@@ -779,7 +779,7 @@ names the lifecycle behaviour that is actually tested.
 | IC-039 | Release/artifact linkage | **GREEN** | `ReleaseRecord` links conclusion to released SHA and artifact reference; the chain refuses a release without a conclusion. |
 | IC-040 | Post-change effectiveness | **GREEN** | Reports before/after windows, metric delta, and recurrence delta; an incomparable cohort must state why and must not report a metric. |
 | IC-041 | Exact release SHA binding | **PARTIAL** | Releases carry an exact SHA, and prospective evaluation fails closed on release drift with an explicit ineligible disposition. Not yet verified against a deployed release SHA. |
-| IC-042 | Isolated shadow deployment architecture | **MISSING** | Not deployed, by instruction. The contracts it depends on (off-by-default mode, advisory-only persistence, contained failure) exist and are tested. |
+| IC-042 | Isolated shadow deployment architecture | **IMPLEMENTED_AWAITING_DEPLOYMENT_APPROVAL** | The exact deployment change is prepared in `deploy/committee/`: a hardened `Type=oneshot` systemd unit (one bounded cycle, `OPIP_COMMITTEE_MODE=off`, resource caps, `NoNewPrivileges`, `ProtectSystem=strict`, `RestrictAddressFamilies`, `IPAddressDeny` with a provider allowlist), a disabled-by-default six-hourly timer, a worker script that refuses without an exact 40-character release SHA and records an explicit `SKIPPED_MODE_OFF` disposition, and `cycle_runner.py`, which runs exactly one cycle, enforces the UTC daily ceiling by capping the cycle budget from the day's remainder, writes every disposition durably before the cycle completes, and emits a trust report. Placement is the learning/analytics plane, never the trading host. Nothing is deployed: installing or enabling any of it needs separate OWNER approval. |
 | IC-043 | Learning observability | **PARTIAL** | Prospective pending counters and a six-gate trust report with explicit insufficiency reasons exist. No deployed dashboard, which is out of scope for this revision. |
 | IC-044 | Committee investment measurement | **GREEN** | Attributable cost, token totals, call and failure counts, with unknown cost remaining unknown and a failure rate that is null when nothing was called. |
 | IC-045 | No credentials or executable tools to models | **GREEN** | Fail-closed outbound screening by prohibited key name, credential-formed value, and environment-dump field; the plane exposes no tool, shell, or browsing surface to a model. |
@@ -790,8 +790,9 @@ names the lifecycle behaviour that is actually tested.
 | --- | --- |
 | GREEN | 36 |
 | PARTIAL | 7 |
-| MISSING | 1 |
+| MISSING | 0 |
 | IMPLEMENTED_AWAITING_CREDENTIALLED_SHADOW_VALIDATION | 1 |
+| IMPLEMENTED_AWAITING_DEPLOYMENT_APPROVAL | 1 |
 | OUT_OF_SCOPE | 0 |
 
 ### What blocks READY_TO_FREEZE
@@ -802,8 +803,8 @@ Two requirements remain, and neither is a correctness defect:
    validation, which needs OWNER-supplied credentials and three undecided values (the
    price book, the per-attempt deadline, and the per-attempt token limit). No provider
    call has been made and mode remains `off`.
-2. **IC-042** requires a deployment decision that this mandate explicitly withholds.
-   The design is complete; the exact change needs separate OWNER approval.
+2. **IC-042** has its exact deployment change prepared in `deploy/committee/` and
+   awaits OWNER approval to install it. Nothing has been deployed.
 
 The seven PARTIAL requirements are contracts with
 proven lifecycles that have not yet been exercised against real evidence or a real
@@ -831,7 +832,7 @@ defect.
 | --- | --- | --- |
 | **1. Implementation complete (GREEN)** | IC-001 to IC-007, IC-009 to IC-020, IC-023 to IC-040, IC-044, IC-045 | Implemented with lifecycle evidence and tests at this revision. |
 | **2. Implementation complete, awaiting real evidence** | IC-005, IC-019, IC-020, IC-021, IC-022, IC-041, IC-043 | The contract, the lifecycle, and the tests exist and pass. Each needs live providers, live cases, a real corpus, or a deployed release before it can be *exercised* end to end. Not an implementation defect, and not repairable by more agent work. |
-| **3. Requires OWNER-authorised external action** | IC-042, and the credentialled validation step of IC-008 | IC-008's transports are implemented and offline-tested, but the credentialled shadow validation cannot happen without OWNER-supplied credentials; IC-042 needs a deployment decision. |
+| **3. Requires OWNER-authorised external action** | IC-042, and the credentialled validation step of IC-008 | IC-008's transports are implemented and offline-tested, but the credentialled shadow validation cannot happen without OWNER-supplied credentials; IC-042's exact deployment change is prepared in `deploy/committee/` and needs OWNER approval to install. |
 
 The concrete plans for class 3 are in
 [`MODULE2_EXTERNAL_ACTION_PROPOSALS.md`](MODULE2_EXTERNAL_ACTION_PROPOSALS.md):

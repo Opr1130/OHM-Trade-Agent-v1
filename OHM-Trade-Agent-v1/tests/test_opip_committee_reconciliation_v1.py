@@ -28,6 +28,7 @@ STATUSES = (
     "PARTIAL",
     "MISSING",
     "IMPLEMENTED_AWAITING_CREDENTIALLED_SHADOW_VALIDATION",
+    "IMPLEMENTED_AWAITING_DEPLOYMENT_APPROVAL",
     "OUT_OF_SCOPE",
 )
 
@@ -104,7 +105,12 @@ def test_the_blockers_section_names_the_unfinished_requirements():
     blocking = [
         requirement
         for requirement, status in _matrix_rows()
-        if status in ("MISSING", "IMPLEMENTED_AWAITING_CREDENTIALLED_SHADOW_VALIDATION")
+        if status
+        in (
+            "MISSING",
+            "IMPLEMENTED_AWAITING_CREDENTIALLED_SHADOW_VALIDATION",
+            "IMPLEMENTED_AWAITING_DEPLOYMENT_APPROVAL",
+        )
     ]
     assert blocking, "expected unfinished requirements to be explained"
     tail = text.split("### What blocks READY_TO_FREEZE")[-1]

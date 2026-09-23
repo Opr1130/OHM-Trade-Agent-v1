@@ -22,8 +22,10 @@ Three rules:
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from app.opip.decision_intelligence.serialization import require_utc, stable_hash
@@ -105,6 +107,58 @@ class InMemoryDailySpendStore:
     def save_day(self, record: DailySpendRecord) -> None:
         self.saves += 1
         self.days[record.day] = record
+
+
+class FileDailySpendStore:
+    """A durable per-day spend store in a single JSON file.
+
+    Written atomically, so a crash mid-write cannot leave a half-record that would
+    reset the day's spend and silently re-open the ceiling.
+    """
+
+    def __init__(self, root: "Path") -> None:
+        self.path = Path(root) / "daily_spend.json"
+
+    def load_day(self, day: date) -> DailySpendRecord | None:
+        if not self.path.exists():
+            return None
+        try:
+            decoded = json.loads(self.path.read_text(encoding="utf-8"))
+        except ValueError:
+            # An unreadable spend record must not be read as zero spend, which would
+            # re-open the ceiling. It is treated as unknown and refuses.
+            raise ValueError(
+                "the durable daily spend record is unreadable; a day's spend cannot "
+                "be reconstructed from it"
+            )
+        if not isinstance(decoded, dict):
+            raise ValueError("the durable daily spend record is not an object")
+        entry = decoded.get(day.isoformat())
+        if not isinstance(entry, dict):
+            return None
+        return DailySpendRecord(
+            day=day,
+            spent_microunits=int(entry.get("spent_microunits", 0)),
+            reservations=int(entry.get("reservations", 0)),
+        )
+
+    def save_day(self, record: DailySpendRecord) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        existing: dict[str, object] = {}
+        if self.path.exists():
+            try:
+                decoded = json.loads(self.path.read_text(encoding="utf-8"))
+                if isinstance(decoded, dict):
+                    existing = decoded
+            except ValueError:
+                existing = {}
+        existing[record.day.isoformat()] = {
+            "spent_microunits": record.spent_microunits,
+            "reservations": record.reservations,
+        }
+        temporary = self.path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(existing, sort_keys=True) + "\n", encoding="utf-8")
+        temporary.replace(self.path)
 
 
 class DailyCeiling:
@@ -206,6 +260,7 @@ __all__ = [
     "DailyCeilingExceededError",
     "DailySpendRecord",
     "DailySpendStore",
+    "FileDailySpendStore",
     "InMemoryDailySpendStore",
     "UnboundedReservationError",
     "utc_day_of",

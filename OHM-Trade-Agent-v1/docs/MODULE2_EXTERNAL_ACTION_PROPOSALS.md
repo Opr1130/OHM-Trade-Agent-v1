@@ -262,7 +262,7 @@ Until then, IC-042 stays MISSING. No process was deployed.
 | Requirement | Status | What remains |
 | --- | --- | --- |
 | IC-008 | **IMPLEMENTED_AWAITING_CREDENTIALLED_SHADOW_VALIDATION** | Real adapters, allowlist, credential injection, ceilings, and the cross-vendor route table are implemented and tested against mocks. Three values are still needed: the price book, the per-attempt deadline, and the per-attempt token limit. Then the credentialled shadow validation itself. |
-| IC-042 | Design complete, **not deployed** | The exact deployment change, on the learning/analytics plane, needs separate OWNER approval. |
+| IC-042 | Design complete, **not deployed** | The exact change is prepared in `deploy/committee/` (`opip-committee-shadow.service`, `.timer`, `run-committee-shadow-cycle.sh`, `README.md`, and `cycle_runner.py`). Installing or enabling it needs separate OWNER approval. |
 
 Every other Module 2 requirement is either GREEN with lifecycle evidence or PARTIAL
 solely because it awaits real evidence, live cases, or a deployed release. No remaining

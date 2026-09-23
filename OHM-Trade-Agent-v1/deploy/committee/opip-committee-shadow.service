@@ -1,0 +1,72 @@
+[Unit]
+# O'Pip Intelligence Committee — isolated shadow worker.
+#
+# INERT UNTIL DEPLOYED. This unit exists so the change can be reviewed as an exact
+# artifact. Installing and enabling it is a separate OWNER-authorised action.
+#
+# Placement rationale: this runs on the learning/analytics plane, NOT the trading
+# droplet, so the committee never shares a host with order authority and the trading
+# droplet stays free of the analytics footprint.
+Description=O'Pip Intelligence Committee shadow planning cycle
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+# One bounded cycle per start. The scheduler's own budget and the daily ceiling bound
+# the work; this unit does not loop, so concurrency cannot exceed one.
+ExecStart=/usr/local/sbin/run-committee-shadow-cycle.sh
+
+# Mode OFF at the unit level. The plane's own gate also defaults to off, and
+# `run_case` refuses to run otherwise, so this is defence in depth rather than the
+# only control. Changing this value is the activation step and requires OWNER
+# approval.
+Environment=OPIP_COMMITTEE_MODE=off
+
+# Credentials are supplied by the operator's secret mechanism as a file reference.
+# No value appears here, in this repository, in an image, or in a log. Absent
+# credentials make each seat UNAVAILABLE rather than permitting an unauthenticated
+# call.
+EnvironmentFile=-/etc/opip/committee-credentials.env
+
+# Timeout and rolling bounds. A hung cycle is killed by the group rather than left
+# running.
+TimeoutStartSec=900
+TimeoutStopSec=30
+KillMode=control-group
+
+# Resource limits: a small capped worker that cannot degrade the analytics host.
+MemoryMax=768M
+CPUQuota=100%
+OOMScoreAdjust=700
+
+# Privilege and filesystem hardening, mirroring the learning worker.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+# The committee reaches providers over HTTPS only; no other socket family is opened.
+RestrictAddressFamilies=AF_INET AF_INET6
+
+# Egress restriction. `IPAddressDeny=any` plus an allowlist means the unit cannot
+# reach anything but the approved provider endpoints, even if the application were
+# misconfigured. The application-level allowlist in `transports.py` is the primary
+# control; this is the backstop, and its exact syntax depends on the host's systemd
+# version, so it must be confirmed at deployment time.
+IPAddressDeny=any
+IPAddressAllow=api.openai.com api.anthropic.com
+
+# Writable paths: only the advisory output directory and the lock directory. The
+# evidence input is mounted read-only, and canonical evidence, the decision
+# intelligence streams, the order path, and the trading registries are not reachable.
+ReadWritePaths=/var/lib/opip-committee /var/lock
+ReadOnlyPaths=/var/lib/opip-learning
+
+# No port is opened or published: this service accepts nothing inbound.
