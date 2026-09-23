@@ -182,7 +182,10 @@ def parse_structured_opinion(
 
     if decoded.get("schema_version") != StructuredOpinion.__dataclass_fields__[
         "schema_version"
-    ].default:
+    ].default or type(decoded.get("schema_version")) is not int:
+        # ``type(...) is not int`` is required, not decorative: ``True == 1`` in
+        # Python, so a JSON ``true`` would otherwise satisfy the equality check and
+        # be admitted as schema version 1.
         raise _schema("schema_version must be exactly 1")
 
     sufficiency = _require_enum(decoded, "evidence_sufficiency", EvidenceSufficiency)
