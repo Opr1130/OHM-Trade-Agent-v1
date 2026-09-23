@@ -438,7 +438,40 @@ and later checked for recurrence.
   (latest validation wins; none means `PENDING`), and `summary()` reports every
   state even at zero.
 
-### 3H — Contribution to the profitability loop
+### 3H — Matched portfolio economics (IC-021 to IC-028, `economics.py`)
+
+The committee's contribution is the difference between what a committee-informed
+research policy would have produced and what the frozen deterministic baseline
+actually produces, on the same opportunities under the same conditions.
+
+- **Matching is a precondition.** Two arms may only be subtracted when they share
+  the eligible population, capital, window, execution model, fees, slippage,
+  liquidity assumption, coverage, and capital-occupancy semantics. A comparison
+  across mismatched conditions is refused, and the error names the differing
+  fields, because otherwise the difference measures the conditions.
+- **Nothing may be quietly excluded.** Each arm must declare a count for all seven
+  populations — filled, no-fill, baseline reject, failed, late, missing committee
+  call, and retry. An arm that reports only its successful calls cannot be
+  constructed, so survivorship bias cannot enter through omission.
+- **Incremental Trading Net** = committee research-policy net − frozen baseline
+  net. **Incremental Operating Net** = Incremental Trading Net − attributable
+  operating cost.
+- **Unknown is never zero.** An unmeasured arm net is `null`, `net_completeness`
+  states it, an unknown operating cost makes the operating net unknown, and an
+  unknown baseline makes the incremental net unknown. `has_negative_operating_value`
+  is `None` rather than healthy when either metric is unknown — which is how
+  "positive gross value, negative operating value" stays visible instead of looking
+  like a win.
+- **False intervention is tracked separately** as a four-way comparison
+  (committee-right/baseline-wrong, baseline-right/committee-wrong, both-right,
+  both-wrong), because a net-positive total can still hide a harmful pattern. An
+  undefined rate is `None`, not zero.
+- **Counterfactuals are labelled.** An avoided-loss or missed-gain claim requires a
+  preregistered policy and feasible timing — an opinion that arrived after the
+  opportunity expired cannot be credited with avoiding it — and carries
+  `SIMULATED_NOT_REALISED_CASH`, so it can never be read as realised cash.
+
+### 3I — Contribution to the profitability loop
 
 This slice supplies the **role-attribution** substrate the profitability loop
 requires. It is not yet wired to a live case pipeline, so the loop above is not
