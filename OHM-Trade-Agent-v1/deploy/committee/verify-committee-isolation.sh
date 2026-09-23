@@ -48,6 +48,10 @@ egress_denies_everything() {
       any) return 0 ;;
       0.0.0.0/0) saw_v4="true" ;;
       ::/0) saw_v6="true" ;;
+      *)
+        # Any other entry denies only part of the space, so it contributes no coverage.
+        # Both family flags must still be set for the policy to count as deny-all.
+        : ;;
     esac
   done
   [[ "$saw_v4" == "true" && "$saw_v6" == "true" ]]
@@ -125,6 +129,7 @@ report_timer_enablement() {
       fail "timer enablement state is unrecognised (state: ${state_label:-none}, rc=$status)"
       ;;
   esac
+  return 0
 }
 
 # When sourced for testing, stop after the definitions: everything below asserts the
