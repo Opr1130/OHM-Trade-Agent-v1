@@ -71,6 +71,21 @@ class ReasoningMode(str, Enum):
     HIGH = "HIGH"
 
 
+class ModelIdKind(str, Enum):
+    """Whether a model id is pinned or floats.
+
+    The requirement is *provider-defined fixed/versioned model id*, not literally a
+    date suffix: some providers use a dated snapshot id and others ship a fixed
+    versioned id with no date in it. What must never be accepted is a rolling alias,
+    because an alias that silently points at a newer model would change what
+    answered a role without changing the registry - exactly the drift the registry
+    exists to prevent.
+    """
+
+    FIXED = "FIXED"
+    ROLLING_ALIAS = "ROLLING_ALIAS"
+
+
 @dataclass(frozen=True)
 class ModelRegistryEntry:
     """One governed provider/model entry for one role."""
@@ -86,6 +101,10 @@ class ModelRegistryEntry:
     approval: ApprovalState
     effective_from: datetime
     review_by: datetime
+    #: Whether ``model_id`` is a pinned id or a rolling alias. A rolling alias is
+    #: refused at routing time, since it would let the served model drift without
+    #: the registry recording a change.
+    model_id_kind: ModelIdKind = ModelIdKind.FIXED
     reasoning_mode: ReasoningMode = ReasoningMode.NONE
     max_output_tokens: int | None = None
     deadline_seconds: int | None = None
@@ -108,6 +127,16 @@ class ModelRegistryEntry:
             raise ValueError("invalid approval state")
         if not isinstance(self.reasoning_mode, ReasoningMode):
             raise ValueError("invalid reasoning_mode")
+        if not isinstance(self.model_id_kind, ModelIdKind):
+            raise ValueError("invalid model_id_kind")
+        if self.model_id_kind is ModelIdKind.ROLLING_ALIAS:
+            # Refused at construction, not merely at routing: a registry that can
+            # hold an alias is a registry whose entries can silently drift.
+            raise RegistryError(
+                f"entry {self.entry_id!r} declares a rolling alias "
+                f"({self.model_id!r}); a governed entry requires a provider-defined "
+                "fixed or versioned model id"
+            )
         for field_name in (
             "entry_id",
             "model_id",
@@ -167,6 +196,7 @@ class ModelRegistryEntry:
             "approval": self.approval,
             "effective_from": self.effective_from,
             "review_by": self.review_by,
+            "model_id_kind": self.model_id_kind,
             "reasoning_mode": self.reasoning_mode,
             "max_output_tokens": self.max_output_tokens,
             "deadline_seconds": self.deadline_seconds,
@@ -375,6 +405,95 @@ class ModelRegistry:
         return hash(self.registry_hash)
 
 
+#: The two governed provider families approved for the initial shadow bake-off.
+APPROVED_SHADOW_MODELS: Mapping[ProviderFamily, str] = {
+    ProviderFamily.OPENAI: "gpt-5.6-terra",
+    ProviderFamily.ANTHROPIC: "claude-sonnet-5",
+}
+
+#: Approved role route table: each role names a primary family, and the other
+#: approved family is its single fallback.
+#:
+#: The primaries are deliberately distributed across both vendors. If every role
+#: used the same primary, the fallback would almost never answer and the committee
+#: population would contain only one vendor's opinions - so there would be no
+#: genuinely independent vendor evidence for the disagreement matrix to measure.
+#: Alternating the primaries makes both vendors answer real roles while every role
+#: still has at most one approved fallback.
+APPROVED_SHADOW_ROLE_PRIMARIES: Mapping[CommitteeRole, ProviderFamily] = {
+    CommitteeRole.REGIME_ANALYST: ProviderFamily.OPENAI,
+    CommitteeRole.LIQUIDITY_STRUCTURE_ANALYST: ProviderFamily.ANTHROPIC,
+    CommitteeRole.EVENT_SENTIMENT_ANALYST: ProviderFamily.OPENAI,
+    CommitteeRole.BULL_ADVOCATE: ProviderFamily.ANTHROPIC,
+    CommitteeRole.BEAR_ADVOCATE: ProviderFamily.OPENAI,
+    CommitteeRole.RISK_CRITIC: ProviderFamily.ANTHROPIC,
+    CommitteeRole.DECISION_SYNTHESIZER: ProviderFamily.OPENAI,
+}
+
+#: Initial economic ceilings, as approved. Microunits are 1e-6 of a currency unit,
+#: so $0.50 is 500_000 and $10 is 10_000_000.
+APPROVED_MAX_CASE_COST_MICROUNITS = 500_000
+APPROVED_MAX_DAILY_COST_MICROUNITS = 10_000_000
+
+#: Initial reasoning effort for the approved routes.
+APPROVED_SHADOW_REASONING_MODE = ReasoningMode.LOW
+
+
+def default_shadow_registry(
+    *,
+    registry_version: str = "committee-shadow-registry-v1",
+    effective_from: datetime,
+    review_by: datetime,
+    prompt_hash: str = "COMMITTEE-PROMPT:pending",
+    schema_hash: str = "COMMITTEE-SCHEMA:pending",
+    owner: str = "owner",
+) -> ModelRegistry:
+    """Build the approved initial shadow registry.
+
+    Every entry pins a provider-defined fixed model id, declares ``LOW`` reasoning,
+    and carries the approved per-case ceiling. No entry is an alias, and each role
+    gets at most one fallback from the other vendor.
+    """
+    entries: list[ModelRegistryEntry] = []
+    routes: dict[CommitteeRole, tuple[str, str | None]] = {}
+    # Imported lazily to keep the registry free of a module-level dependency on the
+    # transport layer, while still recording the exact allowlisted endpoint so a
+    # registry entry and the egress allowlist cannot disagree.
+    from app.opip.committee.transports import ALLOWED_ENDPOINTS
+
+    for role, primary_family in APPROVED_SHADOW_ROLE_PRIMARIES.items():
+        fallback_family = next(
+            family for family in APPROVED_SHADOW_MODELS if family is not primary_family
+        )
+        primary_id = f"{role.value.lower()}:{primary_family.value}"
+        fallback_id = f"{role.value.lower()}:{fallback_family.value}"
+        for entry_id, family in ((primary_id, primary_family), (fallback_id, fallback_family)):
+            entries.append(
+                ModelRegistryEntry(
+                    entry_id=entry_id,
+                    role=role,
+                    provider_family=family,
+                    model_id=APPROVED_SHADOW_MODELS[family],
+                    endpoint=ALLOWED_ENDPOINTS[family],
+                    prompt_hash=prompt_hash,
+                    schema_hash=schema_hash,
+                    owner=owner,
+                    approval=ApprovalState.PROVISIONAL,
+                    effective_from=effective_from,
+                    review_by=review_by,
+                    model_id_kind=ModelIdKind.FIXED,
+                    reasoning_mode=APPROVED_SHADOW_REASONING_MODE,
+                    max_cost_microunits=APPROVED_MAX_CASE_COST_MICROUNITS,
+                )
+            )
+        routes[role] = (primary_id, fallback_id)
+    return ModelRegistry(
+        registry_version=registry_version,
+        entries=tuple(entries),
+        routes=routes,
+    )
+
+
 def assert_result_served_by_route(
     *,
     route: RoleRoute,
@@ -397,16 +516,23 @@ def assert_result_served_by_route(
 
 
 __all__ = [
+    "APPROVED_MAX_CASE_COST_MICROUNITS",
+    "APPROVED_MAX_DAILY_COST_MICROUNITS",
+    "APPROVED_SHADOW_MODELS",
+    "APPROVED_SHADOW_REASONING_MODE",
+    "APPROVED_SHADOW_ROLE_PRIMARIES",
     "MODEL_REGISTRY_ENTRY_SCHEMA_VERSION",
     "MODEL_REGISTRY_SCHEMA_VERSION",
     "MODEL_REGISTRY_ENTRY_IDENTITY_DOMAIN",
     "MODEL_REGISTRY_IDENTITY_DOMAIN",
     "ROLE_ROUTE_IDENTITY_DOMAIN",
     "ApprovalState",
+    "ModelIdKind",
     "ModelRegistry",
     "ModelRegistryEntry",
     "ReasoningMode",
     "RegistryError",
     "RoleRoute",
     "assert_result_served_by_route",
+    "default_shadow_registry",
 ]

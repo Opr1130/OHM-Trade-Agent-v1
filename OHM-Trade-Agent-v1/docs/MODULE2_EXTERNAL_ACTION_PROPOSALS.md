@@ -23,22 +23,45 @@ opinion, under the existing governed registry. The plane stays `off` by default 
 
 ### Providers and exact models
 
-Two entries are proposed, deliberately from different vendors so the disagreement
-matrix has genuinely independent information rather than one vendor agreeing with
-itself:
+APPROVED by OWNER. Two entries from different vendors, so the disagreement matrix
+has genuinely independent information rather than one vendor agreeing with itself:
 
-| Seat | Provider family | Exact model ID | Reasoning mode |
+| Seat | Provider family | Registered model id | Reasoning mode |
 | --- | --- | --- | --- |
-| Primary | `openai` | **REQUIRES OWNER CONFIRMATION** — the exact dated snapshot id, not an alias | `LOW` |
-| Fallback | `anthropic` | **REQUIRES OWNER CONFIRMATION** — the exact dated snapshot id, not an alias | `LOW` |
+| Primary (4 roles) | `openai` | `gpt-5.6-terra` | `LOW` |
+| Primary (3 roles) | `anthropic` | `claude-sonnet-5` | `LOW` |
 
-The registry requires an exact model id rather than an alias, and refuses a response
-whose served model does not match the requested entry. That is deliberate: an alias
-that silently rolls forward would change what answered a role without changing the
-registry, which is exactly the version drift the registry exists to prevent.
+**The requirement is a provider-defined fixed/versioned model id; rolling aliases are
+prohibited.** It is deliberately *not* "must contain a date": Anthropic ships
+`claude-sonnet-5` as a fixed id with no date suffix, and requiring a date would have
+rejected a perfectly pinned model. What is refused is a floating alias such as
+`latest`, because an alias that silently points at a newer model would change what
+answered a role without changing the registry — exactly the drift the registry
+exists to prevent.
 
-`GOOGLE_GEMINI` and `DEEPSEEK` families stay unseated in this proposal. A family with
-no adapter resolves to an explicit `UNAVAILABLE` seat and is never substituted.
+This is enforced in code: `ModelIdKind.ROLLING_ALIAS` is refused at registry-entry
+construction, and a response whose served model differs from the registered id is
+refused by the router rather than credited to the role.
+
+**Primary roles are distributed across both vendors.** If every role used the same
+primary, the fallback would almost never answer and the committee population would
+contain only one vendor's opinions — so there would be no independent vendor
+evidence for the disagreement matrix to measure. The approved table alternates:
+
+| Role | Primary | Fallback |
+| --- | --- | --- |
+| Regime Analyst | OpenAI | Anthropic |
+| Liquidity / Structure Analyst | Anthropic | OpenAI |
+| Event / Sentiment Analyst | OpenAI | Anthropic |
+| Bull Advocate | Anthropic | OpenAI |
+| Bear Advocate | OpenAI | Anthropic |
+| Risk Critic | Anthropic | OpenAI |
+| Decision Synthesizer | OpenAI | Anthropic |
+
+Each role still has **at most one** approved fallback, from the other vendor.
+
+`GOOGLE_GEMINI` and `DEEPSEEK` families stay unseated. A family with no adapter
+resolves to an explicit `UNAVAILABLE` seat and is never substituted.
 
 ### Transport implementation
 
@@ -79,23 +102,33 @@ unapproved destination without a config change.
 
 ### Cost limits
 
-Three ceilings, all enforced by code that already exists and is tested:
+APPROVED by OWNER, and enforced by code that exists and is tested:
 
-| Limit | Proposed value | Enforced by |
+| Limit | Approved value | Enforced by |
 | --- | --- | --- |
-| Per-case cost ceiling | `OPIP_COMMITTEE_MAX_ESTIMATED_COST_MICROUNITS` — **OWNER VALUE** | `RoleBudget.check_cost`; a seat whose cost cannot be bounded is refused, not assumed to fit |
-| Per-cycle case and cost budget | `SchedulerBudget` — **OWNER VALUE** | `CommitteeScheduler`, which counts selected-before-execution so an exhausted cycle cannot keep selecting |
-| Prices | `OPIP_COMMITTEE_PRICES` — **OWNER VALUE** | `pricing.py`; an unconfigured price yields `UNKNOWN` cost, never zero, and a malformed specification raises |
+| Per complete candidate assessment | **$0.50** = `500_000` microunits | `RoleBudget.check_cost`; a seat whose cost cannot be bounded is refused, not assumed to fit |
+| UTC daily Committee ceiling | **$10** = `10_000_000` microunits | `DailyCeiling` (`daily_ceiling.py`), keyed on the **UTC** calendar day, durable across restart, and persisted before the work it authorises |
+| Fallback reservation | shares the primary's reservation | a fallback receives no new budget, so failover cannot double a case's cost |
+| Prices | `OPIP_COMMITTEE_PRICES` — **OWNER VALUE still required** | `pricing.py`; an unconfigured price yields `UNKNOWN` cost, never zero, and a malformed specification raises |
 
-`0` means "no declared ceiling" and would be a deliberate OWNER choice; it is not the
-proposed default.
+Two notes on the daily ceiling, because both are deliberate:
+
+- The day boundary is **UTC**, so the ceiling cannot be stretched by a local timezone
+  or by daylight saving.
+- A reservation whose cost cannot be bounded is **refused** rather than admitted under
+  an assumption, because a ceiling that cannot be evaluated cannot be enforced.
+
+An under-estimate cannot escape the ceiling either: settling charges the greater of
+the reservation and the reported cost, and a failure with unknown cost keeps its
+reservation.
 
 ### Timeout and fallback limits
 
 | Limit | Value |
 | --- | --- |
-| Per-attempt deadline | registry `deadline_seconds`, proposed **OWNER VALUE** |
-| Per-attempt output tokens | registry `max_output_tokens`, proposed **OWNER VALUE** |
+| Reasoning effort | `LOW` (approved, pinned per registry entry) |
+| Per-attempt deadline | registry `deadline_seconds`, **OWNER VALUE still required** |
+| Per-attempt output tokens | registry `max_output_tokens`, **OWNER VALUE still required** |
 | Attempts per role | at most **two**: one primary, one approved fallback |
 | Fallback reservation | shares the primary's deadline, token, and monetary reservation; it never receives a fresh budget |
 
@@ -226,11 +259,11 @@ Until then, IC-042 stays MISSING. No process was deployed.
 
 ## Summary for OWNER
 
-| Requirement | What is missing | Whose decision |
+| Requirement | Status | What remains |
 | --- | --- | --- |
-| IC-008 | Real transports, exact model IDs, credentials, egress, cost limits | OWNER: architecture and secrets |
-| IC-042 | A deployed isolated shadow worker | OWNER: deployment and host choice |
+| IC-008 | **IMPLEMENTED_AWAITING_CREDENTIALLED_SHADOW_VALIDATION** | Real adapters, allowlist, credential injection, ceilings, and the cross-vendor route table are implemented and tested against mocks. Three values are still needed: the price book, the per-attempt deadline, and the per-attempt token limit. Then the credentialled shadow validation itself. |
+| IC-042 | Design complete, **not deployed** | The exact deployment change, on the learning/analytics plane, needs separate OWNER approval. |
 
-Every other Module 2 requirement is either GREEN with lifecycle evidence or
-PARTIAL solely because it awaits real evidence, live cases, or a deployed release.
-No remaining item is blocked on unfinished engineering.
+Every other Module 2 requirement is either GREEN with lifecycle evidence or PARTIAL
+solely because it awaits real evidence, live cases, or a deployed release. No remaining
+item is blocked on unfinished engineering.

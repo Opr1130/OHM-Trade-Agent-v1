@@ -745,7 +745,7 @@ names the lifecycle behaviour that is actually tested.
 | IC-005 | DecisionContext to Committee linkage | **PARTIAL** | `CanonicalDecisionBinding` is opaque by reference, participates in case/case-outcome identity, is persisted, and refuses reattribution and unbinding, with legacy-identity tests. Not yet populated from a real canonical decision, which needs the governed DI bridge. |
 | IC-006 | Explicit role-based Committee | **GREEN** | Seven roles; six required and enforced by `validate_complete`; the optional role must report `UNKNOWN` rather than invent a view; a provider family is asserted never to be a role. |
 | IC-007 | Provider-neutral adapter boundary | **GREEN** | `CommitteeProvider` plus injected `ProviderTransport`; the router never branches on vendor; an absent adapter is `UNAVAILABLE` rather than substituted. |
-| IC-008 | Real governed provider transports | **MISSING** | Adapters exist and are exercised by deterministic fakes; a real transport with credentials and network policy is a separate approved change and is documented as such. |
+| IC-008 | Real governed provider transports | **IMPLEMENTED_AWAITING_CREDENTIALLED_SHADOW_VALIDATION** | Real adapters for the two approved families (`gpt-5.6-terra`, `claude-sonnet-5`) are implemented behind the existing injected transport, with the egress allowlist enforced at construction and per call, credentials injected from the environment only and excluded from body, records, references, and `repr`, HTTP statuses translated into typed failure classes, and the served model read from the payload so a substitution is visible. Rolling aliases are refused at registry construction. Primary roles are distributed across both vendors so both actually answer. Per-case ($0.50) and UTC-daily ($10) ceilings are enforced, with an unbounded reservation refused. All tested against mock posters only: no provider call has been made, mode remains `off`, and no credential has been created, read, or moved. Credentialled shadow validation is the remaining step. |
 | IC-009 | Versioned Model Registry | **GREEN** | Versioned registry of role routes with prompt/schema hashes, owner, approval state, effective and review dates, reasoning mode, and budget limits. |
 | IC-010 | Primary plus at most one approved fallback | **GREEN** | Two routes for one role are refused as ambiguous; the fallback shares the primary's request, deadline, and reservations; an unusable fallback is dropped, never substituted; only `APPROVED` routes. |
 | IC-011 | Deadline/token/cost/concurrency budgets | **GREEN** | `RoleBudget` validates and enforces deadline and cost ceilings, bounds concurrency, and refuses an unknown cost rather than treating it as free. |
@@ -790,20 +790,22 @@ names the lifecycle behaviour that is actually tested.
 | --- | --- |
 | GREEN | 36 |
 | PARTIAL | 7 |
-| MISSING | 2 |
+| MISSING | 1 |
+| IMPLEMENTED_AWAITING_CREDENTIALLED_SHADOW_VALIDATION | 1 |
 | OUT_OF_SCOPE | 0 |
 
 ### What blocks READY_TO_FREEZE
 
-The two MISSING requirements are the honest blockers, and both are deliberate:
+Two requirements remain, and neither is a correctness defect:
 
-1. **IC-008 real governed provider transports** requires credentials and a network
-   policy. That is an owner-authorised change, and no credential may be placed on
-   this plane by an agent.
-2. **IC-042 isolated shadow deployment** requires a deployment decision that this
-   mandate explicitly withholds.
+1. **IC-008** is implemented and offline-tested but awaits credentialled shadow
+   validation, which needs OWNER-supplied credentials and three undecided values (the
+   price book, the per-attempt deadline, and the per-attempt token limit). No provider
+   call has been made and mode remains `off`.
+2. **IC-042** requires a deployment decision that this mandate explicitly withholds.
+   The design is complete; the exact change needs separate OWNER approval.
 
-Neither is a correctness defect. The seven PARTIAL requirements are contracts with
+The seven PARTIAL requirements are contracts with
 proven lifecycles that have not yet been exercised against real evidence or a real
 release; every one of them is blocked on live providers, live cases, or a deployed
 release rather than on missing implementation:
@@ -827,9 +829,9 @@ defect.
 
 | Class | Requirements | Meaning |
 | --- | --- | --- |
-| **1. Implementation complete (GREEN)** | IC-001 to IC-004, IC-006, IC-007, IC-009 to IC-020, IC-023 to IC-040, IC-044, IC-045 | Implemented with lifecycle evidence and tests at this revision. |
+| **1. Implementation complete (GREEN)** | IC-001 to IC-007, IC-009 to IC-020, IC-023 to IC-040, IC-044, IC-045 | Implemented with lifecycle evidence and tests at this revision. |
 | **2. Implementation complete, awaiting real evidence** | IC-005, IC-019, IC-020, IC-021, IC-022, IC-041, IC-043 | The contract, the lifecycle, and the tests exist and pass. Each needs live providers, live cases, a real corpus, or a deployed release before it can be *exercised* end to end. Not an implementation defect, and not repairable by more agent work. |
-| **3. Requires OWNER-authorised external action** | IC-008, IC-042 | Cannot be completed without an owner decision: real provider transports with credentials and egress (IC-008), and a deployed isolated shadow worker (IC-042). |
+| **3. Requires OWNER-authorised external action** | IC-042, and the credentialled validation step of IC-008 | IC-008's transports are implemented and offline-tested, but the credentialled shadow validation cannot happen without OWNER-supplied credentials; IC-042 needs a deployment decision. |
 
 The concrete plans for class 3 are in
 [`MODULE2_EXTERNAL_ACTION_PROPOSALS.md`](MODULE2_EXTERNAL_ACTION_PROPOSALS.md):

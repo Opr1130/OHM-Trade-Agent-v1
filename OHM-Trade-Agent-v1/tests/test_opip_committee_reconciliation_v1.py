@@ -20,8 +20,16 @@ DOC = (
     / "MODULE2_INTELLIGENCE_COMMITTEE.md"
 )
 
-#: The status vocabulary the matrix is allowed to use.
-STATUSES = ("GREEN", "PARTIAL", "MISSING", "OUT_OF_SCOPE")
+#: The status vocabulary the matrix is allowed to use. The last entry is the
+#: OWNER-mandated status for a requirement that is implemented and offline-tested but
+#: awaits credentialled validation.
+STATUSES = (
+    "GREEN",
+    "PARTIAL",
+    "MISSING",
+    "IMPLEMENTED_AWAITING_CREDENTIALLED_SHADOW_VALIDATION",
+    "OUT_OF_SCOPE",
+)
 
 #: Every requirement the matrix must cover.
 REQUIRED_IDS = tuple(f"IC-{index:03d}" for index in range(1, 46))
@@ -75,9 +83,12 @@ def test_the_summary_counts_agree_with_the_rows():
         observed[status] += 1
 
     text = DOC.read_text(encoding="utf-8")
+    alternation = "|".join(STATUSES)
     summary = {
         match.group(1): int(match.group(2))
-        for match in re.finditer(r"^\|\s*(GREEN|PARTIAL|MISSING|OUT_OF_SCOPE)\s*\|\s*(\d+)\s*\|", text, re.M)
+        for match in re.finditer(
+            rf"^\|\s*({alternation})\s*\|\s*(\d+)\s*\|", text, re.M
+        )
     }
     assert summary, "the summary table is missing"
     for status, count in summary.items():
@@ -87,16 +98,17 @@ def test_the_summary_counts_agree_with_the_rows():
     assert sum(summary.values()) == len(REQUIRED_IDS)
 
 
-def test_the_blockers_section_names_the_missing_requirements():
+def test_the_blockers_section_names_the_unfinished_requirements():
     """The blockers must agree with the matrix rather than being prose beside it."""
     text = DOC.read_text(encoding="utf-8")
-    missing = [
+    blocking = [
         requirement
         for requirement, status in _matrix_rows()
-        if status == "MISSING"
+        if status in ("MISSING", "IMPLEMENTED_AWAITING_CREDENTIALLED_SHADOW_VALIDATION")
     ]
-    assert missing, "expected at least one MISSING requirement to be explained"
-    for requirement in missing:
-        assert requirement in text.split("### What blocks READY_TO_FREEZE")[-1], (
-            f"{requirement} is MISSING but not explained in the blockers section"
+    assert blocking, "expected unfinished requirements to be explained"
+    tail = text.split("### What blocks READY_TO_FREEZE")[-1]
+    for requirement in blocking:
+        assert requirement in tail, (
+            f"{requirement} is unfinished but not explained in the blockers section"
         )
