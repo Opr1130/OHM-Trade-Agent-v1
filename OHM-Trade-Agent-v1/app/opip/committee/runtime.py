@@ -24,7 +24,7 @@ Guarantees enforced here:
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Mapping
 
@@ -419,6 +419,13 @@ class CommitteeRunner:
 
         if replay_existing and committed is not None and outcome.opinion is not None:
             if outcome.opinion.opinion_hash != committed.opinion.opinion_hash:
+                # Record the refusal before raising: the committed opinion stays
+                # the only accepted opinion, but the divergence itself must be
+                # durable rather than leaving an unexplained gap between what was
+                # attempted and what is stored.
+                self._ledger.record_replay_rejection(
+                    refused=outcome, committed=committed
+                )
                 raise CommitteeReplayDivergenceError(
                     "replayed observation diverges from the sealed opinion for "
                     f"{family.value}; history is preserved and the replay is refused"
@@ -428,11 +435,26 @@ class CommitteeRunner:
             # A retry that was blocked by the budget already persisted its prior
             # failure (with its charge); recording it again would double-count the
             # attempt and append duplicate raw evidence.
-            self._ledger.record(outcome, charge_microunits=final_charge)
+            outcome = self._charged(outcome, final_charge)
+            self._ledger.record(outcome)
         # The seat is charged the cumulative per-attempt cost computed while
         # invoking, so a retried or under-estimated seat cannot leave room for the
         # next seat to spend past the case ceiling.
         return CommitteeSeatResult(family, logical_id, outcome), reserved
+
+    @staticmethod
+    def _charged(
+        outcome: ProviderCallOutcome, charge_microunits: int
+    ) -> ProviderCallOutcome:
+        """Attach this attempt's charge to the record it belongs to.
+
+        The charge is carried inside the authoritative call record so it is
+        fsynced with the call and read back with it, and so the in-memory result
+        matches what was durably written.
+        """
+        if outcome.charge_microunits == charge_microunits:
+            return outcome
+        return replace(outcome, charge_microunits=charge_microunits)
 
     def _duplicate_acknowledgement(
         self,
@@ -548,11 +570,11 @@ class CommitteeRunner:
                 return outcome, seat_charge, False, final_charge
             # Persist the failed attempt, with its charge, before retrying so the
             # audit trail keeps every try rather than only the last one. The
-            # charge is written under the same lock as the outcome, so a crash
-            # cannot lose a reservation relative to its evidence. A failed
-            # attempt is not a committed observation, so this cannot create a
-            # second opinion.
-            self._ledger.record(outcome, charge_microunits=final_charge)
+            # charge travels inside the outcome, so it cannot be lost relative to
+            # its evidence. A failed attempt is not a committed observation, so
+            # this cannot create a second opinion.
+            outcome = self._charged(outcome, final_charge)
+            self._ledger.record(outcome)
             if attempt + 1 > case.policy.max_attempts_per_seat:
                 # The retry would exceed the declared per-seat policy, so stop
                 # with the recorded failure rather than spending again.

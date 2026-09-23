@@ -25,9 +25,14 @@ class CommitteeShadowSettings:
     The execution API refuses to run unless the committee is enabled, so a caller
     that intends committee work states that intent here rather than depending on
     ambient process settings. Mirrors the Feature Bus shadow-settings helper.
+
+    The default is ``off``, matching the documented dark default and
+    ``app.core.config.Settings``. A caller that wants committee work must say so
+    explicitly; constructing this helper with no arguments must not enable the
+    plane.
     """
 
-    opip_committee_mode: str = COMMITTEE_MODE_SHADOW
+    opip_committee_mode: str = COMMITTEE_MODE_OFF
     opip_committee_max_estimated_cost_microunits: int = 0
 
 

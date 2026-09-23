@@ -54,10 +54,23 @@ from app.opip.decision_intelligence.serialization import require_utc, stable_has
 SEALED_PREDICTION_SCHEMA_VERSION = 1
 OUTCOME_OBSERVATION_SCHEMA_VERSION = 1
 PROSPECTIVE_EVALUATION_SCHEMA_VERSION = 1
+PROSPECTIVE_INELIGIBILITY_SCHEMA_VERSION = 1
 
 SEALED_PREDICTION_IDENTITY_DOMAIN = "COMMITTEE-SEAL"
 OUTCOME_OBSERVATION_IDENTITY_DOMAIN = "COMMITTEE-OUTCOME-OBS"
 PROSPECTIVE_EVALUATION_IDENTITY_DOMAIN = "COMMITTEE-PROSPECTIVE-EVAL"
+PROSPECTIVE_INELIGIBILITY_IDENTITY_DOMAIN = "COMMITTEE-PROSPECTIVE-INELIGIBLE"
+
+#: The declared reason a prospective outcome was refused a disposition. An
+#: explicit code, not a generic failed-evaluation bucket, so ineligible cases can
+#: be excluded from trust and economic metrics while staying accountable.
+RELEASE_DRIFT = "RELEASE_DRIFT"
+
+#: Recorded for a sealed prediction written before the release identity existed.
+#: It cannot equal a real 40-character release SHA, so a legacy prediction stays
+#: readable and reproducible while being permanently ineligible for scoring -
+#: fail-closed rather than silently treated as compatible.
+LEGACY_UNSEALED_RELEASE = "LEGACY_PRE_RELEASE_BINDING"
 
 #: Shared validation message so the horizon rule cannot drift.
 _HORIZON_MESSAGE = "horizon_seconds must be a positive integer"
@@ -68,6 +81,11 @@ _SEALED_PREDICTION_REQUIRED_FIELDS = (
     "case_outcome_id",
     "evidence_snapshot_hash",
     "committee_policy_version",
+    # The release identity is sealed with the prediction. Prospective scoring
+    # compares the scoring release against it and refuses to evaluate on drift,
+    # so a worker running a different release cannot contribute prospective
+    # evidence for a prediction it did not seal.
+    "release_sha",
 )
 
 
@@ -292,12 +310,83 @@ class ProspectivePolicyError(ValueError):
     """The prospective protocol was about to be violated."""
 
 
+class ProspectiveReleaseDriftError(ProspectivePolicyError):
+    """The scoring release does not match the release sealed at T0.
+
+    Raised rather than scored: an outcome evaluated by a drifted worker is not
+    comparable with the sealed prediction, so admitting it would silently
+    contaminate the prospective experiment.
+    """
+
+
 class HindsightLeakageError(ProspectivePolicyError):
     """An outcome that was already knowable at the cutoff was offered as future.
 
     Raised rather than silently accepted, because every metric derived from such
     a join would be optimistic in a way no reader could see.
     """
+
+
+@dataclass(frozen=True)
+class ProspectiveIneligibility:
+    """Durable disposition for a prospective outcome that must not be scored.
+
+    A drifted release must not become a generic failure that a caller can bucket
+    away. This record states the reason explicitly (``RELEASE_DRIFT``), keeps the
+    expected and observed release identities for accountability, and is never a
+    ``ProspectiveEvaluation`` — so it cannot enter prospective trust metrics or
+    economic attribution by construction.
+    """
+
+    prediction_id: str
+    case_id: str
+    experiment_id: str
+    reason: str
+    expected_release_sha: str
+    observed_release_sha: str
+    detected_at: datetime
+    schema_version: int = PROSPECTIVE_INELIGIBILITY_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version != PROSPECTIVE_INELIGIBILITY_SCHEMA_VERSION or (
+            type(self.schema_version) is not int
+        ):
+            raise ValueError("unsupported ProspectiveIneligibility schema_version")
+        for field_name in (
+            "prediction_id",
+            "case_id",
+            "experiment_id",
+            "reason",
+            "expected_release_sha",
+            "observed_release_sha",
+        ):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ProspectivePolicyError(f"{field_name} is required")
+        object.__setattr__(
+            self,
+            "detected_at",
+            require_utc(self.detected_at, field_name="detected_at"),
+        )
+
+    def identity_payload(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "prediction_id": self.prediction_id,
+            "case_id": self.case_id,
+            "experiment_id": self.experiment_id,
+            "reason": self.reason,
+            "expected_release_sha": self.expected_release_sha,
+            "observed_release_sha": self.observed_release_sha,
+            "detected_at": self.detected_at,
+        }
+
+    @property
+    def ineligibility_id(self) -> str:
+        """Content-derived identity of this ineligibility disposition."""
+        return stable_hash(
+            PROSPECTIVE_INELIGIBILITY_IDENTITY_DOMAIN, self.identity_payload()
+        )
 
 
 @dataclass(frozen=True)
@@ -315,6 +404,7 @@ class SealedPrediction:
     sealed_opinion_hashes: tuple[str, ...]
     sealed_seat_count: int
     horizon_seconds: int
+    release_sha: str
     provenance: Provenance
     phase: EvaluationPhase = EvaluationPhase.PROSPECTIVE
     schema_version: int = SEALED_PREDICTION_SCHEMA_VERSION
@@ -323,7 +413,7 @@ class SealedPrediction:
         _validate_sealed_prediction(self)
 
     def identity_payload(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "schema_version": self.schema_version,
             "case_id": self.case_id,
             "case_type": self.case_type,
@@ -336,6 +426,12 @@ class SealedPrediction:
             "sealed_opinion_hashes": self.sealed_opinion_hashes,
             "horizon_seconds": self.horizon_seconds,
         }
+        # The release identity is added only when the prediction was sealed with
+        # one, so a prediction written before the field existed keeps the exact
+        # identity it was written with.
+        if self.release_sha != LEGACY_UNSEALED_RELEASE:
+            payload["release_sha"] = self.release_sha
+        return payload
 
     @property
     def prediction_id(self) -> str:
@@ -547,6 +643,7 @@ def seal_prediction(
     horizon_seconds: int,
     experiment_id: str,
     provenance: Provenance,
+    release_sha: str,
     case_type: CaseType,
 ) -> SealedPrediction:
     """Seal the T0 opinions for a case so no later evidence can alter them.
@@ -589,6 +686,7 @@ def seal_prediction(
         sealed_opinion_hashes=hashes,
         sealed_seat_count=len(hashes),
         horizon_seconds=horizon_seconds,
+        release_sha=release_sha,
         provenance=provenance,
     )
 
@@ -672,6 +770,61 @@ def assert_outcome_is_prospective(
         raise ProspectivePolicyError(_HORIZON_MESSAGE)
 
 
+def assert_release_matches(
+    *, prediction: SealedPrediction, observed_release_sha: str
+) -> None:
+    """Fail closed unless the scoring release is the release sealed at T0."""
+    if not isinstance(observed_release_sha, str) or not observed_release_sha.strip():
+        raise ProspectivePolicyError("observed_release_sha is required")
+    if observed_release_sha != prediction.release_sha:
+        raise ProspectiveReleaseDriftError(
+            "the scoring release does not match the release sealed with this "
+            f"prediction (sealed={prediction.release_sha}, "
+            f"observed={observed_release_sha}); a drifted release cannot produce "
+            "prospective evidence for a prediction it did not seal"
+        )
+
+
+def admit_prospective_outcome(
+    *,
+    prediction: SealedPrediction,
+    case_outcome: CommitteeCaseOutcome,
+    observation: OutcomeObservation,
+    evaluated_at: datetime,
+    provenance: Provenance,
+    observed_release_sha: str,
+) -> ProspectiveEvaluation | ProspectiveIneligibility:
+    """Governed prospective boundary: evaluate, or record why the case is ineligible.
+
+    Returns a :class:`ProspectiveIneligibility` with an explicit ``RELEASE_DRIFT``
+    reason instead of raising, so a drifted case gets a durable, accountable
+    disposition that is structurally excluded from prospective trust metrics and
+    economic attribution — rather than being swallowed as a generic failure.
+    """
+    try:
+        assert_release_matches(
+            prediction=prediction, observed_release_sha=observed_release_sha
+        )
+    except ProspectiveReleaseDriftError:
+        return ProspectiveIneligibility(
+            prediction_id=prediction.prediction_id,
+            case_id=prediction.case_id,
+            experiment_id=prediction.experiment_id,
+            reason=RELEASE_DRIFT,
+            expected_release_sha=prediction.release_sha,
+            observed_release_sha=observed_release_sha,
+            detected_at=require_utc(evaluated_at, field_name="detected_at"),
+        )
+    return evaluate_prospective(
+        prediction=prediction,
+        case_outcome=case_outcome,
+        observation=observation,
+        evaluated_at=evaluated_at,
+        provenance=provenance,
+        observed_release_sha=observed_release_sha,
+    )
+
+
 def _score_seats(
     seats: Iterable[ProviderCallOutcome],
     *,
@@ -707,9 +860,19 @@ def evaluate_prospective(
     observation: OutcomeObservation,
     evaluated_at: datetime,
     provenance: Provenance,
+    observed_release_sha: str,
 ) -> ProspectiveEvaluation:
-    """T2: compare the sealed T0 opinion against the T1 outcome."""
+    """T2: compare the sealed T0 opinion against the T1 outcome.
+
+    The scoring release must be the release sealed at T0. An outcome scored by a
+    drifted worker is not comparable with the sealed prediction, so the drift is
+    refused explicitly rather than being scored and quietly averaged into the
+    experiment.
+    """
     verify_seal(prediction, case_outcome)
+    assert_release_matches(
+        prediction=prediction, observed_release_sha=observed_release_sha
+    )
     assert_outcome_is_prospective(prediction, observation)
     evaluated = require_utc(evaluated_at, field_name="evaluated_at")
     if evaluated < observation.observed_at:

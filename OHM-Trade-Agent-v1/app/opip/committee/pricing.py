@@ -169,6 +169,14 @@ def _parse_rate(value: str, entry: str) -> int:
         raise PriceBookConfigError(
             f"non-numeric rate {text!r} in price entry {entry!r}"
         ) from exc
+    # Non-finite rates must fail closed here, with the documented error type.
+    # ``Decimal("Infinity")`` would otherwise pass the negativity and integrality
+    # checks and then raise a bare ``OverflowError`` from ``int()``, and
+    # ``Decimal("NaN")`` raises ``InvalidOperation`` from the comparison below.
+    if not amount.is_finite():
+        raise PriceBookConfigError(
+            f"non-finite rate {text!r} in price entry {entry!r}"
+        )
     if amount < 0:
         raise PriceBookConfigError(f"negative rate in price entry {entry!r}")
     if amount != amount.to_integral_value():

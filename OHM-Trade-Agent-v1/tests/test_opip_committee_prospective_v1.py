@@ -33,11 +33,15 @@ from app.opip.committee.contracts import (
 from app.opip.committee.evaluation import DirectionalCall
 from app.opip.committee.evidence import build_evidence_item, build_evidence_snapshot
 from app.opip.committee.prospective import (
+    RELEASE_DRIFT,
     HindsightLeakageError,
     OutcomeFinality,
     OutcomeObservation,
+    ProspectiveIneligibility,
     ProspectivePolicyError,
+    ProspectiveReleaseDriftError,
     SealedPrediction,
+    admit_prospective_outcome,
     assert_outcome_is_prospective,
     awaiting_evaluation,
     awaiting_outcome,
@@ -52,6 +56,8 @@ from app.opip.committee.serialization import (
     outcome_observation_to_dict,
     prospective_evaluation_from_dict,
     prospective_evaluation_to_dict,
+    prospective_ineligibility_from_dict,
+    prospective_ineligibility_to_dict,
     prospective_record_from_dict,
     sealed_prediction_from_dict,
     sealed_prediction_to_dict,
@@ -70,6 +76,11 @@ OBSERVED_AT = CUTOFF + timedelta(seconds=HORIZON)
 EVALUATED_AT = OBSERVED_AT + timedelta(minutes=5)
 CASE_ID = "case-1"
 EXPERIMENT_ID = "prospective-exp-1"
+
+#: The release identity sealed with every prediction in this module. A drifted
+#: release must not be able to score a prediction it did not seal.
+RELEASE = "a" * 40
+DRIFTED_RELEASE = "b" * 40
 
 
 def _snapshot(*, cutoff=CUTOFF):
@@ -195,10 +206,21 @@ def _prediction(case_outcome=None, **overrides) -> SealedPrediction:
         "horizon_seconds": HORIZON,
         "experiment_id": EXPERIMENT_ID,
         "provenance": _provenance(),
+        "release_sha": RELEASE,
         "case_type": CaseType.MARKET_OPPORTUNITY,
     }
     values.update(overrides)
     return seal_prediction(**values)
+
+
+def _evaluate(**kwargs):
+    """Evaluate at T2 with the sealed release unless a caller states otherwise.
+
+    Injecting the release here keeps every existing test invocation unchanged in
+    meaning while still requiring the release identity at the boundary.
+    """
+    kwargs.setdefault("observed_release_sha", RELEASE)
+    return evaluate_prospective(**kwargs)
 
 
 def _observation(**overrides) -> OutcomeObservation:
@@ -280,6 +302,7 @@ def test_a_retrospective_prediction_cannot_be_labelled_prospective():
             evidence_cutoff_at=CUTOFF,
             sealed_at=SEALED_AT,
             horizon_seconds=HORIZON,
+            release_sha=RELEASE,
             case_outcome_id="COMMITTEE-OUTCOME:x",
             evidence_snapshot_hash="COMMITTEE-EVIDENCE:abc",
             committee_policy_version="committee-policy-v1",
@@ -334,7 +357,7 @@ def test_evaluation_refuses_a_leaked_outcome_end_to_end():
     leaked = _observation(observed_at=CUTOFF - timedelta(minutes=30))
     provenance = _provenance()
     with pytest.raises(HindsightLeakageError):
-        evaluate_prospective(
+        _evaluate(
             prediction=prediction,
             case_outcome=case_outcome,
             observation=leaked,
@@ -351,7 +374,7 @@ def test_a_future_outcome_cannot_alter_the_sealed_t0_opinion():
     before_sealed = prediction.sealed_opinion_hashes
 
     # A later, adversarial outcome that contradicts the sealed opinion.
-    evaluate_prospective(
+    _evaluate(
         prediction=prediction,
         case_outcome=case_outcome,
         observation=_observation(positive=False),
@@ -384,7 +407,7 @@ def test_outcome_evidence_cannot_be_recomputed_only_referenced():
 
 
 def test_provisional_outcome_is_never_presented_as_final():
-    evaluation = evaluate_prospective(
+    evaluation = _evaluate(
         prediction=_prediction(),
         case_outcome=_case_outcome(),
         observation=_observation(
@@ -415,7 +438,7 @@ def test_final_outcome_cannot_carry_an_incompleteness_reason():
 
 
 def test_final_evaluation_is_labelled_final_evidence():
-    evaluation = evaluate_prospective(
+    evaluation = _evaluate(
         prediction=_prediction(),
         case_outcome=_case_outcome(),
         observation=_observation(),
@@ -431,7 +454,7 @@ def test_final_evaluation_is_labelled_final_evidence():
 
 
 def test_prospective_evaluation_cannot_carry_a_retrospective_phase():
-    evaluation = evaluate_prospective(
+    evaluation = _evaluate(
         prediction=_prediction(),
         case_outcome=_case_outcome(),
         observation=_observation(),
@@ -455,7 +478,7 @@ def test_evaluation_time_cannot_precede_the_outcome():
     too_early = OBSERVED_AT - timedelta(minutes=1)
     provenance = _provenance()
     with pytest.raises(ProspectivePolicyError):
-        evaluate_prospective(
+        _evaluate(
             prediction=prediction,
             case_outcome=case_outcome,
             observation=observation,
@@ -476,7 +499,7 @@ def test_seats_are_scored_against_the_outcome():
             model="model-b",
         ),
     )
-    evaluation = evaluate_prospective(
+    evaluation = _evaluate(
         prediction=_prediction(case_outcome),
         case_outcome=case_outcome,
         observation=_observation(positive=True),
@@ -502,7 +525,7 @@ def test_failed_and_abstaining_seats_are_not_scored():
             status=ObservationStatus.FAILED,
         ),
     )
-    evaluation = evaluate_prospective(
+    evaluation = _evaluate(
         prediction=_prediction(case_outcome),
         case_outcome=case_outcome,
         observation=_observation(positive=True),
@@ -522,7 +545,7 @@ def test_failed_and_abstaining_seats_are_not_scored():
 
 
 def test_non_directional_outcome_yields_not_applicable_metrics_not_zero():
-    evaluation = evaluate_prospective(
+    evaluation = _evaluate(
         prediction=_prediction(),
         case_outcome=_case_outcome(),
         observation=_observation(positive=None),
@@ -543,7 +566,7 @@ def test_awaiting_outcome_tracks_unjoined_seals():
     # A seal with no recorded evaluation is unresolved.
     assert awaiting_outcome(predictions=(prediction,)) == (prediction,)
 
-    evaluation = evaluate_prospective(
+    evaluation = _evaluate(
         prediction=prediction,
         case_outcome=_case_outcome(),
         observation=_observation(),
@@ -578,7 +601,7 @@ def test_an_observed_but_unevaluated_prediction_stays_visible():
 
 def test_observability_counts_distinguish_final_from_provisional():
     prediction = _prediction()
-    provisional_evaluation = evaluate_prospective(
+    provisional_evaluation = _evaluate(
         prediction=prediction,
         case_outcome=_case_outcome(),
         observation=_observation(
@@ -608,7 +631,7 @@ def test_observability_counts_distinguish_final_from_provisional():
 def test_awaiting_outcome_ignores_an_already_evaluated_prediction():
     prediction = _prediction()
     observation = _observation()
-    evaluation = evaluate_prospective(
+    evaluation = _evaluate(
         prediction=prediction,
         case_outcome=_case_outcome(),
         observation=observation,
@@ -627,7 +650,7 @@ def test_awaiting_outcome_ignores_an_already_evaluated_prediction():
 
 
 def test_non_directional_outcome_seats_are_counted_explicitly():
-    evaluation = evaluate_prospective(
+    evaluation = _evaluate(
         prediction=_prediction(),
         case_outcome=_case_outcome(),
         observation=_observation(positive=None),
@@ -650,7 +673,7 @@ def test_prospective_records_round_trip_and_are_immutable(tmp_path):
     case_outcome = _case_outcome()
     prediction = _prediction(case_outcome)
     observation = _observation()
-    evaluation = evaluate_prospective(
+    evaluation = _evaluate(
         prediction=prediction,
         case_outcome=case_outcome,
         observation=observation,
@@ -694,7 +717,7 @@ def test_a_forged_prospective_identity_is_rejected_on_read():
     with pytest.raises(CommitteeSerializationError):
         outcome_observation_from_dict(row)
 
-    evaluation = evaluate_prospective(
+    evaluation = _evaluate(
         prediction=prediction,
         case_outcome=_case_outcome(),
         observation=observation,
@@ -741,8 +764,9 @@ def test_a_retrospective_run_cannot_be_sealed_as_a_prospective_prediction():
             case_outcome=retrospective,
             evidence_snapshot=snapshot,
             sealed_at=SEALED_AT,
-            horizon_seconds=HORIZON,
-            experiment_id=EXPERIMENT_ID,
+                horizon_seconds=HORIZON,
+                release_sha=RELEASE,
+                experiment_id=EXPERIMENT_ID,
             provenance=retrospective_seal,
             case_type=CaseType.MARKET_OPPORTUNITY,
         )
@@ -777,8 +801,9 @@ def test_sealing_derives_the_cutoff_from_the_authenticated_snapshot():
             case_outcome=case_outcome,
             evidence_snapshot=earlier,
             sealed_at=SEALED_AT,
-            horizon_seconds=HORIZON,
-            experiment_id=EXPERIMENT_ID,
+                horizon_seconds=HORIZON,
+                release_sha=RELEASE,
+                experiment_id=EXPERIMENT_ID,
             provenance=provenance,
             case_type=CaseType.MARKET_OPPORTUNITY,
         )
@@ -811,8 +836,9 @@ def test_sealing_rejects_a_snapshot_for_another_case():
             case_outcome=case_outcome,
             evidence_snapshot=other,
             sealed_at=SEALED_AT,
-            horizon_seconds=HORIZON,
-            experiment_id=EXPERIMENT_ID,
+                horizon_seconds=HORIZON,
+                release_sha=RELEASE,
+                experiment_id=EXPERIMENT_ID,
             provenance=provenance,
             case_type=CaseType.MARKET_OPPORTUNITY,
         )
@@ -826,7 +852,7 @@ def test_the_sealed_cutoff_equals_the_snapshot_cutoff():
 
 def test_evaluation_identity_covers_finality_metrics_and_counts():
     """A changed result must change the identity, not reuse the original id."""
-    evaluation = evaluate_prospective(
+    evaluation = _evaluate(
         prediction=_prediction(),
         case_outcome=_case_outcome(),
         observation=_observation(),
@@ -865,7 +891,7 @@ def test_a_lost_prospective_index_is_rebuilt_with_evaluation_ids(tmp_path):
     store = CommitteeEvidenceStore(root=tmp_path)
     prediction = _prediction()
     observation = _observation()
-    evaluation = evaluate_prospective(
+    evaluation = _evaluate(
         prediction=prediction,
         case_outcome=_case_outcome(),
         observation=observation,
@@ -897,7 +923,7 @@ def test_the_outcome_horizon_must_be_the_one_committed_at_sealing():
 
 def test_the_evaluation_records_the_sealed_horizon_not_the_observation_horizon():
     prediction = _prediction()
-    evaluation = evaluate_prospective(
+    evaluation = _evaluate(
         prediction=prediction,
         case_outcome=_case_outcome(),
         observation=_observation(),
@@ -923,3 +949,180 @@ def test_the_sealed_horizon_survives_a_storage_round_trip(tmp_path):
     reloaded = list(store.iter_sealed_predictions())[0]
     assert reloaded.horizon_seconds == HORIZON
     assert reloaded.prediction_id == prediction.prediction_id
+
+
+# ============ Q2-2: prospective evaluation must fail closed on release drift
+
+
+def test_the_sealed_release_participates_in_the_prediction_identity():
+    prediction = _prediction()
+    drifted = replace(prediction, release_sha=DRIFTED_RELEASE)
+    assert drifted.prediction_id != prediction.prediction_id
+    assert prediction.identity_payload()["release_sha"] == RELEASE
+
+
+def test_the_sealed_release_survives_a_storage_round_trip(tmp_path):
+    """The N1 lesson: an identity field must also be persisted and reloaded."""
+    store = CommitteeEvidenceStore(root=tmp_path)
+    prediction = _prediction()
+    assert store.append_sealed_prediction(prediction).reason == REASON_STORED
+    reloaded = list(store.iter_sealed_predictions())[0]
+    assert reloaded.release_sha == RELEASE
+    assert reloaded.prediction_id == prediction.prediction_id
+
+
+def test_evaluation_refuses_a_drifted_release_explicitly():
+    """A drifted worker must be refused with a typed, explicit error."""
+    prediction = _prediction()
+    with pytest.raises(ProspectiveReleaseDriftError):
+        evaluate_prospective(
+            prediction=prediction,
+            case_outcome=_case_outcome(),
+            observation=_observation(),
+            evaluated_at=EVALUATED_AT,
+            provenance=_provenance(),
+            observed_release_sha=DRIFTED_RELEASE,
+        )
+
+
+def test_a_matching_release_still_evaluates():
+    prediction = _prediction()
+    evaluation = _evaluate(
+        prediction=prediction,
+        case_outcome=_case_outcome(),
+        observation=_observation(),
+        evaluated_at=EVALUATED_AT,
+        provenance=_provenance(),
+    )
+    assert evaluation.prediction_id == prediction.prediction_id
+
+
+def test_admission_returns_an_explicit_ineligible_disposition_on_drift():
+    """Not a generic failure: an explicit RELEASE_DRIFT ineligible disposition."""
+    disposition = admit_prospective_outcome(
+        prediction=_prediction(),
+        case_outcome=_case_outcome(),
+        observation=_observation(),
+        evaluated_at=EVALUATED_AT,
+        provenance=_provenance(),
+        observed_release_sha=DRIFTED_RELEASE,
+    )
+    assert isinstance(disposition, ProspectiveIneligibility)
+    assert disposition.reason == RELEASE_DRIFT
+    assert disposition.expected_release_sha == RELEASE
+    assert disposition.observed_release_sha == DRIFTED_RELEASE
+
+
+def test_an_ineligible_disposition_is_structurally_excluded_from_metrics():
+    """It is not a ProspectiveEvaluation, so it cannot enter trust metrics."""
+    from app.opip.committee.prospective import ProspectiveEvaluation
+
+    disposition = admit_prospective_outcome(
+        prediction=_prediction(),
+        case_outcome=_case_outcome(),
+        observation=_observation(),
+        evaluated_at=EVALUATED_AT,
+        provenance=_provenance(),
+        observed_release_sha=DRIFTED_RELEASE,
+    )
+    assert not isinstance(disposition, ProspectiveEvaluation)
+    # It exposes no evaluation identity or seat score, so nothing can average it.
+    assert not hasattr(disposition, "evaluation_id")
+    assert not hasattr(disposition, "seat_scores")
+
+
+def test_admission_still_evaluates_when_the_release_matches():
+    outcome = admit_prospective_outcome(
+        prediction=_prediction(),
+        case_outcome=_case_outcome(),
+        observation=_observation(),
+        evaluated_at=EVALUATED_AT,
+        provenance=_provenance(),
+        observed_release_sha=RELEASE,
+    )
+    assert not isinstance(outcome, ProspectiveIneligibility)
+    assert outcome.evaluation_id.startswith("COMMITTEE-PROSPECTIVE-EVAL:")
+
+
+def test_an_ineligibility_disposition_is_durable_and_idempotent(tmp_path):
+    store = CommitteeEvidenceStore(root=tmp_path)
+    disposition = admit_prospective_outcome(
+        prediction=_prediction(),
+        case_outcome=_case_outcome(),
+        observation=_observation(),
+        evaluated_at=EVALUATED_AT,
+        provenance=_provenance(),
+        observed_release_sha=DRIFTED_RELEASE,
+    )
+    assert store.append_prospective_ineligibility(disposition).reason == REASON_STORED
+    # A redelivery of the same drift is the same disposition, not new evidence.
+    assert (
+        store.append_prospective_ineligibility(disposition).reason == REASON_DUPLICATE
+    )
+    assert len(list(store.iter_prospective_ineligibilities())) == 1
+
+    # Readable after a restart, and never present as a prospective evaluation.
+    reopened = CommitteeEvidenceStore(root=tmp_path)
+    reloaded = list(reopened.iter_prospective_ineligibilities())
+    assert len(reloaded) == 1
+    assert reloaded[0].reason == RELEASE_DRIFT
+    assert list(reopened.iter_prospective_evaluations()) == []
+
+
+def test_a_legacy_sealed_prediction_stays_readable_and_is_never_scored():
+    """A row written before the release field existed must not become unreadable.
+
+    Injecting a fresh release would change its content identity and fail the
+    persisted-id check, so a legacy row keeps its original identity and carries
+    an explicit legacy marker that can never match a real release. It is
+    therefore permanently ineligible for scoring instead of being assumed
+    compatible.
+    """
+    from app.opip.committee.prospective import LEGACY_UNSEALED_RELEASE
+
+    legacy_prediction = replace(_prediction(), release_sha=LEGACY_UNSEALED_RELEASE)
+    row = sealed_prediction_to_dict(legacy_prediction)
+    assert "release_sha" not in row
+    legacy = sealed_prediction_from_dict(row)
+    assert legacy.release_sha == LEGACY_UNSEALED_RELEASE
+    assert "release_sha" not in legacy.identity_payload()
+    assert legacy.prediction_id == legacy_prediction.prediction_id
+
+    # Fail closed: a legacy prediction can never be scored by a real release.
+    with pytest.raises(ProspectiveReleaseDriftError):
+        evaluate_prospective(
+            prediction=legacy,
+            case_outcome=_case_outcome(),
+            observation=_observation(),
+            evaluated_at=EVALUATED_AT,
+            provenance=_provenance(),
+            observed_release_sha=RELEASE,
+        )
+    disposition = admit_prospective_outcome(
+        prediction=legacy,
+        case_outcome=_case_outcome(),
+        observation=_observation(),
+        evaluated_at=EVALUATED_AT,
+        provenance=_provenance(),
+        observed_release_sha=RELEASE,
+    )
+    assert disposition.reason == RELEASE_DRIFT
+
+
+def test_an_ineligibility_disposition_round_trips_through_serialization():
+    disposition = admit_prospective_outcome(
+        prediction=_prediction(),
+        case_outcome=_case_outcome(),
+        observation=_observation(),
+        evaluated_at=EVALUATED_AT,
+        provenance=_provenance(),
+        observed_release_sha=DRIFTED_RELEASE,
+    )
+    row = prospective_ineligibility_to_dict(disposition)
+    restored = prospective_ineligibility_from_dict(row)
+    assert restored.ineligibility_id == disposition.ineligibility_id
+    assert restored.reason == RELEASE_DRIFT
+    # A tampered persisted reason must not silently pass as the original.
+    row["reason"] = "SOMETHING_ELSE"
+    with pytest.raises(CommitteeSerializationError):
+        prospective_ineligibility_from_dict(row)

@@ -74,12 +74,12 @@ from app.opip.committee.store import (
     CommitteeEvidenceStore,
     DurableObservationLedger,
 )
-from app.opip.committee.settings import CommitteeShadowSettings
+from app.opip.committee.settings import COMMITTEE_MODE_SHADOW, CommitteeShadowSettings
 from app.opip.decision_intelligence.identity import Provenance
 
 #: The committee ships dark, so this file states enablement explicitly rather
 #: than depending on ambient process settings.
-SHADOW_SETTINGS = CommitteeShadowSettings()
+SHADOW_SETTINGS = CommitteeShadowSettings(opip_committee_mode=COMMITTEE_MODE_SHADOW)
 
 #: Horizon used by the archive-integrity prediction helper.
 SHADOW_ARCHIVE_HORIZON = 4 * 3600
@@ -1101,6 +1101,186 @@ def test_a_rejected_divergent_ledger_append_is_propagated_not_swallowed(tmp_path
     assert survivors[0].opinion.opinion_hash == committed.opinion.opinion_hash
 
 
+# ============ Q2-1: a refused replay must leave durable audit evidence
+
+
+def _divergent_replay(committed):
+    """A replay of one committed seat that carries a materially different opinion."""
+    divergent_opinion = StructuredOpinion(
+        case_id=committed.case_id,
+        provider=committed.reported_provider,
+        model=committed.reported_model,
+        evidence_sufficiency=EvidenceSufficiency.SUFFICIENT,
+        assessment=DirectionalAssessment.OPPOSING,
+        hypothesis="a different hypothesis",
+        recommended_research_action=ResearchAction.NO_ACTION,
+    )
+    return ProviderCallOutcome(
+        logical_observation_id=committed.logical_observation_id,
+        case_id=committed.case_id,
+        provider_family=committed.provider_family,
+        requested_model=committed.requested_model,
+        status=ObservationStatus.COMPLETED,
+        attempt=1,
+        reproducibility=ReproducibilityClass.NONDETERMINISTIC_PROVIDER_OUTPUT,
+        request_at=NOW,
+        input_hash=committed.input_hash,
+        reported_provider=committed.reported_provider,
+        reported_model=committed.reported_model,
+        opinion=divergent_opinion,
+        response_at=NOW,
+    )
+
+
+def test_a_divergent_replay_leaves_durable_rejection_evidence(tmp_path):
+    """A refusal that leaves no trace is an unexplained gap in the evidence.
+
+    The committed opinion must stay the only accepted opinion, and the refused
+    replay must not appear as an observation, a vote, or spend — but the refusal
+    itself must be durably recorded.
+    """
+    store = CommitteeEvidenceStore(root=tmp_path)
+    policy = _policy(families=(ProviderFamily.OPENAI,))
+    CommitteeRunner(
+        providers={ProviderFamily.OPENAI: _ok(ProviderFamily.OPENAI, hypothesis="sealed")},
+        ledger=DurableObservationLedger(store=store),
+        now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
+    ).run_case(_case(policy=policy))
+    committed = list(store.iter_call_outcomes())[0]
+    spend_before = DurableObservationLedger(store=store).case_spend_microunits(
+        committed.case_id
+    )
+
+    divergent = _divergent_replay(committed)
+    with pytest.raises(CommitteeReplayDivergenceError):
+        DurableObservationLedger(store=store).record(divergent)
+
+    # (a) still refused as an observation
+    survivors = list(store.iter_call_outcomes())
+    assert len(survivors) == 1
+    assert survivors[0].opinion.opinion_hash == committed.opinion.opinion_hash
+
+    # (b) the refusal is durably recorded
+    rejections = list(store.iter_call_rejections())
+    assert len(rejections) == 1
+    rejection = rejections[0]
+    assert rejection.case_id == committed.case_id
+    assert rejection.committed_outcome_id == committed.outcome_id
+    assert rejection.committed_opinion_hash == committed.opinion.opinion_hash
+    assert rejection.refused_outcome_id == divergent.outcome_id
+    assert rejection.refused_opinion_hash == divergent.opinion.opinion_hash
+    assert rejection.reason == "DIVERGENT_REPLAY"
+
+    # (c) canonical outcome semantics unchanged: the refused attempt is not an
+    # observation, so it cannot add spend or a second seat result.
+    assert DurableObservationLedger(store=store).case_spend_microunits(
+        committed.case_id
+    ) == spend_before
+
+
+def test_a_rejected_replay_survives_a_restart(tmp_path):
+    """Rejection evidence must be readable from a fresh store over the same root."""
+    store = CommitteeEvidenceStore(root=tmp_path)
+    policy = _policy(families=(ProviderFamily.OPENAI,))
+    CommitteeRunner(
+        providers={ProviderFamily.OPENAI: _ok(ProviderFamily.OPENAI, hypothesis="sealed")},
+        ledger=DurableObservationLedger(store=store),
+        now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
+    ).run_case(_case(policy=policy))
+    committed = list(store.iter_call_outcomes())[0]
+    divergent = _divergent_replay(committed)
+    with pytest.raises(CommitteeReplayDivergenceError):
+        DurableObservationLedger(store=store).record(divergent)
+
+    # A separate store instance, as a restarted process would construct.
+    reopened = CommitteeEvidenceStore(root=tmp_path)
+    rejections = list(reopened.iter_call_rejections())
+    assert len(rejections) == 1
+    assert rejections[0].refused_outcome_id == divergent.outcome_id
+
+
+def test_replaying_the_same_divergence_does_not_multiply_rejection_evidence(tmp_path):
+    """A repeated identical divergence is one refusal, not many."""
+    store = CommitteeEvidenceStore(root=tmp_path)
+    policy = _policy(families=(ProviderFamily.OPENAI,))
+    CommitteeRunner(
+        providers={ProviderFamily.OPENAI: _ok(ProviderFamily.OPENAI, hypothesis="sealed")},
+        ledger=DurableObservationLedger(store=store),
+        now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
+    ).run_case(_case(policy=policy))
+    committed = list(store.iter_call_outcomes())[0]
+
+    for _ in range(3):
+        divergent = _divergent_replay(committed)
+        with pytest.raises(CommitteeReplayDivergenceError):
+            DurableObservationLedger(store=store).record(divergent)
+
+    assert len(list(store.iter_call_rejections())) == 1
+
+
+def test_the_runtime_divergence_path_records_a_durable_rejection(tmp_path):
+    """The runtime raises before reaching the store, so it must record the refusal.
+
+    Without this the runtime-detected divergence would leave no evidence at all,
+    which is the gap the durable rejection stream exists to close.
+    """
+    store = CommitteeEvidenceStore(root=tmp_path)
+    ledger = DurableObservationLedger(store=store)
+    policy = _policy(families=(ProviderFamily.OPENAI,))
+    CommitteeRunner(
+        providers={ProviderFamily.OPENAI: _ok(ProviderFamily.OPENAI, hypothesis="first sealed")},
+        ledger=ledger,
+        now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
+    ).run_case(_case(policy=policy))
+
+    diverging = _ok(ProviderFamily.OPENAI, hypothesis="a different hypothesis now")
+    replayer = CommitteeRunner(
+        providers={ProviderFamily.OPENAI: diverging},
+        ledger=DurableObservationLedger(store=store),
+        now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
+    )
+    with pytest.raises(CommitteeReplayDivergenceError):
+        replayer.run_case(_case(policy=policy), replay_existing=True)
+
+    reopen = CommitteeEvidenceStore(root=tmp_path)
+    rejections = list(reopen.iter_call_rejections())
+    assert len(rejections) == 1
+    assert rejections[0].reason == "DIVERGENT_REPLAY"
+    # The committed observation is still the only accepted observation.
+    assert len(list(reopen.iter_call_outcomes())) == 1
+
+
+def test_an_in_memory_divergence_records_the_refusal(tmp_path):
+    """The in-memory ledger keeps the same refusal semantics for offline runs."""
+    first = _ok(ProviderFamily.OPENAI, hypothesis="first sealed hypothesis")
+    ledger = InMemoryObservationLedger()
+    policy = _policy(families=(ProviderFamily.OPENAI,))
+    CommitteeRunner(
+        providers={ProviderFamily.OPENAI: first},
+        ledger=ledger,
+        now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
+    ).run_case(_case(policy=policy))
+    diverging = _ok(ProviderFamily.OPENAI, hypothesis="a different hypothesis now")
+    replayer = CommitteeRunner(
+        providers={ProviderFamily.OPENAI: diverging},
+        ledger=ledger,
+        now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
+    )
+    with pytest.raises(CommitteeReplayDivergenceError):
+        replayer.run_case(_case(policy=policy), replay_existing=True)
+
+    rejections = ledger.replay_rejections()
+    assert len(rejections) == 1
+    assert rejections[0].reason == "DIVERGENT_REPLAY"
+
+
 def test_a_partially_stale_call_index_is_reconciled_from_the_log(tmp_path):
     """A non-empty but stale sidecar must not let a redelivery append again."""
     store = CommitteeEvidenceStore(root=tmp_path)
@@ -1214,6 +1394,7 @@ def _prediction_with_snapshot():
         evidence_snapshot=snapshot,
         sealed_at=NOW + timedelta(seconds=30),
         horizon_seconds=SHADOW_ARCHIVE_HORIZON,
+        release_sha="c" * 40,
         experiment_id="archive-exp-1",
         provenance=_provenance(),
         case_type=CaseType.MARKET_OPPORTUNITY,
@@ -1245,6 +1426,7 @@ def _evaluation_probe():
         observation=_observation_probe(),
         evaluated_at=NOW + timedelta(hours=4, minutes=5),
         provenance=_provenance(),
+        observed_release_sha="c" * 40,
     )
 
 
@@ -1618,7 +1800,8 @@ def test_the_configured_operator_ceiling_applies_without_a_policy_ceiling():
         ledger=InMemoryObservationLedger(),
         now=lambda: NOW,
         settings=CommitteeShadowSettings(
-            opip_committee_max_estimated_cost_microunits=1_000
+            opip_committee_mode=COMMITTEE_MODE_SHADOW,
+            opip_committee_max_estimated_cost_microunits=1_000,
         ),
     )
     result = runner.run_case(
@@ -1986,3 +2169,121 @@ def test_reattributing_a_case_to_another_decision_fails_closed(tmp_path):
     )
     with pytest.raises(CommitteePolicyViolation):
         runner.run_case(unbound)
+
+
+def test_a_charge_is_persisted_inside_the_authoritative_call_record(tmp_path):
+    """The reservation must not live in a separate, losable write."""
+    store = CommitteeEvidenceStore(root=tmp_path)
+    provider = _ok(ProviderFamily.OPENAI)
+    provider._estimated_cost_microunits = 40  # noqa: SLF001 - test double
+    provider._cost_override = 40  # noqa: SLF001 - test double
+    runner = CommitteeRunner(
+        providers={ProviderFamily.OPENAI: provider},
+        ledger=DurableObservationLedger(store=store),
+        now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
+    )
+    runner.run_case(_case(policy=_policy(families=(ProviderFamily.OPENAI,))))
+
+    durable = list(store.iter_call_outcomes())
+    assert len(durable) == 1
+    # The charge is part of the durable row itself, not a sidecar.
+    assert durable[0].charge_microunits == 40
+    assert not (tmp_path / "call_charge_index.json").exists()
+    assert DurableObservationLedger(store=store).case_spend_microunits(
+        "case-1"
+    ) == 40
+
+
+def test_a_case_with_durable_calls_is_never_reported_as_unseen(tmp_path):
+    """The binding guard must survive the crash window before the case outcome."""
+    from app.opip.committee.contracts import (
+        CanonicalDecisionBinding,
+        CommitteeCaseOutcome,
+    )
+
+    store = CommitteeEvidenceStore(root=tmp_path)
+    provider = _ok(ProviderFamily.OPENAI)
+    runner = CommitteeRunner(
+        providers={ProviderFamily.OPENAI: provider},
+        ledger=DurableObservationLedger(store=store),
+        now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
+    )
+    binding = CanonicalDecisionBinding(decision_id="D1")
+    case = CommitteeCase(
+        case_id="case-1",
+        case_type=CaseType.MARKET_OPPORTUNITY,
+        snapshot=_snapshot(),
+        policy=_policy(families=(ProviderFamily.OPENAI,)),
+        created_at=NOW,
+        provenance=_provenance(),
+        instrument_id="INSTR:kraken:SOL:USD:1",
+        canonical_binding=binding,
+    )
+    runner.run_case(case)
+    # The aggregate case outcome was never appended - the crash window.
+    assert list(store.iter_case_outcomes()) == []
+    assert any(row.case_id == "case-1" for row in store.iter_call_outcomes())
+
+    # A fresh ledger must still treat the case as recorded, so a different
+    # binding is refused rather than reusing the calls under a new decision.
+    fresh = CommitteeRunner(
+        providers={ProviderFamily.OPENAI: provider},
+        ledger=DurableObservationLedger(store=store),
+        now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
+    )
+    other = CanonicalDecisionBinding(decision_id="D2")
+    reattributed = CommitteeCase(
+        case_id="case-1",
+        case_type=CaseType.MARKET_OPPORTUNITY,
+        snapshot=_snapshot(),
+        policy=_policy(families=(ProviderFamily.OPENAI,)),
+        created_at=NOW,
+        provenance=_provenance(),
+        instrument_id="INSTR:kraken:SOL:USD:1",
+        canonical_binding=other,
+    )
+    with pytest.raises(CommitteePolicyViolation):
+        fresh.run_case(reattributed)
+    del CommitteeCaseOutcome
+
+
+def test_a_same_opinion_replay_is_recorded_as_its_own_attempt(tmp_path):
+    """A replayed invocation and its charge must be durable evidence."""
+    store = CommitteeEvidenceStore(root=tmp_path)
+    provider = _ok(ProviderFamily.OPENAI)
+    provider._estimated_cost_microunits = 25  # noqa: SLF001 - test double
+    provider._cost_override = 25  # noqa: SLF001 - test double
+    ledger = DurableObservationLedger(store=store)
+    policy = _policy(families=(ProviderFamily.OPENAI,))
+    CommitteeRunner(
+        providers={ProviderFamily.OPENAI: provider},
+        ledger=ledger,
+        now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
+    ).run_case(_case(policy=policy))
+
+    # A replay re-asks the seat and reproduces the committed opinion.
+    replayer = CommitteeRunner(
+        providers={ProviderFamily.OPENAI: provider},
+        ledger=DurableObservationLedger(store=store),
+        now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
+    )
+    replayer.run_case(_case(policy=policy), replay_existing=True)
+
+    durable = list(store.iter_call_outcomes())
+    assert len(durable) == 2, "the replay attempt must be its own durable row"
+    assert len(provider.calls) == 2
+    # The first committed opinion is preserved, and the replay recorded its charge.
+    committed = DurableObservationLedger(store=store).committed_opinion(
+        durable[0].logical_observation_id
+    )
+    assert committed is not None
+    assert committed.opinion.opinion_hash == durable[0].opinion.opinion_hash
+    # Durable spend includes the replay: 25 + 25.
+    assert DurableObservationLedger(store=store).case_spend_microunits(
+        "case-1"
+    ) == 50

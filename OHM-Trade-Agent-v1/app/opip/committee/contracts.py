@@ -30,6 +30,7 @@ EVIDENCE_SNAPSHOT_SCHEMA_VERSION = 1
 STRUCTURED_OPINION_SCHEMA_VERSION = 1
 PROVIDER_CALL_OUTCOME_SCHEMA_VERSION = 1
 COMMITTEE_CASE_OUTCOME_SCHEMA_VERSION = 1
+CALL_REPLAY_REJECTION_SCHEMA_VERSION = 1
 
 #: Distinct content-identity hash domains. Distinct domains keep two different
 #: record kinds from ever colliding on a 32-character digest.
@@ -42,6 +43,7 @@ STRUCTURED_OPINION_ID_DOMAIN = "COMMITTEE-OPINION-ID"
 PROVIDER_CALL_OUTCOME_IDENTITY_DOMAIN = "COMMITTEE-CALL"
 COMMITTEE_CASE_OUTCOME_IDENTITY_DOMAIN = "COMMITTEE-OUTCOME"
 LOGICAL_OBSERVATION_IDENTITY_DOMAIN = "COMMITTEE-LOGICAL"
+CALL_REPLAY_REJECTION_IDENTITY_DOMAIN = "COMMITTEE-CALL-REJECTION"
 
 #: Evidence metadata that the snapshot owns. A payload may not supply these, so
 #: the model can never be shown an identity, source, or timestamp that is not the
@@ -359,6 +361,9 @@ def _validate_call_outcome_identity(outcome: "ProviderCallOutcome") -> None:
         _require_optional_exact_int(
             getattr(outcome, field_name), field_name=field_name, minimum=0
         )
+    _require_optional_exact_int(
+        outcome.charge_microunits, field_name="charge_microunits", minimum=0
+    )
     object.__setattr__(
         outcome,
         "request_at",
@@ -968,6 +973,11 @@ class ProviderCallOutcome:
     estimated_cost_microunits: int | None = None
     cost_completeness: CostCompleteness = CostCompleteness.UNKNOWN
     replay_divergence_detected: bool = False
+    #: The runtime-computed charge for this invocation, persisted with the call it
+    #: belongs to so a reservation cannot be lost independently of its evidence.
+    #: It is the per-attempt maximum of the pre-flight estimate and the reported
+    #: cost, which cannot be reconstructed from reported cost alone.
+    charge_microunits: int | None = None
     schema_version: int = PROVIDER_CALL_OUTCOME_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -987,7 +997,7 @@ class ProviderCallOutcome:
         return self.estimated_cost_microunits or 0
 
     def identity_payload(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "schema_version": self.schema_version,
             "logical_observation_id": self.logical_observation_id,
             "case_id": self.case_id,
@@ -1018,6 +1028,11 @@ class ProviderCallOutcome:
             "cost_completeness": self.cost_completeness,
             "detail": self.detail,
         }
+        # The charge is added only when present, so an outcome recorded before
+        # this field existed keeps the identity it was written with.
+        if self.charge_microunits is not None:
+            payload["charge_microunits"] = self.charge_microunits
+        return payload
 
     @property
     def outcome_id(self) -> str:
@@ -1124,6 +1139,81 @@ class CommitteeCaseOutcome:
         )
 
 
+@dataclass(frozen=True)
+class CallReplayRejection:
+    """Durable evidence that a replay was refused as divergent.
+
+    MEASUREMENT ONLY - NO PRODUCTION DECISION AUTHORITY.
+
+    A committed logical observation is immutable: a later replay carrying a
+    materially different opinion must never overwrite it, and must never be
+    admitted as a second accepted opinion. Refusing the replay while discarding
+    the refusal, however, leaves no evidence that the divergence happened - an
+    unexplained gap between what a worker attempted and what the store holds.
+
+    This record closes that gap. It is written at the moment of refusal, inside
+    the same lock as the call stream, and it does **not** enter the call stream
+    itself, so canonical outcome semantics are unchanged: the accepted opinion
+    stays the only accepted opinion, the refused attempt is not an observation,
+    and no cost or seat accounting can read it as one.
+
+    Identity is content-derived from the committed and refused opinion hashes, so
+    replaying the same divergence is recognised as the same rejection and cannot
+    multiply evidence.
+    """
+
+    case_id: str
+    logical_observation_id: str
+    committed_outcome_id: str
+    committed_opinion_hash: str
+    refused_outcome_id: str
+    refused_opinion_hash: str
+    refused_at: datetime
+    reason: str = "DIVERGENT_REPLAY"
+    schema_version: int = CALL_REPLAY_REJECTION_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version != CALL_REPLAY_REJECTION_SCHEMA_VERSION or (
+            type(self.schema_version) is not int
+        ):
+            raise ValueError("unsupported CallReplayRejection schema_version")
+        for field_name in (
+            "case_id",
+            "logical_observation_id",
+            "committed_outcome_id",
+            "committed_opinion_hash",
+            "refused_outcome_id",
+            "refused_opinion_hash",
+            "reason",
+        ):
+            _require_non_empty_str(getattr(self, field_name), field_name=field_name)
+        object.__setattr__(
+            self,
+            "refused_at",
+            require_utc(self.refused_at, field_name="refused_at"),
+        )
+
+    def identity_payload(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "case_id": self.case_id,
+            "logical_observation_id": self.logical_observation_id,
+            "committed_outcome_id": self.committed_outcome_id,
+            "committed_opinion_hash": self.committed_opinion_hash,
+            "refused_outcome_id": self.refused_outcome_id,
+            "refused_opinion_hash": self.refused_opinion_hash,
+            "refused_at": self.refused_at,
+            "reason": self.reason,
+        }
+
+    @property
+    def rejection_id(self) -> str:
+        """Content-derived identity of this refusal."""
+        return stable_hash(
+            CALL_REPLAY_REJECTION_IDENTITY_DOMAIN, self.identity_payload()
+        )
+
+
 def logical_observation_id(
     *,
     case_id: str,
@@ -1181,6 +1271,7 @@ __all__ = [
     "MODEL_BOUND_ITEM_FIELDS",
     "CaseType",
     "CanonicalDecisionBinding",
+    "CallReplayRejection",
     "CommitteeCase",
     "CommitteeCaseOutcome",
     "CommitteePolicy",

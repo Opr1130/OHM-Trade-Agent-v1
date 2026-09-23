@@ -156,6 +156,92 @@ Strict three-point protocol: **T0** seal → **T1** outcome → **T2** compare.
   `ADVISORY`, and influencing production requires a separate, future,
   human-governed promotion gate.
 
+### 2E — Canonical decision linkage by reference (`contracts.py`, `store.py`, `serialization.py`)
+
+Closes the learning-loop edge **recommendation → canonical decision** without
+granting authority and without writing Decision Intelligence streams.
+
+`CanonicalDecisionBinding` is an **opaque by-reference** link to an existing
+canonical decision and/or episode:
+
+| Field | Rule |
+| --- | --- |
+| `decision_id` | Optional opaque string |
+| `episode_id` | Optional opaque string |
+| presence | At least one must be set; empty or whitespace-only fails closed |
+
+The binding carries **no semantics of its own**. It is not a decision, not an
+instruction, and not a second decision authority; it is a lineage reference that
+lets a committee result be traced back to the decision it was advisory on.
+
+**Identity.** The binding participates in `CommitteeCase` and
+`CommitteeCaseOutcome` identity, so a bound artifact and an unbound artifact are
+distinct records. Rows written before the field existed keep the identity they
+were written with, and legacy unbound payloads still verify.
+
+**No silent re-binding.** The store refuses to change a case's binding once it
+has been recorded:
+
+- **reattribution** (`D1` → `D2`) is refused;
+- **unbinding** (`D1` → none) is refused;
+- `recorded_case_binding()` returns `(was_recorded, binding)` so a caller can
+  distinguish a case that was never run from one that was run without a binding.
+
+**Not on `SealedPrediction`.** `SealedPrediction` deliberately does **not** carry
+the binding. It previously did, which was a defect: the field participated in
+`prediction_id` but was not persisted, so a bound sealed prediction failed its
+own content-identity check on read-back. Do not re-add it without persisting it
+in `_SEAL_FIELDS`, `sealed_prediction_to_dict`, and `sealed_prediction_from_dict`
+and adding a bound round-trip test.
+
+**No authority.** The binding is advisory linkage only. It does not write to
+Decision Intelligence streams, cannot admit, rank, size, execute, or promote
+anything, and a governed DI/canonical writer bridge remains a separate, future,
+human-approved change.
+
+### 2F — Durable replay-refusal evidence (`contracts.py`, `ledger.py`, `store.py`)
+
+A committed logical observation is immutable: a replay carrying a materially
+different opinion is refused rather than overwriting history, and it is never
+admitted as a second accepted observation.
+
+Refusing the replay while discarding the refusal would leave an unexplained gap
+between what a worker attempted and what the store holds, so the refusal itself
+is now durable:
+
+- `CallReplayRejection` records the committed and refused opinion hashes, the
+  logical seat, the case, and the refusal reason (`DIVERGENT_REPLAY`).
+- It is written to its own `call_rejections.jsonl` stream, **not** the call
+  stream, so it can never be read as an observation, a vote, or spend. Canonical
+  outcome semantics are unchanged, and no case outcome may be published from it.
+- The runtime's own divergence path — which raises before reaching the store —
+  records the refusal first, so neither detection path can leave a silent gap.
+- Identity is content-derived from the committed and refused opinion hashes, so
+  replaying the same divergence is recognised as the same refusal and cannot
+  multiply evidence. The refusal remains readable after a restart.
+
+### 2G — Release-drift refusal on prospective evaluation (`prospective.py`, `store.py`)
+
+Prospective evidence is only comparable when the release that scores it is the
+release that sealed it. A drifted worker must not be able to score an outcome
+for a prediction it did not seal, so the release identity is part of the
+contract rather than an ambient property:
+
+- `SealedPrediction.release_sha` is **required**, is committed at T0 with the
+  horizon, participates in `prediction_id`, and is persisted — so a bound
+  prediction round-trips and a changed release changes the prediction identity.
+- `evaluate_prospective` takes the scoring release and refuses a mismatch with
+  the typed `ProspectiveReleaseDriftError`. A drifted outcome is never scored.
+- `admit_prospective_outcome` is the governed boundary. On drift it returns a
+  `ProspectiveIneligibility` carrying the explicit `RELEASE_DRIFT` reason, the
+  expected and observed release identities, and the detection time — rather than
+  raising into a generic failure bucket.
+- An ineligibility is **not** a `ProspectiveEvaluation`. It exposes no
+  evaluation identity and no seat scores, so it cannot enter prospective trust
+  metrics or economic attribution by construction.
+- Ineligibilities are persisted durably in `prospective_ineligible.jsonl`,
+  idempotent by content-derived identity, and readable after a restart.
+
 ## Calibration prohibition
 
 A seat's `confidence` is an **ordinal 0–100 self-report**. It is never converted
@@ -213,6 +299,8 @@ Streams live under `/app/data/opip/committee/`:
 | `evaluations.jsonl` | Bake-off reports. |
 | `prospective.jsonl` | Sealed predictions, outcome observations, prospective evaluations. |
 | `attributions.jsonl` | Attribution reports. |
+| `call_rejections.jsonl` | Refused divergent replays: durable evidence that a replay was rejected, kept out of the call stream so it can never be read as an observation or as spend. |
+| `prospective_ineligible.jsonl` | Ineligible prospective dispositions (e.g. `RELEASE_DRIFT`), kept out of the evaluation stream so a drifted case cannot enter trust or economic metrics. |
 
 ## Known limitations
 
@@ -227,6 +315,10 @@ Streams live under `/app/data/opip/committee/`:
 - **No canonical-writer integration.** Committee evidence stays in its own
   stream because the frozen DI import boundary forbids runtime roots from
   reaching the DI plane.
+- **The 2E canonical binding is a lineage reference only, and it is not yet
+  populated for a live decision.** A governed bridge that resolves a real
+  canonical `decision_id`/`episode_id` onto a committee case belongs in
+  `app/opip/canonical/` and remains a separate, future, human-approved change.
 - **No promotion mechanism exists here, by design.** Any promotion requires a
   separate, human-governed gate with its own reviewed SHA.
 - **`MIN_ATTRIBUTION_SAMPLES` / `MIN_EVALUATION_SAMPLES` (30) are conventions,

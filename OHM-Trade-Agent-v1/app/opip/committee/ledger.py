@@ -32,6 +32,27 @@ COMMITTED_STATUSES = frozenset(
 )
 
 
+def build_replay_rejection(
+    *, refused: "ProviderCallOutcome", committed: "ProviderCallOutcome"
+):
+    """Build the durable record for a refused divergent replay.
+
+    One constructor is shared by every ledger so the rejection identity cannot
+    drift between the in-memory and durable paths.
+    """
+    from app.opip.committee.contracts import CallReplayRejection
+
+    return CallReplayRejection(
+        case_id=refused.case_id,
+        logical_observation_id=refused.logical_observation_id,
+        committed_outcome_id=committed.outcome_id,
+        committed_opinion_hash=committed.opinion.opinion_hash,
+        refused_outcome_id=refused.outcome_id,
+        refused_opinion_hash=refused.opinion.opinion_hash,
+        refused_at=refused.response_at or refused.request_at,
+    )
+
+
 class ObservationLedger(Protocol):
     """Structural contract the committee runtime depends on."""
 
@@ -63,13 +84,21 @@ class ObservationLedger(Protocol):
     def note_case_binding(self, case_id: str, binding: object | None) -> None:
         """Remember the canonical binding this case was run with."""
 
-    def record(
+    def record(self, outcome: ProviderCallOutcome) -> None:
+        """Record one attempt outcome, including the charge it consumed."""
+
+    def record_replay_rejection(
         self,
-        outcome: ProviderCallOutcome,
         *,
-        charge_microunits: int | None = None,
+        refused: ProviderCallOutcome,
+        committed: ProviderCallOutcome,
     ) -> None:
-        """Record one attempt outcome, with its charge where known."""
+        """Record durable evidence that a divergent replay was refused.
+
+        The committed observation stays the only accepted opinion; this records
+        the refusal itself so a divergence is auditable instead of leaving an
+        unexplained gap between what a worker attempted and what is stored.
+        """
 
 
 class InMemoryObservationLedger:
@@ -78,12 +107,16 @@ class InMemoryObservationLedger:
     def __init__(self, *, prior: Iterator[ProviderCallOutcome] | None = None) -> None:
         self._committed: dict[str, ProviderCallOutcome] = {}
         self._attempts: dict[str, int] = {}
-        self._charges: dict[str, int] = {}
         self._by_case: dict[str, list[ProviderCallOutcome]] = {}
         self._case_bindings: dict[str, object | None] = {}
+        self._rejections: list[object] = []
         if prior is not None:
             for outcome in prior:
                 self.record(outcome)
+
+    def replay_rejections(self) -> tuple[object, ...]:
+        """Every refused divergent replay recorded by this ledger."""
+        return tuple(self._rejections)
 
     def committed_opinion(
         self, logical_observation_id: str
@@ -95,7 +128,9 @@ class InMemoryObservationLedger:
 
     def case_spend_microunits(self, case_id: str) -> int:
         return sum(
-            self._charges.get(row.outcome_id, row.estimated_microunits_reported())
+            row.charge_microunits
+            if row.charge_microunits is not None
+            else row.estimated_microunits_reported()
             for row in self._by_case.get(case_id, [])
         )
 
@@ -107,26 +142,35 @@ class InMemoryObservationLedger:
     def note_case_binding(self, case_id: str, binding: object | None) -> None:
         self._case_bindings.setdefault(case_id, binding)
 
-    def record(
-        self,
-        outcome: ProviderCallOutcome,
-        *,
-        charge_microunits: int | None = None,
-    ) -> None:
-        if charge_microunits is not None and charge_microunits < 0:
+    def record(self, outcome: ProviderCallOutcome) -> None:
+        """Record one attempt outcome, including the charge it consumed."""
+        charge = outcome.charge_microunits
+        if charge is not None and charge < 0:
             raise ValueError("a case charge cannot be negative")
         key = outcome.logical_observation_id
         self._attempts[key] = self._attempts.get(key, 0) + 1
-        if charge_microunits is not None:
-            self._charges[outcome.outcome_id] = charge_microunits
         self._by_case.setdefault(outcome.case_id, []).append(outcome)
         if outcome.status in COMMITTED_STATUSES:
             # First committed observation wins; history is never rewritten.
             self._committed.setdefault(key, outcome)
+
+    def record_replay_rejection(
+        self,
+        *,
+        refused: ProviderCallOutcome,
+        committed: ProviderCallOutcome,
+    ) -> None:
+        """Keep the refusal visible without touching the committed observation."""
+        rejection = build_replay_rejection(refused=refused, committed=committed)
+        if rejection.rejection_id not in {
+            item.rejection_id for item in self._rejections
+        }:
+            self._rejections.append(rejection)
 
 
 __all__ = [
     "COMMITTED_STATUSES",
     "InMemoryObservationLedger",
     "ObservationLedger",
+    "build_replay_rejection",
 ]

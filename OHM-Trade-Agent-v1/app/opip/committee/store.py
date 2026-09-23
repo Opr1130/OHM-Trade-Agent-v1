@@ -32,8 +32,12 @@ from app.opip.committee.serialization import (
     attribution_report_to_dict,
     call_outcome_from_dict,
     call_outcome_to_dict,
+    call_replay_rejection_from_dict,
+    call_replay_rejection_to_dict,
     case_outcome_from_dict,
     case_outcome_to_dict,
+    prospective_ineligibility_from_dict,
+    prospective_ineligibility_to_dict,
     evaluation_report_from_dict,
     evaluation_report_to_dict,
     outcome_observation_to_dict,
@@ -61,11 +65,19 @@ PROSPECTIVE_MAX_BYTES = 8 * 1024 * 1024
 PROSPECTIVE_KEEP_LINES = 20_000
 ATTRIBUTIONS_MAX_BYTES = 8 * 1024 * 1024
 ATTRIBUTIONS_KEEP_LINES = 5_000
+REJECTIONS_MAX_BYTES = 4 * 1024 * 1024
+REJECTIONS_KEEP_LINES = 20_000
+INELIGIBILITIES_MAX_BYTES = 4 * 1024 * 1024
+INELIGIBILITIES_KEEP_LINES = 20_000
 
 #: Reasons an append is acknowledged without writing a new row.
 REASON_STORED = "STORED"
 REASON_DUPLICATE = "DUPLICATE_UNCHANGED_INPUTS"
 REASON_DIVERGENCE = "REPLAY_DIVERGENCE_PRESERVED_ORIGINAL"
+
+#: Recorded in a rejection when the refused replay carried no opinion at all, so
+#: the field keeps a stable non-empty value instead of implying a hashed opinion.
+REFUSED_OPINION_ABSENT = "NO_OPINION_IN_REFUSED_REPLAY"
 
 
 @dataclass(frozen=True)
@@ -103,6 +115,14 @@ def _parse_prospective_line(line: bytes):
 
 def _parse_attribution_line(line: bytes):
     return attribution_report_from_dict(parse_json_object_line(line))
+
+
+def _parse_rejection_line(line: bytes):
+    return call_replay_rejection_from_dict(parse_json_object_line(line))
+
+
+def _parse_ineligibility_line(line: bytes):
+    return prospective_ineligibility_from_dict(parse_json_object_line(line))
 
 
 def _prospective_visible_at(row: Any) -> datetime:
@@ -172,6 +192,10 @@ class CommitteeEvidenceStore:
         prospective_keep_lines: int = PROSPECTIVE_KEEP_LINES,
         attributions_max_bytes: int = ATTRIBUTIONS_MAX_BYTES,
         attributions_keep_lines: int = ATTRIBUTIONS_KEEP_LINES,
+        rejections_max_bytes: int = REJECTIONS_MAX_BYTES,
+        rejections_keep_lines: int = REJECTIONS_KEEP_LINES,
+        ineligibilities_max_bytes: int = INELIGIBILITIES_MAX_BYTES,
+        ineligibilities_keep_lines: int = INELIGIBILITIES_KEEP_LINES,
     ) -> None:
         self.root = Path(root)
         self.call_lock_file = self.root / ".call_outcomes.lock"
@@ -179,12 +203,15 @@ class CommitteeEvidenceStore:
         self.evaluation_lock_file = self.root / ".evaluations.lock"
         self.prospective_lock_file = self.root / ".prospective.lock"
         self.attribution_lock_file = self.root / ".attributions.lock"
+        self.rejection_lock_file = self.root / ".call_rejections.lock"
+        self.ineligibility_lock_file = self.root / ".prospective_ineligible.lock"
         self.calls_index_file = self.root / "call_outcome_index.json"
         self.cases_index_file = self.root / "case_outcome_index.json"
         self.evaluations_index_file = self.root / "evaluation_index.json"
         self.prospective_index_file = self.root / "prospective_index.json"
         self.attribution_index_file = self.root / "attribution_index.json"
-        self.call_charge_file = self.root / "call_charge_index.json"
+        self.rejections_index_file = self.root / "call_rejection_index.json"
+        self.ineligibility_index_file = self.root / "prospective_ineligible_index.json"
         self._calls = BoundedJsonlArchive(
             data_file=self.root / "call_outcomes.jsonl",
             archive_dir=self.root / "archive_calls",
@@ -232,24 +259,40 @@ class CommitteeEvidenceStore:
             parse_line=_parse_attribution_line,
             visible_at=lambda row: row.generated_at,
         )
+        self._rejections = BoundedJsonlArchive(
+            data_file=self.root / "call_rejections.jsonl",
+            archive_dir=self.root / "archive_rejections",
+            max_bytes=rejections_max_bytes,
+            keep_lines=rejections_keep_lines,
+            archive_prefix="rejections",
+            parse_line=_parse_rejection_line,
+            visible_at=lambda row: row.refused_at,
+        )
+        self._ineligibilities = BoundedJsonlArchive(
+            data_file=self.root / "prospective_ineligible.jsonl",
+            archive_dir=self.root / "archive_ineligible",
+            max_bytes=ineligibilities_max_bytes,
+            keep_lines=ineligibilities_keep_lines,
+            archive_prefix="ineligible",
+            parse_line=_parse_ineligibility_line,
+            visible_at=lambda row: row.detected_at,
+        )
 
     # ---------------------------------------------------------------- calls
 
-    def append_call_outcome(
-        self,
-        outcome: ProviderCallOutcome,
-        *,
-        charge_microunits: int | None = None,
-    ) -> StoreAppendResult:
-        """Append one call outcome, or acknowledge a duplicate without writing.
+    def append_call_outcome(self, outcome: ProviderCallOutcome) -> StoreAppendResult:
+        """Append one call outcome, or acknowledge an identical one as a duplicate.
 
-        A committed observation is immutable. When the same logical seat is
-        re-delivered with materially different content, the original is kept and
-        the divergence is reported instead of silently overwriting history.
+        Every invocation is its own durable row, keyed by its attempt-scoped
+        ``outcome_id``, so a replay attempt and the charge it consumed are
+        persisted as separate evidence rather than being folded into the
+        original. The first committed opinion for a logical seat is what the
+        index remembers, so a replay can never replace it; a replay carrying a
+        materially different opinion for the same logical seat is still refused
+        as a divergence.
 
-        ``charge_microunits`` is the runtime's computed charge for this attempt,
-        written under the same lock as the outcome so a reservation cannot be
-        lost relative to the evidence it belongs to.
+        The charge travels inside the row, so a reservation is fsynced with the
+        call it belongs to instead of in a separate write that could be lost.
         """
         self.root.mkdir(parents=True, exist_ok=True)
         with registry_lock(self.call_lock_file):
@@ -257,17 +300,28 @@ class CommitteeEvidenceStore:
             index = self._load_call_index()
             previous = index.get(outcome.logical_observation_id)
             if previous is not None:
+                if previous.outcome_id == outcome.outcome_id:
+                    # The same attempt re-delivered: already durable.
+                    return StoreAppendResult(
+                        False, previous.outcome_id, REASON_DUPLICATE
+                    )
                 if (
                     outcome.opinion is not None
                     and outcome.opinion.opinion_hash != previous.opinion_hash
                 ):
-                    return StoreAppendResult(False, previous.outcome_id, REASON_DIVERGENCE)
-                return StoreAppendResult(False, previous.outcome_id, REASON_DUPLICATE)
+                    # The committed opinion stays the only accepted opinion. The
+                    # refusal itself is made durable before returning, so a
+                    # divergent replay cannot leave an unexplained gap between
+                    # what a worker attempted and what the store holds. The
+                    # rejection is written to its own stream, not the call stream,
+                    # so it can never be read as an observation, a vote, or a cost.
+                    self._record_replay_rejection(
+                        outcome=outcome, previous=previous
+                    )
+                    return StoreAppendResult(
+                        False, previous.outcome_id, REASON_DIVERGENCE
+                    )
             self._calls.append_encoded_locked(encode_row(call_outcome_to_dict(outcome)))
-            if charge_microunits is not None:
-                charges = self.load_call_charges()
-                charges[outcome.outcome_id] = charge_microunits
-                self.save_call_charges(charges)
             if outcome.status in COMMITTED_STATUSES and outcome.opinion is not None:
                 index[outcome.logical_observation_id] = _CommittedIndexEntry(
                     outcome_id=outcome.outcome_id,
@@ -294,28 +348,150 @@ class CommitteeEvidenceStore:
     def call_hot_signature(self) -> tuple[int, int] | None:
         return self._calls.hot_signature()
 
+    # ---------------------------------------------------- replay rejections
+
+    def _record_replay_rejection(
+        self, *, outcome: ProviderCallOutcome, previous: _CommittedIndexEntry
+    ) -> None:
+        """Persist durable evidence that a divergent replay was refused.
+
+        Called while the call lock is already held, so the refusal is ordered
+        against the call stream it refers to. The rejection timestamp is taken
+        from the refused outcome rather than a clock read, so the record stays
+        reproducible and the plane keeps reading no wall clock.
+
+        A repeated identical divergence maps to the same content-derived
+        ``rejection_id`` and is therefore acknowledged rather than appended a
+        second time, so a replay cannot multiply rejection evidence.
+        """
+        from app.opip.committee.contracts import CallReplayRejection
+
+        refused_at = outcome.response_at or outcome.request_at
+        rejection = CallReplayRejection(
+            case_id=outcome.case_id,
+            logical_observation_id=outcome.logical_observation_id,
+            committed_outcome_id=previous.outcome_id,
+            committed_opinion_hash=previous.opinion_hash,
+            refused_outcome_id=outcome.outcome_id,
+            refused_opinion_hash=(
+                outcome.opinion.opinion_hash
+                if outcome.opinion is not None
+                else REFUSED_OPINION_ABSENT
+            ),
+            refused_at=refused_at,
+        )
+        self.append_call_rejection(rejection)
+
+    def append_call_rejection(self, rejection) -> StoreAppendResult:
+        """Append one replay-rejection record, or acknowledge a duplicate."""
+        self.root.mkdir(parents=True, exist_ok=True)
+        with registry_lock(self.rejection_lock_file):
+            self._rejections.repair_tail()
+            known = self._load_rejection_ids()
+            if rejection.rejection_id in known:
+                return StoreAppendResult(
+                    False, rejection.rejection_id, REASON_DUPLICATE
+                )
+            self._rejections.append_encoded_locked(
+                encode_row(call_replay_rejection_to_dict(rejection))
+            )
+            known.add(rejection.rejection_id)
+            self._save_rejection_ids(known)
+            self._compact(self._rejections, "call replay rejection")
+            return StoreAppendResult(True, rejection.rejection_id, REASON_STORED)
+
+    def iter_call_rejections(self, *, include_archive: bool = True) -> Iterator[Any]:
+        seen: set[str] = set()
+        if include_archive:
+            for row in self._rejections.iter_archive_rows():
+                if row.rejection_id in seen:
+                    continue
+                seen.add(row.rejection_id)
+                yield row
+        for row in self._rejections.iter_hot_rows():
+            if row.rejection_id in seen:
+                continue
+            seen.add(row.rejection_id)
+            yield row
+
+    def _load_rejection_ids(self) -> set[str]:
+        return self._load_id_set(
+            self.rejections_index_file,
+            rebuild=self._rebuild_rejection_ids,
+            persist=self._save_rejection_ids,
+        )
+
+    def _save_rejection_ids(self, ids: set[str]) -> None:
+        self._save_id_set(
+            self.rejections_index_file,
+            kind="CALL_REPLAY_REJECTION",
+            ids=ids,
+            label="call replay rejection",
+        )
+
+    def _rebuild_rejection_ids(self) -> set[str]:
+        """Derive the rejection id set from the authoritative durable log."""
+        return {row.rejection_id for row in self.iter_call_rejections()}
+
+    # ------------------------------------------- prospective ineligibilities
+
+    def append_prospective_ineligibility(self, record) -> StoreAppendResult:
+        """Persist one ineligible-disposition record, or acknowledge a duplicate.
+
+        Kept in its own stream so an ineligible case can never be read as a
+        prospective evaluation. That is what structurally excludes a drifted
+        release from prospective trust metrics and economic attribution.
+        """
+        self.root.mkdir(parents=True, exist_ok=True)
+        with registry_lock(self.ineligibility_lock_file):
+            self._ineligibilities.repair_tail()
+            known = self._load_ineligibility_ids()
+            if record.ineligibility_id in known:
+                return StoreAppendResult(
+                    False, record.ineligibility_id, REASON_DUPLICATE
+                )
+            self._ineligibilities.append_encoded_locked(
+                encode_row(prospective_ineligibility_to_dict(record))
+            )
+            known.add(record.ineligibility_id)
+            self._save_ineligibility_ids(known)
+            self._compact(self._ineligibilities, "prospective ineligibility")
+            return StoreAppendResult(True, record.ineligibility_id, REASON_STORED)
+
+    def iter_prospective_ineligibilities(self, *, include_archive: bool = True) -> Iterator[Any]:
+        seen: set[str] = set()
+        if include_archive:
+            for row in self._ineligibilities.iter_archive_rows():
+                if row.ineligibility_id in seen:
+                    continue
+                seen.add(row.ineligibility_id)
+                yield row
+        for row in self._ineligibilities.iter_hot_rows():
+            if row.ineligibility_id in seen:
+                continue
+            seen.add(row.ineligibility_id)
+            yield row
+
+    def _load_ineligibility_ids(self) -> set[str]:
+        return self._load_id_set(
+            self.ineligibility_index_file,
+            rebuild=self._rebuild_ineligibility_ids,
+            persist=self._save_ineligibility_ids,
+        )
+
+    def _save_ineligibility_ids(self, ids: set[str]) -> None:
+        self._save_id_set(
+            self.ineligibility_index_file,
+            kind="PROSPECTIVE_INELIGIBILITY",
+            ids=ids,
+            label="prospective ineligibility",
+        )
+
+    def _rebuild_ineligibility_ids(self) -> set[str]:
+        """Derive the ineligibility id set from the authoritative durable log."""
+        return {row.ineligibility_id for row in self.iter_prospective_ineligibilities()}
+
     # ---------------------------------------------------------------- cases
-
-    def load_call_charges(self) -> dict[str, int]:
-        """Per-call-outcome charges recorded by the committee runtime."""
-        raw = self._load_index_payload(self.call_charge_file)
-        entries = raw.get("entries")
-        if not isinstance(entries, Mapping):
-            return {}
-        return {
-            key: value
-            for key, value in entries.items()
-            if isinstance(key, str) and type(value) is int and value >= 0
-        }
-
-    def save_call_charges(self, charges: Mapping[str, int]) -> None:
-        """Persist per-call charges so a redelivery cannot respend the ceiling."""
-        payload = {
-            "schema_version": 1,
-            "kind": "CALL_CHARGE",
-            "entries": {key: int(value) for key, value in charges.items()},
-        }
-        self._write_index(self.call_charge_file, payload, label="call charge")
 
     def append_case_outcome(self, outcome: CommitteeCaseOutcome) -> StoreAppendResult:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -741,7 +917,6 @@ class DurableObservationLedger:
         self._store = store
         self._committed: dict[str, ProviderCallOutcome] = {}
         self._attempts: dict[str, int] = {}
-        self._charges: dict[str, int] = {}
         self._case_bindings: dict[str, object | None] = {}
         self._loaded_signature: tuple[int, int] | None = None
         self._loaded = False
@@ -759,7 +934,6 @@ class DurableObservationLedger:
                 committed.setdefault(key, row)
         self._committed = committed
         self._attempts = attempts
-        self._charges = self._store.load_call_charges()
         self._case_bindings = {
             outcome.case_id: outcome.canonical_binding
             for outcome in self._store.iter_case_outcomes()
@@ -768,33 +942,37 @@ class DurableObservationLedger:
         self._loaded = True
 
     def case_spend_microunits(self, case_id: str) -> int:
-        """Known spend for a case.
+        """Known spend already recorded for a case.
 
-        Each attempt contributes its explicitly recorded charge, falling back to
-        its reported cost for evidence written before charges were recorded. That
-        combines legacy and current evidence: choosing the greater of the two
-        totals would drop one of them for a case that spans the upgrade, since
-        legacy calls have only reported cost and new calls have only a charge.
+        Each attempt contributes the charge persisted inside its own call row,
+        falling back to that attempt's reported cost for evidence written before
+        charges were recorded. Because the charge is part of the authoritative
+        record it cannot be lost separately from the call it belongs to, and a
+        replay attempt is counted as its own row.
         """
-        self._ensure_loaded()
-        total = 0
-        for row in self._store.iter_call_outcomes():
-            if row.case_id != case_id:
-                continue
-            total += self._charges.get(
-                row.outcome_id, row.estimated_microunits_reported()
-            )
-        return total
+        return sum(
+            row.charge_microunits
+            if row.charge_microunits is not None
+            else row.estimated_microunits_reported()
+            for row in self._store.iter_call_outcomes()
+            if row.case_id == case_id
+        )
 
     def recorded_case_binding(self, case_id: str) -> tuple[bool, object | None]:
         """The binding already durably recorded for a case, and whether it was.
 
-        Read from the case-outcome artifact itself rather than a cache, because
-        the cache can be populated before the artifact is appended.
+        A case counts as recorded if it has a case outcome or any durable call
+        evidence. The latter covers the crash window between the first call being
+        persisted and the aggregate case outcome being appended: without it, a
+        redelivery could reattribute a case whose calls are already durable.
         """
         for outcome in self._store.iter_case_outcomes():
             if outcome.case_id == case_id:
                 return True, outcome.canonical_binding
+        if any(
+            row.case_id == case_id for row in self._store.iter_call_outcomes()
+        ):
+            return True, self._case_bindings.get(case_id)
         if case_id in self._case_bindings:
             return True, self._case_bindings[case_id]
         return False, None
@@ -812,26 +990,18 @@ class DurableObservationLedger:
         self._ensure_loaded()
         return self._attempts.get(logical_observation_id, 0)
 
-    def record(
-        self,
-        outcome: ProviderCallOutcome,
-        *,
-        charge_microunits: int | None = None,
-    ) -> None:
+    def record(self, outcome: ProviderCallOutcome) -> None:
         """Persist one attempt, refusing to publish a rejected observation.
 
-        The charge is written together with the call outcome, under the same
-        store lock, so a crash between the two cannot lose a reservation and let
-        a redelivery respend the case ceiling.
+        The charge travels inside the outcome, so it is written with the call it
+        belongs to rather than in a separate write that could be lost.
 
         If the durable log already holds a different opinion for this logical
         seat, the append is refused as a divergence. That result cannot be
         discarded: the caller must not proceed to publish a case outcome
         containing an opinion the evidence log explicitly rejected.
         """
-        result = self._store.append_call_outcome(
-            outcome, charge_microunits=charge_microunits
-        )
+        result = self._store.append_call_outcome(outcome)
         if not result.stored and result.reason == REASON_DIVERGENCE:
             raise CommitteeReplayDivergenceError(
                 "the durable call log already holds a different opinion for this "
@@ -841,6 +1011,26 @@ class DurableObservationLedger:
         # Invalidate so the next lookup re-reads durable evidence rather than
         # trusting a locally derived view.
         self._loaded = False
+
+    def record_replay_rejection(
+        self,
+        *,
+        refused: ProviderCallOutcome,
+        committed: ProviderCallOutcome,
+    ) -> None:
+        """Persist durable evidence that a divergent replay was refused.
+
+        The runtime detects a divergence by comparing against the committed
+        opinion it already holds and raises before reaching :meth:`record`, so
+        without this the refusal would leave no trace at all. The committed
+        observation is untouched; only the refusal is written, into its own
+        stream, so it can never be read as an observation or as spend.
+        """
+        from app.opip.committee.ledger import build_replay_rejection
+
+        self._store.append_call_rejection(
+            build_replay_rejection(refused=refused, committed=committed)
+        )
 
 
 __all__ = [
@@ -858,6 +1048,9 @@ __all__ = [
     "REASON_DIVERGENCE",
     "REASON_DUPLICATE",
     "REASON_STORED",
+    "REFUSED_OPINION_ABSENT",
+    "REJECTIONS_KEEP_LINES",
+    "REJECTIONS_MAX_BYTES",
     "CommitteeEvidenceStore",
     "DurableObservationLedger",
     "StoreAppendResult",

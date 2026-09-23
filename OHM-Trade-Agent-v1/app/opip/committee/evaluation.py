@@ -682,12 +682,32 @@ def _finalize_arm(
 def _validate_bake_off_inputs(
     observations: Sequence[CaseObservation],
     *,
+    phase: EvaluationPhase,
     resolved_outcomes: Sequence[ResolvedOutcome],
     deterministic_baseline: Sequence[BaselineCall],
     probability_forecasts: Sequence[ProbabilityForecast],
     replays: Sequence[ReplayComparison] = (),
 ) -> CaseType:
-    """Validate the shared case set and return its single case type."""
+    """Validate the shared case set and return its single case type.
+
+    The bake-off harness is retrospective-only. It is handed already-resolved
+    outcomes and carries no sealed point-in-time cutoff, so it has no way to
+    establish that an outcome was unknowable when the opinions were produced.
+    Labelling its report ``PROSPECTIVE`` would therefore claim anti-hindsight
+    provenance the evidence does not support, and would file retrospective
+    results under prospective metrics. Prospective evaluation belongs to
+    :func:`app.opip.committee.prospective.evaluate_prospective`, which binds a
+    sealed T0 prediction to a T1 outcome. Failing closed here keeps the two
+    populations from merging silently.
+    """
+    if not isinstance(phase, EvaluationPhase):
+        raise ValueError("invalid evaluation phase")
+    if phase is not EvaluationPhase.RETROSPECTIVE:
+        raise ValueError(
+            "the bake-off harness evaluates retrospective evidence only; "
+            f"{phase.value} evaluation requires the sealed prospective experiment "
+            "(app.opip.committee.prospective.evaluate_prospective)"
+        )
     if not observations:
         raise ValueError("a bake-off requires at least one case observation")
     case_types = {observation.case_type for observation in observations}
@@ -982,10 +1002,13 @@ def evaluate_model_bake_off(
     """Compare arms over a shared case set and return a research report.
 
     Retrospective and prospective evidence must be evaluated separately: the
-    caller selects one ``phase`` and one case type per report.
+    caller selects one ``phase`` and one case type per report. This harness
+    serves the retrospective arm only; prospective evidence is produced by the
+    sealed experiment in :mod:`app.opip.committee.prospective`.
     """
     case_type = _validate_bake_off_inputs(
         observations,
+        phase=phase,
         resolved_outcomes=resolved_outcomes,
         deterministic_baseline=deterministic_baseline,
         probability_forecasts=probability_forecasts,

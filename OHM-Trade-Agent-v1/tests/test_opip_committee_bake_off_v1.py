@@ -406,6 +406,20 @@ def test_malformed_price_specification_is_rejected_not_ignored():
             PriceBook.from_env({COMMITTEE_PRICES_ENV: spec})
 
 
+def test_non_finite_price_rates_fail_closed_with_a_configuration_error():
+    """NaN and infinities must raise the documented error, never a bare numeric one.
+
+    ``Decimal("Infinity")`` would otherwise pass the negativity and integrality
+    checks and surface as ``OverflowError`` from ``int()``, and ``Decimal("NaN")``
+    would raise ``InvalidOperation`` from the comparison — neither of which is the
+    declared configuration error a caller is expected to handle.
+    """
+    for rate in ("Infinity", "NaN", "sNaN", "-Infinity"):
+        spec = f"openai:model-a={rate}/1"
+        with pytest.raises(PriceBookConfigError):
+            PriceBook.from_env({COMMITTEE_PRICES_ENV: spec})
+
+
 def test_duplicate_price_entries_are_rejected():
     price = TokenPrice(
         provider="openai",
@@ -522,6 +536,46 @@ def test_bake_off_compares_all_required_baselines():
     assert ArmKind.COMMITTEE_SIGNAL in kinds
     assert ArmKind.DETERMINISTIC_BASELINE in kinds
     assert ArmKind.NULL_BASELINE in kinds
+
+
+def test_bake_off_refuses_a_prospective_label_for_retrospective_evidence():
+    """The bake-off harness cannot earn a PROSPECTIVE label, so it must refuse one.
+
+    It is handed already-resolved outcomes and holds no sealed cutoff, so it
+    cannot show an outcome was unknowable when the opinions were produced.
+    Accepting the label would file retrospective results under prospective
+    metrics and claim anti-hindsight provenance the evidence does not support.
+    """
+    cases = _cases(3)
+    resolved = [
+        ResolvedOutcome(
+            case_id=case.case_id, positive=True, observed_at=LATER, source_ref="outcome-1"
+        )
+        for case in cases
+    ]
+    with pytest.raises(ValueError, match="retrospective evidence only"):
+        evaluate_model_bake_off(
+            cases,
+            experiment_id="exp-prospective",
+            provenance=_provenance(),
+            generated_at=LATER,
+            phase=EvaluationPhase.PROSPECTIVE,
+            resolved_outcomes=resolved,
+            minimum_samples=2,
+        )
+
+
+def test_bake_off_accepts_the_retrospective_phase_explicitly():
+    """The retrospective arm remains usable when the phase is stated explicitly."""
+    report = evaluate_model_bake_off(
+        _cases(3),
+        experiment_id="exp-retrospective",
+        provenance=_provenance(),
+        generated_at=LATER,
+        phase=EvaluationPhase.RETROSPECTIVE,
+        minimum_samples=2,
+    )
+    assert report.phase is EvaluationPhase.RETROSPECTIVE
 
 
 def test_bake_off_labels_identity_but_never_promotes():

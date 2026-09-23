@@ -47,6 +47,8 @@ from app.opip.committee.attribution import (
     committee_research_call,
 )
 from app.opip.committee.contracts import (
+    CanonicalDecisionBinding,
+    CallReplayRejection,
     CaseType,
     CommitteeCase,
     CommitteeCaseOutcome,
@@ -198,6 +200,8 @@ __all__ = [
     "CaseTypeAccuracy",
     "CalibrationBin",
     "CalibrationReport",
+    "CanonicalDecisionBinding",
+    "CallReplayRejection",
     "ClassificationReport",
     "CommitteeCase",
     "CommitteeCaseOutcome",

@@ -63,6 +63,7 @@ _CALL_OUTCOME_FIELDS = frozenset(
         "estimated_cost_microunits",
         "cost_completeness",
         "replay_divergence_detected",
+        "charge_microunits",
     }
 )
 
@@ -101,6 +102,35 @@ _CASE_OUTCOME_FIELDS = frozenset(
         "outcomes",
         "canonical_binding",
         "provenance",
+    }
+)
+
+_CALL_REPLAY_REJECTION_FIELDS = frozenset(
+    {
+        "schema_version",
+        "rejection_id",
+        "case_id",
+        "logical_observation_id",
+        "committed_outcome_id",
+        "committed_opinion_hash",
+        "refused_outcome_id",
+        "refused_opinion_hash",
+        "refused_at",
+        "reason",
+    }
+)
+
+_PROSPECTIVE_INELIGIBILITY_FIELDS = frozenset(
+    {
+        "schema_version",
+        "ineligibility_id",
+        "prediction_id",
+        "case_id",
+        "experiment_id",
+        "reason",
+        "expected_release_sha",
+        "observed_release_sha",
+        "detected_at",
     }
 )
 
@@ -164,6 +194,23 @@ def _parse_optional_str(value: Any, *, field: str) -> str | None:
         return None
     if not isinstance(value, str):
         raise CommitteeSerializationError(f"{field} must be a string or null")
+    return value
+
+
+def _parse_bool(value: Any, *, field: str, default: bool = False) -> bool:
+    """Read a persisted flag, requiring a real JSON boolean.
+
+    ``bool(value)`` coercion would silently read the string ``"false"`` as
+    ``True``. That is unacceptable on authority-bearing flags (``measurement_only``,
+    ``automatic_promotion``, ``trade_authority_changed``), where a malformed row
+    could otherwise appear to assert an authority state it never meant. A missing
+    field keeps the historical default; a present field of the wrong type fails
+    closed.
+    """
+    if value is None:
+        return default
+    if type(value) is not bool:
+        raise CommitteeSerializationError(f"{field} must be a boolean")
     return value
 
 
@@ -279,6 +326,7 @@ def call_outcome_to_dict(outcome: ProviderCallOutcome) -> dict[str, Any]:
         "estimated_cost_microunits": outcome.estimated_cost_microunits,
         "cost_completeness": outcome.cost_completeness.value,
         "replay_divergence_detected": outcome.replay_divergence_detected,
+        "charge_microunits": outcome.charge_microunits,
     }
 
 
@@ -340,7 +388,12 @@ def call_outcome_from_dict(
         cost_completeness=_parse_enum(
             row.get("cost_completeness"), CostCompleteness, field="cost_completeness"
         ),
-        replay_divergence_detected=bool(row.get("replay_divergence_detected", False)),
+        replay_divergence_detected=_parse_bool(
+            row.get("replay_divergence_detected"), field="replay_divergence_detected"
+        ),
+        charge_microunits=_parse_optional_int(
+            row.get("charge_microunits"), field="charge_microunits"
+        ),
     )
     declared_id = row.get("outcome_id")
     if declared_id is not None and declared_id != outcome.outcome_id:
@@ -438,6 +491,86 @@ def case_outcome_from_dict(row: Mapping[str, Any]) -> CommitteeCaseOutcome:
     return case_outcome
 
 
+def call_replay_rejection_to_dict(rejection) -> dict[str, Any]:
+    return {
+        "schema_version": rejection.schema_version,
+        "rejection_id": rejection.rejection_id,
+        "case_id": rejection.case_id,
+        "logical_observation_id": rejection.logical_observation_id,
+        "committed_outcome_id": rejection.committed_outcome_id,
+        "committed_opinion_hash": rejection.committed_opinion_hash,
+        "refused_outcome_id": rejection.refused_outcome_id,
+        "refused_opinion_hash": rejection.refused_opinion_hash,
+        "refused_at": _iso(rejection.refused_at),
+        "reason": rejection.reason,
+    }
+
+
+def call_replay_rejection_from_dict(row: Mapping[str, Any]):
+    from app.opip.committee.contracts import CallReplayRejection
+
+    if not isinstance(row, Mapping):
+        raise CommitteeSerializationError("call replay rejection must be an object")
+    _reject_unknown(row, _CALL_REPLAY_REJECTION_FIELDS, kind="call replay rejection")
+    rejection = CallReplayRejection(
+        schema_version=row.get("schema_version"),
+        case_id=row.get("case_id"),
+        logical_observation_id=row.get("logical_observation_id"),
+        committed_outcome_id=row.get("committed_outcome_id"),
+        committed_opinion_hash=row.get("committed_opinion_hash"),
+        refused_outcome_id=row.get("refused_outcome_id"),
+        refused_opinion_hash=row.get("refused_opinion_hash"),
+        refused_at=_parse_dt(row.get("refused_at"), field="refused_at"),
+        reason=row.get("reason"),
+    )
+    declared_id = row.get("rejection_id")
+    if declared_id is not None and declared_id != rejection.rejection_id:
+        raise CommitteeSerializationError(
+            "persisted rejection_id does not match its content identity"
+        )
+    return rejection
+
+
+def prospective_ineligibility_to_dict(record) -> dict[str, Any]:
+    return {
+        "schema_version": record.schema_version,
+        "ineligibility_id": record.ineligibility_id,
+        "prediction_id": record.prediction_id,
+        "case_id": record.case_id,
+        "experiment_id": record.experiment_id,
+        "reason": record.reason,
+        "expected_release_sha": record.expected_release_sha,
+        "observed_release_sha": record.observed_release_sha,
+        "detected_at": _iso(record.detected_at),
+    }
+
+
+def prospective_ineligibility_from_dict(row: Mapping[str, Any]):
+    from app.opip.committee.prospective import ProspectiveIneligibility
+
+    if not isinstance(row, Mapping):
+        raise CommitteeSerializationError(
+            "prospective ineligibility must be an object"
+        )
+    _reject_unknown(row, _PROSPECTIVE_INELIGIBILITY_FIELDS, kind="prospective ineligibility")
+    record = ProspectiveIneligibility(
+        schema_version=row.get("schema_version"),
+        prediction_id=row.get("prediction_id"),
+        case_id=row.get("case_id"),
+        experiment_id=row.get("experiment_id"),
+        reason=row.get("reason"),
+        expected_release_sha=row.get("expected_release_sha"),
+        observed_release_sha=row.get("observed_release_sha"),
+        detected_at=_parse_dt(row.get("detected_at"), field="detected_at"),
+    )
+    declared_id = row.get("ineligibility_id")
+    if declared_id is not None and declared_id != record.ineligibility_id:
+        raise CommitteeSerializationError(
+            "persisted ineligibility_id does not match its content identity"
+        )
+    return record
+
+
 def _encode_metric(metric) -> dict[str, Any]:
     return {
         "name": metric.name,
@@ -456,7 +589,7 @@ def _decode_metric(row: Mapping[str, Any]):
     return EvaluationMetric(
         name=row.get("name"),
         value=_parse_optional_str(row.get("value"), field="metric.value"),
-        applicable=bool(row.get("applicable")),
+        applicable=_parse_bool(row.get("applicable"), field="metric.applicable"),
         sample_size=row.get("sample_size"),
         not_applicable_reason=_parse_optional_str(
             row.get("reason"), field="metric.reason"
@@ -782,9 +915,9 @@ def evaluation_report_from_dict(row: Mapping[str, Any]):
         ),
         metric_definitions_version=row.get("metric_definitions_version"),
         committee_signal_rule_version=row.get("committee_signal_rule_version"),
-        measurement_only=bool(row.get("measurement_only")),
-        automatic_promotion=bool(row.get("automatic_promotion")),
-        trade_authority_changed=bool(row.get("trade_authority_changed")),
+        measurement_only=_parse_bool(row.get("measurement_only"), field="measurement_only"),
+        automatic_promotion=_parse_bool(row.get("automatic_promotion"), field="automatic_promotion"),
+        trade_authority_changed=_parse_bool(row.get("trade_authority_changed"), field="trade_authority_changed"),
     )
     declared_id = row.get("report_id")
     if declared_id is not None and declared_id != report.report_id:
@@ -810,6 +943,7 @@ _SEAL_FIELDS = frozenset(
         "sealed_opinion_hashes",
         "sealed_seat_count",
         "horizon_seconds",
+        "release_sha",
         "phase",
         "provenance",
     }
@@ -902,7 +1036,9 @@ def _decode_provenance(row: Mapping[str, Any]):
 
 
 def sealed_prediction_to_dict(prediction) -> dict[str, Any]:
-    return {
+    from app.opip.committee.prospective import LEGACY_UNSEALED_RELEASE
+
+    row: dict[str, Any] = {
         "kind": _PREDICTION_KIND,
         "schema_version": prediction.schema_version,
         "prediction_id": prediction.prediction_id,
@@ -920,10 +1056,18 @@ def sealed_prediction_to_dict(prediction) -> dict[str, Any]:
         "phase": prediction.phase.value,
         "provenance": _encode_provenance(prediction.provenance),
     }
+    # Written only when the prediction carries a real release identity, matching
+    # the identity rule, so a legacy row round-trips to the identity it had.
+    if prediction.release_sha != LEGACY_UNSEALED_RELEASE:
+        row["release_sha"] = prediction.release_sha
+    return row
 
 
 def sealed_prediction_from_dict(row: Mapping[str, Any]):
-    from app.opip.committee.prospective import SealedPrediction
+    from app.opip.committee.prospective import (
+        LEGACY_UNSEALED_RELEASE,
+        SealedPrediction,
+    )
 
     _reject_unknown(row, _SEAL_FIELDS, kind="sealed prediction")
     prediction = SealedPrediction(
@@ -943,6 +1087,10 @@ def sealed_prediction_from_dict(row: Mapping[str, Any]):
         ),
         sealed_seat_count=row.get("sealed_seat_count"),
         horizon_seconds=row.get("horizon_seconds"),
+        # A row written before the release identity existed stays readable and
+        # keeps its original identity; it is permanently ineligible for scoring
+        # rather than being silently treated as compatible.
+        release_sha=row.get("release_sha") or LEGACY_UNSEALED_RELEASE,
         phase=_parse_enum(row.get("phase"), EvaluationPhase, field="phase"),
         provenance=_decode_provenance(row.get("provenance")),
     )
@@ -1083,7 +1231,7 @@ def prospective_evaluation_from_dict(row: Mapping[str, Any]):
                     score_row.get("call"), DirectionalCall, field="call"
                 ),
                 correct=score_row.get("correct"),
-                final=bool(score_row.get("final")),
+                final=_parse_bool(score_row.get("final"), field="seat_score.final"),
             )
         )
     evaluation = ProspectiveEvaluation(
@@ -1112,9 +1260,9 @@ def prospective_evaluation_from_dict(row: Mapping[str, Any]):
         f1=_decode_metric(raw_metrics["f1"]),
         accuracy=_decode_metric(raw_metrics["accuracy"]),
         confusion=_decode_confusion(row.get("confusion")),
-        measurement_only=bool(row.get("measurement_only")),
-        automatic_promotion=bool(row.get("automatic_promotion")),
-        trade_authority_changed=bool(row.get("trade_authority_changed")),
+        measurement_only=_parse_bool(row.get("measurement_only"), field="measurement_only"),
+        automatic_promotion=_parse_bool(row.get("automatic_promotion"), field="automatic_promotion"),
+        trade_authority_changed=_parse_bool(row.get("trade_authority_changed"), field="trade_authority_changed"),
         provenance=_decode_provenance(row.get("provenance")),
     )
     declared = row.get("evaluation_id")
@@ -1468,10 +1616,10 @@ def attribution_report_from_dict(row: Mapping[str, Any]):
         calibration=_decode_metric(row.get("calibration")),
         provenance=_decode_provenance(row.get("provenance")),
         attribution_method_version=row.get("attribution_method_version"),
-        advisory_only=bool(row.get("advisory_only")),
-        measurement_only=bool(row.get("measurement_only")),
-        automatic_promotion=bool(row.get("automatic_promotion")),
-        trade_authority_changed=bool(row.get("trade_authority_changed")),
+        advisory_only=_parse_bool(row.get("advisory_only"), field="advisory_only"),
+        measurement_only=_parse_bool(row.get("measurement_only"), field="measurement_only"),
+        automatic_promotion=_parse_bool(row.get("automatic_promotion"), field="automatic_promotion"),
+        trade_authority_changed=_parse_bool(row.get("trade_authority_changed"), field="trade_authority_changed"),
     )
     declared = row.get("attribution_id")
     if declared is not None and declared != report.attribution_id:
@@ -1489,6 +1637,8 @@ __all__ = [
     "attribution_report_to_dict",
     "call_outcome_from_dict",
     "call_outcome_to_dict",
+    "call_replay_rejection_from_dict",
+    "call_replay_rejection_to_dict",
     "case_outcome_from_dict",
     "case_outcome_to_dict",
     "evaluation_report_from_dict",
@@ -1499,6 +1649,8 @@ __all__ = [
     "outcome_observation_to_dict",
     "prospective_evaluation_from_dict",
     "prospective_evaluation_to_dict",
+    "prospective_ineligibility_from_dict",
+    "prospective_ineligibility_to_dict",
     "prospective_record_from_dict",
     "sealed_prediction_from_dict",
     "sealed_prediction_to_dict",
