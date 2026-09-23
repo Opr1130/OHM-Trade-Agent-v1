@@ -566,7 +566,37 @@ authoritative facts rather than computing trust itself.
   *review* stage; trading or paper influence requires a separate human decision
   outside this module.
 
-### 3L — Contribution to the profitability loop
+### 3M — Per-attempt latency (IC-012, `role_router.py`, `role_execution.py`, `serialization.py`, `trust.py`)
+
+Latency is now measured rather than absent, under rules that keep it honest:
+
+- **Measured, not inferred.** The router takes an injected `monotonic` clock
+  (defaulting to `time.monotonic`) and measures the duration of each attempt. Wall
+  clock timestamps are deliberately not used: an NTP adjustment could make a slow
+  call look instant, and the wall clock is already the identity's business.
+- **Recorded on every invoked attempt**: success, retryable failure, invalid
+  response, served-identity mismatch, and each attempt of a failover. A timeout is
+  exactly the latency an operator needs to see.
+- **Null when nothing ran.** An unavailable seat, an unconfigured adapter, and a
+  dead-letter outcome report no duration rather than zero, because zero would read
+  as an instantaneous call.
+- **Aggregation uses measured observations only.** `total_latency_micros` and
+  `mean_latency_micros` are `None` when nothing was measured, and
+  `latency_sample_complete` reports a partial sample as partial. A zero-latency
+  placeholder can neither pad nor deflate an average.
+- **Durable.** A role-result codec round-trips the value; a legacy row written
+  before the field existed decodes to `None` and keeps its original identity; a
+  corrupted value is refused on read. Latency participates in the role-result
+  identity, since a different duration is a different observation.
+- **Observable.** The Trust Report exposes mean latency and the measured/unmeasured
+  split through its investment and maturity views.
+
+Note on "repair": repair is applied by the conformance harness, not by the router.
+The router admits only a payload that already satisfies the contract, so a
+form-repair case appears there as a recorded `INVALID` attempt — and its duration is
+still measured, which is what keeps a repair round visible in latency.
+
+### 3N — Contribution to the profitability loop
 
 This slice supplies the **role-attribution** substrate the profitability loop
 requires. It is not yet wired to a live case pipeline, so the loop above is not
@@ -719,7 +749,7 @@ names the lifecycle behaviour that is actually tested.
 | IC-009 | Versioned Model Registry | **GREEN** | Versioned registry of role routes with prompt/schema hashes, owner, approval state, effective and review dates, reasoning mode, and budget limits. |
 | IC-010 | Primary plus at most one approved fallback | **GREEN** | Two routes for one role are refused as ambiguous; the fallback shares the primary's request, deadline, and reservations; an unusable fallback is dropped, never substituted; only `APPROVED` routes. |
 | IC-011 | Deadline/token/cost/concurrency budgets | **GREEN** | `RoleBudget` validates and enforces deadline and cost ceilings, bounds concurrency, and refuses an unknown cost rather than treating it as free. |
-| IC-012 | Per-attempt latency/token/model/cost accounting | **PARTIAL** | Call outcomes persist served provider/model, tokens, cost, and completeness; `RoleAttempt` carries cost. **Latency is not currently measured** by the router, so the latency field is not populated in role results. |
+| IC-012 | Per-attempt latency/token/model/cost accounting | **GREEN** | Call outcomes persist served provider/model, tokens, cost, and completeness. `RoleAttempt` and `RoleSeatResult` now carry a latency measured with an injected monotonic clock, recorded on every invoked attempt including failures, invalid responses, identity mismatches, and fallback attempts, and left null when nothing was invoked. Aggregation (`total_latency_micros`, `mean_latency_micros`, `latency_sample_complete`) uses measured observations only and reports unknown rather than zero; latency is durable through a role-result codec with legacy rows decoding to null, and is surfaced in the Trust Report investment and maturity views. Tested for success, failure, invalid, unavailable, missing-adapter, failover, repair-path, aggregation, corruption, and legacy reload. |
 | IC-013 | Strict structured-response validation | **GREEN** | Non-JSON, fenced, undeclared, out-of-range, non-finite, and missing-field responses are refused; one bounded repair path only. |
 | IC-014 | Evidence-reference validation | **GREEN** | A citation outside the screened manifest is refused, including after whitespace normalisation; tested against path-like and URL-like references. |
 | IC-015 | Immutable/durable evidence store | **GREEN** | Append-only bounded JSONL with durable idempotency ledger; sidecars are caches reconciled against the authoritative log; divergent replays are refused with durable rejection records. |
@@ -758,8 +788,8 @@ names the lifecycle behaviour that is actually tested.
 
 | Status | Count |
 | --- | --- |
-| GREEN | 35 |
-| PARTIAL | 8 |
+| GREEN | 36 |
+| PARTIAL | 7 |
 | MISSING | 2 |
 | OUT_OF_SCOPE | 0 |
 
@@ -773,7 +803,22 @@ The two MISSING requirements are the honest blockers, and both are deliberate:
 2. **IC-042 isolated shadow deployment** requires a deployment decision that this
    mandate explicitly withholds.
 
-Neither is a correctness defect. The eight PARTIAL requirements are contracts with
+Neither is a correctness defect. The seven PARTIAL requirements are contracts with
 proven lifecycles that have not yet been exercised against real evidence or a real
 release; every one of them is blocked on live providers, live cases, or a deployed
-release, not on missing implementation.
+release rather than on missing implementation:
+
+- **IC-005** the canonical binding exists and is enforced, but is not yet populated
+  from a real canonical decision (needs the governed DI bridge).
+- **IC-019**, **IC-020** the retrospective and prospective infrastructures are
+  complete and tested, but have not been run against a real corpus or live cases.
+- **IC-021**, **IC-022** the baseline and cash comparator arms are declared, matched,
+  and carried into the report, but are not yet populated from production results.
+- **IC-041** releases carry an exact SHA and prospective evaluation fails closed on
+  drift, but neither has been verified against a deployed release.
+- **IC-043** pending counters and the six-gate trust report exist; there is no
+  deployed dashboard, which is out of scope for this revision.
+
+Per the reconciliation rule, "awaiting prospective data" is classified above as
+*implementation complete but awaiting real evidence*, not as an implementation
+defect.

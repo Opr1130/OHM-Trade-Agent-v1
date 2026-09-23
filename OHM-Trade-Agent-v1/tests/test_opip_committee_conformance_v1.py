@@ -97,7 +97,7 @@ def test_the_corpus_covers_every_declared_category():
         ConformanceCategory.UNSUPPORTED_ACTION_FIELD,
         ConformanceCategory.EVIDENCE_REF_OUTSIDE_MANIFEST,
         ConformanceCategory.EMBEDDED_INSTRUCTION,
-        ConformanceCategory.SECRET_LIKE_CONTENT,
+        ConformanceCategory.SENSITIVE_MATERIAL,
         ConformanceCategory.DECLARED_LIST_MISSING,
     ):
         assert category in seen, category

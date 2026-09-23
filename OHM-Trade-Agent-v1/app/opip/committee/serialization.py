@@ -169,6 +169,40 @@ _TALLY_FIELDS = frozenset(
     }
 )
 
+_ROLE_RESULT_KIND = "COMMITTEE_ROLE_RESULT"
+
+_ROLE_RESULT_FIELDS = frozenset(
+    {
+        "kind",
+        "contract_schema_version",
+        "role_output_schema_version",
+        "case_id",
+        "role",
+        "role_version",
+        "status",
+        "prompt_version",
+        "prompt_hash",
+        "provider_family",
+        "requested_model",
+        "resolved_model",
+        "logical_observation_id",
+        "attempt",
+        "recorded_at",
+        "call_outcome_id",
+        "stance",
+        "evidence_sufficiency",
+        "thesis",
+        "risks",
+        "evidence_refs",
+        "missing_evidence",
+        "research_action",
+        "self_reported_confidence",
+        "rubric_score",
+        "latency_micros",
+        "status_detail",
+    }
+)
+
 _PROVENANCE_FIELDS = frozenset(
     {
         "schema_version",
@@ -604,6 +638,126 @@ def prospective_ineligibility_from_dict(row: Mapping[str, Any]):
             "persisted ineligibility_id does not match its content identity"
         )
     return record
+
+
+def role_result_to_dict(result) -> dict[str, Any]:
+    """Encode one role result, including its measured latency.
+
+    Latency is written only when it was measured, so an unmeasured attempt stays
+    null through a round trip rather than becoming a zero that would read as an
+    instantaneous call.
+    """
+    return {
+        "kind": _ROLE_RESULT_KIND,
+        "contract_schema_version": result.contract_schema_version,
+        "role_output_schema_version": result.schema_version,
+        "case_id": result.case_id,
+        "role": result.role.value,
+        "role_version": result.role_version,
+        "status": result.status.value,
+        "prompt_version": result.prompt_version,
+        "prompt_hash": result.prompt_hash,
+        "provider_family": result.provider_family.value,
+        "requested_model": result.requested_model,
+        "resolved_model": result.resolved_model,
+        "logical_observation_id": result.logical_observation_id,
+        "attempt": result.attempt,
+        "recorded_at": _iso(result.recorded_at),
+        "call_outcome_id": result.call_outcome_id,
+        "stance": None if result.stance is None else result.stance.value,
+        "evidence_sufficiency": (
+            None
+            if result.evidence_sufficiency is None
+            else result.evidence_sufficiency.value
+        ),
+        "thesis": result.thesis,
+        "risks": list(result.risks),
+        "evidence_refs": list(result.evidence_refs),
+        "missing_evidence": list(result.missing_evidence),
+        "research_action": (
+            None if result.research_action is None else result.research_action.value
+        ),
+        "self_reported_confidence": result.self_reported_confidence,
+        "rubric_score": result.rubric_score,
+        "latency_micros": result.latency_micros,
+        "status_detail": result.status_detail,
+    }
+
+
+def role_result_from_dict(row: Mapping[str, Any]):
+    """Decode a role result, refusing a row of another kind.
+
+    A legacy row written before latency was measured decodes to ``null`` latency
+    rather than zero, so an unmeasured duration cannot masquerade as a fast one.
+    """
+    from app.opip.committee.contracts import (
+        DirectionalAssessment,
+        EvidenceSufficiency,
+        ProviderFamily,
+        ResearchAction,
+    )
+    from app.opip.committee.role_execution import RoleResultStatus, RoleSeatResult
+    from app.opip.committee.roles import CommitteeRole
+
+    if not isinstance(row, Mapping):
+        raise CommitteeSerializationError("role result must be an object")
+    kind = row.get("kind")
+    if kind != _ROLE_RESULT_KIND:
+        raise CommitteeSerializationError(
+            f"expected a {_ROLE_RESULT_KIND} row, found {kind!r}"
+        )
+    _reject_unknown(row, _ROLE_RESULT_FIELDS, kind="role result")
+    raw_latency = row.get("latency_micros")
+    if raw_latency is not None and (type(raw_latency) is not int or raw_latency < 0):
+        raise CommitteeSerializationError(
+            "latency_micros must be a non-negative integer or null"
+        )
+    return RoleSeatResult(
+        case_id=row.get("case_id"),
+        role=_parse_enum(row.get("role"), CommitteeRole, field="role"),
+        role_version=row.get("role_version"),
+        status=_parse_enum(row.get("status"), RoleResultStatus, field="status"),
+        prompt_version=row.get("prompt_version"),
+        prompt_hash=row.get("prompt_hash"),
+        schema_version=row.get("role_output_schema_version"),
+        provider_family=_parse_enum(
+            row.get("provider_family"), ProviderFamily, field="provider_family"
+        ),
+        requested_model=row.get("requested_model"),
+        resolved_model=_parse_optional_str(
+            row.get("resolved_model"), field="resolved_model"
+        ),
+        logical_observation_id=row.get("logical_observation_id"),
+        attempt=row.get("attempt"),
+        recorded_at=_parse_dt(row.get("recorded_at"), field="recorded_at"),
+        call_outcome_id=_parse_optional_str(
+            row.get("call_outcome_id"), field="call_outcome_id"
+        ),
+        stance=_parse_optional_enum(
+            row.get("stance"), DirectionalAssessment, field="stance"
+        ),
+        evidence_sufficiency=_parse_optional_enum(
+            row.get("evidence_sufficiency"),
+            EvidenceSufficiency,
+            field="evidence_sufficiency",
+        ),
+        thesis=_parse_optional_str(row.get("thesis"), field="thesis"),
+        risks=_parse_str_tuple(row.get("risks"), field="risks"),
+        evidence_refs=_parse_str_tuple(row.get("evidence_refs"), field="evidence_refs"),
+        missing_evidence=_parse_str_tuple(
+            row.get("missing_evidence"), field="missing_evidence"
+        ),
+        research_action=_parse_optional_enum(
+            row.get("research_action"), ResearchAction, field="research_action"
+        ),
+        self_reported_confidence=_parse_optional_int(
+            row.get("self_reported_confidence"), field="self_reported_confidence"
+        ),
+        rubric_score=_parse_optional_int(row.get("rubric_score"), field="rubric_score"),
+        latency_micros=raw_latency,
+        status_detail=_parse_optional_str(row.get("status_detail"), field="status_detail"),
+        contract_schema_version=row.get("contract_schema_version"),
+    )
 
 
 def schedule_disposition_to_dict(record) -> dict[str, Any]:
@@ -1810,6 +1964,8 @@ __all__ = [
     "prospective_ineligibility_to_dict",
     "schedule_disposition_from_dict",
     "schedule_disposition_to_dict",
+    "role_result_from_dict",
+    "role_result_to_dict",
     "population_tally_from_dict",
     "population_tally_to_dict",
     "prospective_record_from_dict",

@@ -1,5 +1,4 @@
 """Role routing: resolve a governed route and execute it under one budget.
-
 MEASUREMENT ONLY - NO PRODUCTION DECISION AUTHORITY.
 
 This is where the three contracts meet:
@@ -27,6 +26,7 @@ concurrent role executions cannot observe each other.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Callable, Iterable, Mapping
@@ -92,8 +92,21 @@ class RoleAttempt:
     served_model: str | None = None
     failure_class: ProviderFailureClass | None = None
     cost_microunits: int | None = None
+    #: Measured attempt duration in microseconds, or ``None`` when nothing was
+    #: invoked. Measured with a monotonic clock, never inferred from wall-clock
+    #: timestamps, and never replaced with zero.
+    latency_micros: int | None = None
     detail: str | None = None
     exceeded_ceiling: bool = False
+
+    def __post_init__(self) -> None:
+        if self.latency_micros is not None and (
+            type(self.latency_micros) is not int or self.latency_micros < 0
+        ):
+            raise ValueError(
+                "latency_micros must be a non-negative integer or null; an "
+                "unmeasured attempt must not report a duration"
+            )
 
 
 @dataclass(frozen=True)
@@ -132,6 +145,41 @@ class RoleExecution:
     def used_fallback(self) -> bool:
         return len(self.attempts) > 1
 
+    @property
+    def measured_latencies_micros(self) -> tuple[int, ...]:
+        """Latencies actually measured for this role's attempts.
+
+        Only measured values appear. An attempt that was never invoked, or whose
+        duration could not be taken, contributes nothing rather than a zero that
+        would drag an average down and look like a very fast call.
+        """
+        return tuple(
+            attempt.latency_micros
+            for attempt in self.attempts
+            if attempt.latency_micros is not None
+        )
+
+    @property
+    def total_latency_micros(self) -> int | None:
+        """Summed measured latency, or ``None`` when nothing was measured.
+
+        Never zero-by-default: a role with no measured attempt reports unknown
+        latency, not an instant one.
+        """
+        measured = self.measured_latencies_micros
+        if not measured:
+            return None
+        return sum(measured)
+
+    @property
+    def attempts_measured(self) -> int:
+        return len(self.measured_latencies_micros)
+
+    @property
+    def attempts_unmeasured(self) -> int:
+        """Attempts with no measured latency, so an incomplete sample is visible."""
+        return len(self.attempts) - self.attempts_measured
+
 
 class RoleRouter:
     """Executes a role's governed route under one shared budget.
@@ -145,9 +193,16 @@ class RoleRouter:
         *,
         providers: Mapping[str, CommitteeProvider],
         now: Callable[[], datetime],
+        monotonic: Callable[[], float] | None = None,
     ) -> None:
         self._providers = dict(providers)
         self._now = now
+        #: A monotonic clock for measuring attempt duration. Injected so a test can
+        #: supply exact values, and defaulted to the standard library's monotonic
+        #: clock, which is the correct instrument for elapsed time. Wall-clock
+        #: timestamps are deliberately not used for this: an NTP adjustment could
+        #: make a slow call look instant.
+        self._monotonic = monotonic or time.monotonic
 
     def execute(
         self,
@@ -287,10 +342,14 @@ class RoleRouter:
                     requested_model=entry.model_id,
                     status=RoleResultStatus.UNAVAILABLE,
                     detail="no adapter is configured for this registry entry",
+                    # Nothing was invoked, so there is no duration to report. Absent
+                    # latency stays null rather than becoming zero, which would look
+                    # like an instantaneous call.
                 ),
                 None,
                 None,
             )
+        started = self._monotonic()
         try:
             response = provider.invoke(request)
         except ProviderInvocationError as exc:
@@ -303,10 +362,14 @@ class RoleRouter:
                     status=RoleResultStatus.FAILED,
                     failure_class=exc.failure_class,
                     detail=str(exc),
+                    # A failed attempt still consumed wall time, and a timeout is
+                    # exactly the latency an operator needs to see.
+                    latency_micros=self._elapsed_micros(started),
                 ),
                 None,
                 None,
             )
+        latency_micros = self._elapsed_micros(started)
 
         # A response served by a model other than the one requested is refused
         # rather than attributed: crediting it would report an opinion from a
@@ -323,6 +386,7 @@ class RoleRouter:
                     served_model=response.reported_model,
                     failure_class=ProviderFailureClass.PROVIDER_IDENTITY_MISMATCH,
                     cost_microunits=response.estimated_cost_microunits,
+                    latency_micros=latency_micros,
                     detail=(
                         "the served model does not match the requested registry entry"
                     ),
@@ -351,6 +415,7 @@ class RoleRouter:
                     served_model=response.reported_model,
                     failure_class=ProviderFailureClass.SCHEMA_VALIDATION_FAILURE,
                     cost_microunits=response.estimated_cost_microunits,
+                    latency_micros=latency_micros,
                     detail=str(exc),
                 ),
                 None,
@@ -367,10 +432,20 @@ class RoleRouter:
                 served_provider=response.reported_provider,
                 served_model=response.reported_model,
                 cost_microunits=response.estimated_cost_microunits,
+                latency_micros=latency_micros,
             ),
             parsed,
             response,
         )
+
+    def _elapsed_micros(self, started: float) -> int:
+        """Whole microseconds elapsed since ``started``, never negative."""
+        elapsed = self._monotonic() - started
+        if elapsed < 0:
+            # A monotonic clock cannot go backwards; if it somehow does, refuse to
+            # report a negative duration rather than publish a nonsensical figure.
+            return 0
+        return int(round(elapsed * 1_000_000))
 
     def _build_result(
         self,
@@ -402,6 +477,7 @@ class RoleRouter:
                     logical_observation_id=logical_observation_id,
                     attempt=attempt.attempt,
                     recorded_at=self._now(),
+                    latency_micros=attempt.latency_micros,
                     stance=opinion.assessment,
                     evidence_sufficiency=opinion.evidence_sufficiency,
                     thesis=opinion.hypothesis,

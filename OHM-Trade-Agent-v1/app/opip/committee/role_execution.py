@@ -233,6 +233,10 @@ class RoleSeatResult:
     #: never silently defaulted to zero.
     self_reported_confidence: int | None = None
     rubric_score: int | None = None
+    #: Measured attempt duration in microseconds, or ``None`` when nothing was
+    #: invoked and therefore nothing was measured. Never inferred from timestamps
+    #: and never replaced with zero.
+    latency_micros: int | None = None
     status_detail: str | None = None
     #: Schema version of *this contract*. Distinct from ``schema_version`` above,
     #: which is the version of the role's output schema. Conflating the two would
@@ -269,6 +273,13 @@ class RoleSeatResult:
             value = getattr(self, field_name)
             if value is not None and (type(value) is not int or not 0 <= value <= 100):
                 raise ValueError(f"{field_name} must be an integer in 0..100 or null")
+        if self.latency_micros is not None and (
+            type(self.latency_micros) is not int or self.latency_micros < 0
+        ):
+            raise ValueError(
+                "latency_micros must be a non-negative integer or null; a missing "
+                "measurement must stay null rather than becoming zero"
+            )
         object.__setattr__(
             self,
             "recorded_at",
@@ -325,6 +336,7 @@ class RoleSeatResult:
             "research_action": self.research_action,
             "self_reported_confidence": self.self_reported_confidence,
             "rubric_score": self.rubric_score,
+            "latency_micros": self.latency_micros,
             "status_detail": self.status_detail,
         }
 

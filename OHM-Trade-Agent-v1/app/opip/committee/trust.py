@@ -122,6 +122,8 @@ class CommitteeInvestment:
     output_tokens: int | None = None
     provider_calls: int = 0
     failed_calls: int = 0
+    measured_latencies_micros: tuple[int, ...] = ()
+    unmeasured_attempts: int = 0
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -132,12 +134,44 @@ class CommitteeInvestment:
             value = getattr(self, field_name)
             if value is not None and (type(value) is not int or value < 0):
                 raise ValueError(f"{field_name} must be a non-negative integer or null")
-        for field_name in ("provider_calls", "failed_calls"):
+        for field_name in ("provider_calls", "failed_calls", "unmeasured_attempts"):
             value = getattr(self, field_name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"{field_name} must be a non-negative integer")
         if self.failed_calls > self.provider_calls:
             raise ValueError("failed_calls cannot exceed provider_calls")
+        for latency in self.measured_latencies_micros:
+            if type(latency) is not int or latency < 0:
+                raise ValueError(
+                    "measured latencies must be non-negative integers; an "
+                    "unmeasured attempt must not be represented as a zero latency"
+                )
+
+    @property
+    def total_latency_micros(self) -> int | None:
+        """Summed measured latency, or ``None`` when nothing was measured.
+
+        Aggregated only from measured observations, never zero-by-default.
+        """
+        if not self.measured_latencies_micros:
+            return None
+        return sum(self.measured_latencies_micros)
+
+    @property
+    def mean_latency_micros(self) -> float | None:
+        """Mean over measured attempts only, or ``None`` when none were measured."""
+        if not self.measured_latencies_micros:
+            return None
+        return sum(self.measured_latencies_micros) / len(self.measured_latencies_micros)
+
+    @property
+    def latency_sample_complete(self) -> bool:
+        """Whether every attempt was measured.
+
+        A partial latency sample is reported as partial rather than presented as
+        the whole picture.
+        """
+        return self.unmeasured_attempts == 0
 
     @property
     def failure_rate(self) -> float | None:
@@ -241,7 +275,14 @@ class CommitteeTrustReport:
                 CommitteeScheduleDisposition.UNAVAILABLE
             ),
             "failed": self.population.count(CommitteeScheduleDisposition.FAILED),
+            "latency_measured": len(self.investment.measured_latencies_micros),
+            "latency_unmeasured": self.investment.unmeasured_attempts,
         }
+
+    @property
+    def mean_latency_micros(self) -> float | None:
+        """Role/model observability latency, or ``None`` when nothing was measured."""
+        return self.investment.mean_latency_micros
 
     @property
     def blocked_gates(self) -> tuple[GateName, ...]:

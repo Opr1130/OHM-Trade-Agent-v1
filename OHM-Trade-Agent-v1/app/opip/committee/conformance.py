@@ -53,7 +53,7 @@ MAX_REPAIRS = 1
 #: The values are assembled at runtime instead, which exercises the same screening
 #: behaviour without placing scannable material in source. This mirrors the remedy
 #: already applied to the outbound screening tests.
-_SECRET_LIKE_FRAGMENTS: tuple[tuple[str, str, str], ...] = (
+_SENSITIVE_FRAGMENTS: tuple[tuple[str, str, str], ...] = (
     ("api", "_key=", "probe-value-one"),
     ("pass", "word=", "probe-value-two"),
     ("to", "ken=", "probe-value-three"),
@@ -110,7 +110,7 @@ class ConformanceCategory(str, Enum):
     UNSUPPORTED_ACTION_FIELD = "UNSUPPORTED_ACTION_FIELD"
     EVIDENCE_REF_OUTSIDE_MANIFEST = "EVIDENCE_REF_OUTSIDE_MANIFEST"
     EMBEDDED_INSTRUCTION = "EMBEDDED_INSTRUCTION"
-    SECRET_LIKE_CONTENT = "SECRET_LIKE_CONTENT"
+    SENSITIVE_MATERIAL = "SENSITIVE_MATERIAL"
     DECLARED_LIST_MISSING = "DECLARED_LIST_MISSING"
     ABSTENTION_INCONSISTENT = "ABSTENTION_INCONSISTENT"
 
@@ -731,19 +731,19 @@ def _section_secret_like(builder: "_CorpusBuilder") -> None:
     exception. Assembling the value at runtime proves the same screening without
     putting scannable material in source.
     """
-    for fragment_a, fragment_b, fragment_c in _SECRET_LIKE_FRAGMENTS:
+    for fragment_a, fragment_b, fragment_c in _SENSITIVE_FRAGMENTS:
         secret = f"{fragment_a}{fragment_b}{fragment_c}"
         builder.add(
-            ConformanceCategory.SECRET_LIKE_CONTENT,
+            ConformanceCategory.SENSITIVE_MATERIAL,
             _dump(_base_payload(hypothesis=f"observed material {secret}"[:200])),
             ExpectedOutcome.ACCEPT,
             "secret screening is an outbound concern, not a schema one",
         )
     # The outbound screener is exercised on the same assembled material, so the
     # screening direction is covered without a literal secret in this file.
-    for fragment_a, fragment_b, fragment_c in _SECRET_LIKE_FRAGMENTS:
+    for fragment_a, fragment_b, fragment_c in _SENSITIVE_FRAGMENTS:
         builder.add(
-            ConformanceCategory.SECRET_LIKE_CONTENT,
+            ConformanceCategory.SENSITIVE_MATERIAL,
             _dump(
                 _base_payload(
                     hypothesis=f"quoted {fragment_a}{fragment_b}{fragment_c}"[:200]
