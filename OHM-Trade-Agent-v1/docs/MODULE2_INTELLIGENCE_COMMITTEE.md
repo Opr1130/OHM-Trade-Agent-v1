@@ -220,6 +220,85 @@ is now durable:
   replaying the same divergence is recognised as the same refusal and cannot
   multiply evidence. The refusal remains readable after a restart.
 
+### 3A — Role identity, governed model registry, and role budgets (`roles.py`, `registry.py`, `role_execution.py`)
+
+A committee seat is a **role**, not a model vendor. The role states what question
+is being answered; the registry states which governed route is permitted to
+answer it. Keeping those identities separate is what makes a result attributable
+to a responsibility rather than to whichever vendor happened to serve it.
+
+**Roles (IC-006).** Seven governed roles: `REGIME_ANALYST`,
+`LIQUIDITY_STRUCTURE_ANALYST`, `EVENT_SENTIMENT_ANALYST`, `BULL_ADVOCATE`,
+`BEAR_ADVOCATE`, `RISK_CRITIC`, `DECISION_SYNTHESIZER`.
+
+- Six are **required**: a case missing any of them is incomplete and
+  `validate_complete()` fails closed. The bull case, the bear case, and the risk
+  critique are deliberately three roles — collapsing them would erase the
+  disagreement structure the attribution layer measures.
+- `EVENT_SENTIMENT_ANALYST` is **optional** because the qualified retained
+  event/sentiment evidence it needs may genuinely not exist. Optional does not
+  mean omittable: an optional role with no evidence must report `UNKNOWN`, so the
+  gap is visible in the case outcome rather than absent from it.
+- Each role carries its own `role_version`, prompt template, prompt version, and
+  output-schema version, so one role's instructions can be revised without
+  silently changing another's meaning.
+- A provider family is never a role. `ProviderFamily.INDEPENDENT_REVIEWER` is a
+  reserved *provider* seat and is not a role here.
+
+**Governed model registry (IC-009/IC-010).** A versioned release of role routes.
+Each entry records the role, provider family, exact model id, endpoint, prompt
+and schema hashes, owner, approval state, `effective_from`/`review_by`, reasoning
+mode, token/deadline/cost limits, data-retention route, and optional rollback
+reference.
+
+- A role routes to **one primary plus at most one approved fallback**. There is no
+  chain of escalating models, because an unbounded chain is unbounded spend and
+  an unbounded change of reasoning effort.
+- The fallback receives **the same request, deadline, token reservation, and
+  monetary reservation** as the primary: `shared_budget` derives from the primary,
+  so failing over cannot double a case's ceiling.
+- Only `APPROVED` entries route. `PROVISIONAL` is a bake-off state and is refused
+  rather than usable by accident; `SUSPENDED`/`ROLLED_BACK` are refused; an entry
+  past its `review_by` is refused so "approved once" cannot mean "approved
+  forever"; an entry before `effective_from` is refused.
+- An **unusable fallback is dropped, never substituted** by an unregistered
+  model. An unregistered alias in a route is rejected at construction.
+- `assert_result_served_by_route` refuses a response whose served provider/model
+  is not on the role's route, so an opinion cannot be credited to a model the role
+  was never approved to use.
+
+**Role budgets and results (IC-011).** `RoleBudget` holds deadline, token, cost,
+and concurrency limits for the role (concurrency capped at 4). Deadlines and
+ceilings fail closed. An unknown cost is **not** treated as free: a ceiling that
+cannot be evaluated cannot be enforced.
+
+`RoleSeatResult` carries everything needed to audit one role's advisory output —
+role and role version, stance, thesis, risks, evidence references, missing
+evidence, research action, ordinal confidence and rubric score, status, provider,
+requested and resolved model, prompt version/hash, output-schema version,
+logical observation id, attempt, timing, and the recorded call-outcome
+reference. Concretely:
+
+- an `ANSWERED` result must carry a stance, a thesis, and a resolved model — a
+  status claiming "answered" with nothing behind it would read as agreement;
+- a non-`ANSWERED` result may **not** carry a stance, because a failure is not a
+  vote;
+- a missing confidence or rubric score stays `None` and is never written as zero;
+  an ordinal self-report is never rescaled into a probability;
+- action-bearing fields (`size`, `stop_loss`, `side`, `order`, …) are refused
+  outright, case-insensitively, so an instruction cannot masquerade as research;
+- an evidence citation outside the screened view is refused as a hallucinated
+  reference rather than stored as evidence;
+- `FAILED`, `INVALID`, `UNAVAILABLE`, and `SKIPPED_BUDGET` remain four distinct
+  statuses, so a budget skip and a provider failure never look identical.
+
+### 3B — Contribution to the profitability loop
+
+This slice supplies the **role-attribution** substrate the profitability loop
+requires. It is not yet wired to a live case pipeline, so the loop above is not
+yet closed end-to-end; what it changes is that a role opinion can now be
+attributed to a governed route rather than to an ambient model.
+
 ### 2G — Release-drift refusal on prospective evaluation (`prospective.py`, `store.py`)
 
 Prospective evidence is only comparable when the release that scores it is the
@@ -324,3 +403,17 @@ Streams live under `/app/data/opip/committee/`:
 - **`MIN_ATTRIBUTION_SAMPLES` / `MIN_EVALUATION_SAMPLES` (30) are conventions,
   not inferential guarantees.** They prevent anecdotal claims; they do not make a
   passing sample statistically conclusive.
+
+## Contributor caution: the frozen boundary token scan
+
+`tests/test_opip_decision_safety_v1.py::test_no_ml_dependency_is_introduced`
+lowercases every file under `app/opip/**` and asserts that the substrings
+`xgboost`, `lightgbm`, `shap`, `sklearn`, `scikit`, `torch`, and `tensorflow`
+appear **nowhere**. Ordinary English words trip it — most often
+"authority-*shap*ed" or "action-*shap*ed" in a docstring, which contains `shap`.
+This has broken the suite three times during Module 2 development.
+
+Write **"authority-bearing"** / **"action-bearing"** instead, and run
+`tests/test_opip_decision_safety_v1.py` after any change that touches prose under
+`app/opip/`. The scan is a frozen contract and must not be weakened to
+accommodate wording.
