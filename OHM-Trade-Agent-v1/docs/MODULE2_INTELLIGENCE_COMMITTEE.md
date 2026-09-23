@@ -822,3 +822,22 @@ release rather than on missing implementation:
 Per the reconciliation rule, "awaiting prospective data" is classified above as
 *implementation complete but awaiting real evidence*, not as an implementation
 defect.
+
+### Three-way classification of the remaining requirements
+
+| Class | Requirements | Meaning |
+| --- | --- | --- |
+| **1. Implementation complete (GREEN)** | IC-001 to IC-004, IC-006, IC-007, IC-009 to IC-020, IC-023 to IC-040, IC-044, IC-045 | Implemented with lifecycle evidence and tests at this revision. |
+| **2. Implementation complete, awaiting real evidence** | IC-005, IC-019, IC-020, IC-021, IC-022, IC-041, IC-043 | The contract, the lifecycle, and the tests exist and pass. Each needs live providers, live cases, a real corpus, or a deployed release before it can be *exercised* end to end. Not an implementation defect, and not repairable by more agent work. |
+| **3. Requires OWNER-authorised external action** | IC-008, IC-042 | Cannot be completed without an owner decision: real provider transports with credentials and egress (IC-008), and a deployed isolated shadow worker (IC-042). |
+
+The concrete plans for class 3 are in
+[`MODULE2_EXTERNAL_ACTION_PROPOSALS.md`](MODULE2_EXTERNAL_ACTION_PROPOSALS.md):
+providers and exact model IDs, transport shape, credential placement, egress, cost and
+timeout limits, shadow-only enforcement, and the no-tools/no-trading-credential
+guarantee for IC-008; host and service choice, isolation, read-only evidence, default
+OFF, resource limits, network policy, rollback path, observability, and release-SHA
+binding for IC-042.
+
+**Nothing in either proposal has been activated.** No credential was created, read, or
+moved; no process was deployed; no provider was contacted.
