@@ -374,6 +374,45 @@ def _bash() -> str | None:
     return None
 
 
+#: Windows ``STATUS_DLL_INIT_FAILED``. A Git-bash process that cannot initialize reports
+#: this status with empty stdout and stderr. It is a host process-creation failure, not
+#: a verifier result, and was observed only on this Windows workstation: the same probe
+#: that fails here passed 60/60 when driven directly, and CI runs Linux bash.
+_BASH_LAUNCH_FAILURE = 3221225794
+
+
+def _is_bash_launch_failure(proc: subprocess.CompletedProcess) -> bool:
+    """True when bash never started, rather than started and disagreed.
+
+    Requires the OS status *and* completely empty output. A real verdict always prints a
+    line (``YES``/``NO``, a verdict, or a PASS/FAIL line), so this signature cannot be
+    produced by a genuine classification result and cannot mask one.
+    """
+    return (
+        proc.returncode == _BASH_LAUNCH_FAILURE
+        and not proc.stdout
+        and not proc.stderr
+    )
+
+
+def _run_bash(argv: list[str]) -> subprocess.CompletedProcess:
+    """Run a bash command, retrying only when bash failed to start at all.
+
+    A launch failure carries no output, so a retry can never convert a real verdict into
+    a pass: any attempt that actually ran is returned immediately.
+    """
+    for _ in range(3):
+        proc = subprocess.run(argv, capture_output=True, text=True)
+        if _is_bash_launch_failure(proc):
+            continue
+        return proc
+    pytest.skip(
+        "bash could not be launched on this host "
+        f"(status {_BASH_LAUNCH_FAILURE:#x}); no verdict was produced, so the "
+        "classifier could not be evaluated"
+    )
+
+
 def _source_and_call(
     bash: str, expression: str, *args: str
 ) -> subprocess.CompletedProcess:
@@ -387,24 +426,27 @@ def _source_and_call(
     containing spaces, slashes, or newlines need no fragile quoting.
     """
     script = str(COMMITTEE_DEPLOY / "verify-committee-isolation.sh").replace("\\", "/")
-    return subprocess.run(
+    return _run_bash(
         [
             bash,
             "-c",
             f'set -uo pipefail; source "{script}"; {expression}',
             "opip-verify",
             *args,
-        ],
-        capture_output=True,
-        text=True,
+        ]
     )
 
 
 #: Prints YES/NO for the egress deny-all predicate applied to ``$1``.
 _EGRESS_PROBE = 'if egress_denies_everything "$1"; then printf YES; else printf NO; fi'
-
 #: Prints the timer enablement verdict for exit status ``$1`` and output ``$2``.
 _TIMER_PROBE = 'timer_enablement_verdict "$1" "$2"'
+
+#: Prints the PASS/FAIL line emitted for a verdict, then the failure counter, so the
+#: fail-closed call site is asserted behaviourally rather than by inspection.
+_TIMER_REPORT_PROBE = (
+    'report_timer_enablement "$1" "$2" "$3"; printf "failures=%s" "$failures"'
+)
 
 
 def _require_bash() -> str:
@@ -427,6 +469,13 @@ def _timer_verdict(bash: str, rc: int, raw: str) -> str:
     return proc.stdout.strip()
 
 
+def _timer_report(bash: str, verdict: str, label: str, rc: int) -> str:
+    """The PASS/FAIL line the fail-closed call site emits, plus the failure counter."""
+    proc = _source_and_call(bash, _TIMER_REPORT_PROBE, verdict, label, str(rc))
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout.strip()
+
+
 def test_the_workflow_target_script_is_the_committed_bootstrap() -> None:
     """The invoked path must exist in the release tree and be syntactically valid."""
     bash = _bash()
@@ -439,7 +488,10 @@ def test_the_workflow_target_script_is_the_committed_bootstrap() -> None:
     ):
         script = COMMITTEE_DEPLOY / name
         assert script.exists(), name
-        subprocess.run([bash, "-n", str(script)], check=True)
+        # Routed through the launch-safe runner: a bash that never started must not be
+        # reported as a syntax error.
+        proc = _run_bash([bash, "-n", str(script)])
+        assert proc.returncode == 0, (name, proc.stderr)
 
 
 def test_the_verification_script_proves_every_claim_the_workflow_reports() -> None:
@@ -538,7 +590,10 @@ def test_the_timer_and_service_state_checks_are_proofs_not_advisories() -> None:
     # asserted installed so an unrecognised state cannot mask a missing timer.
     assert "timer_enablement_verdict" in script
     assert "timer_enabled_rc" in script
-    assert 'case "$timer_verdict" in' in script
+    # The enabled/unknown verdicts must reach a FAIL branch. The mapping lives in
+    # `report_timer_enablement` so it is itself behaviourally testable.
+    assert "report_timer_enablement" in script
+    assert 'case "$timer_verdict" in' not in script
     assert 'service_active" == "inactive"' in script
 
 
@@ -689,6 +744,30 @@ def test_a_missing_timer_is_deterministically_not_enabled(state: str) -> None:
 def test_an_unrecognised_enablement_state_fails_closed() -> None:
     bash = _require_bash()
     assert _timer_verdict(bash, 1, "banana") == "unknown"
+
+
+def test_the_call_site_fails_closed_for_an_enabled_verdict() -> None:
+    """An `enabled` verdict must FAIL at the call site, not merely be classified."""
+    bash = _require_bash()
+    report = _timer_report(bash, "enabled", "enabled", 0)
+    assert report.startswith("FAIL"), report
+    assert "failures=1" in report, report
+
+
+def test_the_call_site_fails_closed_for_an_unrecognised_verdict() -> None:
+    """`unknown` must reach the FAIL branch, so nothing can pass by default."""
+    bash = _require_bash()
+    report = _timer_report(bash, "unknown", "banana", 1)
+    assert report.startswith("FAIL"), report
+    assert "failures=1" in report, report
+
+
+def test_the_call_site_passes_only_for_a_not_enabled_verdict() -> None:
+    """Only `not_enabled` may reach the PASS branch, and it must not count a failure."""
+    bash = _require_bash()
+    report = _timer_report(bash, "not_enabled", "disabled", 1)
+    assert report.startswith("PASS"), report
+    assert "failures=0" in report, report
 
 
 def test_the_verifier_still_requires_the_timer_inactive_and_the_oneshot_inert() -> None:

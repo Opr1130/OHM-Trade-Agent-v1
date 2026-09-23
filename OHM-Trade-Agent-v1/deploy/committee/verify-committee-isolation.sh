@@ -105,6 +105,28 @@ timer_enablement_verdict() {
   return 0
 }
 
+#: Emit the PASS/FAIL verdict for the timer enablement check.
+#:
+#: Kept as a function so the fail-closed call site is itself testable: an `enabled`
+#: or unrecognised verdict must FAIL, and only `not_enabled` may pass. Testing the
+#: classifier alone would leave this mapping unpinned.
+report_timer_enablement() {
+  local verdict="$1"
+  local state_label="$2"
+  local status="$3"
+  case "$verdict" in
+    enabled)
+      fail "timer is enabled (state: ${state_label:-none}): scheduled committee execution is active"
+      ;;
+    not_enabled)
+      pass "timer is not enabled (state: ${state_label:-none}): no scheduled committee execution"
+      ;;
+    *)
+      fail "timer enablement state is unrecognised (state: ${state_label:-none}, rc=$status)"
+      ;;
+  esac
+}
+
 # When sourced for testing, stop after the definitions: everything below asserts the
 # state of a real host and must not run in a test process.
 if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
@@ -318,17 +340,7 @@ timer_enabled_raw="$(systemctl is-enabled "$TIMER" 2>/dev/null)"
 timer_enabled_rc=$?
 timer_verdict="$(timer_enablement_verdict "$timer_enabled_rc" "$timer_enabled_raw")"
 timer_state_label="${timer_enabled_raw//$'\n'/ }"
-case "$timer_verdict" in
-  enabled)
-    fail "timer is enabled (state: ${timer_state_label:-none}): scheduled committee execution is active"
-    ;;
-  not_enabled)
-    pass "timer is not enabled (state: ${timer_state_label:-none}): no scheduled committee execution"
-    ;;
-  *)
-    fail "timer enablement state is unrecognised (state: ${timer_state_label:-none}, rc=$timer_enabled_rc)"
-    ;;
-esac
+report_timer_enablement "$timer_verdict" "$timer_state_label" "$timer_enabled_rc"
 timer_active="$(systemctl show -p ActiveState --value "$TIMER" 2>/dev/null || echo "$UNKNOWN_STATE")"
 if [[ "$timer_active" == "inactive" || "$timer_active" == "$UNKNOWN_STATE" ]]; then
   pass "timer is inactive (state: $timer_active)"
