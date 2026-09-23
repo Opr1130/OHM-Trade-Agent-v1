@@ -130,7 +130,6 @@ def _build_case(release_sha: str) -> CommitteeCase:
         evidence_id="CANARY-EVIDENCE-1",
         source_id="synthetic-credential-canary",
         available_at=CANARY_FIXTURE_TIME,
-        observed_at=CANARY_FIXTURE_TIME,
         payload={
             "metric_name": "transport_contract_fixture",
             "metric_value": "1",
@@ -189,7 +188,7 @@ def _providers(
         poster=poster,
         credentials=credentials,
         models=APPROVED_SHADOW_MODELS,
-        reasoning_effort=APPROVED_SHADOW_REASONING_MODE.value,
+        reasoning_effort=APPROVED_SHADOW_REASONING_MODE.value.lower(),
         max_output_tokens=APPROVED_MAX_OUTPUT_TOKENS,
         timeout_seconds=APPROVED_DEADLINE_SECONDS,
         price_book=price_book,
