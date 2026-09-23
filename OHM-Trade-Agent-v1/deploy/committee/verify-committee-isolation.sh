@@ -20,11 +20,15 @@ EVIDENCE_ROOT="${OPIP_COMMITTEE_EVIDENCE_ROOT:-/var/lib/opip-learning}"
 #: this script must never print a credential, an environment file, or the environment.
 PROVIDER_CREDENTIAL_NAMES='OPIP_COMMITTEE_OPENAI_API_KEY|OPIP_COMMITTEE_ANTHROPIC_API_KEY'
 
+#: Reported when a systemd property cannot be read. A single constant keeps the
+#: wording identical at every call site, so no check can drift from the others.
+UNKNOWN_STATE='unknown'
+
 failures=0
 
-pass() { printf 'PASS  %s\n' "$1"; }
-fail() { printf 'FAIL  %s\n' "$1"; failures=$((failures + 1)); }
-info() { printf 'INFO  %s\n' "$1"; }
+pass() { printf 'PASS  %s\n' "$1"; return 0; }
+fail() { printf 'FAIL  %s\n' "$1"; failures=$((failures + 1)); return 0; }
+info() { printf 'INFO  %s\n' "$1"; return 0; }
 
 # --------------------------------------------------------------- release identity
 expected_sha="$(sed -n 's/^OPIP_COMMITTEE_RELEASE_SHA=//p' "$ENV_FILE" 2>/dev/null | head -n1)"
@@ -80,7 +84,7 @@ if compgen -G '/proc/*/mountinfo' >/dev/null; then
   if [[ "$ro_mount" == *ro* || "$ro_mount" == *"read-only"* ]]; then
     pass "evidence root is mounted read-only: $EVIDENCE_ROOT"
   else
-    info "evidence root options: ${ro_mount:-unknown} — confirm read-only at the unit level"
+    info "evidence root options: ${ro_mount:-$UNKNOWN_STATE} — confirm read-only at the unit level"
   fi
 fi
 unit_ro="$(systemctl show -p ReadOnlyPaths --value "$UNIT" 2>/dev/null || echo '')"
@@ -223,19 +227,19 @@ fi
 # The initial OFF installation must leave the timer disabled and inactive, and the
 # oneshot service must not be continuously active: no recurring committee work runs.
 timer_state="$(systemctl is-enabled "$TIMER" 2>/dev/null || echo 'not-installed')"
-timer_active="$(systemctl show -p ActiveState --value "$TIMER" 2>/dev/null || echo 'unknown')"
+timer_active="$(systemctl show -p ActiveState --value "$TIMER" 2>/dev/null || echo "$UNKNOWN_STATE")"
 if [[ "$timer_state" == "disabled" || "$timer_state" == "not-installed" ]]; then
   pass "timer is not enabled (state: $timer_state): no scheduled committee execution"
 else
   fail "timer enablement is '$timer_state', expected disabled for an OFF installation"
 fi
-if [[ "$timer_active" == "inactive" || "$timer_active" == "unknown" ]]; then
+if [[ "$timer_active" == "inactive" || "$timer_active" == "$UNKNOWN_STATE" ]]; then
   pass "timer is inactive (state: $timer_active)"
 else
   fail "timer active state is '$timer_active', expected inactive"
 fi
-service_active="$(systemctl show -p ActiveState --value "$UNIT" 2>/dev/null || echo 'unknown')"
-service_sub="$(systemctl show -p SubState --value "$UNIT" 2>/dev/null || echo 'unknown')"
+service_active="$(systemctl show -p ActiveState --value "$UNIT" 2>/dev/null || echo "$UNKNOWN_STATE")"
+service_sub="$(systemctl show -p SubState --value "$UNIT" 2>/dev/null || echo "$UNKNOWN_STATE")"
 if [[ "$service_active" == "inactive" ]]; then
   pass "service is not continuously active (oneshot: $service_active/$service_sub)"
 else
