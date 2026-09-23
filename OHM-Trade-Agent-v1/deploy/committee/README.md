@@ -102,3 +102,28 @@ Before deploying, OWNER confirms:
 3. The provider credentials exist at the declared path and nowhere else.
 4. Mode remains `off` at install time, with activation as a separate decision.
 5. The rollback trigger and who invokes it.
+
+## Deployment path
+
+Installation goes through the owner-gated control plane, not a manual SSH path:
+
+```text
+/deploy-committee <40-char-main-sha>
+```
+
+`.github/workflows/deploy-committee.yml` mirrors `deploy-learning.yml`: owner-gated
+issue-comment trigger on issue 64, `author_association == 'OWNER'`, exact 40-character
+SHA, target must equal current `main`, exact-SHA `pytest.yml` must be successful, a
+dedicated protected `committee-shadow` environment, and a pinned SSH identity built
+from the existing learning-host connection secrets. It reuses that established host
+identity deliberately and discovers no local workstation credential.
+
+The workflow **installs and verifies only**. It checks out the exact approved release,
+invokes only the committed bootstrap from that release tree, uploads nothing but the
+release tarball, proves isolation with `verify-committee-isolation.sh`, publishes a
+receipt, cleans the remote release directory, and fails closed unless both the install
+and the isolation proof succeeded.
+
+It does not merge, does not activate credentialled SHADOW calls, enables no provider
+execution, and carries no provider API key. The `OFF -> credentialled SHADOW`
+transition requires a separate OWNER-authorised action with its own validation.
