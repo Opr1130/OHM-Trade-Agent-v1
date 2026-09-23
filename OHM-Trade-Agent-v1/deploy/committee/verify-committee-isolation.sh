@@ -30,6 +30,113 @@ pass() { printf 'PASS  %s\n' "$1"; return 0; }
 fail() { printf 'FAIL  %s\n' "$1"; failures=$((failures + 1)); return 0; }
 info() { printf 'INFO  %s\n' "$1"; return 0; }
 
+#: True when a systemd `IPAddressDeny` value denies every address in both families.
+#:
+#: The committed unit declares `IPAddressDeny=any`, but `systemctl show` normalises
+#: that to the two all-addresses entries (`0.0.0.0/0 ::/0`). Accept the literal
+#: source spelling and the normalised form, and require BOTH families explicitly so a
+#: partial policy (IPv4-only or IPv6-only) cannot pass.
+egress_denies_everything() {
+  local deny_value="$1"
+  local -a tokens=()
+  # shellcheck disable=SC2206
+  read -r -a tokens <<< "$deny_value"
+  local token saw_v4="false" saw_v6="false"
+  for token in ${tokens[@]+"${tokens[@]}"}; do
+    case "$token" in
+      # `any` is total on its own: it covers both families.
+      any) return 0 ;;
+      0.0.0.0/0) saw_v4="true" ;;
+      ::/0) saw_v6="true" ;;
+      *)
+        # Any other entry denies only part of the space, so it contributes no coverage.
+        # Both family flags must still be set for the policy to count as deny-all.
+        : ;;
+    esac
+  done
+  [[ "$saw_v4" == "true" && "$saw_v6" == "true" ]]
+}
+
+#: Enablement states that mean scheduled execution is active. Any of these fails.
+TIMER_ENABLED_STATES='enabled enabled-runtime linked linked-runtime alias indirect'
+
+#: Enablement states that mean no scheduled execution. Any of these is acceptable.
+TIMER_INERT_STATES='disabled masked masked-runtime'
+
+#: Classify `systemctl is-enabled` for the timer as enabled | not_enabled | unknown.
+#:
+#: `systemctl is-enabled` prints `disabled` and still exits non-zero, so the exit
+#: status is captured separately rather than used as an `|| echo` fallback, which
+#: appended a second line and corrupted the value. Only the first non-empty line is
+#: the verdict. Explicit known states are classified first. Any other zero-status
+#: result fails closed as enabled; empty or unrecognised non-zero results are unknown
+#: and therefore fail at the reporting boundary.
+timer_enablement_verdict() {
+  local status="$1"
+  local raw="$2"
+  local state=""
+  while IFS= read -r line; do
+    if [[ -n "$line" ]]; then
+      state="$line"
+      break
+    fi
+  done <<< "$raw"
+  local candidate
+  for candidate in $TIMER_ENABLED_STATES; do
+    if [[ "$state" == "$candidate" ]]; then
+      printf 'enabled\n'
+      return 0
+    fi
+  done
+  for candidate in $TIMER_INERT_STATES; do
+    if [[ "$state" == "$candidate" ]]; then
+      printf 'not_enabled\n'
+      return 0
+    fi
+  done
+  if [[ "$status" -eq 0 ]]; then
+    # An unrecognised successful is-enabled result is unsafe to treat as inert.
+    printf 'enabled\n'
+    return 0
+  fi
+  if [[ -z "$state" ]]; then
+    # A failed query with no reported state proves nothing about timer enablement.
+    printf 'unknown\n'
+    return 0
+  fi
+  printf 'unknown\n'
+  return 0
+}
+
+#: Emit the PASS/FAIL verdict for the timer enablement check.
+#:
+#: Kept as a function so the fail-closed call site is itself testable: an `enabled`
+#: or unrecognised verdict must FAIL, and only `not_enabled` may pass. Testing the
+#: classifier alone would leave this mapping unpinned.
+report_timer_enablement() {
+  local verdict="$1"
+  local state_label="$2"
+  local status="$3"
+  case "$verdict" in
+    enabled)
+      fail "timer is enabled (state: ${state_label:-none}): scheduled committee execution is active"
+      ;;
+    not_enabled)
+      pass "timer is not enabled (state: ${state_label:-none}): no scheduled committee execution"
+      ;;
+    *)
+      fail "timer enablement state is unrecognised (state: ${state_label:-none}, rc=$status)"
+      ;;
+  esac
+  return 0
+}
+
+# When sourced for testing, stop after the definitions: everything below asserts the
+# state of a real host and must not run in a test process.
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
+  return 0
+fi
+
 # --------------------------------------------------------------- release identity
 expected_sha="$(sed -n 's/^OPIP_COMMITTEE_RELEASE_SHA=//p' "$ENV_FILE" 2>/dev/null | head -n1)"
 if [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]]; then
@@ -200,10 +307,10 @@ fi
 # egress belongs to the later, separately OWNER-authorised SHADOW activation.
 unit_deny="$(systemctl show -p IPAddressDeny --value "$UNIT" 2>/dev/null || echo '')"
 unit_allow="$(systemctl show -p IPAddressAllow --value "$UNIT" 2>/dev/null || echo '')"
-if [[ "$unit_deny" == "any" ]]; then
-  pass "egress is deny-all at the unit level (IPAddressDeny=any)"
+if egress_denies_everything "$unit_deny"; then
+  pass "egress is deny-all at the unit level (observed: ${unit_deny:-none})"
 else
-  fail "egress deny rule is '${unit_deny:-none}', expected 'any'"
+  fail "egress deny rule '${unit_deny:-none}' does not deny every address in both families"
 fi
 if [[ -z "$unit_allow" ]]; then
   pass "no egress allowlist entries: OFF-mode egress fails closed"
@@ -226,17 +333,23 @@ fi
 # ------------------------------------------- scheduled execution is off
 # The initial OFF installation must leave the timer disabled and inactive, and the
 # oneshot service must not be continuously active: no recurring committee work runs.
-timer_state="$(systemctl is-enabled "$TIMER" 2>/dev/null || echo 'not-installed')"
-timer_active="$(systemctl show -p ActiveState --value "$TIMER" 2>/dev/null || echo "$UNKNOWN_STATE")"
-if [[ "$timer_state" == "disabled" || "$timer_state" == "not-installed" ]]; then
-  pass "timer is not enabled (state: $timer_state): no scheduled committee execution"
+# The installed timer FILE is asserted too, so an unrecognised/empty enablement state
+# cannot mask a genuinely missing timer.
+if [[ -f "$UNIT_DIR/$TIMER" ]]; then
+  pass "the timer unit file is installed"
 else
-  fail "timer enablement is '$timer_state', expected disabled for an OFF installation"
+  fail "the timer unit file is not installed"
 fi
-if [[ "$timer_active" == "inactive" || "$timer_active" == "$UNKNOWN_STATE" ]]; then
+timer_enabled_raw="$(systemctl is-enabled "$TIMER" 2>/dev/null)"
+timer_enabled_rc=$?
+timer_verdict="$(timer_enablement_verdict "$timer_enabled_rc" "$timer_enabled_raw")"
+timer_state_label="${timer_enabled_raw//$'\n'/ }"
+report_timer_enablement "$timer_verdict" "$timer_state_label" "$timer_enabled_rc"
+timer_active="$(systemctl show -p ActiveState --value "$TIMER" 2>/dev/null || echo "$UNKNOWN_STATE")"
+if [[ "$timer_active" == "inactive" ]]; then
   pass "timer is inactive (state: $timer_active)"
 else
-  fail "timer active state is '$timer_active', expected inactive"
+  fail "timer active state is '$timer_active', expected explicit inactive"
 fi
 service_active="$(systemctl show -p ActiveState --value "$UNIT" 2>/dev/null || echo "$UNKNOWN_STATE")"
 service_sub="$(systemctl show -p SubState --value "$UNIT" 2>/dev/null || echo "$UNKNOWN_STATE")"
