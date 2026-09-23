@@ -404,7 +404,41 @@ are seen*:
   retrospective and ineligible records by construction rather than by a filter a
   caller might forget.
 
-### 3G — Contribution to the profitability loop
+### 3G — Weakness Finding Registry (IC-029 to IC-034, `weakness.py`)
+
+A weakness is not prose. It is a durable, structured record that can be validated
+against a realised outcome, attributed to the role and model that discovered it,
+and later checked for recurrence.
+
+- **The original finding is immutable.** A finding is never edited. Validation,
+  remediation, and post-change evidence are *appended*, so history reads as a
+  sequence rather than a state that silently changes meaning. A duplicate
+  `finding_id` is refused rather than replaced.
+- **The committee cannot certify itself.** `ValidatorKind.COMMITTEE_MODEL` is
+  declared and explicitly refused: a model asserting its own finding is not
+  evidence. A `VALIDATED` or `REJECTED` validation must reference the realised
+  outcome it was judged against, and `PENDING` is the *absence* of a validation
+  rather than a kind of one.
+- **Taxonomy is versioned and additive.** Every finding records the taxonomy
+  version in force when it was raised, on both the finding and its recurrence key,
+  so a later taxonomy change cannot retroactively re-label history. `OTHER` must
+  carry a specific structured statement — it is an escape hatch, not a way to
+  avoid categorising.
+- **Recurrence is scope-bound.** A recurrence key carries an explicit scope and
+  subject, so two slippage incidents on different instruments are two incidents,
+  not one recurring pattern. Recurrence requires at least two occurrences.
+- **Unknown stays unknown.** An economic effect that was not legitimately measured
+  is `None`, never zero, and `validated_economic_effect` returns `None` for an
+  unvalidated finding. Reporting an unmeasured weakness as costing nothing would
+  make the weakest evidence look like the strongest.
+- **Attribution is recorded.** A finding carries its committee role, provider,
+  model, prompt/policy version, case id, paper trade id, and baseline decision
+  reference, which is what makes a role's discovery contribution measurable.
+- **State is derived, not stored**: the current state comes from appended history
+  (latest validation wins; none means `PENDING`), and `summary()` reports every
+  state even at zero.
+
+### 3H — Contribution to the profitability loop
 
 This slice supplies the **role-attribution** substrate the profitability loop
 requires. It is not yet wired to a live case pipeline, so the loop above is not
