@@ -374,6 +374,59 @@ def _bash() -> str | None:
     return None
 
 
+def _source_and_call(
+    bash: str, expression: str, *args: str
+) -> subprocess.CompletedProcess:
+    """Source the real verifier and evaluate ``expression`` against its helpers.
+
+    The script returns after its pure definitions when it is sourced rather than
+    executed, so no assertion about a real host runs in a test process; only the
+    classifier functions defined above the guard are reachable.
+
+    Extra ``args`` arrive as positional parameters (``$1``, ``$2``, ...) so values
+    containing spaces, slashes, or newlines need no fragile quoting.
+    """
+    script = str(COMMITTEE_DEPLOY / "verify-committee-isolation.sh").replace("\\", "/")
+    return subprocess.run(
+        [
+            bash,
+            "-c",
+            f'set -uo pipefail; source "{script}"; {expression}',
+            "opip-verify",
+            *args,
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+
+#: Prints YES/NO for the egress deny-all predicate applied to ``$1``.
+_EGRESS_PROBE = 'if egress_denies_everything "$1"; then printf YES; else printf NO; fi'
+
+#: Prints the timer enablement verdict for exit status ``$1`` and output ``$2``.
+_TIMER_PROBE = 'timer_enablement_verdict "$1" "$2"'
+
+
+def _require_bash() -> str:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("no bash available to exercise the verifier classifiers")
+    return bash
+
+
+def _egress_result(bash: str, value: str) -> str:
+    proc = _source_and_call(bash, _EGRESS_PROBE, value)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() in {"YES", "NO"}, (proc.stdout, proc.stderr)
+    return proc.stdout.strip()
+
+
+def _timer_verdict(bash: str, rc: int, raw: str) -> str:
+    proc = _source_and_call(bash, _TIMER_PROBE, str(rc), raw)
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout.strip()
+
+
 def test_the_workflow_target_script_is_the_committed_bootstrap() -> None:
     """The invoked path must exist in the release tree and be syntactically valid."""
     bash = _bash()
@@ -480,7 +533,12 @@ def test_the_timer_and_service_state_checks_are_proofs_not_advisories() -> None:
     assert "fail " in timer_block
     assert "is-enabled" in timer_block
     assert "ActiveState" in timer_block
-    assert 'timer_state" == "disabled"' in script
+    # IC-042 fix: the enablement verdict is derived from the exit status captured
+    # separately (a disabled timer exits non-zero), and the timer unit file is
+    # asserted installed so an unrecognised state cannot mask a missing timer.
+    assert "timer_enablement_verdict" in script
+    assert "timer_enabled_rc" in script
+    assert 'case "$timer_verdict" in' in script
     assert 'service_active" == "inactive"' in script
 
 
@@ -527,3 +585,121 @@ def test_the_credentials_template_declares_no_real_credential() -> None:
     assert len(credential_lines) == 2
     for line in credential_lines:
         assert line.endswith("=CHANGEME"), line
+
+
+# ---------------------------------------------------------------------------
+# IC-042 isolation-verifier false-negative regression (owner-approved OFF deploy)
+#
+# The live OFF-mode run (workflow run 35915669263) installed cleanly but reported
+# `ISOLATION_PROOF=FAIL failures=2` for a correctly isolated host. Both failures
+# were defects in the VERIFIER, not the host:
+#
+#   1. `systemctl show` normalises `IPAddressDeny=any` to `0.0.0.0/0 ::/0`, which
+#      the verifier compared against the literal source spelling.
+#   2. `systemctl is-enabled` prints `disabled` AND exits non-zero, so the
+#      `|| echo 'not-installed'` fallback appended a second line and corrupted the
+#      value into `disabled\nnot-installed`, matching neither allowed value.
+#
+# These tests exercise the real classifiers through bash with the exact live values,
+# so either false negative would fail loudly if it returned.
+# ---------------------------------------------------------------------------
+
+
+def test_the_egress_predicate_accepts_the_literal_deny_all_spelling() -> None:
+    bash = _require_bash()
+    assert _egress_result(bash, "any") == "YES"
+
+
+def test_the_egress_predicate_accepts_the_systemd_normalised_deny_all_value() -> None:
+    """The exact live value: systemd normalises `IPAddressDeny=any` for `show`."""
+    bash = _require_bash()
+    assert _egress_result(bash, "0.0.0.0/0 ::/0") == "YES"
+
+
+def test_the_egress_predicate_requires_both_families_not_a_substring() -> None:
+    """Reversed order also passes, proving the check is family-based, not textual."""
+    bash = _require_bash()
+    assert _egress_result(bash, "::/0 0.0.0.0/0") == "YES"
+
+
+@pytest.mark.parametrize(
+    "partial",
+    [
+        "0.0.0.0/0",  # IPv4 all-addresses only
+        "::/0",  # IPv6 all-addresses only
+        "",  # empty / unset
+        "10.0.0.0/8 ::/0",  # a scoped IPv4 prefix alongside IPv6 all-addresses
+    ],
+)
+def test_the_egress_predicate_rejects_anything_that_is_not_total(partial: str) -> None:
+    bash = _require_bash()
+    assert _egress_result(bash, partial) == "NO"
+
+
+def test_the_committed_unit_still_declares_deny_all_and_no_allowlist() -> None:
+    """The predicate now tolerates the normalised form; the unit must still deny all.
+
+    A partial policy must not slip through the classifier, and the installed artifact
+    must still request a total deny with no allowlist entry.
+    """
+    service = (COMMITTEE_DEPLOY / "opip-committee-shadow.service").read_text(
+        encoding="utf-8"
+    )
+    assert "IPAddressDeny=any" in service
+    allow_lines = [
+        line for line in service.splitlines() if line.strip().startswith("IPAddressAllow=")
+    ]
+    assert allow_lines == [], allow_lines
+
+
+def test_the_disabled_timer_state_that_also_exits_nonzero_is_not_enabled() -> None:
+    """The exact live case: `systemctl is-enabled` prints `disabled`, rc != 0."""
+    bash = _require_bash()
+    assert _timer_verdict(bash, 1, "disabled") == "not_enabled"
+
+
+def test_a_multiline_corrupted_enablement_value_still_classifies_as_not_enabled() -> None:
+    """The old `|| echo` fallback produced `disabled\\nnot-installed`; first line wins."""
+    bash = _require_bash()
+    assert _timer_verdict(bash, 1, "disabled\nnot-installed") == "not_enabled"
+
+
+@pytest.mark.parametrize(
+    "state", ["enabled", "enabled-runtime", "linked", "linked-runtime"]
+)
+def test_an_enabled_timer_state_is_reported_as_enabled(state: str) -> None:
+    bash = _require_bash()
+    # `enabled` is the canonical rc-0 case; the runtime/linked variants can report a
+    # non-zero status, so exercise those at rc 1 to prove the state text still trips.
+    rc = 0 if state == "enabled" else 1
+    assert _timer_verdict(bash, rc, state) == "enabled"
+
+
+def test_a_zero_exit_status_dominates_so_an_enabled_timer_cannot_be_hidden() -> None:
+    bash = _require_bash()
+    assert _timer_verdict(bash, 0, "") == "enabled"
+
+
+@pytest.mark.parametrize("state", ["not-found", ""])
+def test_a_missing_timer_is_deterministically_not_enabled(state: str) -> None:
+    bash = _require_bash()
+    assert _timer_verdict(bash, 1, state) == "not_enabled"
+
+
+def test_an_unrecognised_enablement_state_fails_closed() -> None:
+    bash = _require_bash()
+    assert _timer_verdict(bash, 1, "banana") == "unknown"
+
+
+def test_the_verifier_still_requires_the_timer_inactive_and_the_oneshot_inert() -> None:
+    """The two checks that PASSED live must keep their exact contract."""
+    script = (COMMITTEE_DEPLOY / "verify-committee-isolation.sh").read_text(
+        encoding="utf-8"
+    )
+    assert 'timer_active" == "inactive"' in script
+    assert 'service_active" == "inactive"' in script
+    # Asserting the timer FILE is installed is what makes the not_enabled tolerance
+    # for an empty enablement state safe: a genuinely missing timer still fails.
+    assert "the timer unit file is not installed" in script
+    # The script can be sourced for testing without running a host assertion.
+    assert 'if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then' in script
