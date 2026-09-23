@@ -787,6 +787,7 @@ def test_the_verifier_still_requires_the_timer_inactive_and_the_oneshot_inert() 
         encoding="utf-8"
     )
     assert 'timer_active" == "inactive"' in script
+    assert 'timer_active" == "$UNKNOWN_STATE"' not in script
     assert 'service_active" == "inactive"' in script
     # Asserting the timer FILE is installed is what makes the not_enabled tolerance
     # for an empty enablement state safe: a genuinely missing timer still fails.
