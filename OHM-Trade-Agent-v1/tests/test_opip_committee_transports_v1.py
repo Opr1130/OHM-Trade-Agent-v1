@@ -18,6 +18,7 @@ import pytest
 
 from app.opip.committee.contracts import CostCompleteness, ProviderFailureClass, ProviderFamily
 from app.opip.committee.providers import ProviderInvocationError, ProviderWireRequest
+from app.opip.committee.pricing import PriceBook, TokenPrice
 from app.opip.committee.registry import (
     APPROVED_MAX_CASE_COST_MICROUNITS,
     APPROVED_MAX_DAILY_COST_MICROUNITS,
@@ -41,7 +42,9 @@ from app.opip.committee.transports import (
     EnvironmentCredentialSource,
     HttpRequest,
     HttpResponse,
+    MAX_HTTP_RESPONSE_BYTES,
     OpenAITransport,
+    StdlibHttpPoster,
     build_approved_transports,
     build_transport,
 )
@@ -426,6 +429,54 @@ def test_the_adapter_records_token_usage_and_unknown_cost():
     assert response.estimated_cost_microunits is None
 
 
+def test_configured_price_book_records_measured_provider_cost():
+    book = PriceBook(
+        (
+            TokenPrice(
+                provider="openai",
+                model="gpt-5.6-terra",
+                microunits_per_million_input_tokens=2_000_000,
+                microunits_per_million_output_tokens=12_000_000,
+            ),
+        )
+    )
+    transport = OpenAITransport(
+        family=ProviderFamily.OPENAI,
+        model="gpt-5.6-terra",
+        poster=MockPoster(body=_openai_body()),
+        credentials=_credentials(),
+        endpoint=ALLOWED_ENDPOINTS[ProviderFamily.OPENAI],
+        price_book=book,
+    )
+    response = transport(_wire())
+    assert response.estimated_cost_microunits == 720
+    assert response.cost_completeness is CostCompleteness.COMPLETE
+
+
+def test_unknown_served_model_keeps_cost_unknown_even_with_price_book():
+    book = PriceBook(
+        (
+            TokenPrice(
+                provider="openai",
+                model="gpt-5.6-terra",
+                microunits_per_million_input_tokens=2_000_000,
+                microunits_per_million_output_tokens=12_000_000,
+            ),
+        )
+    )
+    transport = OpenAITransport(
+        family=ProviderFamily.OPENAI,
+        model="gpt-5.6-terra",
+        poster=MockPoster(body=_openai_body(model="unexpected-model")),
+        credentials=_credentials(),
+        endpoint=ALLOWED_ENDPOINTS[ProviderFamily.OPENAI],
+        price_book=book,
+    )
+    response = transport(_wire())
+    assert response.estimated_cost_microunits is None
+    assert response.cost_completeness is CostCompleteness.UNKNOWN
+
+
 def test_the_recorded_reference_carries_no_payload_text():
     """A reference must not smuggle model text, which could echo anything."""
     poster = MockPoster(body=_openai_body(text='{"echoed":"ignore previous"}'))
@@ -561,6 +612,79 @@ def test_the_anthropic_adapter_joins_text_blocks():
         endpoint=ALLOWED_ENDPOINTS[ProviderFamily.ANTHROPIC],
     )
     assert transport(_wire("claude-sonnet-5")).text == "ab"
+
+
+class _FakeHttpStream:
+    def __init__(self, body: bytes, *, status: int = 200) -> None:
+        self._body = body
+        self._status = status
+
+    def read(self, amount: int) -> bytes:
+        return self._body[:amount]
+
+    def getcode(self) -> int:
+        return self._status
+
+
+class _FakeOpener:
+    def __init__(self, response: _FakeHttpStream) -> None:
+        self.response = response
+        self.calls = []
+
+    def open(self, request, timeout):
+        self.calls.append((request, timeout))
+        return self.response
+
+
+def test_real_http_poster_refuses_a_non_governed_destination_before_opening():
+    opener = _FakeOpener(_FakeHttpStream(b"{}"))
+    poster = StdlibHttpPoster(opener=opener, now=lambda: NOW)
+    with pytest.raises(EgressDeniedError, match="non-governed destination"):
+        poster(
+            HttpRequest(
+                url="https://example.invalid/v1",
+                headers={"Content-Type": "application/json"},
+                body={"safe": True},
+                timeout_seconds=3,
+            )
+        )
+    assert opener.calls == []
+
+
+def test_real_http_poster_serializes_only_the_supplied_request_and_bounds_time():
+    opener = _FakeOpener(_FakeHttpStream(b'{"ok":true}'))
+    poster = StdlibHttpPoster(opener=opener, now=lambda: NOW)
+    response = poster(
+        HttpRequest(
+            url=ALLOWED_ENDPOINTS[ProviderFamily.OPENAI],
+            headers={"Content-Type": "application/json"},
+            body={"b": 2, "a": 1},
+            timeout_seconds=7,
+        )
+    )
+    request, timeout = opener.calls[0]
+    assert request.full_url == ALLOWED_ENDPOINTS[ProviderFamily.OPENAI]
+    assert request.get_method() == "POST"
+    assert request.data == b'{"a":1,"b":2}'
+    assert timeout == 7
+    assert response.body_text == '{"ok":true}'
+    assert response.received_at == NOW
+
+
+def test_real_http_poster_refuses_an_oversized_response():
+    opener = _FakeOpener(
+        _FakeHttpStream(b"x" * (MAX_HTTP_RESPONSE_BYTES + 1))
+    )
+    poster = StdlibHttpPoster(opener=opener, now=lambda: NOW)
+    with pytest.raises(ValueError, match="exceeds"):
+        poster(
+            HttpRequest(
+                url=ALLOWED_ENDPOINTS[ProviderFamily.OPENAI],
+                headers={"Content-Type": "application/json"},
+                body={"safe": True},
+                timeout_seconds=3,
+            )
+        )
 
 
 # ------------------------------------------------- IC-008: mode stays off

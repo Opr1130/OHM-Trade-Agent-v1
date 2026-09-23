@@ -31,9 +31,12 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any, Mapping, Protocol
+from datetime import datetime, timezone
+from typing import Any, Callable, Mapping, Protocol
+from urllib.error import HTTPError, URLError
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request as UrlRequest, build_opener
 
 from app.opip.committee.contracts import (
     CostCompleteness,
@@ -45,6 +48,7 @@ from app.opip.committee.providers import (
     ProviderRawResponse,
     ProviderWireRequest,
 )
+from app.opip.committee.pricing import PriceBook
 from app.opip.decision_intelligence.serialization import require_utc
 
 #: The exact endpoints the approved adapters may reach. Declared as data so the
@@ -64,6 +68,91 @@ CREDENTIAL_ENV_NAMES: Mapping[ProviderFamily, str] = {
 #: The declared API version header for the Anthropic adapter, pinned so a silent
 #: server-side default cannot change the contract under the registry's feet.
 ANTHROPIC_API_VERSION = "2023-06-01"
+
+#: A structured opinion bounded to 1,200 output tokens should be far below this.
+#: The limit is nevertheless enforced before decoding so a provider or intermediary
+#: cannot make the worker buffer an unbounded body.
+MAX_HTTP_RESPONSE_BYTES = 1_048_576
+
+
+class _NoRedirectHandler(HTTPRedirectHandler):
+    """Refuse redirects so an allowlisted URL cannot bounce to another host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        return None
+
+
+def _read_bounded_text(stream: Any, *, limit: int) -> str:
+    raw = stream.read(limit + 1)
+    if len(raw) > limit:
+        raise ValueError(f"provider HTTP response exceeds {limit} bytes")
+    return raw.decode("utf-8", errors="strict")
+
+
+class StdlibHttpPoster:
+    """Minimal real HTTPS POST client for the credentialled canary.
+
+    It accepts only the exact governed provider endpoints, ignores process proxy
+    configuration, refuses redirects, bounds response bytes, uses the platform TLS
+    verifier, and exposes no retry. Provider retry remains owned by the governed
+    runtime rather than by the network client.
+    """
+
+    def __init__(
+        self,
+        *,
+        opener: Any | None = None,
+        now: Callable[[], datetime] | None = None,
+        max_response_bytes: int = MAX_HTTP_RESPONSE_BYTES,
+    ) -> None:
+        if type(max_response_bytes) is not int or max_response_bytes < 1:
+            raise ValueError("max_response_bytes must be a positive integer")
+        self._opener = opener or build_opener(ProxyHandler({}), _NoRedirectHandler())
+        self._now = now or (lambda: datetime.now(timezone.utc))
+        self._max_response_bytes = max_response_bytes
+
+    def __call__(self, request: "HttpRequest") -> "HttpResponse":
+        if request.url not in set(ALLOWED_ENDPOINTS.values()):
+            raise EgressDeniedError(
+                f"real HTTP poster refuses non-governed destination {request.url!r}"
+            )
+        payload = json.dumps(
+            dict(request.body), sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        outgoing = UrlRequest(
+            request.url,
+            data=payload,
+            headers=dict(request.headers),
+            method="POST",
+        )
+        try:
+            response = self._opener.open(
+                outgoing, timeout=request.timeout_seconds
+            )
+            body = _read_bounded_text(
+                response, limit=self._max_response_bytes
+            )
+            return HttpResponse(
+                status_code=int(response.getcode()),
+                body_text=body,
+                received_at=self._now(),
+            )
+        except HTTPError as exc:
+            # Redirects arrive here because _NoRedirectHandler refuses to follow
+            # them. Returning the status lets the adapter classify it without ever
+            # contacting the Location target.
+            body = _read_bounded_text(exc, limit=self._max_response_bytes)
+            return HttpResponse(
+                status_code=int(exc.code),
+                body_text=body,
+                received_at=self._now(),
+            )
+        except (TimeoutError, socket.timeout) as exc:
+            raise TimeoutError("provider HTTPS request timed out") from exc
+        except URLError as exc:
+            if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+                raise TimeoutError("provider HTTPS request timed out") from exc
+            raise OSError("provider HTTPS request failed") from exc
 
 #: HTTP status codes translated into typed committee failure classes.
 _AUTH_STATUSES = frozenset({401, 403})
@@ -219,6 +308,7 @@ class _BaseTransport:
     reasoning_effort: str = "low"
     max_output_tokens: int = 1_024
     timeout_seconds: int = 60
+    price_book: PriceBook | None = None
 
     def __post_init__(self) -> None:
         if self.endpoint != ALLOWED_ENDPOINTS[self.family]:
@@ -292,16 +382,30 @@ class _BaseTransport:
                 failure_class=ProviderFailureClass.MALFORMED_RESPONSE,
             )
         text, input_tokens, output_tokens, served_model = self._extract(payload)
+        reported_model = served_model or self.model
+        measured_cost = None
+        if self.price_book is not None:
+            measured_cost = self.price_book.cost_microunits(
+                provider=self.family.value,
+                model=reported_model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
         return ProviderRawResponse(
             reported_provider=self.family.value,
             # The served identity comes from the payload, never from the request, so
             # the router can detect a substituted model rather than assume one.
-            reported_model=served_model or self.model,
+            reported_model=reported_model,
             text=text,
             received_at=response.received_at,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            cost_completeness=CostCompleteness.UNKNOWN,
+            estimated_cost_microunits=measured_cost,
+            cost_completeness=(
+                CostCompleteness.COMPLETE
+                if measured_cost is not None
+                else CostCompleteness.UNKNOWN
+            ),
             # A reference identifies the exchange without carrying its body, which
             # could contain model text and therefore anything a model echoed back.
             raw_response_ref=f"{self.family.value}:http-{response.status_code}",
@@ -466,6 +570,7 @@ def build_transport(
     reasoning_effort: str = "low",
     max_output_tokens: int = 1_024,
     timeout_seconds: int = 60,
+    price_book: PriceBook | None = None,
 ) -> _BaseTransport:
     """Build the adapter for a governed family, or refuse an ungoverned one."""
     if family is ProviderFamily.OPENAI:
@@ -478,6 +583,7 @@ def build_transport(
             reasoning_effort=reasoning_effort,
             max_output_tokens=max_output_tokens,
             timeout_seconds=timeout_seconds,
+            price_book=price_book,
         )
     if family is ProviderFamily.ANTHROPIC:
         return AnthropicTransport(
@@ -489,6 +595,7 @@ def build_transport(
             reasoning_effort=reasoning_effort,
             max_output_tokens=max_output_tokens,
             timeout_seconds=timeout_seconds,
+            price_book=price_book,
         )
     raise EgressDeniedError(
         f"no approved transport exists for {family.value}; an ungoverned family is "
@@ -504,6 +611,7 @@ def build_approved_transports(
     reasoning_effort: str = "low",
     max_output_tokens: int = 1_024,
     timeout_seconds: int = 60,
+    price_book: PriceBook | None = None,
 ) -> Mapping[ProviderFamily, _BaseTransport]:
     """Build one adapter per approved family, skipping nothing silently.
 
@@ -520,6 +628,7 @@ def build_approved_transports(
             reasoning_effort=reasoning_effort,
             max_output_tokens=max_output_tokens,
             timeout_seconds=timeout_seconds,
+            price_book=price_book,
         )
     return transports
 
@@ -535,7 +644,9 @@ __all__ = [
     "HttpPoster",
     "HttpRequest",
     "HttpResponse",
+    "MAX_HTTP_RESPONSE_BYTES",
     "MissingCredentialError",
+    "StdlibHttpPoster",
     "OpenAITransport",
     "build_approved_transports",
     "build_transport",
