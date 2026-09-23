@@ -593,6 +593,10 @@ def test_the_timer_and_service_state_checks_are_proofs_not_advisories() -> None:
     # The enabled/unknown verdicts must reach a FAIL branch. The mapping lives in
     # `report_timer_enablement` so it is itself behaviourally testable.
     assert "report_timer_enablement" in script
+    assert (
+        'report_timer_enablement "$timer_verdict" "$timer_state_label" "$timer_enabled_rc"'
+        in script
+    )
     assert 'case "$timer_verdict" in' not in script
     assert 'service_active" == "inactive"' in script
 
@@ -735,10 +739,17 @@ def test_a_zero_exit_status_dominates_so_an_enabled_timer_cannot_be_hidden() -> 
     assert _timer_verdict(bash, 0, "") == "enabled"
 
 
-@pytest.mark.parametrize("state", ["not-found", ""])
-def test_a_missing_timer_is_deterministically_not_enabled(state: str) -> None:
+@pytest.mark.parametrize("state", ["static", "generated", "transient"])
+def test_zero_status_non_disabled_states_fail_closed_as_enabled(state: str) -> None:
+    """OFF installation requires an explicitly inert timer state, not merely rc=0."""
     bash = _require_bash()
-    assert _timer_verdict(bash, 1, state) == "not_enabled"
+    assert _timer_verdict(bash, 0, state) == "enabled"
+
+
+@pytest.mark.parametrize("state", ["not-found", ""])
+def test_a_missing_or_silent_timer_query_fails_closed(state: str) -> None:
+    bash = _require_bash()
+    assert _timer_verdict(bash, 1, state) == "unknown"
 
 
 def test_an_unrecognised_enablement_state_fails_closed() -> None:
