@@ -471,7 +471,42 @@ actually produces, on the same opportunities under the same conditions.
   opportunity expired cannot be credited with avoiding it — and carries
   `SIMULATED_NOT_REALISED_CASH`, so it can never be read as realised cash.
 
-### 3I — Contribution to the profitability loop
+### 3I — Integration checkpoint: scheduler vocabulary vs the frozen DI lifecycle (`serialization.py`, `test_opip_committee_scheduler_vocabulary_v1.py`)
+
+The committee scheduler keeps its **own** population-disposition vocabulary rather
+than borrowing the frozen Decision Intelligence `RequestState`. That is the right
+separation — one is "what happened to this committee case", the other is "where did
+this DI request reach in its lifecycle" — but it creates a concrete hazard: **eight
+of the ten committee disposition names are string-identical to `RequestState`
+values** (`ELIGIBLE`, `SELECTED`, `SKIPPED_BUDGET`, `SKIPPED_CAPACITY`, `EXPIRED`,
+`FAILED`, `INVALID`, `COMPLETED`).
+
+The checkpoint therefore closed a real gap rather than asserting the separation:
+
+- **A durable row must declare a record kind.** `kind = "COMMITTEE_SCHEDULE_DISPOSITION"`
+  is required, and a row with no kind is refused, because an unlabelled `COMPLETED`
+  is ambiguous across the two vocabularies. A row naming a different kind is refused
+  rather than reinterpreted, so there is no implicit conversion in either direction.
+- **A persisted tally must state every disposition.** A missing state is refused, so
+  a reloaded tally cannot be read as one that never had that state.
+- **The separation is enforced structurally.** A test parses imports with `ast` and
+  asserts the committee plane imports neither `RequestState` nor
+  `decision_intelligence.contracts`. Parsing rather than grepping means an
+  explanatory comment cannot fail the check while a real import cannot hide.
+- **The overlap itself is pinned.** The test asserts the exact shared set, so if the
+  overlap changes, the justification for the kind guard is revisited rather than
+  silently outliving its reason.
+- **Distinct meanings stay distinct.** `UNAVAILABLE` and `LATE` are committee-only
+  and are asserted distinct from `FAILED`, `INVALID`, `EXPIRED`, `SKIPPED_BUDGET`,
+  and `SKIPPED_CAPACITY`.
+- **Reload is lossless and deterministic.** Re-encoding a reloaded record is
+  byte-identical, the disposition identity is unchanged, and a timestamp with an
+  offset decodes to the same instant.
+
+No mapping between the two vocabularies was added: none is genuinely needed, and
+inventing one would create the coupling this checkpoint exists to prevent.
+
+### 3J — Contribution to the profitability loop
 
 This slice supplies the **role-attribution** substrate the profitability loop
 requires. It is not yet wired to a live case pipeline, so the loop above is not

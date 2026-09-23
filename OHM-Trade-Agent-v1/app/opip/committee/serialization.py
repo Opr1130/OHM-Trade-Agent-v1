@@ -134,6 +134,41 @@ _PROSPECTIVE_INELIGIBILITY_FIELDS = frozenset(
     }
 )
 
+#: Record kinds for the scheduler's own population vocabulary.
+#:
+#: The committee schedules committee work, so it keeps its own disposition
+#: vocabulary rather than borrowing the frozen Decision Intelligence
+#: ``RequestState``. Eight of its disposition names are string-identical to
+#: RequestState values, so a persisted row that carried only the name would be
+#: ambiguous on reload: a reader could not tell whether ``COMPLETED`` meant "this
+#: committee case was executed" or "a DI request reached that lifecycle state".
+#: Every durable row therefore carries an explicit record kind, and a row of the
+#: wrong kind is refused rather than reinterpreted.
+_DISPOSITION_KIND = "COMMITTEE_SCHEDULE_DISPOSITION"
+_TALLY_KIND = "COMMITTEE_POPULATION_TALLY"
+
+_DISPOSITION_FIELDS = frozenset(
+    {
+        "kind",
+        "schema_version",
+        "schedule_key_id",
+        "evidence_id",
+        "disposition",
+        "decided_at",
+        "reason",
+        "detail",
+    }
+)
+
+_TALLY_FIELDS = frozenset(
+    {
+        "kind",
+        "schema_version",
+        "considers",
+        "counts",
+    }
+)
+
 _PROVENANCE_FIELDS = frozenset(
     {
         "schema_version",
@@ -569,6 +604,128 @@ def prospective_ineligibility_from_dict(row: Mapping[str, Any]):
             "persisted ineligibility_id does not match its content identity"
         )
     return record
+
+
+def schedule_disposition_to_dict(record) -> dict[str, Any]:
+    """Encode one scheduler disposition with an explicit record kind.
+
+    The kind is what makes the row unambiguous: the committee's disposition
+    vocabulary shares several names with the frozen Decision Intelligence request
+    vocabulary, so the name alone cannot identify which vocabulary a persisted
+    value belongs to.
+    """
+    return {
+        "kind": _DISPOSITION_KIND,
+        "schema_version": record.schema_version,
+        "schedule_key_id": record.schedule_key_id,
+        "evidence_id": record.evidence_id,
+        "disposition": record.disposition.value,
+        "decided_at": _iso(record.decided_at),
+        "reason": record.reason,
+        "detail": record.detail,
+    }
+
+
+def schedule_disposition_from_dict(row: Mapping[str, Any]):
+    """Decode a scheduler disposition, refusing a row of another kind.
+
+    A row that names a different record kind is refused rather than reinterpreted,
+    and so is a row with no kind at all: interpreting an unlabelled ``COMPLETED``
+    would be exactly the cross-vocabulary collision this codec exists to prevent.
+    """
+    from app.opip.committee.scheduler import (
+        CommitteeScheduleDisposition,
+        ScheduleDispositionRecord,
+    )
+
+    if not isinstance(row, Mapping):
+        raise CommitteeSerializationError("schedule disposition must be an object")
+    kind = row.get("kind")
+    if kind is None:
+        raise CommitteeSerializationError(
+            "a persisted schedule disposition must declare its record kind; an "
+            "unlabelled disposition name is ambiguous across vocabularies"
+        )
+    if kind != _DISPOSITION_KIND:
+        raise CommitteeSerializationError(
+            f"expected a {_DISPOSITION_KIND} row, found {kind!r}"
+        )
+    _reject_unknown(row, _DISPOSITION_FIELDS, kind="schedule disposition")
+    raw_disposition = row.get("disposition")
+    if not isinstance(raw_disposition, str):
+        raise CommitteeSerializationError("disposition must be a string")
+    try:
+        disposition = CommitteeScheduleDisposition(raw_disposition)
+    except ValueError as exc:
+        raise CommitteeSerializationError(
+            f"{raw_disposition!r} is not a declared committee schedule disposition"
+        ) from exc
+    return ScheduleDispositionRecord(
+        schedule_key_id=row.get("schedule_key_id"),
+        evidence_id=row.get("evidence_id"),
+        disposition=disposition,
+        decided_at=_parse_dt(row.get("decided_at"), field="decided_at"),
+        reason=_parse_optional_str(row.get("reason"), field="reason"),
+        detail=_parse_optional_str(row.get("detail"), field="detail"),
+    )
+
+
+def population_tally_to_dict(tally) -> dict[str, Any]:
+    """Encode a tally with every disposition named explicitly.
+
+    Every state is written even at zero, so a reloaded tally cannot be mistaken
+    for one that never had that state.
+    """
+    from app.opip.committee.scheduler import CommitteeScheduleDisposition
+
+    return {
+        "kind": _TALLY_KIND,
+        "schema_version": 1,
+        "considers": tally.considered,
+        "counts": {
+            disposition.value: tally.count(disposition)
+            for disposition in CommitteeScheduleDisposition
+        },
+    }
+
+
+def population_tally_from_dict(row: Mapping[str, Any]):
+    """Decode a tally, refusing a row of another kind or a missing state."""
+    from app.opip.committee.scheduler import (
+        CommitteeScheduleDisposition,
+        PopulationTally,
+    )
+
+    if not isinstance(row, Mapping):
+        raise CommitteeSerializationError("population tally must be an object")
+    kind = row.get("kind")
+    if kind != _TALLY_KIND:
+        raise CommitteeSerializationError(
+            f"expected a {_TALLY_KIND} row, found {kind!r}"
+        )
+    _reject_unknown(row, _TALLY_FIELDS, kind="population tally")
+    raw_counts = row.get("counts")
+    if not isinstance(raw_counts, Mapping):
+        raise CommitteeSerializationError("counts must be an object")
+    counts: dict[CommitteeScheduleDisposition, int] = {}
+    for disposition in CommitteeScheduleDisposition:
+        if disposition.value not in raw_counts:
+            raise CommitteeSerializationError(
+                f"a persisted tally must state every disposition; "
+                f"{disposition.value} is missing"
+            )
+        value = raw_counts[disposition.value]
+        if type(value) is not int or value < 0:
+            raise CommitteeSerializationError(
+                f"count for {disposition.value} must be a non-negative integer"
+            )
+        counts[disposition] = value
+    considered = row.get("considers")
+    if type(considered) is not int or considered < 0:
+        raise CommitteeSerializationError(
+            "considers must be a non-negative integer"
+        )
+    return PopulationTally(counts=counts, considered=considered, redelivered=0)
 
 
 def _encode_metric(metric) -> dict[str, Any]:
@@ -1651,6 +1808,10 @@ __all__ = [
     "prospective_evaluation_to_dict",
     "prospective_ineligibility_from_dict",
     "prospective_ineligibility_to_dict",
+    "schedule_disposition_from_dict",
+    "schedule_disposition_to_dict",
+    "population_tally_from_dict",
+    "population_tally_to_dict",
     "prospective_record_from_dict",
     "sealed_prediction_from_dict",
     "sealed_prediction_to_dict",
