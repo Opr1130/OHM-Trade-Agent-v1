@@ -166,6 +166,14 @@ from app.opip.committee.role_execution import (
     assert_no_action_fields,
     role_status_for_observation,
 )
+from app.opip.committee.role_router import (
+    MAX_ROLE_ATTEMPTS,
+    RETRYABLE_ROLE_FAILURE_CLASSES,
+    RoleAttempt,
+    RoleExecution,
+    RoleRouter,
+    RoleRoutingError,
+)
 from app.opip.committee.roles import (
     OPTIONAL_ROLES,
     REQUIRED_ROLES,
@@ -239,6 +247,12 @@ __all__ = [
     "RegistryError",
     "RoleBudget",
     "RoleBudgetViolation",
+    "RoleAttempt",
+    "RoleExecution",
+    "RoleRouter",
+    "RoleRoutingError",
+    "RETRYABLE_ROLE_FAILURE_CLASSES",
+    "MAX_ROLE_ATTEMPTS",
     "RoleRequirement",
     "RoleResultStatus",
     "RoleRoute",

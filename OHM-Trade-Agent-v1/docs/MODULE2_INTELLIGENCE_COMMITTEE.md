@@ -292,7 +292,37 @@ reference. Concretely:
 - `FAILED`, `INVALID`, `UNAVAILABLE`, and `SKIPPED_BUDGET` remain four distinct
   statuses, so a budget skip and a provider failure never look identical.
 
-### 3B — Contribution to the profitability loop
+### 3B — Role routing: governed route execution (`role_router.py`)
+
+Where the three contracts meet: `CommitteeRole` -> `RoleRoute` -> `RoleBudget` ->
+`RoleSeatResult`. `RoleRouter.execute` resolves nothing itself; the caller passes
+the already-resolved route, so route resolution stays a registry concern.
+
+- **One shared reservation.** Primary and the single fallback draw on the same
+  deadline, token ceiling, and monetary ceiling, so failing over cannot double
+  what a case costs. The route's own limits are the request's limits.
+- **Bounded failover.** At most two attempts, and a second attempt happens only
+  for a retryable failure class (`TIMEOUT`, `RATE_LIMIT`, `PROVIDER_UNAVAILABLE`,
+  `INTERNAL_ERROR`). A schema-invalid answer is **not** retried: the provider
+  answered, the contract was not met, and asking again spends money without
+  changing that. A served-identity mismatch is likewise not retried.
+- **No silent substitution.** A response whose served model differs from the
+  requested registry entry is refused with `PROVIDER_IDENTITY_MISMATCH` rather
+  than credited to the role.
+- **Honest cost.** If any attempt's cost is unknown, `cost_completeness` is
+  `UNKNOWN` and `ceiling_verified` is `False`. An unverifiable ceiling is never
+  reported as satisfied, and a real overrun is recorded with
+  `exceeded_ceiling` rather than hidden.
+- **No shared state.** Every attempt returns what it did; the router holds no
+  per-run state, so concurrent role executions cannot observe each other.
+- **Single wire-construction point.** The router does **not** build the outbound
+  wire request; the caller supplies `build_wire_request`. Outbound screening must
+  happen in exactly one place, and
+  `test_committee_never_constructs_a_wire_request_outside_the_runtime` enforces
+  that only `runtime.py` constructs it. The router decides *which* governed entry
+  answers and *what it may spend*, and has no opinion on payload content.
+
+### 3C — Contribution to the profitability loop
 
 This slice supplies the **role-attribution** substrate the profitability loop
 requires. It is not yet wired to a live case pipeline, so the loop above is not
