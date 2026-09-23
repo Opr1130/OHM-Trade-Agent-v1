@@ -61,16 +61,16 @@ egress_denies_everything() {
 TIMER_ENABLED_STATES='enabled enabled-runtime linked linked-runtime alias indirect'
 
 #: Enablement states that mean no scheduled execution. Any of these is acceptable.
-TIMER_INERT_STATES='disabled masked masked-runtime static not-found generated transient'
+TIMER_INERT_STATES='disabled masked masked-runtime'
 
 #: Classify `systemctl is-enabled` for the timer as enabled | not_enabled | unknown.
 #:
 #: `systemctl is-enabled` prints `disabled` and still exits non-zero, so the exit
 #: status is captured separately rather than used as an `|| echo` fallback, which
 #: appended a second line and corrupted the value. Only the first non-empty line is
-#: the verdict. A zero exit status means the unit IS enabled regardless of the text,
-#: so an enabled timer cannot be hidden by output handling. Anything unrecognised
-#: fails closed rather than passing by default.
+#: the verdict. Explicit known states are classified first. Any other zero-status
+#: result fails closed as enabled; empty or unrecognised non-zero results are unknown
+#: and therefore fail at the reporting boundary.
 timer_enablement_verdict() {
   local status="$1"
   local raw="$2"
@@ -81,10 +81,6 @@ timer_enablement_verdict() {
       break
     fi
   done <<< "$raw"
-  if [[ "$status" -eq 0 ]]; then
-    printf 'enabled\n'
-    return 0
-  fi
   local candidate
   for candidate in $TIMER_ENABLED_STATES; do
     if [[ "$state" == "$candidate" ]]; then
@@ -98,11 +94,14 @@ timer_enablement_verdict() {
       return 0
     fi
   done
+  if [[ "$status" -eq 0 ]]; then
+    # An unrecognised successful is-enabled result is unsafe to treat as inert.
+    printf 'enabled\n'
+    return 0
+  fi
   if [[ -z "$state" ]]; then
-    # No enablement state was reported. Treated as not-enabled, matching the previous
-    # contract; the installed timer FILE is asserted separately below, so a genuinely
-    # missing timer cannot slip through on this path.
-    printf 'not_enabled\n'
+    # A failed query with no reported state proves nothing about timer enablement.
+    printf 'unknown\n'
     return 0
   fi
   printf 'unknown\n'
