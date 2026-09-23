@@ -1,0 +1,20 @@
+[Unit]
+# O'Pip Intelligence Committee — shadow cycle timer.
+#
+# DISABLED BY DEFAULT. The timer ships in a state the operator must explicitly
+# enable, and the unit it starts has OPIP_COMMITTEE_MODE=off, so installing the timer
+# alone still performs no committee work.
+Description=O'Pip Intelligence Committee shadow planning cycle timer
+
+[Timer]
+# One cycle every six hours. Deliberately infrequent: the committee's purpose is
+# measurement, and a frequent cycle would spend the daily ceiling on cases whose
+# outcomes have not matured.
+OnCalendar=*-*-* 00,06,12,18:15:00 UTC
+# Do not backfill cycles missed while the host was down: a late cycle would plan from
+# evidence whose window has moved, and the scheduler already classifies late items.
+Persistent=false
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

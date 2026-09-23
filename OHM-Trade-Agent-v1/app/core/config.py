@@ -12,6 +12,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 _DEFAULT_TRADINGVIEW_VERIFICATION_VALUE = "verified-by-trusted-proxy"
 _MIN_TRADINGVIEW_BEARER_LENGTH = 43
 
+#: Mode pattern for features that may only be off or shadow. Shared so the
+#: shadow-capable switches cannot drift apart.
+_OFF_SHADOW_MODE_PATTERN = r"^(off|shadow)$"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -65,7 +69,7 @@ class Settings(BaseSettings):
     # Invalid env values must fail Settings parsing (never silently become off).
     opip_canonical_writer_mode: str = Field(
         default="off",
-        pattern=r"^(off|shadow)$",
+        pattern=_OFF_SHADOW_MODE_PATTERN,
     )
     # PR 3 feature bus capture. Default off. "shadow" persists market
     # observations, feature snapshots and checkpoints as canonical evidence
@@ -75,7 +79,7 @@ class Settings(BaseSettings):
     # Invalid env values must fail Settings parsing (never silently become off).
     opip_feature_bus_mode: str = Field(
         default="off",
-        pattern=r"^(off|shadow)$",
+        pattern=_OFF_SHADOW_MODE_PATTERN,
     )
     # B/C-3 Paper v2 execution. Default off, and "active" is the only value that
     # enables it: activation is an explicit operator decision, so an unknown or
@@ -85,6 +89,23 @@ class Settings(BaseSettings):
     opip_paper_v2_mode: str = Field(
         default="off",
         pattern=r"^(off|active)$",
+    )
+    # Module 2 Intelligence Committee. Default off; "shadow" is the only value
+    # that permits committee work, and it is research-only: it collects and
+    # evaluates independent model opinions and grants no ranking influence, no
+    # notification, no paper admission, and no exchange authority. It never
+    # activates Paper v2 and never changes funded/live state. An unknown value
+    # must fail Settings parsing rather than silently enabling model spending.
+    opip_committee_mode: str = Field(
+        default="off",
+        pattern=_OFF_SHADOW_MODE_PATTERN,
+    )
+    # Optional committee cost ceiling in microunits. Zero means "no declared
+    # ceiling", and a seat is skipped once the declared ceiling would be
+    # exceeded rather than spending unexpectedly.
+    opip_committee_max_estimated_cost_microunits: int = Field(
+        default=0,
+        ge=0,
     )
     # Wave 9 continuation/entry quality gate. Default-on for real Settings;
     # legacy test/extension SimpleNamespace callers without this field retain

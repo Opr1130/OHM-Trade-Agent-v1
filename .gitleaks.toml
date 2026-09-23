@@ -114,3 +114,35 @@ targetRules = ["generic-api-key"]
 condition = "AND"
 commits = ["9e1b6a1b9b248bbc2d66bb36774b060c64f80609"]
 paths = ['''OHM-Trade-Agent-v1/tests/test_bc4e4_cockpit_publish_network_v1\.py$''']
+
+# ---------------------------------------------------------------------------
+# Secret-like conformance fixtures, commit da73fdd8.
+#
+# `app/opip/committee/conformance.py` is the Phase-A corpus: a deterministic set
+# of adversarial and valid payloads the model boundary must accept or refuse. One
+# category exercises how the boundary treats secret-like content, and its first
+# revision embedded credential-shaped literals (`api_key=...`, `password=...`,
+# `token=...`) directly in source. The generic-api-key rule correctly fired on
+# them: a true positive against the fixture text, not a scanner defect.
+#
+# The literals are now assembled at runtime from fragments, so the current tree
+# carries no contiguous credential form and the fixtures still prove the same
+# screening behaviour. This is the same remedy already applied to the outbound
+# screening tests. The alert persists only because full-history scanning still
+# sees the earlier blob, and that commit should not be rewritten while the branch
+# is under review.
+#
+# Same narrow scope and same reasoning as the entries above: one rule, one commit,
+# one file, AND-combined. It cannot mask a real credential in another commit,
+# another file, or under another rule.
+#
+# `regexes` is deliberately not used: narrowing to the flagged values would mean
+# reproducing credential-shaped strings inside the scanner's own configuration,
+# which is self-defeating and could itself be matched.
+# ---------------------------------------------------------------------------
+[[allowlists]]
+description = "Synthetic credential-shaped fixtures in the Phase-A conformance corpus at commit da73fdd8 (test data, since assembled at runtime from fragments so no contiguous credential form remains in source)."
+targetRules = ["generic-api-key"]
+condition = "AND"
+commits = ["da73fdd814dd38331d9ddc9088802677343e4acc"]
+paths = ['''OHM-Trade-Agent-v1/app/opip/committee/conformance\.py$''']
