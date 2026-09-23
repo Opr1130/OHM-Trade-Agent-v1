@@ -506,7 +506,67 @@ The checkpoint therefore closed a real gap rather than asserting the separation:
 No mapping between the two vocabularies was added: none is genuinely needed, and
 inventing one would create the coupling this checkpoint exists to prevent.
 
-### 3J — Contribution to the profitability loop
+### 3J — Learning lineage (IC-035 to IC-041, `learning.py`)
+
+The chain that turns an observation into governed knowledge:
+
+```text
+observation -> validated weakness -> hypothesis -> registered experiment
+-> sealed prospective evaluation -> ACCEPTED/REJECTED/INCONCLUSIVE
+-> separate human release decision -> post-change effectiveness
+```
+
+- **A hypothesis is falsifiable and grounded** (IC-035). It names a suspected
+  mechanism, an eligible cohort, a falsifiable prediction, and the expected effect
+  direction and size, and it cites the findings it came from. A hypothesis whose
+  only grounding is a PENDING, REJECTED, or INCONCLUSIVE finding is refused, because
+  the finding itself has not been established.
+- **A registered experiment is frozen** (IC-036). Dataset manifest, knowledge
+  cutoff, policy/route/model versions, prompt and schema hashes, endpoint, effect
+  definition, experiment family, statistical method, stopping rule, and holdout are
+  all committed before results. `verify_unchanged` refuses an edit, so a post-hoc
+  change becomes a new experiment or an explicit `COMPROMISED` reason — and because
+  the compromise participates in the identity, a compromised experiment cannot pass
+  as the sealed design it deviated from.
+- **A conclusion is ACCEPTED, REJECTED, or INCONCLUSIVE** (IC-037). Inconclusive is
+  first class: forcing an unresolved experiment into accepted or rejected would
+  manufacture a finding. A resolved conclusion must reference the sealed evaluation
+  it came from, and `authorises_policy_change` is always false.
+- **Promotion stays human and SHA-bound** (IC-038/039). A `ReleaseRecord` requires
+  the conclusion it releases, a **full 40-character lowercase SHA** of the approved
+  artifact, and who decided. No link in this module can change a threshold, a route,
+  or a weight by itself.
+- **Effectiveness is measured, not asserted** (IC-040). An incomparable cohort must
+  state why and must not report a before/after metric, because a comparison over
+  unlike populations produces a confident wrong answer. Unmeasured deltas stay
+  `None`.
+- **Release SHA compatibility** (IC-041) is carried by the release record's exact
+  SHA, so the artifact a change was measured on is always identifiable.
+
+### 3K — Committee Trust Report and investment (IC-043, IC-044, `trust.py`)
+
+The durable authoritative summary Cockpit v2 will consume, so a UI displays
+authoritative facts rather than computing trust itself.
+
+- **Counts are derived, never restated.** Population comes from the scheduler's
+  tally; economics from matched arms; weakness counts from the registry. The report
+  cannot disagree with its sources because it does not duplicate them.
+- **Unknown stays unknown.** An absent comparison, unknown operating cost, or
+  unmeasured net yields `None` with a stated reason, never zero. An empty report is
+  stage T0, not a clean one.
+- **Trust stage follows gates, not outcomes.** Six gates (evidence integrity,
+  coverage, baseline comparison, economics, operating-cost-known, weakness
+  precision) are computed from evidence, and each blocked gate states why. A stage
+  cannot advance on an unknown key metric, on integrity violations, or on
+  insufficient matured coverage — a stage reachable by an unmeasured result would be
+  meaningless.
+- **Investment is reported** (IC-044): attributable cost, token totals, call and
+  failure counts, with unknown cost remaining unknown rather than free.
+- **No stage grants influence.** The highest stage this module computes is a
+  *review* stage; trading or paper influence requires a separate human decision
+  outside this module.
+
+### 3L — Contribution to the profitability loop
 
 This slice supplies the **role-attribution** substrate the profitability loop
 requires. It is not yet wired to a live case pipeline, so the loop above is not
