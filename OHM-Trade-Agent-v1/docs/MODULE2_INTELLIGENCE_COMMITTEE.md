@@ -322,7 +322,45 @@ the already-resolved route, so route resolution stays a registry concern.
   that only `runtime.py` constructs it. The router decides *which* governed entry
   answers and *what it may spend*, and has no opinion on payload content.
 
-### 3C — Contribution to the profitability loop
+### 3D — Durable scheduling from committed evidence (IC-016, `scheduler.py`)
+
+The scheduler decides **which already-committed evidence items become committee
+cases**. It calls no model, reaches no provider, and holds no provider surface at
+all — a test asserts the module source contains no wire-request, provider,
+screening, network, or environment access. An injected `CaseExecutor` performs any
+downstream work, so scheduling is separable from execution and from authority.
+
+- **Committed evidence only.** An item that is not durably committed, not sealed,
+  or whose cutoff is in the future is recorded `INVALID` rather than scheduled,
+  because a case derived from unsettled evidence cannot be reproduced.
+- **Deterministic identity, idempotent delivery.** A logical case is keyed by
+  `(case_id, evidence_snapshot_hash, policy_version)`. Redelivering the same
+  committed evidence returns the *existing* disposition, executes nothing, and
+  creates no second logical case, so at-least-once delivery cannot multiply
+  committee work.
+- **Restart-safe.** The cursor and every decided key live in an injected durable
+  checkpoint, and each disposition is persisted **before** the cycle continues, so
+  a crash mid-cycle loses no decision that was already made.
+- **Exhaustive accounting.** Ten dispositions: `ELIGIBLE`, `SELECTED`,
+  `SKIPPED_BUDGET`, `SKIPPED_CAPACITY`, `EXPIRED`, `INVALID`, `FAILED`,
+  `UNAVAILABLE`, `LATE`, `COMPLETED`. `PopulationTally` reports every state even
+  at zero, and the cycle's considered count is checked against the accounted
+  total, so a skip that disappears fails the cycle rather than understating the
+  population.
+- **Distinct reasons stay distinct.** `SKIPPED_BUDGET` (a spending decision) and
+  `SKIPPED_CAPACITY` (a concurrency decision) are separate states; `UNAVAILABLE`
+  (a missing dependency or an unbounded cost) is separate from `FAILED` (a broken
+  attempt); `LATE` is recorded for accountability and not treated as timely
+  evidence.
+- **Unknown is never favourable.** An item whose cost is unknown is refused
+  (`UNAVAILABLE`), because an unverifiable budget is not a satisfied budget.
+- **Failure is contained.** An executor exception becomes a recorded `FAILED`
+  disposition with the exception type, never an exception into a caller, so a
+  scheduler fault cannot become a trading-path fault.
+- **Dark by default.** With committee mode `off` — or any unrecognised value — the
+  cycle does not run, selects nothing, persists nothing, and creates no case.
+
+### 3E — Contribution to the profitability loop
 
 This slice supplies the **role-attribution** substrate the profitability loop
 requires. It is not yet wired to a live case pipeline, so the loop above is not
