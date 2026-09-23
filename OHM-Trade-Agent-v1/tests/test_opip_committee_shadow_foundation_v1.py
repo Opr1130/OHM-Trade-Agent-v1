@@ -1811,6 +1811,54 @@ def test_the_configured_operator_ceiling_applies_without_a_policy_ceiling():
     assert provider.calls == []
 
 
+def test_a_budget_skip_is_durable_and_does_not_consume_an_attempt(tmp_path):
+    """A blocked seat must stay distinguishable from a seat that never ran.
+
+    A review finding held that a budget skip vanishes because ``_run_seat``
+    returns ``SKIPPED_BUDGET`` without writing to the observation ledger. The
+    ledger deliberately must not count a skip as an attempt - a seat that was
+    never invoked cannot be allowed to consume its attempt budget, which is what
+    ``record`` would do - so durability is established through the persisted case
+    outcome instead. This proves both properties together after a restart.
+    """
+    store = CommitteeEvidenceStore(root=tmp_path)
+    provider = _ok(ProviderFamily.OPENAI)
+    provider._estimated_cost_microunits = 5_000  # noqa: SLF001 - test double
+    runner = CommitteeRunner(
+        providers={ProviderFamily.OPENAI: provider},
+        ledger=DurableObservationLedger(store=store),
+        now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
+    )
+    result = runner.run_case(
+        _case(policy=_policy(families=(ProviderFamily.OPENAI,), cost_ceiling=100))
+    )
+    skipped = result.seats[0].outcome
+    assert skipped.status is ObservationStatus.SKIPPED_BUDGET
+    assert provider.calls == []
+    assert store.append_case_outcome(result.case_outcome).stored is True
+
+    # A restart over the same evidence root still sees the blocked disposition.
+    reopened = CommitteeEvidenceStore(root=tmp_path)
+    reloaded = list(reopened.iter_case_outcomes())[0]
+    blocked = [
+        seat
+        for seat in reloaded.outcomes
+        if seat.status is ObservationStatus.SKIPPED_BUDGET
+    ]
+    assert len(blocked) == 1
+    assert blocked[0].detail
+    assert blocked[0].logical_observation_id == skipped.logical_observation_id
+
+    # The skip is not an invocation, so the seat's attempt budget is untouched.
+    assert (
+        DurableObservationLedger(store=reopened).attempt_count(
+            skipped.logical_observation_id
+        )
+        == 0
+    )
+
+
 def test_a_redelivery_cannot_restart_the_policy_attempt_budget():
     """max_attempts_per_seat=1 must bound total calls, not calls per run."""
     provider = _provider(
