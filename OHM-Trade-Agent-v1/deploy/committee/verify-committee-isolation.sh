@@ -346,10 +346,10 @@ timer_verdict="$(timer_enablement_verdict "$timer_enabled_rc" "$timer_enabled_ra
 timer_state_label="${timer_enabled_raw//$'\n'/ }"
 report_timer_enablement "$timer_verdict" "$timer_state_label" "$timer_enabled_rc"
 timer_active="$(systemctl show -p ActiveState --value "$TIMER" 2>/dev/null || echo "$UNKNOWN_STATE")"
-if [[ "$timer_active" == "inactive" || "$timer_active" == "$UNKNOWN_STATE" ]]; then
+if [[ "$timer_active" == "inactive" ]]; then
   pass "timer is inactive (state: $timer_active)"
 else
-  fail "timer active state is '$timer_active', expected inactive"
+  fail "timer active state is '$timer_active', expected explicit inactive"
 fi
 service_active="$(systemctl show -p ActiveState --value "$UNIT" 2>/dev/null || echo "$UNKNOWN_STATE")"
 service_sub="$(systemctl show -p SubState --value "$UNIT" 2>/dev/null || echo "$UNKNOWN_STATE")"
