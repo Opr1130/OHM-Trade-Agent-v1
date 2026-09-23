@@ -45,7 +45,7 @@ systemctl daemon-reload
 | Dedicated advisory output | `ReadWritePaths=/var/lib/opip-committee` only, plus `/var/lock`. Dispositions and the trust report land in that directory and nowhere else. |
 | No trading credentials | No Kraken credential, no Telegram credential, no cockpit secret, no private key is referenced. The only secret file the unit reads is `/etc/opip/committee-credentials.env`, which holds provider keys. Verify this by inspecting the deployed environment rather than trusting this table. |
 | No inbound network | No port is opened or published. `RestrictAddressFamilies=AF_INET AF_INET6` permits outbound sockets only for provider HTTPS. |
-| Provider-only egress | `IPAddressDeny=any` with an allowlist of the two provider hosts, as a backstop. The **primary** control is the application-level allowlist in `transports.py`, enforced at adapter construction and again per call. Confirm the `IPAddressAllow` syntax against the host's systemd version at deployment time. |
+| Provider-only egress | While `OPIP_COMMITTEE_MODE=off`, egress is **deny-all and fails closed**: `IPAddressDeny=any` with **no** `IPAddressAllow=` entries. No provider egress happens during the OFF installation, so the boundary is simply closed. `IPAddressAllow=` deliberately carries no host names: systemd does not turn DNS names into a reliable boundary, and provider-specific egress belongs to the later, separately OWNER-authorised `OFF -> credentialled SHADOW` activation, where it will be added with its own validation. The application-level allowlist in `transports.py` remains the primary control when SHADOW is eventually enabled. |
 | CPU and memory limits | `MemoryMax=768M`, `CPUQuota=100%`, `OOMScoreAdjust=700`, `KillMode=control-group`, `TimeoutStartSec=900`. |
 | One concurrent cycle initially | The service is `Type=oneshot` and does not loop; the runner performs exactly one cycle. No autoscaling, no parallel workers. |
 | Exact release SHA | `OPIP_COMMITTEE_RELEASE_SHA` is required and must be a full 40-character SHA; a branch name is refused with a configuration error. The prospective path also fails closed on release drift. |
@@ -98,10 +98,12 @@ exception, so a broken worker is observable rather than silent.
 Before deploying, OWNER confirms:
 
 1. The host is the learning/analytics plane, and no trading credential is present.
-2. The resource limits and the `IPAddressAllow` syntax for the host's systemd version.
+2. The resource limits are appropriate for the host.
 3. The provider credentials exist at the declared path and nowhere else.
 4. Mode remains `off` at install time, with activation as a separate decision.
-5. The rollback trigger and who invokes it.
+5. The timer stays disabled and inactive at install time, with activation as a
+   separate decision.
+6. The rollback trigger and who invokes it.
 
 ## Deployment path
 
@@ -118,12 +120,26 @@ dedicated protected `committee-shadow` environment, and a pinned SSH identity bu
 from the existing learning-host connection secrets. It reuses that established host
 identity deliberately and discovers no local workstation credential.
 
-The workflow **installs and verifies only**. It checks out the exact approved release,
-invokes only the committed bootstrap from that release tree, uploads nothing but the
-release tarball, proves isolation with `verify-committee-isolation.sh`, publishes a
-receipt, cleans the remote release directory, and fails closed unless both the install
-and the isolation proof succeeded.
+The workflow **installs and verifies only**:
+
+- It checks out the exact approved release, uploads nothing but that release tarball,
+  and invokes only the committed bootstrap from it.
+- It forces `OPIP_COMMITTEE_MODE=off` and does **not** pass `--enable-timer`. The
+  service and timer artifacts are installed, but the timer is left disabled and
+  inactive, so no scheduled committee execution happens at all: zero provider calls and
+  zero committee cases.
+- It proves isolation with `verify-committee-isolation.sh`, taking the verdict from the
+  machine-readable `ISOLATION_PROOF=PASS` line rather than the exit code alone.
+- It publishes a receipt reporting the result, exact SHA, remote exit codes, cleanup
+  result, workflow URL, and the PASS/FAIL proof lines only. It never prints environment
+  contents or a secret.
+- It **requires successful removal** of the temporary remote release directory. Cleanup
+  is a success condition, not best effort: a proven deployment with a failed cleanup
+  does not pass.
+- It fails closed on a non-main target, unsuccessful exact-SHA CI, absent host secrets,
+  failed install, failed isolation proof, a missing proof line, or a failed cleanup.
 
 It does not merge, does not activate credentialled SHADOW calls, enables no provider
 execution, and carries no provider API key. The `OFF -> credentialled SHADOW`
-transition requires a separate OWNER-authorised action with its own validation.
+transition — provider allowlist, timer activation, and credentialled calls — requires a
+separate OWNER-authorised action with its own validation.

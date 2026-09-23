@@ -5,7 +5,11 @@ name: deploy-committee
 # INSTALL AND VERIFY ONLY. This workflow does not activate credentialled SHADOW calls,
 # does not enable provider execution, and does not merge anything. It installs the
 # committed Committee worker artifacts at an exact approved main SHA with
-# OPIP_COMMITTEE_MODE=off, then proves isolation.
+# OPIP_COMMITTEE_MODE=off, leaves the timer disabled and inactive so no scheduled
+# committee execution occurs, and then proves isolation.
+#
+# Egress while OFF is deny-all and fails closed: no provider allowlist is configured.
+# Provider-specific egress belongs to the later activation boundary.
 #
 # The OFF -> credentialled SHADOW transition is a separate OWNER-authorised action with
 # its own validation. Nothing here performs it.
@@ -146,9 +150,13 @@ jobs:
           PORT="${PORT:-22}"
           RELEASE_DIR="/var/tmp/opip-committee-$TARGET_SHA-$GITHUB_RUN_ID"
           # Only the committed artifact from the exact release tree is invoked. Mode is
-          # forced to off by the bootstrap. --enable-timer installs the units and starts
-          # the timer, whose cycles record an OFF disposition and produce no committee
-          # work; provider execution stays disabled while mode is off.
+          # forced to off by the bootstrap.
+          #
+          # --enable-timer is deliberately NOT passed. The initial deployment installs
+          # the service and timer artifacts but leaves the timer disabled and inactive,
+          # so there is no scheduled committee execution at all: zero provider calls and
+          # zero committee cases. Timer activation belongs to the later, separately
+          # OWNER-authorised OFF -> credentialled SHADOW activation boundary.
           ssh \
             -i ~/.ssh/opip_committee \
             -o BatchMode=yes \
@@ -158,7 +166,7 @@ jobs:
             -o ServerAliveCountMax=20 \
             -p "$PORT" \
             "$USER@$HOST" \
-            "sudo -n bash '$RELEASE_DIR/OHM-Trade-Agent-v1/deploy/committee/bootstrap-opip-committee-worker.sh' '$TARGET_SHA' --enable-timer" \
+            "sudo -n bash '$RELEASE_DIR/OHM-Trade-Agent-v1/deploy/committee/bootstrap-opip-committee-worker.sh' '$TARGET_SHA'" \
             2>&1 | tee committee-install.log
           RC=${PIPESTATUS[0]}
           echo "rc=$RC" >> "$GITHUB_OUTPUT"
@@ -202,15 +210,15 @@ jobs:
           exit 0
 
       - name: Clean remote release
+        id: committee_cleanup
         if: always() && steps.target.outputs.sha != ''
-        continue-on-error: true
         env:
           HOST: ${{ secrets.OPIP_LEARNING_HOST }}
           USER: ${{ secrets.OPIP_LEARNING_USER }}
           PORT: ${{ secrets.OPIP_LEARNING_PORT }}
           TARGET_SHA: ${{ steps.target.outputs.sha }}
         run: |
-          set -euo pipefail
+          set +e
           PORT="${PORT:-22}"
           RELEASE_DIR="/var/tmp/opip-committee-$TARGET_SHA-$GITHUB_RUN_ID"
           ssh \
@@ -221,6 +229,19 @@ jobs:
             -p "$PORT" \
             "$USER@$HOST" \
             "sudo -n rm -rf -- '$RELEASE_DIR'"
+          RC=$?
+          echo "rc=$RC" >> "$GITHUB_OUTPUT"
+          # The temporary release directory must be gone. This is a success
+          # requirement, not best effort: a leftover copy of the release tree on the
+          # host is a real finding, so the step fails on a non-zero exit and the final
+          # gate below also requires it. `set +e` is used only so the result is
+          # captured and reported before the step fails.
+          if [[ "$RC" -eq 0 ]]; then
+            echo "result=CLEANED" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=FAILED" >> "$GITHUB_OUTPUT"
+          fi
+          exit "$RC"
 
       - name: Publish committee deployment receipt
         if: always() && steps.target.outputs.sha != ''
@@ -231,6 +252,8 @@ jobs:
           INSTALL_RC: ${{ steps.committee_install.outputs.rc }}
           ISOLATION_RESULT: ${{ steps.committee_isolation.outputs.result }}
           ISOLATION_RC: ${{ steps.committee_isolation.outputs.rc }}
+          CLEANUP_RESULT: ${{ steps.committee_cleanup.outputs.result }}
+          CLEANUP_RC: ${{ steps.committee_cleanup.outputs.rc }}
         run: |
           set -euo pipefail
           RUN_URL="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
@@ -247,7 +270,8 @@ jobs:
 
           - **Result:** ${ISOLATION_RESULT:-FAILED BEFORE ISOLATION STAGE} (install: ${INSTALL_RESULT:-NOT RUN})
           - **SHA:** \`$TARGET_SHA\`
-          - **Remote exit codes:** install=${INSTALL_RC:-N/A} isolation=${ISOLATION_RC:-N/A}
+          - **Remote exit codes:** install=${INSTALL_RC:-N/A} isolation=${ISOLATION_RC:-N/A} cleanup=${CLEANUP_RC:-N/A}
+          - **Remote cleanup:** ${CLEANUP_RESULT:-NOT RUN}
           - **Workflow run:** $RUN_URL
 
           \`\`\`
@@ -255,10 +279,15 @@ jobs:
           \`\`\`
 
           This workflow installs the isolated Committee worker at an exact main SHA with
-          \`OPIP_COMMITTEE_MODE=off\` and proves OFF-mode isolation. It does **not**
-          activate credentialled SHADOW calls, enable provider execution, or place a
-          provider key anywhere. It does not merge, and it does not touch Kraken or
-          Telegram credentials.
+          \`OPIP_COMMITTEE_MODE=off\` and proves OFF-mode isolation. No provider allowlist
+          is configured: OFF-mode egress is deny-all and fails closed. The service and
+          timer artifacts are installed, but the timer is left disabled and inactive, so
+          no scheduled committee execution occurs. It does **not** activate credentialled
+          SHADOW calls, enable provider execution, or place a provider key anywhere. It
+          does not merge, and it does not touch Kraken or Telegram credentials.
+
+          Success requires the install, the isolation proof, **and** removal of the
+          temporary remote release directory.
 
           The \`OFF -> credentialled SHADOW\` transition requires a separate
           OWNER-authorised action with its own validation.
@@ -266,19 +295,25 @@ jobs:
           )
           gh api --method POST "repos/$GITHUB_REPOSITORY/issues/64/comments" -f body="$BODY" >/dev/null
 
-      - name: Fail unless the committee worker is installed and isolation is proven
+      - name: Fail unless installed, isolation is proven, and the release is cleaned
         if: always()
         env:
           INSTALL_RESULT: ${{ steps.committee_install.outputs.result }}
           ISOLATION_RESULT: ${{ steps.committee_isolation.outputs.result }}
+          CLEANUP_RESULT: ${{ steps.committee_cleanup.outputs.result }}
         run: |
           set -euo pipefail
-          # Fail closed: an install without a proven isolation result is not a success.
+          # Fail closed: an install without a proven isolation result is not a success,
+          # and a proven deployment with a failed remote cleanup is not a success either.
           test "$INSTALL_RESULT" = "INSTALLED" || {
             echo "Committee installation did not succeed." >&2
             exit 1
           }
           test "$ISOLATION_RESULT" = "PROVEN" || {
             echo "Committee OFF-mode isolation was not proven." >&2
+            exit 1
+          }
+          test "$CLEANUP_RESULT" = "CLEANED" || {
+            echo "The temporary remote release directory was not removed." >&2
             exit 1
           }

@@ -13,9 +13,16 @@
 # Usage:
 #   bootstrap-opip-committee-worker.sh <40-char-release-sha> [--enable-timer]
 #
-# Without --enable-timer the units are installed but the timer is not started, which
-# performs even less work than the approved OFF mode. With it, the timer starts and
-# the worker runs cycles that do nothing but record an OFF disposition.
+# Without --enable-timer the units are installed but the timer stays disabled and
+# inactive, so no scheduled committee execution happens at all. The owner-gated
+# `/deploy-committee` workflow deliberately uses that path: the initial deployment
+# installs and proves OFF-mode isolation without enabling any recurring work.
+# Timer activation belongs to the later, separately OWNER-authorised
+# OFF -> credentialled SHADOW activation boundary.
+#
+# With --enable-timer the timer starts and the worker runs cycles that do nothing but
+# record an OFF disposition. It remains no-provider-egress either way, because mode
+# is off.
 set -Eeuo pipefail
 
 TARGET_SHA="${1:-}"
@@ -92,13 +99,19 @@ install -m 0644 -o root -g root "$SOURCE_DIR/opip-committee-shadow.timer" "$UNIT
 install -m 0755 -o root -g root "$SOURCE_DIR/run-committee-shadow-cycle.sh" "$SBIN_DIR/"
 
 systemctl daemon-reload
-systemctl enable opip-committee-shadow.service >/dev/null
 
+# The service is a `Type=oneshot` unit with no `[Install]` section: it is started by
+# the timer, never enabled on its own. Calling `systemctl enable` on it would fail
+# ("no installation config") and, under `set -e`, would abort the install. Enablement
+# of the scheduled path is therefore expressed solely through the timer below.
 if [[ "$ENABLE_TIMER" == "true" ]]; then
   systemctl enable --now opip-committee-shadow.timer
   echo "committee timer enabled; mode is off so cycles perform no provider call"
 else
-  echo "committee units installed; timer NOT started (use --enable-timer to start it)"
+  # Initial OFF installation: units are installed but the timer stays disabled and
+  # inactive, so no scheduled committee execution happens at all.
+  systemctl disable opip-committee-shadow.timer >/dev/null 2>&1 || true
+  echo "committee units installed; timer disabled and NOT started (use --enable-timer to start it)"
 fi
 
 echo

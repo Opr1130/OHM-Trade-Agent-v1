@@ -55,13 +55,16 @@ LockPersonality=true
 # The committee reaches providers over HTTPS only; no other socket family is opened.
 RestrictAddressFamilies=AF_INET AF_INET6
 
-# Egress restriction. `IPAddressDeny=any` plus an allowlist means the unit cannot
-# reach anything but the approved provider endpoints, even if the application were
-# misconfigured. The application-level allowlist in `transports.py` is the primary
-# control; this is the backstop, and its exact syntax depends on the host's systemd
-# version, so it must be confirmed at deployment time.
+# Egress restriction. During the initial OFF installation the boundary is simply
+# deny-all: the worker must make no provider egress at all, and a deny without an
+# allowlist fails closed rather than depending on DNS resolution at start-up.
+#
+# Do NOT add `IPAddressAllow=` host names here. systemd `IPAddressAllow=` does not
+# resolve DNS names reliably, and provider-specific egress belongs to the later,
+# separately OWNER-authorised OFF -> credentialled SHADOW activation, where it will
+# be added with its own validation. The application-level allowlist in
+# `transports.py` remains the primary control when SHADOW is eventually enabled.
 IPAddressDeny=any
-IPAddressAllow=api.openai.com api.anthropic.com
 
 # Writable paths: only the advisory output directory and the lock directory. The
 # evidence input is mounted read-only, and canonical evidence, the decision

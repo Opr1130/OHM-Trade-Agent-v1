@@ -195,12 +195,82 @@ def test_isolation_proof_is_mandatory_and_machine_readable(
     assert 'echo "result=PROVEN"' in workflow_text
 
 
+def test_the_workflow_does_not_start_the_committee_timer(workflow_text: str) -> None:
+    """Initial OFF installation must not enable scheduled committee execution.
+
+    Owner requirement: install the service and timer artifacts, keep mode off, and
+    leave the timer disabled/inactive so no scheduled run happens. Timer activation
+    belongs to the later SHADOW activation boundary.
+    """
+    # The `--enable-timer` argument must not be passed to the bootstrap invocation.
+    # (The workflow may *comment* that it is deliberately not passed, so assert on the
+    # invocation line itself rather than on the whole file.)
+    invocation_lines = [
+        line
+        for line in workflow_text.splitlines()
+        if "bootstrap-opip-committee-worker.sh" in line and not line.strip().startswith("#")
+    ]
+    assert len(invocation_lines) == 1, invocation_lines
+    # Everything after the script name is the argument list: the exact SHA and no flags.
+    tail = invocation_lines[0].split("bootstrap-opip-committee-worker.sh", 1)[1]
+    assert "--" not in tail, tail
+    assert "'$TARGET_SHA'\"" in tail, tail
+    # The intent is stated, not merely implemented.
+    assert "disabled and inactive" in workflow_text
+    assert "no scheduled committee execution" in workflow_text
+
+
+def test_off_mode_egress_is_deny_all_with_no_provider_allowlist(
+    workflow_text: str,
+) -> None:
+    """OFF-mode egress fails closed; host names are not a boundary."""
+    service = (COMMITTEE_DEPLOY / "opip-committee-shadow.service").read_text(
+        encoding="utf-8"
+    )
+    assert "IPAddressDeny=any" in service
+    # No allowlist at all: not host names, not addresses.
+    allow_lines = [
+        line
+        for line in service.splitlines()
+        if line.strip().startswith("IPAddressAllow=")
+    ]
+    assert allow_lines == [], allow_lines
+    for host in ("api.openai.com", "api.anthropic.com"):
+        assert host not in service, host
+    # The boundary is stated where it is enforced, and in the receipt.
+    assert "deny-all" in service
+    assert "No provider allowlist" in workflow_text
+
+
+def test_cleanup_is_a_success_requirement_not_best_effort(
+    workflow_text: str,
+) -> None:
+    """A proven deployment with a failed remote cleanup is not a success."""
+    workflow = yaml.safe_load(workflow_text)
+    steps = {step.get("name"): step for step in workflow["jobs"]["deploy"]["steps"]}
+    cleanup = steps["Clean remote release"]
+    # Explicitly NOT continue-on-error, so a failed removal fails the job.
+    assert cleanup.get("continue-on-error") is not True
+    assert cleanup.get("id") == "committee_cleanup"
+    assert cleanup.get("if") == "always() && steps.target.outputs.sha != ''"
+    # The result is captured and the step exits non-zero on failure.
+    assert 'echo "result=CLEANED"' in workflow_text
+    assert 'exit "$RC"' in workflow_text
+    # The receipt surfaces it.
+    assert "CLEANUP_RESULT" in workflow_text
+    assert "**Remote cleanup:**" in workflow_text
+    # And the final gate requires it.
+    assert 'test "$CLEANUP_RESULT" = "CLEANED"' in workflow_text
+    assert "was not removed" in workflow_text
+
+
 def test_the_receipt_reports_the_required_fields(workflow_text: str) -> None:
     for token in (
         "## O'Pip Intelligence Committee Deployment Receipt",
         "**Result:**",
         "**SHA:**",
         "Remote exit codes:",
+        "**Remote cleanup:**",
         "Workflow run:",
         "ISOLATION_PROOF=",
     ):
@@ -334,12 +404,115 @@ def test_the_verification_script_proves_every_claim_the_workflow_reports() -> No
         "trading-credential names",
         "no listening socket",
         "memory limit applied",
-        "egress deny rule",
         "disable path is available",
+        "rollback path is valid",
         "no committee container is running",
         "ISOLATION_PROOF=",
+        # Owner remediation 1: OFF-mode egress must be deny-all and fail closed.
+        "egress is deny-all at the unit level",
+        "OFF-mode egress fails closed",
+        "no IPAddressAllow entry",
+        # Owner remediation 2: no scheduled committee execution while OFF.
+        "timer is not enabled",
+        "no scheduled committee execution",
+        "timer is inactive",
+        "not continuously active",
+        # Owner remediation 4: provider credentials absent from diagnostics.
+        "no provider credential is exposed through service diagnostics",
+        "exposes no provider credential name",
+        "emit no provider credential name",
+        "no credential-looking value is inlined",
+        "credential-shaped value",
     ):
         assert claim in script, claim
+
+
+def test_the_diagnostics_check_covers_each_systemd_surface_separately() -> None:
+    """A clean result on one diagnostic surface must not mask a leak on another."""
+    script = (COMMITTEE_DEPLOY / "verify-committee-isolation.sh").read_text(
+        encoding="utf-8"
+    )
+    # (a) `systemctl show` — the Environment= property, readable via systemctl.
+    assert 'show_output="$(systemctl show "$UNIT"' in script
+    # (b) `systemctl cat` — the unit file text.
+    assert 'cat_output="$(systemctl cat "$UNIT"' in script
+    # (c) `journalctl` — what an operator actually reads.
+    assert 'journal_output="$(journalctl -u "$UNIT"' in script
+    # The credential names are data-driven, and only names are referenced.
+    assert "PROVIDER_CREDENTIAL_NAMES=" in script
+    assert "OPIP_COMMITTEE_OPENAI_API_KEY" in script
+    assert "OPIP_COMMITTEE_ANTHROPIC_API_KEY" in script
+    # Credentials must arrive only by file reference.
+    assert "EnvironmentFile=" in script
+
+
+def test_the_diagnostics_check_never_prints_a_credential() -> None:
+    """The proof must print counts and statuses, never a value or the environment."""
+    script = (COMMITTEE_DEPLOY / "verify-committee-isolation.sh").read_text(
+        encoding="utf-8"
+    )
+    # A matching diagnostic line must never be echoed.
+    assert "grep -qE" in script  # matched/not-matched only
+    for forbidden in (
+        "cat \"$ENV_FILE\"",
+        "cat $ENV_FILE",
+        "systemctl show -p Environment --value \"$UNIT\" | grep -v",
+        "echo \"$show_output\"",
+        "echo \"$journal_output\"",
+        "printf '%s\\n' \"$show_output\"",
+        "printf '%s\\n' \"$journal_output\"",
+        "set -x",
+        "env |",
+        "printenv",
+    ):
+        assert forbidden not in script, forbidden
+
+
+def test_the_timer_and_service_state_checks_are_proofs_not_advisories() -> None:
+    """Timer/service state must be PASS/FAIL, since OFF mode requires them inert."""
+    script = (COMMITTEE_DEPLOY / "verify-committee-isolation.sh").read_text(
+        encoding="utf-8"
+    )
+    timer_block = script.split("# ------------------------------------------- scheduled execution is off")[
+        1
+    ].split("# ---------------------------------------------- provider credentials")[0]
+    # Every assertion in the block must fail closed, not merely report.
+    assert "fail " in timer_block
+    assert "is-enabled" in timer_block
+    assert "ActiveState" in timer_block
+    assert 'timer_state" == "disabled"' in script
+    assert 'service_active" == "inactive"' in script
+
+
+def test_the_bootstrap_does_not_enable_the_oneshot_service() -> None:
+    """The service has no [Install] section, so enabling it would abort the install.
+
+    This mattered for owner remediation 2: the install-without-timer path must
+    actually succeed, and `systemctl enable` on a unit with no installation config
+    exits non-zero, which `set -Eeuo pipefail` would turn into a hard failure.
+    """
+    bootstrap = (COMMITTEE_DEPLOY / "bootstrap-opip-committee-worker.sh").read_text(
+        encoding="utf-8"
+    )
+    service = (COMMITTEE_DEPLOY / "opip-committee-shadow.service").read_text(
+        encoding="utf-8"
+    )
+    assert "[Install]" not in service
+    assert "systemctl enable opip-committee-shadow.service" not in bootstrap
+    # The timer is explicitly disabled on the no-timer path.
+    assert "systemctl disable opip-committee-shadow.timer" in bootstrap
+    # And the units are still installed.
+    assert "install -m 0644 -o root -g root \"$SOURCE_DIR/opip-committee-shadow.service\"" in bootstrap
+    assert "install -m 0644 -o root -g root \"$SOURCE_DIR/opip-committee-shadow.timer\"" in bootstrap
+
+
+def test_the_bootstrap_still_supports_the_timer_for_the_later_boundary() -> None:
+    """--enable-timer remains available for the separately authorised activation."""
+    bootstrap = (COMMITTEE_DEPLOY / "bootstrap-opip-committee-worker.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "--enable-timer" in bootstrap
+    assert 'systemctl enable --now opip-committee-shadow.timer' in bootstrap
 
 
 def test_the_credentials_template_declares_no_real_credential() -> None:
