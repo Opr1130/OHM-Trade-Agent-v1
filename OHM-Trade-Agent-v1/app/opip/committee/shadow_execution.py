@@ -60,7 +60,10 @@ class HttpxPoster:
     """Exact-endpoint HTTPS POST implementation with no redirects."""
 
     def __init__(self, *, client: httpx.Client | None = None) -> None:
-        self._client = client or httpx.Client(follow_redirects=False)
+        self._client = client or httpx.Client(
+            follow_redirects=False,
+            trust_env=False,
+        )
         self._owns_client = client is None
 
     def close(self) -> None:
@@ -182,33 +185,38 @@ def execute_shadow_case(
     )
     ceiling.admit(estimated_cost_microunits=reservation, at=moment)
 
+    owns_poster = poster is None
     resolved_poster = poster or HttpxPoster()
     resolved_credentials = credentials or EnvironmentCredentialSource()
-    providers = build_governed_shadow_providers(
-        poster=resolved_poster,
-        credentials=resolved_credentials,
-    )
-    runner = CommitteeRunner(
-        providers=providers,
-        ledger=DurableObservationLedger(store=store),
-        max_output_tokens=APPROVED_MAX_OUTPUT_TOKENS,
-        timeout_seconds=APPROVED_DEADLINE_SECONDS,
-        now=clock,
-        settings=settings,
-    )
-    result = runner.run_case(case)
-    store.append_case_outcome(result.case_outcome)
+    try:
+        providers = build_governed_shadow_providers(
+            poster=resolved_poster,
+            credentials=resolved_credentials,
+        )
+        runner = CommitteeRunner(
+            providers=providers,
+            ledger=DurableObservationLedger(store=store),
+            max_output_tokens=APPROVED_MAX_OUTPUT_TOKENS,
+            timeout_seconds=APPROVED_DEADLINE_SECONDS,
+            now=clock,
+            settings=settings,
+        )
+        result = runner.run_case(case)
+        store.append_case_outcome(result.case_outcome)
 
-    reported = sum(
-        outcome.charge_microunits or outcome.estimated_microunits_reported()
-        for outcome in result.case_outcome.outcomes
-    )
-    ceiling.settle(
-        reserved_microunits=reservation,
-        reported_microunits=reported,
-        at=moment,
-    )
-    return result
+        reported = sum(
+            outcome.charge_microunits or outcome.estimated_microunits_reported()
+            for outcome in result.case_outcome.outcomes
+        )
+        ceiling.settle(
+            reserved_microunits=reservation,
+            reported_microunits=reported,
+            at=moment,
+        )
+        return result
+    finally:
+        if owns_poster and isinstance(resolved_poster, HttpxPoster):
+            resolved_poster.close()
 
 
 __all__ = [
