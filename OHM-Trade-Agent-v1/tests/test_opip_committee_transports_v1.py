@@ -41,7 +41,9 @@ from app.opip.committee.transports import (
     EnvironmentCredentialSource,
     HttpRequest,
     HttpResponse,
+    MAX_PROVIDER_RESPONSE_BYTES,
     OpenAITransport,
+    UrllibHttpPoster,
     build_approved_transports,
     build_transport,
 )
@@ -52,6 +54,32 @@ NEXT_DAY = datetime(2026, 9, 24, 0, 30, tzinfo=timezone.utc)
 
 OPENAI_KEY = "test-openai-credential-value"
 ANTHROPIC_KEY = "test-anthropic-credential-value"
+
+
+class _FakeHttpResponse:
+    def __init__(self, body: bytes, *, status: int = 200, content_length: int | None = None):
+        self._body = body
+        self.status = status
+        self.headers = {}
+        if content_length is not None:
+            self.headers["Content-Length"] = str(content_length)
+        self.closed = False
+
+    def read(self, limit: int) -> bytes:
+        return self._body[:limit]
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeOpener:
+    def __init__(self, response: _FakeHttpResponse) -> None:
+        self.response = response
+        self.calls = []
+
+    def open(self, request, timeout):
+        self.calls.append((request, timeout))
+        return self.response
 
 
 class MockPoster:
@@ -508,6 +536,63 @@ def test_the_anthropic_adapter_joins_text_blocks():
         endpoint=ALLOWED_ENDPOINTS[ProviderFamily.ANTHROPIC],
     )
     assert transport(_wire("claude-sonnet-5")).text == "ab"
+
+
+# ------------------------------------------------- bounded production HTTP seam
+
+
+def test_production_poster_refuses_non_https_before_opening_a_socket():
+    response = _FakeHttpResponse(b"{}")
+    opener = _FakeOpener(response)
+    poster = UrllibHttpPoster(_opener=opener, now=lambda: NOW)
+    request = HttpRequest(
+        url="http://api.openai.com/v1/chat/completions",
+        headers={"Content-Type": "application/json"},
+        body={"x": 1},
+        timeout_seconds=5,
+    )
+    with pytest.raises(EgressDeniedError, match="HTTPS only"):
+        poster(request)
+    assert opener.calls == []
+
+
+def test_production_poster_posts_bounded_json_without_logging_credentials():
+    response = _FakeHttpResponse(b'{"ok":true}')
+    opener = _FakeOpener(response)
+    poster = UrllibHttpPoster(_opener=opener, now=lambda: NOW)
+    request = HttpRequest(
+        url=ALLOWED_ENDPOINTS[ProviderFamily.OPENAI],
+        headers={"Authorization": "Bearer test-secret", "Content-Type": "application/json"},
+        body={"model": "example", "value": 1},
+        timeout_seconds=7,
+    )
+    result = poster(request)
+    assert result.status_code == 200
+    assert result.body_text == '{"ok":true}'
+    assert result.received_at == NOW
+    assert len(opener.calls) == 1
+    assert opener.calls[0][1] == 7
+    assert response.closed is True
+    assert "test-secret" not in repr(poster)
+
+
+def test_production_poster_refuses_declared_oversize_response():
+    response = _FakeHttpResponse(
+        b"{}",
+        content_length=MAX_PROVIDER_RESPONSE_BYTES + 1,
+    )
+    poster = UrllibHttpPoster(
+        _opener=_FakeOpener(response),
+        now=lambda: NOW,
+    )
+    request = HttpRequest(
+        url=ALLOWED_ENDPOINTS[ProviderFamily.OPENAI],
+        headers={"Content-Type": "application/json"},
+        body={"x": 1},
+        timeout_seconds=5,
+    )
+    with pytest.raises(ValueError, match="byte limit"):
+        poster(request)
 
 
 # ------------------------------------------------- IC-008: mode stays off
