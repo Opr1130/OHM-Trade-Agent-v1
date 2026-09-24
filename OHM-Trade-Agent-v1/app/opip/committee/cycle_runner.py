@@ -241,6 +241,15 @@ def _runtime_settings_from_environment() -> CommitteeShadowSettings:
 
 
 @dataclass(frozen=True)
+class ShadowCycleExecution:
+    """Optional real-execution dependencies for the sealed-case SHADOW path."""
+
+    case_input_path: Path
+    poster: HttpPoster | None = None
+    credentials: CredentialSource | None = None
+
+
+@dataclass(frozen=True)
 class CycleOutcome:
     """What one cycle did, for the worker's own reporting."""
 
@@ -256,12 +265,10 @@ def run_once(
     release_sha: str,
     committee_home: Path,
     evidence_path: Path,
-    case_input_path: Path | None = None,
     settings: CommitteeShadowSettings | None = None,
     budget: SchedulerBudget | None = None,
     now: datetime | None = None,
-    poster: HttpPoster | None = None,
-    credentials: CredentialSource | None = None,
+    execution: ShadowCycleExecution | None = None,
 ) -> CycleOutcome:
     """Run exactly one bounded cycle. Never raises for a data problem."""
     if not release_sha or len(release_sha) != 40:
@@ -276,11 +283,11 @@ def run_once(
 
     cases: tuple[CommitteeCase, ...] = ()
     case_by_key: Mapping[tuple[str, str, str], CommitteeCase] = {}
-    if case_input_path is None:
+    if execution is None:
         items = load_evidence_items(evidence_path)
     else:
         try:
-            cases = load_case_envelopes(case_input_path)
+            cases = load_case_envelopes(execution.case_input_path)
         except ShadowCaseEnvelopeError as exc:
             raise CycleConfigurationError(
                 f"sealed case input is invalid: {exc}"
@@ -308,7 +315,7 @@ def run_once(
         settings=resolved_settings,
     )
     executor = None
-    if case_input_path is not None:
+    if execution is not None:
         store = CommitteeEvidenceStore(root=committee_home)
 
         def execute(item: CommittedEvidenceItem) -> bool:
@@ -326,8 +333,8 @@ def run_once(
                 case,
                 store=store,
                 settings=resolved_settings,
-                poster=poster,
-                credentials=credentials,
+                poster=execution.poster,
+                credentials=execution.credentials,
                 now=lambda: moment,
             )
             return True
@@ -383,15 +390,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     committee_home = Path(committee_home_value)
     evidence_path = committee_home / EVIDENCE_ITEMS_FILE
     case_inputs_value = _value_of(args, "--case-inputs")
-    case_input_path = None if not case_inputs_value else Path(case_inputs_value)
+    execution = (
+        None
+        if not case_inputs_value
+        else ShadowCycleExecution(case_input_path=Path(case_inputs_value))
+    )
 
     try:
         outcome = run_once(
             release_sha=release_sha or "",
             committee_home=committee_home,
             evidence_path=evidence_path,
-            case_input_path=case_input_path,
             settings=_runtime_settings_from_environment(),
+            execution=execution,
         )
     except CycleConfigurationError as exc:
         print(f"committee cycle refused: {exc}", file=sys.stderr)
@@ -440,6 +451,7 @@ __all__ = [
     "CycleConfigurationError",
     "CycleOutcome",
     "FileCheckpoint",
+    "ShadowCycleExecution",
     "load_evidence_items",
     "main",
     "run_once",
