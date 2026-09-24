@@ -1,14 +1,16 @@
 # Module 2 — external-action proposals
 
-> **PROPOSALS ONLY. NOTHING HERE IS ACTIVATED.**
+> **HISTORICAL PROPOSAL + CURRENT BOUNDARY STATUS.**
 >
-> These documents specify the two remaining Module 2 requirements that cannot be
-> completed by an engineering agent: real provider transports (IC-008) and an
-> isolated shadow deployment (IC-042). Each is written so an OWNER can approve,
-> amend, or reject a concrete plan rather than answer an open question.
+> The initial OFF worker deployment has since been OWNER-approved, installed, and
+> proven isolated. It remains OFF: timer disabled/inactive, deny-all egress, no
+> provider credential installed for Committee execution, and no provider call.
 >
-> No credential has been created, read, or moved. No process has been deployed. No
-> provider has been contacted. No trading authority exists anywhere in this plane.
+> The repository now contains the separately gated SHADOW runtime bridge: verified
+> canonical-replica case production, bounded provider transports/executor, durable
+> accounting, and an explicit no-backfill boundary. That code is still not a live
+> activation. Provider credentials, provider egress, SHADOW mode, and recurring timer
+> activation remain a separate OWNER-authorised action.
 
 ---
 
@@ -253,7 +255,8 @@ worker running a different release cannot contribute prospective evidence.
 3. Confirmation that default mode is `off` and that no trading credential is mounted.
 4. The rollback trigger and who invokes it.
 
-Until then, IC-042 stays MISSING. No process was deployed.
+IC-042 OFF installation is now **DEPLOYED_AND_ISOLATION_PROVEN**. Credentialled
+SHADOW activation remains deliberately separate and has not occurred.
 
 ---
 
@@ -261,9 +264,11 @@ Until then, IC-042 stays MISSING. No process was deployed.
 
 | Requirement | Status | What remains |
 | --- | --- | --- |
-| IC-008 | **IMPLEMENTED_AWAITING_CREDENTIALLED_SHADOW_VALIDATION** | Real adapters, allowlist, credential injection, ceilings, and the cross-vendor route table are implemented and tested against mocks. Three values are still needed: the price book, the per-attempt deadline, and the per-attempt token limit. Then the credentialled shadow validation itself. |
-| IC-042 | Design complete, **not deployed** | The exact change is prepared in `deploy/committee/` (`opip-committee-shadow.service`, `.timer`, `run-committee-shadow-cycle.sh`, `README.md`, and `cycle_runner.py`). Installing or enabling it needs separate OWNER approval. |
+| IC-008 | **IMPLEMENTED_AWAITING_CREDENTIALLED_SHADOW_VALIDATION** | Approved OpenAI/Anthropic adapters, fixed model identities, price book, 45-second deadline, 1,200-token ceiling, cost accounting, bounded HTTPS transport, durable executor, and fail-closed credential handling are implemented. Real credentialled canary evidence is still intentionally absent. |
+| IC-042 | **OFF_DEPLOYMENT_PROVEN / SHADOW_NOT_ACTIVATED** | The isolated worker is installed and proven OFF. The repository-side SHADOW bridge consumes only verified read-only replica evidence and remains unreachable until a separate OWNER-authorised mode/credential/egress activation. The timer stays disabled until a later recurring-work decision. |
 
-Every other Module 2 requirement is either GREEN with lifecycle evidence or PARTIAL
-solely because it awaits real evidence, live cases, or a deployed release. No remaining
-item is blocked on unfinished engineering.
+The repository engineering needed for a bounded provider-family SHADOW canary is now
+present in PR #268, subject to its exact-head tests/reviews. This does **not** mean the
+seven-role `RoleRouter` research layer has been made the deployed orchestration path;
+that semantic orchestration remains a separate bounded integration decision rather
+than being silently implied by provider-family execution.
