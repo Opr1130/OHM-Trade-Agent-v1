@@ -139,6 +139,9 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Refuse redirects so an allowlisted URL cannot bounce to another host."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # urllib requires this override signature. Consume every argument explicitly
+        # so static analysis can distinguish intentional refusal from unused inputs.
+        del req, fp, code, msg, headers, newurl
         return None
 
 
@@ -166,6 +169,19 @@ class UrllibHttpPoster:
             raise ValueError("max_response_bytes must be a positive integer")
 
     def __call__(self, request: HttpRequest) -> HttpResponse:
+        wire = self._wire_request(request)
+        try:
+            response = self._opener.open(wire, timeout=request.timeout_seconds)
+        except urllib.error.HTTPError as exc:
+            return self._http_response(exc, status_code=int(exc.code))
+        except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
+            self._raise_network_failure(exc)
+        try:
+            return self._http_response(response, status_code=int(response.status))
+        finally:
+            response.close()
+
+    def _wire_request(self, request: HttpRequest) -> urllib.request.Request:
         if not request.url.startswith("https://"):
             raise EgressDeniedError("provider HTTP poster permits HTTPS only")
         body = json.dumps(
@@ -174,33 +190,26 @@ class UrllibHttpPoster:
             separators=(",", ":"),
             allow_nan=False,
         ).encode("utf-8")
-        wire = urllib.request.Request(
+        return urllib.request.Request(
             request.url,
             data=body,
             headers=dict(request.headers),
             method="POST",
         )
-        try:
-            response = self._opener.open(wire, timeout=request.timeout_seconds)
-        except urllib.error.HTTPError as exc:
-            return HttpResponse(
-                status_code=int(exc.code),
-                body_text=self._read_bounded(exc),
-                received_at=self.now(),
-            )
-        except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
-            reason = getattr(exc, "reason", exc)
-            if isinstance(reason, (socket.timeout, TimeoutError)):
-                raise TimeoutError("provider HTTPS request timed out") from exc
-            raise OSError("provider HTTPS request failed") from exc
-        try:
-            return HttpResponse(
-                status_code=int(response.status),
-                body_text=self._read_bounded(response),
-                received_at=self.now(),
-            )
-        finally:
-            response.close()
+
+    def _http_response(self, response: Any, *, status_code: int) -> HttpResponse:
+        return HttpResponse(
+            status_code=status_code,
+            body_text=self._read_bounded(response),
+            received_at=self.now(),
+        )
+
+    @staticmethod
+    def _raise_network_failure(exc: BaseException) -> None:
+        reason = getattr(exc, "reason", exc)
+        if isinstance(reason, (socket.timeout, TimeoutError)):
+            raise TimeoutError("provider HTTPS request timed out") from exc
+        raise OSError("provider HTTPS request failed") from exc
 
     def _read_bounded(self, response: Any) -> str:
         length = response.headers.get("Content-Length")
@@ -363,13 +372,19 @@ class _BaseTransport:
                 reason, failure_class=ProviderFailureClass.PROVIDER_UNAVAILABLE
             )
         self.require_allowed(self.endpoint)
-        http_request = HttpRequest(
+        response = self.poster(self._http_request(request))
+        payload = self._validated_payload(response)
+        return self._provider_response(response=response, payload=payload)
+
+    def _http_request(self, request: ProviderWireRequest) -> HttpRequest:
+        return HttpRequest(
             url=self.endpoint,
             headers=dict(self._authorization_headers()),
             body=dict(self._vendor_body(request)),
             timeout_seconds=self.timeout_seconds,
         )
-        response = self.poster(http_request)
+
+    def _validated_payload(self, response: HttpResponse) -> Mapping[str, Any]:
         if response.status_code != 200:
             raise ProviderInvocationError(
                 f"{self.family.value} returned HTTP {response.status_code}",
@@ -381,20 +396,39 @@ class _BaseTransport:
                 f"{self.family.value} returned a body that is not a JSON object",
                 failure_class=ProviderFailureClass.MALFORMED_RESPONSE,
             )
+        return payload
+
+    def _estimated_cost(
+        self,
+        *,
+        served_identity: str,
+        input_tokens: int | None,
+        output_tokens: int | None,
+    ) -> int | None:
+        if self.price_book is None:
+            return None
+        return self.price_book.cost_microunits(
+            provider=self.family.value,
+            model=served_identity,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+
+    def _provider_response(
+        self,
+        *,
+        response: HttpResponse,
+        payload: Mapping[str, Any],
+    ) -> ProviderRawResponse:
         text, input_tokens, output_tokens, served_model = self._extract(payload)
         served_identity = served_model or self.model
-        estimated_cost = None
-        if self.price_book is not None:
-            estimated_cost = self.price_book.cost_microunits(
-                provider=self.family.value,
-                model=served_identity,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-            )
+        estimated_cost = self._estimated_cost(
+            served_identity=served_identity,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
         return ProviderRawResponse(
             reported_provider=self.family.value,
-            # The served identity comes from the payload, never from the request, so
-            # the router can detect a substituted model rather than assume one.
             reported_model=served_identity,
             text=text,
             received_at=response.received_at,
@@ -406,8 +440,6 @@ class _BaseTransport:
                 if estimated_cost is not None
                 else CostCompleteness.UNKNOWN
             ),
-            # A reference identifies the exchange without carrying its body, which
-            # could contain model text and therefore anything a model echoed back.
             raw_response_ref=f"{self.family.value}:http-{response.status_code}",
         )
 
