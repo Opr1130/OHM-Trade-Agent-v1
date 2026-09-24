@@ -18,6 +18,7 @@ import pytest
 
 from app.opip.committee.contracts import CostCompleteness, ProviderFailureClass, ProviderFamily
 from app.opip.committee.providers import ProviderInvocationError, ProviderWireRequest
+from app.opip.committee.pricing import PriceBook, TokenPrice
 from app.opip.committee.registry import (
     APPROVED_MAX_CASE_COST_MICROUNITS,
     APPROVED_MAX_DAILY_COST_MICROUNITS,
@@ -41,7 +42,9 @@ from app.opip.committee.transports import (
     EnvironmentCredentialSource,
     HttpRequest,
     HttpResponse,
+    MAX_HTTP_RESPONSE_BYTES,
     OpenAITransport,
+    StdlibHttpPoster,
     build_approved_transports,
     build_transport,
 )
@@ -90,12 +93,25 @@ def _wire(model: str = "gpt-5.6-terra") -> ProviderWireRequest:
     )
 
 
-def _openai_body(text: str = '{"assessment":"SUPPORTIVE"}', model: str = "gpt-5.6-terra") -> str:
+def _openai_body(
+    text: str = '{"assessment":"SUPPORTIVE"}',
+    model: str = "gpt-5.6-terra",
+    *,
+    status: str = "completed",
+) -> str:
     return json.dumps(
         {
             "model": model,
-            "choices": [{"message": {"role": "assistant", "content": text}}],
-            "usage": {"prompt_tokens": 120, "completion_tokens": 40},
+            "status": status,
+            "output": [
+                {"type": "reasoning", "summary": []},
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": text}],
+                },
+            ],
+            "usage": {"input_tokens": 120, "output_tokens": 40},
         }
     )
 
@@ -353,8 +369,13 @@ def test_the_openai_adapter_pins_the_model_and_reasoning_effort():
     transport(_wire())
     body = poster.requests[0].body
     assert body["model"] == "gpt-5.6-terra"
-    assert body["reasoning_effort"] == "low"
-    assert body["max_completion_tokens"] == 256
+    assert body["reasoning"] == {"effort": "low"}
+    assert body["max_output_tokens"] == 256
+    assert body["instructions"] == "role prompt"
+    assert body["store"] is False
+    assert body["tools"] == []
+    assert "messages" not in body
+    assert poster.requests[0].url == "https://api.openai.com/v1/responses"
     assert poster.requests[0].url == ALLOWED_ENDPOINTS[ProviderFamily.OPENAI]
 
 
@@ -371,6 +392,8 @@ def test_the_anthropic_adapter_pins_the_model_and_api_version():
     body = poster.requests[0].body
     assert body["model"] == "claude-sonnet-5"
     assert body["max_tokens"] == 256
+    assert body["thinking"] == {"type": "adaptive"}
+    assert body["output_config"] == {"effort": "low"}
     assert poster.requests[0].headers["anthropic-version"] == ANTHROPIC_API_VERSION
 
 
@@ -404,6 +427,54 @@ def test_the_adapter_records_token_usage_and_unknown_cost():
     # The adapter does not invent a cost; pricing is configuration.
     assert response.cost_completeness is CostCompleteness.UNKNOWN
     assert response.estimated_cost_microunits is None
+
+
+def test_configured_price_book_records_measured_provider_cost():
+    book = PriceBook(
+        (
+            TokenPrice(
+                provider="openai",
+                model="gpt-5.6-terra",
+                microunits_per_million_input_tokens=2_000_000,
+                microunits_per_million_output_tokens=12_000_000,
+            ),
+        )
+    )
+    transport = OpenAITransport(
+        family=ProviderFamily.OPENAI,
+        model="gpt-5.6-terra",
+        poster=MockPoster(body=_openai_body()),
+        credentials=_credentials(),
+        endpoint=ALLOWED_ENDPOINTS[ProviderFamily.OPENAI],
+        price_book=book,
+    )
+    response = transport(_wire())
+    assert response.estimated_cost_microunits == 720
+    assert response.cost_completeness is CostCompleteness.COMPLETE
+
+
+def test_unknown_served_model_keeps_cost_unknown_even_with_price_book():
+    book = PriceBook(
+        (
+            TokenPrice(
+                provider="openai",
+                model="gpt-5.6-terra",
+                microunits_per_million_input_tokens=2_000_000,
+                microunits_per_million_output_tokens=12_000_000,
+            ),
+        )
+    )
+    transport = OpenAITransport(
+        family=ProviderFamily.OPENAI,
+        model="gpt-5.6-terra",
+        poster=MockPoster(body=_openai_body(model="unexpected-model")),
+        credentials=_credentials(),
+        endpoint=ALLOWED_ENDPOINTS[ProviderFamily.OPENAI],
+        price_book=book,
+    )
+    response = transport(_wire())
+    assert response.estimated_cost_microunits is None
+    assert response.cost_completeness is CostCompleteness.UNKNOWN
 
 
 def test_the_recorded_reference_carries_no_payload_text():
@@ -481,13 +552,46 @@ def test_a_body_missing_its_content_is_a_malformed_response():
     transport = OpenAITransport(
         family=ProviderFamily.OPENAI,
         model="gpt-5.6-terra",
-        poster=MockPoster(body=json.dumps({"choices": []})),
+        poster=MockPoster(
+            body=json.dumps(
+                {
+                    "model": "gpt-5.6-terra",
+                    "status": "completed",
+                    "output": [{"type": "reasoning", "summary": []}],
+                }
+            )
+        ),
         credentials=_credentials(),
         endpoint=ALLOWED_ENDPOINTS[ProviderFamily.OPENAI],
     )
     with pytest.raises(ProviderInvocationError) as error:
         transport(_wire())
     assert error.value.failure_class is ProviderFailureClass.MALFORMED_RESPONSE
+
+
+def test_an_incomplete_openai_response_is_not_admitted_as_an_opinion():
+    transport = OpenAITransport(
+        family=ProviderFamily.OPENAI,
+        model="gpt-5.6-terra",
+        poster=MockPoster(body=_openai_body(status="incomplete")),
+        credentials=_credentials(),
+        endpoint=ALLOWED_ENDPOINTS[ProviderFamily.OPENAI],
+    )
+    with pytest.raises(ProviderInvocationError) as error:
+        transport(_wire())
+    assert error.value.failure_class is ProviderFailureClass.MALFORMED_RESPONSE
+
+
+def test_openai_output_text_is_found_after_non_message_items():
+    poster = MockPoster(body=_openai_body(text='{"assessment":"NEUTRAL"}'))
+    transport = OpenAITransport(
+        family=ProviderFamily.OPENAI,
+        model="gpt-5.6-terra",
+        poster=poster,
+        credentials=_credentials(),
+        endpoint=ALLOWED_ENDPOINTS[ProviderFamily.OPENAI],
+    )
+    assert transport(_wire()).text == '{"assessment":"NEUTRAL"}'
 
 
 def test_the_anthropic_adapter_joins_text_blocks():
@@ -508,6 +612,79 @@ def test_the_anthropic_adapter_joins_text_blocks():
         endpoint=ALLOWED_ENDPOINTS[ProviderFamily.ANTHROPIC],
     )
     assert transport(_wire("claude-sonnet-5")).text == "ab"
+
+
+class _FakeHttpStream:
+    def __init__(self, body: bytes, *, status: int = 200) -> None:
+        self._body = body
+        self._status = status
+
+    def read(self, amount: int) -> bytes:
+        return self._body[:amount]
+
+    def getcode(self) -> int:
+        return self._status
+
+
+class _FakeOpener:
+    def __init__(self, response: _FakeHttpStream) -> None:
+        self.response = response
+        self.calls = []
+
+    def open(self, request, timeout):
+        self.calls.append((request, timeout))
+        return self.response
+
+
+def test_real_http_poster_refuses_a_non_governed_destination_before_opening():
+    opener = _FakeOpener(_FakeHttpStream(b"{}"))
+    poster = StdlibHttpPoster(opener=opener, now=lambda: NOW)
+    with pytest.raises(EgressDeniedError, match="non-governed destination"):
+        poster(
+            HttpRequest(
+                url="https://example.invalid/v1",
+                headers={"Content-Type": "application/json"},
+                body={"safe": True},
+                timeout_seconds=3,
+            )
+        )
+    assert opener.calls == []
+
+
+def test_real_http_poster_serializes_only_the_supplied_request_and_bounds_time():
+    opener = _FakeOpener(_FakeHttpStream(b'{"ok":true}'))
+    poster = StdlibHttpPoster(opener=opener, now=lambda: NOW)
+    response = poster(
+        HttpRequest(
+            url=ALLOWED_ENDPOINTS[ProviderFamily.OPENAI],
+            headers={"Content-Type": "application/json"},
+            body={"b": 2, "a": 1},
+            timeout_seconds=7,
+        )
+    )
+    request, timeout = opener.calls[0]
+    assert request.full_url == ALLOWED_ENDPOINTS[ProviderFamily.OPENAI]
+    assert request.get_method() == "POST"
+    assert request.data == b'{"a":1,"b":2}'
+    assert timeout == 7
+    assert response.body_text == '{"ok":true}'
+    assert response.received_at == NOW
+
+
+def test_real_http_poster_refuses_an_oversized_response():
+    opener = _FakeOpener(
+        _FakeHttpStream(b"x" * (MAX_HTTP_RESPONSE_BYTES + 1))
+    )
+    poster = StdlibHttpPoster(opener=opener, now=lambda: NOW)
+    with pytest.raises(ValueError, match="exceeds"):
+        poster(
+            HttpRequest(
+                url=ALLOWED_ENDPOINTS[ProviderFamily.OPENAI],
+                headers={"Content-Type": "application/json"},
+                body={"safe": True},
+                timeout_seconds=3,
+            )
+        )
 
 
 # ------------------------------------------------- IC-008: mode stays off
