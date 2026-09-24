@@ -29,6 +29,7 @@ What it deliberately does **not** do:
 from __future__ import annotations
 
 import json
+import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -36,6 +37,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
 
 from app.opip.committee.case_ingress import CaseIngressPopulation, load_case_envelopes
+from app.opip.committee.case_producer import CaseSourceError, produce_case_population
 from app.opip.committee.contracts import CommitteeCase
 from app.opip.committee.daily_ceiling import DailyCeiling, FileDailySpendStore
 from app.opip.committee.registry import APPROVED_MAX_DAILY_COST_MICROUNITS
@@ -46,8 +48,18 @@ from app.opip.committee.scheduler import (
     SchedulerCheckpoint,
     ScheduleDispositionRecord,
 )
-from app.opip.committee.settings import CommitteeShadowSettings
+from app.opip.committee.settings import (
+    COMMITTEE_MODE_SHADOW,
+    CommitteeShadowSettings,
+    resolve_committee_cost_ceiling,
+    resolve_committee_mode,
+)
+from app.opip.committee.shadow_executor import (
+    ShadowExecutorConfigurationError,
+    build_credentialled_shadow_executor,
+)
 from app.opip.committee.trust import CommitteeInvestment, build_trust_report
+from app.opip.learning.canonical_replica import ReplicaVerificationError
 
 #: Exit codes the deploying script relies on.
 EXIT_OK = 0
@@ -57,6 +69,11 @@ EXIT_OPERATIONAL_ERROR = 2
 CYCLE_DISPOSITIONS_FILE = "cycle_dispositions.jsonl"
 TRUST_REPORT_FILE = "trust_report.json"
 EVIDENCE_ITEMS_FILE = "committed_evidence_items.jsonl"
+SHADOW_NOT_BEFORE_ENV = "OPIP_COMMITTEE_SHADOW_NOT_BEFORE"
+LEARNING_DATA_MANIFEST_ENV = "OPIP_COMMITTEE_LEARNING_MANIFEST"
+REPLICA_ROOT_ENV = "OPIP_CANONICAL_REPLICA_ROOT_HOST"
+DEFAULT_LEARNING_DATA_MANIFEST = Path("/var/lib/opip-learning/data/manifest.env")
+DEFAULT_REPLICA_REPOSITORY_ROOT = Path("/var/lib/opip-learning/canonical-replica")
 
 #: Initial per-cycle bounds. The daily ceiling is the stronger, approved bound.
 DEFAULT_CYCLE_CASES = 8
@@ -205,6 +222,7 @@ def run_once(
     settings: CommitteeShadowSettings | None = None,
     budget: SchedulerBudget | None = None,
     case_ingress_path: Path | None = None,
+    case_population: CaseIngressPopulation | None = None,
     case_executor: Callable[[CommitteeCase], bool] | None = None,
     now: datetime | None = None,
 ) -> CycleOutcome:
@@ -215,23 +233,31 @@ def run_once(
             "identify a released artifact"
         )
     moment = now or datetime.now(timezone.utc)
-    resolved_settings = settings or CommitteeShadowSettings()
+    resolved_settings = settings or CommitteeShadowSettings(
+        opip_committee_mode=resolve_committee_mode(),
+        opip_committee_max_estimated_cost_microunits=(
+            resolve_committee_cost_ceiling() or 0
+        ),
+    )
     committee_home.mkdir(parents=True, exist_ok=True)
     checkpoint = FileCheckpoint(committee_home)
 
-    scheduler_executor = None
-    if case_ingress_path is None:
+    if case_ingress_path is not None and case_population is not None:
+        raise CycleConfigurationError(
+            "case_ingress_path and case_population are mutually exclusive"
+        )
+    population = case_population
+    if population is None and case_ingress_path is not None:
+        population = CaseIngressPopulation(load_case_envelopes(case_ingress_path))
+
+    if population is None:
         if case_executor is not None:
             raise CycleConfigurationError(
-                "a case_executor requires a validated case_ingress_path"
+                "a case_executor requires validated case ingress"
             )
         items = load_evidence_items(evidence_path)
     else:
-        population = CaseIngressPopulation(load_case_envelopes(case_ingress_path))
         items = population.scheduler_items
-        if case_executor is not None:
-            def scheduler_executor(item):
-                return case_executor(population.case_for(item))
 
     # The daily ceiling caps this cycle's cost budget, so a cycle can never spend
     # more than the UTC day's remaining allowance. The per-case ceiling still applies
@@ -242,6 +268,19 @@ def run_once(
         now=lambda: moment,
     )
     remaining_today = ceiling.remaining_today()
+
+    scheduler_executor = None
+    if case_executor is not None and population is not None:
+        def scheduler_executor(item):
+            # Persist the full candidate reservation before any external work. A
+            # failure keeps the reservation: unknown/failed spend is never treated
+            # as free, and a restart cannot reopen the daily ceiling.
+            ceiling.admit(
+                estimated_cost_microunits=item.estimated_cost_microunits,
+                at=moment,
+            )
+            return case_executor(population.case_for(item))
+
     scheduler = CommitteeScheduler(
         checkpoint=checkpoint,
         now=lambda: moment,
@@ -252,9 +291,8 @@ def run_once(
         ),
         settings=resolved_settings,
     )
-    # The deployed CLI supplies no case executor. An executor is accepted only as
-    # an explicit injected dependency so the scheduler -> exact-case binding can be
-    # exercised in tests before provider execution is wired into the worker.
+    # OFF has no executor. SHADOW receives an explicitly constructed executor only
+    # after provenance, activation-boundary, credential and budget checks pass.
     run = scheduler.run_cycle(items=items, executor=scheduler_executor)
 
     report = build_trust_report(
@@ -291,6 +329,56 @@ def run_once(
     )
 
 
+def _runtime_settings() -> CommitteeShadowSettings:
+    return CommitteeShadowSettings(
+        opip_committee_mode=resolve_committee_mode(),
+        opip_committee_max_estimated_cost_microunits=(
+            resolve_committee_cost_ceiling() or 0
+        ),
+    )
+
+
+def _parse_activation_boundary(value: str | None) -> datetime:
+    if not isinstance(value, str) or not value.strip():
+        raise CycleConfigurationError(
+            f"{SHADOW_NOT_BEFORE_ENV} is required for SHADOW; historical backfill "
+            "is never inferred"
+        )
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise CycleConfigurationError(
+            f"{SHADOW_NOT_BEFORE_ENV} must be an ISO-8601 timestamp"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise CycleConfigurationError(
+            f"{SHADOW_NOT_BEFORE_ENV} must include a timezone"
+        )
+    return parsed.astimezone(timezone.utc)
+
+
+def _production_sha_from_learning_manifest(path: Path) -> str:
+    if not path.is_file():
+        raise CycleConfigurationError(
+            f"learning manifest is unavailable at {path}"
+        )
+    matches: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip() == "production_deployed_sha":
+            matches.append(value.strip())
+    if len(matches) != 1:
+        raise CycleConfigurationError(
+            "learning manifest must contain exactly one production_deployed_sha"
+        )
+    sha = matches[0]
+    if len(sha) != 40 or any(ch not in "0123456789abcdef" for ch in sha):
+        raise CycleConfigurationError(
+            "learning manifest production_deployed_sha is not 40 lowercase hex"
+        )
+    return sha
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Parse the worker's arguments and run one cycle."""
     args = list(sys.argv[1:] if argv is None else argv)
@@ -304,14 +392,56 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_CONFIG_ERROR
     committee_home = Path(committee_home_value)
     evidence_path = committee_home / EVIDENCE_ITEMS_FILE
+    settings = _runtime_settings()
+    moment = datetime.now(timezone.utc)
 
     try:
+        population = None
+        executor = None
+        if settings.opip_committee_mode == COMMITTEE_MODE_SHADOW:
+            activation_boundary = _parse_activation_boundary(
+                os.environ.get(SHADOW_NOT_BEFORE_ENV)
+            )
+            learning_manifest = Path(
+                os.environ.get(
+                    LEARNING_DATA_MANIFEST_ENV,
+                    str(DEFAULT_LEARNING_DATA_MANIFEST),
+                )
+            )
+            replica_root = Path(
+                os.environ.get(
+                    REPLICA_ROOT_ENV,
+                    str(DEFAULT_REPLICA_REPOSITORY_ROOT),
+                )
+            )
+            source_sha = _production_sha_from_learning_manifest(learning_manifest)
+            population = produce_case_population(
+                replica_repository_root=replica_root,
+                expected_source_release_sha=source_sha,
+                not_before=activation_boundary,
+                now=moment,
+            )
+            executor = build_credentialled_shadow_executor(
+                committee_home=committee_home
+            )
+
         outcome = run_once(
             release_sha=release_sha or "",
             committee_home=committee_home,
             evidence_path=evidence_path,
+            settings=settings,
+            case_population=population,
+            case_executor=executor,
+            now=moment,
         )
-    except CycleConfigurationError as exc:
+    except (
+        CycleConfigurationError,
+        CaseSourceError,
+        ShadowExecutorConfigurationError,
+        ReplicaVerificationError,
+        ValueError,
+        OSError,
+    ) as exc:
         print(f"committee cycle refused: {exc}", file=sys.stderr)
         return EXIT_CONFIG_ERROR
     try:
@@ -349,14 +479,21 @@ if __name__ == "__main__":  # pragma: no cover - exercised through main()
 __all__ = [
     "CYCLE_DISPOSITIONS_FILE",
     "DEFAULT_CYCLE_CASES",
+    "DEFAULT_LEARNING_DATA_MANIFEST",
+    "DEFAULT_REPLICA_REPOSITORY_ROOT",
     "EVIDENCE_ITEMS_FILE",
     "EXIT_CONFIG_ERROR",
     "EXIT_OK",
     "EXIT_OPERATIONAL_ERROR",
+    "LEARNING_DATA_MANIFEST_ENV",
+    "REPLICA_ROOT_ENV",
+    "SHADOW_NOT_BEFORE_ENV",
     "TRUST_REPORT_FILE",
     "CycleConfigurationError",
     "CycleOutcome",
     "FileCheckpoint",
+    "_parse_activation_boundary",
+    "_production_sha_from_learning_manifest",
     "load_evidence_items",
     "main",
     "run_once",
