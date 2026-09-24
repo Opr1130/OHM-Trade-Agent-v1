@@ -73,8 +73,6 @@ EVIDENCE_ITEMS_FILE = "committed_evidence_items.jsonl"
 SHADOW_NOT_BEFORE_ENV = "OPIP_COMMITTEE_SHADOW_NOT_BEFORE"
 LEARNING_DATA_MANIFEST_ENV = "OPIP_COMMITTEE_LEARNING_MANIFEST"
 REPLICA_ROOT_ENV = "OPIP_CANONICAL_REPLICA_ROOT_HOST"
-DEFAULT_LEARNING_DATA_MANIFEST = Path("/var/lib/opip-learning/data/manifest.env")
-DEFAULT_REPLICA_REPOSITORY_ROOT = Path("/var/lib/opip-learning/canonical-replica")
 
 #: Initial per-cycle bounds. The daily ceiling is the stronger, approved bound.
 DEFAULT_CYCLE_CASES = 8
@@ -361,6 +359,15 @@ def _resolve_cycle_case_limit() -> int:
     return value
 
 
+def _required_path_env(name: str) -> Path:
+    raw = os.environ.get(name)
+    if not isinstance(raw, str) or not raw.strip():
+        raise CycleConfigurationError(
+            f"{name} is required for SHADOW; no host path is inferred"
+        )
+    return Path(raw.strip())
+
+
 def _runtime_settings() -> CommitteeShadowSettings:
     return CommitteeShadowSettings(
         opip_committee_mode=resolve_committee_mode(),
@@ -434,18 +441,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             activation_boundary = _parse_activation_boundary(
                 os.environ.get(SHADOW_NOT_BEFORE_ENV)
             )
-            learning_manifest = Path(
-                os.environ.get(
-                    LEARNING_DATA_MANIFEST_ENV,
-                    str(DEFAULT_LEARNING_DATA_MANIFEST),
-                )
+            learning_manifest = _required_path_env(
+                LEARNING_DATA_MANIFEST_ENV
             )
-            replica_root = Path(
-                os.environ.get(
-                    REPLICA_ROOT_ENV,
-                    str(DEFAULT_REPLICA_REPOSITORY_ROOT),
-                )
-            )
+            replica_root = _required_path_env(REPLICA_ROOT_ENV)
             source_sha = _production_sha_from_learning_manifest(learning_manifest)
             population = produce_case_population(
                 replica_repository_root=replica_root,
@@ -511,8 +510,6 @@ if __name__ == "__main__":  # pragma: no cover - exercised through main()
 __all__ = [
     "CYCLE_DISPOSITIONS_FILE",
     "DEFAULT_CYCLE_CASES",
-    "DEFAULT_LEARNING_DATA_MANIFEST",
-    "DEFAULT_REPLICA_REPOSITORY_ROOT",
     "EVIDENCE_ITEMS_FILE",
     "EXIT_CONFIG_ERROR",
     "EXIT_OK",
@@ -527,6 +524,7 @@ __all__ = [
     "FileCheckpoint",
     "_parse_activation_boundary",
     "_production_sha_from_learning_manifest",
+    "_required_path_env",
     "_resolve_cycle_case_limit",
     "load_evidence_items",
     "main",
