@@ -101,7 +101,7 @@ def test_sealed_case_path_executes_identity_matched_case_once(
         release_sha=SHA,
         committee_home=tmp_path / "committee",
         evidence_path=tmp_path / "legacy.jsonl",
-        case_input_path=case_path,
+        execution=cycle_runner.ShadowCycleExecution(case_input_path=case_path),
         settings=_settings(),
         budget=SchedulerBudget(max_committee_cases=1, max_cost_microunits=500_000),
         now=NOW,
@@ -128,7 +128,9 @@ def test_restart_checkpoint_prevents_second_external_execution(
         "release_sha": SHA,
         "committee_home": tmp_path / "committee",
         "evidence_path": tmp_path / "legacy.jsonl",
-        "case_input_path": tmp_path / "read-only" / cycle_runner.CASE_INPUTS_FILE,
+        "execution": cycle_runner.ShadowCycleExecution(
+            case_input_path=tmp_path / "read-only" / cycle_runner.CASE_INPUTS_FILE
+        ),
         "settings": _settings(),
         "budget": SchedulerBudget(
             max_committee_cases=1,
@@ -158,7 +160,9 @@ def test_off_mode_never_invokes_the_case_executor(
         release_sha=SHA,
         committee_home=tmp_path / "committee",
         evidence_path=tmp_path / "legacy.jsonl",
-        case_input_path=tmp_path / "sealed.jsonl",
+        execution=cycle_runner.ShadowCycleExecution(
+            case_input_path=tmp_path / "sealed.jsonl"
+        ),
         settings=CommitteeShadowSettings(),
         now=NOW,
     )
@@ -183,7 +187,9 @@ def test_invalid_sealed_input_is_a_configuration_failure(
             release_sha=SHA,
             committee_home=tmp_path / "committee",
             evidence_path=tmp_path / "legacy.jsonl",
-            case_input_path=tmp_path / "sealed.jsonl",
+            execution=cycle_runner.ShadowCycleExecution(
+            case_input_path=tmp_path / "sealed.jsonl"
+        ),
             settings=_settings(),
             now=NOW,
         )
