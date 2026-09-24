@@ -29,6 +29,7 @@ What it deliberately does **not** do:
 from __future__ import annotations
 
 import json
+import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -36,6 +37,7 @@ from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 from app.opip.committee.daily_ceiling import DailyCeiling, FileDailySpendStore
+from app.opip.committee.contracts import CommitteeCase
 from app.opip.committee.registry import APPROVED_MAX_DAILY_COST_MICROUNITS
 from app.opip.committee.scheduler import (
     CommitteeScheduler,
@@ -45,6 +47,10 @@ from app.opip.committee.scheduler import (
     ScheduleDispositionRecord,
 )
 from app.opip.committee.settings import CommitteeShadowSettings
+from app.opip.committee.shadow_case_bridge import load_case_envelopes
+from app.opip.committee.shadow_execution import execute_shadow_case
+from app.opip.committee.store import CommitteeEvidenceStore
+from app.opip.committee.transports import CredentialSource, HttpPoster
 from app.opip.committee.trust import CommitteeInvestment, build_trust_report
 
 #: Exit codes the deploying script relies on.
@@ -55,6 +61,7 @@ EXIT_OPERATIONAL_ERROR = 2
 CYCLE_DISPOSITIONS_FILE = "cycle_dispositions.jsonl"
 TRUST_REPORT_FILE = "trust_report.json"
 EVIDENCE_ITEMS_FILE = "committed_evidence_items.jsonl"
+CASE_INPUTS_FILE = "committee_case_inputs.jsonl"
 
 #: Initial per-cycle bounds. The daily ceiling is the stronger, approved bound.
 DEFAULT_CYCLE_CASES = 8
@@ -184,6 +191,52 @@ def load_evidence_items(path: Path) -> tuple[CommittedEvidenceItem, ...]:
     return tuple(items)
 
 
+def _item_from_case(case: CommitteeCase) -> CommittedEvidenceItem:
+    """Project a sealed governed case into the scheduler's committed-evidence key."""
+    return CommittedEvidenceItem(
+        evidence_id=case.case_hash,
+        case_id=case.case_id,
+        evidence_snapshot_hash=case.snapshot.snapshot_hash,
+        committee_policy_version=case.policy.policy_version,
+        committed=True,
+        sealed=True,
+        available_at=case.created_at,
+        evidence_cutoff_at=case.snapshot.evidence_cutoff_at,
+        expires_at=None,
+        estimated_cost_microunits=case.policy.max_estimated_cost_microunits,
+    )
+
+
+def _case_lookup(cases: Sequence[CommitteeCase]) -> Mapping[tuple[str, str, str], CommitteeCase]:
+    return {
+        (
+            case.case_id,
+            case.snapshot.snapshot_hash,
+            case.policy.policy_version,
+        ): case
+        for case in cases
+    }
+
+
+def _runtime_settings_from_environment() -> CommitteeShadowSettings:
+    """Resolve only the two committee settings needed by this isolated worker."""
+    raw_cost = os.environ.get("OPIP_COMMITTEE_MAX_ESTIMATED_COST_MICROUNITS", "0")
+    try:
+        cost = int(raw_cost)
+    except ValueError as exc:
+        raise CycleConfigurationError(
+            "OPIP_COMMITTEE_MAX_ESTIMATED_COST_MICROUNITS must be an integer"
+        ) from exc
+    if cost < 0:
+        raise CycleConfigurationError(
+            "OPIP_COMMITTEE_MAX_ESTIMATED_COST_MICROUNITS must be >= 0"
+        )
+    return CommitteeShadowSettings(
+        opip_committee_mode=os.environ.get("OPIP_COMMITTEE_MODE", "off"),
+        opip_committee_max_estimated_cost_microunits=cost,
+    )
+
+
 @dataclass(frozen=True)
 class CycleOutcome:
     """What one cycle did, for the worker's own reporting."""
@@ -200,9 +253,12 @@ def run_once(
     release_sha: str,
     committee_home: Path,
     evidence_path: Path,
+    case_input_path: Path | None = None,
     settings: CommitteeShadowSettings | None = None,
     budget: SchedulerBudget | None = None,
     now: datetime | None = None,
+    poster: HttpPoster | None = None,
+    credentials: CredentialSource | None = None,
 ) -> CycleOutcome:
     """Run exactly one bounded cycle. Never raises for a data problem."""
     if not release_sha or len(release_sha) != 40:
@@ -215,7 +271,15 @@ def run_once(
     committee_home.mkdir(parents=True, exist_ok=True)
     checkpoint = FileCheckpoint(committee_home)
 
-    items = load_evidence_items(evidence_path)
+    cases: tuple[CommitteeCase, ...] = ()
+    case_by_key: Mapping[tuple[str, str, str], CommitteeCase] = {}
+    if case_input_path is None:
+        items = load_evidence_items(evidence_path)
+    else:
+        cases = load_case_envelopes(case_input_path)
+        items = tuple(_item_from_case(case) for case in cases)
+        case_by_key = _case_lookup(cases)
+
     # The daily ceiling caps this cycle's cost budget, so a cycle can never spend
     # more than the UTC day's remaining allowance. The per-case ceiling still applies
     # inside the cycle. Together the two bounds are the approved economics.
@@ -235,8 +299,33 @@ def run_once(
         ),
         settings=resolved_settings,
     )
-    # No executor is supplied on purpose: scheduling is exercised, spending is not.
-    run = scheduler.run_cycle(items=items)
+    executor = None
+    if case_input_path is not None:
+        store = CommitteeEvidenceStore(root=committee_home)
+
+        def execute(item: CommittedEvidenceItem) -> bool:
+            key = (
+                item.case_id,
+                item.evidence_snapshot_hash,
+                item.committee_policy_version,
+            )
+            case = case_by_key.get(key)
+            if case is None:
+                raise CycleConfigurationError(
+                    "scheduler item has no identity-matched sealed CommitteeCase"
+                )
+            execute_shadow_case(
+                case,
+                store=store,
+                settings=resolved_settings,
+                poster=poster,
+                credentials=credentials,
+                now=lambda: moment,
+            )
+            return True
+
+        executor = execute
+    run = scheduler.run_cycle(items=items, executor=executor)
 
     report = build_trust_report(
         report_version="committee-trust-v1",
@@ -285,12 +374,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_CONFIG_ERROR
     committee_home = Path(committee_home_value)
     evidence_path = committee_home / EVIDENCE_ITEMS_FILE
+    case_inputs_value = _value_of(args, "--case-inputs")
+    case_input_path = None if not case_inputs_value else Path(case_inputs_value)
 
     try:
         outcome = run_once(
             release_sha=release_sha or "",
             committee_home=committee_home,
             evidence_path=evidence_path,
+            case_input_path=case_input_path,
+            settings=_runtime_settings_from_environment(),
         )
     except CycleConfigurationError as exc:
         print(f"committee cycle refused: {exc}", file=sys.stderr)
@@ -328,6 +421,7 @@ if __name__ == "__main__":  # pragma: no cover - exercised through main()
 
 
 __all__ = [
+    "CASE_INPUTS_FILE",
     "CYCLE_DISPOSITIONS_FILE",
     "DEFAULT_CYCLE_CASES",
     "EVIDENCE_ITEMS_FILE",
