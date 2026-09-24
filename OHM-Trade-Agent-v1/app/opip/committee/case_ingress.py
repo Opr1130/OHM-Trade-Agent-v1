@@ -91,15 +91,10 @@ def _string_tuple(value: object, *, field: str) -> tuple[str, ...]:
     return result
 
 
-def _case_from_mapping(raw: Mapping[str, Any]) -> CommitteeCase:
-    snapshot_raw = _mapping(raw.get("snapshot"), field="case.snapshot")
-    policy_raw = _mapping(raw.get("policy"), field="case.policy")
-    provenance_raw = _mapping(raw.get("provenance"), field="case.provenance")
-
+def _provider_families(policy_raw: Mapping[str, Any]) -> tuple[ProviderFamily, ...]:
     try:
-        case_type = CaseType(_required_str(raw.get("case_type"), field="case.case_type"))
-        seated = tuple(
-            ProviderFamily(_required_str(item, field="case.policy.seated_providers[]"))
+        return tuple(
+            ProviderFamily(item)
             for item in _string_tuple(
                 policy_raw.get("seated_providers"),
                 field="case.policy.seated_providers",
@@ -108,11 +103,13 @@ def _case_from_mapping(raw: Mapping[str, Any]) -> CommitteeCase:
     except ValueError as exc:
         raise CaseIngressError(str(exc)) from exc
 
-    policy = CommitteePolicy(
+
+def _policy_from_mapping(policy_raw: Mapping[str, Any]) -> CommitteePolicy:
+    return CommitteePolicy(
         policy_version=_required_str(
             policy_raw.get("policy_version"), field="case.policy.policy_version"
         ),
-        seated_providers=seated,
+        seated_providers=_provider_families(policy_raw),
         prompt_template_id=_required_str(
             policy_raw.get("prompt_template_id"),
             field="case.policy.prompt_template_id",
@@ -127,6 +124,8 @@ def _case_from_mapping(raw: Mapping[str, Any]) -> CommitteeCase:
         ),
     )
 
+
+def _items_from_snapshot(snapshot_raw: Mapping[str, Any]) -> tuple[EvidenceItem, ...]:
     raw_items = snapshot_raw.get("items")
     if not isinstance(raw_items, list) or not raw_items:
         raise CaseIngressError("case.snapshot.items must be a non-empty array")
@@ -153,8 +152,13 @@ def _case_from_mapping(raw: Mapping[str, Any]) -> CommitteeCase:
                 payload=dict(payload),
             )
         )
+    return tuple(items)
 
-    snapshot = EvidenceSnapshot(
+
+def _snapshot_from_mapping(
+    snapshot_raw: Mapping[str, Any], *, case_type: CaseType
+) -> EvidenceSnapshot:
+    return EvidenceSnapshot(
         case_id=_required_str(snapshot_raw.get("case_id"), field="case.snapshot.case_id"),
         case_type=case_type,
         evidence_cutoff_at=_datetime(
@@ -164,7 +168,7 @@ def _case_from_mapping(raw: Mapping[str, Any]) -> CommitteeCase:
         assembled_at=_datetime(
             snapshot_raw.get("assembled_at"), field="case.snapshot.assembled_at"
         ),
-        items=tuple(items),
+        items=_items_from_snapshot(snapshot_raw),
         source_refs=_string_tuple(
             snapshot_raw.get("source_refs"), field="case.snapshot.source_refs"
         ),
@@ -189,58 +193,66 @@ def _case_from_mapping(raw: Mapping[str, Any]) -> CommitteeCase:
         ),
     )
 
-    binding_raw = raw.get("canonical_binding")
-    binding = None
-    if binding_raw is not None:
-        binding_map = _mapping(binding_raw, field="case.canonical_binding")
-        binding = CanonicalDecisionBinding(
-            decision_id=_optional_str(
-                binding_map.get("decision_id"),
-                field="case.canonical_binding.decision_id",
-            ),
-            episode_id=_optional_str(
-                binding_map.get("episode_id"),
-                field="case.canonical_binding.episode_id",
-            ),
-        )
 
-    provenance = Provenance(
-        producing_component=_required_str(
-            provenance_raw.get("producing_component"),
-            field="case.provenance.producing_component",
+def _binding_from_mapping(raw: object) -> CanonicalDecisionBinding | None:
+    if raw is None:
+        return None
+    binding = _mapping(raw, field="case.canonical_binding")
+    return CanonicalDecisionBinding(
+        decision_id=_optional_str(
+            binding.get("decision_id"), field="case.canonical_binding.decision_id"
         ),
-        artifact_or_build_id=_required_str(
-            provenance_raw.get("artifact_or_build_id"),
-            field="case.provenance.artifact_or_build_id",
-        ),
-        process_instance_id=_required_str(
-            provenance_raw.get("process_instance_id"),
-            field="case.provenance.process_instance_id",
-        ),
-        emitted_at=_datetime(
-            provenance_raw.get("emitted_at"), field="case.provenance.emitted_at"
-        ),
-        source_record_refs=_string_tuple(
-            provenance_raw.get("source_record_refs"),
-            field="case.provenance.source_record_refs",
+        episode_id=_optional_str(
+            binding.get("episode_id"), field="case.canonical_binding.episode_id"
         ),
     )
 
+
+def _provenance_from_mapping(raw: Mapping[str, Any]) -> Provenance:
+    return Provenance(
+        producing_component=_required_str(
+            raw.get("producing_component"),
+            field="case.provenance.producing_component",
+        ),
+        artifact_or_build_id=_required_str(
+            raw.get("artifact_or_build_id"),
+            field="case.provenance.artifact_or_build_id",
+        ),
+        process_instance_id=_required_str(
+            raw.get("process_instance_id"),
+            field="case.provenance.process_instance_id",
+        ),
+        emitted_at=_datetime(raw.get("emitted_at"), field="case.provenance.emitted_at"),
+        source_record_refs=_string_tuple(
+            raw.get("source_record_refs"), field="case.provenance.source_record_refs"
+        ),
+    )
+
+
+def _case_from_mapping(raw: Mapping[str, Any]) -> CommitteeCase:
+    snapshot_raw = _mapping(raw.get("snapshot"), field="case.snapshot")
+    policy_raw = _mapping(raw.get("policy"), field="case.policy")
+    provenance_raw = _mapping(raw.get("provenance"), field="case.provenance")
     try:
+        case_type = CaseType(
+            _required_str(raw.get("case_type"), field="case.case_type")
+        )
+        policy = _policy_from_mapping(policy_raw)
+        snapshot = _snapshot_from_mapping(snapshot_raw, case_type=case_type)
         return CommitteeCase(
             case_id=_required_str(raw.get("case_id"), field="case.case_id"),
             case_type=case_type,
             snapshot=snapshot,
             policy=policy,
             created_at=_datetime(raw.get("created_at"), field="case.created_at"),
-            provenance=provenance,
+            provenance=_provenance_from_mapping(provenance_raw),
             instrument_id=_optional_str(
                 raw.get("instrument_id"), field="case.instrument_id"
             ),
             strategy_context_id=_optional_str(
                 raw.get("strategy_context_id"), field="case.strategy_context_id"
             ),
-            canonical_binding=binding,
+            canonical_binding=_binding_from_mapping(raw.get("canonical_binding")),
         )
     except ValueError as exc:
         raise CaseIngressError(str(exc)) from exc
@@ -306,7 +318,10 @@ class CommittedCaseEnvelope:
 
 def envelope_from_dict(row: Mapping[str, Any]) -> CommittedCaseEnvelope:
     """Reconstruct one envelope and reject identity metadata that does not match."""
-    if type(row.get("schema_version")) is not int or row.get("schema_version") != 1:
+    if (
+        type(row.get("schema_version")) is not int
+        or row.get("schema_version") != CASE_INGRESS_SCHEMA_VERSION
+    ):
         raise CaseIngressError("unsupported case-ingress schema_version")
     case = _case_from_mapping(_mapping(row.get("case"), field="case"))
 
@@ -357,7 +372,7 @@ def load_case_envelopes(path: Path) -> tuple[CommittedCaseEnvelope, ...]:
             raise CaseIngressError(f"{path.name} line {number} is not a JSON object")
         try:
             envelope = envelope_from_dict(decoded)
-        except (CaseIngressError, ValueError, TypeError, KeyError) as exc:
+        except (ValueError, TypeError, KeyError) as exc:
             raise CaseIngressError(
                 f"{path.name} line {number} is not a valid committed case: {exc}"
             ) from exc
