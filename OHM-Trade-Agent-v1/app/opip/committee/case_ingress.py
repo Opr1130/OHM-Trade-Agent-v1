@@ -355,6 +355,48 @@ def envelope_from_dict(row: Mapping[str, Any]) -> CommittedCaseEnvelope:
     )
 
 
+@dataclass(frozen=True)
+class CaseIngressPopulation:
+    """Validated envelopes plus an exact scheduler-item-to-case binding."""
+
+    envelopes: tuple[CommittedCaseEnvelope, ...]
+
+    def __post_init__(self) -> None:
+        seen: set[str] = set()
+        for envelope in self.envelopes:
+            if not isinstance(envelope, CommittedCaseEnvelope):
+                raise CaseIngressError(
+                    "case ingress population requires CommittedCaseEnvelope values"
+                )
+            if envelope.evidence_id in seen:
+                raise CaseIngressError(
+                    f"duplicate case-ingress evidence_id {envelope.evidence_id!r}"
+                )
+            seen.add(envelope.evidence_id)
+
+    @property
+    def scheduler_items(self) -> tuple[CommittedEvidenceItem, ...]:
+        """The compact scheduling population derived from validated cases."""
+        return tuple(envelope.scheduler_item for envelope in self.envelopes)
+
+    def case_for(self, item: CommittedEvidenceItem) -> CommitteeCase:
+        """Return the exact reconstructed case for a scheduler item or fail closed."""
+        if not isinstance(item, CommittedEvidenceItem):
+            raise CaseIngressError("case lookup requires a CommittedEvidenceItem")
+        for envelope in self.envelopes:
+            if envelope.evidence_id != item.evidence_id:
+                continue
+            expected = envelope.scheduler_item
+            if item != expected:
+                raise CaseIngressError(
+                    "scheduler item does not match its validated case-ingress envelope"
+                )
+            return envelope.case
+        raise CaseIngressError(
+            f"no validated CommitteeCase exists for evidence_id {item.evidence_id!r}"
+        )
+
+
 def load_case_envelopes(path: Path) -> tuple[CommittedCaseEnvelope, ...]:
     """Load a JSONL ingress file; malformed rows fail the entire population closed."""
     if not path.exists():
@@ -388,6 +430,7 @@ def load_case_envelopes(path: Path) -> tuple[CommittedCaseEnvelope, ...]:
 __all__ = [
     "CASE_INGRESS_SCHEMA_VERSION",
     "CaseIngressError",
+    "CaseIngressPopulation",
     "CommittedCaseEnvelope",
     "envelope_from_dict",
     "load_case_envelopes",
