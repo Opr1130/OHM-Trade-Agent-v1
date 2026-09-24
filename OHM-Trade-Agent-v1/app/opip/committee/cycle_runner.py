@@ -47,7 +47,10 @@ from app.opip.committee.scheduler import (
     ScheduleDispositionRecord,
 )
 from app.opip.committee.settings import CommitteeShadowSettings
-from app.opip.committee.shadow_case_bridge import load_case_envelopes
+from app.opip.committee.shadow_case_bridge import (
+    ShadowCaseEnvelopeError,
+    load_case_envelopes,
+)
 from app.opip.committee.shadow_execution import execute_shadow_case
 from app.opip.committee.store import CommitteeEvidenceStore
 from app.opip.committee.transports import CredentialSource, HttpPoster
@@ -276,7 +279,12 @@ def run_once(
     if case_input_path is None:
         items = load_evidence_items(evidence_path)
     else:
-        cases = load_case_envelopes(case_input_path)
+        try:
+            cases = load_case_envelopes(case_input_path)
+        except ShadowCaseEnvelopeError as exc:
+            raise CycleConfigurationError(
+                f"sealed case input is invalid: {exc}"
+            ) from exc
         items = tuple(_item_from_case(case) for case in cases)
         case_by_key = _case_lookup(cases)
 
