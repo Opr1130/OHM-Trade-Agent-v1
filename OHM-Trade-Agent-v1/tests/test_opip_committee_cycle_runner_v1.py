@@ -24,6 +24,8 @@ from app.opip.committee.contracts import (
     EvidenceSnapshot,
     ProviderFamily,
 )
+from app.opip.committee import cycle_runner
+from app.opip.committee.case_ingress import CaseIngressPopulation
 from app.opip.committee.cycle_runner import (
     EXIT_CONFIG_ERROR,
     EXIT_OK,
@@ -299,7 +301,7 @@ def test_validated_case_ingress_dispatches_the_exact_reconstructed_case(tmp_path
 def test_an_executor_cannot_run_without_validated_case_ingress(tmp_path):
     with pytest.raises(
         CycleConfigurationError,
-        match="case_executor requires a validated case_ingress_path",
+        match="case_executor requires validated case ingress",
     ):
         run_once(
             release_sha=SHA,
@@ -311,6 +313,26 @@ def test_an_executor_cannot_run_without_validated_case_ingress(tmp_path):
             ),
             now=NOW,
         )
+
+
+def test_daily_reservation_survives_executor_failure(tmp_path):
+    def fail(case: CommitteeCase) -> bool:
+        raise RuntimeError("scripted failure")
+
+    outcome = run_once(
+        release_sha=SHA,
+        committee_home=tmp_path,
+        evidence_path=tmp_path / EVIDENCE_ITEMS_FILE,
+        case_ingress_path=_write_case_ingress(tmp_path),
+        case_executor=fail,
+        settings=CommitteeShadowSettings(
+            opip_committee_mode=COMMITTEE_MODE_SHADOW
+        ),
+        now=NOW,
+    )
+    assert outcome.dispositions[CommitteeScheduleDisposition.FAILED.value] == 1
+    daily = json.loads((tmp_path / "daily_spend.json").read_text(encoding="utf-8"))
+    assert daily[NOW.date().isoformat()]["spent_microunits"] == 400_000
 
 
 def test_a_second_cycle_does_not_reprocess_the_same_evidence(tmp_path):
@@ -414,6 +436,98 @@ def test_an_evidence_row_missing_a_required_field_raises(tmp_path):
     path.write_text(json.dumps({"evidence_id": "ev-1"}) + "\n", encoding="utf-8")
     with pytest.raises(CycleConfigurationError, match="not a valid evidence item"):
         load_evidence_items(path)
+
+
+# ------------------------------------------------- deployed runtime gate
+
+
+def test_main_shadow_requires_explicit_no_backfill_boundary(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(cycle_runner, "resolve_committee_mode", lambda: "shadow")
+    monkeypatch.setattr(
+        cycle_runner, "resolve_committee_cost_ceiling", lambda: 500_000
+    )
+    monkeypatch.delenv(cycle_runner.SHADOW_NOT_BEFORE_ENV, raising=False)
+    touched = []
+
+    def forbidden(*args, **kwargs):
+        touched.append(True)
+        raise AssertionError("source/executor must not be built without boundary")
+
+    monkeypatch.setattr(cycle_runner, "produce_case_population", forbidden)
+    monkeypatch.setattr(
+        cycle_runner, "build_credentialled_shadow_executor", forbidden
+    )
+    assert (
+        main(
+            [
+                "--release-sha",
+                SHA,
+                "--committee-home",
+                str(tmp_path),
+            ]
+        )
+        == EXIT_CONFIG_ERROR
+    )
+    assert touched == []
+
+
+def test_main_shadow_builds_from_verified_source_inputs_before_execution(
+    tmp_path, monkeypatch
+):
+    manifest = tmp_path / "manifest.env"
+    manifest.write_text(
+        f"production_deployed_sha={SHA}\n",
+        encoding="utf-8",
+    )
+    replica = tmp_path / "replica"
+    replica.mkdir()
+    monkeypatch.setattr(cycle_runner, "resolve_committee_mode", lambda: "shadow")
+    monkeypatch.setattr(
+        cycle_runner, "resolve_committee_cost_ceiling", lambda: 500_000
+    )
+    monkeypatch.setenv(cycle_runner.SHADOW_NOT_BEFORE_ENV, NOW.isoformat())
+    monkeypatch.setenv(cycle_runner.LEARNING_DATA_MANIFEST_ENV, str(manifest))
+    monkeypatch.setenv(cycle_runner.REPLICA_ROOT_ENV, str(replica))
+    calls = []
+
+    def produce(**kwargs):
+        calls.append(("produce", kwargs))
+        return CaseIngressPopulation(())
+
+    def build(**kwargs):
+        calls.append(("executor", kwargs))
+        return lambda case: True
+
+    monkeypatch.setattr(cycle_runner, "produce_case_population", produce)
+    monkeypatch.setattr(
+        cycle_runner, "build_credentialled_shadow_executor", build
+    )
+    assert (
+        main(
+            [
+                "--release-sha",
+                SHA,
+                "--committee-home",
+                str(tmp_path / "committee"),
+            ]
+        )
+        == EXIT_OK
+    )
+    assert [item[0] for item in calls] == ["produce", "executor"]
+    assert calls[0][1]["expected_source_release_sha"] == SHA
+    assert calls[0][1]["replica_repository_root"] == replica
+
+
+def test_learning_manifest_source_sha_is_strict_and_unique(tmp_path):
+    manifest = tmp_path / "manifest.env"
+    manifest.write_text(
+        f"production_deployed_sha={SHA}\nproduction_deployed_sha={'b' * 40}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(CycleConfigurationError, match="exactly one"):
+        cycle_runner._production_sha_from_learning_manifest(manifest)
 
 
 # ------------------------------------------------- observability
