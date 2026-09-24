@@ -21,6 +21,8 @@ This stack is intentionally layered on the verified Wave 2 head and does not mod
 - thin/adverse markets force passive limit behavior
 - imminent catalysts suppress urgency and price chasing
 
+Historical note: this Wave 5 execution-optimizer implementation was later retired from the active repository after repository-wide reachability review found no production, operator, deployment, recovery, or compatibility consumer. Git history retains the original implementation.
+
 ## Wave 6 — Operations and autonomy
 - unattended operation requires green CI, healthy reconciliation and alerting, fresh data, and zero unresolved execution errors
 - any failed operational gate blocks autonomy
