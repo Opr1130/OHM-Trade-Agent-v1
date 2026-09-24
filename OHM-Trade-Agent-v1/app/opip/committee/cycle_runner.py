@@ -8,22 +8,23 @@ rather than an imaginary one.
 
 What it does, in order:
 
-1. Refuses to run unless the plane is enabled. The unit also sets ``off``, so this is
-   defence in depth rather than the only gate.
-2. Reads committed evidence items from the read-only evidence path.
-3. Runs exactly one scheduling cycle, bounded by the cycle budget and the UTC daily
-   ceiling, writing every disposition durably.
-4. Writes a trust report describing what happened, including what could not be
-   measured.
+1. Resolves the explicit OFF/SHADOW gate. OFF remains inert and reads no provider
+   credential.
+2. In SHADOW only, resolves one verified canonical-replica generation and builds
+   sealed point-in-time Committee cases no older than the explicit activation
+   boundary.
+3. Constructs the credentialled executor only after those gates pass, then runs one
+   bounded scheduling cycle with a durable UTC daily reservation written before
+   external work.
+4. Writes append-only provider/case evidence, scheduling dispositions, and a trust
+   report into the dedicated advisory directory.
 
 What it deliberately does **not** do:
 
-* It constructs no provider transport and makes no model call. Committed evidence is
-  scheduled, but no executor is wired, so nothing is spent. Wiring an executor is a
-  later, separately approved step; this module's job is to prove the cycle, the
-  accounting, and the observability are real.
-* It writes nothing to canonical evidence, the decision-intelligence streams, the
-  order path, or any registry.
+* It writes nothing to canonical evidence, Decision Intelligence streams, the order
+  path, or any trading registry.
+* It grants no admission, ranking, sizing, protection, execution, funded, or live
+  authority. Committee output remains measurement-only advisory evidence.
 """
 
 from __future__ import annotations
