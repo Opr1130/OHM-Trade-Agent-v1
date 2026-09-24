@@ -33,8 +33,10 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
+from typing import Callable, Iterable, Mapping, Sequence
 
+from app.opip.committee.case_ingress import CaseIngressPopulation, load_case_envelopes
+from app.opip.committee.contracts import CommitteeCase
 from app.opip.committee.daily_ceiling import DailyCeiling, FileDailySpendStore
 from app.opip.committee.registry import APPROVED_MAX_DAILY_COST_MICROUNITS
 from app.opip.committee.scheduler import (
@@ -202,6 +204,8 @@ def run_once(
     evidence_path: Path,
     settings: CommitteeShadowSettings | None = None,
     budget: SchedulerBudget | None = None,
+    case_ingress_path: Path | None = None,
+    case_executor: Callable[[CommitteeCase], bool] | None = None,
     now: datetime | None = None,
 ) -> CycleOutcome:
     """Run exactly one bounded cycle. Never raises for a data problem."""
@@ -215,7 +219,20 @@ def run_once(
     committee_home.mkdir(parents=True, exist_ok=True)
     checkpoint = FileCheckpoint(committee_home)
 
-    items = load_evidence_items(evidence_path)
+    scheduler_executor = None
+    if case_ingress_path is None:
+        if case_executor is not None:
+            raise CycleConfigurationError(
+                "a case_executor requires a validated case_ingress_path"
+            )
+        items = load_evidence_items(evidence_path)
+    else:
+        population = CaseIngressPopulation(load_case_envelopes(case_ingress_path))
+        items = population.scheduler_items
+        if case_executor is not None:
+            def scheduler_executor(item):
+                return case_executor(population.case_for(item))
+
     # The daily ceiling caps this cycle's cost budget, so a cycle can never spend
     # more than the UTC day's remaining allowance. The per-case ceiling still applies
     # inside the cycle. Together the two bounds are the approved economics.
@@ -235,8 +252,10 @@ def run_once(
         ),
         settings=resolved_settings,
     )
-    # No executor is supplied on purpose: scheduling is exercised, spending is not.
-    run = scheduler.run_cycle(items=items)
+    # The deployed CLI supplies no case executor. An executor is accepted only as
+    # an explicit injected dependency so the scheduler -> exact-case binding can be
+    # exercised in tests before provider execution is wired into the worker.
+    run = scheduler.run_cycle(items=items, executor=scheduler_executor)
 
     report = build_trust_report(
         report_version="committee-trust-v1",
