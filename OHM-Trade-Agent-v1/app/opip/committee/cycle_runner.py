@@ -77,6 +77,7 @@ DEFAULT_REPLICA_REPOSITORY_ROOT = Path("/var/lib/opip-learning/canonical-replica
 
 #: Initial per-cycle bounds. The daily ceiling is the stronger, approved bound.
 DEFAULT_CYCLE_CASES = 8
+MAX_CASES_PER_CYCLE_ENV = "OPIP_COMMITTEE_MAX_CASES_PER_CYCLE"
 
 
 class CycleConfigurationError(ValueError):
@@ -301,7 +302,7 @@ def run_once(
         now=lambda: moment,
         budget=budget
         or SchedulerBudget(
-            max_committee_cases=DEFAULT_CYCLE_CASES,
+            max_committee_cases=_resolve_cycle_case_limit(),
             max_cost_microunits=remaining_today,
         ),
         settings=resolved_settings,
@@ -342,6 +343,21 @@ def run_once(
         dispositions=run.tally.as_dict(),
         report_id=report.report_id,
     )
+
+
+def _resolve_cycle_case_limit() -> int:
+    raw = str(os.environ.get(MAX_CASES_PER_CYCLE_ENV, DEFAULT_CYCLE_CASES)).strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise CycleConfigurationError(
+            f"{MAX_CASES_PER_CYCLE_ENV} must be an integer in 0..{DEFAULT_CYCLE_CASES}"
+        ) from exc
+    if not 0 <= value <= DEFAULT_CYCLE_CASES:
+        raise CycleConfigurationError(
+            f"{MAX_CASES_PER_CYCLE_ENV} must be in 0..{DEFAULT_CYCLE_CASES}"
+        )
+    return value
 
 
 def _runtime_settings() -> CommitteeShadowSettings:
@@ -501,6 +517,7 @@ __all__ = [
     "EXIT_OK",
     "EXIT_OPERATIONAL_ERROR",
     "LEARNING_DATA_MANIFEST_ENV",
+    "MAX_CASES_PER_CYCLE_ENV",
     "REPLICA_ROOT_ENV",
     "SHADOW_NOT_BEFORE_ENV",
     "TRUST_REPORT_FILE",
@@ -509,6 +526,7 @@ __all__ = [
     "FileCheckpoint",
     "_parse_activation_boundary",
     "_production_sha_from_learning_manifest",
+    "_resolve_cycle_case_limit",
     "load_evidence_items",
     "main",
     "run_once",
