@@ -96,19 +96,24 @@ class FileCheckpoint(SchedulerCheckpoint):
     def _iter_rows(self) -> Iterable[Mapping[str, object]]:
         if not self.path.exists():
             return
-        for line in self.path.read_text(encoding="utf-8").splitlines():
+        for number, line in enumerate(
+            self.path.read_text(encoding="utf-8").splitlines(), start=1
+        ):
             line = line.strip()
             if not line:
                 continue
             try:
                 decoded = json.loads(line)
-            except ValueError:
-                # A corrupt row is skipped rather than treated as absent evidence:
-                # the durable log is reconciled on load, so this cannot silently
-                # resurrect a decision.
-                continue
-            if isinstance(decoded, Mapping) and "disposition" in decoded:
-                yield decoded
+            except ValueError as exc:
+                raise CycleConfigurationError(
+                    f"{self.path.name} line {number} is corrupt; scheduler state "
+                    "cannot be reconstructed safely"
+                ) from exc
+            if not isinstance(decoded, Mapping) or "disposition" not in decoded:
+                raise CycleConfigurationError(
+                    f"{self.path.name} line {number} is not a schedule disposition"
+                )
+            yield decoded
 
     def load_decided(self) -> Mapping[str, ScheduleDispositionRecord]:
         from app.opip.committee.scheduler import CommitteeScheduleDisposition
@@ -117,7 +122,7 @@ class FileCheckpoint(SchedulerCheckpoint):
         for row in self._iter_rows():
             try:
                 decision = CommitteeScheduleDisposition(str(row["disposition"]))
-                decided[str(row["schedule_key_id"])] = ScheduleDispositionRecord(
+                record = ScheduleDispositionRecord(
                     schedule_key_id=str(row["schedule_key_id"]),
                     evidence_id=str(row["evidence_id"]),
                     disposition=decision,
@@ -125,8 +130,16 @@ class FileCheckpoint(SchedulerCheckpoint):
                     reason=(None if row.get("reason") is None else str(row["reason"])),
                     detail=(None if row.get("detail") is None else str(row["detail"])),
                 )
-            except (KeyError, ValueError):
-                continue
+            except (KeyError, ValueError) as exc:
+                raise CycleConfigurationError(
+                    "scheduler checkpoint contains an invalid disposition"
+                ) from exc
+            previous = decided.get(record.schedule_key_id)
+            if previous is not None and previous != record:
+                raise CycleConfigurationError(
+                    "scheduler checkpoint contains conflicting duplicate identities"
+                )
+            decided[record.schedule_key_id] = record
         return decided
 
     def save_disposition(self, record: ScheduleDispositionRecord) -> None:
@@ -146,6 +159,8 @@ class FileCheckpoint(SchedulerCheckpoint):
                 )
                 + "\n"
             )
+            handle.flush()
+            os.fsync(handle.fileno())
 
 
 def load_evidence_items(path: Path) -> tuple[CommittedEvidenceItem, ...]:
