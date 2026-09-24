@@ -14,6 +14,7 @@ No credential, network, scheduler, trading, or deployment behavior exists here.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -34,6 +35,16 @@ CASE_ENVELOPE_SCHEMA_VERSION = 1
 _EVIDENCE_ITEMS_FIELD = "evidence_items"
 _SOURCE_REFS_FIELD = "source_refs"
 _PROVENANCE_REFS_FIELD = "provenance.source_record_refs"
+
+
+@dataclass(frozen=True)
+class _EnvelopeContext:
+    case_id: str
+    case_type: CaseType
+    policy: CommitteePolicy
+    evidence_cutoff_at: datetime
+    instrument_id: str | None
+    strategy_context_id: str | None
 
 
 class ShadowCaseEnvelopeError(ValueError):
@@ -227,29 +238,23 @@ def _source_refs(row: Mapping[str, Any]) -> tuple[str, ...]:
     return tuple(_string(item, field_name=f"{_SOURCE_REFS_FIELD}[]") for item in raw)
 
 
-def _build_snapshot(
-    row: Mapping[str, Any],
-    *,
-    case_id: str,
-    case_type: CaseType,
-    policy: CommitteePolicy,
-    evidence_cutoff_at: datetime,
-    instrument_id: str | None,
-    strategy_context_id: str | None,
-):
+def _build_snapshot(row: Mapping[str, Any], context: _EnvelopeContext):
     try:
         return build_evidence_snapshot(
-            case_id=case_id,
-            case_type=case_type,
-            evidence_cutoff_at=evidence_cutoff_at,
+            case_id=context.case_id,
+            case_type=context.case_type,
+            evidence_cutoff_at=context.evidence_cutoff_at,
             assembled_at=_datetime(row.get("assembled_at"), field_name="assembled_at"),
-            items=_build_items(row, evidence_cutoff_at=evidence_cutoff_at),
+            items=_build_items(
+                row,
+                evidence_cutoff_at=context.evidence_cutoff_at,
+            ),
             source_refs=_source_refs(row),
-            committee_policy_version=policy.policy_version,
-            prompt_template_id=policy.prompt_template_id,
-            prompt_version=policy.prompt_version,
-            instrument_id=instrument_id,
-            strategy_context_id=strategy_context_id,
+            committee_policy_version=context.policy.policy_version,
+            prompt_template_id=context.policy.prompt_template_id,
+            prompt_version=context.policy.prompt_version,
+            instrument_id=context.instrument_id,
+            strategy_context_id=context.strategy_context_id,
         )
     except ValueError as exc:
         raise ShadowCaseEnvelopeError(str(exc)) from exc
@@ -257,24 +262,19 @@ def _build_snapshot(
 
 def _build_case(
     row: Mapping[str, Any],
-    *,
-    case_id: str,
-    case_type: CaseType,
-    policy: CommitteePolicy,
+    context: _EnvelopeContext,
     snapshot,
-    instrument_id: str | None,
-    strategy_context_id: str | None,
 ) -> CommitteeCase:
     try:
         return CommitteeCase(
-            case_id=case_id,
-            case_type=case_type,
+            case_id=context.case_id,
+            case_type=context.case_type,
             snapshot=snapshot,
-            policy=policy,
+            policy=context.policy,
             created_at=_datetime(row.get("created_at"), field_name="created_at"),
             provenance=_provenance(row.get("provenance")),
-            instrument_id=instrument_id,
-            strategy_context_id=strategy_context_id,
+            instrument_id=context.instrument_id,
+            strategy_context_id=context.strategy_context_id,
             canonical_binding=_binding(row.get("canonical_binding")),
         )
     except ValueError as exc:
@@ -322,39 +322,25 @@ def case_from_envelope(value: Mapping[str, Any]) -> CommitteeCase:
             f"unsupported case-envelope schema_version {schema_version}"
         )
 
-    case_id = _string(row.get("case_id"), field_name="case_id")
-    case_type = _parse_case_type(row)
-    policy = _policy(row.get("policy"))
-    evidence_cutoff_at = _datetime(
-        row.get("evidence_cutoff_at"),
-        field_name="evidence_cutoff_at",
+    context = _EnvelopeContext(
+        case_id=_string(row.get("case_id"), field_name="case_id"),
+        case_type=_parse_case_type(row),
+        policy=_policy(row.get("policy")),
+        evidence_cutoff_at=_datetime(
+            row.get("evidence_cutoff_at"),
+            field_name="evidence_cutoff_at",
+        ),
+        instrument_id=_optional_string(
+            row.get("instrument_id"),
+            field_name="instrument_id",
+        ),
+        strategy_context_id=_optional_string(
+            row.get("strategy_context_id"),
+            field_name="strategy_context_id",
+        ),
     )
-    instrument_id = _optional_string(
-        row.get("instrument_id"),
-        field_name="instrument_id",
-    )
-    strategy_context_id = _optional_string(
-        row.get("strategy_context_id"),
-        field_name="strategy_context_id",
-    )
-    snapshot = _build_snapshot(
-        row,
-        case_id=case_id,
-        case_type=case_type,
-        policy=policy,
-        evidence_cutoff_at=evidence_cutoff_at,
-        instrument_id=instrument_id,
-        strategy_context_id=strategy_context_id,
-    )
-    case = _build_case(
-        row,
-        case_id=case_id,
-        case_type=case_type,
-        policy=policy,
-        snapshot=snapshot,
-        instrument_id=instrument_id,
-        strategy_context_id=strategy_context_id,
-    )
+    snapshot = _build_snapshot(row, context)
+    case = _build_case(row, context, snapshot)
     _verify_identities(row, case=case)
     return case
 
