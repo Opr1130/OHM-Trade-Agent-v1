@@ -520,6 +520,22 @@ def test_main_shadow_builds_from_verified_source_inputs_before_execution(
     assert calls[0][1]["replica_repository_root"] == replica
 
 
+def test_cycle_case_limit_defaults_bounded_and_refuses_expansion(monkeypatch):
+    monkeypatch.delenv(cycle_runner.MAX_CASES_PER_CYCLE_ENV, raising=False)
+    assert cycle_runner._resolve_cycle_case_limit() == cycle_runner.DEFAULT_CYCLE_CASES
+    monkeypatch.setenv(
+        cycle_runner.MAX_CASES_PER_CYCLE_ENV,
+        str(cycle_runner.DEFAULT_CYCLE_CASES + 1),
+    )
+    with pytest.raises(CycleConfigurationError, match="must be in"):
+        cycle_runner._resolve_cycle_case_limit()
+
+
+def test_cycle_case_limit_can_pin_a_single_canary(monkeypatch):
+    monkeypatch.setenv(cycle_runner.MAX_CASES_PER_CYCLE_ENV, "1")
+    assert cycle_runner._resolve_cycle_case_limit() == 1
+
+
 def test_learning_manifest_source_sha_is_strict_and_unique(tmp_path):
     manifest = tmp_path / "manifest.env"
     manifest.write_text(
