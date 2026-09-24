@@ -22,7 +22,7 @@ import httpx
 
 from app.opip.committee.contracts import CommitteeCase, ProviderFamily
 from app.opip.committee.daily_ceiling import DailyCeiling, FileDailySpendStore
-from app.opip.committee.ledger import DurableObservationLedger
+from app.opip.committee.store import CommitteeEvidenceStore, DurableObservationLedger
 from app.opip.committee.providers import (
     CommitteeProvider,
     ProviderWireRequest,
@@ -37,7 +37,6 @@ from app.opip.committee.registry import (
 )
 from app.opip.committee.runtime import CommitteeRunResult, CommitteeRunner
 from app.opip.committee.settings import committee_shadow_enabled
-from app.opip.committee.store import CommitteeEvidenceStore
 from app.opip.committee.transports import (
     ALLOWED_ENDPOINTS,
     CredentialSource,
