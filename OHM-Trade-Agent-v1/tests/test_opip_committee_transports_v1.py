@@ -28,6 +28,7 @@ from app.opip.committee.registry import (
     ModelRegistryEntry,
     ReasoningMode,
     RegistryError,
+    approved_price_book,
     default_shadow_registry,
 )
 from app.opip.committee.roles import CommitteeRole
@@ -432,6 +433,21 @@ def test_the_adapter_records_token_usage_and_unknown_cost():
     # The adapter does not invent a cost; pricing is configuration.
     assert response.cost_completeness is CostCompleteness.UNKNOWN
     assert response.estimated_cost_microunits is None
+
+
+def test_configured_price_book_records_complete_provider_cost():
+    poster = MockPoster(body=_openai_body())
+    transport = OpenAITransport(
+        family=ProviderFamily.OPENAI,
+        model="gpt-5.6-terra",
+        poster=poster,
+        credentials=_credentials(),
+        endpoint=ALLOWED_ENDPOINTS[ProviderFamily.OPENAI],
+        price_book=approved_price_book(),
+    )
+    response = transport(_wire())
+    assert response.cost_completeness is CostCompleteness.COMPLETE
+    assert response.estimated_cost_microunits == 720
 
 
 def test_the_recorded_reference_carries_no_payload_text():
