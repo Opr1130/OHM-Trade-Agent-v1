@@ -31,9 +31,12 @@ from __future__ import annotations
 
 import json
 import os
+import socket
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any, Mapping, Protocol
+from datetime import datetime, timezone
+from typing import Any, Callable, Mapping, Protocol
 
 from app.opip.committee.contracts import (
     CostCompleteness,
@@ -126,6 +129,91 @@ class HttpResponse:
             "received_at",
             require_utc(self.received_at, field_name="received_at"),
         )
+
+
+MAX_PROVIDER_RESPONSE_BYTES = 1024 * 1024
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects so an allowlisted URL cannot bounce to another host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+@dataclass
+class UrllibHttpPoster:
+    """Bounded production HTTPS poster with no redirect or logging surface.
+
+    The provider transport has already checked the exact allowlisted endpoint before
+    this object is called. This layer independently requires HTTPS, refuses redirects,
+    uses the standard verified TLS context supplied by urllib, and reads at most one
+    bounded response body.
+    """
+
+    max_response_bytes: int = MAX_PROVIDER_RESPONSE_BYTES
+    now: Callable[[], datetime] = field(
+        default_factory=lambda: (lambda: datetime.now(timezone.utc))
+    )
+    _opener: Any = field(
+        default_factory=lambda: urllib.request.build_opener(_NoRedirectHandler()),
+        repr=False,
+    )
+
+    def __post_init__(self) -> None:
+        if type(self.max_response_bytes) is not int or self.max_response_bytes < 1:
+            raise ValueError("max_response_bytes must be a positive integer")
+
+    def __call__(self, request: HttpRequest) -> HttpResponse:
+        if not request.url.startswith("https://"):
+            raise EgressDeniedError("provider HTTP poster permits HTTPS only")
+        body = json.dumps(
+            dict(request.body),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        wire = urllib.request.Request(
+            request.url,
+            data=body,
+            headers=dict(request.headers),
+            method="POST",
+        )
+        try:
+            response = self._opener.open(wire, timeout=request.timeout_seconds)
+        except urllib.error.HTTPError as exc:
+            return HttpResponse(
+                status_code=int(exc.code),
+                body_text=self._read_bounded(exc),
+                received_at=self.now(),
+            )
+        except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
+            reason = getattr(exc, "reason", exc)
+            if isinstance(reason, (socket.timeout, TimeoutError)):
+                raise TimeoutError("provider HTTPS request timed out") from exc
+            raise OSError("provider HTTPS request failed") from exc
+        try:
+            return HttpResponse(
+                status_code=int(response.status),
+                body_text=self._read_bounded(response),
+                received_at=self.now(),
+            )
+        finally:
+            response.close()
+
+    def _read_bounded(self, response: Any) -> str:
+        length = response.headers.get("Content-Length")
+        if length is not None:
+            try:
+                declared = int(length)
+            except (TypeError, ValueError):
+                declared = -1
+            if declared > self.max_response_bytes:
+                raise ValueError("provider response exceeds the configured byte limit")
+        raw = response.read(self.max_response_bytes + 1)
+        if len(raw) > self.max_response_bytes:
+            raise ValueError("provider response exceeds the configured byte limit")
+        return raw.decode("utf-8")
 
 
 class HttpPoster(Protocol):
@@ -502,6 +590,8 @@ __all__ = [
     "HttpPoster",
     "HttpRequest",
     "HttpResponse",
+    "MAX_PROVIDER_RESPONSE_BYTES",
+    "UrllibHttpPoster",
     "MissingCredentialError",
     "OpenAITransport",
     "build_approved_transports",
