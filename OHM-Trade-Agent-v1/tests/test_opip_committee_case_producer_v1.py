@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -171,17 +171,15 @@ def test_only_allowlisted_pre_outcome_fields_enter_model_evidence():
 
 def test_source_snapshot_must_be_cited_by_context_provenance():
     context = _context()
-    bad = DecisionContextV2(
-        **{
-            **context.as_dict(),
-            "provenance": Provenance(
-                producing_component="test",
-                artifact_or_build_id=SOURCE_SHA,
-                process_instance_id="bad",
-                emitted_at=NOW,
-                source_record_refs=("EVT:instrument-1",),
-            ),
-        }
+    bad = replace(
+        context,
+        provenance=Provenance(
+            producing_component="test",
+            artifact_or_build_id=SOURCE_SHA,
+            process_instance_id="bad",
+            emitted_at=NOW,
+            source_record_refs=("EVT:instrument-1",),
+        ),
     )
     with pytest.raises(CaseSourceError, match="not cited"):
         build_case_envelope(
