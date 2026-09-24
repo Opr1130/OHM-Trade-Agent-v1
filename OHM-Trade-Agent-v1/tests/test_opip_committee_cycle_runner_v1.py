@@ -290,6 +290,11 @@ def test_validated_case_ingress_dispatches_the_exact_reconstructed_case(tmp_path
     assert seen[0].case_id == row["case"]["case_id"]
     assert seen[0].snapshot.snapshot_hash == row["evidence_snapshot_hash"]
 
+    daily = json.loads((tmp_path / "daily_spend.json").read_text(encoding="utf-8"))
+    today = daily[NOW.date().isoformat()]
+    assert today["spent_microunits"] == 400_000
+    assert today["reservations"] == 1
+
 
 def test_an_executor_cannot_run_without_validated_case_ingress(tmp_path):
     with pytest.raises(
@@ -462,9 +467,10 @@ def test_the_checkpoint_rebuilds_from_its_durable_file(tmp_path):
     assert len(restarted.load_decided()) == 1
 
 
-def test_a_corrupt_disposition_row_does_not_resurrect_a_decision(tmp_path):
+def test_a_corrupt_disposition_row_blocks_reprocessing(tmp_path):
     (tmp_path / CYCLE_DISPOSITIONS_FILE).write_text("{not json\n", encoding="utf-8")
-    assert FileCheckpoint(tmp_path).load_decided() == {}
+    with pytest.raises(CycleConfigurationError, match="cannot be reconstructed safely"):
+        FileCheckpoint(tmp_path).load_decided()
 
 
 def test_the_cycle_budget_can_be_supplied_by_the_caller(tmp_path):
