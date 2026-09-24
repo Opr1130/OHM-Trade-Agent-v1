@@ -31,6 +31,10 @@ from app.opip.decision_intelligence.serialization import require_utc
 
 CASE_ENVELOPE_SCHEMA_VERSION = 1
 
+_EVIDENCE_ITEMS_FIELD = "evidence_items"
+_SOURCE_REFS_FIELD = "source_refs"
+_PROVENANCE_REFS_FIELD = "provenance.source_record_refs"
+
 
 class ShadowCaseEnvelopeError(ValueError):
     """A producer envelope cannot be admitted as a governed committee case."""
@@ -111,7 +115,7 @@ def _binding(value: object) -> CanonicalDecisionBinding | None:
 
 def _provenance(value: object) -> Provenance:
     row = _mapping(value, field_name="provenance")
-    refs = _sequence(row.get("source_record_refs"), field_name="provenance.source_record_refs")
+    refs = _sequence(row.get("source_record_refs"), field_name=_PROVENANCE_REFS_FIELD)
     try:
         return Provenance(
             producing_component=_string(
@@ -128,7 +132,7 @@ def _provenance(value: object) -> Provenance:
             ),
             emitted_at=_datetime(row.get("emitted_at"), field_name="provenance.emitted_at"),
             source_record_refs=tuple(
-                _string(item, field_name="provenance.source_record_refs[]") for item in refs
+                _string(item, field_name=f"{_PROVENANCE_REFS_FIELD}[]") for item in refs
             ),
         )
     except ValueError as exc:
@@ -169,81 +173,100 @@ def _policy(value: object) -> CommitteePolicy:
         raise ShadowCaseEnvelopeError(str(exc)) from exc
 
 
-def case_from_envelope(value: Mapping[str, Any]) -> CommitteeCase:
-    """Reconstruct one governed case and verify all supplied identities."""
-    row = _mapping(value, field_name="case envelope")
-    schema_version = _exact_int(row.get("schema_version"), field_name="schema_version")
-    if schema_version != CASE_ENVELOPE_SCHEMA_VERSION:
-        raise ShadowCaseEnvelopeError(
-            f"unsupported case-envelope schema_version {schema_version}"
-        )
-
-    case_id = _string(row.get("case_id"), field_name="case_id")
+def _parse_case_type(row: Mapping[str, Any]) -> CaseType:
     try:
-        case_type = CaseType(_string(row.get("case_type"), field_name="case_type"))
+        return CaseType(_string(row.get("case_type"), field_name="case_type"))
     except ValueError as exc:
         raise ShadowCaseEnvelopeError("case_type is unsupported") from exc
 
-    policy = _policy(row.get("policy"))
-    evidence_cutoff_at = _datetime(
-        row.get("evidence_cutoff_at"), field_name="evidence_cutoff_at"
-    )
-    assembled_at = _datetime(row.get("assembled_at"), field_name="assembled_at")
-    instrument_id = _optional_string(row.get("instrument_id"), field_name="instrument_id")
-    strategy_context_id = _optional_string(
-        row.get("strategy_context_id"), field_name="strategy_context_id"
-    )
 
-    evidence_rows = _sequence(row.get("evidence_items"), field_name="evidence_items")
+def _build_items(
+    row: Mapping[str, Any],
+    *,
+    evidence_cutoff_at: datetime,
+) -> tuple[Any, ...]:
+    evidence_rows = _sequence(
+        row.get(_EVIDENCE_ITEMS_FIELD),
+        field_name=_EVIDENCE_ITEMS_FIELD,
+    )
     if not evidence_rows:
-        raise ShadowCaseEnvelopeError("evidence_items must not be empty")
+        raise ShadowCaseEnvelopeError(f"{_EVIDENCE_ITEMS_FIELD} must not be empty")
     items = []
     for index, raw_item in enumerate(evidence_rows):
-        item = _mapping(raw_item, field_name=f"evidence_items[{index}]")
+        prefix = f"{_EVIDENCE_ITEMS_FIELD}[{index}]"
+        item = _mapping(raw_item, field_name=prefix)
         try:
             items.append(
                 build_evidence_item(
                     evidence_id=_string(
                         item.get("evidence_id"),
-                        field_name=f"evidence_items[{index}].evidence_id",
+                        field_name=f"{prefix}.evidence_id",
                     ),
                     source_id=_string(
                         item.get("source_id"),
-                        field_name=f"evidence_items[{index}].source_id",
+                        field_name=f"{prefix}.source_id",
                     ),
                     available_at=_datetime(
                         item.get("available_at"),
-                        field_name=f"evidence_items[{index}].available_at",
+                        field_name=f"{prefix}.available_at",
                     ),
                     payload=_mapping(
                         item.get("payload"),
-                        field_name=f"evidence_items[{index}].payload",
+                        field_name=f"{prefix}.payload",
                     ),
                     evidence_cutoff_at=evidence_cutoff_at,
                 )
             )
         except ValueError as exc:
             raise ShadowCaseEnvelopeError(str(exc)) from exc
+    return tuple(items)
 
-    source_refs_raw = _sequence(row.get("source_refs"), field_name="source_refs")
-    source_refs = tuple(
-        _string(item, field_name="source_refs[]") for item in source_refs_raw
-    )
+
+def _source_refs(row: Mapping[str, Any]) -> tuple[str, ...]:
+    raw = _sequence(row.get(_SOURCE_REFS_FIELD), field_name=_SOURCE_REFS_FIELD)
+    return tuple(_string(item, field_name=f"{_SOURCE_REFS_FIELD}[]") for item in raw)
+
+
+def _build_snapshot(
+    row: Mapping[str, Any],
+    *,
+    case_id: str,
+    case_type: CaseType,
+    policy: CommitteePolicy,
+    evidence_cutoff_at: datetime,
+    instrument_id: str | None,
+    strategy_context_id: str | None,
+):
     try:
-        snapshot = build_evidence_snapshot(
+        return build_evidence_snapshot(
             case_id=case_id,
             case_type=case_type,
             evidence_cutoff_at=evidence_cutoff_at,
-            assembled_at=assembled_at,
-            items=items,
-            source_refs=source_refs,
+            assembled_at=_datetime(row.get("assembled_at"), field_name="assembled_at"),
+            items=_build_items(row, evidence_cutoff_at=evidence_cutoff_at),
+            source_refs=_source_refs(row),
             committee_policy_version=policy.policy_version,
             prompt_template_id=policy.prompt_template_id,
             prompt_version=policy.prompt_version,
             instrument_id=instrument_id,
             strategy_context_id=strategy_context_id,
         )
-        case = CommitteeCase(
+    except ValueError as exc:
+        raise ShadowCaseEnvelopeError(str(exc)) from exc
+
+
+def _build_case(
+    row: Mapping[str, Any],
+    *,
+    case_id: str,
+    case_type: CaseType,
+    policy: CommitteePolicy,
+    snapshot,
+    instrument_id: str | None,
+    strategy_context_id: str | None,
+) -> CommitteeCase:
+    try:
+        return CommitteeCase(
             case_id=case_id,
             case_type=case_type,
             snapshot=snapshot,
@@ -257,23 +280,83 @@ def case_from_envelope(value: Mapping[str, Any]) -> CommitteeCase:
     except ValueError as exc:
         raise ShadowCaseEnvelopeError(str(exc)) from exc
 
-    expected_snapshot_hash = _string(
-        row.get("expected_snapshot_hash"), field_name="expected_snapshot_hash"
-    )
-    expected_policy_hash = _string(
-        row.get("expected_policy_hash"), field_name="expected_policy_hash"
-    )
-    expected_case_hash = _string(
-        row.get("expected_case_hash"), field_name="expected_case_hash"
-    )
-    if snapshot.snapshot_hash != expected_snapshot_hash:
-        raise ShadowCaseEnvelopeError("snapshot identity does not match envelope")
-    if policy.policy_hash != expected_policy_hash:
-        raise ShadowCaseEnvelopeError("policy identity does not match envelope")
-    if case.case_hash != expected_case_hash:
-        raise ShadowCaseEnvelopeError("case identity does not match envelope")
-    return case
 
+def _verify_identities(
+    row: Mapping[str, Any],
+    *,
+    case: CommitteeCase,
+) -> None:
+    expected = {
+        "snapshot": (
+            case.snapshot.snapshot_hash,
+            _string(
+                row.get("expected_snapshot_hash"),
+                field_name="expected_snapshot_hash",
+            ),
+        ),
+        "policy": (
+            case.policy.policy_hash,
+            _string(
+                row.get("expected_policy_hash"),
+                field_name="expected_policy_hash",
+            ),
+        ),
+        "case": (
+            case.case_hash,
+            _string(row.get("expected_case_hash"), field_name="expected_case_hash"),
+        ),
+    }
+    for label, (actual, declared) in expected.items():
+        if actual != declared:
+            raise ShadowCaseEnvelopeError(
+                f"{label} identity does not match envelope"
+            )
+
+
+def case_from_envelope(value: Mapping[str, Any]) -> CommitteeCase:
+    """Reconstruct one governed case and verify all supplied identities."""
+    row = _mapping(value, field_name="case envelope")
+    schema_version = _exact_int(row.get("schema_version"), field_name="schema_version")
+    if schema_version != CASE_ENVELOPE_SCHEMA_VERSION:
+        raise ShadowCaseEnvelopeError(
+            f"unsupported case-envelope schema_version {schema_version}"
+        )
+
+    case_id = _string(row.get("case_id"), field_name="case_id")
+    case_type = _parse_case_type(row)
+    policy = _policy(row.get("policy"))
+    evidence_cutoff_at = _datetime(
+        row.get("evidence_cutoff_at"),
+        field_name="evidence_cutoff_at",
+    )
+    instrument_id = _optional_string(
+        row.get("instrument_id"),
+        field_name="instrument_id",
+    )
+    strategy_context_id = _optional_string(
+        row.get("strategy_context_id"),
+        field_name="strategy_context_id",
+    )
+    snapshot = _build_snapshot(
+        row,
+        case_id=case_id,
+        case_type=case_type,
+        policy=policy,
+        evidence_cutoff_at=evidence_cutoff_at,
+        instrument_id=instrument_id,
+        strategy_context_id=strategy_context_id,
+    )
+    case = _build_case(
+        row,
+        case_id=case_id,
+        case_type=case_type,
+        policy=policy,
+        snapshot=snapshot,
+        instrument_id=instrument_id,
+        strategy_context_id=strategy_context_id,
+    )
+    _verify_identities(row, case=case)
+    return case
 
 def load_case_envelopes(path: Path) -> tuple[CommitteeCase, ...]:
     """Load a complete JSONL input stream, failing closed on any malformed row."""
