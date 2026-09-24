@@ -1,10 +1,11 @@
 # O'Pip Intelligence Committee — isolated shadow worker (IC-042)
 
-> **PREPARED, NOT DEPLOYED.**
+> **OFF DEPLOYMENT PROVEN; SHADOW NOT ACTIVATED.**
 >
-> Everything in this directory is inert until an operator installs it. Nothing here has
-> been deployed, enabled, or activated. Installing or enabling any of it requires
-> separate OWNER approval of this exact change.
+> The isolated worker artifacts have been installed and independently proven in OFF
+> mode. The timer remains disabled/inactive, egress remains deny-all, and no provider
+> credential or provider call is active. OFF -> credentialled SHADOW remains a separate
+> OWNER-authorised boundary.
 
 ## Placement: the learning/analytics plane, not the trading droplet
 
@@ -26,7 +27,7 @@ than an architecture.
 | `run-committee-shadow-cycle.sh` | The worker entry point. Runs one cycle and exits; refuses without an exact release SHA; records an explicit `SKIPPED_MODE_OFF` disposition rather than exiting silently. |
 | `app/opip/committee/cycle_runner.py` | What the script invokes: reads committed evidence, runs exactly one scheduling cycle, writes dispositions and a trust report. |
 
-Installation would be:
+The OFF installation path is:
 
 ```bash
 install -m 0644 opip-committee-shadow.service /etc/systemd/system/
@@ -41,7 +42,7 @@ systemctl daemon-reload
 
 | Requirement | How it is satisfied |
 | --- | --- |
-| Read-only evidence input | `ReadOnlyPaths=/var/lib/opip-learning`; the runner reads JSONL and writes nothing there. Canonical evidence, the decision-intelligence streams, the order path, and trading registries are not reachable from this unit. |
+| Read-only evidence input | `ReadOnlyPaths=/var/lib/opip-learning`; SHADOW case production resolves the verified canonical-replica generation there, requires its external production-release provenance, reconstructs schema-v2 DecisionContext plus the cited canonical decision snapshot, and writes nothing to the learning tree. Canonical evidence remains read-only; the order path and trading registries are not reachable from this unit. |
 | Dedicated advisory output | `ReadWritePaths=/var/lib/opip-committee` only, plus `/var/lock`. Dispositions and the trust report land in that directory and nowhere else. |
 | No trading credentials | No Kraken credential, no Telegram credential, no cockpit secret, no private key is referenced. The only secret file the unit reads is `/etc/opip/committee-credentials.env`, which holds provider keys. Verify this by inspecting the deployed environment rather than trusting this table. |
 | No inbound network | No port is opened or published. `RestrictAddressFamilies=AF_INET AF_INET6` permits outbound sockets only for provider HTTPS. |
@@ -88,10 +89,18 @@ exception, so a broken worker is observable rather than silent.
 ## What this change does not do
 
 - It does not enable the committee. Mode stays `off`.
-- It does not wire an executor, so a scheduled case currently resolves to
-  `UNAVAILABLE` and nothing is spent. Wiring an executor is a separate approved step.
-- It does not create, read, or move any credential.
-- It does not touch Paper-v2, funded/live authority, or any trading path.
+- OFF still constructs no executor and reads no provider credential.
+- The repository contains a credentialled SHADOW executor path, but it is unreachable
+  unless runtime mode explicitly resolves to `shadow`. It requires both approved
+  provider credentials, bounded request/cost reservations, durable provider/case
+  evidence, and a verified canonical-replica source.
+- SHADOW production has an explicit activation-time boundary so historical Paper-v2
+  contexts are not silently backfilled into paid work.
+- Provider calls use a bounded HTTPS poster that refuses redirects; the application
+  adapter still enforces exact provider endpoints. Host egress remains deny-all until
+  the separate activation boundary installs and proves its provider-only network policy.
+- It does not grant Paper-v2, funded/live, admission, ranking, sizing, protection, or
+  execution authority.
 
 ## Approval checklist
 
