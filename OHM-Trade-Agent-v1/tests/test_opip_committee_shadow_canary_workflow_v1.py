@@ -44,6 +44,7 @@ def test_provider_secrets_are_transient_and_never_rendered():
     assert "cat committee-credential-canary.env" not in text
     assert "set -x" not in text
     assert "Transient cleanup" in text
+    assert "^[A-Za-z0-9._-]+$" in text
 
 
 def test_canary_unit_is_fail_closed_and_has_no_listener():
@@ -69,6 +70,8 @@ def test_validation_adds_egress_only_to_the_transient_canary_dropin():
     assert "committee-shadow.service" in text
     assert "persistent egress allowlist" in text
     assert "systemctl enable" not in text
+    assert "BindReadOnlyPaths=%s:%s" in text
+    assert "CANARY_EGRESS_POLICY=PASS" in text
 
 
 def test_validation_proves_off_before_and_after_and_cleans_on_exit():
@@ -78,6 +81,11 @@ def test_validation_proves_off_before_and_after_and_cleans_on_exit():
     assert "trap cleanup EXIT" in text
     assert 'rm -f -- "$ENV_FILE" "$HOSTS_FILE" "$DROPIN" "$CANARY_LOG"' in text
     assert 'rm -f -- "$UNIT_PATH" "$LAUNCHER"' in text
+    assert "TRANSIENT_CANARY_CLEANUP=PASS" in text
+    assert "assert_cleanup" in text
+    assert 'systemctl cat "$UNIT"' in text
+    assert 'rmdir "$BOUND_RELEASE"' in text
+    assert 'OPIP_COMMITTEE_CANARY_PYTHONPATH=%s' in text
     assert "CREDENTIAL_CANARY_PROOF=PASS" in text
 
 
@@ -87,3 +95,13 @@ def test_launcher_requires_exact_release_and_uses_only_canary_root():
     assert "credential_canary" in text
     assert "/var/lib/opip-committee/credential-canary" in text
     assert "opip-committee-shadow.timer" not in text
+
+
+def test_private_tmp_cannot_hide_the_release_tree_from_the_canary():
+    unit = _text(DEPLOY / "opip-committee-credential-canary.service")
+    script = _text(DEPLOY / "validate-committee-shadow-canary.sh")
+    assert "PrivateTmp=true" in unit
+    assert 'BOUND_RELEASE="$RUNTIME_DIR/committee-canary-release"' in script
+    assert "BindReadOnlyPaths=%s:%s" in script
+    assert 'printf \'OPIP_COMMITTEE_CANARY_PYTHONPATH=%s\\n\' "$BOUND_RELEASE"' in script
+    assert 'install -d -o root -g root -m 0750 /var/lib/opip-committee/credential-canary' in script
