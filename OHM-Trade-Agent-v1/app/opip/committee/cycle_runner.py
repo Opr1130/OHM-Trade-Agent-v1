@@ -218,6 +218,93 @@ def load_evidence_items(path: Path) -> tuple[CommittedEvidenceItem, ...]:
     return tuple(items)
 
 
+def _resolve_population(
+    *,
+    evidence_path: Path,
+    case_ingress_path: Path | None,
+    case_population: CaseIngressPopulation | None,
+    case_executor: Callable[[CommitteeCase], bool] | None,
+) -> tuple[CaseIngressPopulation | None, tuple[CommittedEvidenceItem, ...]]:
+    if case_ingress_path is not None and case_population is not None:
+        raise CycleConfigurationError(
+            "case_ingress_path and case_population are mutually exclusive"
+        )
+    population = case_population
+    if population is None and case_ingress_path is not None:
+        population = CaseIngressPopulation(load_case_envelopes(case_ingress_path))
+    if population is None:
+        if case_executor is not None:
+            raise CycleConfigurationError(
+                "a case_executor requires validated case ingress"
+            )
+        return None, load_evidence_items(evidence_path)
+    return population, population.scheduler_items
+
+
+@dataclass
+class _ReservedCaseExecutor:
+    population: CaseIngressPopulation
+    executor: Callable[[CommitteeCase], bool]
+    ceiling: DailyCeiling
+    moment: datetime
+
+    def __call__(self, item: CommittedEvidenceItem) -> bool:
+        self.ceiling.admit(
+            estimated_cost_microunits=item.estimated_cost_microunits,
+            at=self.moment,
+        )
+        return self.executor(self.population.case_for(item))
+
+
+def _scheduler_executor(
+    *,
+    population: CaseIngressPopulation | None,
+    case_executor: Callable[[CommitteeCase], bool] | None,
+    ceiling: DailyCeiling,
+    moment: datetime,
+):
+    if population is None or case_executor is None:
+        return None
+    return _ReservedCaseExecutor(
+        population=population,
+        executor=case_executor,
+        ceiling=ceiling,
+        moment=moment,
+    )
+
+
+def _write_trust_report(
+    *,
+    committee_home: Path,
+    release_sha: str,
+    moment: datetime,
+    run,
+    remaining_daily_ceiling_microunits: int,
+):
+    report = build_trust_report(
+        report_version="committee-trust-v1",
+        release_sha=release_sha,
+        registry_version="committee-shadow-registry-v1",
+        generated_at=moment,
+        population=run.tally,
+        investment=CommitteeInvestment(),
+    )
+    payload = {
+        "report_id": report.report_id,
+        "stage": report.stage.value,
+        "blocked_gates": [gate.value for gate in report.blocked_gates],
+        "insufficiency_reasons": list(report.insufficiency_reasons),
+        "population": report.population.as_dict(),
+        "mean_latency_micros": report.mean_latency_micros,
+        "remaining_daily_ceiling_microunits": remaining_daily_ceiling_microunits,
+    }
+    (committee_home / TRUST_REPORT_FILE).write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return report
+
+
 @dataclass(frozen=True)
 class CycleOutcome:
     """What one cycle did, for the worker's own reporting."""
@@ -257,22 +344,12 @@ def run_once(
     committee_home.mkdir(parents=True, exist_ok=True)
     checkpoint = FileCheckpoint(committee_home)
 
-    if case_ingress_path is not None and case_population is not None:
-        raise CycleConfigurationError(
-            "case_ingress_path and case_population are mutually exclusive"
-        )
-    population = case_population
-    if population is None and case_ingress_path is not None:
-        population = CaseIngressPopulation(load_case_envelopes(case_ingress_path))
-
-    if population is None:
-        if case_executor is not None:
-            raise CycleConfigurationError(
-                "a case_executor requires validated case ingress"
-            )
-        items = load_evidence_items(evidence_path)
-    else:
-        items = population.scheduler_items
+    population, items = _resolve_population(
+        evidence_path=evidence_path,
+        case_ingress_path=case_ingress_path,
+        case_population=case_population,
+        case_executor=case_executor,
+    )
 
     # The daily ceiling caps this cycle's cost budget, so a cycle can never spend
     # more than the UTC day's remaining allowance. The per-case ceiling still applies
@@ -284,17 +361,12 @@ def run_once(
     )
     remaining_today = ceiling.remaining_today()
 
-    scheduler_executor = None
-    if case_executor is not None and population is not None:
-        def scheduler_executor(item):
-            # Persist the full candidate reservation before any external work. A
-            # failure keeps the reservation: unknown/failed spend is never treated
-            # as free, and a restart cannot reopen the daily ceiling.
-            ceiling.admit(
-                estimated_cost_microunits=item.estimated_cost_microunits,
-                at=moment,
-            )
-            return case_executor(population.case_for(item))
+    reserved_executor = _scheduler_executor(
+        population=population,
+        case_executor=case_executor,
+        ceiling=ceiling,
+        moment=moment,
+    )
 
     scheduler = CommitteeScheduler(
         checkpoint=checkpoint,
@@ -308,32 +380,14 @@ def run_once(
     )
     # OFF has no executor. SHADOW receives an explicitly constructed executor only
     # after provenance, activation-boundary, credential and budget checks pass.
-    run = scheduler.run_cycle(items=items, executor=scheduler_executor)
+    run = scheduler.run_cycle(items=items, executor=reserved_executor)
 
-    report = build_trust_report(
-        report_version="committee-trust-v1",
+    report = _write_trust_report(
+        committee_home=committee_home,
         release_sha=release_sha,
-        registry_version="committee-shadow-registry-v1",
-        generated_at=moment,
-        population=run.tally,
-        investment=CommitteeInvestment(),
-    )
-    (committee_home / TRUST_REPORT_FILE).write_text(
-        json.dumps(
-            {
-                "report_id": report.report_id,
-                "stage": report.stage.value,
-                "blocked_gates": [gate.value for gate in report.blocked_gates],
-                "insufficiency_reasons": list(report.insufficiency_reasons),
-                "population": report.population.as_dict(),
-                "mean_latency_micros": report.mean_latency_micros,
-                "remaining_daily_ceiling_microunits": ceiling.remaining_today(),
-            },
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n",
-        encoding="utf-8",
+        moment=moment,
+        run=run,
+        remaining_daily_ceiling_microunits=ceiling.remaining_today(),
     )
     return CycleOutcome(
         ran=run.ran,
@@ -418,6 +472,47 @@ def _production_sha_from_learning_manifest(path: Path) -> str:
     return sha
 
 
+def _shadow_dependencies(
+    *,
+    settings: CommitteeShadowSettings,
+    committee_home: Path,
+    moment: datetime,
+) -> tuple[CaseIngressPopulation | None, Callable[[CommitteeCase], bool] | None]:
+    if settings.opip_committee_mode != COMMITTEE_MODE_SHADOW:
+        return None, None
+    activation_boundary = _parse_activation_boundary(
+        os.environ.get(SHADOW_NOT_BEFORE_ENV)
+    )
+    learning_manifest = _required_path_env(LEARNING_DATA_MANIFEST_ENV)
+    replica_root = _required_path_env(REPLICA_ROOT_ENV)
+    source_sha = _production_sha_from_learning_manifest(learning_manifest)
+    population = produce_case_population(
+        replica_repository_root=replica_root,
+        expected_source_release_sha=source_sha,
+        not_before=activation_boundary,
+        now=moment,
+    )
+    executor = build_credentialled_shadow_executor(
+        committee_home=committee_home
+    )
+    return population, executor
+
+
+def _emit_outcome(outcome: CycleOutcome) -> None:
+    print(
+        json.dumps(
+            {
+                "ran": outcome.ran,
+                "reason": outcome.reason,
+                "considered": outcome.considered,
+                "dispositions": outcome.dispositions,
+                "report_id": outcome.report_id,
+            },
+            sort_keys=True,
+        )
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Parse the worker's arguments and run one cycle."""
     args = list(sys.argv[1:] if argv is None else argv)
@@ -435,27 +530,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     moment = datetime.now(timezone.utc)
 
     try:
-        population = None
-        executor = None
-        if settings.opip_committee_mode == COMMITTEE_MODE_SHADOW:
-            activation_boundary = _parse_activation_boundary(
-                os.environ.get(SHADOW_NOT_BEFORE_ENV)
-            )
-            learning_manifest = _required_path_env(
-                LEARNING_DATA_MANIFEST_ENV
-            )
-            replica_root = _required_path_env(REPLICA_ROOT_ENV)
-            source_sha = _production_sha_from_learning_manifest(learning_manifest)
-            population = produce_case_population(
-                replica_repository_root=replica_root,
-                expected_source_release_sha=source_sha,
-                not_before=activation_boundary,
-                now=moment,
-            )
-            executor = build_credentialled_shadow_executor(
-                committee_home=committee_home
-            )
-
+        population, executor = _shadow_dependencies(
+            settings=settings,
+            committee_home=committee_home,
+            moment=moment,
+        )
         outcome = run_once(
             release_sha=release_sha or "",
             committee_home=committee_home,
@@ -476,18 +555,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"committee cycle refused: {exc}", file=sys.stderr)
         return EXIT_CONFIG_ERROR
     try:
-        print(
-            json.dumps(
-                {
-                    "ran": outcome.ran,
-                    "reason": outcome.reason,
-                    "considered": outcome.considered,
-                    "dispositions": outcome.dispositions,
-                    "report_id": outcome.report_id,
-                },
-                sort_keys=True,
-            )
-        )
+        _emit_outcome(outcome)
     except Exception as exc:  # noqa: BLE001 - a reporting failure is operational.
         print(f"committee cycle reported a failure: {exc}", file=sys.stderr)
         return EXIT_OPERATIONAL_ERROR
