@@ -79,6 +79,9 @@ class _NoRedirectHandler(HTTPRedirectHandler):
     """Refuse redirects so an allowlisted URL cannot bounce to another host."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        # urllib's override contract requires all six parameters. Deliberately
+        # consume them so static analysis records that their non-use is intentional.
+        _ = (req, fp, code, msg, headers, newurl)
         return None
 
 
