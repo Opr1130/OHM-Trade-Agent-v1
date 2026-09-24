@@ -26,7 +26,6 @@ from pathlib import Path
 import sqlite3
 from typing import Any, Mapping
 
-from app.opip.canonical.schema import connect
 from app.opip.committee.case_ingress import CaseIngressPopulation, CommittedCaseEnvelope
 from app.opip.committee.contracts import (
     CanonicalDecisionBinding,
@@ -136,8 +135,14 @@ def _read_decision_snapshots(
     db_path: Path,
 ) -> Mapping[str, CanonicalDecisionSnapshotRecord]:
     """Read and validate every canonical Paper-v2 decision snapshot, read-only."""
+    target = Path(db_path).resolve()
     try:
-        connection = connect(Path(db_path), read_only=True)
+        connection = sqlite3.connect(
+            f"file:{target.as_posix()}?mode=ro",
+            uri=True,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only=ON")
     except sqlite3.Error as exc:
         raise CaseSourceError(
             f"canonical replica could not be opened read-only: {exc}"
