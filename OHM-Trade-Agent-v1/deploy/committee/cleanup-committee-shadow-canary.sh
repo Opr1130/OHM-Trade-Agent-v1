@@ -14,7 +14,6 @@ HOSTS_FILE="$RUNTIME_DIR/committee-credential-canary-hosts"
 CANARY_LOG="$RUNTIME_DIR/committee-credential-canary.log"
 PRE_OFF_LOG="$RUNTIME_DIR/committee-canary-pre-off.log"
 POST_OFF_LOG="$RUNTIME_DIR/committee-canary-post-off.log"
-BOUND_RELEASE="$RUNTIME_DIR/committee-canary-release"
 DROPIN_DIR="/run/systemd/system/$UNIT.d"
 DROPIN="$DROPIN_DIR/10-provider-egress.conf"
 
@@ -22,7 +21,6 @@ set +e
 systemctl stop "$UNIT" >/dev/null 2>&1
 rm -f -- "$ENV_FILE" "$HOSTS_FILE" "$CANARY_LOG" "$PRE_OFF_LOG" "$POST_OFF_LOG" "$DROPIN"
 rmdir "$DROPIN_DIR" >/dev/null 2>&1
-rmdir "$BOUND_RELEASE" >/dev/null 2>&1
 rm -f -- "$UNIT_PATH" "$LAUNCHER"
 systemctl daemon-reload >/dev/null 2>&1
 set -e
@@ -33,7 +31,7 @@ for path in "$ENV_FILE" "$HOSTS_FILE" "$CANARY_LOG" "$DROPIN" "$UNIT_PATH" "$LAU
     residue=1
   fi
 done
-if [[ -d "$DROPIN_DIR" || -d "$BOUND_RELEASE" ]]; then
+if [[ -d "$DROPIN_DIR" ]]; then
   residue=1
 fi
 if systemctl is-active --quiet "$UNIT" 2>/dev/null; then

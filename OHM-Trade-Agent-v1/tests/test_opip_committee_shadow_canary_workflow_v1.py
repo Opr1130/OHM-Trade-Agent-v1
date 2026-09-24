@@ -78,12 +78,15 @@ def test_validation_adds_egress_only_to_the_transient_canary_dropin():
     assert "systemctl enable" not in text
 
 
-def test_private_tmp_release_visibility_is_explicit_and_read_only():
-    text = _text(DEPLOY / "validate-committee-shadow-canary.sh")
-    assert 'BOUND_RELEASE="$RUNTIME_DIR/committee-canary-release"' in text
-    assert "BindReadOnlyPaths=%s:%s" in text
-    assert "OPIP_COMMITTEE_CANARY_PYTHONPATH=%s" in text
-    assert '"$BOUND_RELEASE" >> "$ENV_FILE"' in text
+def test_private_tmp_does_not_hide_the_transient_release_tree():
+    unit = _text(DEPLOY / "opip-committee-credential-canary.service")
+    validation = _text(DEPLOY / "validate-committee-shadow-canary.sh")
+    workflow = _text(WORKFLOW)
+    assert "PrivateTmp=true" in unit
+    assert "/opt/opip-committee-canary-staging/" in workflow
+    assert "OPIP_COMMITTEE_CANARY_PYTHONPATH=%s" in validation
+    assert '"$RELEASE_ROOT" >> "$ENV_FILE"' in validation
+    assert "BindReadOnlyPaths=%s:%s" not in validation
 
 
 def test_validation_proves_off_before_and_after_and_uses_committed_cleanup():
@@ -100,7 +103,6 @@ def test_cleanup_script_proves_transient_authority_is_gone():
     text = _text(DEPLOY / "cleanup-committee-shadow-canary.sh")
     assert 'rm -f -- "$ENV_FILE" "$HOSTS_FILE" "$CANARY_LOG"' in text
     assert 'rm -f -- "$UNIT_PATH" "$LAUNCHER"' in text
-    assert 'rmdir "$BOUND_RELEASE"' in text
     assert 'systemctl is-active --quiet "$UNIT"' in text
     assert 'systemctl cat "$UNIT"' in text
     assert "TRANSIENT_CANARY_CLEANUP=PASS" in text

@@ -113,8 +113,8 @@ jobs:
           PORT="${PORT:-22}"
           SSH=(ssh -i ~/.ssh/opip_committee -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -p "$PORT")
           REMOTE="$USER@$HOST"
-          RELEASE_DIR="/var/tmp/opip-committee-canary-$TARGET_SHA-$GITHUB_RUN_ID"
-          "${SSH[@]}" "$REMOTE" "sudo -n install -d -o root -g root -m 0700 '$RELEASE_DIR'"
+          RELEASE_DIR="/opt/opip-committee-canary-staging/$TARGET_SHA-$GITHUB_RUN_ID"
+          "${SSH[@]}" "$REMOTE" "sudo -n install -d -o root -g root -m 0700 /opt/opip-committee-canary-staging '$RELEASE_DIR'"
           git archive --format=tar "$TARGET_SHA" | "${SSH[@]}" "$REMOTE" "sudo -n tar -xf - -C '$RELEASE_DIR'"
 
       - name: Transfer transient provider credentials
@@ -148,7 +148,7 @@ jobs:
           set +e
           PORT="${PORT:-22}"
           SSH=(ssh -i ~/.ssh/opip_committee -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -p "$PORT")
-          RELEASE_DIR="/var/tmp/opip-committee-canary-$TARGET_SHA-$GITHUB_RUN_ID"
+          RELEASE_DIR="/opt/opip-committee-canary-staging/$TARGET_SHA-$GITHUB_RUN_ID"
           "${SSH[@]}" "$USER@$HOST" "sudo -n bash '$RELEASE_DIR/OHM-Trade-Agent-v1/deploy/committee/validate-committee-shadow-canary.sh' '$TARGET_SHA' '$RELEASE_DIR/OHM-Trade-Agent-v1'" 2>&1 | tee committee-shadow-canary.log
           RC=${PIPESTATUS[0]}
           echo "rc=$RC" >> "$GITHUB_OUTPUT"
@@ -175,7 +175,7 @@ jobs:
           set +e
           PORT="${PORT:-22}"
           SSH=(ssh -i ~/.ssh/opip_committee -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -p "$PORT")
-          RELEASE_DIR="/var/tmp/opip-committee-canary-$TARGET_SHA-$GITHUB_RUN_ID"
+          RELEASE_DIR="/opt/opip-committee-canary-staging/$TARGET_SHA-$GITHUB_RUN_ID"
           CLEANUP_SCRIPT="$RELEASE_DIR/OHM-Trade-Agent-v1/deploy/committee/cleanup-committee-shadow-canary.sh"
           "${SSH[@]}" "$USER@$HOST" "sudo -n bash '$CLEANUP_SCRIPT'"
           CLEAN_RC=$?

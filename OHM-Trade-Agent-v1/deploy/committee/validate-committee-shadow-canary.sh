@@ -18,7 +18,6 @@ HOSTS_FILE="$RUNTIME_DIR/committee-credential-canary-hosts"
 CANARY_LOG="$RUNTIME_DIR/committee-credential-canary.log"
 PRE_OFF_LOG="$RUNTIME_DIR/committee-canary-pre-off.log"
 POST_OFF_LOG="$RUNTIME_DIR/committee-canary-post-off.log"
-BOUND_RELEASE="$RUNTIME_DIR/committee-canary-release"
 DROPIN_DIR="/run/systemd/system/$UNIT.d"
 DROPIN="$DROPIN_DIR/10-provider-egress.conf"
 OFF_VERIFY="$RELEASE_ROOT/deploy/committee/verify-committee-isolation.sh"
@@ -53,7 +52,7 @@ for stale in "$UNIT_PATH" "$LAUNCHER" "$DROPIN"; do
     exit 67
   }
 done
-[[ ! -d "$DROPIN_DIR" && ! -d "$BOUND_RELEASE" ]] || {
+[[ ! -d "$DROPIN_DIR" ]] || {
   echo "refusing canary: stale transient canary directory exists" >&2
   exit 68
 }
@@ -88,21 +87,17 @@ grep -q '^OPIP_COMMITTEE_ANTHROPIC_API_KEY_B64=[A-Za-z0-9+/=][A-Za-z0-9+/=]*$' "
 }
 
 printf 'OPIP_COMMITTEE_CANARY_RELEASE_SHA=%s\n' "$TARGET_SHA" >> "$ENV_FILE"
-printf 'OPIP_COMMITTEE_CANARY_PYTHONPATH=%s\n' "$BOUND_RELEASE" >> "$ENV_FILE"
+printf 'OPIP_COMMITTEE_CANARY_PYTHONPATH=%s\n' "$RELEASE_ROOT" >> "$ENV_FILE"
 
 install -m 0755 "$LAUNCHER_SOURCE" "$LAUNCHER"
 install -m 0644 "$SERVICE_SOURCE" "$UNIT_PATH"
-install -d -m 0755 "$RUNTIME_DIR" "$DROPIN_DIR" "$BOUND_RELEASE"
+install -d -m 0755 "$RUNTIME_DIR" "$DROPIN_DIR"
 install -d -o root -g root -m 0750 /var/lib/opip-committee/credential-canary
 
 : > "$HOSTS_FILE"
 printf '127.0.0.1 localhost\n::1 localhost\n' >> "$HOSTS_FILE"
 : > "$DROPIN"
 printf '[Service]\n' >> "$DROPIN"
-# PrivateTmp hides the uploaded /var/tmp release tree from the service. Bind that
-# exact release read-only into /run, which stays visible in the private namespace.
-printf 'BindReadOnlyPaths=%s:%s\n' "$RELEASE_ROOT" "$BOUND_RELEASE" >> "$DROPIN"
-
 resolve_provider() {
   local host="$1"
   local found=0
