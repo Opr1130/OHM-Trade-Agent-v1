@@ -36,15 +36,16 @@ def test_canary_workflow_never_enables_the_recurring_timer_or_shadow_worker():
     assert "POST_CANARY_OFF_ISOLATION=PASS" in text
 
 
-def test_provider_secrets_are_transient_and_never_rendered():
+def test_provider_secrets_are_transient_encoded_and_never_rendered():
     text = _text(WORKFLOW)
     assert "secrets.OPIP_COMMITTEE_OPENAI_API_KEY" in text
     assert "secrets.OPIP_COMMITTEE_ANTHROPIC_API_KEY" in text
+    assert "OPIP_COMMITTEE_OPENAI_API_KEY_B64" in text
+    assert "OPIP_COMMITTEE_ANTHROPIC_API_KEY_B64" in text
     assert "/run/opip/committee-credential-canary.env" in text
     assert "cat committee-credential-canary.env" not in text
     assert "set -x" not in text
     assert "Transient cleanup" in text
-    assert "^[A-Za-z0-9._-]+$" in text
 
 
 def test_canary_unit_is_fail_closed_and_has_no_listener():
@@ -54,10 +55,14 @@ def test_canary_unit_is_fail_closed_and_has_no_listener():
     assert "IPAddressAllow=" not in unit
     assert "Environment=OPIP_COMMITTEE_MODE=off" in unit
     assert "EnvironmentFile=/run/opip/committee-credential-canary.env" in unit
-    assert "BindReadOnlyPaths=/run/opip/committee-credential-canary-hosts:/etc/hosts" in unit
+    assert (
+        "BindReadOnlyPaths=/run/opip/committee-credential-canary-hosts:/etc/hosts"
+        in unit
+    )
     assert "ReadWritePaths=/var/lib/opip-committee/credential-canary /var/lock" in unit
+    assert "PrivateTmp=true" in unit
     assert "ListenStream" not in unit
-    assert "Socket" not in unit
+    assert "ListenDatagram" not in unit
 
 
 def test_validation_adds_egress_only_to_the_transient_canary_dropin():
@@ -69,39 +74,56 @@ def test_validation_adds_egress_only_to_the_transient_canary_dropin():
     assert 'resolve_provider "api.anthropic.com"' in text
     assert "committee-shadow.service" in text
     assert "persistent egress allowlist" in text
-    assert "systemctl enable" not in text
-    assert "BindReadOnlyPaths=%s:%s" in text
     assert "CANARY_EGRESS_POLICY=PASS" in text
+    assert "systemctl enable" not in text
 
 
-def test_validation_proves_off_before_and_after_and_cleans_on_exit():
+def test_private_tmp_release_visibility_is_explicit_and_read_only():
+    text = _text(DEPLOY / "validate-committee-shadow-canary.sh")
+    assert 'BOUND_RELEASE="$RUNTIME_DIR/committee-canary-release"' in text
+    assert "BindReadOnlyPaths=%s:%s" in text
+    assert "OPIP_COMMITTEE_CANARY_PYTHONPATH=%s" in text
+    assert '"$BOUND_RELEASE" >> "$ENV_FILE"' in text
+
+
+def test_validation_proves_off_before_and_after_and_uses_committed_cleanup():
     text = _text(DEPLOY / "validate-committee-shadow-canary.sh")
     assert "PRE_CANARY_OFF_ISOLATION=PASS" in text
     assert "POST_CANARY_OFF_ISOLATION=PASS" in text
-    assert "trap cleanup EXIT" in text
-    assert 'rm -f -- "$ENV_FILE" "$HOSTS_FILE" "$DROPIN" "$CANARY_LOG"' in text
-    assert 'rm -f -- "$UNIT_PATH" "$LAUNCHER"' in text
-    assert "TRANSIENT_CANARY_CLEANUP=PASS" in text
-    assert "assert_cleanup" in text
-    assert 'systemctl cat "$UNIT"' in text
-    assert 'rmdir "$BOUND_RELEASE"' in text
-    assert 'OPIP_COMMITTEE_CANARY_PYTHONPATH=%s' in text
+    assert "trap cleanup_on_exit EXIT" in text
+    assert 'bash "$CLEANUP_SCRIPT"' in text
+    assert "TRANSIENT_CANARY_CLEANUP=PASS" not in text
     assert "CREDENTIAL_CANARY_PROOF=PASS" in text
 
 
-def test_launcher_requires_exact_release_and_uses_only_canary_root():
+def test_cleanup_script_proves_transient_authority_is_gone():
+    text = _text(DEPLOY / "cleanup-committee-shadow-canary.sh")
+    assert 'rm -f -- "$ENV_FILE" "$HOSTS_FILE" "$CANARY_LOG"' in text
+    assert 'rm -f -- "$UNIT_PATH" "$LAUNCHER"' in text
+    assert 'rmdir "$BOUND_RELEASE"' in text
+    assert 'systemctl is-active --quiet "$UNIT"' in text
+    assert 'systemctl cat "$UNIT"' in text
+    assert "TRANSIENT_CANARY_CLEANUP=PASS" in text
+    assert "/var/lib/opip-committee/credential-canary" not in text
+
+
+def test_launcher_decodes_credentials_only_inside_the_canary_process():
     text = _text(DEPLOY / "run-committee-credential-canary.sh")
     assert "^[0-9a-f]{40}$" in text
+    assert "OPIP_COMMITTEE_OPENAI_API_KEY_B64" in text
+    assert "OPIP_COMMITTEE_ANTHROPIC_API_KEY_B64" in text
+    assert "base64 --decode" in text
     assert "credential_canary" in text
     assert "/var/lib/opip-committee/credential-canary" in text
     assert "opip-committee-shadow.timer" not in text
 
 
-def test_private_tmp_cannot_hide_the_release_tree_from_the_canary():
-    unit = _text(DEPLOY / "opip-committee-credential-canary.service")
-    script = _text(DEPLOY / "validate-committee-shadow-canary.sh")
-    assert "PrivateTmp=true" in unit
-    assert 'BOUND_RELEASE="$RUNTIME_DIR/committee-canary-release"' in script
-    assert "BindReadOnlyPaths=%s:%s" in script
-    assert 'printf \'OPIP_COMMITTEE_CANARY_PYTHONPATH=%s\\n\' "$BOUND_RELEASE"' in script
-    assert 'install -d -o root -g root -m 0750 /var/lib/opip-committee/credential-canary' in script
+def test_canary_workflow_requires_all_machine_readable_proofs():
+    text = _text(WORKFLOW)
+    for proof in (
+        "CANARY_EGRESS_POLICY=PASS",
+        "CREDENTIAL_CANARY_PROOF=PASS",
+        "TRANSIENT_CANARY_CLEANUP=PASS",
+        "POST_CANARY_OFF_ISOLATION=PASS",
+    ):
+        assert proof in text

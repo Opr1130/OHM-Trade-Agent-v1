@@ -2,11 +2,9 @@ name: validate-committee-shadow
 
 # Credentialled SHADOW CANARY ONLY.
 #
-# This workflow does not enable the recurring Committee timer, does not switch the
-# persistent worker out of OFF mode, and does not consume production trading evidence.
-# It permits exactly one synthetic, owner-approved provider validation under a
-# temporary systemd network boundary, removes credentials/egress afterward, and then
-# requires the durable OFF isolation proof to pass again.
+# This workflow never enables the recurring Committee timer and never switches the
+# persistent worker out of OFF mode. It runs one synthetic provider validation under
+# a transient network/credential boundary, proves cleanup, and then re-proves OFF.
 
 on:
   issue_comment:
@@ -64,7 +62,7 @@ jobs:
         run: |
           set -euo pipefail
           for WORKFLOW in pytest.yml quality-security.yml; do
-            RESULT="$(gh run list               --repo "$GITHUB_REPOSITORY"               --workflow "$WORKFLOW"               --branch main               --commit "$TARGET_SHA"               --limit 1               --json status,conclusion               --jq '.[0] | [.status,.conclusion] | @tsv')"
+            RESULT="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow "$WORKFLOW" --branch main --commit "$TARGET_SHA" --limit 1 --json status,conclusion --jq '.[0] | [.status,.conclusion] | @tsv')"
             test "$RESULT" = $'completed\tsuccess' || {
               echo "Refusing canary: $WORKFLOW is not successful for the exact SHA." >&2
               exit 1
@@ -90,8 +88,6 @@ jobs:
           for value in "$HOST" "$USER" "$SSH_KEY_B64" "$KNOWN_HOSTS" "$OPENAI_KEY" "$ANTHROPIC_KEY"; do
             test -n "$value"
           done
-          [[ "$OPENAI_KEY" =~ ^[A-Za-z0-9._-]+$ ]]
-          [[ "$ANTHROPIC_KEY" =~ ^[A-Za-z0-9._-]+$ ]]
 
       - name: Configure pinned SSH identity
         env:
@@ -131,10 +127,14 @@ jobs:
         run: |
           set -euo pipefail
           PORT="${PORT:-22}"
+          SSH=(ssh -i ~/.ssh/opip_committee -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -p "$PORT")
+          OPENAI_B64="$(printf '%s' "$OPENAI_KEY" | base64 -w0)"
+          ANTHROPIC_B64="$(printf '%s' "$ANTHROPIC_KEY" | base64 -w0)"
           {
-            printf 'OPIP_COMMITTEE_OPENAI_API_KEY=%s\n' "$OPENAI_KEY"
-            printf 'OPIP_COMMITTEE_ANTHROPIC_API_KEY=%s\n' "$ANTHROPIC_KEY"
-          } | ssh             -i ~/.ssh/opip_committee             -o BatchMode=yes             -o IdentitiesOnly=yes             -o StrictHostKeyChecking=yes             -p "$PORT"             "$USER@$HOST"             "sudo -n sh -c 'install -d -m 0755 /run/opip; umask 077; cat > /run/opip/committee-credential-canary.env'"
+            printf 'OPIP_COMMITTEE_OPENAI_API_KEY_B64=%s\n' "$OPENAI_B64"
+            printf 'OPIP_COMMITTEE_ANTHROPIC_API_KEY_B64=%s\n' "$ANTHROPIC_B64"
+          } | "${SSH[@]}" "$USER@$HOST" "sudo -n sh -c 'install -d -m 0755 /run/opip; umask 077; cat > /run/opip/committee-credential-canary.env'"
+          unset OPENAI_B64 ANTHROPIC_B64
 
       - name: Run one-shot credentialled SHADOW canary
         id: canary
@@ -147,12 +147,16 @@ jobs:
         run: |
           set +e
           PORT="${PORT:-22}"
+          SSH=(ssh -i ~/.ssh/opip_committee -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -p "$PORT")
           RELEASE_DIR="/var/tmp/opip-committee-canary-$TARGET_SHA-$GITHUB_RUN_ID"
-          ssh             -i ~/.ssh/opip_committee             -o BatchMode=yes             -o IdentitiesOnly=yes             -o StrictHostKeyChecking=yes             -o ServerAliveInterval=30             -o ServerAliveCountMax=10             -p "$PORT"             "$USER@$HOST"             "sudo -n bash '$RELEASE_DIR/OHM-Trade-Agent-v1/deploy/committee/validate-committee-shadow-canary.sh' '$TARGET_SHA' '$RELEASE_DIR/OHM-Trade-Agent-v1'"             2>&1 | tee committee-shadow-canary.log
+          "${SSH[@]}" "$USER@$HOST" "sudo -n bash '$RELEASE_DIR/OHM-Trade-Agent-v1/deploy/committee/validate-committee-shadow-canary.sh' '$TARGET_SHA' '$RELEASE_DIR/OHM-Trade-Agent-v1'" 2>&1 | tee committee-shadow-canary.log
           RC=${PIPESTATUS[0]}
           echo "rc=$RC" >> "$GITHUB_OUTPUT"
           if [[ "$RC" -eq 0 ]] &&
-             grep -q '^CANARY_EGRESS_POLICY=PASS
+             grep -q '^CANARY_EGRESS_POLICY=PASS$' committee-shadow-canary.log &&
+             grep -q '^CREDENTIAL_CANARY_PROOF=PASS$' committee-shadow-canary.log &&
+             grep -q '^TRANSIENT_CANARY_CLEANUP=PASS$' committee-shadow-canary.log &&
+             grep -q '^POST_CANARY_OFF_ISOLATION=PASS$' committee-shadow-canary.log; then
             echo "result=PROVEN" >> "$GITHUB_OUTPUT"
           else
             echo "result=FAILED" >> "$GITHUB_OUTPUT"
@@ -170,11 +174,21 @@ jobs:
         run: |
           set +e
           PORT="${PORT:-22}"
+          SSH=(ssh -i ~/.ssh/opip_committee -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -p "$PORT")
           RELEASE_DIR="/var/tmp/opip-committee-canary-$TARGET_SHA-$GITHUB_RUN_ID"
-          ssh             -i ~/.ssh/opip_committee             -o BatchMode=yes             -o IdentitiesOnly=yes             -o StrictHostKeyChecking=yes             -p "$PORT"             "$USER@$HOST"             "sudo -n sh -c 'systemctl stop opip-committee-credential-canary.service >/dev/null 2>&1 || true; rm -f /run/opip/committee-credential-canary.env /run/opip/committee-credential-canary-hosts /run/opip/committee-credential-canary.log /run/opip/committee-canary-pre-off.log /run/opip/committee-canary-post-off.log /run/systemd/system/opip-committee-credential-canary.service.d/10-provider-egress.conf /etc/systemd/system/opip-committee-credential-canary.service /usr/local/sbin/run-committee-credential-canary.sh; rmdir /run/systemd/system/opip-committee-credential-canary.service.d /run/opip/committee-canary-release >/dev/null 2>&1 || true; systemctl daemon-reload >/dev/null 2>&1 || true; rm -rf -- "$RELEASE_DIR"'"
-          RC=$?
+          CLEANUP_SCRIPT="$RELEASE_DIR/OHM-Trade-Agent-v1/deploy/committee/cleanup-committee-shadow-canary.sh"
+          "${SSH[@]}" "$USER@$HOST" "sudo -n bash '$CLEANUP_SCRIPT'"
+          CLEAN_RC=$?
+          "${SSH[@]}" "$USER@$HOST" "sudo -n rm -rf -- '$RELEASE_DIR'"
+          RELEASE_RC=$?
+          if [[ "$CLEAN_RC" -eq 0 && "$RELEASE_RC" -eq 0 ]]; then
+            RC=0
+            echo "result=CLEANED" >> "$GITHUB_OUTPUT"
+          else
+            RC=1
+            echo "result=FAILED" >> "$GITHUB_OUTPUT"
+          fi
           echo "rc=$RC" >> "$GITHUB_OUTPUT"
-          if [[ "$RC" -eq 0 ]]; then echo "result=CLEANED" >> "$GITHUB_OUTPUT"; else echo "result=FAILED" >> "$GITHUB_OUTPUT"; fi
           exit "$RC"
 
       - name: Publish SHADOW canary receipt
@@ -193,318 +207,18 @@ jobs:
           BODY=$(cat <<EOF
           ## O'Pip Intelligence Committee SHADOW Canary Receipt
 
-          - **Result:** ${CANARY_RESULT:-NOT RUN}
-          - **SHA:** `$TARGET_SHA`
-          - **Canary exit code:** ${CANARY_RC:-N/A}
-          - **Transient cleanup:** ${CLEANUP_RESULT:-NOT RUN} (rc=${CLEANUP_RC:-N/A})
-          - **Workflow run:** $RUN_URL
+          Result: ${CANARY_RESULT:-NOT RUN}
+          SHA: $TARGET_SHA
+          Canary exit code: ${CANARY_RC:-N/A}
+          Transient cleanup: ${CLEANUP_RESULT:-NOT RUN} (rc=${CLEANUP_RC:-N/A})
+          Workflow run: $RUN_URL
 
-          ```
+          Proof:
           $PROOF
-          ```
 
           This was a synthetic one-shot provider validation only. The recurring
           Committee worker remains OFF and its timer remains disabled. Provider
-          credentials and provider-IP egress were transient and are removed before
-          success. No production trading evidence or trading authority is involved.
-          EOF
-          )
-          gh api --method POST "repos/$GITHUB_REPOSITORY/issues/64/comments" -f body="$BODY" >/dev/null
-
-      - name: Fail unless canary, OFF restoration, and cleanup are proven
-        if: always()
-        env:
-          CANARY_RESULT: ${{ steps.canary.outputs.result }}
-          CLEANUP_RESULT: ${{ steps.cleanup.outputs.result }}
-        run: |
-          set -euo pipefail
-          test "$CANARY_RESULT" = "PROVEN" || {
-            echo "Credentialled SHADOW canary was not proven." >&2
-            exit 1
-          }
-          test "$CLEANUP_RESULT" = "CLEANED" || {
-            echo "Transient canary artifacts were not cleaned." >&2
-            exit 1
-          }
- committee-shadow-canary.log &&
-             grep -q '^CREDENTIAL_CANARY_PROOF=PASS
-            echo "result=PROVEN" >> "$GITHUB_OUTPUT"
-          else
-            echo "result=FAILED" >> "$GITHUB_OUTPUT"
-          fi
-          exit 0
-
-      - name: Clean all transient remote artifacts
-        id: cleanup
-        if: always() && steps.target.outputs.sha != ''
-        env:
-          HOST: ${{ secrets.OPIP_LEARNING_HOST }}
-          USER: ${{ secrets.OPIP_LEARNING_USER }}
-          PORT: ${{ secrets.OPIP_LEARNING_PORT }}
-          TARGET_SHA: ${{ steps.target.outputs.sha }}
-        run: |
-          set +e
-          PORT="${PORT:-22}"
-          RELEASE_DIR="/var/tmp/opip-committee-canary-$TARGET_SHA-$GITHUB_RUN_ID"
-          ssh             -i ~/.ssh/opip_committee             -o BatchMode=yes             -o IdentitiesOnly=yes             -o StrictHostKeyChecking=yes             -p "$PORT"             "$USER@$HOST"             "sudo -n sh -c 'systemctl stop opip-committee-credential-canary.service >/dev/null 2>&1 || true; rm -f /run/opip/committee-credential-canary.env /run/opip/committee-credential-canary-hosts /run/systemd/system/opip-committee-credential-canary.service.d/10-provider-egress.conf /etc/systemd/system/opip-committee-credential-canary.service /usr/local/sbin/run-committee-credential-canary.sh; rmdir /run/systemd/system/opip-committee-credential-canary.service.d >/dev/null 2>&1 || true; systemctl daemon-reload >/dev/null 2>&1 || true; rm -rf -- "$RELEASE_DIR"'"
-          RC=$?
-          echo "rc=$RC" >> "$GITHUB_OUTPUT"
-          if [[ "$RC" -eq 0 ]]; then echo "result=CLEANED" >> "$GITHUB_OUTPUT"; else echo "result=FAILED" >> "$GITHUB_OUTPUT"; fi
-          exit "$RC"
-
-      - name: Publish SHADOW canary receipt
-        if: always() && steps.target.outputs.sha != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TARGET_SHA: ${{ steps.target.outputs.sha }}
-          CANARY_RESULT: ${{ steps.canary.outputs.result }}
-          CANARY_RC: ${{ steps.canary.outputs.rc }}
-          CLEANUP_RESULT: ${{ steps.cleanup.outputs.result }}
-          CLEANUP_RC: ${{ steps.cleanup.outputs.rc }}
-        run: |
-          set -euo pipefail
-          RUN_URL="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          PROOF="$(grep -E '^(PRE_CANARY_OFF_ISOLATION=|CREDENTIAL_CANARY_PROOF=|POST_CANARY_OFF_ISOLATION=)' committee-shadow-canary.log 2>/dev/null || true)"
-          BODY=$(cat <<EOF
-          ## O'Pip Intelligence Committee SHADOW Canary Receipt
-
-          - **Result:** ${CANARY_RESULT:-NOT RUN}
-          - **SHA:** `$TARGET_SHA`
-          - **Canary exit code:** ${CANARY_RC:-N/A}
-          - **Transient cleanup:** ${CLEANUP_RESULT:-NOT RUN} (rc=${CLEANUP_RC:-N/A})
-          - **Workflow run:** $RUN_URL
-
-          ```
-          $PROOF
-          ```
-
-          This was a synthetic one-shot provider validation only. The recurring
-          Committee worker remains OFF and its timer remains disabled. Provider
-          credentials and provider-IP egress were transient and are removed before
-          success. No production trading evidence or trading authority is involved.
-          EOF
-          )
-          gh api --method POST "repos/$GITHUB_REPOSITORY/issues/64/comments" -f body="$BODY" >/dev/null
-
-      - name: Fail unless canary, OFF restoration, and cleanup are proven
-        if: always()
-        env:
-          CANARY_RESULT: ${{ steps.canary.outputs.result }}
-          CLEANUP_RESULT: ${{ steps.cleanup.outputs.result }}
-        run: |
-          set -euo pipefail
-          test "$CANARY_RESULT" = "PROVEN" || {
-            echo "Credentialled SHADOW canary was not proven." >&2
-            exit 1
-          }
-          test "$CLEANUP_RESULT" = "CLEANED" || {
-            echo "Transient canary artifacts were not cleaned." >&2
-            exit 1
-          }
- committee-shadow-canary.log &&
-             grep -q '^TRANSIENT_CANARY_CLEANUP=PASS
-            echo "result=PROVEN" >> "$GITHUB_OUTPUT"
-          else
-            echo "result=FAILED" >> "$GITHUB_OUTPUT"
-          fi
-          exit 0
-
-      - name: Clean all transient remote artifacts
-        id: cleanup
-        if: always() && steps.target.outputs.sha != ''
-        env:
-          HOST: ${{ secrets.OPIP_LEARNING_HOST }}
-          USER: ${{ secrets.OPIP_LEARNING_USER }}
-          PORT: ${{ secrets.OPIP_LEARNING_PORT }}
-          TARGET_SHA: ${{ steps.target.outputs.sha }}
-        run: |
-          set +e
-          PORT="${PORT:-22}"
-          RELEASE_DIR="/var/tmp/opip-committee-canary-$TARGET_SHA-$GITHUB_RUN_ID"
-          ssh             -i ~/.ssh/opip_committee             -o BatchMode=yes             -o IdentitiesOnly=yes             -o StrictHostKeyChecking=yes             -p "$PORT"             "$USER@$HOST"             "sudo -n sh -c 'systemctl stop opip-committee-credential-canary.service >/dev/null 2>&1 || true; rm -f /run/opip/committee-credential-canary.env /run/opip/committee-credential-canary-hosts /run/systemd/system/opip-committee-credential-canary.service.d/10-provider-egress.conf /etc/systemd/system/opip-committee-credential-canary.service /usr/local/sbin/run-committee-credential-canary.sh; rmdir /run/systemd/system/opip-committee-credential-canary.service.d >/dev/null 2>&1 || true; systemctl daemon-reload >/dev/null 2>&1 || true; rm -rf -- "$RELEASE_DIR"'"
-          RC=$?
-          echo "rc=$RC" >> "$GITHUB_OUTPUT"
-          if [[ "$RC" -eq 0 ]]; then echo "result=CLEANED" >> "$GITHUB_OUTPUT"; else echo "result=FAILED" >> "$GITHUB_OUTPUT"; fi
-          exit "$RC"
-
-      - name: Publish SHADOW canary receipt
-        if: always() && steps.target.outputs.sha != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TARGET_SHA: ${{ steps.target.outputs.sha }}
-          CANARY_RESULT: ${{ steps.canary.outputs.result }}
-          CANARY_RC: ${{ steps.canary.outputs.rc }}
-          CLEANUP_RESULT: ${{ steps.cleanup.outputs.result }}
-          CLEANUP_RC: ${{ steps.cleanup.outputs.rc }}
-        run: |
-          set -euo pipefail
-          RUN_URL="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          PROOF="$(grep -E '^(PRE_CANARY_OFF_ISOLATION=|CREDENTIAL_CANARY_PROOF=|POST_CANARY_OFF_ISOLATION=)' committee-shadow-canary.log 2>/dev/null || true)"
-          BODY=$(cat <<EOF
-          ## O'Pip Intelligence Committee SHADOW Canary Receipt
-
-          - **Result:** ${CANARY_RESULT:-NOT RUN}
-          - **SHA:** `$TARGET_SHA`
-          - **Canary exit code:** ${CANARY_RC:-N/A}
-          - **Transient cleanup:** ${CLEANUP_RESULT:-NOT RUN} (rc=${CLEANUP_RC:-N/A})
-          - **Workflow run:** $RUN_URL
-
-          ```
-          $PROOF
-          ```
-
-          This was a synthetic one-shot provider validation only. The recurring
-          Committee worker remains OFF and its timer remains disabled. Provider
-          credentials and provider-IP egress were transient and are removed before
-          success. No production trading evidence or trading authority is involved.
-          EOF
-          )
-          gh api --method POST "repos/$GITHUB_REPOSITORY/issues/64/comments" -f body="$BODY" >/dev/null
-
-      - name: Fail unless canary, OFF restoration, and cleanup are proven
-        if: always()
-        env:
-          CANARY_RESULT: ${{ steps.canary.outputs.result }}
-          CLEANUP_RESULT: ${{ steps.cleanup.outputs.result }}
-        run: |
-          set -euo pipefail
-          test "$CANARY_RESULT" = "PROVEN" || {
-            echo "Credentialled SHADOW canary was not proven." >&2
-            exit 1
-          }
-          test "$CLEANUP_RESULT" = "CLEANED" || {
-            echo "Transient canary artifacts were not cleaned." >&2
-            exit 1
-          }
- committee-shadow-canary.log &&
-             grep -q '^POST_CANARY_OFF_ISOLATION=PASS
-            echo "result=PROVEN" >> "$GITHUB_OUTPUT"
-          else
-            echo "result=FAILED" >> "$GITHUB_OUTPUT"
-          fi
-          exit 0
-
-      - name: Clean all transient remote artifacts
-        id: cleanup
-        if: always() && steps.target.outputs.sha != ''
-        env:
-          HOST: ${{ secrets.OPIP_LEARNING_HOST }}
-          USER: ${{ secrets.OPIP_LEARNING_USER }}
-          PORT: ${{ secrets.OPIP_LEARNING_PORT }}
-          TARGET_SHA: ${{ steps.target.outputs.sha }}
-        run: |
-          set +e
-          PORT="${PORT:-22}"
-          RELEASE_DIR="/var/tmp/opip-committee-canary-$TARGET_SHA-$GITHUB_RUN_ID"
-          ssh             -i ~/.ssh/opip_committee             -o BatchMode=yes             -o IdentitiesOnly=yes             -o StrictHostKeyChecking=yes             -p "$PORT"             "$USER@$HOST"             "sudo -n sh -c 'systemctl stop opip-committee-credential-canary.service >/dev/null 2>&1 || true; rm -f /run/opip/committee-credential-canary.env /run/opip/committee-credential-canary-hosts /run/systemd/system/opip-committee-credential-canary.service.d/10-provider-egress.conf /etc/systemd/system/opip-committee-credential-canary.service /usr/local/sbin/run-committee-credential-canary.sh; rmdir /run/systemd/system/opip-committee-credential-canary.service.d >/dev/null 2>&1 || true; systemctl daemon-reload >/dev/null 2>&1 || true; rm -rf -- "$RELEASE_DIR"'"
-          RC=$?
-          echo "rc=$RC" >> "$GITHUB_OUTPUT"
-          if [[ "$RC" -eq 0 ]]; then echo "result=CLEANED" >> "$GITHUB_OUTPUT"; else echo "result=FAILED" >> "$GITHUB_OUTPUT"; fi
-          exit "$RC"
-
-      - name: Publish SHADOW canary receipt
-        if: always() && steps.target.outputs.sha != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TARGET_SHA: ${{ steps.target.outputs.sha }}
-          CANARY_RESULT: ${{ steps.canary.outputs.result }}
-          CANARY_RC: ${{ steps.canary.outputs.rc }}
-          CLEANUP_RESULT: ${{ steps.cleanup.outputs.result }}
-          CLEANUP_RC: ${{ steps.cleanup.outputs.rc }}
-        run: |
-          set -euo pipefail
-          RUN_URL="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          PROOF="$(grep -E '^(PRE_CANARY_OFF_ISOLATION=|CREDENTIAL_CANARY_PROOF=|POST_CANARY_OFF_ISOLATION=)' committee-shadow-canary.log 2>/dev/null || true)"
-          BODY=$(cat <<EOF
-          ## O'Pip Intelligence Committee SHADOW Canary Receipt
-
-          - **Result:** ${CANARY_RESULT:-NOT RUN}
-          - **SHA:** `$TARGET_SHA`
-          - **Canary exit code:** ${CANARY_RC:-N/A}
-          - **Transient cleanup:** ${CLEANUP_RESULT:-NOT RUN} (rc=${CLEANUP_RC:-N/A})
-          - **Workflow run:** $RUN_URL
-
-          ```
-          $PROOF
-          ```
-
-          This was a synthetic one-shot provider validation only. The recurring
-          Committee worker remains OFF and its timer remains disabled. Provider
-          credentials and provider-IP egress were transient and are removed before
-          success. No production trading evidence or trading authority is involved.
-          EOF
-          )
-          gh api --method POST "repos/$GITHUB_REPOSITORY/issues/64/comments" -f body="$BODY" >/dev/null
-
-      - name: Fail unless canary, OFF restoration, and cleanup are proven
-        if: always()
-        env:
-          CANARY_RESULT: ${{ steps.canary.outputs.result }}
-          CLEANUP_RESULT: ${{ steps.cleanup.outputs.result }}
-        run: |
-          set -euo pipefail
-          test "$CANARY_RESULT" = "PROVEN" || {
-            echo "Credentialled SHADOW canary was not proven." >&2
-            exit 1
-          }
-          test "$CLEANUP_RESULT" = "CLEANED" || {
-            echo "Transient canary artifacts were not cleaned." >&2
-            exit 1
-          }
- committee-shadow-canary.log; then
-            echo "result=PROVEN" >> "$GITHUB_OUTPUT"
-          else
-            echo "result=FAILED" >> "$GITHUB_OUTPUT"
-          fi
-          exit 0
-
-      - name: Clean all transient remote artifacts
-        id: cleanup
-        if: always() && steps.target.outputs.sha != ''
-        env:
-          HOST: ${{ secrets.OPIP_LEARNING_HOST }}
-          USER: ${{ secrets.OPIP_LEARNING_USER }}
-          PORT: ${{ secrets.OPIP_LEARNING_PORT }}
-          TARGET_SHA: ${{ steps.target.outputs.sha }}
-        run: |
-          set +e
-          PORT="${PORT:-22}"
-          RELEASE_DIR="/var/tmp/opip-committee-canary-$TARGET_SHA-$GITHUB_RUN_ID"
-          ssh             -i ~/.ssh/opip_committee             -o BatchMode=yes             -o IdentitiesOnly=yes             -o StrictHostKeyChecking=yes             -p "$PORT"             "$USER@$HOST"             "sudo -n sh -c 'systemctl stop opip-committee-credential-canary.service >/dev/null 2>&1 || true; rm -f /run/opip/committee-credential-canary.env /run/opip/committee-credential-canary-hosts /run/systemd/system/opip-committee-credential-canary.service.d/10-provider-egress.conf /etc/systemd/system/opip-committee-credential-canary.service /usr/local/sbin/run-committee-credential-canary.sh; rmdir /run/systemd/system/opip-committee-credential-canary.service.d >/dev/null 2>&1 || true; systemctl daemon-reload >/dev/null 2>&1 || true; rm -rf -- "$RELEASE_DIR"'"
-          RC=$?
-          echo "rc=$RC" >> "$GITHUB_OUTPUT"
-          if [[ "$RC" -eq 0 ]]; then echo "result=CLEANED" >> "$GITHUB_OUTPUT"; else echo "result=FAILED" >> "$GITHUB_OUTPUT"; fi
-          exit "$RC"
-
-      - name: Publish SHADOW canary receipt
-        if: always() && steps.target.outputs.sha != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TARGET_SHA: ${{ steps.target.outputs.sha }}
-          CANARY_RESULT: ${{ steps.canary.outputs.result }}
-          CANARY_RC: ${{ steps.canary.outputs.rc }}
-          CLEANUP_RESULT: ${{ steps.cleanup.outputs.result }}
-          CLEANUP_RC: ${{ steps.cleanup.outputs.rc }}
-        run: |
-          set -euo pipefail
-          RUN_URL="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          PROOF="$(grep -E '^(PRE_CANARY_OFF_ISOLATION=|CREDENTIAL_CANARY_PROOF=|POST_CANARY_OFF_ISOLATION=)' committee-shadow-canary.log 2>/dev/null || true)"
-          BODY=$(cat <<EOF
-          ## O'Pip Intelligence Committee SHADOW Canary Receipt
-
-          - **Result:** ${CANARY_RESULT:-NOT RUN}
-          - **SHA:** `$TARGET_SHA`
-          - **Canary exit code:** ${CANARY_RC:-N/A}
-          - **Transient cleanup:** ${CLEANUP_RESULT:-NOT RUN} (rc=${CLEANUP_RC:-N/A})
-          - **Workflow run:** $RUN_URL
-
-          ```
-          $PROOF
-          ```
-
-          This was a synthetic one-shot provider validation only. The recurring
-          Committee worker remains OFF and its timer remains disabled. Provider
-          credentials and provider-IP egress were transient and are removed before
+          credentials and provider-IP egress were transient and removed before
           success. No production trading evidence or trading authority is involved.
           EOF
           )
