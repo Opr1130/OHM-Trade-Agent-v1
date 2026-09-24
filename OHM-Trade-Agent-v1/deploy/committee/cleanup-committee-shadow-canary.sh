@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Remove and prove removal of every transient credentialled-canary runtime artifact.
 #
-# The synthetic evidence archive under /var/lib/opip-committee/credential-canary is
-# intentionally durable audit evidence and is NOT removed here.
+# The synthetic canary evidence archive is durable audit evidence and is
+# intentionally outside this transient-authority cleanup surface.
 set -euo pipefail
 
 UNIT="opip-committee-credential-canary.service"

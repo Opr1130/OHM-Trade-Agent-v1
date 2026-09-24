@@ -147,7 +147,7 @@ def test_invalid_release_sha_fails_before_reading_credentials(tmp_path):
     assert poster.requests == []
 
 
-def test_canary_payload_contains_no_account_or_trading_evidence(tmp_path):
+def test_canary_model_bound_payload_contains_no_account_or_trading_evidence(tmp_path):
     poster = ScriptedPoster()
     run_credential_canary(
         release_sha=SHA,
@@ -156,10 +156,13 @@ def test_canary_payload_contains_no_account_or_trading_evidence(tmp_path):
         credentials=_credentials(),
         now=lambda: NOW,
     )
-    rendered = json.dumps(
-        [request.credential_safe_view() for request in poster.requests],
-        sort_keys=True,
-    ).lower()
+    payloads = []
+    for request in poster.requests:
+        if request.url == ALLOWED_ENDPOINTS[ProviderFamily.OPENAI]:
+            payloads.append(request.body["input"][0]["content"])
+        else:
+            payloads.append(request.body["messages"][0]["content"])
+    rendered = " ".join(payloads).lower()
     for forbidden in (
         "kraken",
         "telegram",

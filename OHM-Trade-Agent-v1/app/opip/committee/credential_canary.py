@@ -348,7 +348,8 @@ def main() -> int:
     parser.add_argument("release_sha")
     parser.add_argument(
         "--root",
-        default="/var/lib/opip-committee/credential-canary",
+        required=True,
+        help="Operator-supplied isolated canary evidence directory.",
     )
     args = parser.parse_args()
     try:
