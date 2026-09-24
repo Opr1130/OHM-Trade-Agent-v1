@@ -16,6 +16,14 @@ from pathlib import Path
 
 import pytest
 
+from app.opip.committee.contracts import (
+    CaseType,
+    CommitteeCase,
+    CommitteePolicy,
+    EvidenceItem,
+    EvidenceSnapshot,
+    ProviderFamily,
+)
 from app.opip.committee.cycle_runner import (
     EXIT_CONFIG_ERROR,
     EXIT_OK,
@@ -29,6 +37,7 @@ from app.opip.committee.cycle_runner import (
     run_once,
 )
 from app.opip.committee.registry import APPROVED_MAX_DAILY_COST_MICROUNITS
+from app.opip.decision_intelligence.identity import Provenance
 from app.opip.committee.scheduler import (
     CommitteeScheduleDisposition,
     SchedulerBudget,
@@ -57,6 +66,117 @@ def _item(evidence_id: str = "ev-1", *, cost: int | None = 400_000) -> dict:
 def _write_items(root: Path, items: list[dict]) -> Path:
     path = root / EVIDENCE_ITEMS_FILE
     path.write_text("\n".join(json.dumps(item) for item in items) + "\n", encoding="utf-8")
+    return path
+
+
+def _case_ingress_row() -> dict:
+    policy = CommitteePolicy(
+        policy_version="policy-v1",
+        seated_providers=(ProviderFamily.OPENAI, ProviderFamily.ANTHROPIC),
+        prompt_template_id="committee-v1",
+        prompt_version="prompt-v1",
+        max_attempts_per_seat=1,
+        max_estimated_cost_microunits=500_000,
+    )
+    evidence = EvidenceItem(
+        evidence_id="fact-1",
+        source_id="canonical:1",
+        available_at=NOW,
+        payload={
+            "instrument_id": "BTCUSD",
+            "metric_name": "example",
+            "metric_value": "1",
+        },
+    )
+    snapshot = EvidenceSnapshot(
+        case_id="case-ingress-1",
+        case_type=CaseType.MARKET_OPPORTUNITY,
+        evidence_cutoff_at=NOW,
+        assembled_at=NOW,
+        items=(evidence,),
+        source_refs=("canonical:1",),
+        committee_policy_version=policy.policy_version,
+        prompt_template_id=policy.prompt_template_id,
+        prompt_version=policy.prompt_version,
+        instrument_id="BTCUSD",
+    )
+    case = CommitteeCase(
+        case_id="case-ingress-1",
+        case_type=CaseType.MARKET_OPPORTUNITY,
+        snapshot=snapshot,
+        policy=policy,
+        created_at=NOW,
+        provenance=Provenance(
+            producing_component="test.cycle_runner",
+            artifact_or_build_id="test",
+            process_instance_id="cycle-runner-1",
+            emitted_at=NOW,
+            source_record_refs=("canonical:1",),
+        ),
+        instrument_id="BTCUSD",
+    )
+    return {
+        "schema_version": 1,
+        "evidence_id": "queue-ingress-1",
+        "evidence_snapshot_hash": snapshot.snapshot_hash,
+        "committee_policy_version": policy.policy_version,
+        "committed": True,
+        "sealed": True,
+        "available_at": NOW.isoformat(),
+        "expires_at": None,
+        "estimated_cost_microunits": 400_000,
+        "case": {
+            "case_id": case.case_id,
+            "case_type": case.case_type.value,
+            "created_at": case.created_at.isoformat(),
+            "instrument_id": case.instrument_id,
+            "strategy_context_id": None,
+            "canonical_binding": None,
+            "policy": {
+                "policy_version": policy.policy_version,
+                "seated_providers": [
+                    family.value for family in policy.seated_providers
+                ],
+                "prompt_template_id": policy.prompt_template_id,
+                "prompt_version": policy.prompt_version,
+                "max_attempts_per_seat": policy.max_attempts_per_seat,
+                "max_estimated_cost_microunits": (
+                    policy.max_estimated_cost_microunits
+                ),
+            },
+            "snapshot": {
+                "case_id": snapshot.case_id,
+                "evidence_cutoff_at": snapshot.evidence_cutoff_at.isoformat(),
+                "assembled_at": snapshot.assembled_at.isoformat(),
+                "items": [
+                    {
+                        "evidence_id": evidence.evidence_id,
+                        "source_id": evidence.source_id,
+                        "available_at": evidence.available_at.isoformat(),
+                        "payload": dict(evidence.payload),
+                    }
+                ],
+                "source_refs": list(snapshot.source_refs),
+                "committee_policy_version": snapshot.committee_policy_version,
+                "prompt_template_id": snapshot.prompt_template_id,
+                "prompt_version": snapshot.prompt_version,
+                "instrument_id": snapshot.instrument_id,
+                "strategy_context_id": snapshot.strategy_context_id,
+            },
+            "provenance": {
+                "producing_component": case.provenance.producing_component,
+                "artifact_or_build_id": case.provenance.artifact_or_build_id,
+                "process_instance_id": case.provenance.process_instance_id,
+                "emitted_at": case.provenance.emitted_at.isoformat(),
+                "source_record_refs": list(case.provenance.source_record_refs),
+            },
+        },
+    }
+
+
+def _write_case_ingress(root: Path) -> Path:
+    path = root / "committed_committee_cases.jsonl"
+    path.write_text(json.dumps(_case_ingress_row()) + "\n", encoding="utf-8")
     return path
 
 
@@ -146,6 +266,46 @@ def test_no_provider_call_is_made_by_a_cycle(tmp_path):
     report = json.loads((tmp_path / TRUST_REPORT_FILE).read_text(encoding="utf-8"))
     # Latency is unmeasured because nothing was invoked.
     assert report["mean_latency_micros"] is None
+
+
+def test_validated_case_ingress_dispatches_the_exact_reconstructed_case(tmp_path):
+    seen: list[CommitteeCase] = []
+
+    def execute(case: CommitteeCase) -> bool:
+        seen.append(case)
+        return True
+
+    row = _case_ingress_row()
+    outcome = run_once(
+        release_sha=SHA,
+        committee_home=tmp_path,
+        evidence_path=tmp_path / EVIDENCE_ITEMS_FILE,
+        case_ingress_path=_write_case_ingress(tmp_path),
+        case_executor=execute,
+        settings=CommitteeShadowSettings(opip_committee_mode=COMMITTEE_MODE_SHADOW),
+        now=NOW,
+    )
+    assert outcome.dispositions[CommitteeScheduleDisposition.COMPLETED.value] == 1
+    assert len(seen) == 1
+    assert seen[0].case_id == row["case"]["case_id"]
+    assert seen[0].snapshot.snapshot_hash == row["evidence_snapshot_hash"]
+
+
+def test_an_executor_cannot_run_without_validated_case_ingress(tmp_path):
+    with pytest.raises(
+        CycleConfigurationError,
+        match="case_executor requires a validated case_ingress_path",
+    ):
+        run_once(
+            release_sha=SHA,
+            committee_home=tmp_path,
+            evidence_path=_write_items(tmp_path, [_item()]),
+            case_executor=lambda case: True,
+            settings=CommitteeShadowSettings(
+                opip_committee_mode=COMMITTEE_MODE_SHADOW
+            ),
+            now=NOW,
+        )
 
 
 def test_a_second_cycle_does_not_reprocess_the_same_evidence(tmp_path):
