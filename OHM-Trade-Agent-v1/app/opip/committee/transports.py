@@ -43,6 +43,7 @@ from app.opip.committee.contracts import (
     ProviderFailureClass,
     ProviderFamily,
 )
+from app.opip.committee.pricing import PriceBook
 from app.opip.committee.providers import (
     ProviderInvocationError,
     ProviderRawResponse,
@@ -307,6 +308,7 @@ class _BaseTransport:
     reasoning_effort: str = "low"
     max_output_tokens: int = 1_024
     timeout_seconds: int = 60
+    price_book: PriceBook | None = None
 
     def __post_init__(self) -> None:
         if self.endpoint != ALLOWED_ENDPOINTS[self.family]:
@@ -380,16 +382,30 @@ class _BaseTransport:
                 failure_class=ProviderFailureClass.MALFORMED_RESPONSE,
             )
         text, input_tokens, output_tokens, served_model = self._extract(payload)
+        served_identity = served_model or self.model
+        estimated_cost = None
+        if self.price_book is not None:
+            estimated_cost = self.price_book.cost_microunits(
+                provider=self.family.value,
+                model=served_identity,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
         return ProviderRawResponse(
             reported_provider=self.family.value,
             # The served identity comes from the payload, never from the request, so
             # the router can detect a substituted model rather than assume one.
-            reported_model=served_model or self.model,
+            reported_model=served_identity,
             text=text,
             received_at=response.received_at,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            cost_completeness=CostCompleteness.UNKNOWN,
+            estimated_cost_microunits=estimated_cost,
+            cost_completeness=(
+                CostCompleteness.COMPLETE
+                if estimated_cost is not None
+                else CostCompleteness.UNKNOWN
+            ),
             # A reference identifies the exchange without carrying its body, which
             # could contain model text and therefore anything a model echoed back.
             raw_response_ref=f"{self.family.value}:http-{response.status_code}",
@@ -521,6 +537,7 @@ def build_transport(
     reasoning_effort: str = "low",
     max_output_tokens: int = 1_024,
     timeout_seconds: int = 60,
+    price_book: PriceBook | None = None,
 ) -> _BaseTransport:
     """Build the adapter for a governed family, or refuse an ungoverned one."""
     if family is ProviderFamily.OPENAI:
@@ -533,6 +550,7 @@ def build_transport(
             reasoning_effort=reasoning_effort,
             max_output_tokens=max_output_tokens,
             timeout_seconds=timeout_seconds,
+            price_book=price_book,
         )
     if family is ProviderFamily.ANTHROPIC:
         return AnthropicTransport(
@@ -544,6 +562,7 @@ def build_transport(
             reasoning_effort=reasoning_effort,
             max_output_tokens=max_output_tokens,
             timeout_seconds=timeout_seconds,
+            price_book=price_book,
         )
     raise EgressDeniedError(
         f"no approved transport exists for {family.value}; an ungoverned family is "
@@ -559,6 +578,7 @@ def build_approved_transports(
     reasoning_effort: str = "low",
     max_output_tokens: int = 1_024,
     timeout_seconds: int = 60,
+    price_book: PriceBook | None = None,
 ) -> Mapping[ProviderFamily, _BaseTransport]:
     """Build one adapter per approved family, skipping nothing silently.
 
@@ -575,6 +595,7 @@ def build_approved_transports(
             reasoning_effort=reasoning_effort,
             max_output_tokens=max_output_tokens,
             timeout_seconds=timeout_seconds,
+            price_book=price_book,
         )
     return transports
 
