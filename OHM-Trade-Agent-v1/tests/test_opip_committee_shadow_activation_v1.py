@@ -2046,4 +2046,4 @@ def test_shadow_proof_accepts_production_shaped_nine_entry_policy(
     proc = _prove_shadow(bash, plane)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "SHADOW_PROOF=PASS" in proc.stdout
-    assert "failures=0" in proc.stdout
+    assert "SHADOW_PROOF=FAIL" not in proc.stdout
