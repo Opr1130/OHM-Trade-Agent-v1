@@ -484,9 +484,21 @@ ensure_python_venv() {
     return 81
   fi
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y
-  apt-get install -y --no-install-recommends python3-venv
-  python3 -c 'import venv, ensurepip' >/dev/null 2>&1
+  # Called as `ensure_python_venv || fail_provision`, which disables errexit
+  # inside this function. Check each apt status explicitly.
+  if ! apt-get update -y; then
+    echo "apt-get update failed while installing python3-venv" >&2
+    return 81
+  fi
+  if ! apt-get install -y --no-install-recommends python3-venv; then
+    echo "apt-get install python3-venv failed" >&2
+    return 81
+  fi
+  if ! python3 -c 'import venv, ensurepip' >/dev/null 2>&1; then
+    echo "python3 venv module is still missing after install" >&2
+    return 81
+  fi
+  return 0
 }
 
 provision_main() {
