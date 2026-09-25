@@ -12,17 +12,87 @@
 #   verify-committee-shadow.sh --rollback
 #
 # `--rollback` first returns the plane to OFF (removing the provider egress drop-in
-# and restoring mode=off), then proves the OFF state. Advisory evidence is left in
-# place: rollback disables measurement, it does not destroy it.
+# and the shadow mode drop-in, and restoring mode=off), then proves the OFF state.
+# Advisory evidence is left in place: rollback disables measurement, it does not
+# destroy it.
 set -uo pipefail
 
 UNIT="opip-committee-shadow.service"
 TIMER="opip-committee-shadow.timer"
-UNIT_DIR="/etc/systemd/system"
-DROPIN_DIR="$UNIT_DIR/$UNIT.d"
-DROPIN="$DROPIN_DIR/10-provider-egress.conf"
-ENV_FILE="/etc/opip/committee-credentials.env"
-COMMITTEE_HOME="${OPIP_COMMITTEE_HOME:-/var/lib/opip-committee}"
+
+# Same jail as activate-committee-shadow.sh. Production paths are fixed.
+# OPIP_COMMITTEE_HOME and OPIP_COMMITTEE_EVIDENCE_ROOT are harness-only.
+refuse_harness_path() {
+  local label="$1" path="$2" resolved root
+  if [[ -z "$path" ]]; then
+    echo "test harness requires ${label}" >&2
+    exit 76
+  fi
+  case "$path" in
+    *..*)
+      echo "test harness refuses a parent-relative path for ${label}" >&2
+      exit 76
+      ;;
+    *) ;;
+  esac
+  if [[ ! -e "$path" ]]; then
+    echo "test harness path for ${label} does not exist" >&2
+    exit 76
+  fi
+  root="${OPIP_COMMITTEE_HARNESS_ROOT:-}"
+  if [[ -z "$root" || ! -d "$root" ]]; then
+    echo "test harness requires OPIP_COMMITTEE_HARNESS_ROOT" >&2
+    exit 76
+  fi
+  resolved="$(readlink -f "$path")"
+  root="$(readlink -f "$root")"
+  case "$resolved" in
+    "$root"|"$root"/*) ;;
+    *)
+      echo "test harness refuses a path outside the harness root for ${label}" >&2
+      exit 76
+      ;;
+  esac
+  case "$resolved" in
+    /etc|/etc/*|/opt/opip|/opt/opip/*)
+      echo "test harness refuses production path for ${label}" >&2
+      exit 76
+      ;;
+    *) ;;
+  esac
+  return 0
+}
+
+configure_committee_paths() {
+  if [[ "${OPIP_COMMITTEE_RUNTIME_TEST_HARNESS:-}" == "1" ]]; then
+    UNIT_DIR="${OPIP_COMMITTEE_UNIT_DIR:-}"
+    ENV_FILE="${OPIP_COMMITTEE_ENV_FILE:-}"
+    COMMITTEE_HOME="${OPIP_COMMITTEE_HOME:-}"
+    EVIDENCE_ROOT="${OPIP_COMMITTEE_EVIDENCE_ROOT:-}"
+    RESOLV_CONF="${OPIP_COMMITTEE_RESOLV_CONF:-}"
+    refuse_harness_path UNIT_DIR "$UNIT_DIR"
+    refuse_harness_path ENV_FILE "$ENV_FILE"
+    refuse_harness_path COMMITTEE_HOME "$COMMITTEE_HOME"
+    refuse_harness_path EVIDENCE_ROOT "$EVIDENCE_ROOT"
+    refuse_harness_path RESOLV_CONF "$RESOLV_CONF"
+  else
+    UNIT_DIR="/etc/systemd/system"
+    ENV_FILE="/etc/opip/committee-credentials.env"
+    COMMITTEE_HOME="/var/lib/opip-committee"
+    EVIDENCE_ROOT="/var/lib/opip-learning"
+    RESOLV_CONF="/etc/resolv.conf"
+  fi
+  DROPIN_DIR="$UNIT_DIR/$UNIT.d"
+  DROPIN="$DROPIN_DIR/10-provider-egress.conf"
+  MODE_DROPIN="$DROPIN_DIR/20-shadow-mode.conf"
+  return 0
+}
+
+configure_committee_paths
+if [[ "${OPIP_COMMITTEE_RUNTIME_TEST_HARNESS:-}" != "1" && "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "verify the committee shadow boundary as root" >&2
+  exit 77
+fi
 
 #: Credential NAMES only. This script never reads, prints, or compares a value.
 PROVIDER_CREDENTIAL_NAMES='OPIP_COMMITTEE_OPENAI_API_KEY|OPIP_COMMITTEE_ANTHROPIC_API_KEY'
@@ -45,15 +115,28 @@ env_value() {
 
 # --------------------------------------------------------------- rollback mode
 if [[ "${1:-}" == "--rollback" ]]; then
-  # Restore OFF first, then fall through to prove the resulting state. The order
-  # matters: proving OFF before actually returning to OFF would report a state
-  # that does not exist yet. Rollback is the one mode in which the provider egress
-  # allowlist must be ABSENT, so it is proven absent rather than required present.
-  if [[ -f "$DROPIN" ]]; then
-    rm -f "$DROPIN"
-    rmdir "$DROPIN_DIR" 2>/dev/null || true
-    info "removed the provider egress drop-in"
+  # Restore OFF first, then prove the resulting state. The order matters: proving
+  # OFF before actually returning to OFF would report a state that does not exist
+  # yet. Rollback removes both drop-ins. The provider egress allowlist must be
+  # ABSENT, so it is proven absent rather than required present. Advisory evidence
+  # is not deleted.
+  systemctl disable "$TIMER" >/dev/null 2>&1 || true
+  systemctl stop "$TIMER" >/dev/null 2>&1 || true
+  rm -f "$DROPIN"
+  rm -f "$MODE_DROPIN"
+  # A renamed drop-in is still SHADOW configuration. Remove any sibling that
+  # allowlists egress or forces shadow mode, then prove none remain.
+  if [[ -d "$DROPIN_DIR" ]]; then
+    shopt -s nullglob
+    for conf in "$DROPIN_DIR"/*.conf; do
+      if grep -qE '^[[:space:]]*IPAddressAllow=|^[[:space:]]*Environment=OPIP_COMMITTEE_MODE=shadow$' "$conf"; then
+        rm -f "$conf"
+      fi
+    done
+    shopt -u nullglob
   fi
+  rmdir "$DROPIN_DIR" 2>/dev/null || true
+  info "removed the provider egress drop-in and the shadow mode drop-in"
   if [[ -r "$ENV_FILE" ]]; then
     if grep -q '^OPIP_COMMITTEE_MODE=' "$ENV_FILE"; then
       sed -i 's|^OPIP_COMMITTEE_MODE=.*|OPIP_COMMITTEE_MODE=off|' "$ENV_FILE"
@@ -61,8 +144,6 @@ if [[ "${1:-}" == "--rollback" ]]; then
       printf 'OPIP_COMMITTEE_MODE=off\n' >> "$ENV_FILE"
     fi
   fi
-  systemctl disable "$TIMER" >/dev/null 2>&1 || true
-  systemctl stop "$TIMER" >/dev/null 2>&1 || true
   systemctl daemon-reload
   PROOF_LABEL="ROLLBACK_PROOF"
   echo "ROLLBACK_APPLIED=off+deny-all"
@@ -72,11 +153,33 @@ if [[ "${1:-}" == "--rollback" ]]; then
   else
     fail "mode is '${mode}' in the environment file, expected off after rollback"
   fi
-  allow_lines="$(grep -E '^[[:space:]]*IPAddressAllow=' "$DROPIN" 2>/dev/null || true)"
+  unit_mode="$(systemctl show -p Environment --value "$UNIT" 2>/dev/null | tr ' ' '\n' | sed -n 's/^OPIP_COMMITTEE_MODE=//p' | head -n1)"
+  if [[ "$unit_mode" == "off" ]]; then
+    pass "unit-level mode is off"
+  else
+    fail "unit-level mode '${unit_mode:-none}' disagrees with rollback off"
+  fi
+  if [[ ! -e "$MODE_DROPIN" ]]; then
+    pass "shadow mode drop-in is absent"
+  else
+    fail "shadow mode drop-in is still present after rollback"
+  fi
+  if [[ ! -e "$DROPIN" ]]; then
+    pass "provider egress drop-in is absent"
+  else
+    fail "provider egress drop-in is still present after rollback"
+  fi
+  allow_lines="$(grep -R -E '^[[:space:]]*IPAddressAllow=' "$DROPIN_DIR" 2>/dev/null || true)"
   if [[ -z "$allow_lines" ]]; then
     pass "no provider egress allowlist remains: OFF-mode egress is deny-all again"
   else
     fail "the provider egress allowlist is still present after rollback"
+  fi
+  unit_allow="$(systemctl show -p IPAddressAllow --value "$UNIT" 2>/dev/null | tr -d '[:space:]' || true)"
+  if [[ -z "$unit_allow" ]]; then
+    pass "effective IPAddressAllow has no exceptions"
+  else
+    fail "effective IPAddressAllow still has exceptions after rollback"
   fi
   unit_deny="$(systemctl show -p IPAddressDeny --value "$UNIT" 2>/dev/null || echo '')"
   if [[ "$unit_deny" == "any" || "$unit_deny" == *"0.0.0.0/0"* ]]; then
@@ -84,10 +187,13 @@ if [[ "${1:-}" == "--rollback" ]]; then
   else
     fail "egress default deny is '${unit_deny:-none}'"
   fi
+  timer_active="$(systemctl show -p ActiveState --value "$TIMER" 2>/dev/null || echo '')"
   if systemctl is-enabled "$TIMER" >/dev/null 2>&1; then
     fail "the recurring timer is still enabled after rollback"
+  elif [[ "$timer_active" != "inactive" ]]; then
+    fail "the recurring timer is not inactive after rollback (active: ${timer_active:-none})"
   else
-    pass "the recurring timer is not enabled after rollback"
+    pass "the recurring timer is not enabled and is inactive after rollback"
   fi
   if [[ -d "$COMMITTEE_HOME" ]]; then
     pass "advisory evidence directory survived rollback"
@@ -156,8 +262,8 @@ expected_addresses="$(
     done
     # Resolution has to survive deny-all, so the host's configured resolvers are
     # legitimately allowlisted alongside the provider addresses.
-    awk '/^[[:space:]]*nameserver[[:space:]]+/ {print $2}' /etc/resolv.conf 2>/dev/null || true
-    if grep -qE '^[[:space:]]*nameserver[[:space:]]+(127\.|::1)' /etc/resolv.conf 2>/dev/null; then
+    awk '/^[[:space:]]*nameserver[[:space:]]+/ {print $2}' "$RESOLV_CONF" 2>/dev/null || true
+    if grep -qE '^[[:space:]]*nameserver[[:space:]]+(127\.|::1)' "$RESOLV_CONF" 2>/dev/null; then
       printf '127.0.0.1\n::1\n'
     fi
   } | sort -u
@@ -176,6 +282,23 @@ if [[ "$unexpected" -eq 0 ]]; then
 else
   fail "$unexpected allowlisted address(es) do not belong to an approved endpoint"
 fi
+unit_allow="$(systemctl show -p IPAddressAllow --value "$UNIT" 2>/dev/null | tr ' ' '\n' || true)"
+if [[ -z "$(printf '%s' "$unit_allow" | tr -d '[:space:]')" ]]; then
+  fail "effective IPAddressAllow has no provider exception"
+else
+  effective_unexpected=0
+  while IFS= read -r address; do
+    [[ -z "$address" ]] && continue
+    if ! printf '%s\n' "$expected_addresses" | grep -qx "$address"; then
+      effective_unexpected=$((effective_unexpected + 1))
+    fi
+  done <<< "$unit_allow"
+  if [[ "$effective_unexpected" -eq 0 ]]; then
+    pass "effective IPAddressAllow contains only approved provider or resolver addresses"
+  else
+    fail "$effective_unexpected effective allowlist address(es) are not approved"
+  fi
+fi
 
 unit_deny="$(systemctl show -p IPAddressDeny --value "$UNIT" 2>/dev/null || echo '')"
 if [[ "$unit_deny" == "any" || "$unit_deny" == *"0.0.0.0/0"* ]]; then
@@ -191,6 +314,15 @@ if [[ "$unit_mode" == "$file_mode" ]]; then
   pass "unit-level mode agrees with the environment file (${file_mode:-none})"
 else
   fail "unit-level mode '${unit_mode:-none}' disagrees with the environment file '${file_mode:-none}'"
+fi
+base_unit="$UNIT_DIR/$UNIT"
+if [[ -f "$MODE_DROPIN" ]] \
+  && grep -qx 'Environment=OPIP_COMMITTEE_MODE=shadow' "$MODE_DROPIN" \
+  && [[ -f "$base_unit" ]] \
+  && grep -qx 'Environment=OPIP_COMMITTEE_MODE=off' "$base_unit"; then
+  pass "shadow mode drop-in overrides the base unit, which stays off"
+else
+  fail "shadow mode drop-in is absent or does not keep the base unit off"
 fi
 
 # ------------------------------------------------------------- activation boundary
@@ -257,7 +389,8 @@ fi
 timer_enabled="$(systemctl is-enabled "$TIMER" 2>/dev/null || true)"
 timer_active="$(systemctl show -p ActiveState --value "$TIMER" 2>/dev/null || echo "$UNKNOWN_STATE")"
 timer_cap="$(env_value OPIP_COMMITTEE_MAX_CASES_PER_CYCLE)"
-if [[ "$timer_enabled" == "enabled" ]]; then
+# Exit 0 covers enabled and enabled-runtime. A runtime enable is still enabled.
+if systemctl is-enabled "$TIMER" >/dev/null 2>&1; then
   if [[ "$timer_cap" == "1" ]]; then
     # A recurring timer is only acceptable with the conservative cap still in force.
     pass "recurring timer is enabled with a one-case cycle cap"
