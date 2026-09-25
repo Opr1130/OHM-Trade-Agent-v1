@@ -21,12 +21,31 @@ UNIT="opip-committee-shadow.service"
 TIMER="opip-committee-shadow.timer"
 
 refuse_harness_path() {
-  local label="$1" path="$2"
+  local label="$1" path="$2" resolved parent
   if [[ -z "$path" ]]; then
     echo "test harness requires ${label}" >&2
     exit 76
   fi
   case "$path" in
+    *..*)
+      echo "test harness refuses a parent-relative path for ${label}" >&2
+      exit 76
+      ;;
+  esac
+  if [[ -d "$path" ]]; then
+    parent="$path"
+  else
+    parent="$(dirname "$path")"
+  fi
+  if [[ ! -d "$parent" ]]; then
+    echo "test harness path for ${label} does not exist" >&2
+    exit 76
+  fi
+  resolved="$(cd "$parent" && pwd -P)"
+  if [[ ! -d "$path" ]]; then
+    resolved="${resolved}/$(basename "$path")"
+  fi
+  case "$resolved" in
     /etc|/etc/*|/opt/opip|/opt/opip/*)
       echo "test harness refuses production path for ${label}" >&2
       exit 76
@@ -96,6 +115,17 @@ if [[ "${1:-}" == "--rollback" ]]; then
   systemctl stop "$TIMER" >/dev/null 2>&1 || true
   rm -f "$DROPIN"
   rm -f "$MODE_DROPIN"
+  # A renamed drop-in is still SHADOW configuration. Remove any sibling that
+  # allowlists egress or forces shadow mode, then prove none remain.
+  if [[ -d "$DROPIN_DIR" ]]; then
+    shopt -s nullglob
+    for conf in "$DROPIN_DIR"/*.conf; do
+      if grep -qE '^[[:space:]]*IPAddressAllow=|^[[:space:]]*Environment=OPIP_COMMITTEE_MODE=shadow$' "$conf"; then
+        rm -f "$conf"
+      fi
+    done
+    shopt -u nullglob
+  fi
   rmdir "$DROPIN_DIR" 2>/dev/null || true
   info "removed the provider egress drop-in and the shadow mode drop-in"
   if [[ -r "$ENV_FILE" ]]; then
@@ -130,7 +160,7 @@ if [[ "${1:-}" == "--rollback" ]]; then
   else
     fail "provider egress drop-in is still present after rollback"
   fi
-  allow_lines="$(grep -E '^[[:space:]]*IPAddressAllow=' "$DROPIN" 2>/dev/null || true)"
+  allow_lines="$(grep -R -E '^[[:space:]]*IPAddressAllow=' "$DROPIN_DIR" 2>/dev/null || true)"
   if [[ -z "$allow_lines" ]]; then
     pass "no provider egress allowlist remains: OFF-mode egress is deny-all again"
   else

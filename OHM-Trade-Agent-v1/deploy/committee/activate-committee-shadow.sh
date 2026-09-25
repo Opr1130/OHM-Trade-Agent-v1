@@ -34,15 +34,36 @@ set -Eeuo pipefail
 UNIT="opip-committee-shadow.service"
 TIMER="opip-committee-shadow.timer"
 
-# Harness overrides apply only when OPIP_COMMITTEE_RUNTIME_TEST_HARNESS=1.
-# Otherwise the production absolute paths are used and any override is ignored.
+# UNIT_DIR, ENV_FILE, and RESOLV_CONF overrides apply only when
+# OPIP_COMMITTEE_RUNTIME_TEST_HARNESS=1. Otherwise those production paths are
+# fixed. OPIP_COMMITTEE_HOME and OPIP_COMMITTEE_EVIDENCE_ROOT keep their
+# pre-existing defaults.
 refuse_harness_path() {
-  local label="$1" path="$2"
+  local label="$1" path="$2" resolved parent
   if [[ -z "$path" ]]; then
     echo "test harness requires ${label}" >&2
     exit 76
   fi
   case "$path" in
+    *..*)
+      echo "test harness refuses a parent-relative path for ${label}" >&2
+      exit 76
+      ;;
+  esac
+  if [[ -d "$path" ]]; then
+    parent="$path"
+  else
+    parent="$(dirname "$path")"
+  fi
+  if [[ ! -d "$parent" ]]; then
+    echo "test harness path for ${label} does not exist" >&2
+    exit 76
+  fi
+  resolved="$(cd "$parent" && pwd -P)"
+  if [[ ! -d "$path" ]]; then
+    resolved="${resolved}/$(basename "$path")"
+  fi
+  case "$resolved" in
     /etc|/etc/*|/opt/opip|/opt/opip/*)
       echo "test harness refuses production path for ${label}" >&2
       exit 76
@@ -305,6 +326,29 @@ install_conf "$tmp_dropin" "$DROPIN"
 rm -f "$tmp_dropin"
 echo "PASS  provider-only egress pinned for ${#PROVIDER_ENDPOINTS[@]} endpoints ($resolved_count address entries, $resolver_count resolver entries)"
 
+# --- precondition: the pinned policy actually permits a provider connection ---
+# A pinned address that cannot be reached is a denial of legitimate egress, so
+# reachability is proven here rather than assumed from the allowlist. The mode
+# drop-in is installed only after this succeeds, so a failed probe cannot
+# publish unit-level shadow.
+systemctl daemon-reload
+reachable=0
+for endpoint in "${PROVIDER_ENDPOINTS[@]}"; do
+  if timeout 10 bash -c "exec 3<>/dev/tcp/$endpoint/443" 2>/dev/null; then
+    reachable=$((reachable + 1))
+  else
+    echo "WARN  $endpoint:443 was not reachable during activation" >&2
+  fi
+done
+if [[ "$reachable" -eq 0 ]]; then
+  rm -f "$DROPIN" "$MODE_DROPIN"
+  rmdir "$DROPIN_DIR" 2>/dev/null || true
+  systemctl daemon-reload
+  echo "refusing activation: no approved provider endpoint is reachable under the pinned policy" >&2
+  exit 78
+fi
+echo "PASS  $reachable of ${#PROVIDER_ENDPOINTS[@]} approved provider endpoints are reachable"
+
 # The base unit stays Environment=OPIP_COMMITTEE_MODE=off. This later drop-in
 # replaces only that assignment in the merged Environment property. A bare
 # Environment= line is not used: it would clear PYTHONDONTWRITEBYTECODE=1.
@@ -326,31 +370,6 @@ if [[ "$mode_installed" -ne 1 ]]; then
   exit 78
 fi
 echo "PASS  shadow mode drop-in installed; base unit stays off"
-
-# --- precondition: the pinned policy actually permits a provider connection ---
-# A pinned address that cannot be reached is a denial of legitimate egress, so
-# reachability is proven here rather than assumed from the allowlist.
-systemctl daemon-reload
-reachable=0
-for endpoint in "${PROVIDER_ENDPOINTS[@]}"; do
-  if timeout 10 bash -c "exec 3<>/dev/tcp/$endpoint/443" 2>/dev/null; then
-    reachable=$((reachable + 1))
-  else
-    echo "WARN  $endpoint:443 was not reachable during activation" >&2
-  fi
-done
-if [[ "$reachable" -eq 0 ]]; then
-  if [[ "$(current_file_mode)" != "shadow" ]]; then
-    rm -f "$DROPIN" "$MODE_DROPIN"
-  else
-    rm -f "$DROPIN"
-  fi
-  rmdir "$DROPIN_DIR" 2>/dev/null || true
-  systemctl daemon-reload
-  echo "refusing activation: no approved provider endpoint is reachable under the pinned policy" >&2
-  exit 78
-fi
-echo "PASS  $reachable of ${#PROVIDER_ENDPOINTS[@]} approved provider endpoints are reachable"
 
 # --- mode and activation boundary --------------------------------------------
 set_env_value() {
@@ -382,11 +401,11 @@ systemctl daemon-reload
 effective_mode="$(systemctl show -p Environment --value "$UNIT" 2>/dev/null | tr ' ' '\n' | sed -n 's/^OPIP_COMMITTEE_MODE=//p' | head -n1 || true)"
 file_mode="$(current_file_mode)"
 if [[ "$effective_mode" != "shadow" || "$file_mode" != "shadow" || ! -f "$DROPIN" ]]; then
-  if [[ "$effective_mode" != "shadow" ]]; then
-    set_env_value OPIP_COMMITTEE_MODE off
-    rm -f "$MODE_DROPIN"
-    systemctl daemon-reload
-  fi
+  # Returning the file to off must also remove the allowlist. OFF with a
+  # provider allowlist still installed is not deny-all.
+  set_env_value OPIP_COMMITTEE_MODE off
+  rm -f "$MODE_DROPIN" "$DROPIN"
+  systemctl daemon-reload
   echo "refusing activation: effective unit mode '${effective_mode:-none}' is not shadow" >&2
   exit 1
 fi
@@ -397,6 +416,12 @@ if [[ "$ENABLE_TIMER" == "true" ]]; then
 else
   systemctl disable "$TIMER" >/dev/null 2>&1 || true
   systemctl stop "$TIMER" >/dev/null 2>&1 || true
+  timer_enabled="$(systemctl is-enabled "$TIMER" 2>/dev/null || true)"
+  timer_active="$(systemctl show -p ActiveState --value "$TIMER" 2>/dev/null | tr -d '\r' || true)"
+  if [[ "$timer_enabled" == "enabled" || "$timer_active" != "inactive" ]]; then
+    echo "refusing activation: the committee timer is not disabled and inactive" >&2
+    exit 1
+  fi
   echo "PASS  committee timer left disabled and inactive (manual canary only)"
 fi
 
