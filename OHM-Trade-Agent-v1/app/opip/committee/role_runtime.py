@@ -44,6 +44,7 @@ from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 from app.opip.committee.contracts import (
     CanonicalDecisionBinding,
     CommitteeCase,
+    CostCompleteness,
     EvaluationPhase,
     ProviderFamily,
 )
@@ -108,9 +109,16 @@ SEAT_ORDER: tuple[CommitteeRole, ...] = (
 #: declared evidence dependency is ``role_opinions``.
 SYNTHESIZER_ROLE = CommitteeRole.DECISION_SYNTHESIZER
 
-#: Evidence ids whose presence decides whether the optional event/sentiment role
-#: can answer at all. Absent evidence means ``UNKNOWN``, never a fabricated view.
-QUALIFIED_EVENT_EVIDENCE_IDS = frozenset({"qualified_retained_event_evidence"})
+#: Payload metric-name prefixes that identify evidence the optional
+#: event/sentiment role depends on. The producer derives every ``evidence_id`` as a
+#: content hash, so an evidence *id* can never be matched by a literal; the metric
+#: name the producer records in the payload is the stable, semantic signal.
+#:
+#: The current canonical producer emits no metric in this namespace, so the
+#: optional role legitimately reports ``UNKNOWN`` for every SHADOW case today. The
+#: check is expressed against the metric namespace rather than a literal id so it
+#: stays correct if the producer later retains qualified event evidence.
+QUALIFIED_EVENT_METRIC_PREFIXES = ("event.", "sentiment.")
 
 #: Hard cap on the already-screened logical request handed to a vendor. Mirrors
 #: the executor's independent spend bound; it is not a token estimate.
@@ -122,12 +130,6 @@ MAX_ROLE_REQUEST_BYTES = 16 * 1024
 #: cannot be optimistic merely because no local tokenizer exists.
 INPUT_TOKEN_SAFETY_MULTIPLIER = 4
 PROTOCOL_TOKEN_ALLOWANCE = 4_096
-
-#: The per-role share of the approved per-case ceiling. Seven role seats share
-#: one approved case ceiling; no role may therefore reserve the whole of it.
-ROLE_SEAT_RESERVATION_MICROUNITS = (
-    APPROVED_MAX_CASE_COST_MICROUNITS // len(SEAT_ORDER)
-)
 
 #: Longest thesis projection the synthesizer receives per peer. A synthesizer
 #: prompt is an aggregation input, not an evidence copy, and the request bound is
@@ -260,12 +262,24 @@ class RoleGovernedCaseOutcome:
     spent_microunits: int
     provenance: Any
     canonical_binding: CanonicalDecisionBinding | None = None
+    #: Whether every role's attempt cost could be measured. ``UNKNOWN`` means at
+    #: least one attempt reported no usable cost, so ``spent_microunits`` is a
+    #: lower bound rather than a total. An unknown cost is never reported as a
+    #: verified one.
+    cost_completeness: CostCompleteness = CostCompleteness.COMPLETE
+    #: Whether the approved per-case ceiling was provably respected. False when the
+    #: cost was incomplete or an attempt's measured spend exceeded its reservation.
+    ceiling_verified: bool = True
     schema_version: int = ROLE_CASE_OUTCOME_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
         _require_role_case_identity(self)
         _require_role_case_results(self)
         _require_role_case_moments(self)
+        if not isinstance(self.cost_completeness, CostCompleteness):
+            raise ValueError("invalid cost_completeness")
+        if type(self.ceiling_verified) is not bool:
+            raise ValueError("ceiling_verified must be a bool")
 
 
     @property
@@ -283,6 +297,16 @@ class RoleGovernedCaseOutcome:
             for role in SEAT_ORDER
             if role in REQUIRED_ROLES and role not in answered
         )
+
+    @property
+    def complete(self) -> bool:
+        """Whether this case is a complete committee.
+
+        A case that could not seat every required role is *reported*, not
+        silently treated as a smaller committee. Consumers must check this rather
+        than counting rows.
+        """
+        return not self.missing_required_roles
 
     @property
     def synthesis(self) -> RoleSeatResult | None:
@@ -307,6 +331,8 @@ class RoleGovernedCaseOutcome:
                 result.role_result_id for result in self.role_results
             ),
             "spent_microunits": self.spent_microunits,
+            "cost_completeness": self.cost_completeness,
+            "ceiling_verified": self.ceiling_verified,
         }
         if self.canonical_binding is not None:
             payload["canonical_binding"] = (
@@ -318,7 +344,6 @@ class RoleGovernedCaseOutcome:
     @property
     def role_case_outcome_id(self) -> str:
         return stable_hash(ROLE_CASE_OUTCOME_IDENTITY_DOMAIN, self.identity_payload())
-
 
 def _require_role_case_identity(outcome: RoleGovernedCaseOutcome) -> None:
     """The opaque identity fields must all be present and non-blank."""
@@ -370,6 +395,24 @@ def _require_role_case_moments(outcome: RoleGovernedCaseOutcome) -> None:
             raise ValueError(f"{field_name} must be a timezone-aware datetime")
     if outcome.completed_at < outcome.started_at:
         raise ValueError("completed_at must be >= started_at")
+
+
+@dataclass(frozen=True)
+class RoleRunOutcome:
+    """What one role's seat contributed to a case, including its accounting.
+
+    ``cost_completeness`` and ``exceeded_reservation`` travel out of the role so
+    the case outcome can state whether its ceiling was actually verified rather
+    than assuming it was.
+    """
+
+    result: RoleSeatResult
+    spent_microunits: int = 0
+    cost_completeness: CostCompleteness = CostCompleteness.COMPLETE
+    #: Whether this role's ceiling was provably respected. False when the cost
+    #: could not be measured, or when measured spend exceeded the reservation.
+    ceiling_verified: bool = True
+
 
 @dataclass(frozen=True)
 class RoleGovernedRunResult:
@@ -574,6 +617,8 @@ class RoleGovernedRunner:
         started_at = self._now()
         case_ceiling = self._case_ceiling(case)
         spent = 0
+        cost_complete = True
+        ceiling_verified = True
         results: list[RoleSeatResult] = []
 
         for role in SEAT_ORDER:
@@ -581,38 +626,27 @@ class RoleGovernedRunner:
                 case=case, role=role
             ):
                 # Reported, not omitted: an absent opinion must be visible in the
-                # case outcome rather than silently missing from it. The result is
-                # durable so every seated role has exactly one recorded result, and
-                # it is deterministic, so a redelivery changes nothing.
-                unknown = self._unknown_optional_result(
-                    case=case, role=role, screened_view=screened_view
-                )
-                self._ledger.record_role_result(unknown)
+                # case outcome rather than silently missing from it. The recorded
+                # result is consulted first so a redelivery of the same logical
+                # seat is acknowledged rather than re-recorded.
+                unknown = self._optional_absent_result(case=case, role=role)
                 results.append(unknown)
                 continue
 
-            if spent + ROLE_SEAT_RESERVATION_MICROUNITS > case_ceiling:
-                results.append(
-                    self._skipped_result(
-                        case=case,
-                        role=role,
-                        reason=(
-                            "committee case cost ceiling would be exceeded by this "
-                            "role's seat reservation"
-                        ),
-                    )
-                )
-                continue
-
-            result, role_spend = self._run_role(
+            outcome = self._run_role(
                 case=case,
                 role=role,
                 screened_view=screened_view,
                 allowed_refs=allowed_refs,
                 peer_results=tuple(results),
+                remaining_ceiling=max(0, case_ceiling - spent),
             )
-            spent += role_spend
-            results.append(result)
+            spent += outcome.spent_microunits
+            if outcome.cost_completeness is CostCompleteness.UNKNOWN:
+                cost_complete = False
+            if not outcome.ceiling_verified:
+                ceiling_verified = False
+            results.append(outcome.result)
 
         completed_at = self._now()
         if completed_at < started_at:
@@ -632,6 +666,10 @@ class RoleGovernedRunner:
             completed_at=completed_at,
             role_results=tuple(results),
             spent_microunits=spent,
+            cost_completeness=(
+                CostCompleteness.COMPLETE if cost_complete else CostCompleteness.UNKNOWN
+            ),
+            ceiling_verified=ceiling_verified,
             canonical_binding=case.canonical_binding,
             provenance=Provenance(
                 producing_component="app.opip.committee.role_runtime",
@@ -662,11 +700,48 @@ class RoleGovernedRunner:
     def _optional_evidence_present(
         *, case: CommitteeCase, role: CommitteeRole
     ) -> bool:
+        """Whether the optional role's declared evidence exists in this snapshot.
+
+        Matched on the producer's recorded ``metric_name`` namespace rather than a
+        literal evidence id: the producer derives evidence ids as content hashes,
+        so a literal id could never match and the role would be permanently
+        unaskable regardless of the evidence.
+        """
         if role not in OPTIONAL_ROLES:
             return True
-        return any(
-            item.evidence_id in QUALIFIED_EVENT_EVIDENCE_IDS
-            for item in case.snapshot.items
+        for item in case.snapshot.items:
+            metric_name = str(item.payload.get("metric_name", "")).strip().lower()
+            if metric_name.startswith(QUALIFIED_EVENT_METRIC_PREFIXES):
+                return True
+        return False
+
+    def _optional_absent_result(
+        self, *, case: CommitteeCase, role: CommitteeRole
+    ) -> RoleSeatResult:
+        """The optional role's explicit UNKNOWN, acknowledged if already recorded.
+
+        The result is deterministic for one logical seat, so recording it is
+        idempotent; the ledger is still consulted first so a redelivery returns the
+        durable row rather than re-deriving one.
+        """
+        logical_id = self._logical_id(case=case, role=role)
+        recorded = self._ledger.role_result_for(logical_id)
+        if recorded is not None:
+            return recorded
+        unknown = self._unknown_optional_result(
+            case=case, role=role, screened_view={}, logical_id=logical_id
+        )
+        self._ledger.record_role_result(unknown)
+        return unknown
+
+    def _logical_id(self, *, case: CommitteeCase, role: CommitteeRole) -> str:
+        return role_observation_id(
+            case_id=case.case_id,
+            role=role,
+            prompt_version=case.policy.prompt_version,
+            prompt_hash=ROLE_PROMPT_HASH[role],
+            committee_policy_version=case.policy.policy_version,
+            evidence_snapshot_hash=case.snapshot.snapshot_hash,
         )
 
     def _run_role(
@@ -677,43 +752,36 @@ class RoleGovernedRunner:
         screened_view: Mapping[str, Any],
         allowed_refs: Sequence[str],
         peer_results: tuple[RoleSeatResult, ...],
-    ) -> tuple[RoleSeatResult, int]:
+        remaining_ceiling: int,
+    ) -> RoleRunOutcome:
         prompt_hash = ROLE_PROMPT_HASH[role]
-        logical_id = role_observation_id(
-            case_id=case.case_id,
-            role=role,
-            prompt_version=case.policy.prompt_version,
-            prompt_hash=prompt_hash,
-            committee_policy_version=case.policy.policy_version,
-            evidence_snapshot_hash=case.snapshot.snapshot_hash,
-        )
+        logical_id = self._logical_id(case=case, role=role)
 
         recorded = self._ledger.role_result_for(logical_id)
         if recorded is not None:
             # A redelivered case must not buy a second paid opinion: the recorded
             # logical seat is acknowledged as-is and costs nothing new.
-            return recorded, 0
+            return RoleRunOutcome(result=recorded, spent_microunits=0)
 
         try:
             route = self._registry.route_for(role, at=self._now())
         except RegistryError as exc:
-            return (
-                self._unavailable_result(
+            return RoleRunOutcome(
+                result=self._unavailable_result(
                     case=case,
                     role=role,
                     logical_id=logical_id,
                     prompt_hash=prompt_hash,
                     detail=f"no usable governed route: {exc}",
-                ),
-                0,
+                )
             )
 
         payload = self._wire_payload(
             screened_view=screened_view, role=role, peer_results=peer_results
         )
         if payload is None:
-            return (
-                self._skipped_result(
+            return RoleRunOutcome(
+                result=self._skipped_result(
                     case=case,
                     role=role,
                     reason=(
@@ -723,33 +791,48 @@ class RoleGovernedRunner:
                     logical_id=logical_id,
                     prompt_hash=prompt_hash,
                     route=route,
-                ),
-                0,
+                )
             )
 
-        reservation = self._bounded_reservation(
+        worst_case = self._worst_case_cost(
             route=route, payload_bytes=_payload_bytes(payload, role)
         )
-        if reservation is None:
-            return (
-                self._skipped_result(
+        if worst_case is None:
+            return RoleRunOutcome(
+                result=self._skipped_result(
                     case=case,
                     role=role,
                     reason=(
                         "the worst-case cost of this role's request cannot be "
-                        "bounded inside its governed reservation"
+                        "bounded, so its ceiling cannot be enforced"
                     ),
                     logical_id=logical_id,
                     prompt_hash=prompt_hash,
                     route=route,
-                ),
-                0,
+                )
+            )
+        if worst_case > remaining_ceiling:
+            # The approved per-case ceiling is the bound that actually enforces the
+            # economics. No role may reserve more than what is left of it, so seven
+            # role seats can never collectively exceed one case ceiling.
+            return RoleRunOutcome(
+                result=self._skipped_result(
+                    case=case,
+                    role=role,
+                    reason=(
+                        "committee case cost ceiling would be exceeded by this "
+                        "role's worst-case reservation"
+                    ),
+                    logical_id=logical_id,
+                    prompt_hash=prompt_hash,
+                    route=route,
+                )
             )
 
         budget = RoleBudget(
             deadline_seconds=APPROVED_DEADLINE_SECONDS,
             max_output_tokens=APPROVED_MAX_OUTPUT_TOKENS,
-            max_cost_microunits=ROLE_SEAT_RESERVATION_MICROUNITS,
+            max_cost_microunits=worst_case,
         )
 
         def build_wire_request(entry: ModelRegistryEntry) -> ProviderWireRequest:
@@ -780,21 +863,31 @@ class RoleGovernedRunner:
             # invoked, so it is reported but deliberately not recorded. Recording
             # it would freeze a transient refusal permanently and stop the role
             # from answering once the daily ceiling resets.
-            return (
-                self._skipped_result(
+            return RoleRunOutcome(
+                result=self._skipped_result(
                     case=case,
                     role=role,
                     reason=str(exc),
                     logical_id=logical_id,
                     prompt_hash=prompt_hash,
                     route=route,
-                ),
-                0,
+                )
             )
 
         result = execution.result
         self._ledger.record_role_result(result)
-        return result, execution.spent_microunits
+        return RoleRunOutcome(
+            result=result,
+            spent_microunits=execution.spent_microunits,
+            cost_completeness=execution.cost_completeness,
+            # The router already refuses to report a ceiling it could not evaluate;
+            # a measured spend above the pre-flight reservation is this role
+            # breaching its own bound, which is a second way to lose verification.
+            ceiling_verified=(
+                execution.ceiling_verified
+                and execution.spent_microunits <= worst_case
+            ),
+        )
 
     def _wire_payload(
         self,
@@ -829,10 +922,13 @@ class RoleGovernedRunner:
             return None
         return screened
 
-    def _bounded_reservation(
-        self, *, route: RoleRoute, payload_bytes: int
-    ) -> int | None:
-        """The fixed seat reservation when a worst-case bound fits it, else None."""
+    def _worst_case_cost(self, *, route: RoleRoute, payload_bytes: int) -> int | None:
+        """The worst-case cost of this role's request, or ``None`` when unbounded.
+
+        Bounded by the route's own primary/fallback entries so the caller can
+        enforce the approved per-case ceiling against it. An unpriced model yields
+        ``None`` rather than a zero that would read as free.
+        """
         if payload_bytes > MAX_ROLE_REQUEST_BYTES:
             return None
         input_token_bound = (
@@ -849,11 +945,21 @@ class RoleGovernedRunner:
             if cost is None:
                 return None
             worst_case = max(worst_case, cost)
-        if worst_case > ROLE_SEAT_RESERVATION_MICROUNITS:
-            return None
-        return ROLE_SEAT_RESERVATION_MICROUNITS
+        return worst_case if worst_case > 0 else None
 
     # ----------------------------------------------------------- result builders
+
+    def _role_primary_entry(self, role: CommitteeRole) -> ModelRegistryEntry | None:
+        """The registry's declared primary for a role, or ``None`` when unrouted.
+
+        Reported provider family and requested model are read from the governed
+        registry rather than assumed, so a disposition is never attributed to a
+        vendor the role was not routed to.
+        """
+        route_ids = self._registry.routes.get(role)
+        if not route_ids:
+            return None
+        return self._registry.entry(route_ids[0])
 
     def _unknown_optional_result(
         self,
@@ -861,6 +967,7 @@ class RoleGovernedRunner:
         case: CommitteeCase,
         role: CommitteeRole,
         screened_view: Mapping[str, Any],
+        logical_id: str | None = None,
     ) -> RoleSeatResult:
         """An explicit UNKNOWN for an optional role whose evidence is absent.
 
@@ -869,28 +976,23 @@ class RoleGovernedRunner:
         called, so nothing is spent and no opinion is fabricated.
         """
         del screened_view
-        primary = self._registry.routes.get(role)
-        entry = self._registry.entry(primary[0]) if primary else None
+        entry = self._role_primary_entry(role)
+        prompt_hash = ROLE_PROMPT_HASH[role]
         return RoleSeatResult(
             case_id=case.case_id,
             role=role,
             role_version="1",
             status=RoleResultStatus.UNKNOWN,
             prompt_version=case.policy.prompt_version,
-            prompt_hash=ROLE_PROMPT_HASH[role],
+            prompt_hash=prompt_hash,
             schema_version=ROLE_OUTPUT_SCHEMA_VERSION,
             provider_family=(
                 entry.provider_family if entry is not None else ProviderFamily.OPENAI
             ),
             requested_model=entry.model_id if entry is not None else "unrouted",
             resolved_model=None,
-            logical_observation_id=role_observation_id(
-                case_id=case.case_id,
-                role=role,
-                prompt_version=case.policy.prompt_version,
-                prompt_hash=ROLE_PROMPT_HASH[role],
-                committee_policy_version=case.policy.policy_version,
-                evidence_snapshot_hash=case.snapshot.snapshot_hash,
+            logical_observation_id=(
+                logical_id or self._logical_id(case=case, role=role)
             ),
             attempt=1,
             recorded_at=self._now(),
@@ -910,10 +1012,7 @@ class RoleGovernedRunner:
         prompt_hash: str | None = None,
         route: RoleRoute | None = None,
     ) -> RoleSeatResult:
-        entry = route.primary if route is not None else None
-        if entry is None:
-            route_ids = self._registry.routes.get(role)
-            entry = self._registry.entry(route_ids[0]) if route_ids else None
+        entry = route.primary if route is not None else self._role_primary_entry(role)
         resolved_prompt_hash = prompt_hash or ROLE_PROMPT_HASH[role]
         return RoleSeatResult(
             case_id=case.case_id,
@@ -928,14 +1027,8 @@ class RoleGovernedRunner:
             ),
             requested_model=entry.model_id if entry is not None else "unrouted",
             resolved_model=None,
-            logical_observation_id=logical_id
-            or role_observation_id(
-                case_id=case.case_id,
-                role=role,
-                prompt_version=case.policy.prompt_version,
-                prompt_hash=resolved_prompt_hash,
-                committee_policy_version=case.policy.policy_version,
-                evidence_snapshot_hash=case.snapshot.snapshot_hash,
+            logical_observation_id=(
+                logical_id or self._logical_id(case=case, role=role)
             ),
             attempt=1,
             recorded_at=self._now(),
@@ -951,6 +1044,7 @@ class RoleGovernedRunner:
         prompt_hash: str,
         detail: str,
     ) -> RoleSeatResult:
+        entry = self._role_primary_entry(role)
         return RoleSeatResult(
             case_id=case.case_id,
             role=role,
@@ -959,8 +1053,10 @@ class RoleGovernedRunner:
             prompt_version=case.policy.prompt_version,
             prompt_hash=prompt_hash,
             schema_version=ROLE_OUTPUT_SCHEMA_VERSION,
-            provider_family=ProviderFamily.OPENAI,
-            requested_model="unrouted",
+            provider_family=(
+                entry.provider_family if entry is not None else ProviderFamily.OPENAI
+            ),
+            requested_model=entry.model_id if entry is not None else "unrouted",
             resolved_model=None,
             logical_observation_id=logical_id,
             attempt=1,
@@ -1004,7 +1100,7 @@ __all__ = [
     "MAX_PEER_THESIS_CHARS",
     "MAX_ROLE_REQUEST_BYTES",
     "PROTOCOL_TOKEN_ALLOWANCE",
-    "QUALIFIED_EVENT_EVIDENCE_IDS",
+    "QUALIFIED_EVENT_METRIC_PREFIXES",
     "ROLE_CASE_OUTCOME_IDENTITY_DOMAIN",
     "ROLE_CASE_OUTCOME_SCHEMA_VERSION",
     "ROLE_INSTRUCTIONS",
@@ -1012,13 +1108,13 @@ __all__ = [
     "ROLE_OUTPUT_SCHEMA_HASH",
     "ROLE_OUTPUT_SCHEMA_VERSION",
     "ROLE_PROMPT_HASH",
-    "ROLE_SEAT_RESERVATION_MICROUNITS",
     "SEAT_ORDER",
     "SYNTHESIZER_ROLE",
     "RoleGovernedCaseOutcome",
     "RoleGovernedRunResult",
     "RoleGovernedRunner",
     "RoleResultLedger",
+    "RoleRunOutcome",
     "RoleRuntimeConfigurationError",
     "build_approved_shadow_registry",
     "build_role_providers",

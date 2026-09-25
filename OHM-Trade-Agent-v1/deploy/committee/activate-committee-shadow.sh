@@ -79,6 +79,41 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exit 77
 fi
 
+# --- precondition: the arguments are usable ----------------------------------
+# Both instants are validated here as well as in the workflow: they are written
+# into a root-owned environment file that a `sudo bash` path reads, so an
+# unvalidated value must never reach them.
+iso_utc_re='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2})$'
+if [[ ! "$NOT_BEFORE" =~ $iso_utc_re ]]; then
+  echo "refusing activation: not-before must be an ISO-8601 UTC instant" >&2
+  exit 64
+fi
+if [[ ! "$REVIEW_BY" =~ $iso_utc_re ]]; then
+  echo "refusing activation: review-by must be an ISO-8601 UTC instant" >&2
+  exit 64
+fi
+
+# --- precondition: the worker can actually start a cycle ---------------------
+# The OFF path returns before it needs the application, so a missing or
+# non-executable application root stays invisible until SHADOW is attempted.
+# Activation refuses rather than reporting PASS on a worker that cannot run.
+APP_ROOT="${OPIP_APP_ROOT:-/opt/opip/app}"
+VENV_PYTHON="${OPIP_VENV_PYTHON:-/opt/opip/venv/bin/python}"
+if [[ ! -d "$APP_ROOT" ]]; then
+  echo "refusing activation: the worker application root $APP_ROOT does not exist" >&2
+  echo "a SHADOW cycle cannot start without it; provision it or set OPIP_APP_ROOT" >&2
+  exit 78
+fi
+if [[ ! -x "$VENV_PYTHON" ]]; then
+  echo "refusing activation: the worker interpreter $VENV_PYTHON is not executable" >&2
+  exit 78
+fi
+if ! ( cd "$APP_ROOT" && "$VENV_PYTHON" -c 'import app.opip.committee.cycle_runner' ) 2>/dev/null; then
+  echo "refusing activation: the worker interpreter cannot import the committee cycle runner" >&2
+  exit 78
+fi
+echo "PASS  the worker can import the committee cycle runner from $APP_ROOT"
+
 # --- precondition: the installed worker and its environment file -------------
 if [[ ! -f "$UNIT_DIR/$UNIT" ]]; then
   echo "refusing activation: $UNIT is not installed; run the OFF deployment first" >&2
@@ -149,6 +184,24 @@ tmp_dropin="$(mktemp)"
   echo "# IPAddressDeny=any remains in the unit: anything not listed here is denied."
   echo "[Service]"
 } > "$tmp_dropin"
+
+# Name resolution must survive the deny-all default, or every provider call fails
+# before a connection is attempted. The host's own configured resolvers are the
+# only extra addresses allowed, and they are read from the resolver config rather
+# than guessed.
+resolver_count=0
+while IFS= read -r nameserver; do
+  [[ -z "$nameserver" ]] && continue
+  printf 'IPAddressAllow=%s\n' "$nameserver" >> "$tmp_dropin"
+  resolver_count=$((resolver_count + 1))
+done < <(awk '/^[[:space:]]*nameserver[[:space:]]+/ {print $2}' /etc/resolv.conf 2>/dev/null || true)
+# A loopback stub resolver is the common case; loopback is denied by `any`, so it
+# must be allowed explicitly when the host resolves through it.
+if grep -qE '^[[:space:]]*nameserver[[:space:]]+(127\.|::1)' /etc/resolv.conf 2>/dev/null; then
+  printf 'IPAddressAllow=127.0.0.1\nIPAddressAllow=::1\n' >> "$tmp_dropin"
+  resolver_count=$((resolver_count + 1))
+fi
+
 resolved_count=0
 for endpoint in "${PROVIDER_ENDPOINTS[@]}"; do
   addresses="$(getent ahosts "$endpoint" 2>/dev/null | awk '{print $1}' | sort -u || true)"
@@ -170,7 +223,28 @@ if [[ "$resolved_count" -eq 0 ]]; then
 fi
 install -m 0644 -o root -g root "$tmp_dropin" "$DROPIN"
 rm -f "$tmp_dropin"
-echo "PASS  provider-only egress pinned for ${#PROVIDER_ENDPOINTS[@]} endpoints ($resolved_count address entries)"
+echo "PASS  provider-only egress pinned for ${#PROVIDER_ENDPOINTS[@]} endpoints ($resolved_count address entries, $resolver_count resolver entries)"
+
+# --- precondition: the pinned policy actually permits a provider connection ---
+# A pinned address that cannot be reached is a denial of legitimate egress, so
+# reachability is proven here rather than assumed from the allowlist.
+systemctl daemon-reload
+reachable=0
+for endpoint in "${PROVIDER_ENDPOINTS[@]}"; do
+  if timeout 10 bash -c "exec 3<>/dev/tcp/$endpoint/443" 2>/dev/null; then
+    reachable=$((reachable + 1))
+  else
+    echo "WARN  $endpoint:443 was not reachable during activation" >&2
+  fi
+done
+if [[ "$reachable" -eq 0 ]]; then
+  rm -f "$DROPIN"
+  rmdir "$DROPIN_DIR" 2>/dev/null || true
+  systemctl daemon-reload
+  echo "refusing activation: no approved provider endpoint is reachable under the pinned policy" >&2
+  exit 78
+fi
+echo "PASS  $reachable of ${#PROVIDER_ENDPOINTS[@]} approved provider endpoints are reachable"
 
 # --- mode and activation boundary --------------------------------------------
 set_env_value() {

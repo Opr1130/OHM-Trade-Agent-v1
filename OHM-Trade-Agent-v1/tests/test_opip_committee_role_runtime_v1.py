@@ -10,6 +10,7 @@ from app.opip.committee.contracts import (
     CaseType,
     CommitteeCase,
     CommitteePolicy,
+    CostCompleteness,
     EvidenceItem,
     EvidenceSnapshot,
     ProviderFamily,
@@ -28,7 +29,6 @@ from app.opip.committee.registry import (
 from app.opip.committee.role_execution import RoleResultStatus
 from app.opip.committee.role_runtime import (
     ROLE_PROMPT_HASH,
-    ROLE_SEAT_RESERVATION_MICROUNITS,
     SEAT_ORDER,
     SYNTHESIZER_ROLE,
     RoleGovernedRunner,
@@ -36,7 +36,7 @@ from app.opip.committee.role_runtime import (
     role_observation_id,
     role_prompt,
 )
-from app.opip.committee.roles import CommitteeRole
+from app.opip.committee.roles import OPTIONAL_ROLES, CommitteeRole
 from app.opip.committee.runtime import CommitteePolicyViolation
 from app.opip.committee.serialization import (
     CommitteeSerializationError,
@@ -274,11 +274,23 @@ def test_a_role_whose_cost_cannot_be_bounded_is_skipped_not_sent(tmp_path):
     assert all(not provider.calls for provider in providers.values())
 
 
-def test_the_per_role_reservation_never_exceeds_the_case_ceiling():
-    assert ROLE_SEAT_RESERVATION_MICROUNITS * len(SEAT_ORDER) <= (
-        APPROVED_MAX_CASE_COST_MICROUNITS
+def test_the_case_ceiling_bounds_every_role_by_construction(tmp_path):
+    """Seven role seats can never collectively exceed one approved case ceiling.
+
+    The bound is the case ceiling minus spend so far, applied per role, so the
+    invariant holds without a fixed per-role share that could starve a role whose
+    worst case is legitimately larger than one seventh.
+    """
+    runner, _, providers = _runner(tmp_path)
+    assert runner._case_ceiling(_case()) == APPROVED_MAX_CASE_COST_MICROUNITS
+    # A ceiling below any role's worst case funds nothing at all.
+    result = runner.run_case(_case(ceiling=1))
+    assert all(not provider.calls for provider in providers.values())
+    assert result.case_outcome.spent_microunits == 0
+    assert result.case_outcome.missing_required_roles == tuple(
+        role for role in SEAT_ORDER if role not in OPTIONAL_ROLES
     )
-    assert ROLE_SEAT_RESERVATION_MICROUNITS > 0
+    assert result.case_outcome.complete is False
 
 
 # --------------------------------------------------------------- governed routes
@@ -444,3 +456,195 @@ def _replace_thesis(result):
     from dataclasses import replace
 
     return replace(result, thesis="a materially different thesis")
+
+
+# ------------------------------------------------- defects found in independent review
+
+
+def test_redelivering_a_case_with_an_absent_optional_role_does_not_fail(tmp_path):
+    """The optional-absent seat must be idempotent, not a divergence.
+
+    The seat is recorded on the first run and re-derived on a redelivery. If the
+    re-derived result carried a different recorded_at it would share the logical
+    seat identity but not the content identity, and the append would be refused as
+    a divergence - turning every redelivered SHADOW case into a permanently FAILED
+    one with orphaned evidence.
+    """
+    from app.opip.committee.shadow_executor import ShadowCaseExecutor
+
+    registry = _registry()
+    executor = ShadowCaseExecutor(
+        committee_home=tmp_path,
+        registry=registry,
+        providers=_providers(registry),
+        price_book=_approved_price_book(),
+        settings=CommitteeShadowSettings(opip_committee_mode=COMMITTEE_MODE_SHADOW),
+        now=lambda: NOW,
+    )
+    assert executor(_case()) is True
+
+    store = CommitteeEvidenceStore(root=tmp_path)
+    first = next(
+        row
+        for row in store.iter_role_results()
+        if row.role is CommitteeRole.EVENT_SENTIMENT_ANALYST
+    )
+    assert first.status is RoleResultStatus.UNKNOWN
+
+    # A later clock and a fresh provider map: a redelivery must not re-derive a
+    # divergent seat, and must not spend.
+    restarted_providers = _providers(registry)
+    restarted = ShadowCaseExecutor(
+        committee_home=tmp_path,
+        registry=registry,
+        providers=restarted_providers,
+        price_book=_approved_price_book(),
+        settings=CommitteeShadowSettings(opip_committee_mode=COMMITTEE_MODE_SHADOW),
+        now=lambda: NOW.replace(minute=59),
+    )
+    assert restarted(_case()) is True
+
+    assert all(not provider.calls for provider in restarted_providers.values())
+    rows = tuple(store.iter_role_results())
+    assert len(rows) == len(SEAT_ORDER)
+    optional_again = next(
+        row
+        for row in rows
+        if row.role is CommitteeRole.EVENT_SENTIMENT_ANALYST
+    )
+    assert optional_again.role_result_id == first.role_result_id
+    assert len(tuple(store.iter_role_case_outcomes())) == 1
+
+
+def test_the_optional_role_answers_when_its_evidence_namespace_is_present(tmp_path):
+    """The optional gate is matched on the producer's metric namespace.
+
+    The producer derives every evidence_id as a content hash, so a literal id could
+    never match and the role would be permanently unaskable. A metric in the
+    qualified namespace must let it answer.
+    """
+    runner, _, providers = _runner(tmp_path)
+    extra = (
+        EvidenceItem(
+            evidence_id="ev-event-1",
+            source_id="EVT:event",
+            available_at=NOW,
+            payload={
+                "observed_at": NOW.isoformat(),
+                "instrument_id": "INSTR:1",
+                "metric_name": "event.retained.headline",
+                "metric_value": "listed",
+            },
+        ),
+    )
+    result = runner.run_case(_case(extra_evidence=extra))
+    by_role = {row.role: row for row in result.role_results}
+    assert by_role[CommitteeRole.EVENT_SENTIMENT_ANALYST].status is (
+        RoleResultStatus.ANSWERED
+    )
+    assert any(
+        entry_id.startswith("event_sentiment_analyst") and provider.calls
+        for entry_id, provider in providers.items()
+    )
+
+
+def test_a_role_that_spends_past_its_reservation_unverifies_the_case_ceiling(tmp_path):
+    """Measured spend above the pre-flight reservation must stop the ceiling claim.
+
+    The per-role reservation is a pre-flight bound. A provider that reports more
+    than it was reserved is a real spend event, so the case must record that its
+    ceiling was not verified rather than asserting one.
+    """
+    registry = _registry()
+    over = 400_000
+    providers = {
+        entry.entry_id: ScriptedCommitteeProvider(
+            family=entry.provider_family,
+            model=entry.model_id,
+            answers=(
+                ScriptedAnswer(
+                    text=opinion_json(
+                        lists={"supporting_evidence_refs": ("ev-1",)}
+                    ),
+                    reported_provider=entry.provider_family.value,
+                    reported_model=entry.model_id,
+                    received_at=NOW,
+                ),
+            ),
+            estimated_cost_microunits=10_000,
+            cost_override=over,
+        )
+        for entry in registry.entries
+    }
+    runner, _, _ = _runner(tmp_path, registry=registry, providers=providers)
+    result = runner.run_case(_case())
+
+    assert result.case_outcome.spent_microunits > 0
+    # Once the running total can no longer fit the ceiling, every later role is
+    # skipped, so the case is bounded even though one role overran its own share.
+    assert result.case_outcome.spent_microunits <= (
+        APPROVED_MAX_CASE_COST_MICROUNITS + over
+    )
+    assert result.case_outcome.ceiling_verified is False
+
+
+def test_an_unmeasured_role_cost_is_recorded_as_incomplete_not_zero(tmp_path):
+    """Unknown cost must never be reported as a verified zero."""
+    registry = _registry()
+    providers = {
+        entry.entry_id: ScriptedCommitteeProvider(
+            family=entry.provider_family,
+            model=entry.model_id,
+            answers=(
+                ScriptedAnswer(
+                    text=opinion_json(
+                        lists={"supporting_evidence_refs": ("ev-1",)}
+                    ),
+                    reported_provider=entry.provider_family.value,
+                    reported_model=entry.model_id,
+                    estimated_cost_microunits=None,
+                    cost_completeness=CostCompleteness.UNKNOWN,
+                    input_tokens=None,
+                    output_tokens=None,
+                    received_at=NOW,
+                ),
+            ),
+        )
+        for entry in registry.entries
+    }
+    runner, _, _ = _runner(tmp_path, registry=registry, providers=providers)
+    result = runner.run_case(_case())
+
+    assert result.case_outcome.spent_microunits == 0
+    assert result.case_outcome.cost_completeness is CostCompleteness.UNKNOWN
+    assert result.case_outcome.ceiling_verified is False
+    # The incompleteness survives the codec rather than being flattened.
+    decoded = role_case_outcome_from_dict(
+        role_case_outcome_to_dict(result.case_outcome)
+    )
+    assert decoded.cost_completeness is CostCompleteness.UNKNOWN
+    assert decoded.ceiling_verified is False
+
+
+def test_an_incomplete_committee_is_not_reported_as_complete(tmp_path):
+    """A case that cannot seat a required role must say so."""
+    runner, _, _ = _runner(tmp_path, price_book=_unpriced_price_book())
+    result = runner.run_case(_case())
+    assert result.case_outcome.complete is False
+    assert result.case_outcome.missing_required_roles
+    assert result.case_outcome.missing_required_roles == tuple(
+        role for role in SEAT_ORDER if role not in OPTIONAL_ROLES
+    )
+
+
+def test_no_roster_role_can_be_omitted_from_the_seat_order():
+    """SEAT_ORDER must be exactly the governed role set."""
+    assert set(SEAT_ORDER) == set(CommitteeRole)
+    assert SEAT_ORDER == tuple(
+        role for role in CommitteeRole
+    ) or set(SEAT_ORDER) == set(CommitteeRole)
+
+
+def _unpriced_price_book() -> PriceBook:
+    """A price book that prices no model, so every bound is unknown."""
+    return PriceBook.from_env({COMMITTEE_PRICES_ENV: "openai:other-model=1/1"})

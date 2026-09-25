@@ -47,7 +47,8 @@ env_value() {
 if [[ "${1:-}" == "--rollback" ]]; then
   # Restore OFF first, then fall through to prove the resulting state. The order
   # matters: proving OFF before actually returning to OFF would report a state
-  # that does not exist yet.
+  # that does not exist yet. Rollback is the one mode in which the provider egress
+  # allowlist must be ABSENT, so it is proven absent rather than required present.
   if [[ -f "$DROPIN" ]]; then
     rm -f "$DROPIN"
     rmdir "$DROPIN_DIR" 2>/dev/null || true
@@ -65,13 +66,75 @@ if [[ "${1:-}" == "--rollback" ]]; then
   systemctl daemon-reload
   PROOF_LABEL="ROLLBACK_PROOF"
   echo "ROLLBACK_APPLIED=off+deny-all"
-else
-  PROOF_LABEL="SHADOW_PROOF"
   mode="$(env_value OPIP_COMMITTEE_MODE)"
-  if [[ "$mode" == "shadow" ]]; then
-    pass "mode is shadow in the environment file"
+  if [[ "$mode" == "off" ]]; then
+    pass "mode is off in the environment file"
   else
-    fail "mode is '${mode}' in the environment file, expected shadow"
+    fail "mode is '${mode}' in the environment file, expected off after rollback"
+  fi
+  allow_lines="$(grep -E '^[[:space:]]*IPAddressAllow=' "$DROPIN" 2>/dev/null || true)"
+  if [[ -z "$allow_lines" ]]; then
+    pass "no provider egress allowlist remains: OFF-mode egress is deny-all again"
+  else
+    fail "the provider egress allowlist is still present after rollback"
+  fi
+  unit_deny="$(systemctl show -p IPAddressDeny --value "$UNIT" 2>/dev/null || echo '')"
+  if [[ "$unit_deny" == "any" || "$unit_deny" == *"0.0.0.0/0"* ]]; then
+    pass "egress default remains deny-all (observed: ${unit_deny:-none})"
+  else
+    fail "egress default deny is '${unit_deny:-none}'"
+  fi
+  if systemctl is-enabled "$TIMER" >/dev/null 2>&1; then
+    fail "the recurring timer is still enabled after rollback"
+  else
+    pass "the recurring timer is not enabled after rollback"
+  fi
+  if [[ -d "$COMMITTEE_HOME" ]]; then
+    pass "advisory evidence directory survived rollback"
+  else
+    fail "advisory evidence directory is missing"
+  fi
+  echo
+  if [[ "$failures" -eq 0 ]]; then
+    echo "ROLLBACK_PROOF=PASS"
+    exit 0
+  fi
+  echo "ROLLBACK_PROOF=FAIL failures=$failures"
+  exit 1
+fi
+
+# ------------------------------------------------------------- SHADOW-mode only
+PROOF_LABEL="SHADOW_PROOF"
+mode="$(env_value OPIP_COMMITTEE_MODE)"
+if [[ "$mode" == "shadow" ]]; then
+  pass "mode is shadow in the environment file"
+else
+  fail "mode is '${mode}' in the environment file, expected shadow"
+fi
+
+# ---------------------------------------------- the cycle can actually execute
+# Activation must not report PASS on a worker that cannot start one cycle: the
+# OFF path returns before it needs the application at all, so a missing or
+# non-executable application root is invisible until SHADOW mode is attempted.
+app_root="$(sed -n 's/^OPIP_APP_ROOT=//p' "$ENV_FILE" 2>/dev/null | head -n1)"
+app_root="${OPIP_APP_ROOT:-${app_root:-/opt/opip/app}}"
+venv_python="$(sed -n 's/^OPIP_VENV_PYTHON=//p' "$ENV_FILE" 2>/dev/null | head -n1)"
+venv_python="${OPIP_VENV_PYTHON:-${venv_python:-/opt/opip/venv/bin/python}}"
+if [[ -d "$app_root" ]]; then
+  pass "the worker application root exists: $app_root"
+else
+  fail "the worker application root does not exist ($app_root); a SHADOW cycle cannot start"
+fi
+if [[ -x "$venv_python" ]]; then
+  pass "the worker interpreter is executable: $venv_python"
+else
+  fail "the worker interpreter is not executable ($venv_python); a SHADOW cycle cannot start"
+fi
+if [[ -d "$app_root" && -x "$venv_python" ]]; then
+  if ( cd "$app_root" && "$venv_python" -c 'import app.opip.committee.cycle_runner' ) 2>/dev/null; then
+    pass "the worker interpreter can import the committee cycle runner"
+  else
+    fail "the worker interpreter cannot import the committee cycle runner from $app_root"
   fi
 fi
 
@@ -87,9 +150,17 @@ fi
 # An address that no longer belongs to a provider is a widened boundary, not a
 # stale one, so it fails closed.
 expected_addresses="$(
-  for endpoint in "${PROVIDER_ENDPOINTS[@]}"; do
-    getent ahosts "$endpoint" 2>/dev/null | awk '{print $1}' || true
-  done | sort -u
+  {
+    for endpoint in "${PROVIDER_ENDPOINTS[@]}"; do
+      getent ahosts "$endpoint" 2>/dev/null | awk '{print $1}' || true
+    done
+    # Resolution has to survive deny-all, so the host's configured resolvers are
+    # legitimately allowlisted alongside the provider addresses.
+    awk '/^[[:space:]]*nameserver[[:space:]]+/ {print $2}' /etc/resolv.conf 2>/dev/null || true
+    if grep -qE '^[[:space:]]*nameserver[[:space:]]+(127\.|::1)' /etc/resolv.conf 2>/dev/null; then
+      printf '127.0.0.1\n::1\n'
+    fi
+  } | sort -u
 )"
 unexpected=0
 while IFS= read -r line; do

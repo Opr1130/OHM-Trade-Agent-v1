@@ -58,7 +58,7 @@ jobs:
         run: |
           set -euo pipefail
           BODY="$COMMENT_BODY"
-          if [[ "$BODY" =~ ^/shadow-committee[[:space:]]+([0-9a-f]{40})[[:space:]]+([^[:space:]]+)[[:space:]]+([^[:space:]]+)[[:space:]]*$ ]]; then
+          if [[ "$BODY" =~ ^/shadow-committee[[:space:]]+([0-9a-f]{40})[[:space:]]+([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2}))[[:space:]]+([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2}))[[:space:]]*$ ]]; then
             echo "command=shadow" >> "$GITHUB_OUTPUT"
             echo "sha=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
             echo "not_before=${BASH_REMATCH[2]}" >> "$GITHUB_OUTPUT"
@@ -288,7 +288,11 @@ jobs:
             "sudo -n sh -c 'd=/var/lib/opip-committee; for f in role_results.jsonl role_case_outcomes.jsonl cycle_dispositions.jsonl daily_spend.json; do if [ -f \"\$d/\$f\" ]; then printf \"%s lines=%s\\n\" \"\$f\" \"\$(wc -l < \"\$d/\$f\")\"; else printf \"%s ABSENT\\n\" \"\$f\"; fi; done'" \
             2>&1 | tee -a committee-canary.log
           echo "rc=$RC" >> "$GITHUB_OUTPUT"
-          echo "result=RAN" >> "$GITHUB_OUTPUT"
+          if [[ "$RC" -eq 0 ]]; then
+            echo "result=RAN" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=FAILED" >> "$GITHUB_OUTPUT"
+          fi
           exit 0
 
       # --------------------------------------------------------------- timer
@@ -353,6 +357,7 @@ jobs:
           exit 0
 
       - name: Clean remote release
+        id: committee_cleanup
         if: always() && steps.command.outputs.sha != ''
         env:
           HOST: ${{ secrets.OPIP_LEARNING_HOST }}

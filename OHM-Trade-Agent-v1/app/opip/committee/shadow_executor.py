@@ -195,7 +195,10 @@ class ShadowCaseExecutor:
         # idempotency ledger; only the aggregate case outcome is appended here.
         result = self._runner.run_case(case, phase=EvaluationPhase.PROSPECTIVE)
         self._store.append_role_case_outcome(result.case_outcome)
-        return True
+        # A case that could not seat every required role is durable evidence of an
+        # incomplete committee, not a completed one. Reporting it as completed
+        # would let the scheduler record committee work that never happened.
+        return result.case_outcome.complete
 
 
 def build_credentialled_shadow_executor(

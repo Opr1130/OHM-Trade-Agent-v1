@@ -306,6 +306,104 @@ def test_the_credentials_template_documents_the_activation_inputs() -> None:
         "OPIP_COMMITTEE_REGISTRY_REVIEW_BY",
         "OPIP_COMMITTEE_LEARNING_MANIFEST",
         "OPIP_CANONICAL_REPLICA_ROOT_HOST",
+        "OPIP_APP_ROOT",
+        "OPIP_VENV_PYTHON",
         "OPIP_COMMITTEE_MAX_CASES_PER_CYCLE=1",
     ):
         assert key in template, key
+
+
+# ------------------------------------------- defects found in independent review
+
+
+def test_every_referenced_workflow_step_id_exists(activation: dict) -> None:
+    """A receipt or gate that reads a non-existent step id always sees empty.
+
+    That is how a cleanup step with no `id` made every non-rollback command fail
+    its own final gate while the receipt misreported the cleanup as NOT RUN.
+    """
+    import re
+
+    steps = activation["jobs"]["control"]["steps"]
+    declared = {step["id"] for step in steps if "id" in step}
+    text = ACTIVATION.read_text(encoding="utf-8")
+    referenced = set(re.findall(r"steps\.([A-Za-z0-9_-]+)\.outputs", text))
+    missing = sorted(referenced - declared)
+    assert missing == [], f"referenced but undeclared step ids: {missing}"
+
+
+def test_the_cleanup_step_is_addressable_by_the_final_gate(activation: dict) -> None:
+    steps = {
+        step.get("name"): step for step in activation["jobs"]["control"]["steps"]
+    }
+    cleanup = steps["Clean remote release"]
+    assert cleanup.get("id") == "committee_cleanup"
+    # Cleanup remains a success requirement for the commands that upload a release.
+    assert cleanup.get("continue-on-error") is not True
+
+
+def test_the_canary_cannot_report_success_on_a_failed_remote_start() -> None:
+    """The only execution proof must be able to fail."""
+    text = ACTIVATION.read_text(encoding="utf-8")
+    canary = text.split("Run one bounded credentialled canary cycle")[1].split(
+        "Enable the bounded recurring timer"
+    )[0]
+    assert 'if [[ "$RC" -eq 0 ]]' in canary
+    assert 'echo "result=RAN"' in canary
+    assert 'echo "result=FAILED"' in canary
+    # The gate requires RAN, so a non-zero remote start cannot pass.
+    assert 'test "$CANARY_RESULT" = "RAN"' in text
+
+
+def test_activation_validates_the_timestamps_before_they_reach_the_host() -> None:
+    """An unvalidated value must not be interpolated into a remote sudo command."""
+    text = ACTIVATION.read_text(encoding="utf-8")
+    # The workflow regex constrains both instants to ISO-8601 shape.
+    assert r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}" in text
+    # And the host script re-validates them independently.
+    script = (COMMITTEE_DEPLOY / "activate-committee-shadow.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "must be an ISO-8601 UTC instant" in script
+
+
+def test_activation_refuses_when_the_worker_cannot_execute() -> None:
+    """Activation must not report PASS on a worker that cannot start one cycle."""
+    script = (COMMITTEE_DEPLOY / "activate-committee-shadow.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "OPIP_APP_ROOT" in script
+    assert "the worker application root" in script
+    assert "import app.opip.committee.cycle_runner" in script
+    proof = (COMMITTEE_DEPLOY / "verify-committee-shadow.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "the worker interpreter can import the committee cycle runner" in proof
+    assert "the worker interpreter is executable" in proof
+
+
+def test_name_resolution_survives_the_deny_all_egress_policy() -> None:
+    """Deny-all also denies the resolver, so resolution must be allowed explicitly."""
+    activate = (COMMITTEE_DEPLOY / "activate-committee-shadow.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "/etc/resolv.conf" in activate
+    assert "nameserver" in activate
+    proof = (COMMITTEE_DEPLOY / "verify-committee-shadow.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "/etc/resolv.conf" in proof
+
+
+def test_the_rollback_proof_does_not_require_the_allowlist_it_just_removed() -> None:
+    """Rollback removes the drop-in, so it must be proven absent, not present."""
+    script = (COMMITTEE_DEPLOY / "verify-committee-shadow.sh").read_text(
+        encoding="utf-8"
+    )
+    rollback = script.split('if [[ "${1:-}" == "--rollback" ]]')[1].split(
+        "# ------------------------------------------------------------- SHADOW-mode only"
+    )[0]
+    assert "ROLLBACK_PROOF=PASS" in rollback
+    assert "no provider egress allowlist remains" in rollback
+    # It must not fail the run for the allowlist being absent.
+    assert "no provider egress allowlist is installed" not in rollback

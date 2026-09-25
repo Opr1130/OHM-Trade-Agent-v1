@@ -778,6 +778,8 @@ _ROLE_CASE_OUTCOME_FIELDS = frozenset(
         "completed_at",
         "role_results",
         "spent_microunits",
+        "cost_completeness",
+        "ceiling_verified",
         "canonical_binding",
         "provenance",
     }
@@ -809,6 +811,8 @@ def role_case_outcome_to_dict(outcome) -> dict[str, Any]:
             role_result_to_dict(result) for result in outcome.role_results
         ],
         "spent_microunits": outcome.spent_microunits,
+        "cost_completeness": outcome.cost_completeness.value,
+        "ceiling_verified": outcome.ceiling_verified,
         "canonical_binding": (
             None
             if outcome.canonical_binding is None
@@ -823,7 +827,7 @@ def role_case_outcome_to_dict(outcome) -> dict[str, Any]:
 
 def role_case_outcome_from_dict(row: Mapping[str, Any]):
     """Decode a role-governed case outcome, refusing a row of another kind."""
-    from app.opip.committee.contracts import CanonicalDecisionBinding
+    from app.opip.committee.contracts import CanonicalDecisionBinding, CostCompleteness
     from app.opip.committee.role_runtime import RoleGovernedCaseOutcome
 
     if not isinstance(row, Mapping):
@@ -855,6 +859,10 @@ def role_case_outcome_from_dict(row: Mapping[str, Any]):
             role_result_from_dict(item) for item in raw_results
         ),
         spent_microunits=row.get("spent_microunits"),
+        cost_completeness=_parse_enum(
+            row.get("cost_completeness"), CostCompleteness, field="cost_completeness"
+        ),
+        ceiling_verified=row.get("ceiling_verified"),
         canonical_binding=(
             None
             if raw_binding is None
