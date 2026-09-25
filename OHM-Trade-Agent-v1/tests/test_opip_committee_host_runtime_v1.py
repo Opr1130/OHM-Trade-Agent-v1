@@ -443,7 +443,10 @@ def test_provision_scripts_do_not_open_egress_or_touch_trading_credentials() -> 
     assert 'requirements.txt' in lib
     assert "systemctl stop opip-committee-shadow.timer" in lib
     bootstrap = (COMMITTEE / "bootstrap-opip-committee-worker.sh").read_text(encoding="utf-8")
-    assert "provision-committee-host-runtime.sh" in bootstrap
+    assert any(
+        line.strip() == 'bash "$SOURCE_DIR/provision-committee-host-runtime.sh" "$TARGET_SHA"'
+        for line in bootstrap.splitlines()
+    )
     workflow = WORKFLOW.read_text(encoding="utf-8")
     assert "OPIP_COMMITTEE_RUNTIME_TEST_HARNESS" not in workflow
     assert "verify-committee-runtime.sh" in workflow
