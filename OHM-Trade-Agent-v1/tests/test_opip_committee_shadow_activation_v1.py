@@ -358,13 +358,95 @@ def test_the_canary_cannot_report_success_on_a_failed_remote_start() -> None:
 def test_activation_validates_the_timestamps_before_they_reach_the_host() -> None:
     """An unvalidated value must not be interpolated into a remote sudo command."""
     text = ACTIVATION.read_text(encoding="utf-8")
-    # The workflow regex constrains both instants to ISO-8601 shape.
+    # Instants are constrained to ISO-8601 shape before they are used.
     assert r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}" in text
     # And the host script re-validates them independently.
     script = (COMMITTEE_DEPLOY / "activate-committee-shadow.sh").read_text(
         encoding="utf-8"
     )
     assert "must be an ISO-8601 UTC instant" in script
+
+
+# ----------------------------------------------------------- parser behaviour
+
+
+def _resolve_owner_command(body: str, tmp_path):
+    """Run the workflow's real command parser and return (proc, outputs).
+
+    The parser lives in the workflow's `run:` block. Executing that exact script
+    is what makes a group-index mistake visible: asserting on the pattern's shape
+    would not have caught it.
+    """
+    import os
+    import subprocess
+
+    bash = _bash()
+    if bash is None:
+        pytest.skip("no bash available to exercise the command parser")
+    steps = yaml.safe_load(ACTIVATION.read_text(encoding="utf-8"))["jobs"]["control"][
+        "steps"
+    ]
+    step = next(item for item in steps if item.get("id") == "command")
+    script_path = tmp_path / "resolve_command.sh"
+    script_path.write_text(step["run"], encoding="utf-8")
+    output_path = tmp_path / "github_output.txt"
+    output_path.write_text("", encoding="utf-8")
+    env = {**os.environ, "COMMENT_BODY": body, "GITHUB_OUTPUT": str(output_path)}
+    proc = subprocess.run(
+        [bash, str(script_path)], capture_output=True, text=True, env=env
+    )
+    return proc, output_path.read_text(encoding="utf-8")
+
+
+def test_the_parser_extracts_both_instants_in_full(tmp_path) -> None:
+    """A nested group once shifted the index, so review-by became the timezone."""
+    body = (
+        "/shadow-committee 004d2f05cf92668594dafb492420eeda1dc74506 "
+        "2026-09-25T13:20:00Z 2026-12-25T00:00:00Z"
+    )
+    proc, outputs = _resolve_owner_command(body, tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert "command=shadow" in outputs
+    assert "sha=004d2f05cf92668594dafb492420eeda1dc74506" in outputs
+    assert "not_before=2026-09-25T13:20:00Z" in outputs
+    assert "review_by=2026-12-25T00:00:00Z" in outputs
+
+
+def test_the_parser_accepts_a_numeric_offset_in_both_instants(tmp_path) -> None:
+    body = (
+        "/shadow-committee 004d2f05cf92668594dafb492420eeda1dc74506 "
+        "2026-09-25T13:20:00+00:00 2026-12-25T00:00:00-05:00"
+    )
+    proc, outputs = _resolve_owner_command(body, tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert "not_before=2026-09-25T13:20:00+00:00" in outputs
+    assert "review_by=2026-12-25T00:00:00-05:00" in outputs
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # A shell metacharacter in an instant must never reach the remote command.
+        "/shadow-committee 004d2f05cf92668594dafb492420eeda1dc74506 "
+        "2026-09-25T13:20:00Z 2026-12-25T00:00:00Z';nc -l 1;'",
+        "/shadow-committee 004d2f05cf92668594dafb492420eeda1dc74506 "
+        "not-a-date 2026-12-25T00:00:00Z",
+        "/shadow-committee 004d2f05cf92668594dafb492420eeda1dc74506 "
+        "2026-09-25T13:20:00Z not-a-date",
+        "/shadow-committee deadbeef "
+        "2026-09-25T13:20:00Z 2026-12-25T00:00:00Z",
+        "/shadow-committee 004d2f05cf92668594dafb492420eeda1dc74506 "
+        "2026-09-25T13:20:00Z",
+        "/shadow-committee 004d2f05cf92668594dafb492420eeda1dc74506 "
+        "2026-09-25T13:20:00Z 2026-12-25T00:00:00Z extra",
+        "/shadow-committee",
+        "/not-a-command 004d2f05cf92668594dafb492420eeda1dc74506",
+    ],
+)
+def test_the_parser_refuses_anything_that_is_not_strictly_formed(body, tmp_path) -> None:
+    proc, outputs = _resolve_owner_command(body, tmp_path)
+    assert proc.returncode == 64, (proc.returncode, proc.stdout, proc.stderr)
+    assert outputs.strip() == ""
 
 
 def test_activation_refuses_when_the_worker_cannot_execute() -> None:

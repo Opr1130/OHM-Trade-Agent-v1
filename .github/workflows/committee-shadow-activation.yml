@@ -58,11 +58,36 @@ jobs:
         run: |
           set -euo pipefail
           BODY="$COMMENT_BODY"
-          if [[ "$BODY" =~ ^/shadow-committee[[:space:]]+([0-9a-f]{40})[[:space:]]+([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2}))[[:space:]]+([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2}))[[:space:]]*$ ]]; then
+          SHA_RE='^[0-9a-f]{40}$'
+          # ISO-8601 instant, either a `Z` or a numeric UTC offset. Validated here,
+          # before the value is ever interpolated into a remote `sudo bash` command
+          # line, and re-validated on the host.
+          ISO_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2})$'
+          if [[ "$BODY" =~ ^/shadow-committee[[:space:]]+(.+)$ ]]; then
+            # Split on whitespace rather than matching nested groups: a nested
+            # group shifts every later BASH_REMATCH index, which silently
+            # mis-assigned the second instant.
+            read -r -a PARTS <<< "${BASH_REMATCH[1]}"
+            if [[ "${#PARTS[@]}" -ne 3 ]]; then
+              echo "Refusing committee activation: /shadow-committee needs a SHA, a not-before instant, and a review-by instant." >&2
+              exit 64
+            fi
+            if [[ ! "${PARTS[0]}" =~ $SHA_RE ]]; then
+              echo "Refusing committee activation: the first argument must be a 40-character lowercase SHA." >&2
+              exit 64
+            fi
+            if [[ ! "${PARTS[1]}" =~ $ISO_RE ]]; then
+              echo "Refusing committee activation: not-before must be an ISO-8601 UTC instant." >&2
+              exit 64
+            fi
+            if [[ ! "${PARTS[2]}" =~ $ISO_RE ]]; then
+              echo "Refusing committee activation: review-by must be an ISO-8601 UTC instant." >&2
+              exit 64
+            fi
             echo "command=shadow" >> "$GITHUB_OUTPUT"
-            echo "sha=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
-            echo "not_before=${BASH_REMATCH[2]}" >> "$GITHUB_OUTPUT"
-            echo "review_by=${BASH_REMATCH[3]}" >> "$GITHUB_OUTPUT"
+            echo "sha=${PARTS[0]}" >> "$GITHUB_OUTPUT"
+            echo "not_before=${PARTS[1]}" >> "$GITHUB_OUTPUT"
+            echo "review_by=${PARTS[2]}" >> "$GITHUB_OUTPUT"
           elif [[ "$BODY" =~ ^/committee-canary[[:space:]]+([0-9a-f]{40})[[:space:]]*$ ]]; then
             echo "command=canary" >> "$GITHUB_OUTPUT"
             echo "sha=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
