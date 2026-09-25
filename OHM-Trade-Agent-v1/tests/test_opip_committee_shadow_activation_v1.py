@@ -1497,13 +1497,13 @@ def test_mixed_dns_failure_returns_to_proven_off(
 def test_mixed_precondition_failure_returns_to_proven_off(
     tmp_path: pathlib.Path, fork_bash: str
 ) -> None:
-    """Case W: a preflight refusal on the mixed host still proves OFF."""
+    """Case W: a missing replica root on the mixed host still proves OFF."""
     bash = fork_bash
     plane = _plane(tmp_path, mode="shadow")
     _egress(plane["dropin"])
     marker = plane["advisory"] / "role_results.jsonl"
     marker.write_text("kept\n", encoding="utf-8", newline="\n")
-    shutil.rmtree(plane["evidence"])
+    shutil.rmtree(plane["root"] / "replica")
     proc = _run_script(
         bash,
         COMMITTEE_DEPLOY / "activate-committee-shadow.sh",
@@ -1523,7 +1523,7 @@ def test_pristine_off_precondition_failure_does_not_mutate(
     """Case X: the same preflight refusal on proven OFF writes nothing."""
     bash = fork_bash
     plane = _plane(tmp_path, mode="off")
-    shutil.rmtree(plane["evidence"])
+    shutil.rmtree(plane["root"] / "replica")
     proc = _run_script(
         bash,
         COMMITTEE_DEPLOY / "activate-committee-shadow.sh",
