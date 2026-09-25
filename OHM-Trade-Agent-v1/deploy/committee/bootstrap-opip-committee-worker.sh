@@ -78,13 +78,9 @@ fi
 chmod 0600 "$ENV_FILE"
 chown root:root "$ENV_FILE"
 
-# The release SHA is non-secret and is set here so the worker cannot start without
-# an exact release identity.
-if grep -q '^OPIP_COMMITTEE_RELEASE_SHA=' "$ENV_FILE"; then
-  sed -i "s|^OPIP_COMMITTEE_RELEASE_SHA=.*|OPIP_COMMITTEE_RELEASE_SHA=${TARGET_SHA}|" "$ENV_FILE"
-else
-  printf 'OPIP_COMMITTEE_RELEASE_SHA=%s\n' "$TARGET_SHA" >> "$ENV_FILE"
-fi
+# OPIP_COMMITTEE_RELEASE_SHA is committed by provision-committee-host-runtime.sh
+# only after the staged tree is active. A failed provision must keep the previous
+# release identity.
 
 # Mode is forced to off at install. Activation is a separate, approved change.
 if grep -q '^OPIP_COMMITTEE_MODE=' "$ENV_FILE"; then
@@ -99,6 +95,11 @@ install -m 0644 -o root -g root "$SOURCE_DIR/opip-committee-shadow.timer" "$UNIT
 install -m 0755 -o root -g root "$SOURCE_DIR/run-committee-shadow-cycle.sh" "$SBIN_DIR/"
 
 systemctl daemon-reload
+
+# Provision the exact release tree and virtualenv while mode is still off.
+# The timer decision below is unchanged: /deploy-committee does not pass
+# --enable-timer, so the timer stays disabled after provisioning.
+"$SOURCE_DIR/provision-committee-host-runtime.sh" "$TARGET_SHA"
 
 # The service is a `Type=oneshot` unit with no `[Install]` section: it is started by
 # the timer, never enabled on its own. Calling `systemctl enable` on it would fail
@@ -117,3 +118,4 @@ fi
 echo
 echo "installed at release $TARGET_SHA with OPIP_COMMITTEE_MODE=off"
 echo "verify isolation with: $SOURCE_DIR/verify-committee-isolation.sh"
+echo "verify runtime with: $SOURCE_DIR/verify-committee-runtime.sh"

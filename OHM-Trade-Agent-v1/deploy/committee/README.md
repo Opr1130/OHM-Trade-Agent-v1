@@ -25,6 +25,8 @@ than an architecture.
 | `opip-committee-shadow.service` | The worker unit. One bounded cycle per start; `OPIP_COMMITTEE_MODE=off`; hardened and resource-capped. |
 | `opip-committee-shadow.timer` | A six-hourly cycle, UTC. **Disabled by default.** |
 | `run-committee-shadow-cycle.sh` | The worker entry point. Runs one cycle and exits; refuses without an exact release SHA; records an explicit `SKIPPED_MODE_OFF` disposition rather than exiting silently. |
+| `provision-committee-host-runtime.sh` | Installs `/opt/opip/app` and `/opt/opip/venv` from the exact release SHA. Dependencies come from `requirements.txt`. Mode stays `off`. |
+| `verify-committee-runtime.sh` | Proves runtime readiness with `COMMITTEE_RUNTIME_PROOF=PASS` without activating SHADOW. |
 | `app/opip/committee/cycle_runner.py` | What the script invokes: reads committed evidence, runs exactly one scheduling cycle, writes dispositions and a trust report. |
 
 The OFF installation path is:
@@ -37,6 +39,18 @@ systemctl daemon-reload
 # NOT run as part of preparing this change:
 #   systemctl enable --now opip-committee-shadow.timer
 ```
+
+`/deploy-committee` runs `bootstrap-opip-committee-worker.sh`, which also runs
+`provision-committee-host-runtime.sh` for the same exact SHA. That provisioner
+installs the release tree at `/opt/opip/app`, creates `/opt/opip/venv` from the
+committed `requirements.txt`, and records non-secret paths in the existing
+environment file. It forces `OPIP_COMMITTEE_MODE=off`, leaves the timer disabled,
+and does not print or replace provider credential values. A failed run keeps the
+previous runtime active when one exists, or leaves the plane OFF.
+
+Runtime readiness is a separate machine-readable proof,
+`COMMITTEE_RUNTIME_PROOF=PASS`, from `verify-committee-runtime.sh`. Isolation
+remains `ISOLATION_PROOF=PASS`. Neither proof activates SHADOW.
 
 ## Requirement-by-requirement
 
@@ -139,6 +153,11 @@ The workflow **installs and verifies only**:
   zero committee cases.
 - It proves isolation with `verify-committee-isolation.sh`, taking the verdict from the
   machine-readable `ISOLATION_PROOF=PASS` line rather than the exit code alone.
+- It proves runtime readiness with `verify-committee-runtime.sh`, taking the verdict
+  from `COMMITTEE_RUNTIME_PROOF=PASS`. That proof checks the exact SHA, the
+  application root, the virtualenv interpreter, the cycle-runner import, the
+  manifest and replica paths, mode OFF, a disabled timer, and deny-all egress.
+  It does not activate SHADOW.
 - It publishes a receipt reporting the result, exact SHA, remote exit codes, cleanup
   result, workflow URL, and the PASS/FAIL proof lines only. It never prints environment
   contents or a secret.

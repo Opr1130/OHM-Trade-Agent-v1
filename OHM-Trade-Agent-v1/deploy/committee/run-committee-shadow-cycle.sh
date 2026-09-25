@@ -46,7 +46,11 @@ if [[ "${MODE}" == "off" ]]; then
 fi
 
 cd "${APP_ROOT}"
+unset PYTHONPATH
+unset PYTHONHOME
+unset PYTHONSTARTUP
+export PYTHONDONTWRITEBYTECODE=1
 
-exec "${VENV_PYTHON}" -m app.opip.committee.cycle_runner \
+exec "${VENV_PYTHON}" -s -m app.opip.committee.cycle_runner \
   --release-sha "${RELEASE_SHA}" \
   --committee-home "${COMMITTEE_HOME}"
