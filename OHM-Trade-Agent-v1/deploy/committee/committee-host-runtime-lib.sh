@@ -16,16 +16,19 @@ require_exact_sha() {
 }
 
 normalize_dir() {
-  mkdir -p "$1"
-  (cd "$1" && pwd)
+  local dir="$1"
+  mkdir -p "$dir"
+  (cd "$dir" && pwd)
+  return
 }
 
 normalize_file() {
-  local dir base
-  dir="$(dirname "$1")"
-  base="$(basename "$1")"
+  local path="$1" dir base
+  dir="$(dirname "$path")"
+  base="$(basename "$path")"
   mkdir -p "$dir"
   printf '%s/%s\n' "$(cd "$dir" && pwd)" "$base"
+  return
 }
 
 runtime_paths_init() {
@@ -40,12 +43,14 @@ runtime_paths_init() {
         echo "test harness cannot target the production runtime prefix" >&2
         exit 76
         ;;
+      *) ;;
     esac
     case "$ENV_FILE" in
       /etc/opip/*)
         echo "test harness cannot target the production environment file" >&2
         exit 76
         ;;
+      *) ;;
     esac
     SBIN_DIR="$PREFIX/sbin"
     LIB_DIR="$PREFIX/lib"
@@ -116,6 +121,7 @@ resolve_source_root() {
       echo "release source must not live inside the runtime prefix" >&2
       return 79
       ;;
+    *) ;;
   esac
 }
 
@@ -127,6 +133,7 @@ extract_provider_lines() {
       OPIP_COMMITTEE_OPENAI_API_KEY=*|OPIP_COMMITTEE_ANTHROPIC_API_KEY=*)
         printf '%s\n' "$line"
         ;;
+      *) ;;
     esac
   done < "$file"
 }
@@ -193,6 +200,7 @@ rewrite_nonsecret_env() {
         printf '%s\n' "$line" >> "$tmp"
         continue
         ;;
+      *) ;;
     esac
     if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)= ]]; then
       key="${BASH_REMATCH[1]}"
@@ -256,6 +264,7 @@ force_mode_off_only() {
         fi
         continue
         ;;
+      *) ;;
     esac
     printf '%s\n' "$line" >> "$tmp"
   done < "$ENV_FILE"

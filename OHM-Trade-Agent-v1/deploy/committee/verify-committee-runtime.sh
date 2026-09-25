@@ -14,16 +14,19 @@ source "$SCRIPT_DIR/verify-committee-isolation.sh"
 failures=0
 
 normalize_dir() {
-  mkdir -p "$1"
-  (cd "$1" && pwd)
+  local dir="$1"
+  mkdir -p "$dir"
+  (cd "$dir" && pwd)
+  return
 }
 
 normalize_file() {
-  local dir base
-  dir="$(dirname "$1")"
-  base="$(basename "$1")"
+  local path="$1" dir base
+  dir="$(dirname "$path")"
+  base="$(basename "$path")"
   mkdir -p "$dir"
   printf '%s/%s\n' "$(cd "$dir" && pwd)" "$base"
+  return
 }
 
 if [[ "${OPIP_COMMITTEE_RUNTIME_TEST_HARNESS:-}" == "1" ]]; then
@@ -40,6 +43,7 @@ if [[ "${OPIP_COMMITTEE_RUNTIME_TEST_HARNESS:-}" == "1" ]]; then
       echo "test harness cannot target the production runtime prefix" >&2
       exit 76
       ;;
+    *) ;;
   esac
 else
   PREFIX=/opt/opip
@@ -57,6 +61,7 @@ VENV_PYTHON="$PREFIX/venv/bin/python"
 env_value() {
   local key="$1"
   sed -n "s/^${key}=//p" "$ENV_FILE" 2>/dev/null | head -n1
+  return
 }
 
 if [[ -d "$APP_ROOT" && ! -L "$APP_ROOT" ]]; then
@@ -85,8 +90,7 @@ fi
 import_log="$(mktemp)"
 chmod 0600 "$import_log"
 import_ok=0
-if [[ -d "$APP_ROOT" && -x "$VENV_PYTHON" ]]; then
-  if (
+if [[ -d "$APP_ROOT" && -x "$VENV_PYTHON" ]] && (
     cd "$APP_ROOT" &&
       env -u PYTHONPATH -u PYTHONHOME -u PYTHONSTARTUP -u PYTHONUSERBASE \
         "$VENV_PYTHON" -s -c 'import os, sys
@@ -97,8 +101,7 @@ if os.path.realpath(resolved) != root:
     raise SystemExit(2)
 import app.opip.committee.cycle_runner'
   ) >"$import_log" 2>&1; then
-    import_ok=1
-  fi
+  import_ok=1
 fi
 if [[ "$import_ok" -eq 1 ]]; then
   pass "cycle_runner import succeeded"

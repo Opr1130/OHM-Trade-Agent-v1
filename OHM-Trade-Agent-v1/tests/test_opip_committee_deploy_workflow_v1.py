@@ -268,6 +268,7 @@ def test_the_receipt_reports_the_required_fields(workflow_text: str) -> None:
     for token in (
         "## O'Pip Intelligence Committee Deployment Receipt",
         "**Result:**",
+        "DEPLOY_RESULT",
         "**SHA:**",
         "Remote exit codes:",
         "**Remote cleanup:**",

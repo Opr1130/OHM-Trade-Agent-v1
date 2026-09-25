@@ -303,10 +303,18 @@ jobs:
           else
             RUNTIME_PROOF="runtime proof did not run"
           fi
+          if [[ "${INSTALL_RESULT:-}" == "INSTALLED" \
+            && "${ISOLATION_RESULT:-}" == "PROVEN" \
+            && "${RUNTIME_RESULT:-}" == "PROVEN" \
+            && "${CLEANUP_RESULT:-}" == "CLEANED" ]]; then
+            DEPLOY_RESULT="PROVEN"
+          else
+            DEPLOY_RESULT="FAILED"
+          fi
           BODY=$(cat <<EOF
           ## O'Pip Intelligence Committee Deployment Receipt
 
-          - **Result:** ${ISOLATION_RESULT:-FAILED BEFORE ISOLATION STAGE} (install: ${INSTALL_RESULT:-NOT RUN}; runtime: ${RUNTIME_RESULT:-NOT RUN})
+          - **Result:** ${DEPLOY_RESULT} (install: ${INSTALL_RESULT:-NOT RUN}; isolation: ${ISOLATION_RESULT:-NOT RUN}; runtime: ${RUNTIME_RESULT:-NOT RUN})
           - **SHA:** \`$TARGET_SHA\`
           - **Remote exit codes:** install=${INSTALL_RC:-N/A} isolation=${ISOLATION_RC:-N/A} runtime=${RUNTIME_RC:-N/A} cleanup=${CLEANUP_RC:-N/A}
           - **Remote cleanup:** ${CLEANUP_RESULT:-NOT RUN}
