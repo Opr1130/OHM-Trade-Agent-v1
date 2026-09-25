@@ -6,7 +6,8 @@ name: deploy-committee
 # does not enable provider execution, and does not merge anything. It installs the
 # committed Committee worker artifacts at an exact approved main SHA with
 # OPIP_COMMITTEE_MODE=off, leaves the timer disabled and inactive so no scheduled
-# committee execution occurs, and then proves isolation.
+# committee execution occurs, proves isolation, and proves the host runtime can
+# import the committee cycle runner. It does not activate SHADOW.
 #
 # Egress while OFF is deny-all and fails closed: no provider allowlist is configured.
 # Provider-specific egress belongs to the later activation boundary.
@@ -163,7 +164,7 @@ jobs:
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=yes \
             -o ServerAliveInterval=30 \
-            -o ServerAliveCountMax=20 \
+            -o ServerAliveCountMax=60 \
             -p "$PORT" \
             "$USER@$HOST" \
             "sudo -n bash '$RELEASE_DIR/OHM-Trade-Agent-v1/deploy/committee/bootstrap-opip-committee-worker.sh' '$TARGET_SHA'" \
@@ -203,6 +204,36 @@ jobs:
           # A missing ISOLATION_PROOF=PASS line is a failed proof even if the exit code
           # was zero, so the verdict is taken from the machine-readable line.
           if [[ "$RC" -eq 0 ]] && grep -q '^ISOLATION_PROOF=PASS$' committee-isolation.log; then
+            echo "result=PROVEN" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=FAILED" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+
+      - name: Prove Committee runtime readiness
+        id: committee_runtime
+        if: always() && steps.committee_install.outputs.result == 'INSTALLED'
+        continue-on-error: true
+        env:
+          HOST: ${{ secrets.OPIP_LEARNING_HOST }}
+          USER: ${{ secrets.OPIP_LEARNING_USER }}
+          PORT: ${{ secrets.OPIP_LEARNING_PORT }}
+        run: |
+          set +e
+          PORT="${PORT:-22}"
+          RELEASE_DIR="/var/tmp/opip-committee-${{ steps.target.outputs.sha }}-$GITHUB_RUN_ID"
+          ssh \
+            -i ~/.ssh/opip_committee \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -p "$PORT" \
+            "$USER@$HOST" \
+            "sudo -n bash '$RELEASE_DIR/OHM-Trade-Agent-v1/deploy/committee/verify-committee-runtime.sh'" \
+            2>&1 | tee committee-runtime.log
+          RC=${PIPESTATUS[0]}
+          echo "rc=$RC" >> "$GITHUB_OUTPUT"
+          if [[ "$RC" -eq 0 ]] && grep -q '^COMMITTEE_RUNTIME_PROOF=PASS$' committee-runtime.log; then
             echo "result=PROVEN" >> "$GITHUB_OUTPUT"
           else
             echo "result=FAILED" >> "$GITHUB_OUTPUT"
@@ -252,6 +283,8 @@ jobs:
           INSTALL_RC: ${{ steps.committee_install.outputs.rc }}
           ISOLATION_RESULT: ${{ steps.committee_isolation.outputs.result }}
           ISOLATION_RC: ${{ steps.committee_isolation.outputs.rc }}
+          RUNTIME_RESULT: ${{ steps.committee_runtime.outputs.result }}
+          RUNTIME_RC: ${{ steps.committee_runtime.outputs.rc }}
           CLEANUP_RESULT: ${{ steps.committee_cleanup.outputs.result }}
           CLEANUP_RC: ${{ steps.committee_cleanup.outputs.rc }}
         run: |
@@ -265,17 +298,26 @@ jobs:
           else
             PROOF="isolation proof did not run"
           fi
+          if [[ -f committee-runtime.log ]]; then
+            RUNTIME_PROOF="$(grep -E '^(PASS|FAIL|INFO|COMMITTEE_RUNTIME_PROOF=)' committee-runtime.log || true)"
+          else
+            RUNTIME_PROOF="runtime proof did not run"
+          fi
           BODY=$(cat <<EOF
           ## O'Pip Intelligence Committee Deployment Receipt
 
-          - **Result:** ${ISOLATION_RESULT:-FAILED BEFORE ISOLATION STAGE} (install: ${INSTALL_RESULT:-NOT RUN})
+          - **Result:** ${ISOLATION_RESULT:-FAILED BEFORE ISOLATION STAGE} (install: ${INSTALL_RESULT:-NOT RUN}; runtime: ${RUNTIME_RESULT:-NOT RUN})
           - **SHA:** \`$TARGET_SHA\`
-          - **Remote exit codes:** install=${INSTALL_RC:-N/A} isolation=${ISOLATION_RC:-N/A} cleanup=${CLEANUP_RC:-N/A}
+          - **Remote exit codes:** install=${INSTALL_RC:-N/A} isolation=${ISOLATION_RC:-N/A} runtime=${RUNTIME_RC:-N/A} cleanup=${CLEANUP_RC:-N/A}
           - **Remote cleanup:** ${CLEANUP_RESULT:-NOT RUN}
           - **Workflow run:** $RUN_URL
 
           \`\`\`
           $PROOF
+          \`\`\`
+
+          \`\`\`
+          $RUNTIME_PROOF
           \`\`\`
 
           This workflow installs the isolated Committee worker at an exact main SHA with
@@ -286,8 +328,8 @@ jobs:
           SHADOW calls, enable provider execution, or place a provider key anywhere. It
           does not merge, and it does not touch Kraken or Telegram credentials.
 
-          Success requires the install, the isolation proof, **and** removal of the
-          temporary remote release directory.
+          Success requires the install, the isolation proof, the runtime readiness
+          proof, **and** removal of the temporary remote release directory.
 
           The \`OFF -> credentialled SHADOW\` transition requires a separate
           OWNER-authorised action with its own validation.
@@ -300,6 +342,7 @@ jobs:
         env:
           INSTALL_RESULT: ${{ steps.committee_install.outputs.result }}
           ISOLATION_RESULT: ${{ steps.committee_isolation.outputs.result }}
+          RUNTIME_RESULT: ${{ steps.committee_runtime.outputs.result }}
           CLEANUP_RESULT: ${{ steps.committee_cleanup.outputs.result }}
         run: |
           set -euo pipefail
@@ -311,6 +354,10 @@ jobs:
           }
           test "$ISOLATION_RESULT" = "PROVEN" || {
             echo "Committee OFF-mode isolation was not proven." >&2
+            exit 1
+          }
+          test "$RUNTIME_RESULT" = "PROVEN" || {
+            echo "Committee runtime readiness was not proven." >&2
             exit 1
           }
           test "$CLEANUP_RESULT" = "CLEANED" || {

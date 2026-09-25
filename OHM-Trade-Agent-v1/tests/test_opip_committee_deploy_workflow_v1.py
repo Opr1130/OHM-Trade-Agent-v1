@@ -273,6 +273,7 @@ def test_the_receipt_reports_the_required_fields(workflow_text: str) -> None:
         "**Remote cleanup:**",
         "Workflow run:",
         "ISOLATION_PROOF=",
+        "COMMITTEE_RUNTIME_PROOF=",
     ):
         assert token in workflow_text, token
 
@@ -308,11 +309,13 @@ def test_the_workflow_fails_closed_on_every_required_condition(
         "Validate committee host connection secrets",
         "Committee installation did not succeed",
         "Committee OFF-mode isolation was not proven",
+        "Committee runtime readiness was not proven",
     ):
         assert condition in workflow_text, condition
     # The final gate requires both stages to have succeeded.
     assert 'test "$INSTALL_RESULT" = "INSTALLED"' in workflow_text
     assert 'test "$ISOLATION_RESULT" = "PROVEN"' in workflow_text
+    assert 'test "$RUNTIME_RESULT" = "PROVEN"' in workflow_text
     # Absent host secrets fail the run rather than skipping the deploy.
     assert "test -n \"$SSH_KEY_B64\"" in workflow_text
     assert "test -n \"$KNOWN_HOSTS\"" in workflow_text
@@ -485,6 +488,10 @@ def test_the_workflow_target_script_is_the_committed_bootstrap() -> None:
         "bootstrap-opip-committee-worker.sh",
         "verify-committee-isolation.sh",
         "run-committee-shadow-cycle.sh",
+        "provision-committee-host-runtime.sh",
+        "verify-committee-runtime.sh",
+        "rollback-committee-host-runtime.sh",
+        "committee-host-runtime-lib.sh",
     ):
         script = COMMITTEE_DEPLOY / name
         assert script.exists(), name

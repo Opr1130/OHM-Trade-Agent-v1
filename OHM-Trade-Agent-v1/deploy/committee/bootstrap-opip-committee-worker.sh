@@ -100,6 +100,11 @@ install -m 0755 -o root -g root "$SOURCE_DIR/run-committee-shadow-cycle.sh" "$SB
 
 systemctl daemon-reload
 
+# Provision the exact release tree and virtualenv while mode is still off.
+# The timer decision below is unchanged: /deploy-committee does not pass
+# --enable-timer, so the timer stays disabled after provisioning.
+"$SOURCE_DIR/provision-committee-host-runtime.sh" "$TARGET_SHA"
+
 # The service is a `Type=oneshot` unit with no `[Install]` section: it is started by
 # the timer, never enabled on its own. Calling `systemctl enable` on it would fail
 # ("no installation config") and, under `set -e`, would abort the install. Enablement
@@ -117,3 +122,4 @@ fi
 echo
 echo "installed at release $TARGET_SHA with OPIP_COMMITTEE_MODE=off"
 echo "verify isolation with: $SOURCE_DIR/verify-committee-isolation.sh"
+echo "verify runtime with: $SOURCE_DIR/verify-committee-runtime.sh"

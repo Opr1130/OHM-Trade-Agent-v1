@@ -23,6 +23,9 @@ ExecStart=/usr/local/sbin/run-committee-shadow-cycle.sh
 # only control. Changing this value is the activation step and requires OWNER
 # approval.
 Environment=OPIP_COMMITTEE_MODE=off
+# The release tree is read-only under ProtectSystem=strict. Do not let Python
+# try to write bytecode beside the imported modules.
+Environment=PYTHONDONTWRITEBYTECODE=1
 
 # Credentials are supplied by the operator's secret mechanism as a file reference.
 # No value appears here, in this repository, in an image, or in a log. Absent
