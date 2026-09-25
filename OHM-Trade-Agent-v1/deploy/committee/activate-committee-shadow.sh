@@ -49,6 +49,7 @@ refuse_harness_path() {
       echo "test harness refuses a parent-relative path for ${label}" >&2
       exit 76
       ;;
+    *) ;;
   esac
   if [[ -d "$path" ]]; then
     parent="$path"
@@ -68,7 +69,9 @@ refuse_harness_path() {
       echo "test harness refuses production path for ${label}" >&2
       exit 76
       ;;
+    *) ;;
   esac
+  return 0
 }
 
 configure_committee_paths() {
@@ -93,6 +96,7 @@ configure_committee_paths() {
   DROPIN_DIR="$UNIT_DIR/$UNIT.d"
   DROPIN="$DROPIN_DIR/10-provider-egress.conf"
   MODE_DROPIN="$DROPIN_DIR/20-shadow-mode.conf"
+  return 0
 }
 
 install_conf() {
@@ -146,11 +150,9 @@ if [[ -z "$NOT_BEFORE" || -z "$REVIEW_BY" ]]; then
   exit 64
 fi
 configure_committee_paths
-if [[ "${OPIP_COMMITTEE_RUNTIME_TEST_HARNESS:-}" != "1" ]]; then
-  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    echo "activate the committee shadow boundary as root" >&2
-    exit 77
-  fi
+if [[ "${OPIP_COMMITTEE_RUNTIME_TEST_HARNESS:-}" != "1" && "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "activate the committee shadow boundary as root" >&2
+  exit 77
 fi
 
 # --- precondition: the arguments are usable ----------------------------------
