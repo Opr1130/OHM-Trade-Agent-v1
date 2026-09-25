@@ -12,9 +12,12 @@
 #      and installing an `IPAddressAllow=` drop-in alongside the unit's existing
 #      `IPAddressDeny=any`, so egress stays allowlist-only and everything else stays
 #      denied,
-#   4. sets mode to `shadow`, records the explicit UTC activation instant, records
+#   4. installs `20-shadow-mode.conf` so the merged unit Environment property is
+#      `shadow` while the base unit file stays `off` (a later Environment=
+#      assignment replaces the earlier one; a bare Environment= is never used),
+#   5. sets mode to `shadow`, records the explicit UTC activation instant, records
 #      the registry review date, and caps a cycle at one case,
-#   5. leaves the timer DISABLED unless `--enable-timer` is passed.
+#   6. leaves the timer DISABLED unless `--enable-timer` is passed.
 #
 # MEASUREMENT ONLY: it grants no trading authority and touches no trading credential.
 #
@@ -30,12 +33,59 @@ set -Eeuo pipefail
 
 UNIT="opip-committee-shadow.service"
 TIMER="opip-committee-shadow.timer"
-UNIT_DIR="/etc/systemd/system"
-DROPIN_DIR="$UNIT_DIR/$UNIT.d"
-DROPIN="$DROPIN_DIR/10-provider-egress.conf"
-ENV_FILE="/etc/opip/committee-credentials.env"
-COMMITTEE_HOME="${OPIP_COMMITTEE_HOME:-/var/lib/opip-committee}"
-EVIDENCE_ROOT="${OPIP_COMMITTEE_EVIDENCE_ROOT:-/var/lib/opip-learning}"
+
+# Harness overrides apply only when OPIP_COMMITTEE_RUNTIME_TEST_HARNESS=1.
+# Otherwise the production absolute paths are used and any override is ignored.
+refuse_harness_path() {
+  local label="$1" path="$2"
+  if [[ -z "$path" ]]; then
+    echo "test harness requires ${label}" >&2
+    exit 76
+  fi
+  case "$path" in
+    /etc|/etc/*|/opt/opip|/opt/opip/*)
+      echo "test harness refuses production path for ${label}" >&2
+      exit 76
+      ;;
+  esac
+}
+
+configure_committee_paths() {
+  if [[ "${OPIP_COMMITTEE_RUNTIME_TEST_HARNESS:-}" == "1" ]]; then
+    UNIT_DIR="${OPIP_COMMITTEE_UNIT_DIR:-}"
+    ENV_FILE="${OPIP_COMMITTEE_ENV_FILE:-}"
+    COMMITTEE_HOME="${OPIP_COMMITTEE_HOME:-}"
+    EVIDENCE_ROOT="${OPIP_COMMITTEE_EVIDENCE_ROOT:-}"
+    RESOLV_CONF="${OPIP_COMMITTEE_RESOLV_CONF:-}"
+    refuse_harness_path UNIT_DIR "$UNIT_DIR"
+    refuse_harness_path ENV_FILE "$ENV_FILE"
+    refuse_harness_path COMMITTEE_HOME "$COMMITTEE_HOME"
+    refuse_harness_path EVIDENCE_ROOT "$EVIDENCE_ROOT"
+    refuse_harness_path RESOLV_CONF "$RESOLV_CONF"
+  else
+    UNIT_DIR="/etc/systemd/system"
+    ENV_FILE="/etc/opip/committee-credentials.env"
+    COMMITTEE_HOME="${OPIP_COMMITTEE_HOME:-/var/lib/opip-committee}"
+    EVIDENCE_ROOT="${OPIP_COMMITTEE_EVIDENCE_ROOT:-/var/lib/opip-learning}"
+    RESOLV_CONF="/etc/resolv.conf"
+  fi
+  DROPIN_DIR="$UNIT_DIR/$UNIT.d"
+  DROPIN="$DROPIN_DIR/10-provider-egress.conf"
+  MODE_DROPIN="$DROPIN_DIR/20-shadow-mode.conf"
+}
+
+install_conf() {
+  local src="$1" dest="$2"
+  if [[ "${OPIP_COMMITTEE_RUNTIME_TEST_HARNESS:-}" == "1" ]]; then
+    install -T -m 0644 "$src" "$dest"
+  else
+    install -T -m 0644 -o root -g root "$src" "$dest"
+  fi
+}
+
+current_file_mode() {
+  sed -n 's/^OPIP_COMMITTEE_MODE=//p' "$ENV_FILE" 2>/dev/null | head -n1 || true
+}
 
 #: Provider endpoints. These are the exact application-level allowlist entries in
 #: `app/opip/committee/transports.py`; the network policy is derived from them so
@@ -74,9 +124,12 @@ if [[ -z "$NOT_BEFORE" || -z "$REVIEW_BY" ]]; then
   fail_usage
   exit 64
 fi
-if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-  echo "activate the committee shadow boundary as root" >&2
-  exit 77
+configure_committee_paths
+if [[ "${OPIP_COMMITTEE_RUNTIME_TEST_HARNESS:-}" != "1" ]]; then
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    echo "activate the committee shadow boundary as root" >&2
+    exit 77
+  fi
 fi
 
 # --- precondition: the arguments are usable ----------------------------------
@@ -221,10 +274,10 @@ while IFS= read -r nameserver; do
   [[ -z "$nameserver" ]] && continue
   printf 'IPAddressAllow=%s\n' "$nameserver" >> "$tmp_dropin"
   resolver_count=$((resolver_count + 1))
-done < <(awk '/^[[:space:]]*nameserver[[:space:]]+/ {print $2}' /etc/resolv.conf 2>/dev/null || true)
+done < <(awk '/^[[:space:]]*nameserver[[:space:]]+/ {print $2}' "$RESOLV_CONF" 2>/dev/null || true)
 # A loopback stub resolver is the common case; loopback is denied by `any`, so it
 # must be allowed explicitly when the host resolves through it.
-if grep -qE '^[[:space:]]*nameserver[[:space:]]+(127\.|::1)' /etc/resolv.conf 2>/dev/null; then
+if grep -qE '^[[:space:]]*nameserver[[:space:]]+(127\.|::1)' "$RESOLV_CONF" 2>/dev/null; then
   printf 'IPAddressAllow=127.0.0.1\nIPAddressAllow=::1\n' >> "$tmp_dropin"
   resolver_count=$((resolver_count + 1))
 fi
@@ -248,9 +301,31 @@ if [[ "$resolved_count" -eq 0 ]]; then
   echo "refusing activation: no provider address was pinned" >&2
   exit 78
 fi
-install -m 0644 -o root -g root "$tmp_dropin" "$DROPIN"
+install_conf "$tmp_dropin" "$DROPIN"
 rm -f "$tmp_dropin"
 echo "PASS  provider-only egress pinned for ${#PROVIDER_ENDPOINTS[@]} endpoints ($resolved_count address entries, $resolver_count resolver entries)"
+
+# The base unit stays Environment=OPIP_COMMITTEE_MODE=off. This later drop-in
+# replaces only that assignment in the merged Environment property. A bare
+# Environment= line is not used: it would clear PYTHONDONTWRITEBYTECODE=1.
+tmp_mode="$(mktemp)"
+printf '%s\n' '[Service]' 'Environment=OPIP_COMMITTEE_MODE=shadow' > "$tmp_mode"
+# A directory at the drop-in path is not a unit file. install -T refuses to
+# treat that directory as the destination file.
+mode_installed=0
+if [[ ! -d "$MODE_DROPIN" ]] && install_conf "$tmp_mode" "$MODE_DROPIN"; then
+  mode_installed=1
+fi
+rm -f "$tmp_mode"
+if [[ "$mode_installed" -ne 1 ]]; then
+  if [[ "$(current_file_mode)" != "shadow" ]]; then
+    rm -f "$DROPIN"
+    systemctl daemon-reload
+  fi
+  echo "refusing activation: the shadow mode drop-in was not installed" >&2
+  exit 78
+fi
+echo "PASS  shadow mode drop-in installed; base unit stays off"
 
 # --- precondition: the pinned policy actually permits a provider connection ---
 # A pinned address that cannot be reached is a denial of legitimate egress, so
@@ -265,7 +340,11 @@ for endpoint in "${PROVIDER_ENDPOINTS[@]}"; do
   fi
 done
 if [[ "$reachable" -eq 0 ]]; then
-  rm -f "$DROPIN"
+  if [[ "$(current_file_mode)" != "shadow" ]]; then
+    rm -f "$DROPIN" "$MODE_DROPIN"
+  else
+    rm -f "$DROPIN"
+  fi
   rmdir "$DROPIN_DIR" 2>/dev/null || true
   systemctl daemon-reload
   echo "refusing activation: no approved provider endpoint is reachable under the pinned policy" >&2
@@ -291,9 +370,26 @@ set_env_value OPIP_COMMITTEE_REGISTRY_REVIEW_BY "$REVIEW_BY"
 # One case per cycle for the canary. Raising it is a separate decision.
 set_env_value OPIP_COMMITTEE_MAX_CASES_PER_CYCLE 1
 chmod 0600 "$ENV_FILE"
-chown root:root "$ENV_FILE"
+if [[ "${OPIP_COMMITTEE_RUNTIME_TEST_HARNESS:-}" != "1" ]]; then
+  chown root:root "$ENV_FILE"
+fi
 
 systemctl daemon-reload
+
+# Same pipeline verify-committee-shadow.sh uses for the merged unit Environment
+# property. EnvironmentFile= is not part of that property, so the drop-in must
+# have replaced the base unit's off assignment before activation can pass.
+effective_mode="$(systemctl show -p Environment --value "$UNIT" 2>/dev/null | tr ' ' '\n' | sed -n 's/^OPIP_COMMITTEE_MODE=//p' | head -n1 || true)"
+file_mode="$(current_file_mode)"
+if [[ "$effective_mode" != "shadow" || "$file_mode" != "shadow" || ! -f "$DROPIN" ]]; then
+  if [[ "$effective_mode" != "shadow" ]]; then
+    set_env_value OPIP_COMMITTEE_MODE off
+    rm -f "$MODE_DROPIN"
+    systemctl daemon-reload
+  fi
+  echo "refusing activation: effective unit mode '${effective_mode:-none}' is not shadow" >&2
+  exit 1
+fi
 
 if [[ "$ENABLE_TIMER" == "true" ]]; then
   systemctl enable --now "$TIMER"

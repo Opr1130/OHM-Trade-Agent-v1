@@ -199,6 +199,12 @@ Egress is pinned by resolving the two approved endpoints and writing
 `IPAddressDeny=any`. systemd does not resolve host names into an address policy, so a
 DNS change is a visible re-activation event rather than silently widened egress.
 
+SHADOW mode is a separate drop-in, `20-shadow-mode.conf`
+(`Environment=OPIP_COMMITTEE_MODE=shadow`). The base unit file stays
+`Environment=OPIP_COMMITTEE_MODE=off`. Rollback removes both that drop-in and the
+provider egress drop-in. A pending rollback must be cancelled before a corrected
+activation.
+
 ### Runtime structure of a SHADOW case
 
 A SHADOW case is governed by the **seven roles**, not by two provider families:
