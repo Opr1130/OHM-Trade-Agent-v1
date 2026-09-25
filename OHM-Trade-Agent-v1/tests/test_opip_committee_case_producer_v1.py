@@ -181,9 +181,10 @@ def test_source_snapshot_must_be_cited_by_context_provenance():
             source_record_refs=("EVT:instrument-1",),
         ),
     )
+    source = _source()
     with pytest.raises(CaseSourceError, match="not cited"):
         build_case_envelope(
-            context=bad, source=_source(), source_release_sha=SOURCE_SHA
+            context=bad, source=source, source_release_sha=SOURCE_SHA
         )
 
 
@@ -202,9 +203,11 @@ def test_snapshot_identity_mismatch_fails_closed():
 
 
 def test_source_release_sha_is_exact_and_lowercase():
+    context = _context()
+    source = _source()
     with pytest.raises(CaseSourceError, match="40 lowercase hex"):
         build_case_envelope(
-            context=_context(), source=_source(), source_release_sha="main"
+            context=context, source=source, source_release_sha="main"
         )
 
 
@@ -286,10 +289,11 @@ def test_incomplete_di_replica_refuses_the_population(tmp_path, monkeypatch):
 
 
 def test_future_activation_boundary_is_refused(tmp_path):
+    not_before = NOW + timedelta(seconds=1)
     with pytest.raises((CaseSourceError, ValueError), match="future"):
         produce_case_population(
             replica_repository_root=tmp_path,
             expected_source_release_sha=SOURCE_SHA,
-            not_before=NOW + timedelta(seconds=1),
+            not_before=not_before,
             now=NOW,
         )

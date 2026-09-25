@@ -263,46 +263,10 @@ class RoleGovernedCaseOutcome:
     schema_version: int = ROLE_CASE_OUTCOME_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
-        if self.schema_version != ROLE_CASE_OUTCOME_SCHEMA_VERSION or (
-            type(self.schema_version) is not int
-        ):
-            raise ValueError("unsupported RoleGovernedCaseOutcome schema_version")
-        for field_name in (
-            "case_id",
-            "evidence_snapshot_hash",
-            "committee_policy_version",
-            "policy_hash",
-            "registry_version",
-            "registry_hash",
-        ):
-            value = getattr(self, field_name)
-            if not isinstance(value, str) or not value.strip():
-                raise ValueError(f"{field_name} is required")
-        if not isinstance(self.phase, EvaluationPhase):
-            raise ValueError("invalid evaluation phase")
-        if not isinstance(self.role_results, tuple) or not self.role_results:
-            raise ValueError("a role-governed case outcome requires role results")
-        seen: set[CommitteeRole] = set()
-        for result in self.role_results:
-            if not isinstance(result, RoleSeatResult):
-                raise ValueError("role_results must be RoleSeatResult values")
-            if result.case_id != self.case_id:
-                raise ValueError("every role result must belong to this case")
-            if result.role in seen:
-                raise ValueError("one role result per role")
-            seen.add(result.role)
-        if type(self.spent_microunits) is not int or self.spent_microunits < 0:
-            raise ValueError("spent_microunits must be a non-negative integer")
-        if self.canonical_binding is not None and not isinstance(
-            self.canonical_binding, CanonicalDecisionBinding
-        ):
-            raise ValueError("invalid canonical_binding")
-        for field_name in ("started_at", "completed_at"):
-            value = getattr(self, field_name)
-            if not isinstance(value, datetime) or value.tzinfo is None:
-                raise ValueError(f"{field_name} must be a timezone-aware datetime")
-        if self.completed_at < self.started_at:
-            raise ValueError("completed_at must be >= started_at")
+        _require_role_case_identity(self)
+        _require_role_case_results(self)
+        _require_role_case_moments(self)
+
 
     @property
     def answered_roles(self) -> tuple[RoleSeatResult, ...]:
@@ -355,6 +319,57 @@ class RoleGovernedCaseOutcome:
     def role_case_outcome_id(self) -> str:
         return stable_hash(ROLE_CASE_OUTCOME_IDENTITY_DOMAIN, self.identity_payload())
 
+
+def _require_role_case_identity(outcome: RoleGovernedCaseOutcome) -> None:
+    """The opaque identity fields must all be present and non-blank."""
+    if outcome.schema_version != ROLE_CASE_OUTCOME_SCHEMA_VERSION or (
+        type(outcome.schema_version) is not int
+    ):
+        raise ValueError("unsupported RoleGovernedCaseOutcome schema_version")
+    for field_name in (
+        "case_id",
+        "evidence_snapshot_hash",
+        "committee_policy_version",
+        "policy_hash",
+        "registry_version",
+        "registry_hash",
+    ):
+        value = getattr(outcome, field_name)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{field_name} is required")
+    if not isinstance(outcome.phase, EvaluationPhase):
+        raise ValueError("invalid evaluation phase")
+    if outcome.canonical_binding is not None and not isinstance(
+        outcome.canonical_binding, CanonicalDecisionBinding
+    ):
+        raise ValueError("invalid canonical_binding")
+
+
+def _require_role_case_results(outcome: RoleGovernedCaseOutcome) -> None:
+    """Every seated role must appear exactly once, and belong to this case."""
+    if not isinstance(outcome.role_results, tuple) or not outcome.role_results:
+        raise ValueError("a role-governed case outcome requires role results")
+    seen: set[CommitteeRole] = set()
+    for result in outcome.role_results:
+        if not isinstance(result, RoleSeatResult):
+            raise ValueError("role_results must be RoleSeatResult values")
+        if result.case_id != outcome.case_id:
+            raise ValueError("every role result must belong to this case")
+        if result.role in seen:
+            raise ValueError("one role result per role")
+        seen.add(result.role)
+    if type(outcome.spent_microunits) is not int or outcome.spent_microunits < 0:
+        raise ValueError("spent_microunits must be a non-negative integer")
+
+
+def _require_role_case_moments(outcome: RoleGovernedCaseOutcome) -> None:
+    """Both instants must be timezone-aware and correctly ordered."""
+    for field_name in ("started_at", "completed_at"):
+        value = getattr(outcome, field_name)
+        if not isinstance(value, datetime) or value.tzinfo is None:
+            raise ValueError(f"{field_name} must be a timezone-aware datetime")
+    if outcome.completed_at < outcome.started_at:
+        raise ValueError("completed_at must be >= started_at")
 
 @dataclass(frozen=True)
 class RoleGovernedRunResult:
@@ -592,9 +607,7 @@ class RoleGovernedRunner:
             result, role_spend = self._run_role(
                 case=case,
                 role=role,
-                phase=phase,
                 screened_view=screened_view,
-                evidence_view_hash=evidence_view_hash,
                 allowed_refs=allowed_refs,
                 peer_results=tuple(results),
             )
@@ -661,9 +674,7 @@ class RoleGovernedRunner:
         *,
         case: CommitteeCase,
         role: CommitteeRole,
-        phase: EvaluationPhase,
         screened_view: Mapping[str, Any],
-        evidence_view_hash: str,
         allowed_refs: Sequence[str],
         peer_results: tuple[RoleSeatResult, ...],
     ) -> tuple[RoleSeatResult, int]:

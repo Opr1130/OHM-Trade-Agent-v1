@@ -299,6 +299,8 @@ def test_validated_case_ingress_dispatches_the_exact_reconstructed_case(tmp_path
 
 
 def test_an_executor_cannot_run_without_validated_case_ingress(tmp_path):
+    items_path = _write_items(tmp_path, [_item()])
+    settings = CommitteeShadowSettings(opip_committee_mode=COMMITTEE_MODE_SHADOW)
     with pytest.raises(
         CycleConfigurationError,
         match="case_executor requires validated case ingress",
@@ -306,11 +308,9 @@ def test_an_executor_cannot_run_without_validated_case_ingress(tmp_path):
         run_once(
             release_sha=SHA,
             committee_home=tmp_path,
-            evidence_path=_write_items(tmp_path, [_item()]),
+            evidence_path=items_path,
             case_executor=lambda case: True,
-            settings=CommitteeShadowSettings(
-                opip_committee_mode=COMMITTEE_MODE_SHADOW
-            ),
+            settings=settings,
             now=NOW,
         )
 
@@ -599,8 +599,9 @@ def test_the_checkpoint_rebuilds_from_its_durable_file(tmp_path):
 
 def test_a_corrupt_disposition_row_blocks_reprocessing(tmp_path):
     (tmp_path / CYCLE_DISPOSITIONS_FILE).write_text("{not json\n", encoding="utf-8")
+    checkpoint = FileCheckpoint(tmp_path)
     with pytest.raises(CycleConfigurationError, match="cannot be reconstructed safely"):
-        FileCheckpoint(tmp_path).load_decided()
+        checkpoint.load_decided()
 
 
 def test_the_cycle_budget_can_be_supplied_by_the_caller(tmp_path):

@@ -285,13 +285,16 @@ def test_executor_is_idempotent_across_a_restart(tmp_path):
 
 
 def test_off_mode_refuses_executor_construction():
+    registry = _registry()
+    price_book = approved_price_book()
+    settings = _settings(COMMITTEE_MODE_OFF)
     with pytest.raises(ShadowExecutorConfigurationError, match="SHADOW mode"):
         ShadowCaseExecutor(
             committee_home=".",
-            registry=_registry(),
+            registry=registry,
             providers={},
-            price_book=approved_price_book(),
-            settings=_settings(COMMITTEE_MODE_OFF),
+            price_book=price_book,
+            settings=settings,
         )
 
 

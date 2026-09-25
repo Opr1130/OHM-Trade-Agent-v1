@@ -406,8 +406,9 @@ def test_off_mode_refuses_the_role_runtime(tmp_path):
         tmp_path,
         settings=CommitteeShadowSettings(opip_committee_mode=COMMITTEE_MODE_OFF),
     )
+    case = _case()
     with pytest.raises(CommitteePolicyViolation, match="disabled"):
-        runner.run_case(_case())
+        runner.run_case(case)
 
 
 def test_the_logical_role_seat_is_role_scoped_not_model_scoped():

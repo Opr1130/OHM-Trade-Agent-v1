@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
 
 from app.opip.committee.case_ingress import CaseIngressPopulation, load_case_envelopes
-from app.opip.committee.case_producer import CaseSourceError, produce_case_population
+from app.opip.committee.case_producer import produce_case_population
 from app.opip.committee.contracts import CommitteeCase
 from app.opip.committee.daily_ceiling import DailyCeiling, FileDailySpendStore
 from app.opip.committee.registry import APPROVED_MAX_DAILY_COST_MICROUNITS
@@ -55,10 +55,7 @@ from app.opip.committee.settings import (
     resolve_committee_cost_ceiling,
     resolve_committee_mode,
 )
-from app.opip.committee.shadow_executor import (
-    ShadowExecutorConfigurationError,
-    build_credentialled_shadow_executor,
-)
+from app.opip.committee.shadow_executor import build_credentialled_shadow_executor
 from app.opip.committee.trust import CommitteeInvestment, build_trust_report
 from app.opip.learning.canonical_replica import ReplicaVerificationError
 
@@ -545,9 +542,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             now=moment,
         )
     except (
-        CycleConfigurationError,
-        CaseSourceError,
-        ShadowExecutorConfigurationError,
+        # The Committee's own configuration errors all derive from ValueError, so
+        # ValueError alone covers them; ReplicaVerificationError is a RuntimeError
+        # and must stay named.
         ReplicaVerificationError,
         ValueError,
         OSError,

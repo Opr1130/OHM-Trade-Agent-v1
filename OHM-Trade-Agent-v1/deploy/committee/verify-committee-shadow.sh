@@ -37,7 +37,11 @@ pass() { printf 'PASS  %s\n' "$1"; return 0; }
 fail() { printf 'FAIL  %s\n' "$1"; failures=$((failures + 1)); return 0; }
 info() { printf 'INFO  %s\n' "$1"; return 0; }
 
-env_value() { sed -n "s/^$1=//p" "$ENV_FILE" 2>/dev/null | head -n1; }
+env_value() {
+  local key="$1"
+  sed -n "s/^${key}=//p" "$ENV_FILE" 2>/dev/null | head -n1
+  return 0
+}
 
 # --------------------------------------------------------------- rollback mode
 if [[ "${1:-}" == "--rollback" ]]; then
