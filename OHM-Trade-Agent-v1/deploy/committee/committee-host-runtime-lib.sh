@@ -507,6 +507,7 @@ provision_main() {
   if ! prove_cycle_runner_import "$STAGE/app" "$STAGE/venv/bin/python"; then
     fail_provision 82 "staged cycle_runner import failed"
   fi
+  install_runtime_tools "$script_dir" || fail_provision 81 "runtime tools were not installed"
   activate_staged_runtime
   if ! rewrite_nonsecret_env "$sha"; then
     # The new tree is active and proven, but configuration did not commit.
@@ -525,7 +526,6 @@ provision_main() {
     fi
     fail_provision 80 "environment update failed after staging; previous runtime restored when present"
   fi
-  install_runtime_tools "$script_dir" || fail_provision 81 "runtime tools were not installed"
   keep_timer_disabled || fail_provision 83 "Committee timer could not be stopped"
   if ! prove_cycle_runner_import "$APP_ROOT" "$VENV_PYTHON"; then
     fail_provision 82 "active import proof failed after configuration"
@@ -563,6 +563,25 @@ rollback_main() {
     echo "$_ROLLBACK_FAIL" >&2
     return 1
   fi
+  if [[ ! -f "$PREFIX/previous/app/.opip-release-sha" || -L "$PREFIX/previous/app/.opip-release-sha" ]]; then
+    force_mode_off_only || true
+    keep_timer_disabled || true
+    echo "$_ROLLBACK_FAIL" >&2
+    return 1
+  fi
+  local restored
+  restored="$(tr -d "$_TRIM" < "$PREFIX/previous/app/.opip-release-sha")" || {
+    force_mode_off_only || true
+    keep_timer_disabled || true
+    echo "$_ROLLBACK_FAIL" >&2
+    return 1
+  }
+  require_exact_sha "$restored" || {
+    force_mode_off_only || true
+    keep_timer_disabled || true
+    echo "$_ROLLBACK_FAIL" >&2
+    return 1
+  }
   local stamp
   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
   mkdir -p "$PREFIX/displaced/$stamp"
@@ -595,24 +614,19 @@ rollback_main() {
     echo "$_ROLLBACK_FAIL" >&2
     return 1
   fi
+  if ! rewrite_nonsecret_env "$restored"; then
+    rm -rf "$PREFIX/app" "$PREFIX/venv"
+    mv "$PREFIX/displaced/$stamp/app" "$PREFIX/app" || true
+    mv "$PREFIX/displaced/$stamp/venv" "$PREFIX/venv" || true
+    force_mode_off_only || true
+    keep_timer_disabled || true
+    echo "$_ROLLBACK_FAIL" >&2
+    return 1
+  fi
   mkdir -p "$PREFIX/previous"
   mv "$PREFIX/displaced/$stamp/app" "$PREFIX/previous/app"
   mv "$PREFIX/displaced/$stamp/venv" "$PREFIX/previous/venv"
   rmdir "$PREFIX/displaced/$stamp" 2>/dev/null || true
-  local restored
-  restored="$(tr -d "$_TRIM" < "$APP_ROOT/.opip-release-sha")"
-  require_exact_sha "$restored" || {
-    force_mode_off_only || true
-    keep_timer_disabled || true
-    echo "$_ROLLBACK_FAIL" >&2
-    return 1
-  }
-  rewrite_nonsecret_env "$restored" || {
-    force_mode_off_only || true
-    keep_timer_disabled || true
-    echo "$_ROLLBACK_FAIL" >&2
-    return 1
-  }
   if ! keep_timer_disabled; then
     echo "$_ROLLBACK_FAIL" >&2
     return 1
