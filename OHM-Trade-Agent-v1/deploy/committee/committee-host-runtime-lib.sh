@@ -283,6 +283,7 @@ keep_timer_disabled() {
   fi
   if command -v systemctl >/dev/null 2>&1; then
     systemctl disable opip-committee-shadow.timer >/dev/null 2>&1 || true
+    systemctl stop opip-committee-shadow.timer >/dev/null 2>&1 || true
   fi
 }
 
@@ -368,12 +369,16 @@ install_runtime_tools() {
 }
 
 restore_retiring() {
+  if [[ -e "$PREFIX/app.retiring" && -e "$PREFIX/app" ]]; then
+    return 1
+  fi
+  if [[ -e "$PREFIX/venv.retiring" && -e "$PREFIX/venv" ]]; then
+    return 1
+  fi
   if [[ -e "$PREFIX/app.retiring" ]]; then
-    rm -rf "$PREFIX/app"
     mv "$PREFIX/app.retiring" "$PREFIX/app"
   fi
   if [[ -e "$PREFIX/venv.retiring" ]]; then
-    rm -rf "$PREFIX/venv"
     mv "$PREFIX/venv.retiring" "$PREFIX/venv"
   fi
 }
@@ -383,7 +388,7 @@ fail_provision() {
   shift
   printf 'COMMITTEE_RUNTIME_INSTALL=FAIL %s\n' "$*" >&2
   if [[ "${SWAP_COMMITTED:-0}" != "1" ]]; then
-    restore_retiring
+    restore_retiring || true
   fi
   if [[ -n "${STAGE:-}" && -d "${STAGE}" ]]; then
     rm -rf "$STAGE"
@@ -394,7 +399,9 @@ fail_provision() {
 }
 
 activate_staged_runtime() {
-  rm -rf "$PREFIX/app.retiring" "$PREFIX/venv.retiring"
+  if [[ -e "$PREFIX/app.retiring" || -e "$PREFIX/venv.retiring" ]]; then
+    restore_retiring || fail_provision 81 "incomplete runtime swap is still present; refusing to discard either tree"
+  fi
   if [[ -e "$PREFIX/app" ]]; then
     mv "$PREFIX/app" "$PREFIX/app.retiring" || fail_provision 81 "could not move the active application aside"
   fi

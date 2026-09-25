@@ -441,6 +441,7 @@ def test_provision_scripts_do_not_open_egress_or_touch_trading_credentials() -> 
         assert forbidden not in combined, forbidden
     assert 'pip install' in lib
     assert 'requirements.txt' in lib
+    assert "systemctl stop opip-committee-shadow.timer" in lib
     bootstrap = (COMMITTEE / "bootstrap-opip-committee-worker.sh").read_text(encoding="utf-8")
     assert "provision-committee-host-runtime.sh" in bootstrap
     workflow = WORKFLOW.read_text(encoding="utf-8")
