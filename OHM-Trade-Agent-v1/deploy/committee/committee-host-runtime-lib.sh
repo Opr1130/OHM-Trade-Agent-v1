@@ -431,16 +431,19 @@ activate_staged_runtime() {
     fail_provision 82 "import proof failed; the previous runtime was restored"
   fi
   SWAP_COMMITTED=1
-  if [[ -e "$PREFIX/app.retiring" || -e "$PREFIX/venv.retiring" ]]; then
-    rm -rf "$PREFIX/previous"
+  if [[ -e "$PREFIX/app.retiring" ]]; then
+    mv "$PREFIX/app.retiring" "$PREFIX/previous.app.next" || fail_provision 81 "could not retain the previous application"
+    rm -rf "$PREFIX/previous/app"
     mkdir -p "$PREFIX/previous"
     chmod 0755 "$PREFIX/previous"
-    if [[ -e "$PREFIX/app.retiring" ]]; then
-      mv "$PREFIX/app.retiring" "$PREFIX/previous/app"
-    fi
-    if [[ -e "$PREFIX/venv.retiring" ]]; then
-      mv "$PREFIX/venv.retiring" "$PREFIX/previous/venv"
-    fi
+    mv "$PREFIX/previous.app.next" "$PREFIX/previous/app" || fail_provision 81 "could not publish the previous application"
+  fi
+  if [[ -e "$PREFIX/venv.retiring" ]]; then
+    mv "$PREFIX/venv.retiring" "$PREFIX/previous.venv.next" || fail_provision 81 "could not retain the previous interpreter"
+    rm -rf "$PREFIX/previous/venv"
+    mkdir -p "$PREFIX/previous"
+    chmod 0755 "$PREFIX/previous"
+    mv "$PREFIX/previous.venv.next" "$PREFIX/previous/venv" || fail_provision 81 "could not publish the previous interpreter"
   fi
   rm -rf "$STAGE"
   STAGE=""
@@ -506,8 +509,8 @@ provision_main() {
       mkdir -p "$PREFIX/previous"
       mv "$PREFIX/app.failed" "$PREFIX/previous/app" || fail_provision 80 "could not retain the failed application"
       mv "$PREFIX/venv.failed" "$PREFIX/previous/venv" || fail_provision 80 "could not retain the failed interpreter"
+      SWAP_COMMITTED=0
     fi
-    SWAP_COMMITTED=0
     fail_provision 80 "environment update failed after staging; previous runtime restored when present"
   fi
   install_runtime_tools "$script_dir" || fail_provision 81 "runtime tools were not installed"
