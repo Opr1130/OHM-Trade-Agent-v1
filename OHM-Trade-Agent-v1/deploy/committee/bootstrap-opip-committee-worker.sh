@@ -99,7 +99,7 @@ systemctl daemon-reload
 # Provision the exact release tree and virtualenv while mode is still off.
 # The timer decision below is unchanged: /deploy-committee does not pass
 # --enable-timer, so the timer stays disabled after provisioning.
-"$SOURCE_DIR/provision-committee-host-runtime.sh" "$TARGET_SHA"
+bash "$SOURCE_DIR/provision-committee-host-runtime.sh" "$TARGET_SHA"
 
 # The service is a `Type=oneshot` unit with no `[Install]` section: it is started by
 # the timer, never enabled on its own. Calling `systemctl enable` on it would fail
