@@ -16,6 +16,16 @@ from pathlib import Path
 
 import pytest
 
+from app.opip.committee.contracts import (
+    CaseType,
+    CommitteeCase,
+    CommitteePolicy,
+    EvidenceItem,
+    EvidenceSnapshot,
+    ProviderFamily,
+)
+from app.opip.committee import cycle_runner
+from app.opip.committee.case_ingress import CaseIngressPopulation
 from app.opip.committee.cycle_runner import (
     EXIT_CONFIG_ERROR,
     EXIT_OK,
@@ -29,6 +39,7 @@ from app.opip.committee.cycle_runner import (
     run_once,
 )
 from app.opip.committee.registry import APPROVED_MAX_DAILY_COST_MICROUNITS
+from app.opip.decision_intelligence.identity import Provenance
 from app.opip.committee.scheduler import (
     CommitteeScheduleDisposition,
     SchedulerBudget,
@@ -57,6 +68,117 @@ def _item(evidence_id: str = "ev-1", *, cost: int | None = 400_000) -> dict:
 def _write_items(root: Path, items: list[dict]) -> Path:
     path = root / EVIDENCE_ITEMS_FILE
     path.write_text("\n".join(json.dumps(item) for item in items) + "\n", encoding="utf-8")
+    return path
+
+
+def _case_ingress_row() -> dict:
+    policy = CommitteePolicy(
+        policy_version="policy-v1",
+        seated_providers=(ProviderFamily.OPENAI, ProviderFamily.ANTHROPIC),
+        prompt_template_id="committee-v1",
+        prompt_version="prompt-v1",
+        max_attempts_per_seat=1,
+        max_estimated_cost_microunits=500_000,
+    )
+    evidence = EvidenceItem(
+        evidence_id="fact-1",
+        source_id="canonical:1",
+        available_at=NOW,
+        payload={
+            "instrument_id": "BTCUSD",
+            "metric_name": "example",
+            "metric_value": "1",
+        },
+    )
+    snapshot = EvidenceSnapshot(
+        case_id="case-ingress-1",
+        case_type=CaseType.MARKET_OPPORTUNITY,
+        evidence_cutoff_at=NOW,
+        assembled_at=NOW,
+        items=(evidence,),
+        source_refs=("canonical:1",),
+        committee_policy_version=policy.policy_version,
+        prompt_template_id=policy.prompt_template_id,
+        prompt_version=policy.prompt_version,
+        instrument_id="BTCUSD",
+    )
+    case = CommitteeCase(
+        case_id="case-ingress-1",
+        case_type=CaseType.MARKET_OPPORTUNITY,
+        snapshot=snapshot,
+        policy=policy,
+        created_at=NOW,
+        provenance=Provenance(
+            producing_component="test.cycle_runner",
+            artifact_or_build_id="test",
+            process_instance_id="cycle-runner-1",
+            emitted_at=NOW,
+            source_record_refs=("canonical:1",),
+        ),
+        instrument_id="BTCUSD",
+    )
+    return {
+        "schema_version": 1,
+        "evidence_id": "queue-ingress-1",
+        "evidence_snapshot_hash": snapshot.snapshot_hash,
+        "committee_policy_version": policy.policy_version,
+        "committed": True,
+        "sealed": True,
+        "available_at": NOW.isoformat(),
+        "expires_at": None,
+        "estimated_cost_microunits": 400_000,
+        "case": {
+            "case_id": case.case_id,
+            "case_type": case.case_type.value,
+            "created_at": case.created_at.isoformat(),
+            "instrument_id": case.instrument_id,
+            "strategy_context_id": None,
+            "canonical_binding": None,
+            "policy": {
+                "policy_version": policy.policy_version,
+                "seated_providers": [
+                    family.value for family in policy.seated_providers
+                ],
+                "prompt_template_id": policy.prompt_template_id,
+                "prompt_version": policy.prompt_version,
+                "max_attempts_per_seat": policy.max_attempts_per_seat,
+                "max_estimated_cost_microunits": (
+                    policy.max_estimated_cost_microunits
+                ),
+            },
+            "snapshot": {
+                "case_id": snapshot.case_id,
+                "evidence_cutoff_at": snapshot.evidence_cutoff_at.isoformat(),
+                "assembled_at": snapshot.assembled_at.isoformat(),
+                "items": [
+                    {
+                        "evidence_id": evidence.evidence_id,
+                        "source_id": evidence.source_id,
+                        "available_at": evidence.available_at.isoformat(),
+                        "payload": dict(evidence.payload),
+                    }
+                ],
+                "source_refs": list(snapshot.source_refs),
+                "committee_policy_version": snapshot.committee_policy_version,
+                "prompt_template_id": snapshot.prompt_template_id,
+                "prompt_version": snapshot.prompt_version,
+                "instrument_id": snapshot.instrument_id,
+                "strategy_context_id": snapshot.strategy_context_id,
+            },
+            "provenance": {
+                "producing_component": case.provenance.producing_component,
+                "artifact_or_build_id": case.provenance.artifact_or_build_id,
+                "process_instance_id": case.provenance.process_instance_id,
+                "emitted_at": case.provenance.emitted_at.isoformat(),
+                "source_record_refs": list(case.provenance.source_record_refs),
+            },
+        },
+    }
+
+
+def _write_case_ingress(root: Path) -> Path:
+    path = root / "committed_committee_cases.jsonl"
+    path.write_text(json.dumps(_case_ingress_row()) + "\n", encoding="utf-8")
     return path
 
 
@@ -146,6 +268,71 @@ def test_no_provider_call_is_made_by_a_cycle(tmp_path):
     report = json.loads((tmp_path / TRUST_REPORT_FILE).read_text(encoding="utf-8"))
     # Latency is unmeasured because nothing was invoked.
     assert report["mean_latency_micros"] is None
+
+
+def test_validated_case_ingress_dispatches_the_exact_reconstructed_case(tmp_path):
+    seen: list[CommitteeCase] = []
+
+    def execute(case: CommitteeCase) -> bool:
+        seen.append(case)
+        return True
+
+    row = _case_ingress_row()
+    outcome = run_once(
+        release_sha=SHA,
+        committee_home=tmp_path,
+        evidence_path=tmp_path / EVIDENCE_ITEMS_FILE,
+        case_ingress_path=_write_case_ingress(tmp_path),
+        case_executor=execute,
+        settings=CommitteeShadowSettings(opip_committee_mode=COMMITTEE_MODE_SHADOW),
+        now=NOW,
+    )
+    assert outcome.dispositions[CommitteeScheduleDisposition.COMPLETED.value] == 1
+    assert len(seen) == 1
+    assert seen[0].case_id == row["case"]["case_id"]
+    assert seen[0].snapshot.snapshot_hash == row["evidence_snapshot_hash"]
+
+    daily = json.loads((tmp_path / "daily_spend.json").read_text(encoding="utf-8"))
+    today = daily[NOW.date().isoformat()]
+    assert today["spent_microunits"] == 400_000
+    assert today["reservations"] == 1
+
+
+def test_an_executor_cannot_run_without_validated_case_ingress(tmp_path):
+    items_path = _write_items(tmp_path, [_item()])
+    settings = CommitteeShadowSettings(opip_committee_mode=COMMITTEE_MODE_SHADOW)
+    with pytest.raises(
+        CycleConfigurationError,
+        match="case_executor requires validated case ingress",
+    ):
+        run_once(
+            release_sha=SHA,
+            committee_home=tmp_path,
+            evidence_path=items_path,
+            case_executor=lambda case: True,
+            settings=settings,
+            now=NOW,
+        )
+
+
+def test_daily_reservation_survives_executor_failure(tmp_path):
+    def fail(case: CommitteeCase) -> bool:
+        raise RuntimeError("scripted failure")
+
+    outcome = run_once(
+        release_sha=SHA,
+        committee_home=tmp_path,
+        evidence_path=tmp_path / EVIDENCE_ITEMS_FILE,
+        case_ingress_path=_write_case_ingress(tmp_path),
+        case_executor=fail,
+        settings=CommitteeShadowSettings(
+            opip_committee_mode=COMMITTEE_MODE_SHADOW
+        ),
+        now=NOW,
+    )
+    assert outcome.dispositions[CommitteeScheduleDisposition.FAILED.value] == 1
+    daily = json.loads((tmp_path / "daily_spend.json").read_text(encoding="utf-8"))
+    assert daily[NOW.date().isoformat()]["spent_microunits"] == 400_000
 
 
 def test_a_second_cycle_does_not_reprocess_the_same_evidence(tmp_path):
@@ -251,6 +438,114 @@ def test_an_evidence_row_missing_a_required_field_raises(tmp_path):
         load_evidence_items(path)
 
 
+# ------------------------------------------------- deployed runtime gate
+
+
+def test_main_shadow_requires_explicit_no_backfill_boundary(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(cycle_runner, "resolve_committee_mode", lambda: "shadow")
+    monkeypatch.setattr(
+        cycle_runner, "resolve_committee_cost_ceiling", lambda: 500_000
+    )
+    monkeypatch.delenv(cycle_runner.SHADOW_NOT_BEFORE_ENV, raising=False)
+    touched = []
+
+    def forbidden(*args, **kwargs):
+        touched.append(True)
+        raise AssertionError("source/executor must not be built without boundary")
+
+    monkeypatch.setattr(cycle_runner, "produce_case_population", forbidden)
+    monkeypatch.setattr(
+        cycle_runner, "build_credentialled_shadow_executor", forbidden
+    )
+    assert (
+        main(
+            [
+                "--release-sha",
+                SHA,
+                "--committee-home",
+                str(tmp_path),
+            ]
+        )
+        == EXIT_CONFIG_ERROR
+    )
+    assert touched == []
+
+
+def test_main_shadow_builds_from_verified_source_inputs_before_execution(
+    tmp_path, monkeypatch
+):
+    manifest = tmp_path / "manifest.env"
+    manifest.write_text(
+        f"production_deployed_sha={SHA}\n",
+        encoding="utf-8",
+    )
+    replica = tmp_path / "replica"
+    replica.mkdir()
+    monkeypatch.setattr(cycle_runner, "resolve_committee_mode", lambda: "shadow")
+    monkeypatch.setattr(
+        cycle_runner, "resolve_committee_cost_ceiling", lambda: 500_000
+    )
+    monkeypatch.setenv(cycle_runner.SHADOW_NOT_BEFORE_ENV, NOW.isoformat())
+    monkeypatch.setenv(cycle_runner.LEARNING_DATA_MANIFEST_ENV, str(manifest))
+    monkeypatch.setenv(cycle_runner.REPLICA_ROOT_ENV, str(replica))
+    calls = []
+
+    def produce(**kwargs):
+        calls.append(("produce", kwargs))
+        return CaseIngressPopulation(())
+
+    def build(**kwargs):
+        calls.append(("executor", kwargs))
+        return lambda case: True
+
+    monkeypatch.setattr(cycle_runner, "produce_case_population", produce)
+    monkeypatch.setattr(
+        cycle_runner, "build_credentialled_shadow_executor", build
+    )
+    assert (
+        main(
+            [
+                "--release-sha",
+                SHA,
+                "--committee-home",
+                str(tmp_path / "committee"),
+            ]
+        )
+        == EXIT_OK
+    )
+    assert [item[0] for item in calls] == ["produce", "executor"]
+    assert calls[0][1]["expected_source_release_sha"] == SHA
+    assert calls[0][1]["replica_repository_root"] == replica
+
+
+def test_cycle_case_limit_defaults_bounded_and_refuses_expansion(monkeypatch):
+    monkeypatch.delenv(cycle_runner.MAX_CASES_PER_CYCLE_ENV, raising=False)
+    assert cycle_runner._resolve_cycle_case_limit() == cycle_runner.DEFAULT_CYCLE_CASES
+    monkeypatch.setenv(
+        cycle_runner.MAX_CASES_PER_CYCLE_ENV,
+        str(cycle_runner.DEFAULT_CYCLE_CASES + 1),
+    )
+    with pytest.raises(CycleConfigurationError, match="must be in"):
+        cycle_runner._resolve_cycle_case_limit()
+
+
+def test_cycle_case_limit_can_pin_a_single_canary(monkeypatch):
+    monkeypatch.setenv(cycle_runner.MAX_CASES_PER_CYCLE_ENV, "1")
+    assert cycle_runner._resolve_cycle_case_limit() == 1
+
+
+def test_learning_manifest_source_sha_is_strict_and_unique(tmp_path):
+    manifest = tmp_path / "manifest.env"
+    manifest.write_text(
+        f"production_deployed_sha={SHA}\nproduction_deployed_sha={'b' * 40}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(CycleConfigurationError, match="exactly one"):
+        cycle_runner._production_sha_from_learning_manifest(manifest)
+
+
 # ------------------------------------------------- observability
 
 
@@ -302,9 +597,11 @@ def test_the_checkpoint_rebuilds_from_its_durable_file(tmp_path):
     assert len(restarted.load_decided()) == 1
 
 
-def test_a_corrupt_disposition_row_does_not_resurrect_a_decision(tmp_path):
+def test_a_corrupt_disposition_row_blocks_reprocessing(tmp_path):
     (tmp_path / CYCLE_DISPOSITIONS_FILE).write_text("{not json\n", encoding="utf-8")
-    assert FileCheckpoint(tmp_path).load_decided() == {}
+    checkpoint = FileCheckpoint(tmp_path)
+    with pytest.raises(CycleConfigurationError, match="cannot be reconstructed safely"):
+        checkpoint.load_decided()
 
 
 def test_the_cycle_budget_can_be_supplied_by_the_caller(tmp_path):

@@ -760,6 +760,127 @@ def role_result_from_dict(row: Mapping[str, Any]):
     )
 
 
+_ROLE_CASE_OUTCOME_KIND = "COMMITTEE_ROLE_CASE_OUTCOME"
+
+_ROLE_CASE_OUTCOME_FIELDS = frozenset(
+    {
+        "kind",
+        "role_case_outcome_id",
+        "schema_version",
+        "case_id",
+        "evidence_snapshot_hash",
+        "committee_policy_version",
+        "policy_hash",
+        "registry_version",
+        "registry_hash",
+        "phase",
+        "started_at",
+        "completed_at",
+        "role_results",
+        "spent_microunits",
+        "cost_completeness",
+        "ceiling_verified",
+        "canonical_binding",
+        "provenance",
+    }
+)
+
+
+def role_case_outcome_to_dict(outcome) -> dict[str, Any]:
+    """Encode one role-governed case outcome, self-contained.
+
+    The role results are written inline rather than referenced, so a case outcome
+    can be reconstructed without depending on a second stream. A missing
+    reference could silently degrade a case into a partial one; an inline copy
+    cannot.
+    """
+    return {
+        "kind": _ROLE_CASE_OUTCOME_KIND,
+        "role_case_outcome_id": outcome.role_case_outcome_id,
+        "schema_version": outcome.schema_version,
+        "case_id": outcome.case_id,
+        "evidence_snapshot_hash": outcome.evidence_snapshot_hash,
+        "committee_policy_version": outcome.committee_policy_version,
+        "policy_hash": outcome.policy_hash,
+        "registry_version": outcome.registry_version,
+        "registry_hash": outcome.registry_hash,
+        "phase": outcome.phase.value,
+        "started_at": _iso(outcome.started_at),
+        "completed_at": _iso(outcome.completed_at),
+        "role_results": [
+            role_result_to_dict(result) for result in outcome.role_results
+        ],
+        "spent_microunits": outcome.spent_microunits,
+        "cost_completeness": outcome.cost_completeness.value,
+        "ceiling_verified": outcome.ceiling_verified,
+        "canonical_binding": (
+            None
+            if outcome.canonical_binding is None
+            else {
+                "decision_id": outcome.canonical_binding.decision_id,
+                "episode_id": outcome.canonical_binding.episode_id,
+            }
+        ),
+        "provenance": _encode_provenance(outcome.provenance),
+    }
+
+
+def role_case_outcome_from_dict(row: Mapping[str, Any]):
+    """Decode a role-governed case outcome, refusing a row of another kind."""
+    from app.opip.committee.contracts import CanonicalDecisionBinding, CostCompleteness
+    from app.opip.committee.role_runtime import RoleGovernedCaseOutcome
+
+    if not isinstance(row, Mapping):
+        raise CommitteeSerializationError("role case outcome must be an object")
+    kind = row.get("kind")
+    if kind != _ROLE_CASE_OUTCOME_KIND:
+        raise CommitteeSerializationError(
+            f"expected a {_ROLE_CASE_OUTCOME_KIND} row, found {kind!r}"
+        )
+    _reject_unknown(row, _ROLE_CASE_OUTCOME_FIELDS, kind="role case outcome")
+    raw_results = row.get("role_results")
+    if not isinstance(raw_results, list):
+        raise CommitteeSerializationError("role_results must be a list")
+    raw_binding = row.get("canonical_binding")
+    if raw_binding is not None and not isinstance(raw_binding, Mapping):
+        raise CommitteeSerializationError("canonical_binding must be an object or null")
+    outcome = RoleGovernedCaseOutcome(
+        schema_version=row.get("schema_version"),
+        case_id=row.get("case_id"),
+        evidence_snapshot_hash=row.get("evidence_snapshot_hash"),
+        committee_policy_version=row.get("committee_policy_version"),
+        policy_hash=row.get("policy_hash"),
+        registry_version=row.get("registry_version"),
+        registry_hash=row.get("registry_hash"),
+        phase=_parse_enum(row.get("phase"), EvaluationPhase, field="phase"),
+        started_at=_parse_dt(row.get("started_at"), field="started_at"),
+        completed_at=_parse_dt(row.get("completed_at"), field="completed_at"),
+        role_results=tuple(
+            role_result_from_dict(item) for item in raw_results
+        ),
+        spent_microunits=row.get("spent_microunits"),
+        cost_completeness=_parse_enum(
+            row.get("cost_completeness"), CostCompleteness, field="cost_completeness"
+        ),
+        ceiling_verified=row.get("ceiling_verified"),
+        canonical_binding=(
+            None
+            if raw_binding is None
+            else CanonicalDecisionBinding(
+                decision_id=raw_binding.get("decision_id"),
+                episode_id=raw_binding.get("episode_id"),
+            )
+        ),
+        provenance=_decode_provenance(row.get("provenance")),
+    )
+    recorded = row.get("role_case_outcome_id")
+    if recorded != outcome.role_case_outcome_id:
+        raise CommitteeSerializationError(
+            "persisted role case outcome id does not match its content identity"
+        )
+    return outcome
+
+
 def schedule_disposition_to_dict(record) -> dict[str, Any]:
     """Encode one scheduler disposition with an explicit record kind.
 
@@ -1966,6 +2087,8 @@ __all__ = [
     "schedule_disposition_to_dict",
     "role_result_from_dict",
     "role_result_to_dict",
+    "role_case_outcome_from_dict",
+    "role_case_outcome_to_dict",
     "population_tally_from_dict",
     "population_tally_to_dict",
     "prospective_record_from_dict",

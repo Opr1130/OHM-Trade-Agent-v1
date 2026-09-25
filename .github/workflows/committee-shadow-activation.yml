@@ -1,0 +1,464 @@
+name: committee-shadow-activation
+
+# O'Pip Intelligence Committee — OFF -> credentialled SHADOW control plane (IC-043).
+#
+# This is the separately authorised activation boundary the OFF installation
+# deliberately stops short of. It is a distinct workflow from `deploy-committee.yml`
+# on purpose: the install workflow must keep proving that it never activates
+# credentialled SHADOW calls, and a single file cannot honestly assert both.
+#
+# It performs four owner-gated operations, selected by the command in the issue
+# comment. Every one of them is maintainer-visible in the receipt:
+#
+#   /shadow-committee <40-char-sha> <not-before-iso8601> <review-by-iso8601>
+#         Activate: prove both dedicated provider credentials exist, pin provider-only
+#         egress, set mode shadow with an explicit UTC activation boundary and a
+#         registry review date, cap a cycle at one case, and leave the timer disabled.
+#   /committee-canary <40-char-sha>
+#         Run exactly one bounded cycle with the recurring timer still disabled.
+#   /committee-timer <40-char-sha>
+#         Enable the existing bounded recurring timer, keeping the one-case cap.
+#   /rollback-committee
+#         Return the plane to OFF with deny-all egress. Advisory evidence survives.
+#
+# It never carries a provider credential value: the activation script reads the
+# host's own protected environment file and reports only presence verdicts. It
+# never touches a Kraken or Telegram credential, and it grants no trading authority.
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  actions: read
+  issues: write
+
+concurrency:
+  group: opip-committee
+  cancel-in-progress: false
+
+jobs:
+  control:
+    if: >-
+      github.event.issue.number == 64 &&
+      github.event.comment.user.login == github.repository_owner &&
+      github.event.comment.author_association == 'OWNER' &&
+      (startsWith(github.event.comment.body, '/shadow-committee ') ||
+       startsWith(github.event.comment.body, '/committee-canary ') ||
+       startsWith(github.event.comment.body, '/committee-timer ') ||
+       startsWith(github.event.comment.body, '/rollback-committee'))
+    runs-on: ubuntu-latest
+    environment: committee-shadow
+    steps:
+      - name: Resolve owner command
+        id: command
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          set -euo pipefail
+          BODY="$COMMENT_BODY"
+          if [[ "$BODY" =~ ^/shadow-committee[[:space:]]+([0-9a-f]{40})[[:space:]]+([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2}))[[:space:]]+([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2}))[[:space:]]*$ ]]; then
+            echo "command=shadow" >> "$GITHUB_OUTPUT"
+            echo "sha=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+            echo "not_before=${BASH_REMATCH[2]}" >> "$GITHUB_OUTPUT"
+            echo "review_by=${BASH_REMATCH[3]}" >> "$GITHUB_OUTPUT"
+          elif [[ "$BODY" =~ ^/committee-canary[[:space:]]+([0-9a-f]{40})[[:space:]]*$ ]]; then
+            echo "command=canary" >> "$GITHUB_OUTPUT"
+            echo "sha=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+          elif [[ "$BODY" =~ ^/committee-timer[[:space:]]+([0-9a-f]{40})[[:space:]]*$ ]]; then
+            echo "command=timer" >> "$GITHUB_OUTPUT"
+            echo "sha=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+          elif [[ "$BODY" =~ ^/rollback-committee[[:space:]]*$ ]]; then
+            echo "command=rollback" >> "$GITHUB_OUTPUT"
+          else
+            echo "Refusing committee activation: unrecognised command." >&2
+            echo "Formats: /shadow-committee <40-char-sha> <not-before-iso8601> <review-by-iso8601>, /committee-canary <40-char-sha>, /committee-timer <40-char-sha>, /rollback-committee" >&2
+            exit 64
+          fi
+
+      - name: Require target to equal current main
+        if: steps.command.outputs.sha != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ steps.command.outputs.sha }}
+        run: |
+          set -euo pipefail
+          MAIN_SHA="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq '.sha')"
+          test "$TARGET_SHA" = "$MAIN_SHA" || {
+            echo "Refusing committee activation: target is not current main." >&2
+            exit 65
+          }
+
+      - name: Require successful exact-SHA CI
+        if: steps.command.outputs.sha != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ steps.command.outputs.sha }}
+        run: |
+          set -euo pipefail
+          RESULT="$(gh run list \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow pytest.yml \
+            --branch main \
+            --commit "$TARGET_SHA" \
+            --limit 1 \
+            --json status,conclusion \
+            --jq '.[0] | [.status,.conclusion] | @tsv')"
+          test "$RESULT" = $'completed\tsuccess' || {
+            echo "Refusing committee activation: pytest.yml is not successful for the exact SHA." >&2
+            exit 1
+          }
+
+      - name: Check out exact approved release
+        if: steps.command.outputs.sha != ''
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.command.outputs.sha }}
+          persist-credentials: false
+
+      - name: Validate committee host connection secrets
+        env:
+          HOST: ${{ secrets.OPIP_LEARNING_HOST }}
+          USER: ${{ secrets.OPIP_LEARNING_USER }}
+          SSH_KEY_B64: ${{ secrets.OPIP_LEARNING_SSH_KEY_B64 }}
+          KNOWN_HOSTS: ${{ secrets.OPIP_LEARNING_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST"
+          test -n "$USER"
+          test -n "$SSH_KEY_B64"
+          test -n "$KNOWN_HOSTS"
+
+      - name: Configure pinned SSH identity
+        env:
+          SSH_KEY_B64: ${{ secrets.OPIP_LEARNING_SSH_KEY_B64 }}
+          KNOWN_HOSTS: ${{ secrets.OPIP_LEARNING_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s' "$SSH_KEY_B64" | base64 --decode > ~/.ssh/opip_committee
+          chmod 600 ~/.ssh/opip_committee
+          ssh-keygen -y -f ~/.ssh/opip_committee >/dev/null
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Upload exact release tree
+        if: steps.command.outputs.sha != ''
+        env:
+          HOST: ${{ secrets.OPIP_LEARNING_HOST }}
+          USER: ${{ secrets.OPIP_LEARNING_USER }}
+          PORT: ${{ secrets.OPIP_LEARNING_PORT }}
+          TARGET_SHA: ${{ steps.command.outputs.sha }}
+        run: |
+          set -euo pipefail
+          PORT="${PORT:-22}"
+          SSH=(ssh -i ~/.ssh/opip_committee -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -p "$PORT")
+          REMOTE="$USER@$HOST"
+          RELEASE_DIR="/var/tmp/opip-committee-$TARGET_SHA-$GITHUB_RUN_ID"
+          "${SSH[@]}" "$REMOTE" "sudo -n install -d -o root -g root -m 0700 '$RELEASE_DIR'"
+          git archive --format=tar "$TARGET_SHA" | "${SSH[@]}" "$REMOTE" "sudo -n tar -xf - -C '$RELEASE_DIR'"
+
+      # ------------------------------------------------------------ activate
+      - name: Activate credentialled SHADOW (timer stays disabled)
+        id: activate
+        if: steps.command.outputs.command == 'shadow'
+        continue-on-error: true
+        env:
+          HOST: ${{ secrets.OPIP_LEARNING_HOST }}
+          USER: ${{ secrets.OPIP_LEARNING_USER }}
+          PORT: ${{ secrets.OPIP_LEARNING_PORT }}
+          TARGET_SHA: ${{ steps.command.outputs.sha }}
+          NOT_BEFORE: ${{ steps.command.outputs.not_before }}
+          REVIEW_BY: ${{ steps.command.outputs.review_by }}
+        run: |
+          set +e
+          PORT="${PORT:-22}"
+          RELEASE_DIR="/var/tmp/opip-committee-$TARGET_SHA-$GITHUB_RUN_ID"
+          ssh \
+            -i ~/.ssh/opip_committee \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=20 \
+            -p "$PORT" \
+            "$USER@$HOST" \
+            "sudo -n bash '$RELEASE_DIR/OHM-Trade-Agent-v1/deploy/committee/activate-committee-shadow.sh' '$TARGET_SHA' '$NOT_BEFORE' '$REVIEW_BY'" \
+            2>&1 | tee committee-activate.log
+          RC=${PIPESTATUS[0]}
+          ACT_MARKER=0
+          if [[ "$RC" -eq 0 ]] && grep -q '^SHADOW_ACTIVATION=PASS' committee-activate.log; then
+            ACT_MARKER=1
+          fi
+          # Install the proof helper at a stable path so the rollback command can
+          # return the plane to OFF without needing a release tree. It is the same
+          # reviewed artifact from the exact release SHA, never inline logic.
+          if [[ "$ACT_MARKER" -eq 1 ]]; then
+            ssh \
+              -i ~/.ssh/opip_committee \
+              -o BatchMode=yes \
+              -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes \
+              -p "$PORT" \
+              "$USER@$HOST" \
+              "sudo -n install -m 0755 -o root -g root '$RELEASE_DIR/OHM-Trade-Agent-v1/deploy/committee/verify-committee-shadow.sh' /usr/local/sbin/opip-committee-shadow-proof"
+          fi
+          echo "rc=$RC" >> "$GITHUB_OUTPUT"
+          if [[ "$ACT_MARKER" -eq 1 ]]; then
+            echo "result=ACTIVATED" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=FAILED" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+
+      - name: Prove SHADOW mode
+        id: shadow_proof
+        if: steps.command.outputs.command == 'shadow'
+        continue-on-error: true
+        env:
+          HOST: ${{ secrets.OPIP_LEARNING_HOST }}
+          USER: ${{ secrets.OPIP_LEARNING_USER }}
+          PORT: ${{ secrets.OPIP_LEARNING_PORT }}
+        run: |
+          set +e
+          PORT="${PORT:-22}"
+          RELEASE_DIR="/var/tmp/opip-committee-${{ steps.command.outputs.sha }}-$GITHUB_RUN_ID"
+          ssh \
+            -i ~/.ssh/opip_committee \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -p "$PORT" \
+            "$USER@$HOST" \
+            "sudo -n bash '$RELEASE_DIR/OHM-Trade-Agent-v1/deploy/committee/verify-committee-shadow.sh'" \
+            2>&1 | tee committee-shadow-proof.log
+          RC=${PIPESTATUS[0]}
+          echo "rc=$RC" >> "$GITHUB_OUTPUT"
+          if [[ "$RC" -eq 0 ]] && grep -q '^SHADOW_PROOF=PASS$' committee-shadow-proof.log; then
+            echo "result=PROVEN" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=FAILED" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+
+      # -------------------------------------------------------------- canary
+      - name: Run one bounded credentialled canary cycle (timer disabled)
+        id: canary
+        if: steps.command.outputs.command == 'canary'
+        continue-on-error: true
+        env:
+          HOST: ${{ secrets.OPIP_LEARNING_HOST }}
+          USER: ${{ secrets.OPIP_LEARNING_USER }}
+          PORT: ${{ secrets.OPIP_LEARNING_PORT }}
+          TARGET_SHA: ${{ steps.command.outputs.sha }}
+        run: |
+          set +e
+          PORT="${PORT:-22}"
+          ssh \
+            -i ~/.ssh/opip_committee \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=20 \
+            -p "$PORT" \
+            "$USER@$HOST" \
+            "sudo -n systemctl start opip-committee-shadow.service" \
+            2>&1 | tee committee-canary.log
+          RC=${PIPESTATUS[0]}
+          ssh \
+            -i ~/.ssh/opip_committee \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -p "$PORT" \
+            "$USER@$HOST" \
+            "sudo -n journalctl -u opip-committee-shadow.service -n 40 --no-pager" \
+            2>&1 | tee -a committee-canary.log
+          # Report the durable advisory counts. Only counts and dispositions are
+          # printed: no model output, no environment, no credential.
+          ssh \
+            -i ~/.ssh/opip_committee \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -p "$PORT" \
+            "$USER@$HOST" \
+            "sudo -n sh -c 'd=/var/lib/opip-committee; for f in role_results.jsonl role_case_outcomes.jsonl cycle_dispositions.jsonl daily_spend.json; do if [ -f \"\$d/\$f\" ]; then printf \"%s lines=%s\\n\" \"\$f\" \"\$(wc -l < \"\$d/\$f\")\"; else printf \"%s ABSENT\\n\" \"\$f\"; fi; done'" \
+            2>&1 | tee -a committee-canary.log
+          echo "rc=$RC" >> "$GITHUB_OUTPUT"
+          if [[ "$RC" -eq 0 ]]; then
+            echo "result=RAN" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=FAILED" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+
+      # --------------------------------------------------------------- timer
+      - name: Enable the bounded recurring timer
+        id: timer
+        if: steps.command.outputs.command == 'timer'
+        continue-on-error: true
+        env:
+          HOST: ${{ secrets.OPIP_LEARNING_HOST }}
+          USER: ${{ secrets.OPIP_LEARNING_USER }}
+          PORT: ${{ secrets.OPIP_LEARNING_PORT }}
+          TARGET_SHA: ${{ steps.command.outputs.sha }}
+        run: |
+          set +e
+          PORT="${PORT:-22}"
+          ssh \
+            -i ~/.ssh/opip_committee \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -p "$PORT" \
+            "$USER@$HOST" \
+            "sudo -n systemctl enable --now opip-committee-shadow.timer" \
+            2>&1 | tee committee-timer.log
+          RC=${PIPESTATUS[0]}
+          echo "rc=$RC" >> "$GITHUB_OUTPUT"
+          if [[ "$RC" -eq 0 ]]; then
+            echo "result=ENABLED" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=FAILED" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+
+      # ------------------------------------------------------------ rollback
+      - name: Return the plane to OFF and prove it
+        id: rollback
+        if: steps.command.outputs.command == 'rollback'
+        continue-on-error: true
+        env:
+          HOST: ${{ secrets.OPIP_LEARNING_HOST }}
+          USER: ${{ secrets.OPIP_LEARNING_USER }}
+          PORT: ${{ secrets.OPIP_LEARNING_PORT }}
+        run: |
+          set +e
+          PORT="${PORT:-22}"
+          ssh \
+            -i ~/.ssh/opip_committee \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -p "$PORT" \
+            "$USER@$HOST" \
+            "sudo -n bash /usr/local/sbin/opip-committee-shadow-proof --rollback" \
+            2>&1 | tee committee-rollback.log
+          RC=${PIPESTATUS[0]}
+          echo "rc=$RC" >> "$GITHUB_OUTPUT"
+          if [[ "$RC" -eq 0 ]] && grep -q '^ROLLBACK_PROOF=PASS$' committee-rollback.log; then
+            echo "result=ROLLED_BACK" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=FAILED" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+
+      - name: Clean remote release
+        id: committee_cleanup
+        if: always() && steps.command.outputs.sha != ''
+        env:
+          HOST: ${{ secrets.OPIP_LEARNING_HOST }}
+          USER: ${{ secrets.OPIP_LEARNING_USER }}
+          PORT: ${{ secrets.OPIP_LEARNING_PORT }}
+          TARGET_SHA: ${{ steps.command.outputs.sha }}
+        run: |
+          set +e
+          PORT="${PORT:-22}"
+          RELEASE_DIR="/var/tmp/opip-committee-$TARGET_SHA-$GITHUB_RUN_ID"
+          ssh \
+            -i ~/.ssh/opip_committee \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -p "$PORT" \
+            "$USER@$HOST" \
+            "sudo -n rm -rf -- '$RELEASE_DIR'"
+          RC=$?
+          echo "rc=$RC" >> "$GITHUB_OUTPUT"
+          if [[ "$RC" -eq 0 ]]; then
+            echo "result=CLEANED" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=FAILED" >> "$GITHUB_OUTPUT"
+          fi
+          exit "$RC"
+
+      - name: Publish committee activation receipt
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMAND: ${{ steps.command.outputs.command }}
+          TARGET_SHA: ${{ steps.command.outputs.sha }}
+          RESULTS: >-
+            activate=${{ steps.activate.outputs.result }} shadow=${{ steps.shadow_proof.outputs.result }}
+            canary=${{ steps.canary.outputs.result }} timer=${{ steps.timer.outputs.result }}
+            rollback=${{ steps.rollback.outputs.result }}
+          CLEANUP_RESULT: ${{ steps.committee_cleanup.outputs.result }}
+          CLEANUP_RC: ${{ steps.committee_cleanup.outputs.rc }}
+        run: |
+          set -euo pipefail
+          RUN_URL="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          PROOF="$(
+            grep -hE '^(PASS|FAIL|INFO|ROLLBACK_APPLIED=|SHADOW_ACTIVATION=|SHADOW_PROOF=)' \
+              committee-activate.log committee-shadow-proof.log committee-canary.log \
+              committee-timer.log committee-rollback.log 2>/dev/null || true
+          )"
+          BODY=$(cat <<EOF
+          ## O'Pip Intelligence Committee Activation Receipt
+
+          - **Command:** \`$COMMAND\`
+          - **SHA:** \`$TARGET_SHA\`
+          - **Stage results:** ${RESULTS//$'\n'/ }
+          - **Remote cleanup:** ${CLEANUP_RESULT:-NOT RUN} (rc=${CLEANUP_RC:-N/A})
+          - **Workflow run:** $RUN_URL
+
+          \`\`\`
+          $PROOF
+          \`\`\`
+
+          This workflow is the separately authorised OFF -> credentialled SHADOW boundary.
+          It reports presence verdicts and proof lines only: it never prints an
+          environment file, a credential name, a credential value, or model output.
+          The Committee remains a measurement plane. It grants no order, sizing,
+          protection, exchange, Telegram, or funded/live trading authority, and it never
+          touches a Kraken or Telegram credential.
+          EOF
+          )
+          gh api --method POST "repos/$GITHUB_REPOSITORY/issues/64/comments" -f body="$BODY" >/dev/null
+
+      - name: Fail unless the requested operation succeeded
+        if: always()
+        env:
+          COMMAND: ${{ steps.command.outputs.command }}
+          ACTIVATE_RESULT: ${{ steps.activate.outputs.result }}
+          SHADOW_RESULT: ${{ steps.shadow_proof.outputs.result }}
+          CANARY_RESULT: ${{ steps.canary.outputs.result }}
+          TIMER_RESULT: ${{ steps.timer.outputs.result }}
+          ROLLBACK_RESULT: ${{ steps.rollback.outputs.result }}
+          CLEANUP_RESULT: ${{ steps.committee_cleanup.outputs.result }}
+        run: |
+          set -euo pipefail
+          case "$COMMAND" in
+            shadow)
+              test "$ACTIVATE_RESULT" = "ACTIVATED" || { echo "SHADOW activation did not succeed." >&2; exit 1; }
+              test "$SHADOW_RESULT" = "PROVEN" || { echo "SHADOW mode was not proven." >&2; exit 1; }
+              ;;
+            canary)
+              test "$CANARY_RESULT" = "RAN" || { echo "Canary cycle did not run." >&2; exit 1; }
+              ;;
+            timer)
+              test "$TIMER_RESULT" = "ENABLED" || { echo "The recurring timer was not enabled." >&2; exit 1; }
+              ;;
+            rollback)
+              test "$ROLLBACK_RESULT" = "ROLLED_BACK" || { echo "Rollback was not proven." >&2; exit 1; }
+              ;;
+            *)
+              echo "Unrecognised command '$COMMAND'." >&2
+              exit 1
+              ;;
+          esac
+          if [[ "$COMMAND" != "rollback" ]]; then
+            test "$CLEANUP_RESULT" = "CLEANED" || { echo "The temporary remote release directory was not removed." >&2; exit 1; }
+          fi

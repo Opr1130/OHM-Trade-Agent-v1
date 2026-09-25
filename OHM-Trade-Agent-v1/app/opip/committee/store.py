@@ -43,6 +43,10 @@ from app.opip.committee.serialization import (
     outcome_observation_to_dict,
     prospective_evaluation_to_dict,
     prospective_record_from_dict,
+    role_case_outcome_from_dict,
+    role_case_outcome_to_dict,
+    role_result_from_dict,
+    role_result_to_dict,
     sealed_prediction_to_dict,
 )
 from app.opip.storage.bounded_jsonl import (
@@ -69,6 +73,10 @@ REJECTIONS_MAX_BYTES = 4 * 1024 * 1024
 REJECTIONS_KEEP_LINES = 20_000
 INELIGIBILITIES_MAX_BYTES = 4 * 1024 * 1024
 INELIGIBILITIES_KEEP_LINES = 20_000
+ROLE_RESULTS_MAX_BYTES = 8 * 1024 * 1024
+ROLE_RESULTS_KEEP_LINES = 20_000
+ROLE_CASE_OUTCOMES_MAX_BYTES = 8 * 1024 * 1024
+ROLE_CASE_OUTCOMES_KEEP_LINES = 20_000
 
 #: Reasons an append is acknowledged without writing a new row.
 REASON_STORED = "STORED"
@@ -123,6 +131,14 @@ def _parse_rejection_line(line: bytes):
 
 def _parse_ineligibility_line(line: bytes):
     return prospective_ineligibility_from_dict(parse_json_object_line(line))
+
+
+def _parse_role_result_line(line: bytes):
+    return role_result_from_dict(parse_json_object_line(line))
+
+
+def _parse_role_case_outcome_line(line: bytes):
+    return role_case_outcome_from_dict(parse_json_object_line(line))
 
 
 def _prospective_visible_at(row: Any) -> datetime:
@@ -196,6 +212,10 @@ class CommitteeEvidenceStore:
         rejections_keep_lines: int = REJECTIONS_KEEP_LINES,
         ineligibilities_max_bytes: int = INELIGIBILITIES_MAX_BYTES,
         ineligibilities_keep_lines: int = INELIGIBILITIES_KEEP_LINES,
+        role_results_max_bytes: int = ROLE_RESULTS_MAX_BYTES,
+        role_results_keep_lines: int = ROLE_RESULTS_KEEP_LINES,
+        role_case_outcomes_max_bytes: int = ROLE_CASE_OUTCOMES_MAX_BYTES,
+        role_case_outcomes_keep_lines: int = ROLE_CASE_OUTCOMES_KEEP_LINES,
     ) -> None:
         self.root = Path(root)
         self.call_lock_file = self.root / ".call_outcomes.lock"
@@ -205,6 +225,8 @@ class CommitteeEvidenceStore:
         self.attribution_lock_file = self.root / ".attributions.lock"
         self.rejection_lock_file = self.root / ".call_rejections.lock"
         self.ineligibility_lock_file = self.root / ".prospective_ineligible.lock"
+        self.role_result_lock_file = self.root / ".role_results.lock"
+        self.role_case_lock_file = self.root / ".role_case_outcomes.lock"
         self.calls_index_file = self.root / "call_outcome_index.json"
         self.cases_index_file = self.root / "case_outcome_index.json"
         self.evaluations_index_file = self.root / "evaluation_index.json"
@@ -212,6 +234,8 @@ class CommitteeEvidenceStore:
         self.attribution_index_file = self.root / "attribution_index.json"
         self.rejections_index_file = self.root / "call_rejection_index.json"
         self.ineligibility_index_file = self.root / "prospective_ineligible_index.json"
+        self.role_results_index_file = self.root / "role_result_index.json"
+        self.role_cases_index_file = self.root / "role_case_outcome_index.json"
         self._calls = BoundedJsonlArchive(
             data_file=self.root / "call_outcomes.jsonl",
             archive_dir=self.root / "archive_calls",
@@ -276,6 +300,24 @@ class CommitteeEvidenceStore:
             archive_prefix="ineligible",
             parse_line=_parse_ineligibility_line,
             visible_at=lambda row: row.detected_at,
+        )
+        self._role_results = BoundedJsonlArchive(
+            data_file=self.root / "role_results.jsonl",
+            archive_dir=self.root / "archive_role_results",
+            max_bytes=role_results_max_bytes,
+            keep_lines=role_results_keep_lines,
+            archive_prefix="role_results",
+            parse_line=_parse_role_result_line,
+            visible_at=lambda row: row.recorded_at,
+        )
+        self._role_case_outcomes = BoundedJsonlArchive(
+            data_file=self.root / "role_case_outcomes.jsonl",
+            archive_dir=self.root / "archive_role_case_outcomes",
+            max_bytes=role_case_outcomes_max_bytes,
+            keep_lines=role_case_outcomes_keep_lines,
+            archive_prefix="role_case_outcomes",
+            parse_line=_parse_role_case_outcome_line,
+            visible_at=lambda row: row.started_at,
         )
 
     # ---------------------------------------------------------------- calls
@@ -532,6 +574,103 @@ class CommitteeEvidenceStore:
             if row.case_outcome_id in seen:
                 continue
             seen.add(row.case_outcome_id)
+            yield row
+
+    # ----------------------------------------------------------- role results
+
+    def append_role_result(self, result) -> StoreAppendResult:
+        """Append one governed role result, or acknowledge an identical one.
+
+        A logical role seat is immutable once recorded: the first durable result
+        for a role's observation identity is the only one accepted, so a
+        redelivered case cannot replace an answer or manufacture a second paid
+        opinion. A materially different result for the same logical seat is
+        refused rather than appended.
+        """
+        self.root.mkdir(parents=True, exist_ok=True)
+        with registry_lock(self.role_result_lock_file):
+            self._role_results.repair_tail()
+            for existing in self.iter_role_results():
+                if existing.logical_observation_id != result.logical_observation_id:
+                    continue
+                if existing.role_result_id == result.role_result_id:
+                    return StoreAppendResult(
+                        False, result.role_result_id, REASON_DUPLICATE
+                    )
+                raise CommitteeSerializationError(
+                    "a role result already exists for this logical role seat with "
+                    "different content; the recorded result is preserved and the "
+                    "divergent one is refused"
+                )
+            self._role_results.append_encoded_locked(
+                encode_row(role_result_to_dict(result))
+            )
+            self._compact(self._role_results, "role result")
+            return StoreAppendResult(True, result.role_result_id, REASON_STORED)
+
+    def iter_role_results(self, *, include_archive: bool = True) -> Iterator[Any]:
+        seen: set[str] = set()
+        if include_archive:
+            for row in self._role_results.iter_archive_rows():
+                if row.role_result_id in seen:
+                    continue
+                seen.add(row.role_result_id)
+                yield row
+        for row in self._role_results.iter_hot_rows():
+            if row.role_result_id in seen:
+                continue
+            seen.add(row.role_result_id)
+            yield row
+
+    def append_role_case_outcome(self, outcome) -> StoreAppendResult:
+        """Append one role-governed case outcome, or acknowledge a duplicate.
+
+        A case may hold only one role-governed outcome. A second outcome for the
+        same case with a different canonical binding fails closed, so an opinion
+        obtained for one decision can never be durably reattributed to another.
+        """
+        self.root.mkdir(parents=True, exist_ok=True)
+        with registry_lock(self.role_case_lock_file):
+            self._role_case_outcomes.repair_tail()
+            known = self._load_role_case_ids()
+            if outcome.role_case_outcome_id in known:
+                return StoreAppendResult(
+                    False, outcome.role_case_outcome_id, REASON_DUPLICATE
+                )
+            for existing in self.iter_role_case_outcomes():
+                if existing.case_id != outcome.case_id:
+                    continue
+                if existing.canonical_binding != outcome.canonical_binding:
+                    raise CommitteeSerializationError(
+                        f"case {outcome.case_id!r} already has a role-governed "
+                        "outcome with a different canonical binding; a reused case "
+                        "cannot be reattributed to another decision"
+                    )
+                return StoreAppendResult(
+                    False, outcome.role_case_outcome_id, REASON_DUPLICATE
+                )
+            self._role_case_outcomes.append_encoded_locked(
+                encode_row(role_case_outcome_to_dict(outcome))
+            )
+            known.add(outcome.role_case_outcome_id)
+            self._save_role_case_ids(known)
+            self._compact(self._role_case_outcomes, "role case outcome")
+            return StoreAppendResult(
+                True, outcome.role_case_outcome_id, REASON_STORED
+            )
+
+    def iter_role_case_outcomes(self, *, include_archive: bool = True) -> Iterator[Any]:
+        seen: set[str] = set()
+        if include_archive:
+            for row in self._role_case_outcomes.iter_archive_rows():
+                if row.role_case_outcome_id in seen:
+                    continue
+                seen.add(row.role_case_outcome_id)
+                yield row
+        for row in self._role_case_outcomes.iter_hot_rows():
+            if row.role_case_outcome_id in seen:
+                continue
+            seen.add(row.role_case_outcome_id)
             yield row
 
     # ----------------------------------------------------------- evaluations
@@ -863,6 +1002,27 @@ class CommitteeEvidenceStore:
             self.cases_index_file, kind="CASE_OUTCOME", ids=ids, label="case outcome"
         )
 
+    def _load_role_case_ids(self) -> set[str]:
+        return self._load_id_set(
+            self.role_cases_index_file,
+            rebuild=self._rebuild_role_case_ids,
+            persist=self._save_role_case_ids,
+        )
+
+    def _save_role_case_ids(self, ids: set[str]) -> None:
+        self._save_id_set(
+            self.role_cases_index_file,
+            kind="ROLE_CASE_OUTCOME",
+            ids=ids,
+            label="role case outcome",
+        )
+
+    def _rebuild_role_case_ids(self) -> set[str]:
+        """Derive the role-case-outcome id set from the durable log."""
+        return {
+            row.role_case_outcome_id for row in self.iter_role_case_outcomes()
+        }
+
     def _load_index_payload(self, path: Path) -> Mapping[str, Any]:
         if not path.exists():
             # A first run has no index yet; the durable log is the authority.
@@ -1033,6 +1193,40 @@ class DurableObservationLedger:
         )
 
 
+class DurableRoleResultLedger:
+    """Idempotency ledger for governed role results, backed by durable evidence.
+
+    A lookup answers "has this logical role seat already been recorded?" from
+    durable evidence, so a process restart or a redelivered case cannot create a
+    second paid opinion for the same role, case, prompt, policy, and evidence
+    snapshot. The first recorded result for a logical seat is authoritative.
+    """
+
+    def __init__(self, *, store: CommitteeEvidenceStore) -> None:
+        self._store = store
+        self._loaded = False
+        self._by_observation: dict[str, Any] = {}
+
+    def _ensure_loaded(self) -> None:
+        if self._loaded:
+            return
+        by_observation: dict[str, Any] = {}
+        for row in self._store.iter_role_results():
+            by_observation.setdefault(row.logical_observation_id, row)
+        self._by_observation = by_observation
+        self._loaded = True
+
+    def role_result_for(self, logical_observation_id: str):
+        self._ensure_loaded()
+        return self._by_observation.get(logical_observation_id)
+
+    def record_role_result(self, result) -> None:
+        self._store.append_role_result(result)
+        # Invalidate rather than mutate: the durable log is the authority, so a
+        # concurrent writer's row must be observed on the next lookup.
+        self._loaded = False
+
+
 __all__ = [
     "ATTRIBUTIONS_KEEP_LINES",
     "ATTRIBUTIONS_MAX_BYTES",
@@ -1051,7 +1245,12 @@ __all__ = [
     "REFUSED_OPINION_ABSENT",
     "REJECTIONS_KEEP_LINES",
     "REJECTIONS_MAX_BYTES",
+    "ROLE_CASE_OUTCOMES_KEEP_LINES",
+    "ROLE_CASE_OUTCOMES_MAX_BYTES",
+    "ROLE_RESULTS_KEEP_LINES",
+    "ROLE_RESULTS_MAX_BYTES",
     "CommitteeEvidenceStore",
     "DurableObservationLedger",
+    "DurableRoleResultLedger",
     "StoreAppendResult",
 ]
