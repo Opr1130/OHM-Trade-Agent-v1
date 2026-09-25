@@ -360,13 +360,26 @@ def test_committee_reports_are_never_wired_to_a_production_consumer():
 
 
 def test_committee_never_constructs_a_wire_request_outside_the_runtime():
-    """Screening cannot be bypassed: only the runtime builds a wire request."""
+    """Screening cannot be bypassed: only a screened runtime builds a wire request.
+
+    Two runtimes may build one: the provider-seat runtime and the governed
+    seven-role runtime. Both must screen the payload they wire, which the test
+    below asserts per builder, so adding a builder cannot silently add a path
+    around ``screen_model_bound_view``.
+    """
     builders: list[str] = []
     for path in _committee_files():
         source = path.read_text(encoding="utf-8")
         if "ProviderWireRequest(" in source:
             builders.append(path.name)
-    assert builders == ["runtime.py"], builders
+    assert builders == ["role_runtime.py", "runtime.py"], builders
+
+
+def test_every_wire_request_builder_screens_the_payload_first():
+    for name in ("runtime.py", "role_runtime.py"):
+        source = (COMMITTEE_ROOT / name).read_text(encoding="utf-8")
+        assert "screen_model_bound_view(" in source, name
+        assert "model_bound_view()" in source, name
 
 
 def test_the_runtime_screens_the_payload_before_it_is_wired():

@@ -152,3 +152,54 @@ It does not merge, does not activate credentialled SHADOW calls, enables no prov
 execution, and carries no provider API key. The `OFF -> credentialled SHADOW`
 transition — provider allowlist, timer activation, and credentialled calls — requires a
 separate OWNER-authorised action with its own validation.
+
+## OFF -> credentialled SHADOW (IC-043)
+
+The activation boundary is a **separate workflow**,
+`.github/workflows/committee-shadow-activation.yml`, deliberately not this file: the
+installation workflow must keep proving that it never activates credentialled SHADOW
+calls, and one file cannot honestly assert both. It is owner-gated on issue 64 in the
+same shape as `/deploy-committee`, and it uses the same protected `committee-shadow`
+environment and pinned learning-host identity.
+
+| Command | What it does |
+| --- | --- |
+| `/shadow-committee <40-char-sha> <not-before-iso8601> <review-by-iso8601>` | Refuses unless both dedicated provider credentials are present and non-placeholder, pins provider-only egress, sets `mode=shadow` with an explicit UTC activation boundary and registry review date, caps a cycle at one case, and leaves the timer **disabled**. Then proves the resulting state. |
+| `/committee-canary <40-char-sha>` | Starts the oneshot worker exactly once, with the recurring timer still disabled, and reports the durable advisory counts. |
+| `/committee-timer <40-char-sha>` | Enables the existing six-hourly bounded timer, keeping the one-case cap. |
+| `/rollback-committee` | Returns the plane to `off` and deny-all egress, then proves it. Advisory evidence is left in place. |
+
+`activate-committee-shadow.sh` refuses to run unless the environment file already holds
+real (non-placeholder) values for the two dedicated provider credentials, and it reports
+only a presence verdict — never a value, and never a line from the file. The two
+credential names are `OPIP_COMMITTEE_OPENAI_API_KEY` and
+`OPIP_COMMITTEE_ANTHROPIC_API_KEY`; the template ships them as `CHANGEME`.
+
+Egress is pinned by resolving the two approved endpoints and writing
+`IPAddressAllow=` entries into a unit drop-in while the unit keeps
+`IPAddressDeny=any`. systemd does not resolve host names into an address policy, so a
+DNS change is a visible re-activation event rather than silently widened egress.
+
+### Runtime structure of a SHADOW case
+
+A SHADOW case is governed by the **seven roles**, not by two provider families:
+
+```text
+verified canonical replica
+  -> sealed CommitteeCase (activation boundary, snapshot lineage)
+  -> scheduler
+  -> for each role: governed route (primary + at most one approved fallback)
+       -> screened outbound request
+       -> approved provider transport
+       -> validated structured opinion
+       -> durable RoleSeatResult (append-only, idempotent per logical role seat)
+  -> DECISION_SYNTHESIZER, the only role that sees the other roles' screened results
+  -> durable RoleGovernedCaseOutcome (registry, policy, and role-result provenance)
+```
+
+Each role has its own prompt, prompt hash, output schema version, budget, and served
+model identity. Six roles are required; `EVENT_SENTIMENT_ANALYST` is optional and
+reports an explicit `UNKNOWN` — with no provider call — when the qualified retained
+event evidence it depends on is absent. A missing role is never filled by a provider
+family. `role_results.jsonl` and `role_case_outcomes.jsonl` land in the advisory
+directory and nowhere else.
