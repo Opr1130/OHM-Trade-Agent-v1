@@ -442,6 +442,9 @@ def test_provision_scripts_do_not_open_egress_or_touch_trading_credentials() -> 
     assert 'pip install' in lib
     assert 'requirements.txt' in lib
     assert "systemctl stop opip-committee-shadow.timer" in lib
+    assert "python3-venv" in lib
+    venv_fn = lib.split("ensure_python_venv()", 1)[1].split("provision_main()", 1)[0]
+    assert venv_fn.index("OPIP_COMMITTEE_RUNTIME_TEST_HARNESS") < venv_fn.index("apt-get install")
     bootstrap = (COMMITTEE / "bootstrap-opip-committee-worker.sh").read_text(encoding="utf-8")
     assert any(
         line.strip() == 'bash "$SOURCE_DIR/provision-committee-host-runtime.sh" "$TARGET_SHA"'

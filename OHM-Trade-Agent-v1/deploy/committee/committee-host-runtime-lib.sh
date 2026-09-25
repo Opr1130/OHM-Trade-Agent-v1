@@ -472,6 +472,23 @@ runtime_already_ready() {
   prove_cycle_runner_import "$APP_ROOT" "$VENV_PYTHON"
 }
 
+ensure_python_venv() {
+  if [[ "${OPIP_COMMITTEE_RUNTIME_TEST_HARNESS:-}" == "1" ]]; then
+    return 0
+  fi
+  if python3 -c 'import venv, ensurepip' >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! command -v apt-get >/dev/null 2>&1; then
+    echo "python3 venv module is missing and apt-get is unavailable" >&2
+    return 81
+  fi
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y --no-install-recommends python3-venv
+  python3 -c 'import venv, ensurepip' >/dev/null 2>&1
+}
+
 provision_main() {
   local sha="$1"
   local script_dir="$2"
@@ -493,6 +510,7 @@ provision_main() {
   copy_release_tree "$SOURCE_ROOT" "$STAGE/app" || fail_provision 79 "release tree was rejected"
   printf '%s\n' "$sha" > "$STAGE/app/.opip-release-sha"
   chmod 0644 "$STAGE/app/.opip-release-sha"
+  ensure_python_venv || fail_provision 81 "virtualenv module is unavailable"
   if ! python3 -m venv "$STAGE/venv"; then
     fail_provision 81 "virtualenv creation failed"
   fi
