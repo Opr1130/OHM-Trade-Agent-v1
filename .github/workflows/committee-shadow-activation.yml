@@ -191,7 +191,11 @@ jobs:
           if [[ "$RC" -eq 0 ]] && grep -q '^SHADOW_ACTIVATION=PASS' committee-activate.log; then
             ACT_MARKER=1
           fi
-          # Install the proof helper at a stable path so the rollback command can
+          if grep -q '^SHADOW_ACTIVATION=BLOCKED' committee-activate.log; then
+            echo "result=BLOCKED" >> "$GITHUB_OUTPUT"
+            echo "rc=$RC" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi          # Install the proof helper at a stable path so the rollback command can
           # return the plane to OFF without needing a release tree. It is the same
           # reviewed artifact from the exact release SHA, never inline logic.
           if [[ "$ACT_MARKER" -eq 1 ]]; then
@@ -442,6 +446,10 @@ jobs:
           set -euo pipefail
           case "$COMMAND" in
             shadow)
+              if [[ "$ACTIVATE_RESULT" = "BLOCKED" ]]; then
+                echo "SHADOW activation is BLOCKED by unmet preconditions; nothing was changed." >&2
+                exit 1
+              fi
               test "$ACTIVATE_RESULT" = "ACTIVATED" || { echo "SHADOW activation did not succeed." >&2; exit 1; }
               test "$SHADOW_RESULT" = "PROVEN" || { echo "SHADOW mode was not proven." >&2; exit 1; }
               ;;

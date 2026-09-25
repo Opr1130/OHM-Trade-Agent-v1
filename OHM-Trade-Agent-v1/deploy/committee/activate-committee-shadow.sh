@@ -93,84 +93,111 @@ if [[ ! "$REVIEW_BY" =~ $iso_utc_re ]]; then
   exit 64
 fi
 
-# --- precondition: the worker can actually start a cycle ---------------------
-# The OFF path returns before it needs the application, so a missing or
-# non-executable application root stays invisible until SHADOW is attempted.
-# Activation refuses rather than reporting PASS on a worker that cannot run.
-APP_ROOT="${OPIP_APP_ROOT:-/opt/opip/app}"
-VENV_PYTHON="${OPIP_VENV_PYTHON:-/opt/opip/venv/bin/python}"
-if [[ ! -d "$APP_ROOT" ]]; then
-  echo "refusing activation: the worker application root $APP_ROOT does not exist" >&2
-  echo "a SHADOW cycle cannot start without it; provision it or set OPIP_APP_ROOT" >&2
-  exit 78
-fi
-if [[ ! -x "$VENV_PYTHON" ]]; then
-  echo "refusing activation: the worker interpreter $VENV_PYTHON is not executable" >&2
-  exit 78
-fi
-if ! ( cd "$APP_ROOT" && "$VENV_PYTHON" -c 'import app.opip.committee.cycle_runner' ) 2>/dev/null; then
-  echo "refusing activation: the worker interpreter cannot import the committee cycle runner" >&2
-  exit 78
-fi
-echo "PASS  the worker can import the committee cycle runner from $APP_ROOT"
+# --- preconditions -----------------------------------------------------------
+# Every precondition is evaluated and reported before the script refuses, so an
+# operator sees the complete set of things to fix rather than fixing them one
+# deployment at a time. A refusal is still fail-closed: nothing is written and no
+# mode is changed while any precondition is unmet.
+precondition_failed=0
+refuse() { printf 'REFUSED  %s\n' "$1" >&2; precondition_failed=$((precondition_failed + 1)); return 0; }
+satisfy() { printf 'PASS     %s\n' "$1"; return 0; }
 
-# --- precondition: the installed worker and its environment file -------------
-if [[ ! -f "$UNIT_DIR/$UNIT" ]]; then
-  echo "refusing activation: $UNIT is not installed; run the OFF deployment first" >&2
-  exit 78
+# The worker must be installed and have a readable environment file.
+if [[ -f "$UNIT_DIR/$UNIT" ]]; then
+  satisfy "$UNIT is installed"
+else
+  refuse "$UNIT is not installed; run the OFF deployment first"
 fi
-if [[ ! -r "$ENV_FILE" ]]; then
-  echo "refusing activation: $ENV_FILE is not readable" >&2
-  exit 78
+if [[ -r "$ENV_FILE" ]]; then
+  satisfy "$ENV_FILE is readable"
+else
+  refuse "$ENV_FILE is not readable; run the OFF deployment first"
 fi
 
-# --- precondition: dedicated provider credentials are real -------------------
-# Each name must be present with a non-empty, non-placeholder value. Only a
-# verdict is printed; no value and no line from the file is ever echoed.
+# The application root and interpreter the cycle actually executes. The OFF path
+# returns before it needs the application, so a missing root stays invisible
+# until SHADOW is attempted. Activation refuses rather than reporting PASS on a
+# worker that cannot start one cycle.
+APP_ROOT="${OPIP_APP_ROOT:-$(sed -n 's/^OPIP_APP_ROOT=//p' "$ENV_FILE" 2>/dev/null | head -n1)}"
+APP_ROOT="${APP_ROOT:-/opt/opip/app}"
+VENV_PYTHON="${OPIP_VENV_PYTHON:-$(sed -n 's/^OPIP_VENV_PYTHON=//p' "$ENV_FILE" 2>/dev/null | head -n1)}"
+VENV_PYTHON="${VENV_PYTHON:-/opt/opip/venv/bin/python}"
+if [[ -d "$APP_ROOT" ]]; then
+  satisfy "the worker application root exists: $APP_ROOT"
+else
+  refuse "the worker application root does not exist ($APP_ROOT); a SHADOW cycle cannot start"
+fi
+if [[ -x "$VENV_PYTHON" ]]; then
+  satisfy "the worker interpreter is executable: $VENV_PYTHON"
+else
+  refuse "the worker interpreter is not executable ($VENV_PYTHON); a SHADOW cycle cannot start"
+fi
+if [[ -d "$APP_ROOT" && -x "$VENV_PYTHON" ]]; then
+  if ( cd "$APP_ROOT" && "$VENV_PYTHON" -c 'import app.opip.committee.cycle_runner' ) 2>/dev/null; then
+    satisfy "the worker interpreter can import the committee cycle runner"
+  else
+    refuse "the worker interpreter cannot import the committee cycle runner from $APP_ROOT"
+  fi
+fi
+
+# Both dedicated provider credentials must be present with a real value. Each
+# name is checked individually; only a verdict is printed, and no value and no
+# line from the environment file is ever echoed.
 missing_names=()
 placeholder_names=()
-for name in "${PROVIDER_CREDENTIAL_NAMES[@]}"; do
-  value="$(sed -n "s/^${name}=//p" "$ENV_FILE" 2>/dev/null | head -n1)"
-  if [[ -z "$value" ]]; then
-    missing_names+=("$name")
-    continue
-  fi
-  for placeholder in $PLACEHOLDER_VALUES; do
-    if [[ "$value" == "$placeholder" ]]; then
-      placeholder_names+=("$name")
-      break
+if [[ -r "$ENV_FILE" ]]; then
+  for name in "${PROVIDER_CREDENTIAL_NAMES[@]}"; do
+    value="$(sed -n "s/^${name}=//p" "$ENV_FILE" 2>/dev/null | head -n1)"
+    if [[ -z "$value" ]]; then
+      missing_names+=("$name")
+      continue
     fi
+    for placeholder in $PLACEHOLDER_VALUES; do
+      if [[ "$value" == "$placeholder" ]]; then
+        placeholder_names+=("$name")
+        break
+      fi
+    done
   done
-done
-unset value
-if [[ "${#missing_names[@]}" -gt 0 ]]; then
-  echo "refusing activation: ${#missing_names[@]} dedicated Committee provider credential(s) are unset" >&2
-  printf 'unset credential names: %s\n' "${missing_names[*]}" >&2
-  exit 78
+  unset value
 fi
-if [[ "${#placeholder_names[@]}" -gt 0 ]]; then
-  echo "refusing activation: ${#placeholder_names[@]} dedicated Committee provider credential(s) are still placeholders" >&2
-  printf 'placeholder credential names: %s\n' "${placeholder_names[*]}" >&2
-  exit 78
+if [[ "${#missing_names[@]}" -eq 0 && "${#placeholder_names[@]}" -eq 0 ]]; then
+  satisfy "both dedicated Committee provider credentials are configured (values never read into output)"
+else
+  if [[ "${#missing_names[@]}" -gt 0 ]]; then
+    refuse "${#missing_names[@]} dedicated Committee provider credential(s) are unset: ${missing_names[*]}"
+  fi
+  if [[ "${#placeholder_names[@]}" -gt 0 ]]; then
+    refuse "${#placeholder_names[@]} dedicated Committee provider credential(s) are still placeholders: ${placeholder_names[*]}"
+  fi
 fi
-echo "PASS  both dedicated Committee provider credentials are configured (values never read into output)"
 
-# --- precondition: the SHADOW source inputs exist ----------------------------
-if [[ ! -d "$EVIDENCE_ROOT" ]]; then
-  echo "refusing activation: $EVIDENCE_ROOT does not exist" >&2
-  exit 78
-fi
+# The verified canonical-replica inputs the SHADOW case producer needs.
 MANIFEST="$(sed -n 's/^OPIP_COMMITTEE_LEARNING_MANIFEST=//p' "$ENV_FILE" 2>/dev/null | head -n1)"
 REPLICA_ROOT="$(sed -n 's/^OPIP_CANONICAL_REPLICA_ROOT_HOST=//p' "$ENV_FILE" 2>/dev/null | head -n1)"
-if [[ -z "$MANIFEST" || ! -r "$MANIFEST" ]]; then
-  echo "refusing activation: OPIP_COMMITTEE_LEARNING_MANIFEST is unset or unreadable" >&2
+if [[ -n "$MANIFEST" && -r "$MANIFEST" ]]; then
+  satisfy "the learning export manifest is readable"
+else
+  refuse "OPIP_COMMITTEE_LEARNING_MANIFEST is unset or unreadable (got '${MANIFEST:-unset}')"
+fi
+if [[ -n "$REPLICA_ROOT" && -d "$REPLICA_ROOT" ]]; then
+  satisfy "the verified canonical-replica root is present"
+else
+  refuse "OPIP_CANONICAL_REPLICA_ROOT_HOST is unset or absent (got '${REPLICA_ROOT:-unset}')"
+fi
+if [[ -d "$EVIDENCE_ROOT" ]]; then
+  satisfy "the read-only evidence root is present: $EVIDENCE_ROOT"
+else
+  refuse "$EVIDENCE_ROOT does not exist"
+fi
+
+echo
+if [[ "$precondition_failed" -gt 0 ]]; then
+  echo "SHADOW_ACTIVATION=BLOCKED preconditions_failed=$precondition_failed"
+  echo "nothing was changed; the plane remains as it was" >&2
   exit 78
 fi
-if [[ -z "$REPLICA_ROOT" || ! -d "$REPLICA_ROOT" ]]; then
-  echo "refusing activation: OPIP_CANONICAL_REPLICA_ROOT_HOST is unset or absent" >&2
-  exit 78
-fi
-echo "PASS  verified canonical-replica source inputs are present"
+echo "SHADOW_ACTIVATION=PREFLIGHT_PASS"
 
 # --- provider-only egress -----------------------------------------------------
 # systemd does not resolve host names into an address policy, so the approved
