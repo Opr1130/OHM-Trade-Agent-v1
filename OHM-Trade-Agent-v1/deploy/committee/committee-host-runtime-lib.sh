@@ -7,6 +7,9 @@
 # not open provider egress. Source it; do not execute it.
 set -euo pipefail
 
+_TRIM='[:space:]'
+_ROLLBACK_FAIL='ROLLBACK_RUNTIME=FAIL'
+
 require_exact_sha() {
   local sha="$1"
   if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
@@ -348,7 +351,7 @@ copy_release_tree() {
   done < <(find -P "$dest" -type d -name '__pycache__' -print0)
   find -P "$dest" -type f \( -name '*.pyc' -o -name '.env' \) -delete
   local links
-  links="$(find -P "$dest" -type l | wc -l | tr -d '[:space:]')"
+  links="$(find -P "$dest" -type l | wc -l | tr -d "$_TRIM")"
   if [[ "$links" != "0" ]]; then
     echo "refusing release tree that contains symlinks" >&2
     return 79
@@ -464,7 +467,7 @@ activate_staged_runtime() {
 runtime_already_ready() {
   local sha="$1" current
   [[ -f "$APP_ROOT/.opip-release-sha" && ! -L "$APP_ROOT/.opip-release-sha" ]] || return 1
-  current="$(tr -d '[:space:]' < "$APP_ROOT/.opip-release-sha")"
+  current="$(tr -d "$_TRIM" < "$APP_ROOT/.opip-release-sha")"
   [[ "$current" == "$sha" ]] || return 1
   prove_cycle_runner_import "$APP_ROOT" "$VENV_PYTHON"
 }
@@ -528,7 +531,7 @@ provision_main() {
     fail_provision 82 "active import proof failed after configuration"
   fi
   local installed
-  installed="$(tr -d '[:space:]' < "$APP_ROOT/.opip-release-sha")"
+  installed="$(tr -d "$_TRIM" < "$APP_ROOT/.opip-release-sha")"
   if [[ "$installed" != "$sha" ]]; then
     fail_provision 82 "active release identity does not match the authorized SHA"
   fi
@@ -557,7 +560,7 @@ rollback_main() {
   if ! prove_cycle_runner_import "$PREFIX/previous/app" "$PREFIX/previous/venv/bin/python"; then
     force_mode_off_only || true
     keep_timer_disabled || true
-    echo "ROLLBACK_RUNTIME=FAIL" >&2
+    echo "$_ROLLBACK_FAIL" >&2
     return 1
   fi
   local stamp
@@ -571,7 +574,7 @@ rollback_main() {
     mv "$PREFIX/displaced/$stamp/venv" "$PREFIX/venv" || true
     force_mode_off_only || true
     keep_timer_disabled || true
-    echo "ROLLBACK_RUNTIME=FAIL" >&2
+    echo "$_ROLLBACK_FAIL" >&2
     return 1
   fi
   if ! mv "$PREFIX/previous/venv" "$PREFIX/venv"; then
@@ -580,7 +583,7 @@ rollback_main() {
     mv "$PREFIX/displaced/$stamp/venv" "$PREFIX/venv" || true
     force_mode_off_only || true
     keep_timer_disabled || true
-    echo "ROLLBACK_RUNTIME=FAIL" >&2
+    echo "$_ROLLBACK_FAIL" >&2
     return 1
   fi
   if ! prove_cycle_runner_import "$APP_ROOT" "$VENV_PYTHON"; then
@@ -589,7 +592,7 @@ rollback_main() {
     mv "$PREFIX/displaced/$stamp/venv" "$PREFIX/venv" || true
     force_mode_off_only || true
     keep_timer_disabled || true
-    echo "ROLLBACK_RUNTIME=FAIL" >&2
+    echo "$_ROLLBACK_FAIL" >&2
     return 1
   fi
   mkdir -p "$PREFIX/previous"
@@ -597,21 +600,21 @@ rollback_main() {
   mv "$PREFIX/displaced/$stamp/venv" "$PREFIX/previous/venv"
   rmdir "$PREFIX/displaced/$stamp" 2>/dev/null || true
   local restored
-  restored="$(tr -d '[:space:]' < "$APP_ROOT/.opip-release-sha")"
+  restored="$(tr -d "$_TRIM" < "$APP_ROOT/.opip-release-sha")"
   require_exact_sha "$restored" || {
     force_mode_off_only || true
     keep_timer_disabled || true
-    echo "ROLLBACK_RUNTIME=FAIL" >&2
+    echo "$_ROLLBACK_FAIL" >&2
     return 1
   }
   rewrite_nonsecret_env "$restored" || {
     force_mode_off_only || true
     keep_timer_disabled || true
-    echo "ROLLBACK_RUNTIME=FAIL" >&2
+    echo "$_ROLLBACK_FAIL" >&2
     return 1
   }
   if ! keep_timer_disabled; then
-    echo "ROLLBACK_RUNTIME=FAIL" >&2
+    echo "$_ROLLBACK_FAIL" >&2
     return 1
   fi
   echo "ROLLBACK_RUNTIME=PASS"
