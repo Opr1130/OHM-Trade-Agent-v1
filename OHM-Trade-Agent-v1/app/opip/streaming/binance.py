@@ -6,10 +6,11 @@ normalizes them into the provider-neutral BUILD 4.1/4.2 contracts.
 """
 from __future__ import annotations
 
+import asyncio
+from collections import deque
 from datetime import datetime, timezone
 import math
 from typing import Any
-from uuid import uuid4
 
 import orjson
 from websockets.asyncio.client import connect
@@ -89,6 +90,7 @@ class BinancePublicAdapter:
         if not self.symbols or len(self.symbols) > 5:
             raise ValueError("Binance adapter requires 1..5 symbols")
         self._ws = None
+        self._pending: deque[RawProviderFrame] = deque()
         self._connection_id: str | None = None
         self._reconnect_epoch = -1
         self._trade_trackers: dict[str, StrictIncrementingSequenceTracker] = {
@@ -101,6 +103,7 @@ class BinancePublicAdapter:
     async def connect(self, *, connection_id: str, reconnect_epoch: int) -> None:
         self._connection_id = str(connection_id)
         self._reconnect_epoch = int(reconnect_epoch)
+        self._pending.clear()
         self._ws = await connect(
             self.url,
             open_timeout=10,
@@ -118,60 +121,99 @@ class BinancePublicAdapter:
         for symbol in self.symbols:
             lower = symbol.lower()
             params.extend((f"{lower}@aggTrade", f"{lower}@forceOrder"))
+
+        # Binance's live-subscription contract requires an unsigned integer ID.
+        # Do not transition the runtime to CONNECTED until the server explicitly
+        # acknowledges this exact subscription request.
+        subscription_id = 1
         await self._ws.send(
             orjson.dumps(
                 {
                     "method": "SUBSCRIBE",
                     "params": params,
-                    "id": uuid4().hex,
+                    "id": subscription_id,
                 }
             )
+        )
+        while True:
+            payload = await self._receive_payload(timeout_seconds=5.0)
+            if payload.get("id") == subscription_id:
+                if payload.get("result") is None and "error" not in payload:
+                    return
+                raise ConnectionError(
+                    "Binance public stream subscription rejected"
+                )
+            frame = self._frame_from_payload(payload)
+            if frame is not None:
+                self._pending.append(frame)
+
+    async def _receive_payload(
+        self,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict:
+        if self._ws is None:
+            raise ConnectionError("Binance adapter is not connected")
+        receiver = self._ws.recv()
+        message = (
+            await asyncio.wait_for(receiver, timeout=timeout_seconds)
+            if timeout_seconds is not None
+            else await receiver
+        )
+        if isinstance(message, str):
+            raw = message.encode("utf-8")
+        elif isinstance(message, bytes):
+            raw = message
+        else:
+            raise TypeError("unsupported Binance websocket frame type")
+        payload = orjson.loads(raw)
+        if not isinstance(payload, dict):
+            raise ValueError("Binance websocket message must be an object")
+        return payload
+
+    def _frame_from_payload(self, payload: dict) -> RawProviderFrame | None:
+        if "result" in payload and "id" in payload:
+            return None
+        if "error" in payload and "id" in payload:
+            raise ConnectionError("Binance public stream request rejected")
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        if not isinstance(data, dict):
+            return None
+        if data.get("st") not in (None, 1):
+            return None
+        event = str(data.get("e") or "")
+        symbol = str(
+            data.get("s")
+            or (
+                data.get("o", {}).get("s")
+                if isinstance(data.get("o"), dict)
+                else ""
+            )
+            or ""
+        ).upper()
+        if symbol not in self.symbols:
+            return None
+        if event == "aggTrade":
+            stream_type = StreamType.AGG_TRADE
+        elif event == "forceOrder":
+            stream_type = StreamType.LIQUIDATION
+        else:
+            return None
+        return RawProviderFrame(
+            stream_type=stream_type,
+            provider_symbol=symbol,
+            payload=orjson.dumps(data),
         )
 
     async def receive(self) -> RawProviderFrame:
         if self._ws is None:
             raise ConnectionError("Binance adapter is not connected")
         while True:
-            message = await self._ws.recv()
-            if isinstance(message, str):
-                raw = message.encode("utf-8")
-            elif isinstance(message, bytes):
-                raw = message
-            else:
-                raise TypeError("unsupported Binance websocket frame type")
-            payload = orjson.loads(raw)
-            if not isinstance(payload, dict):
-                continue
-            if "result" in payload and "id" in payload:
-                continue
-            data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-            if not isinstance(data, dict):
-                continue
-            if data.get("st") not in (None, 1):
-                continue
-            event = str(data.get("e") or "")
-            symbol = str(
-                data.get("s")
-                or (
-                    data.get("o", {}).get("s")
-                    if isinstance(data.get("o"), dict)
-                    else ""
-                )
-                or ""
-            ).upper()
-            if symbol not in self.symbols:
-                continue
-            if event == "aggTrade":
-                stream_type = StreamType.AGG_TRADE
-            elif event == "forceOrder":
-                stream_type = StreamType.LIQUIDATION
-            else:
-                continue
-            return RawProviderFrame(
-                stream_type=stream_type,
-                provider_symbol=symbol,
-                payload=orjson.dumps(data),
-            )
+            if self._pending:
+                return self._pending.popleft()
+            frame = self._frame_from_payload(await self._receive_payload())
+            if frame is not None:
+                return frame
 
     async def heartbeat(self) -> None:
         if self._ws is None:
@@ -181,6 +223,7 @@ class BinancePublicAdapter:
 
     async def close(self) -> None:
         ws, self._ws = self._ws, None
+        self._pending.clear()
         if ws is not None:
             await ws.close()
 

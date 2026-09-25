@@ -383,3 +383,44 @@ def test_drop_after_seal_degrades_retained_window_and_next_window():
     ]
     assert len(notices_15s) == 1
     assert notices_15s[0].quality.state is EvidenceQualityState.INCOMPLETE
+
+
+def test_feature_persistence_retry_is_idempotent_after_latest_write_failure(
+    tmp_path, monkeypatch
+):
+    import app.opip.streaming.store as module
+
+    store = StreamingShadowStore(base_dir=tmp_path, retention_hours=72)
+    real_save = module.save_json_atomic
+    calls = {"count": 0}
+
+    def fail_latest_once(path, data, *, mode=None):
+        calls["count"] += 1
+        if path.name == "latest_features.json" and calls["count"] == 1:
+            raise OSError("simulated latest read-model failure")
+        return real_save(path, data, mode=mode)
+
+    monkeypatch.setattr(module, "save_json_atomic", fail_latest_once)
+    row = _feature("bitcoin")
+
+    with pytest.raises(OSError):
+        store.append_features([row])
+
+    hourly = next(tmp_path.glob("features-*.jsonl"))
+    first_lines = hourly.read_text(encoding="utf-8").splitlines()
+    assert len(first_lines) == 1
+    assert '"feature_id":"SF1:' in first_lines[0]
+
+    assert store.append_features([row]) == 1
+    second_lines = hourly.read_text(encoding="utf-8").splitlines()
+    assert second_lines == first_lines
+    latest = load_json(tmp_path / "latest_features.json")
+    assert latest["assets"]["bitcoin"]["feature_id"].startswith("SF1:")
+
+
+def test_feature_persistence_deduplicates_same_logical_window_in_one_batch(tmp_path):
+    store = StreamingShadowStore(base_dir=tmp_path, retention_hours=72)
+    row = _feature("bitcoin")
+    assert store.append_features([row, row]) == 2
+    hourly = next(tmp_path.glob("features-*.jsonl"))
+    assert len(hourly.read_text(encoding="utf-8").splitlines()) == 1
