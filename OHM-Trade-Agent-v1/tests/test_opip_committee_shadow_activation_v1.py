@@ -15,6 +15,7 @@ activation workflow is the only place that may.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import pathlib
 import shutil
@@ -610,10 +611,25 @@ merge_allows() {
   if [[ -n "${OPIP_TEST_FORCE_IP_ALLOW:-}" ]]; then
     printf '%s\n' "$OPIP_TEST_FORCE_IP_ALLOW" >> "$state"
   fi
-  if [[ -s "$state" ]]; then
-    paste -sd ' ' "$state"
+  # systemd's in_addr_prefix_to_string always prints the prefix length.
+  # A bare host in the drop-in is stored as /32 or /128 and shown that way.
+  # An explicit prefix is left unchanged so a broader CIDR stays broader.
+  canon="$(mktemp)"
+  while IFS= read -r token || [[ -n "$token" ]]; do
+    token="${token%$'\r'}"
+    token="${token%% *}"
+    [[ -z "$token" ]] && continue
+    case "$token" in
+      */*) printf '%s\n' "$token" >> "$canon" ;;
+      *:*) printf '%s/128\n' "$token" >> "$canon" ;;
+      *.*.*.*) printf '%s/32\n' "$token" >> "$canon" ;;
+      *) printf '%s\n' "$token" >> "$canon" ;;
+    esac
+  done < "$state"
+  if [[ -s "$canon" ]]; then
+    paste -sd ' ' "$canon"
   fi
-  rm -f "$state"
+  rm -f "$state" "$canon"
 }
 
 cmd="${1:-}"
@@ -706,7 +722,12 @@ case "$cmd" in
         fi
         ;;
       IPAddressAllow)
-        printf '%s\n' "$(merge_allows)"
+        egress="$DROPIN_DIR/10-provider-egress.conf"
+        if [[ -n "${OPIP_TEST_EFFECTIVE_IP_ALLOW+x}" && -f "$egress" ]]; then
+          printf '%s\n' "$OPIP_TEST_EFFECTIVE_IP_ALLOW"
+        else
+          printf '%s\n' "$(merge_allows)"
+        fi
         ;;
       ActiveState)
         if [[ -f "$ACTIVE_FILE" ]]; then
@@ -1150,6 +1171,12 @@ def test_base_unit_and_bootstrap_stay_fail_closed() -> None:
     assert "SAFE_OFF=FAIL" in activate
     assert 'current_file_mode)" != "shadow"' not in activate
     assert "printf '%s\\n' '[Service]' 'Environment=OPIP_COMMITTEE_MODE=shadow'" in activate
+    assert "ip_allow_policy.py" in verify
+    assert "ip_allow_policy.py" in activate
+    assert "s|/.*||" not in verify
+    policy = (COMMITTEE_DEPLOY / "ip_allow_policy.py").read_text(encoding="utf-8")
+    assert "ip_network" in policy
+    assert "subnet_of" not in policy
     for script in (activate, verify):
         else_branch = script.split('== "1" ]]; then', 1)[1].split("else", 1)[1].split("fi", 1)[0]
         assert 'COMMITTEE_HOME="/var/lib/opip-committee"' in else_branch
@@ -1586,3 +1613,437 @@ def test_malformed_arguments_do_not_clean_a_mixed_plane(
     assert _file_mode(plane) == "shadow"
     assert (plane["dropin"] / "10-provider-egress.conf").is_file()
     assert marker.read_text(encoding="utf-8") == "kept\n"
+
+
+def _load_ip_allow_policy():
+    path = COMMITTEE_DEPLOY / "ip_allow_policy.py"
+    spec = importlib.util.spec_from_file_location("ip_allow_policy", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+
+def test_ip_allow_policy_canonical_sets_keep_network_width() -> None:
+    """Cases A–I at the comparison itself: host prefixes match, wider networks do not."""
+    policy = _load_ip_allow_policy()
+    assert policy.canonical_network("203.0.113.7") == "203.0.113.7/32"
+    assert policy.canonical_network("203.0.113.7/32") == "203.0.113.7/32"
+    assert policy.canonical_network("2001:db8::7") == "2001:db8::7/128"
+    assert policy.canonical_network("2001:db8::7/128") == "2001:db8::7/128"
+    assert (
+        policy.canonical_network("2001:0db8:0000:0000:0000:0000:0000:0007")
+        == "2001:db8::7/128"
+    )
+    assert policy.canonical_network("203.0.113.0/24") == "203.0.113.0/24"
+    assert policy.canonical_network("203.0.113.0/24") != policy.canonical_network(
+        "203.0.113.7"
+    )
+    assert policy.canonical_network("2001:db8::/64") != policy.canonical_network(
+        "2001:db8::7"
+    )
+    with pytest.raises(ValueError):
+        policy.canonical_network("not-an-ip")
+    with pytest.raises(ValueError):
+        policy.canonical_network("203.0.113.7/24")
+    with pytest.raises(ValueError):
+        policy.canonical_network("localhost")
+
+    def compare(
+        expected: list[str], installed: list[str], effective: list[str]
+    ) -> tuple[int, str]:
+        lines = ["EXPECTED", *expected, "INSTALLED", *installed, "EFFECTIVE", *effective]
+        return policy.compare_groups(lines)
+
+    assert compare(["203.0.113.7"], ["203.0.113.7"], ["203.0.113.7/32"])[0] == 0
+    assert compare(["2001:db8::7"], ["2001:db8::7"], ["2001:db8::7/128"])[0] == 0
+    assert (
+        compare(
+            ["2001:db8::7"],
+            ["2001:db8::7"],
+            ["2001:0db8:0000:0000:0000:0000:0000:0007/128"],
+        )[0]
+        == 0
+    )
+    status, message = compare(["203.0.113.7"], ["203.0.113.7"], ["203.0.113.0/24"])
+    assert status == 1
+    assert message.startswith("effective-mismatch")
+    status, message = compare(["2001:db8::7"], ["2001:db8::7"], ["2001:db8::/64"])
+    assert status == 1
+    assert message.startswith("effective-mismatch")
+    status, message = compare(
+        ["203.0.113.7", "2001:db8::7"],
+        ["203.0.113.7", "2001:db8::7"],
+        ["203.0.113.7/32", "2001:db8::7/128", "198.51.100.9/32"],
+    )
+    assert status == 1
+    assert "extra=1" in message
+    status, message = compare(
+        ["203.0.113.7", "2001:db8::7"],
+        ["203.0.113.7", "2001:db8::7"],
+        ["203.0.113.7/32"],
+    )
+    assert status == 1
+    assert "missing=1" in message
+    assert (
+        compare(
+            ["203.0.113.7", "2001:db8::7"],
+            ["203.0.113.7", "203.0.113.7", "2001:db8::7"],
+            ["203.0.113.7/32", "203.0.113.7", "2001:db8::7/128"],
+        )[0]
+        == 0
+    )
+    status, message = compare(
+        ["203.0.113.7", "2001:db8::7"],
+        ["203.0.113.7", "2001:db8::7"],
+        ["203.0.113.7/32", "203.0.113.7/32"],
+    )
+    assert status == 1
+    assert "missing=1" in message
+    status, _message = compare(["203.0.113.7"], ["203.0.113.7"], ["not-an-ip"])
+    assert status == 2
+
+
+def _write_getent(plane: dict[str, pathlib.Path], mapping: dict[str, list[str]]) -> None:
+    lines = [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        'if [[ "${1:-}" != "ahosts" ]]; then exit 1; fi',
+        'case "${2:-}" in',
+    ]
+    for host, addresses in mapping.items():
+        lines.append(f"{host})")
+        for address in addresses:
+            lines.append(f"  printf '%s\\n' '{address} STREAM'")
+        lines.append("  exit 0")
+        lines.append("  ;;")
+    lines.extend(["*) exit 1 ;;", "esac", ""])
+    _write_exe(plane["bin"] / "getent", "\n".join(lines))
+
+
+def _pin_allow(
+    plane: dict[str, pathlib.Path],
+    addresses: list[str],
+    *,
+    resolv: str,
+    providers: dict[str, list[str]],
+) -> None:
+    _write_getent(plane, providers)
+    plane["resolv"].write_text(resolv, encoding="utf-8", newline="\n")
+    body = ["[Service]", *[f"IPAddressAllow={address}" for address in addresses], ""]
+    (plane["dropin"] / "10-provider-egress.conf").write_text(
+        "\n".join(body), encoding="utf-8", newline="\n"
+    )
+    _mode_dropin(plane["dropin"])
+
+
+def _prove_shadow(
+    bash: str,
+    plane: dict[str, pathlib.Path],
+    extra: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return _run_script(
+        bash,
+        COMMITTEE_DEPLOY / "verify-committee-shadow.sh",
+        [],
+        plane,
+        extra=extra,
+    )
+
+
+def test_shadow_proof_accepts_systemd_ipv4_host_prefix(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """Case A: bare IPv4 in the drop-in matches systemd's /32 show form."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="shadow")
+    _pin_allow(
+        plane,
+        ["203.0.113.7"],
+        resolv="nameserver 203.0.113.7\n",
+        providers={
+            "api.openai.com": ["203.0.113.7"],
+            "api.anthropic.com": ["203.0.113.7"],
+        },
+    )
+    shown = _show_allow(bash, plane)
+    assert shown.split() == ["203.0.113.7/32"]
+    proc = _prove_shadow(bash, plane)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "SHADOW_PROOF=PASS" in proc.stdout
+    assert "effective IPAddressAllow exactly matches the approved host set" in proc.stdout
+
+
+def test_shadow_proof_accepts_systemd_ipv6_host_prefix(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """Case B: bare IPv6 in the drop-in matches systemd's /128 show form."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="shadow")
+    _pin_allow(
+        plane,
+        ["2001:db8::7"],
+        resolv="nameserver 2001:db8::7\n",
+        providers={
+            "api.openai.com": ["2001:db8::7"],
+            "api.anthropic.com": ["2001:db8::7"],
+        },
+    )
+    assert _show_allow(bash, plane).split() == ["2001:db8::7/128"]
+    proc = _prove_shadow(bash, plane)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "SHADOW_PROOF=PASS" in proc.stdout
+
+
+def test_shadow_proof_accepts_equivalent_ipv6_spellings(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """Case C: expanded and compressed IPv6 are the same host prefix."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="shadow")
+    _pin_allow(
+        plane,
+        ["2001:db8::7"],
+        resolv="nameserver 2001:db8::7\n",
+        providers={
+            "api.openai.com": ["2001:db8::7"],
+            "api.anthropic.com": ["2001:db8::7"],
+        },
+    )
+    proc = _prove_shadow(
+        bash,
+        plane,
+        extra={
+            "OPIP_TEST_EFFECTIVE_IP_ALLOW": "2001:0db8:0000:0000:0000:0000:0000:0007/128"
+        },
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "SHADOW_PROOF=PASS" in proc.stdout
+
+
+def test_shadow_proof_rejects_broader_ipv4_network(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """Case D: an effective /24 is not the approved IPv4 host."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="shadow")
+    _pin_allow(
+        plane,
+        ["203.0.113.7"],
+        resolv="nameserver 203.0.113.7\n",
+        providers={
+            "api.openai.com": ["203.0.113.7"],
+            "api.anthropic.com": ["203.0.113.7"],
+        },
+    )
+    proc = _prove_shadow(
+        bash,
+        plane,
+        extra={"OPIP_TEST_EFFECTIVE_IP_ALLOW": "203.0.113.0/24"},
+    )
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0
+    assert "SHADOW_PROOF=PASS" not in combined
+    assert "effective allowlist does not exactly match the approved host set" in proc.stdout
+    assert "extra=1" in proc.stdout
+    assert "missing=1" in proc.stdout
+
+
+def test_shadow_proof_rejects_broader_ipv6_network(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """Case E: an effective /64 is not the approved IPv6 host."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="shadow")
+    _pin_allow(
+        plane,
+        ["2001:db8::7"],
+        resolv="nameserver 2001:db8::7\n",
+        providers={
+            "api.openai.com": ["2001:db8::7"],
+            "api.anthropic.com": ["2001:db8::7"],
+        },
+    )
+    proc = _prove_shadow(
+        bash,
+        plane,
+        extra={"OPIP_TEST_EFFECTIVE_IP_ALLOW": "2001:db8::/64"},
+    )
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0
+    assert "SHADOW_PROOF=PASS" not in combined
+    assert "effective allowlist does not exactly match the approved host set" in proc.stdout
+
+
+def test_shadow_proof_rejects_an_extra_effective_host(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """Case F: one extra effective host fails even when every approved host is present."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="shadow")
+    _pin_allow(
+        plane,
+        ["203.0.113.7", "2001:db8::7"],
+        resolv="nameserver 2001:db8::7\n",
+        providers={
+            "api.openai.com": ["203.0.113.7"],
+            "api.anthropic.com": ["203.0.113.7"],
+        },
+    )
+    proc = _prove_shadow(
+        bash,
+        plane,
+        extra={
+            "OPIP_TEST_EFFECTIVE_IP_ALLOW": "203.0.113.7/32 2001:db8::7/128 198.51.100.9/32"
+        },
+    )
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0
+    assert "SHADOW_PROOF=PASS" not in combined
+    assert "extra=1" in proc.stdout
+    assert "missing=0" in proc.stdout
+
+
+def test_shadow_proof_rejects_a_missing_effective_host(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """Case G: a missing effective host fails closed."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="shadow")
+    _pin_allow(
+        plane,
+        ["203.0.113.7", "2001:db8::7"],
+        resolv="nameserver 2001:db8::7\n",
+        providers={
+            "api.openai.com": ["203.0.113.7"],
+            "api.anthropic.com": ["203.0.113.7"],
+        },
+    )
+    proc = _prove_shadow(
+        bash,
+        plane,
+        extra={"OPIP_TEST_EFFECTIVE_IP_ALLOW": "203.0.113.7/32"},
+    )
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0
+    assert "SHADOW_PROOF=PASS" not in combined
+    assert "missing=1" in proc.stdout
+
+
+def test_shadow_proof_duplicate_spellings_do_not_hide_a_missing_host(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """Case H: duplicate spellings collapse, so they cannot stand in for another host."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="shadow")
+    _pin_allow(
+        plane,
+        ["203.0.113.7", "2001:db8::7"],
+        resolv="nameserver 2001:db8::7\n",
+        providers={
+            "api.openai.com": ["203.0.113.7"],
+            "api.anthropic.com": ["203.0.113.7"],
+        },
+    )
+    duplicate_only = _prove_shadow(
+        bash,
+        plane,
+        extra={"OPIP_TEST_EFFECTIVE_IP_ALLOW": "203.0.113.7/32 203.0.113.7"},
+    )
+    assert duplicate_only.returncode != 0
+    assert "SHADOW_PROOF=PASS" not in duplicate_only.stdout
+    assert "missing=1" in duplicate_only.stdout
+    complete = _prove_shadow(
+        bash,
+        plane,
+        extra={
+            "OPIP_TEST_EFFECTIVE_IP_ALLOW": "203.0.113.7/32 203.0.113.7 2001:db8::7/128"
+        },
+    )
+    assert complete.returncode == 0, complete.stdout + complete.stderr
+    assert "SHADOW_PROOF=PASS" in complete.stdout
+
+
+def test_shadow_proof_rejects_an_unparseable_effective_token(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """Case I: an unparseable effective token fails closed and activation returns to proven OFF."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="shadow")
+    _pin_allow(
+        plane,
+        ["203.0.113.7"],
+        resolv="nameserver 203.0.113.7\n",
+        providers={
+            "api.openai.com": ["203.0.113.7"],
+            "api.anthropic.com": ["203.0.113.7"],
+        },
+    )
+    proc = _prove_shadow(
+        bash,
+        plane,
+        extra={"OPIP_TEST_EFFECTIVE_IP_ALLOW": "not-an-ip"},
+    )
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0
+    assert "SHADOW_PROOF=PASS" not in combined
+    assert "unparseable token" in proc.stdout
+
+    activation = _plane(tmp_path / "activation", mode="off")
+    marker = activation["advisory"] / "role_results.jsonl"
+    marker.write_text("kept\n", encoding="utf-8", newline="\n")
+    activated = _run_script(
+        bash,
+        COMMITTEE_DEPLOY / "activate-committee-shadow.sh",
+        _activation(activation),
+        activation,
+        extra={"OPIP_TEST_EFFECTIVE_IP_ALLOW": "not-an-ip"},
+    )
+    _assert_proven_off(activated, activation, bash)
+    assert marker.read_text(encoding="utf-8") == "kept\n"
+
+
+def test_shadow_proof_accepts_production_shaped_nine_entry_policy(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """Case J: bare provider, resolver, and loopback hosts match systemd /32 and /128 output."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="shadow")
+    addresses = [
+        "203.0.113.10",
+        "203.0.113.11",
+        "2001:db8::10",
+        "203.0.113.20",
+        "203.0.113.21",
+        "2001:db8::20",
+        "127.0.0.53",
+        "127.0.0.1",
+        "::1",
+    ]
+    _pin_allow(
+        plane,
+        addresses,
+        resolv="nameserver 127.0.0.53\n",
+        providers={
+            "api.openai.com": ["203.0.113.10", "203.0.113.11", "2001:db8::10"],
+            "api.anthropic.com": ["203.0.113.20", "203.0.113.21", "2001:db8::20"],
+        },
+    )
+    shown = set(_show_allow(bash, plane).split())
+    assert "203.0.113.10" not in shown
+    assert shown == {
+        "203.0.113.10/32",
+        "203.0.113.11/32",
+        "2001:db8::10/128",
+        "203.0.113.20/32",
+        "203.0.113.21/32",
+        "2001:db8::20/128",
+        "127.0.0.53/32",
+        "127.0.0.1/32",
+        "::1/128",
+    }
+    proc = _prove_shadow(bash, plane)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "SHADOW_PROOF=PASS" in proc.stdout
+    assert "failures=0" in proc.stdout

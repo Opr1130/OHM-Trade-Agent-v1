@@ -198,6 +198,9 @@ Egress is pinned by resolving the two approved endpoints and writing
 `IPAddressAllow=` entries into a unit drop-in while the unit keeps
 `IPAddressDeny=any`. systemd does not resolve host names into an address policy, so a
 DNS change is a visible re-activation event rather than silently widened egress.
+The SHADOW proof compares the installed lines and `systemctl show -p IPAddressAllow`
+as canonical networks: a bare host equals that same host as `/32` or `/128`, and a
+broader prefix does not. The comparison reports set counts, not addresses.
 
 SHADOW mode is a separate drop-in, `20-shadow-mode.conf`
 (`Environment=OPIP_COMMITTEE_MODE=shadow`). The base unit file stays
