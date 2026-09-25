@@ -34,12 +34,13 @@ set -Eeuo pipefail
 UNIT="opip-committee-shadow.service"
 TIMER="opip-committee-shadow.timer"
 
-# UNIT_DIR, ENV_FILE, and RESOLV_CONF overrides apply only when
-# OPIP_COMMITTEE_RUNTIME_TEST_HARNESS=1. Otherwise those production paths are
-# fixed. OPIP_COMMITTEE_HOME and OPIP_COMMITTEE_EVIDENCE_ROOT keep their
-# pre-existing defaults.
+# Path overrides apply only when OPIP_COMMITTEE_RUNTIME_TEST_HARNESS=1, and only
+# when every path canonicalises inside OPIP_COMMITTEE_HARNESS_ROOT. Production
+# sudo does not need that variable and must not inherit it. Production paths
+# below are fixed; OPIP_COMMITTEE_HOME and OPIP_COMMITTEE_EVIDENCE_ROOT cannot
+# redirect a privileged write.
 refuse_harness_path() {
-  local label="$1" path="$2" resolved parent
+  local label="$1" path="$2" resolved root
   if [[ -z "$path" ]]; then
     echo "test harness requires ${label}" >&2
     exit 76
@@ -51,19 +52,24 @@ refuse_harness_path() {
       ;;
     *) ;;
   esac
-  if [[ -d "$path" ]]; then
-    parent="$path"
-  else
-    parent="$(dirname "$path")"
-  fi
-  if [[ ! -d "$parent" ]]; then
+  if [[ ! -e "$path" ]]; then
     echo "test harness path for ${label} does not exist" >&2
     exit 76
   fi
-  resolved="$(cd "$parent" && pwd -P)"
-  if [[ ! -d "$path" ]]; then
-    resolved="${resolved}/$(basename "$path")"
+  root="${OPIP_COMMITTEE_HARNESS_ROOT:-}"
+  if [[ -z "$root" || ! -d "$root" ]]; then
+    echo "test harness requires OPIP_COMMITTEE_HARNESS_ROOT" >&2
+    exit 76
   fi
+  resolved="$(readlink -f "$path")"
+  root="$(readlink -f "$root")"
+  case "$resolved" in
+    "$root"|"$root"/*) ;;
+    *)
+      echo "test harness refuses a path outside the harness root for ${label}" >&2
+      exit 76
+      ;;
+  esac
   case "$resolved" in
     /etc|/etc/*|/opt/opip|/opt/opip/*)
       echo "test harness refuses production path for ${label}" >&2
@@ -89,8 +95,8 @@ configure_committee_paths() {
   else
     UNIT_DIR="/etc/systemd/system"
     ENV_FILE="/etc/opip/committee-credentials.env"
-    COMMITTEE_HOME="${OPIP_COMMITTEE_HOME:-/var/lib/opip-committee}"
-    EVIDENCE_ROOT="${OPIP_COMMITTEE_EVIDENCE_ROOT:-/var/lib/opip-learning}"
+    COMMITTEE_HOME="/var/lib/opip-committee"
+    EVIDENCE_ROOT="/var/lib/opip-learning"
     RESOLV_CONF="/etc/resolv.conf"
   fi
   DROPIN_DIR="$UNIT_DIR/$UNIT.d"
@@ -110,6 +116,91 @@ install_conf() {
 
 current_file_mode() {
   sed -n 's/^OPIP_COMMITTEE_MODE=//p' "$ENV_FILE" 2>/dev/null | head -n1 || true
+}
+
+set_env_value() {
+  local key="$1" value="$2"
+  if grep -q "^${key}=" "$ENV_FILE"; then
+    # `|` as the delimiter keeps ISO-8601 values with colons unambiguous.
+    sed -i "s|^${key}=.*|${key}=${value}|" "$ENV_FILE"
+  else
+    printf '%s=%s\n' "$key" "$value" >> "$ENV_FILE"
+  fi
+  return 0
+}
+
+# One path for every failure after a persistent write. It does not look at the
+# mode the file had when activation started. SAFE_OFF=PROVEN is printed only
+# after the resulting OFF state is read back.
+converge_to_safe_off() {
+  local reason="${1:-activation failed}"
+  local file_mode="" unit_mode="" unit_deny="" unit_allow="" timer_enabled="" timer_active="" allow_lines="" conf=""
+  echo "converging to safe off: ${reason}" >&2
+  systemctl disable "$TIMER" >/dev/null 2>&1 || true
+  systemctl stop "$TIMER" >/dev/null 2>&1 || true
+  rm -f "$DROPIN" "$MODE_DROPIN" || true
+  if [[ -d "$MODE_DROPIN" ]]; then
+    rmdir "$MODE_DROPIN" 2>/dev/null || true
+  fi
+  if [[ -d "$DROPIN_DIR" ]]; then
+    shopt -s nullglob
+    for conf in "$DROPIN_DIR"/*.conf; do
+      if grep -qE '^[[:space:]]*IPAddressAllow=|^[[:space:]]*Environment=OPIP_COMMITTEE_MODE=shadow$' "$conf"; then
+        rm -f "$conf" || true
+      fi
+    done
+    shopt -u nullglob
+  fi
+  rmdir "$DROPIN_DIR" 2>/dev/null || true
+  if [[ -f "$ENV_FILE" ]]; then
+    set_env_value OPIP_COMMITTEE_MODE off || true
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  file_mode="$(current_file_mode)"
+  unit_mode="$(systemctl show -p Environment --value "$UNIT" 2>/dev/null | tr ' ' '\n' | sed -n 's/^OPIP_COMMITTEE_MODE=//p' | head -n1 || true)"
+  unit_deny="$(systemctl show -p IPAddressDeny --value "$UNIT" 2>/dev/null | tr -d '\r' || true)"
+  unit_allow="$(systemctl show -p IPAddressAllow --value "$UNIT" 2>/dev/null | tr -d '[:space:]' || true)"
+  timer_enabled="$(systemctl is-enabled "$TIMER" 2>/dev/null || true)"
+  timer_active="$(systemctl show -p ActiveState --value "$TIMER" 2>/dev/null | tr -d '\r' || true)"
+  allow_lines="$(grep -R -E '^[[:space:]]*IPAddressAllow=' "$DROPIN_DIR" 2>/dev/null || true)"
+  if [[ "$file_mode" == "off" \
+    && "$unit_mode" == "off" \
+    && -z "$unit_allow" \
+    && -z "$allow_lines" \
+    && ( "$unit_deny" == "any" || "$unit_deny" == *"0.0.0.0/0"* ) \
+    && "$timer_enabled" != "enabled" \
+    && "$timer_active" == "inactive" \
+    && -d "$COMMITTEE_HOME" \
+    && ! -f "$MODE_DROPIN" \
+    && ! -f "$DROPIN" ]]; then
+    echo "SAFE_OFF=PROVEN"
+    return 0
+  fi
+  echo "SAFE_OFF=FAIL file=${file_mode:-none} unit=${unit_mode:-none} allow=${unit_allow:-none} deny=${unit_deny:-none} timer=${timer_enabled:-none}/${timer_active:-none}" >&2
+  return 1
+}
+
+mutated=0
+safe_off_started=0
+on_activation_error() {
+  local status=$?
+  trap - ERR
+  if [[ "$mutated" -eq 1 && "$safe_off_started" -eq 0 ]]; then
+    safe_off_started=1
+    converge_to_safe_off "activation command failed" || true
+  fi
+  exit "$status"
+}
+trap on_activation_error ERR
+
+fail_closed() {
+  local reason="$1"
+  trap - ERR
+  if [[ "$safe_off_started" -eq 0 ]]; then
+    safe_off_started=1
+    converge_to_safe_off "$reason" || true
+  fi
+  exit 1
 }
 
 #: Provider endpoints. These are the exact application-level allowlist entries in
@@ -279,7 +370,8 @@ echo "SHADOW_ACTIVATION=PREFLIGHT_PASS"
 # systemd does not resolve host names into an address policy, so the approved
 # endpoint names are resolved here and pinned as addresses. A DNS change is
 # therefore a visible re-activation event rather than silently widened egress.
-install -d -m 0755 "$DROPIN_DIR"
+# Resolution finishes before any unit file is written. After the first install,
+# every failure goes through converge_to_safe_off.
 tmp_dropin="$(mktemp)"
 {
   echo "# Generated by activate-committee-shadow.sh at $(date -u +%Y-%m-%dT%H:%M:%SZ)."
@@ -324,66 +416,33 @@ if [[ "$resolved_count" -eq 0 ]]; then
   echo "refusing activation: no provider address was pinned" >&2
   exit 78
 fi
-install_conf "$tmp_dropin" "$DROPIN"
-rm -f "$tmp_dropin"
-echo "PASS  provider-only egress pinned for ${#PROVIDER_ENDPOINTS[@]} endpoints ($resolved_count address entries, $resolver_count resolver entries)"
-
-# --- precondition: the pinned policy actually permits a provider connection ---
-# A pinned address that cannot be reached is a denial of legitimate egress, so
-# reachability is proven here rather than assumed from the allowlist. The mode
-# drop-in is installed only after this succeeds, so a failed probe cannot
-# publish unit-level shadow.
-systemctl daemon-reload
-reachable=0
-for endpoint in "${PROVIDER_ENDPOINTS[@]}"; do
-  if timeout 10 bash -c "exec 3<>/dev/tcp/$endpoint/443" 2>/dev/null; then
-    reachable=$((reachable + 1))
-  else
-    echo "WARN  $endpoint:443 was not reachable during activation" >&2
-  fi
-done
-if [[ "$reachable" -eq 0 ]]; then
-  rm -f "$DROPIN" "$MODE_DROPIN"
-  rmdir "$DROPIN_DIR" 2>/dev/null || true
-  systemctl daemon-reload
-  echo "refusing activation: no approved provider endpoint is reachable under the pinned policy" >&2
-  exit 78
-fi
-echo "PASS  $reachable of ${#PROVIDER_ENDPOINTS[@]} approved provider endpoints are reachable"
 
 # The base unit stays Environment=OPIP_COMMITTEE_MODE=off. This later drop-in
 # replaces only that assignment in the merged Environment property. A bare
 # Environment= line is not used: it would clear PYTHONDONTWRITEBYTECODE=1.
 tmp_mode="$(mktemp)"
 printf '%s\n' '[Service]' 'Environment=OPIP_COMMITTEE_MODE=shadow' > "$tmp_mode"
+
+mutated=1
+install -d -m 0755 "$DROPIN_DIR"
+if ! install_conf "$tmp_dropin" "$DROPIN"; then
+  rm -f "$tmp_dropin" "$tmp_mode"
+  fail_closed "provider egress drop-in was not installed"
+fi
+rm -f "$tmp_dropin"
+echo "PASS  provider-only egress pinned for ${#PROVIDER_ENDPOINTS[@]} endpoints ($resolved_count address entries, $resolver_count resolver entries)"
+
 # A directory at the drop-in path is not a unit file. install -T refuses to
-# treat that directory as the destination file.
-mode_installed=0
-if [[ ! -d "$MODE_DROPIN" ]] && install_conf "$tmp_mode" "$MODE_DROPIN"; then
-  mode_installed=1
+# treat that directory as the destination file. Failure here still removes the
+# egress drop-in through the same safe-OFF path.
+if [[ -d "$MODE_DROPIN" ]] || ! install_conf "$tmp_mode" "$MODE_DROPIN"; then
+  rm -f "$tmp_mode"
+  fail_closed "the shadow mode drop-in was not installed"
 fi
 rm -f "$tmp_mode"
-if [[ "$mode_installed" -ne 1 ]]; then
-  if [[ "$(current_file_mode)" != "shadow" ]]; then
-    rm -f "$DROPIN"
-    systemctl daemon-reload
-  fi
-  echo "refusing activation: the shadow mode drop-in was not installed" >&2
-  exit 78
-fi
 echo "PASS  shadow mode drop-in installed; base unit stays off"
 
 # --- mode and activation boundary --------------------------------------------
-set_env_value() {
-  local key="$1" value="$2"
-  if grep -q "^${key}=" "$ENV_FILE"; then
-    # `|` as the delimiter keeps ISO-8601 values with colons unambiguous.
-    sed -i "s|^${key}=.*|${key}=${value}|" "$ENV_FILE"
-  else
-    printf '%s=%s\n' "$key" "$value" >> "$ENV_FILE"
-  fi
-}
-
 set_env_value OPIP_COMMITTEE_RELEASE_SHA "$TARGET_SHA"
 set_env_value OPIP_COMMITTEE_MODE shadow
 set_env_value OPIP_COMMITTEE_SHADOW_NOT_BEFORE "$NOT_BEFORE"
@@ -397,21 +456,6 @@ fi
 
 systemctl daemon-reload
 
-# Same pipeline verify-committee-shadow.sh uses for the merged unit Environment
-# property. EnvironmentFile= is not part of that property, so the drop-in must
-# have replaced the base unit's off assignment before activation can pass.
-effective_mode="$(systemctl show -p Environment --value "$UNIT" 2>/dev/null | tr ' ' '\n' | sed -n 's/^OPIP_COMMITTEE_MODE=//p' | head -n1 || true)"
-file_mode="$(current_file_mode)"
-if [[ "$effective_mode" != "shadow" || "$file_mode" != "shadow" || ! -f "$DROPIN" ]]; then
-  # Returning the file to off must also remove the allowlist. OFF with a
-  # provider allowlist still installed is not deny-all.
-  set_env_value OPIP_COMMITTEE_MODE off
-  rm -f "$MODE_DROPIN" "$DROPIN"
-  systemctl daemon-reload
-  echo "refusing activation: effective unit mode '${effective_mode:-none}' is not shadow" >&2
-  exit 1
-fi
-
 if [[ "$ENABLE_TIMER" == "true" ]]; then
   systemctl enable --now "$TIMER"
   echo "PASS  recurring committee timer enabled (one case per cycle)"
@@ -421,10 +465,50 @@ else
   timer_enabled="$(systemctl is-enabled "$TIMER" 2>/dev/null || true)"
   timer_active="$(systemctl show -p ActiveState --value "$TIMER" 2>/dev/null | tr -d '\r' || true)"
   if [[ "$timer_enabled" == "enabled" || "$timer_active" != "inactive" ]]; then
-    echo "refusing activation: the committee timer is not disabled and inactive" >&2
-    exit 1
+    fail_closed "the committee timer is not disabled and inactive"
   fi
   echo "PASS  committee timer left disabled and inactive (manual canary only)"
+fi
+
+# Same pipeline verify-committee-shadow.sh uses for the merged unit Environment
+# property. EnvironmentFile= is not part of that property, so the drop-in must
+# have replaced the base unit's off assignment before activation can pass.
+effective_mode="$(systemctl show -p Environment --value "$UNIT" 2>/dev/null | tr ' ' '\n' | sed -n 's/^OPIP_COMMITTEE_MODE=//p' | head -n1 || true)"
+file_mode="$(current_file_mode)"
+unit_deny="$(systemctl show -p IPAddressDeny --value "$UNIT" 2>/dev/null | tr -d '\r' || true)"
+unit_allow="$(systemctl show -p IPAddressAllow --value "$UNIT" 2>/dev/null | tr -d '[:space:]' || true)"
+if [[ "$effective_mode" != "shadow" || "$file_mode" != "shadow" || ! -f "$DROPIN" || ! -f "$MODE_DROPIN" ]]; then
+  fail_closed "effective unit mode '${effective_mode:-none}' is not shadow"
+fi
+if [[ "$unit_deny" != "any" && "$unit_deny" != *"0.0.0.0/0"* ]]; then
+  fail_closed "egress default is not deny-all (observed: ${unit_deny:-none})"
+fi
+if [[ -z "$unit_allow" ]]; then
+  fail_closed "effective provider allowlist is absent"
+fi
+
+# A pinned address that cannot be reached is a denial of legitimate egress.
+# The probe runs after the writes so a failure cannot stop in a mixed state:
+# safe-OFF removes both drop-ins and returns the environment file to off.
+reachable=0
+for endpoint in "${PROVIDER_ENDPOINTS[@]}"; do
+  if timeout 10 bash -c "exec 3<>/dev/tcp/$endpoint/443" 2>/dev/null; then
+    reachable=$((reachable + 1))
+  else
+    echo "WARN  $endpoint:443 was not reachable during activation" >&2
+  fi
+done
+if [[ "$reachable" -eq 0 ]]; then
+  fail_closed "no approved provider endpoint is reachable under the pinned policy"
+fi
+echo "PASS  $reachable of ${#PROVIDER_ENDPOINTS[@]} approved provider endpoints are reachable"
+
+proof_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/verify-committee-shadow.sh"
+if [[ ! -f "$proof_script" ]]; then
+  fail_closed "the independent shadow proof script is absent"
+fi
+if ! bash "$proof_script"; then
+  fail_closed "the independent shadow proof failed"
 fi
 
 echo

@@ -20,8 +20,10 @@ set -uo pipefail
 UNIT="opip-committee-shadow.service"
 TIMER="opip-committee-shadow.timer"
 
+# Same jail as activate-committee-shadow.sh. Production paths are fixed.
+# OPIP_COMMITTEE_HOME and OPIP_COMMITTEE_EVIDENCE_ROOT are harness-only.
 refuse_harness_path() {
-  local label="$1" path="$2" resolved parent
+  local label="$1" path="$2" resolved root
   if [[ -z "$path" ]]; then
     echo "test harness requires ${label}" >&2
     exit 76
@@ -33,19 +35,24 @@ refuse_harness_path() {
       ;;
     *) ;;
   esac
-  if [[ -d "$path" ]]; then
-    parent="$path"
-  else
-    parent="$(dirname "$path")"
-  fi
-  if [[ ! -d "$parent" ]]; then
+  if [[ ! -e "$path" ]]; then
     echo "test harness path for ${label} does not exist" >&2
     exit 76
   fi
-  resolved="$(cd "$parent" && pwd -P)"
-  if [[ ! -d "$path" ]]; then
-    resolved="${resolved}/$(basename "$path")"
+  root="${OPIP_COMMITTEE_HARNESS_ROOT:-}"
+  if [[ -z "$root" || ! -d "$root" ]]; then
+    echo "test harness requires OPIP_COMMITTEE_HARNESS_ROOT" >&2
+    exit 76
   fi
+  resolved="$(readlink -f "$path")"
+  root="$(readlink -f "$root")"
+  case "$resolved" in
+    "$root"|"$root"/*) ;;
+    *)
+      echo "test harness refuses a path outside the harness root for ${label}" >&2
+      exit 76
+      ;;
+  esac
   case "$resolved" in
     /etc|/etc/*|/opt/opip|/opt/opip/*)
       echo "test harness refuses production path for ${label}" >&2
@@ -71,8 +78,8 @@ configure_committee_paths() {
   else
     UNIT_DIR="/etc/systemd/system"
     ENV_FILE="/etc/opip/committee-credentials.env"
-    COMMITTEE_HOME="${OPIP_COMMITTEE_HOME:-/var/lib/opip-committee}"
-    EVIDENCE_ROOT="${OPIP_COMMITTEE_EVIDENCE_ROOT:-/var/lib/opip-learning}"
+    COMMITTEE_HOME="/var/lib/opip-committee"
+    EVIDENCE_ROOT="/var/lib/opip-learning"
     RESOLV_CONF="/etc/resolv.conf"
   fi
   DROPIN_DIR="$UNIT_DIR/$UNIT.d"
@@ -167,6 +174,12 @@ if [[ "${1:-}" == "--rollback" ]]; then
     pass "no provider egress allowlist remains: OFF-mode egress is deny-all again"
   else
     fail "the provider egress allowlist is still present after rollback"
+  fi
+  unit_allow="$(systemctl show -p IPAddressAllow --value "$UNIT" 2>/dev/null | tr -d '[:space:]' || true)"
+  if [[ -z "$unit_allow" ]]; then
+    pass "effective IPAddressAllow has no exceptions"
+  else
+    fail "effective IPAddressAllow still has exceptions after rollback"
   fi
   unit_deny="$(systemctl show -p IPAddressDeny --value "$UNIT" 2>/dev/null || echo '')"
   if [[ "$unit_deny" == "any" || "$unit_deny" == *"0.0.0.0/0"* ]]; then
@@ -268,6 +281,23 @@ if [[ "$unexpected" -eq 0 ]]; then
   pass "every allowlisted address belongs to an approved provider endpoint"
 else
   fail "$unexpected allowlisted address(es) do not belong to an approved endpoint"
+fi
+unit_allow="$(systemctl show -p IPAddressAllow --value "$UNIT" 2>/dev/null | tr ' ' '\n' || true)"
+if [[ -z "$(printf '%s' "$unit_allow" | tr -d '[:space:]')" ]]; then
+  fail "effective IPAddressAllow has no provider exception"
+else
+  effective_unexpected=0
+  while IFS= read -r address; do
+    [[ -z "$address" ]] && continue
+    if ! printf '%s\n' "$expected_addresses" | grep -qx "$address"; then
+      effective_unexpected=$((effective_unexpected + 1))
+    fi
+  done <<< "$unit_allow"
+  if [[ "$effective_unexpected" -eq 0 ]]; then
+    pass "effective IPAddressAllow contains only approved provider or resolver addresses"
+  else
+    fail "$effective_unexpected effective allowlist address(es) are not approved"
+  fi
 fi
 
 unit_deny="$(systemctl show -p IPAddressDeny --value "$UNIT" 2>/dev/null || echo '')"

@@ -578,6 +578,44 @@ merge_environment() {
   rm -f "$state"
 }
 
+merge_allows() {
+  local state line conf
+  state="$(mktemp)"
+  : > "$state"
+  collect_file() {
+    local file="$1"
+    [[ -f "$file" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="${line%$'\r'}"
+      case "$line" in
+        IPAddressAllow=*)
+          printf '%s\n' "${line#IPAddressAllow=}" >> "$state"
+          ;;
+        *) ;;
+      esac
+    done < "$file"
+  }
+  collect_file "$UNIT_FILE"
+  if [[ -d "$DROPIN_DIR" ]]; then
+    shopt -s nullglob
+    local files=("$DROPIN_DIR"/*.conf)
+    shopt -u nullglob
+    if [[ ${#files[@]} -gt 0 ]]; then
+      while IFS= read -r conf; do
+        [[ -z "$conf" ]] && continue
+        collect_file "$conf"
+      done < <(printf '%s\n' "${files[@]}" | sort)
+    fi
+  fi
+  if [[ -n "${OPIP_TEST_FORCE_IP_ALLOW:-}" ]]; then
+    printf '%s\n' "$OPIP_TEST_FORCE_IP_ALLOW" >> "$state"
+  fi
+  if [[ -s "$state" ]]; then
+    paste -sd ' ' "$state"
+  fi
+  rm -f "$state"
+}
+
 cmd="${1:-}"
 shift || true
 case "$cmd" in
@@ -594,10 +632,32 @@ case "$cmd" in
     [[ "$state" == "enabled" ]]
     ;;
   disable)
+    if [[ "${OPIP_TEST_DISABLE_ALWAYS_FAIL:-}" == "1" ]]; then
+      exit 1
+    fi
+    if [[ "${OPIP_TEST_DISABLE_FAILS_ONCE:-}" == "1" && ! -f "${ENABLEMENT}.disable-once" ]]; then
+      : > "${ENABLEMENT}.disable-once"
+      exit 1
+    fi
+    if [[ "${OPIP_TEST_DISABLE_IGNORES_ONCE:-}" == "1" && ! -f "${ENABLEMENT}.disable-ignore" ]]; then
+      : > "${ENABLEMENT}.disable-ignore"
+      exit 0
+    fi
     printf '%s\n' disabled > "$ENABLEMENT"
     exit 0
     ;;
   stop)
+    if [[ "${OPIP_TEST_STOP_ALWAYS_FAIL:-}" == "1" ]]; then
+      exit 1
+    fi
+    if [[ "${OPIP_TEST_STOP_FAILS_ONCE:-}" == "1" && ! -f "${ACTIVE_FILE}.stop-once" ]]; then
+      : > "${ACTIVE_FILE}.stop-once"
+      exit 1
+    fi
+    if [[ "${OPIP_TEST_STOP_IGNORES_ONCE:-}" == "1" && ! -f "${ACTIVE_FILE}.stop-ignore" ]]; then
+      : > "${ACTIVE_FILE}.stop-ignore"
+      exit 0
+    fi
     printf '%s\n' inactive > "$ACTIVE_FILE"
     exit 0
     ;;
@@ -635,8 +695,15 @@ case "$cmd" in
         printf '%s\n' "$(merge_environment)"
         ;;
       IPAddressDeny)
-        deny="$(sed -n 's/^IPAddressDeny=//p' "$UNIT_FILE" | head -n1 | tr -d '\r')"
-        printf '%s\n' "${deny:-any}"
+        if [[ -n "${OPIP_TEST_FORCE_DENY:-}" ]]; then
+          printf '%s\n' "$OPIP_TEST_FORCE_DENY"
+        else
+          deny="$(sed -n 's/^IPAddressDeny=//p' "$UNIT_FILE" | head -n1 | tr -d '\r')"
+          printf '%s\n' "${deny:-any}"
+        fi
+        ;;
+      IPAddressAllow)
+        printf '%s\n' "$(merge_allows)"
         ;;
       ActiveState)
         if [[ -f "$ACTIVE_FILE" ]]; then
@@ -805,6 +872,7 @@ def _harness_env(plane: dict[str, pathlib.Path]) -> dict[str, str]:
     env.update(
         {
             "OPIP_COMMITTEE_RUNTIME_TEST_HARNESS": "1",
+            "OPIP_COMMITTEE_HARNESS_ROOT": _bash_path(plane["root"]),
             "OPIP_COMMITTEE_UNIT_DIR": _bash_path(plane["unit_dir"]),
             "OPIP_COMMITTEE_ENV_FILE": _bash_path(plane["env"]),
             "OPIP_COMMITTEE_HOME": _bash_path(plane["advisory"]),
@@ -915,6 +983,47 @@ def _show_environment(bash: str, plane: dict[str, pathlib.Path]) -> str:
     return proc.stdout
 
 
+def _show_allow(bash: str, plane: dict[str, pathlib.Path]) -> str:
+    proc = subprocess.run(
+        [
+            bash,
+            "-c",
+            "systemctl show -p IPAddressAllow --value opip-committee-shadow.service",
+        ],
+        capture_output=True,
+        text=True,
+        env=_harness_env(plane),
+    )
+    _skip_if_bash_cannot_fork(proc)
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout.strip()
+
+
+def _activation(plane: dict[str, pathlib.Path]) -> list[str]:
+    return [_SHA, _NOT_BEFORE, _REVIEW_BY]
+
+
+def _assert_proven_off(
+    proc: subprocess.CompletedProcess[str],
+    plane: dict[str, pathlib.Path],
+    bash: str,
+) -> None:
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0
+    assert "SHADOW_ACTIVATION=PASS" not in combined
+    assert "SAFE_OFF=PROVEN" in proc.stdout
+    assert "SAFE_OFF=FAIL" not in combined
+    assert _file_mode(plane) == "off"
+    assert not (plane["dropin"] / "10-provider-egress.conf").exists()
+    assert not (plane["dropin"] / "20-shadow-mode.conf").is_file()
+    assert _show_mode(bash, plane) == "off"
+    assert _show_allow(bash, plane) == ""
+    assert plane["enablement"].read_text(encoding="utf-8").strip() == "disabled"
+    assert plane["active"].read_text(encoding="utf-8").strip() == "inactive"
+    marker = plane["advisory"] / "role_results.jsonl"
+    assert marker.is_file()
+
+
 def _show_mode(bash: str, plane: dict[str, pathlib.Path]) -> str:
     proc = subprocess.run(
         [
@@ -974,6 +1083,8 @@ def test_rollback_proves_off_and_keeps_advisory_evidence(
         encoding="utf-8",
         newline="\n",
     )
+    note = plane["dropin"] / "30-admin-note.conf"
+    note.write_text("# administrator note\n", encoding="utf-8", newline="\n")
     proc = _run_script(
         bash,
         COMMITTEE_DEPLOY / "verify-committee-shadow.sh",
@@ -987,7 +1098,9 @@ def test_rollback_proves_off_and_keeps_advisory_evidence(
     assert not (plane["dropin"] / "20-shadow-mode.conf").exists()
     assert not (plane["dropin"] / "10-provider-egress.conf").exists()
     assert not stale.exists()
+    assert note.is_file()
     assert _show_mode(bash, plane) == "off"
+    assert _show_allow(bash, plane) == ""
     assert plane["enablement"].read_text(encoding="utf-8").strip() == "disabled"
     assert plane["active"].read_text(encoding="utf-8").strip() == "inactive"
     assert marker.is_file()
@@ -1007,11 +1120,7 @@ def test_activation_refuses_pass_when_mode_dropin_install_fails(
         [_SHA, _NOT_BEFORE, _REVIEW_BY],
         plane,
     )
-    assert proc.returncode != 0
-    combined = proc.stdout + proc.stderr
-    assert "SHADOW_ACTIVATION=PASS" not in combined
-    assert _file_mode(plane) == "off"
-    assert not (plane["dropin"] / "10-provider-egress.conf").exists()
+    _assert_proven_off(proc, plane, bash)
 
 
 def test_base_unit_and_bootstrap_stay_fail_closed() -> None:
@@ -1026,6 +1135,19 @@ def test_base_unit_and_bootstrap_stay_fail_closed() -> None:
     assert "IPAddressAllow=" not in bootstrap
     install = INSTALL.read_text(encoding="utf-8")
     assert "OPIP_COMMITTEE_MODE=shadow" not in install
+    activate = (COMMITTEE_DEPLOY / "activate-committee-shadow.sh").read_text(encoding="utf-8")
+    verify = (COMMITTEE_DEPLOY / "verify-committee-shadow.sh").read_text(encoding="utf-8")
+    assert "converge_to_safe_off" in activate
+    assert "SAFE_OFF=PROVEN" in activate
+    assert "SAFE_OFF=FAIL" in activate
+    assert 'current_file_mode)" != "shadow"' not in activate
+    assert "printf '%s\\n' '[Service]' 'Environment=OPIP_COMMITTEE_MODE=shadow'" in activate
+    for script in (activate, verify):
+        else_branch = script.split('== "1" ]]; then', 1)[1].split("else", 1)[1].split("fi", 1)[0]
+        assert 'COMMITTEE_HOME="/var/lib/opip-committee"' in else_branch
+        assert 'EVIDENCE_ROOT="/var/lib/opip-learning"' in else_branch
+        assert "OPIP_COMMITTEE_HOME:-" not in else_branch
+        assert "OPIP_COMMITTEE_EVIDENCE_ROOT:-" not in else_branch
 
 
 def test_base_unit_stays_off_and_bootstrap_does_not_open_shadow(
@@ -1056,9 +1178,16 @@ def test_activation_reconciles_a_shadow_file_whose_unit_still_shows_off(
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "SHADOW_ACTIVATION=PASS" in proc.stdout
+    assert "SHADOW_PROOF=PASS" in proc.stdout
     mode_dropin = plane["dropin"] / "20-shadow-mode.conf"
     assert mode_dropin.is_file()
-    assert "Environment=OPIP_COMMITTEE_MODE=shadow" in mode_dropin.read_text(encoding="utf-8")
+    mode_text = mode_dropin.read_text(encoding="utf-8")
+    assert "Environment=OPIP_COMMITTEE_MODE=shadow" in mode_text
+    assert "Environment=\n" not in mode_text
+    assert not any(line.strip() == "Environment=" for line in mode_text.splitlines())
+    shown = _show_environment(bash, plane)
+    assert "OPIP_COMMITTEE_MODE=shadow" in shown
+    assert "PYTHONDONTWRITEBYTECODE=1" in shown
     assert _show_mode(bash, plane) == "shadow"
     assert plane["enablement"].read_text(encoding="utf-8").strip() == "disabled"
     assert plane["active"].read_text(encoding="utf-8").strip() == "inactive"
@@ -1083,30 +1212,220 @@ def test_activation_does_not_leave_an_allowlist_when_unit_mode_stays_off(
         plane,
         extra={"OPIP_TEST_FORCE_UNIT_MODE": "off"},
     )
-    assert proc.returncode != 0
-    combined = proc.stdout + proc.stderr
-    assert "SHADOW_ACTIVATION=PASS" not in combined
-    assert _file_mode(plane) == "off"
-    assert not (plane["dropin"] / "10-provider-egress.conf").exists()
-    assert not (plane["dropin"] / "20-shadow-mode.conf").is_file()
+    _assert_proven_off(proc, plane, bash)
 
 
-def test_unreachable_providers_do_not_publish_unit_shadow(
+def test_unreachable_providers_return_the_mixed_state_to_off(
     tmp_path: pathlib.Path, fork_bash: str
 ) -> None:
-    """Reachability failure on the mixed state must not install the mode drop-in."""
+    """Case H: reachability failure after writes must end at proven OFF."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="shadow")
+    _egress(plane["dropin"])
+    marker = plane["advisory"] / "role_results.jsonl"
+    marker.write_text("kept\n", encoding="utf-8", newline="\n")
+    proc = _run_script(
+        bash,
+        COMMITTEE_DEPLOY / "activate-committee-shadow.sh",
+        _activation(plane),
+        plane,
+        extra={"OPIP_TEST_TIMEOUT_FAIL": "1"},
+    )
+    _assert_proven_off(proc, plane, bash)
+    assert marker.read_text(encoding="utf-8") == "kept\n"
+
+
+def test_rollback_fails_when_effective_allowlist_remains(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """Case J: a stale allowlist that is still effective cannot produce ROLLBACK_PROOF=PASS."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="shadow")
+    _egress(plane["dropin"])
+    _mode_dropin(plane["dropin"])
+    stale = plane["dropin"] / "99-stale-provider-egress.conf"
+    stale.write_text(
+        "[Service]\nIPAddressAllow=198.51.100.10\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    proc = _run_script(
+        bash,
+        COMMITTEE_DEPLOY / "verify-committee-shadow.sh",
+        ["--rollback"],
+        plane,
+        extra={"OPIP_TEST_FORCE_IP_ALLOW": "198.51.100.10"},
+    )
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 1
+    assert "ROLLBACK_PROOF=FAIL" in proc.stdout
+    assert "ROLLBACK_PROOF=PASS" not in proc.stdout
+    assert "effective IPAddressAllow still has exceptions after rollback" in proc.stdout
+
+
+def test_timer_disable_failure_returns_to_proven_off(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """Case K: a failed disable cannot be followed by SHADOW_ACTIVATION=PASS."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="off")
+    plane["enablement"].write_text("enabled\n", encoding="utf-8", newline="\n")
+    proc = _run_script(
+        bash,
+        COMMITTEE_DEPLOY / "activate-committee-shadow.sh",
+        _activation(plane),
+        plane,
+        extra={"OPIP_TEST_DISABLE_FAILS_ONCE": "1"},
+    )
+    _assert_proven_off(proc, plane, bash)
+
+
+def test_timer_stop_failure_returns_to_proven_off(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """Case L: a failed stop cannot be followed by SHADOW_ACTIVATION=PASS."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="off")
+    plane["active"].write_text("active\n", encoding="utf-8", newline="\n")
+    proc = _run_script(
+        bash,
+        COMMITTEE_DEPLOY / "activate-committee-shadow.sh",
+        _activation(plane),
+        plane,
+        extra={"OPIP_TEST_STOP_FAILS_ONCE": "1"},
+    )
+    _assert_proven_off(proc, plane, bash)
+
+
+def test_timer_remaining_enabled_returns_to_proven_off(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """Case M: a disable that leaves the timer enabled cannot pass activation."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="off")
+    plane["enablement"].write_text("enabled\n", encoding="utf-8", newline="\n")
+    proc = _run_script(
+        bash,
+        COMMITTEE_DEPLOY / "activate-committee-shadow.sh",
+        _activation(plane),
+        plane,
+        extra={"OPIP_TEST_DISABLE_IGNORES_ONCE": "1"},
+    )
+    _assert_proven_off(proc, plane, bash)
+
+
+def test_timer_remaining_active_returns_to_proven_off(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """Case N: a stop that leaves the timer active cannot pass activation."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="off")
+    plane["active"].write_text("active\n", encoding="utf-8", newline="\n")
+    proc = _run_script(
+        bash,
+        COMMITTEE_DEPLOY / "activate-committee-shadow.sh",
+        _activation(plane),
+        plane,
+        extra={"OPIP_TEST_STOP_IGNORES_ONCE": "1"},
+    )
+    _assert_proven_off(proc, plane, bash)
+
+
+def test_activation_is_idempotent(tmp_path: pathlib.Path, fork_bash: str) -> None:
+    """Case S: a second corrected activation stays on proven SHADOW."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="off")
+    script = COMMITTEE_DEPLOY / "activate-committee-shadow.sh"
+    first = _run_script(bash, script, _activation(plane), plane)
+    assert first.returncode == 0, first.stdout + first.stderr
+    second = _run_script(bash, script, _activation(plane), plane)
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert "SHADOW_ACTIVATION=PASS" in second.stdout
+    assert "SHADOW_PROOF=PASS" in second.stdout
+    assert "SAFE_OFF=PROVEN" not in second.stdout
+    assert _file_mode(plane) == "shadow"
+    assert _show_mode(bash, plane) == "shadow"
+    assert plane["enablement"].read_text(encoding="utf-8").strip() == "disabled"
+    assert plane["active"].read_text(encoding="utf-8").strip() == "inactive"
+
+
+def test_rollback_is_idempotent(tmp_path: pathlib.Path, fork_bash: str) -> None:
+    """Case T: rolling back an already-OFF plane still proves OFF."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="off")
+    script = COMMITTEE_DEPLOY / "verify-committee-shadow.sh"
+    first = _run_script(bash, script, ["--rollback"], plane)
+    assert first.returncode == 0, first.stdout + first.stderr
+    second = _run_script(bash, script, ["--rollback"], plane)
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert "ROLLBACK_PROOF=PASS" in second.stdout
+    assert _file_mode(plane) == "off"
+    assert _show_mode(bash, plane) == "off"
+    assert _show_allow(bash, plane) == ""
+    marker = plane["advisory"] / "role_results.jsonl"
+    assert marker.is_file()
+
+
+def test_safe_off_does_not_claim_success_when_proof_fails(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """Case U: a cleanup that cannot prove deny-all never claims SAFE_OFF or activation PASS."""
     bash = fork_bash
     plane = _plane(tmp_path, mode="shadow")
     _egress(plane["dropin"])
     proc = _run_script(
         bash,
         COMMITTEE_DEPLOY / "activate-committee-shadow.sh",
-        [_SHA, _NOT_BEFORE, _REVIEW_BY],
+        _activation(plane),
         plane,
-        extra={"OPIP_TEST_TIMEOUT_FAIL": "1"},
+        extra={"OPIP_TEST_FORCE_DENY": "broken"},
     )
-    assert proc.returncode != 0
     combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0
     assert "SHADOW_ACTIVATION=PASS" not in combined
-    assert _file_mode(plane) == "shadow"
-    assert not (plane["dropin"] / "20-shadow-mode.conf").exists()
+    assert "SAFE_OFF=PROVEN" not in proc.stdout
+    assert "SAFE_OFF=FAIL" in proc.stderr
+
+
+def test_harness_rejects_parent_relative_escape(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """Case Q: allowed-root/../etc is rejected before any write."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="off")
+    env = _harness_env(plane)
+    env["OPIP_COMMITTEE_UNIT_DIR"] = _bash_path(plane["unit_dir"]) + "/../etc"
+    proc = subprocess.run(
+        [bash, str(COMMITTEE_DEPLOY / "verify-committee-shadow.sh")],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    _skip_if_bash_cannot_fork(proc)
+    assert proc.returncode == 76
+    assert "parent-relative" in proc.stderr
+    assert "SHADOW_PROOF=PASS" not in proc.stdout
+    assert "ROLLBACK_PROOF=PASS" not in proc.stdout
+
+
+def test_harness_rejects_symlink_escape(tmp_path: pathlib.Path, fork_bash: str) -> None:
+    """Case R: a symlink from the harness root to /etc is rejected."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="off")
+    link = plane["root"] / "escape-etc"
+    try:
+        link.symlink_to("/etc", target_is_directory=True)
+    except OSError:
+        pytest.skip("this platform cannot create the /etc symlink")
+    env = _harness_env(plane)
+    env["OPIP_COMMITTEE_UNIT_DIR"] = link.as_posix()
+    proc = subprocess.run(
+        [bash, str(COMMITTEE_DEPLOY / "verify-committee-shadow.sh")],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    _skip_if_bash_cannot_fork(proc)
+    assert proc.returncode == 76
+    assert "outside the harness root" in proc.stderr
+    assert "SHADOW_PROOF=PASS" not in proc.stdout
