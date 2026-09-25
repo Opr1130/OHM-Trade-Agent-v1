@@ -629,7 +629,10 @@ case "$cmd" in
       state="disabled"
     fi
     printf '%s\n' "$state"
-    [[ "$state" == "enabled" ]]
+    case "$state" in
+      enabled|enabled-runtime|linked|linked-runtime|alias) exit 0 ;;
+      *) exit 1 ;;
+    esac
     ;;
   disable)
     if [[ "${OPIP_TEST_DISABLE_ALWAYS_FAIL:-}" == "1" ]]; then
@@ -1293,6 +1296,23 @@ def test_timer_stop_failure_returns_to_proven_off(
         _activation(plane),
         plane,
         extra={"OPIP_TEST_STOP_FAILS_ONCE": "1"},
+    )
+    _assert_proven_off(proc, plane, bash)
+
+
+def test_timer_enabled_runtime_returns_to_proven_off(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """enabled-runtime is still enabled and cannot pass activation."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="off")
+    plane["enablement"].write_text("enabled-runtime\n", encoding="utf-8", newline="\n")
+    proc = _run_script(
+        bash,
+        COMMITTEE_DEPLOY / "activate-committee-shadow.sh",
+        _activation(plane),
+        plane,
+        extra={"OPIP_TEST_DISABLE_IGNORES_ONCE": "1"},
     )
     _assert_proven_off(proc, plane, bash)
 

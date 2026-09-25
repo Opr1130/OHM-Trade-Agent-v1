@@ -134,7 +134,7 @@ set_env_value() {
 # after the resulting OFF state is read back.
 converge_to_safe_off() {
   local reason="${1:-activation failed}"
-  local file_mode="" unit_mode="" unit_deny="" unit_allow="" timer_enabled="" timer_active="" allow_lines="" conf=""
+  local file_mode="" unit_mode="" unit_deny="" unit_allow="" timer_enabled="" timer_active="" allow_lines="" conf="" timer_on=0
   echo "converging to safe off: ${reason}" >&2
   systemctl disable "$TIMER" >/dev/null 2>&1 || true
   systemctl stop "$TIMER" >/dev/null 2>&1 || true
@@ -162,13 +162,16 @@ converge_to_safe_off() {
   unit_allow="$(systemctl show -p IPAddressAllow --value "$UNIT" 2>/dev/null | tr -d '[:space:]' || true)"
   timer_enabled="$(systemctl is-enabled "$TIMER" 2>/dev/null || true)"
   timer_active="$(systemctl show -p ActiveState --value "$TIMER" 2>/dev/null | tr -d '\r' || true)"
+  if systemctl is-enabled "$TIMER" >/dev/null 2>&1; then
+    timer_on=1
+  fi
   allow_lines="$(grep -R -E '^[[:space:]]*IPAddressAllow=' "$DROPIN_DIR" 2>/dev/null || true)"
   if [[ "$file_mode" == "off" \
     && "$unit_mode" == "off" \
     && -z "$unit_allow" \
     && -z "$allow_lines" \
     && ( "$unit_deny" == "any" || "$unit_deny" == *"0.0.0.0/0"* ) \
-    && "$timer_enabled" != "enabled" \
+    && "$timer_on" -eq 0 \
     && "$timer_active" == "inactive" \
     && -d "$COMMITTEE_HOME" \
     && ! -f "$MODE_DROPIN" \
@@ -462,9 +465,8 @@ if [[ "$ENABLE_TIMER" == "true" ]]; then
 else
   systemctl disable "$TIMER" >/dev/null 2>&1 || true
   systemctl stop "$TIMER" >/dev/null 2>&1 || true
-  timer_enabled="$(systemctl is-enabled "$TIMER" 2>/dev/null || true)"
   timer_active="$(systemctl show -p ActiveState --value "$TIMER" 2>/dev/null | tr -d '\r' || true)"
-  if [[ "$timer_enabled" == "enabled" || "$timer_active" != "inactive" ]]; then
+  if systemctl is-enabled "$TIMER" >/dev/null 2>&1 || [[ "$timer_active" != "inactive" ]]; then
     fail_closed "the committee timer is not disabled and inactive"
   fi
   echo "PASS  committee timer left disabled and inactive (manual canary only)"

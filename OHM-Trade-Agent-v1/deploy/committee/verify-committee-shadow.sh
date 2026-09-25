@@ -389,7 +389,8 @@ fi
 timer_enabled="$(systemctl is-enabled "$TIMER" 2>/dev/null || true)"
 timer_active="$(systemctl show -p ActiveState --value "$TIMER" 2>/dev/null || echo "$UNKNOWN_STATE")"
 timer_cap="$(env_value OPIP_COMMITTEE_MAX_CASES_PER_CYCLE)"
-if [[ "$timer_enabled" == "enabled" ]]; then
+# Exit 0 covers enabled and enabled-runtime. A runtime enable is still enabled.
+if systemctl is-enabled "$TIMER" >/dev/null 2>&1; then
   if [[ "$timer_cap" == "1" ]]; then
     # A recurring timer is only acceptable with the conservative cap still in force.
     pass "recurring timer is enabled with a one-case cycle cap"
