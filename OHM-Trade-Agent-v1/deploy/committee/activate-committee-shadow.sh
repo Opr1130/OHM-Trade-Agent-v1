@@ -184,17 +184,48 @@ converge_to_safe_off() {
 }
 
 mutated=0
+# Set after arguments and paths are valid. Distinct from mutated: the host may
+# already be mixed before this process writes anything.
+recovery_required=0
 safe_off_started=0
 on_activation_error() {
   local status=$?
   trap - ERR
-  if [[ "$mutated" -eq 1 && "$safe_off_started" -eq 0 ]]; then
+  if [[ "$safe_off_started" -eq 0 && ( "$mutated" -eq 1 || "$recovery_required" -eq 1 ) ]]; then
     safe_off_started=1
     converge_to_safe_off "activation command failed" || true
   fi
   exit "$status"
 }
 trap on_activation_error ERR
+
+# True when the plane is already SHADOW or mixed. A later failure must not
+# leave that state in place, even if this process has not written yet.
+plane_requires_recovery() {
+  local file_mode="" unit_mode="" unit_allow=""
+  file_mode="$(current_file_mode)"
+  unit_mode="$(systemctl show -p Environment --value "$UNIT" 2>/dev/null | tr ' ' '\n' | sed -n 's/^OPIP_COMMITTEE_MODE=//p' | head -n1 || true)"
+  unit_allow="$(systemctl show -p IPAddressAllow --value "$UNIT" 2>/dev/null | tr -d '[:space:]' || true)"
+  if [[ "$file_mode" == "shadow" || "$unit_mode" == "shadow" || -n "$unit_allow" || -e "$DROPIN" || -e "$MODE_DROPIN" ]]; then
+    return 0
+  fi
+  if [[ -d "$DROPIN_DIR" ]] && grep -R -qE '^[[:space:]]*IPAddressAllow=|^[[:space:]]*Environment=OPIP_COMMITTEE_MODE=shadow$' "$DROPIN_DIR" 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+# Early reconciliation failures. Malformed arguments never call this.
+exit_reconciliation() {
+  local status="${1:-78}"
+  local reason="${2:-reconciliation failed before a new write}"
+  trap - ERR
+  if [[ "$recovery_required" -eq 1 && "$safe_off_started" -eq 0 ]]; then
+    safe_off_started=1
+    converge_to_safe_off "$reason" || true
+  fi
+  exit "$status"
+}
 
 fail_closed() {
   local reason="$1"
@@ -263,11 +294,20 @@ if [[ ! "$REVIEW_BY" =~ $iso_utc_re ]]; then
   exit 64
 fi
 
+# Arguments and paths are valid. From here a failure is a failed reconciliation.
+# A pristine OFF plane is left unchanged. A plane that is already SHADOW or
+# mixed is returned through converge_to_safe_off.
+recovery_required=0
+if plane_requires_recovery; then
+  recovery_required=1
+fi
+
 # --- preconditions -----------------------------------------------------------
 # Every precondition is evaluated and reported before the script refuses, so an
 # operator sees the complete set of things to fix rather than fixing them one
-# deployment at a time. A refusal is still fail-closed: nothing is written and no
-# mode is changed while any precondition is unmet.
+# deployment at a time. A pristine OFF refusal writes nothing. A refusal on a
+# plane that already has SHADOW or provider-egress state returns that plane to
+# proven OFF.
 precondition_failed=0
 refuse() { printf 'REFUSED  %s\n' "$1" >&2; precondition_failed=$((precondition_failed + 1)); return 0; }
 satisfy() { printf 'PASS     %s\n' "$1"; return 0; }
@@ -364,8 +404,11 @@ fi
 echo
 if [[ "$precondition_failed" -gt 0 ]]; then
   echo "SHADOW_ACTIVATION=BLOCKED preconditions_failed=$precondition_failed"
-  echo "nothing was changed; the plane remains as it was" >&2
-  exit 78
+  if [[ "$recovery_required" -eq 0 ]]; then
+    echo "nothing was changed; the plane remains as it was" >&2
+    exit 78
+  fi
+  exit_reconciliation 78 "preconditions failed on a plane that already had shadow or provider-egress state"
 fi
 echo "SHADOW_ACTIVATION=PREFLIGHT_PASS"
 
@@ -406,7 +449,7 @@ for endpoint in "${PROVIDER_ENDPOINTS[@]}"; do
   if [[ -z "$addresses" ]]; then
     rm -f "$tmp_dropin"
     echo "refusing activation: could not resolve $endpoint; egress cannot be pinned" >&2
-    exit 78
+    exit_reconciliation 78 "could not resolve $endpoint"
   fi
   while IFS= read -r address; do
     [[ -z "$address" ]] && continue
@@ -417,7 +460,7 @@ done
 if [[ "$resolved_count" -eq 0 ]]; then
   rm -f "$tmp_dropin"
   echo "refusing activation: no provider address was pinned" >&2
-  exit 78
+  exit_reconciliation 78 "no provider address was pinned"
 fi
 
 # The base unit stays Environment=OPIP_COMMITTEE_MODE=off. This later drop-in

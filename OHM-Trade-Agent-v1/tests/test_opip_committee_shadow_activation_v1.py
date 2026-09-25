@@ -730,6 +730,9 @@ esac
 
 _GETENT = """#!/usr/bin/env bash
 set -euo pipefail
+if [[ "${OPIP_TEST_GETENT_FAIL:-}" == "1" ]]; then
+  exit 1
+fi
 if [[ "${1:-}" == "ahosts" ]]; then
   case "${2:-}" in
     api.openai.com|api.anthropic.com)
@@ -1141,6 +1144,8 @@ def test_base_unit_and_bootstrap_stay_fail_closed() -> None:
     activate = (COMMITTEE_DEPLOY / "activate-committee-shadow.sh").read_text(encoding="utf-8")
     verify = (COMMITTEE_DEPLOY / "verify-committee-shadow.sh").read_text(encoding="utf-8")
     assert "converge_to_safe_off" in activate
+    assert "recovery_required" in activate
+    assert "plane_requires_recovery" in activate
     assert "SAFE_OFF=PROVEN" in activate
     assert "SAFE_OFF=FAIL" in activate
     assert 'current_file_mode)" != "shadow"' not in activate
@@ -1449,3 +1454,135 @@ def test_harness_rejects_symlink_escape(tmp_path: pathlib.Path, fork_bash: str) 
     assert proc.returncode == 76
     assert "outside the harness root" in proc.stderr
     assert "SHADOW_PROOF=PASS" not in proc.stdout
+
+
+def _show_deny(bash: str, plane: dict[str, pathlib.Path]) -> str:
+    proc = subprocess.run(
+        [
+            bash,
+            "-c",
+            "systemctl show -p IPAddressDeny --value opip-committee-shadow.service",
+        ],
+        capture_output=True,
+        text=True,
+        env=_harness_env(plane),
+    )
+    _skip_if_bash_cannot_fork(proc)
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout.strip()
+
+
+def test_mixed_dns_failure_returns_to_proven_off(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """Case V: provider resolution failure on the mixed host cannot leave it mixed."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="shadow")
+    _egress(plane["dropin"])
+    marker = plane["advisory"] / "role_results.jsonl"
+    marker.write_text("kept\n", encoding="utf-8", newline="\n")
+    proc = _run_script(
+        bash,
+        COMMITTEE_DEPLOY / "activate-committee-shadow.sh",
+        _activation(plane),
+        plane,
+        extra={"OPIP_TEST_GETENT_FAIL": "1"},
+    )
+    _assert_proven_off(proc, plane, bash)
+    assert marker.read_text(encoding="utf-8") == "kept\n"
+    deny = _show_deny(bash, plane)
+    assert deny == "any" or "0.0.0.0/0" in deny
+
+
+def test_mixed_precondition_failure_returns_to_proven_off(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """Case W: a preflight refusal on the mixed host still proves OFF."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="shadow")
+    _egress(plane["dropin"])
+    marker = plane["advisory"] / "role_results.jsonl"
+    marker.write_text("kept\n", encoding="utf-8", newline="\n")
+    shutil.rmtree(plane["evidence"])
+    proc = _run_script(
+        bash,
+        COMMITTEE_DEPLOY / "activate-committee-shadow.sh",
+        _activation(plane),
+        plane,
+    )
+    combined = proc.stdout + proc.stderr
+    assert "SHADOW_ACTIVATION=BLOCKED" in proc.stdout
+    assert "SHADOW_ACTIVATION=PASS" not in combined
+    _assert_proven_off(proc, plane, bash)
+    assert marker.read_text(encoding="utf-8") == "kept\n"
+
+
+def test_pristine_off_precondition_failure_does_not_mutate(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """Case X: the same preflight refusal on proven OFF writes nothing."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="off")
+    shutil.rmtree(plane["evidence"])
+    proc = _run_script(
+        bash,
+        COMMITTEE_DEPLOY / "activate-committee-shadow.sh",
+        _activation(plane),
+        plane,
+    )
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0
+    assert "SHADOW_ACTIVATION=BLOCKED" in proc.stdout
+    assert "nothing was changed; the plane remains as it was" in proc.stderr
+    assert "SHADOW_ACTIVATION=PASS" not in combined
+    assert "SAFE_OFF=PROVEN" not in proc.stdout
+    assert _file_mode(plane) == "off"
+    assert _show_mode(bash, plane) == "off"
+    assert list(plane["dropin"].glob("*.conf")) == []
+    assert not (plane["dropin"] / "10-provider-egress.conf").exists()
+    assert not (plane["dropin"] / "20-shadow-mode.conf").exists()
+
+
+def test_mixed_early_failure_does_not_claim_off_when_proof_fails(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """Case Y: early cleanup that cannot prove deny-all never claims SAFE_OFF."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="shadow")
+    _egress(plane["dropin"])
+    proc = _run_script(
+        bash,
+        COMMITTEE_DEPLOY / "activate-committee-shadow.sh",
+        _activation(plane),
+        plane,
+        extra={"OPIP_TEST_GETENT_FAIL": "1", "OPIP_TEST_FORCE_DENY": "broken"},
+    )
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0
+    assert "SHADOW_ACTIVATION=PASS" not in combined
+    assert "SAFE_OFF=PROVEN" not in proc.stdout
+    assert "SAFE_OFF=FAIL" in proc.stderr
+
+
+def test_malformed_arguments_do_not_clean_a_mixed_plane(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """A bad SHA is not a reconciliation attempt and must not return the plane to OFF."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="shadow")
+    _egress(plane["dropin"])
+    marker = plane["advisory"] / "role_results.jsonl"
+    marker.write_text("kept\n", encoding="utf-8", newline="\n")
+    proc = _run_script(
+        bash,
+        COMMITTEE_DEPLOY / "activate-committee-shadow.sh",
+        ["not-a-sha", _NOT_BEFORE, _REVIEW_BY],
+        plane,
+    )
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 64
+    assert "SAFE_OFF=PROVEN" not in proc.stdout
+    assert "SAFE_OFF=FAIL" not in combined
+    assert _file_mode(plane) == "shadow"
+    assert (plane["dropin"] / "10-provider-egress.conf").is_file()
+    assert marker.read_text(encoding="utf-8") == "kept\n"

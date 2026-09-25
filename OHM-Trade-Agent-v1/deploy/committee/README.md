@@ -201,10 +201,11 @@ DNS change is a visible re-activation event rather than silently widened egress.
 
 SHADOW mode is a separate drop-in, `20-shadow-mode.conf`
 (`Environment=OPIP_COMMITTEE_MODE=shadow`). The base unit file stays
-`Environment=OPIP_COMMITTEE_MODE=off`. Any failure after a drop-in is written
-returns the plane to a proven OFF state: environment mode off, effective unit
-mode off, no provider allowlist, deny-all still in force, timer disabled and
-inactive. Rollback removes both named drop-ins and any other Committee drop-in
+`Environment=OPIP_COMMITTEE_MODE=off`. A failed reconciliation of a plane that is already SHADOW or mixed returns it
+to a proven OFF state, including a failure before the first new drop-in write:
+environment mode off, effective unit mode off, no provider allowlist, deny-all
+still in force, timer disabled and inactive. A pristine OFF preflight refusal
+leaves that plane unchanged. Malformed arguments do not mutate the plane. Rollback removes both named drop-ins and any other Committee drop-in
 that still allowlists egress or forces shadow mode, then proves the effective
 network policy. A pending rollback must be cancelled before a corrected
 activation.
