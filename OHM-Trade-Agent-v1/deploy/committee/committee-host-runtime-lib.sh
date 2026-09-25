@@ -281,9 +281,17 @@ keep_timer_disabled() {
     printf 'inactive\n' > "$PREFIX/timer-active"
     return 0
   fi
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl disable opip-committee-shadow.timer >/dev/null 2>&1 || true
-    systemctl stop opip-committee-shadow.timer >/dev/null 2>&1 || true
+  if ! command -v systemctl >/dev/null 2>&1; then
+    echo "systemctl is required to keep the Committee timer inactive" >&2
+    return 1
+  fi
+  if ! systemctl disable opip-committee-shadow.timer >/dev/null 2>&1; then
+    echo "Committee timer could not be disabled" >&2
+    return 1
+  fi
+  if ! systemctl stop opip-committee-shadow.timer >/dev/null 2>&1; then
+    echo "Committee timer could not be stopped" >&2
+    return 1
   fi
 }
 
@@ -423,14 +431,16 @@ activate_staged_runtime() {
     fail_provision 82 "import proof failed; the previous runtime was restored"
   fi
   SWAP_COMMITTED=1
-  rm -rf "$PREFIX/previous"
-  mkdir -p "$PREFIX/previous"
-  chmod 0755 "$PREFIX/previous"
-  if [[ -e "$PREFIX/app.retiring" ]]; then
-    mv "$PREFIX/app.retiring" "$PREFIX/previous/app"
-  fi
-  if [[ -e "$PREFIX/venv.retiring" ]]; then
-    mv "$PREFIX/venv.retiring" "$PREFIX/previous/venv"
+  if [[ -e "$PREFIX/app.retiring" || -e "$PREFIX/venv.retiring" ]]; then
+    rm -rf "$PREFIX/previous"
+    mkdir -p "$PREFIX/previous"
+    chmod 0755 "$PREFIX/previous"
+    if [[ -e "$PREFIX/app.retiring" ]]; then
+      mv "$PREFIX/app.retiring" "$PREFIX/previous/app"
+    fi
+    if [[ -e "$PREFIX/venv.retiring" ]]; then
+      mv "$PREFIX/venv.retiring" "$PREFIX/previous/venv"
+    fi
   fi
   rm -rf "$STAGE"
   STAGE=""
@@ -459,7 +469,7 @@ provision_main() {
   if runtime_already_ready "$sha"; then
     rewrite_nonsecret_env "$sha" || fail_provision 80 "environment update failed"
     install_runtime_tools "$script_dir" || fail_provision 81 "runtime tools were not installed"
-    keep_timer_disabled
+    keep_timer_disabled || fail_provision 83 "Committee timer could not be stopped"
     printf 'COMMITTEE_RUNTIME_INSTALL=PASS sha=%s\n' "$sha"
     return 0
   fi
@@ -489,19 +499,19 @@ provision_main() {
     # or the reverse. Mode is forced OFF either way.
     if [[ -d "$PREFIX/previous/app" && -d "$PREFIX/previous/venv" ]]; then
       rm -rf "$PREFIX/app.failed" "$PREFIX/venv.failed"
-      mv "$PREFIX/app" "$PREFIX/app.failed"
-      mv "$PREFIX/venv" "$PREFIX/venv.failed"
-      mv "$PREFIX/previous/app" "$PREFIX/app"
-      mv "$PREFIX/previous/venv" "$PREFIX/venv"
+      mv "$PREFIX/app" "$PREFIX/app.failed" || fail_provision 80 "could not move the new application aside"
+      mv "$PREFIX/venv" "$PREFIX/venv.failed" || fail_provision 80 "could not move the new interpreter aside"
+      mv "$PREFIX/previous/app" "$PREFIX/app" || fail_provision 80 "could not restore the previous application"
+      mv "$PREFIX/previous/venv" "$PREFIX/venv" || fail_provision 80 "could not restore the previous interpreter"
       mkdir -p "$PREFIX/previous"
-      mv "$PREFIX/app.failed" "$PREFIX/previous/app"
-      mv "$PREFIX/venv.failed" "$PREFIX/previous/venv"
+      mv "$PREFIX/app.failed" "$PREFIX/previous/app" || fail_provision 80 "could not retain the failed application"
+      mv "$PREFIX/venv.failed" "$PREFIX/previous/venv" || fail_provision 80 "could not retain the failed interpreter"
     fi
     SWAP_COMMITTED=0
     fail_provision 80 "environment update failed after staging; previous runtime restored when present"
   fi
   install_runtime_tools "$script_dir" || fail_provision 81 "runtime tools were not installed"
-  keep_timer_disabled
+  keep_timer_disabled || fail_provision 83 "Committee timer could not be stopped"
   if ! prove_cycle_runner_import "$APP_ROOT" "$VENV_PYTHON"; then
     fail_provision 82 "active import proof failed after configuration"
   fi
@@ -588,7 +598,10 @@ rollback_main() {
     echo "ROLLBACK_RUNTIME=FAIL" >&2
     return 1
   }
-  keep_timer_disabled
+  if ! keep_timer_disabled; then
+    echo "ROLLBACK_RUNTIME=FAIL" >&2
+    return 1
+  fi
   echo "ROLLBACK_RUNTIME=PASS"
 }
 
