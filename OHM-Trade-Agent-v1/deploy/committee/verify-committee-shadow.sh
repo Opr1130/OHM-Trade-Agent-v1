@@ -252,9 +252,12 @@ else
   fail "no provider egress allowlist is installed; SHADOW egress would be denied outright"
 fi
 
-# Every allowlisted address must still resolve from one of the approved endpoints.
-# An address that no longer belongs to a provider is a widened boundary, not a
-# stale one, so it fails closed.
+# The approved set is regenerated from the same inputs the activator pins:
+# provider addresses, configured resolvers, and loopback when the stub resolver
+# is itself on loopback. Installed lines and the effective systemd property must
+# both equal that set after canonicalization. systemd prints a bare host as
+# /32 or /128; a wider prefix is a different policy and must not match.
+# ip_allow_policy.py is the only comparison. It reports counts, never addresses.
 expected_addresses="$(
   {
     for endpoint in "${PROVIDER_ENDPOINTS[@]}"; do
@@ -268,35 +271,57 @@ expected_addresses="$(
     fi
   } | sort -u
 )"
-unexpected=0
-while IFS= read -r line; do
-  [[ -z "$line" ]] && continue
-  address="${line#IPAddressAllow=}"
-  address="${address%% *}"
-  if ! printf '%s\n' "$expected_addresses" | grep -qx "$address"; then
-    unexpected=$((unexpected + 1))
-  fi
-done <<< "$allow_lines"
-if [[ "$unexpected" -eq 0 ]]; then
-  pass "every allowlisted address belongs to an approved provider endpoint"
-else
-  fail "$unexpected allowlisted address(es) do not belong to an approved endpoint"
-fi
+installed_addresses="$(
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    address="${line#IPAddressAllow=}"
+    address="${address%% *}"
+    printf '%s\n' "$address"
+  done <<< "$allow_lines"
+)"
 unit_allow="$(systemctl show -p IPAddressAllow --value "$UNIT" 2>/dev/null | tr ' ' '\n' || true)"
 if [[ -z "$(printf '%s' "$unit_allow" | tr -d '[:space:]')" ]]; then
   fail "effective IPAddressAllow has no provider exception"
 else
-  effective_unexpected=0
-  while IFS= read -r address; do
-    [[ -z "$address" ]] && continue
-    if ! printf '%s\n' "$expected_addresses" | grep -qx "$address"; then
-      effective_unexpected=$((effective_unexpected + 1))
-    fi
-  done <<< "$unit_allow"
-  if [[ "$effective_unexpected" -eq 0 ]]; then
-    pass "effective IPAddressAllow contains only approved provider or resolver addresses"
+  policy_py="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ip_allow_policy.py"
+  if [[ ! -f "$policy_py" ]]; then
+    fail "IP allowlist canonicalizer is absent"
+  elif ! command -v python3 >/dev/null 2>&1; then
+    fail "IP allowlist canonicalizer cannot run"
   else
-    fail "$effective_unexpected effective allowlist address(es) are not approved"
+    policy_result="$(
+      {
+        printf '%s\n' EXPECTED
+        printf '%s\n' "$expected_addresses"
+        printf '%s\n' INSTALLED
+        printf '%s\n' "$installed_addresses"
+        printf '%s\n' EFFECTIVE
+        printf '%s\n' "$unit_allow"
+      } | python3 "$policy_py" compare
+    )"
+    policy_rc=$?
+    case "$policy_rc" in
+      0)
+        pass "every allowlisted address belongs to an approved provider endpoint"
+        pass "effective IPAddressAllow exactly matches the approved host set"
+        ;;
+      2)
+        fail "effective or installed IPAddressAllow contains an unparseable token"
+        ;;
+      *)
+        case "$policy_result" in
+          installed-mismatch*)
+            fail "installed allowlist does not exactly match the approved host set (${policy_result#installed-mismatch })"
+            ;;
+          effective-mismatch*)
+            fail "effective allowlist does not exactly match the approved host set (${policy_result#effective-mismatch })"
+            ;;
+          *)
+            fail "IP allowlist comparison failed closed (${policy_result:-no result})"
+            ;;
+        esac
+        ;;
+    esac
   fi
 fi
 

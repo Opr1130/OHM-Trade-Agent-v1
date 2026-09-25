@@ -531,6 +531,8 @@ fi
 if [[ -z "$unit_allow" ]]; then
   fail_closed "effective provider allowlist is absent"
 fi
+# Presence only. Semantic equality, including systemd's /32 and /128 host form,
+# is decided solely by verify-committee-shadow.sh via ip_allow_policy.py.
 
 # A pinned address that cannot be reached is a denial of legitimate egress.
 # The probe runs after the writes so a failure cannot stop in a mixed state:
