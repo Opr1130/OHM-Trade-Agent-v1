@@ -3875,3 +3875,95 @@ def test_a_no_sha_rollback_is_not_held_to_release_cleanup(
     # And the requirement can actually be evaluated: the gate declares the SHA.
     declared = activation["jobs"]["control"]["steps"][-1].get("env") or {}
     assert "TARGET_SHA" in declared, declared
+
+
+# ---------------------------------------------------------------------------
+# IC-046 round 4: review residuals.
+#
+# L-b: the `=`-joined flag form was not covered by any case.
+# L-c: the missing-value usage string omitted the `| --rollback` alternative.
+# L-d: rollback stopped the timer but not the oneshot service.
+# M-a: the drift-recovery ORDER was prose-only; nothing tied it to the isolation
+#      verifier's actual preconditions, so a reordering would stay green.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "token",
+    ["--expected-sha=--rollback", "--expected-sha=" + _SHA, "--expected-sha="],
+)
+def test_lb_a_joined_flag_form_is_refused_not_interpreted(
+    tmp_path: pathlib.Path, fork_bash: str, token: str
+) -> None:
+    """The scan matches exact tokens, so a `=`-joined form is a usage error."""
+    plane = _plane(tmp_path / token.replace("=", "eq").replace("-", "d"), mode="shadow")
+    _pin_allow(
+        plane,
+        _STUB_PLANE_ADDRESSES,
+        resolv=_STUB_PLANE_RESOLV,
+        providers=_STUB_PLANE_PROVIDERS,
+    )
+    proc = _run_script(
+        bash=fork_bash,
+        script=COMMITTEE_DEPLOY / "verify-committee-shadow.sh",
+        args=[token],
+        plane=plane,
+    )
+    assert proc.returncode == 64, (token, proc.stdout + proc.stderr)
+    assert "usage" in (proc.stdout + proc.stderr)
+    # It must never be treated as a rollback, and never mutate the plane.
+    assert "ROLLBACK_PROOF=PASS" not in proc.stdout
+    assert _file_mode(plane) == "shadow"
+
+
+def test_ld_rollback_stops_the_oneshot_service_as_well_as_the_timer() -> None:
+    """A proven OFF state must not leave an in-flight cycle running."""
+    script = (COMMITTEE_DEPLOY / "verify-committee-shadow.sh").read_text(
+        encoding="utf-8"
+    )
+    rollback = script.split('if [[ "$ROLLBACK_MODE" -eq 1 ]]; then')[1].split(
+        "# ------------------------------------------------------------- SHADOW-mode only"
+    )[0]
+    assert 'systemctl stop "$UNIT"' in rollback
+    assert 'systemctl stop "$TIMER"' in rollback
+
+
+def test_ma_the_documented_recovery_order_matches_the_isolation_preconditions() -> None:
+    """M-a: pin the recovery ORDER, so a silent reordering fails the suite.
+
+    `/deploy-committee` proves OFF-mode isolation, which requires the unit-level
+    mode to be `off` and `IPAddressAllow` to be empty. A SHADOW plane carries both
+    drop-ins, so the documented procedure MUST return OFF first.
+    """
+    readme = (COMMITTEE_DEPLOY / "README.md").read_text(encoding="utf-8")
+    section = readme.split("**Drift recovery procedure.**")[1].split("### ")[0]
+    assert "must return the plane to **OFF first**" in section
+    # The order is asserted within the COMMAND BLOCK, not by first mention anywhere
+    # in the prose (the prose necessarily names /deploy-committee while explaining
+    # why it cannot run first).
+    block = section.split("```text")[1].split("```")[0]
+    order = (
+        block.index("/rollback-committee"),
+        block.index("/deploy-committee"),
+        block.index("/shadow-committee"),
+        block.index("/committee-canary"),
+    )
+    assert order == tuple(sorted(order)), order
+    # And the reason is the isolation proof's actual precondition.
+    isolation = (COMMITTEE_DEPLOY / "verify-committee-isolation.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "mode is off at the unit level" in isolation
+    assert "IPAddressAllow is non-empty" in isolation
+    assert "drop-in" in section
+
+
+def test_la_the_proof_wording_does_not_claim_tree_provenance() -> None:
+    """L-a: the PASS line must not imply more than the declared-SHA binding proves."""
+    script = (COMMITTEE_DEPLOY / "verify-committee-shadow.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "declared release identity matches the authorized SHA" in script
+    assert "the worker release is the authorized SHA" not in script
+    # The usage string offers both invocations consistently.
+    assert "--expected-sha <40-char-sha> | --rollback" in script
