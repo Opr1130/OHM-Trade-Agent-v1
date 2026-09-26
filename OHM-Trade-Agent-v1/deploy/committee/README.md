@@ -271,6 +271,17 @@ canonicalizer and never compares releases, and it is detected before the release
 comparison. A safety action must remain callable even when release identity cannot
 be proven.
 
+`/rollback-committee` accepts an **optional** 40-character SHA:
+
+```text
+/rollback-committee                # uses the installed durable helper
+/rollback-committee <40-char-sha>  # uploads that release tree and uses it instead
+```
+
+The durable helper is the normal vehicle. Supplying a SHA selects the pinned release
+tree as the vehicle, which matters when the durable helper is absent or broken: the
+safety action must not depend on a single artifact.
+
 ### Runtime structure of a SHADOW caseA SHADOW case is governed by the **seven roles**, not by two provider families:
 
 ```text

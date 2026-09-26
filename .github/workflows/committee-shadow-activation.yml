@@ -94,11 +94,14 @@ jobs:
           elif [[ "$BODY" =~ ^/committee-timer[[:space:]]+([0-9a-f]{40})[[:space:]]*$ ]]; then
             echo "command=timer" >> "$GITHUB_OUTPUT"
             echo "sha=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
-          elif [[ "$BODY" =~ ^/rollback-committee[[:space:]]*$ ]]; then
+          elif [[ "$BODY" =~ ^/rollback-committee([[:space:]]+([0-9a-f]{40}))?[[:space:]]*$ ]]; then
             echo "command=rollback" >> "$GITHUB_OUTPUT"
+            # An optional SHA selects the release tree as the rollback vehicle, so
+            # the safety action does not depend on the durable helper being present.
+            echo "sha=${BASH_REMATCH[2]:-}" >> "$GITHUB_OUTPUT"
           else
             echo "Refusing committee activation: unrecognised command." >&2
-            echo "Formats: /shadow-committee <40-char-sha> <not-before-iso8601> <review-by-iso8601>, /committee-canary <40-char-sha>, /committee-timer <40-char-sha>, /rollback-committee" >&2
+            echo "Formats: /shadow-committee <40-char-sha> <not-before-iso8601> <review-by-iso8601>, /committee-canary <40-char-sha>, /committee-timer <40-char-sha>, /rollback-committee [40-char-sha]" >&2
             exit 64
           fi
 
@@ -477,10 +480,20 @@ jobs:
           HOST: ${{ secrets.OPIP_LEARNING_HOST }}
           USER: ${{ secrets.OPIP_LEARNING_USER }}
           PORT: ${{ secrets.OPIP_LEARNING_PORT }}
+          TARGET_SHA: ${{ steps.command.outputs.sha }}
         run: |
           set +e
           set -u
           PORT="${PORT:-22}"
+          # Two vehicles, so the safety action never depends on a single artifact.
+          # With a SHA, the pinned release tree is used, which is available even
+          # when the durable helper is missing or broken; without one, the durable
+          # helper. Either way the plane is returned to a proven OFF state.
+          if [[ -n "${TARGET_SHA:-}" ]]; then
+            ROLLBACK_VEHICLE="/var/tmp/opip-committee-$TARGET_SHA-$GITHUB_RUN_ID/OHM-Trade-Agent-v1/deploy/committee/verify-committee-shadow.sh"
+          else
+            ROLLBACK_VEHICLE="/usr/local/sbin/opip-committee-shadow-proof"
+          fi
           ssh \
             -i ~/.ssh/opip_committee \
             -o BatchMode=yes \
@@ -488,7 +501,7 @@ jobs:
             -o StrictHostKeyChecking=yes \
             -p "$PORT" \
             "$USER@$HOST" \
-            "sudo -n bash /usr/local/sbin/opip-committee-shadow-proof --rollback" \
+            "sudo -n bash '$ROLLBACK_VEHICLE' --rollback" \
             2>&1 | tee committee-rollback.log
           RC=${PIPESTATUS[0]}
           echo "rc=$RC" >> "$GITHUB_OUTPUT"

@@ -22,6 +22,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tempfile
 import time
 
 import pytest
@@ -2250,10 +2251,14 @@ def _substitute_expressions(text: str, outputs: dict[str, str]) -> str:
         if step_ref:
             return outputs.get(f"{step_ref.group(1)}.{step_ref.group(2)}", "")
         if expression.startswith("secrets."):
+            # A configured secret is non-empty; the control plane validates that the
+            # secrets it depends on are present.
             return "harness-secret"
-        # Any other context (github.*, env.*, inputs.*): a stable placeholder is
-        # enough for the harness, and is never a credential value.
-        return "harness-context"
+        # Any other context (github.*, env.*, inputs.*) resolves to EMPTY, because
+        # the real runner can render an absent value as empty. Returning a
+        # placeholder here would let a body that consumes an empty value pass
+        # untested.
+        return ""
 
     return _GITHUB_EXPRESSION.sub(replace, text)
 
@@ -2284,23 +2289,16 @@ def _run_workflow_step(
     declared = _step_declared_env(activation, step_id, outputs_map)
 
     env = os.environ.copy()
-    # Evict any ambient value for a runner-supplied name, so the step observes the
-    # same emptiness the real runner would give it. Only declared names are added
-    # back below: an unconditional injection would mask the defect class where a
-    # step body uses a variable the runner never provides.
-    for name in (
-        "TARGET_SHA",
-        "NOT_BEFORE",
-        "REVIEW_BY",
-        "COMMAND",
-        "RESULTS",
-        "HOST",
-        "USER",
-        "PORT",
-        "GH_TOKEN",
-        "SSH_KEY_B64",
-        "KNOWN_HOSTS",
-    ):
+    # Evict EVERY runner-supplied name the body references but the step does not
+    # declare, so the step observes the empty value the real runner would give it.
+    # Deriving this from the body, rather than a fixed list, means a name the harness
+    # has never seen is covered too.
+    assigned = set(
+        re.findall(r"^\s*(?:local\s+)?([A-Za-z_][A-Za-z0-9_]*)=", body, re.M)
+    )
+    for name in set(_REFERENCE_PATTERN.findall(body)):
+        if name in declared or name in assigned or name in RUNNER_PLUMBING_NAMES:
+            continue
         env.pop(name, None)
     env.update(
         {
@@ -2310,7 +2308,6 @@ def _run_workflow_step(
             "GITHUB_RUN_ID": "12345",
         }
     )
-    # Harness plumbing the runner itself supplies, then the step's own declarations.
     env.update(declared)
     env.update(scenario or {})
     # Run in the temporary directory so the step's `tee` logs land there rather
@@ -3559,9 +3556,26 @@ STEP_SUPPLIED_NAMES = (
     "ROLLBACK_RESULT",
 )
 
-#: Names the runner always provides, whatever a step declares. Referencing one of
-#: these without declaring it is fine.
-RUNNER_PLUMBING_NAMES = ("GITHUB_OUTPUT", "GITHUB_RUN_ID", "GITHUB_REPOSITORY")
+#: Names the runner or bash itself always provides, whatever a step declares.
+#: Referencing one of these without declaring it is fine.
+RUNNER_PLUMBING_NAMES = (
+    "GITHUB_OUTPUT",
+    "GITHUB_RUN_ID",
+    "GITHUB_REPOSITORY",
+    # Bash-provided rather than runner-provided, but equally always present.
+    "BASH_REMATCH",
+    "PIPESTATUS",
+    "BASH_SOURCE",
+    "LINENO",
+    "RANDOM",
+    "SECONDS",
+)
+
+#: Environment variables are declared in UPPER_SNAKE_CASE by convention, so every
+#: uppercase reference is treated as runner-supplied and must be declared. This is a
+#: property of the name, not a finite allowlist, so a name the guard has never seen
+#: is still covered.
+_ENV_NAME_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 #: Matches `$NAME`, `${NAME}`, `${NAME:-default}`, `${NAME:?message}` and
 #: `${NAME:=default}`, so a defaulted reference cannot slip past the guard.
@@ -3587,11 +3601,14 @@ def test_c11_every_step_supplied_variable_is_declared_by_its_step(
                 step_name = step.get("id") or step.get("name") or "<unnamed>"
                 declared = set((step.get("env") or {}).keys())
                 assigned = set(re.findall(r"^\s*(?:local\s+)?([A-Za-z_][A-Za-z0-9_]*)=", body, re.M))
+                assigned |= set(re.findall(r"([A-Za-z_][A-Za-z0-9_]*)=\$\(", body))
                 assigned |= set(re.findall(r"read\s+-r\s+-a\s+([A-Za-z_][A-Za-z0-9_]*)", body))
                 for name in sorted(set(_REFERENCE_PATTERN.findall(body))):
                     if name in declared or name in assigned or name in RUNNER_PLUMBING_NAMES:
                         continue
-                    if name not in STEP_SUPPLIED_NAMES:
+                    # Any uppercase reference is runner-supplied by convention, so an
+                    # unrecognised name is still covered rather than skipped.
+                    if not _ENV_NAME_PATTERN.match(name):
                         continue
                     missing.append(
                         f"{workflow}/{step_name}: references ${name} but does not declare it"
@@ -3659,3 +3676,120 @@ def test_c11_an_undeclared_target_would_corrupt_the_remote_command(
         command_outputs={"command.sha": ""},
     )
     assert "--expected-sha ''" in bad_log, bad_log
+
+
+# ===========================================================================
+# Review remediation (IC-046 round 2).
+#
+# MEDIUM-1: `/rollback-committee` depended solely on the durable helper, so a plane
+#   whose stable bundle was missing had no owner-gated way back to OFF.
+# MEDIUM-2: the guard and harness were narrower than the defect class.
+# MEDIUM-3: the harness mapped non-step expression contexts to a NON-EMPTY literal,
+#   so a body consuming an absent value could pass untested.
+# ===========================================================================
+
+#: The reference pattern and substitution helper used by the guard and harness above.
+
+def test_m3_a_non_step_expression_context_substitutes_to_empty() -> None:
+    """An absent `github.*`/`env.*`/`inputs.*` value must render empty, not a literal."""
+    assert _substitute_expressions("${{ github.event.issue.number }}", {}) == ""
+    assert _substitute_expressions("${{ env.SOMETHING }}", {}) == ""
+    assert _substitute_expressions("${{ inputs.pr_number }}", {}) == ""
+    # A step output still resolves, and an absent one is empty.
+    assert (
+        _substitute_expressions("${{ steps.command.outputs.sha }}", {"command.sha": _SHA})
+        == _SHA
+    )
+    assert _substitute_expressions("${{ steps.command.outputs.sha }}", {}) == ""
+    # A configured secret is non-empty.
+    assert _substitute_expressions("${{ secrets.OPIP_LEARNING_HOST }}", {}) != ""
+
+
+def test_m2_the_guard_covers_a_name_outside_any_allowlist(activation: dict) -> None:
+    """The guard keys on the NAME, so an unrecognised uppercase name is still caught."""
+    document = yaml.safe_load(ACTIVATION.read_text(encoding="utf-8"))
+    for step in document["jobs"]["control"]["steps"]:
+        if step.get("id") != "pre_operation_shadow":
+            continue
+        # A name the guard has never seen, and a defaulted form of a known one.
+        step["run"] = step["run"] + "\necho \"${BRAND_NEW_RUNNER_VALUE:-}\" >/dev/null\n"
+    flagged: list[str] = []
+    for job in document["jobs"].values():
+        for step in job.get("steps", []):
+            body = step.get("run") or ""
+            if not body:
+                continue
+            name = step.get("id") or step.get("name") or "?"
+            declared = set((step.get("env") or {}).keys())
+            assigned = set(
+                re.findall(r"^\s*(?:local\s+)?([A-Za-z_][A-Za-z0-9_]*)=", body, re.M)
+            )
+            assigned |= set(re.findall(r"([A-Za-z_][A-Za-z0-9_]*)=\$\(", body))
+            assigned |= set(re.findall(r"read\s+-r\s+-a\s+([A-Za-z_][A-Za-z0-9_]*)", body))
+            for ref in sorted(set(_REFERENCE_PATTERN.findall(body))):
+                if ref in declared or ref in assigned or ref in RUNNER_PLUMBING_NAMES:
+                    continue
+                if not _ENV_NAME_PATTERN.match(ref):
+                    continue
+                flagged.append(f"{name}: {ref}")
+    assert flagged == ["pre_operation_shadow: BRAND_NEW_RUNNER_VALUE"], flagged
+
+
+def test_m2_the_harness_evicts_an_undeclared_referenced_name(
+    tmp_path: pathlib.Path, fork_bash: str, activation: dict
+) -> None:
+    """An ambient value for an undeclared referenced name must not leak into the step."""
+    document = yaml.safe_load(ACTIVATION.read_text(encoding="utf-8"))
+    for step in document["jobs"]["control"]["steps"]:
+        if step.get("id") == "pre_operation_shadow":
+            step["run"] = step["run"].replace(
+                "set +e",
+                "set +e\n          if [[ -n \"${LEAK_CANARY:-}\" ]]; then echo LEAKED; fi",
+            )
+    proc, _outputs, _log = _run_workflow_step(
+        fork_bash,
+        tmp_path,
+        document,
+        "pre_operation_shadow",
+        scenario={"LEAK_CANARY": "should-not-be-visible", "command.sha": _SHA},
+    )
+    assert "LEAKED" not in proc.stdout, proc.stdout
+
+
+def test_m1_rollback_accepts_an_optional_release_sha(activation: dict) -> None:
+    """An optional SHA selects the release-tree vehicle for the safety action."""
+    body = _step_run_body(activation, "command")
+    script = pathlib.Path(tempfile.gettempdir()) / "rollback-parse.sh"
+    script.write_text(body, encoding="utf-8", newline="\n")
+    outputs = pathlib.Path(tempfile.gettempdir()) / "rollback-parse.out"
+    outputs.write_text("", encoding="utf-8")
+    bash = _bash()
+    if bash is None:
+        pytest.skip("no bash available to exercise the parser")
+    env = {**os.environ, "GITHUB_OUTPUT": str(outputs)}
+    for body_text, expect_sha in (
+        ("/rollback-committee", ""),
+        (f"/rollback-committee {_SHA}", _SHA),
+        ("/rollback-committee  not-a-sha", None),
+    ):
+        outputs.write_text("", encoding="utf-8")
+        proc = _run_bash([bash, str(script)], env={**env, "COMMENT_BODY": body_text})
+        text = outputs.read_text(encoding="utf-8")
+        if expect_sha is None:
+            assert proc.returncode == 64, (body_text, proc.returncode)
+            continue
+        assert proc.returncode == 0, (body_text, proc.stdout + proc.stderr)
+        assert "command=rollback" in text, body_text
+        assert f"sha={expect_sha}" in text, (body_text, text)
+
+
+def test_m1_the_rollback_step_uses_the_release_tree_when_a_sha_is_given(
+    activation: dict,
+) -> None:
+    body = _step_run_body(activation, "rollback")
+    assert "TARGET_SHA" in (_control_steps(activation)["rollback"].get("env") or {})
+    assert "ROLLBACK_VEHICLE" in body
+    assert "verify-committee-shadow.sh" in body
+    assert "opip-committee-shadow-proof" in body
+    # The durable helper remains the vehicle when no SHA is supplied.
+    assert 'if [[ -n "${TARGET_SHA:-}" ]]' in body
