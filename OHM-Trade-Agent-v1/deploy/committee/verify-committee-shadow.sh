@@ -274,7 +274,18 @@ if [[ "$ROLLBACK_MODE" -eq 1 ]]; then
   else
     fail "egress default deny is '${unit_deny:-none}'"
   fi
-  timer_active="$(systemctl show -p ActiveState --value "$TIMER" 2>/dev/null || echo '')"
+  # Discard stdout on query failure: "inactive" alone cannot prove a stopped unit.
+  if ! unit_active="$(systemctl show -p ActiveState --value "$UNIT" 2>/dev/null)"; then
+    unit_active="UNKNOWN"
+  fi
+  if [[ "$unit_active" == "inactive" ]]; then
+    pass "the committee service is inactive after rollback"
+  else
+    fail "the committee service is not inactive after rollback (active: ${unit_active:-none})"
+  fi
+  if ! timer_active="$(systemctl show -p ActiveState --value "$TIMER" 2>/dev/null)"; then
+    timer_active="UNKNOWN"
+  fi
   if systemctl is-enabled "$TIMER" >/dev/null 2>&1; then
     fail "the recurring timer is still enabled after rollback"
   elif [[ "$timer_active" != "inactive" ]]; then

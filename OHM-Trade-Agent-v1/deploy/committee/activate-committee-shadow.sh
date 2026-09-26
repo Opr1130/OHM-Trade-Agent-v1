@@ -134,10 +134,11 @@ set_env_value() {
 # after the resulting OFF state is read back.
 converge_to_safe_off() {
   local reason="${1:-activation failed}"
-  local file_mode="" unit_mode="" unit_deny="" unit_allow="" timer_enabled="" timer_active="" allow_lines="" conf="" timer_on=0
+  local file_mode="" unit_mode="" unit_deny="" unit_allow="" unit_active="" timer_enabled="" timer_active="" allow_lines="" conf="" timer_on=0
   echo "converging to safe off: ${reason}" >&2
   systemctl disable "$TIMER" >/dev/null 2>&1 || true
   systemctl stop "$TIMER" >/dev/null 2>&1 || true
+  systemctl stop "$UNIT" >/dev/null 2>&1 || true
   rm -f "$DROPIN" "$MODE_DROPIN" || true
   if [[ -d "$MODE_DROPIN" ]]; then
     rmdir "$MODE_DROPIN" 2>/dev/null || true
@@ -161,7 +162,13 @@ converge_to_safe_off() {
   unit_deny="$(systemctl show -p IPAddressDeny --value "$UNIT" 2>/dev/null | tr -d '\r' || true)"
   unit_allow="$(systemctl show -p IPAddressAllow --value "$UNIT" 2>/dev/null | tr -d '[:space:]' || true)"
   timer_enabled="$(systemctl is-enabled "$TIMER" 2>/dev/null || true)"
-  timer_active="$(systemctl show -p ActiveState --value "$TIMER" 2>/dev/null | tr -d '\r' || true)"
+  # A failed query is not evidence, even if it printed "inactive" before failing.
+  if ! timer_active="$(systemctl show -p ActiveState --value "$TIMER" 2>/dev/null)"; then
+    timer_active="UNKNOWN"
+  fi
+  if ! unit_active="$(systemctl show -p ActiveState --value "$UNIT" 2>/dev/null)"; then
+    unit_active="UNKNOWN"
+  fi
   if systemctl is-enabled "$TIMER" >/dev/null 2>&1; then
     timer_on=1
   fi
@@ -173,13 +180,14 @@ converge_to_safe_off() {
     && ( "$unit_deny" == "any" || "$unit_deny" == *"0.0.0.0/0"* ) \
     && "$timer_on" -eq 0 \
     && "$timer_active" == "inactive" \
+    && "$unit_active" == "inactive" \
     && -d "$COMMITTEE_HOME" \
     && ! -f "$MODE_DROPIN" \
     && ! -f "$DROPIN" ]]; then
     echo "SAFE_OFF=PROVEN"
     return 0
   fi
-  echo "SAFE_OFF=FAIL file=${file_mode:-none} unit=${unit_mode:-none} allow=${unit_allow:-none} deny=${unit_deny:-none} timer=${timer_enabled:-none}/${timer_active:-none}" >&2
+  echo "SAFE_OFF=FAIL file=${file_mode:-none} unit=${unit_mode:-none} allow=${unit_allow:-none} deny=${unit_deny:-none} timer=${timer_enabled:-none}/${timer_active:-none} service=${unit_active:-none}" >&2
   return 1
 }
 

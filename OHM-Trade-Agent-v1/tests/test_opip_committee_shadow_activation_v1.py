@@ -543,6 +543,7 @@ UNIT_FILE="$UNIT_DIR/$UNIT_NAME"
 DROPIN_DIR="$UNIT_DIR/${UNIT_NAME}.d"
 ENABLEMENT="${OPIP_TEST_TIMER_ENABLEMENT:?}"
 ACTIVE_FILE="${OPIP_TEST_TIMER_ACTIVE:?}"
+SERVICE_ACTIVE_FILE="${OPIP_TEST_SERVICE_ACTIVE:?}"
 
 merge_environment() {
   local state line rest key value conf
@@ -686,6 +687,15 @@ case "$cmd" in
     exit 0
     ;;
   stop)
+    if [[ "${1:-}" == "$UNIT_NAME" ]]; then
+      if [[ "${OPIP_TEST_SERVICE_STOP_FAIL:-}" == "1" ]]; then
+        exit 1
+      fi
+      if [[ "${OPIP_TEST_SERVICE_STOP_IGNORE:-}" != "1" ]]; then
+        printf '%s\n' inactive > "$SERVICE_ACTIVE_FILE"
+      fi
+      exit 0
+    fi
     if [[ "${OPIP_TEST_STOP_ALWAYS_FAIL:-}" == "1" ]]; then
       exit 1
     fi
@@ -750,11 +760,17 @@ case "$cmd" in
         fi
         ;;
       ActiveState)
+        query_rc="${OPIP_TEST_TIMER_QUERY_RC:-0}"
+        if [[ "$target" == "$UNIT_NAME" ]]; then
+          ACTIVE_FILE="$SERVICE_ACTIVE_FILE"
+          query_rc="${OPIP_TEST_SERVICE_QUERY_RC:-0}"
+        fi
         if [[ -f "$ACTIVE_FILE" ]]; then
           tr -d '\r' < "$ACTIVE_FILE"
         else
           printf '%s\n' inactive
         fi
+        exit "$query_rc"
         ;;
       *)
         printf '\n'
@@ -845,6 +861,8 @@ def _plane(tmp_path: pathlib.Path, *, mode: str) -> dict[str, pathlib.Path]:
     enablement.write_text("disabled\n", encoding="utf-8", newline="\n")
     active = root / "timer-active"
     active.write_text("inactive\n", encoding="utf-8", newline="\n")
+    service_active = root / "service-active"
+    service_active.write_text("inactive\n", encoding="utf-8", newline="\n")
     log = root / "systemctl.log"
     bin_dir = root / "bin"
     _write_exe(bin_dir / "systemctl", _SYSTEMCTL)
@@ -881,6 +899,7 @@ def _plane(tmp_path: pathlib.Path, *, mode: str) -> dict[str, pathlib.Path]:
         "resolv": resolv,
         "enablement": enablement,
         "active": active,
+        "service_active": service_active,
         "log": log,
         "bin": bin_dir,
         "app": app,
@@ -927,6 +946,7 @@ def _harness_env(plane: dict[str, pathlib.Path]) -> dict[str, str]:
             "OPIP_COMMITTEE_RESOLV_CONF": _bash_path(plane["resolv"]),
             "OPIP_TEST_TIMER_ENABLEMENT": _bash_path(plane["enablement"]),
             "OPIP_TEST_TIMER_ACTIVE": _bash_path(plane["active"]),
+            "OPIP_TEST_SERVICE_ACTIVE": _bash_path(plane["service_active"]),
             "OPIP_TEST_SYSTEMCTL_LOG": _bash_path(plane["log"]),
             "PATH": _bash_path(plane["bin"]) + os.pathsep + env.get("PATH", ""),
         }
@@ -1174,6 +1194,88 @@ def test_rollback_proves_off_and_keeps_advisory_evidence(
     assert plane["active"].read_text(encoding="utf-8").strip() == "inactive"
     assert marker.is_file()
     assert marker.read_text(encoding="utf-8") == "kept\n"
+
+
+@pytest.mark.parametrize("operation", ["rollback", "activation-recovery"])
+@pytest.mark.parametrize(
+    ("service_state", "extra", "proven"),
+    [
+        pytest.param("active", {}, True, id="stop-reaches-inactive"),
+        pytest.param(
+            "active", {"OPIP_TEST_SERVICE_STOP_FAIL": "1"}, False,
+            id="stop-fails-service-still-active",
+        ),
+        pytest.param(
+            "inactive", {"OPIP_TEST_SERVICE_STOP_FAIL": "1"}, True,
+            id="failed-stop-but-independently-proven-inactive",
+        ),
+        *[
+            pytest.param(
+                state, {"OPIP_TEST_SERVICE_STOP_IGNORE": "1"}, False,
+                id=f"ignored-stop-{state or 'empty'}",
+            )
+            for state in ("active", "activating", "deactivating", "reloading", "failed", "unknown", "")
+        ],
+        pytest.param(
+            "inactive", {"OPIP_TEST_SERVICE_QUERY_RC": "1"}, False,
+            id="failed-service-query-prints-inactive",
+        ),
+        pytest.param(
+            "", {"OPIP_TEST_SERVICE_STOP_IGNORE": "1", "OPIP_TEST_SERVICE_QUERY_RC": "1"}, False,
+            id="failed-service-query-no-output",
+        ),
+        pytest.param(
+            "active", {"OPIP_TEST_TIMER_QUERY_RC": "1"}, False,
+            id="failed-timer-query-prints-inactive",
+        ),
+    ],
+)
+def test_off_proof_requires_successfully_observed_inactive_service(
+    tmp_path: pathlib.Path,
+    fork_bash: str,
+    operation: str,
+    service_state: str,
+    extra: dict[str, str],
+    proven: bool,
+) -> None:
+    """Configuration and a stopped timer cannot prove an in-flight cycle stopped."""
+    plane = _plane(tmp_path, mode="shadow")
+    _egress(plane["dropin"])
+    _mode_dropin(plane["dropin"])
+    plane["service_active"].write_text(service_state + "\n", encoding="utf-8", newline="\n")
+    plane["active"].write_text("active\n", encoding="utf-8", newline="\n")
+    plane["enablement"].write_text("enabled\n", encoding="utf-8", newline="\n")
+    marker = plane["advisory"] / "role_results.jsonl"
+    marker.write_text("retained evidence\n", encoding="utf-8", newline="\n")
+    overrides = dict(extra)
+    if operation == "rollback":
+        script = "verify-committee-shadow.sh"
+        args = ["--rollback"]
+        success_marker, failure_marker = "ROLLBACK_PROOF=PASS", "ROLLBACK_PROOF=FAIL"
+    else:
+        script = "activate-committee-shadow.sh"
+        args = _activation(plane)
+        # Fail DNS on an existing SHADOW plane to exercise real recovery code.
+        overrides["OPIP_TEST_GETENT_FAIL"] = "1"
+        success_marker, failure_marker = "SAFE_OFF=PROVEN", "SAFE_OFF=FAIL"
+    proc = _run_script(fork_bash, COMMITTEE_DEPLOY / script, args, plane, extra=overrides)
+    combined = proc.stdout + proc.stderr
+    assert (success_marker in combined) is proven, combined
+    assert (failure_marker in combined) is not proven, combined
+    assert "SHADOW_ACTIVATION=PASS" not in combined
+    assert proc.returncode == 0 if operation == "rollback" and proven else proc.returncode != 0
+    log = plane["log"].read_text(encoding="utf-8").splitlines()
+    assert "stop opip-committee-shadow.service" in log
+    assert "show -p ActiveState --value opip-committee-shadow.service" in log
+    assert plane["active"].read_text(encoding="utf-8").strip() == "inactive"
+    assert plane["enablement"].read_text(encoding="utf-8").strip() == "disabled"
+    if proven:
+        assert plane["service_active"].read_text(encoding="utf-8").strip() == "inactive"
+    assert _file_mode(plane) == "off"
+    assert not (plane["dropin"] / "10-provider-egress.conf").exists()
+    assert not (plane["dropin"] / "20-shadow-mode.conf").exists()
+    assert marker.read_text(encoding="utf-8") == "retained evidence\n"
+    _assert_no_sentinels(proc)
 
 
 def test_activation_refuses_pass_when_mode_dropin_install_fails(
