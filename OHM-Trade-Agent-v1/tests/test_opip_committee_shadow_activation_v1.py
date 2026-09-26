@@ -3298,16 +3298,16 @@ def test_f2_rollback_is_not_obstructed_by_the_binding_arguments(
 ) -> None:
     """F2: no release-flag shape may prevent the safety action from running."""
     bash = fork_bash
-    for extra in (
-        [],
+    cases = (
         ["--rollback"],
-        ["--expected-sha", _DRIFT_SHA, "--rollback"],
         ["--rollback", "--expected-sha"],
+        ["--rollback", "--expected-sha", _DRIFT_SHA],
         ["--rollback", "--expected-sha", "not-a-sha"],
         ["--rollback", "--not-a-flag"],
-    ):
-        args = extra if extra else ["--rollback"]
-        plane = _plane(tmp_path / f"rb-{len(args)}-{abs(hash(tuple(args))) % 10000}", mode="shadow")
+        ["--expected-sha", _DRIFT_SHA, "--rollback"],
+    )
+    for index, args in enumerate(cases):
+        plane = _plane(tmp_path / f"rollback-case-{index}", mode="shadow")
         _pin_allow(
             plane,
             _STUB_PLANE_ADDRESSES,
