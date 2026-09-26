@@ -47,6 +47,11 @@ def activation() -> dict:
     return yaml.safe_load(ACTIVATION.read_text(encoding="utf-8"))
 
 
+@pytest.fixture(scope="module")
+def install_workflow() -> dict:
+    return yaml.safe_load(INSTALL.read_text(encoding="utf-8"))
+
+
 def _bash() -> str | None:
     found = shutil.which("bash")
     if found:
@@ -2249,9 +2254,23 @@ def _run_workflow_step(
     declared = _step_declared_env(activation, step_id, outputs_map)
 
     env = os.environ.copy()
-    # Evict any ambient value for a name this step does not declare, so the step
-    # observes the same emptiness the real runner would give it.
-    for name in ("TARGET_SHA", "NOT_BEFORE", "REVIEW_BY"):
+    # Evict any ambient value for a runner-supplied name, so the step observes the
+    # same emptiness the real runner would give it. Only declared names are added
+    # back below: an unconditional injection would mask the defect class where a
+    # step body uses a variable the runner never provides.
+    for name in (
+        "TARGET_SHA",
+        "NOT_BEFORE",
+        "REVIEW_BY",
+        "COMMAND",
+        "RESULTS",
+        "HOST",
+        "USER",
+        "PORT",
+        "GH_TOKEN",
+        "SSH_KEY_B64",
+        "KNOWN_HOSTS",
+    ):
         env.pop(name, None)
     env.update(
         {
@@ -2259,11 +2278,9 @@ def _run_workflow_step(
             "GITHUB_OUTPUT": _bash_path(harness["outputs"]),
             "FAKE_SSH_LOG": _bash_path(harness["log"]),
             "GITHUB_RUN_ID": "12345",
-            "PORT": "22",
-            "USER": "deploy",
-            "HOST": "fake.invalid",
         }
     )
+    # Harness plumbing the runner itself supplies, then the step's own declarations.
     env.update(declared)
     env.update(scenario or {})
     # Run in the temporary directory so the step's `tee` logs land there rather
@@ -3478,28 +3495,77 @@ def test_l11_prior_a_to_k_protections_are_present_and_behavioral() -> None:
 # and the guard below makes the class of defect fail loudly.
 # ===========================================================================
 
-#: Names a step body may consume from the runner. A body that references one of
-#: these must declare it, or it silently observes an empty string.
-STEP_SUPPLIED_NAMES = ("TARGET_SHA", "NOT_BEFORE", "REVIEW_BY", "COMMAND", "RESULTS")
+#: Runner-supplied names a step body may consume. A body that references one of
+#: these must declare it, or it silently observes an empty string. The set is
+#: deliberately broader than the names currently in use, so a future body that
+#: reaches for one of them without declaring it fails the guard rather than
+#: shipping.
+STEP_SUPPLIED_NAMES = (
+    "TARGET_SHA",
+    "NOT_BEFORE",
+    "REVIEW_BY",
+    "COMMAND",
+    "RESULTS",
+    "HOST",
+    "USER",
+    "PORT",
+    "GH_TOKEN",
+    "SSH_KEY_B64",
+    "KNOWN_HOSTS",
+    "INSTALL_RESULT",
+    "INSTALL_RC",
+    "ISOLATION_RESULT",
+    "ISOLATION_RC",
+    "CLEANUP_RESULT",
+    "CLEANUP_RC",
+    "PRE_OPERATION_SHADOW",
+    "STABLE_BUNDLE",
+    "STABLE_PROOF",
+    "SAFE_OFF",
+    "ACTIVATE_RESULT",
+    "SHADOW_RESULT",
+    "CANARY_RESULT",
+    "TIMER_RESULT",
+    "ROLLBACK_RESULT",
+)
+
+#: Names the runner always provides, whatever a step declares. Referencing one of
+#: these without declaring it is fine.
+RUNNER_PLUMBING_NAMES = ("GITHUB_OUTPUT", "GITHUB_RUN_ID", "GITHUB_REPOSITORY")
+
+#: Matches `$NAME`, `${NAME}`, `${NAME:-default}`, `${NAME:?message}` and
+#: `${NAME:=default}`, so a defaulted reference cannot slip past the guard.
+_REFERENCE_PATTERN = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)")
 
 
 def test_c11_every_step_supplied_variable_is_declared_by_its_step(
-    activation: dict,
+    activation: dict, install_workflow: dict
 ) -> None:
     """A step must declare every runner-supplied variable its body references.
 
     GitHub expands an undeclared `$NAME` to empty, so a missing declaration is a
-    functional defect, not a cosmetic one.
+    functional defect, not a cosmetic one. Both workflows are checked, and the scan
+    covers `${NAME:-default}`-style references and names assigned inside the body.
     """
     missing: list[str] = []
-    for step in activation["jobs"]["control"]["steps"]:
-        body = step.get("run") or ""
-        step_name = step.get("id") or step.get("name") or "<unnamed>"
-        declared = set((step.get("env") or {}).keys())
-        for name in STEP_SUPPLIED_NAMES:
-            for form in (f"${name}", f"${{{name}}}"):
-                if form in body and name not in declared:
-                    missing.append(f"{step_name}: references {form} but does not declare {name}")
+    for workflow, document in (("activation", activation), ("install", install_workflow)):
+        for job in document["jobs"].values():
+            for step in job.get("steps", []):
+                body = step.get("run") or ""
+                if not body:
+                    continue
+                step_name = step.get("id") or step.get("name") or "<unnamed>"
+                declared = set((step.get("env") or {}).keys())
+                assigned = set(re.findall(r"^\s*(?:local\s+)?([A-Za-z_][A-Za-z0-9_]*)=", body, re.M))
+                assigned |= set(re.findall(r"read\s+-r\s+-a\s+([A-Za-z_][A-Za-z0-9_]*)", body))
+                for name in sorted(set(_REFERENCE_PATTERN.findall(body))):
+                    if name in declared or name in assigned or name in RUNNER_PLUMBING_NAMES:
+                        continue
+                    if name not in STEP_SUPPLIED_NAMES:
+                        continue
+                    missing.append(
+                        f"{workflow}/{step_name}: references ${name} but does not declare it"
+                    )
     assert missing == [], missing
 
 
