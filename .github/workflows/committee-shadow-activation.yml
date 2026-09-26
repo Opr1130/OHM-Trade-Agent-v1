@@ -199,6 +199,10 @@ jobs:
           HOST: ${{ secrets.OPIP_LEARNING_HOST }}
           USER: ${{ secrets.OPIP_LEARNING_USER }}
           PORT: ${{ secrets.OPIP_LEARNING_PORT }}
+          # Declared explicitly: the proof below binds this exact SHA, and an
+          # undeclared variable would expand to empty and be refused as a usage
+          # error, permanently blocking the canary and timer commands.
+          TARGET_SHA: ${{ steps.command.outputs.sha }}
         run: |
           set +e
           PORT="${PORT:-22}"

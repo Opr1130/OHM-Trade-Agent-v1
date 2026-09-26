@@ -2195,6 +2195,34 @@ def _step_harness(tmp_path: pathlib.Path, **scenario: str) -> dict[str, pathlib.
     return {"bin": bin_dir, "log": log, "outputs": outputs}
 
 
+def _resolve_step_env_value(
+    raw: str, command_outputs: dict[str, str]
+) -> str:
+    """Resolve one declared step `env:` value the way GitHub would.
+
+    A `${{ steps.<id>.outputs.<key> }}` reference resolves from the simulated
+    outputs; a `${{ secrets.* }}` reference resolves to a placeholder. Anything else
+    is passed through literally.
+    """
+    match = re.fullmatch(r"\$\{\{\s*steps\.([A-Za-z0-9_-]+)\.outputs\.([A-Za-z0-9_-]+)\s*\}\}", raw)
+    if match:
+        step_name, key = match.groups()
+        return command_outputs.get(f"{step_name}.{key}", "")
+    if re.fullmatch(r"\$\{\{\s*secrets\.[A-Za-z0-9_]+\s*\}\}", raw):
+        return "harness-secret"
+    return raw
+
+
+def _step_declared_env(
+    activation: dict, step_id: str, command_outputs: dict[str, str]
+) -> dict[str, str]:
+    declared = _control_steps(activation)[step_id].get("env") or {}
+    return {
+        key: _resolve_step_env_value(str(value), command_outputs)
+        for key, value in declared.items()
+    }
+
+
 def _run_workflow_step(
     bash: str,
     tmp_path: pathlib.Path,
@@ -2203,13 +2231,28 @@ def _run_workflow_step(
     *,
     command: str = "shadow",
     scenario: dict[str, str] | None = None,
+    command_outputs: dict[str, str] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], dict[str, str], str]:
-    """Execute one real workflow step body and return (proc, outputs, ssh log)."""
+    """Execute one real workflow step body and return (proc, outputs, ssh log).
+
+    Faithfulness matters here: the environment is built ONLY from the harness
+    plumbing plus the keys the step actually declares, with `${{ … }}` references
+    resolved. Injecting a variable the step does not declare would hide exactly the
+    class of defect where a step body uses a variable the runner never provides.
+    """
     harness = _step_harness(tmp_path)
     body = _step_run_body(activation, step_id)
     script = tmp_path / f"step-{step_id}.sh"
     script.write_text(body, encoding="utf-8", newline="\n")
+    outputs_map = {"command.sha": _SHA}
+    outputs_map.update(command_outputs or {})
+    declared = _step_declared_env(activation, step_id, outputs_map)
+
     env = os.environ.copy()
+    # Evict any ambient value for a name this step does not declare, so the step
+    # observes the same emptiness the real runner would give it.
+    for name in ("TARGET_SHA", "NOT_BEFORE", "REVIEW_BY"):
+        env.pop(name, None)
     env.update(
         {
             "PATH": _bash_path(harness["bin"]) + os.pathsep + env.get("PATH", ""),
@@ -2219,11 +2262,9 @@ def _run_workflow_step(
             "PORT": "22",
             "USER": "deploy",
             "HOST": "fake.invalid",
-            "TARGET_SHA": _SHA,
-            "NOT_BEFORE": _NOT_BEFORE,
-            "REVIEW_BY": _REVIEW_BY,
         }
     )
+    env.update(declared)
     env.update(scenario or {})
     # Run in the temporary directory so the step's `tee` logs land there rather
     # than in the checkout.
@@ -3370,3 +3411,93 @@ def test_l11_prior_a_to_k_protections_are_present_and_behavioral() -> None:
     assert "activation_completed=1" in activate
     # Rollback stays non-destructive to advisory evidence.
     assert "advisory evidence directory survived rollback" in script
+
+
+# ===========================================================================
+# Step environment declaration (IC-046 verification finding).
+#
+# The defect this section exists to prevent: the `pre_operation_shadow` step body
+# referenced `$TARGET_SHA` but did not declare it in `env:`. GitHub therefore
+# expanded it to empty, the proof received `--expected-sha ''`, the parser refused
+# it with exit 64, and the pre-operation proof was ALWAYS `FAILED` - permanently
+# blocking `/committee-canary` and `/committee-timer`.
+#
+# The earlier harness hid this because it injected TARGET_SHA into every step
+# regardless of what the step declared. The runner now injects only declared keys,
+# and the guard below makes the class of defect fail loudly.
+# ===========================================================================
+
+#: Names a step body may consume from the runner. A body that references one of
+#: these must declare it, or it silently observes an empty string.
+STEP_SUPPLIED_NAMES = ("TARGET_SHA", "NOT_BEFORE", "REVIEW_BY", "COMMAND", "RESULTS")
+
+
+def test_c11_every_step_supplied_variable_is_declared_by_its_step(
+    activation: dict,
+) -> None:
+    """A step must declare every runner-supplied variable its body references.
+
+    GitHub expands an undeclared `$NAME` to empty, so a missing declaration is a
+    functional defect, not a cosmetic one.
+    """
+    missing: list[str] = []
+    for step in activation["jobs"]["control"]["steps"]:
+        body = step.get("run") or ""
+        step_name = step.get("id") or step.get("name") or "<unnamed>"
+        declared = set((step.get("env") or {}).keys())
+        for name in STEP_SUPPLIED_NAMES:
+            for form in (f"${name}", f"${{{name}}}"):
+                if form in body and name not in declared:
+                    missing.append(f"{step_name}: references {form} but does not declare {name}")
+    assert missing == [], missing
+
+
+def test_c11_the_pre_operation_step_declares_its_bound_target(activation: dict) -> None:
+    """The pre-operation proof binds TARGET_SHA, so it must declare it."""
+    steps = _control_steps(activation)
+    declared = steps["pre_operation_shadow"].get("env") or {}
+    assert "TARGET_SHA" in declared, declared
+    assert "steps.command.outputs.sha" in str(declared["TARGET_SHA"])
+    # And the body still binds it.
+    body = _step_run_body(activation, "pre_operation_shadow")
+    assert "--expected-sha '$TARGET_SHA'" in body
+
+
+def test_c11_the_pre_operation_step_is_provable_with_faithful_env(
+    tmp_path: pathlib.Path, fork_bash: str, activation: dict
+) -> None:
+    """Behavioural: with only the declared env, the pre-operation proof PROVES.
+
+    This is the case the defect broke. TARGET_SHA resolves through the step's own
+    declaration, so the proof is bound and succeeds.
+    """
+    proc, outputs, _ = _run_workflow_step(
+        fork_bash,
+        tmp_path,
+        activation,
+        "pre_operation_shadow",
+        command_outputs={"command.sha": _SHA},
+    )
+    assert outputs.get("result") == "PROVEN", (outputs, proc.stdout, proc.stderr)
+    assert "pre_operation_shadow=PROVEN" in proc.stdout
+
+
+def test_c11_an_undeclared_target_blocks_the_pre_operation_proof(
+    tmp_path: pathlib.Path, fork_bash: str, activation: dict
+) -> None:
+    """Contrapositive: the defect's mechanism is reproduced and is fail-closed.
+
+    With TARGET_SHA empty - what an undeclared variable would produce - the proof is
+    refused as a usage error, so the operation is blocked rather than permitted.
+    """
+    proc, outputs, _ = _run_workflow_step(
+        fork_bash,
+        tmp_path,
+        activation,
+        "pre_operation_shadow",
+        command_outputs={"command.sha": ""},
+    )
+    assert outputs.get("result") == "FAILED", (outputs, proc.stdout)
+    assert "pre_operation_shadow=FAILED" in proc.stdout
+    # Fail-closed: nothing was started or enabled.
+    assert outputs.get("result") != "PROVEN"
