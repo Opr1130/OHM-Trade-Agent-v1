@@ -22,6 +22,7 @@ import re
 import shutil
 import stat
 import subprocess
+import time
 
 import pytest
 import yaml
@@ -2662,3 +2663,129 @@ def test_case_k_the_installed_helper_still_supports_rollback_without_the_policy(
     assert "ROLLBACK_PROOF=PASS" in proc.stdout
     assert "SHADOW_PROOF=PASS" not in proc.stdout
     assert _file_mode(plane) == "off"
+
+
+# ===========================================================================
+# Abort convergence (IC-045 review finding).
+#
+# A command failure converges through the ERR trap, but a SIGNAL or an aborted
+# transport does not raise ERR. Without an EXIT/signal trap, a run killed after
+# the egress drop-in was written but before the mode/env write would leave the
+# host carrying a provider `IPAddressAllow` entry while mode is still `off`, so
+# the "OFF means deny-all" boundary would be briefly false.
+# ===========================================================================
+
+#: A fake `timeout` that blocks, giving the test a window to abort the run.
+_SLOW_TIMEOUT = """#!/usr/bin/env bash
+sleep "${OPIP_TEST_TIMEOUT_SLEEP:-30}"
+exit 0
+"""
+
+
+def test_abort_traps_are_installed_and_the_success_line_clears_them() -> None:
+    """The activation script converges on signals, and never on success."""
+    script = (COMMITTEE_DEPLOY / "activate-committee-shadow.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "activation_completed=0" in script
+    assert "on_activation_exit" in script
+    assert "trap on_activation_exit EXIT" in script
+    for signal_name in ("TERM", "INT", "HUP"):
+        assert f"trap 'exit 1" in script and signal_name in script, signal_name
+    # The completion flag must be set before the success marker, so the trap can
+    # distinguish a finished activation from an aborted one.
+    completed = script.index("activation_completed=1")
+    success = script.index("SHADOW_ACTIVATION=PASS release=")
+    assert completed < success
+    # And the trap must consult it.
+    assert '"$activation_completed" -eq 0' in script
+
+
+def test_an_aborted_activation_converges_to_off(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """Case: SIGTERM mid-activation must remove the egress drop-in and mode shadow."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="off")
+    _pin_allow(
+        plane,
+        [],
+        resolv="nameserver 127.0.0.53\n",
+        providers={
+            "api.openai.com": ["203.0.113.10"],
+            "api.anthropic.com": ["203.0.113.20"],
+        },
+    )
+    # Remove the drop-in the fixture created: activation must create it.
+    (plane["dropin"] / "10-provider-egress.conf").unlink()
+    (plane["dropin"] / "20-shadow-mode.conf").unlink()
+    # Block inside the provider reachability probe, after the writes have begun.
+    _write_exe(plane["bin"] / "timeout", _SLOW_TIMEOUT)
+    _chmod_advisory(bash, plane)
+    env = _harness_env(plane)
+    env["OPIP_TEST_TIMEOUT_SLEEP"] = "30"
+
+    script = COMMITTEE_DEPLOY / "activate-committee-shadow.sh"
+    proc = subprocess.Popen(
+        [bash, str(script), *_activation(plane)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    try:
+        egress = plane["dropin"] / "10-provider-egress.conf"
+        for _ in range(200):
+            if egress.exists():
+                break
+            if proc.poll() is not None:
+                break
+            time.sleep(0.05)
+        if not egress.exists():
+            proc.kill()
+            proc.communicate()
+            pytest.skip(
+                "the activation run finished before the aborting window opened; "
+                "no verdict was produced"
+            )
+        proc.terminate()
+        stdout, stderr = proc.communicate(timeout=60)
+    except Exception:  # noqa: BLE001 - never leave a stray child behind
+        proc.kill()
+        proc.communicate()
+        raise
+
+    combined = f"{stdout}{stderr}"
+    # The abort converged rather than leaving a half-applied boundary.
+    assert not egress.exists(), combined
+    assert not (plane["dropin"] / "20-shadow-mode.conf").exists(), combined
+    assert _file_mode(plane) == "off", combined
+    assert "SHADOW_ACTIVATION=PASS" not in combined
+    assert "converging to safe off: activation did not complete" in combined
+
+
+def test_a_completed_activation_is_not_rolled_back_on_exit(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """The EXIT trap must not undo a successful activation."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="off")
+    _pin_allow(
+        plane,
+        [],
+        resolv="nameserver 127.0.0.53\n",
+        providers={
+            "api.openai.com": ["203.0.113.10"],
+            "api.anthropic.com": ["203.0.113.20"],
+        },
+    )
+    (plane["dropin"] / "10-provider-egress.conf").unlink()
+    (plane["dropin"] / "20-shadow-mode.conf").unlink()
+    proc = _run_script(bash, COMMITTEE_DEPLOY / "activate-committee-shadow.sh", _activation(plane), plane)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "SHADOW_ACTIVATION=PASS" in proc.stdout
+    assert "converging to safe off" not in proc.stdout + proc.stderr
+    # The activation survived its own exit.
+    assert (plane["dropin"] / "10-provider-egress.conf").exists()
+    assert (plane["dropin"] / "20-shadow-mode.conf").exists()
+    assert _file_mode(plane) == "shadow"
