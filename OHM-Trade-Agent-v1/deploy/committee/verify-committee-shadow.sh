@@ -126,14 +126,24 @@ env_value() {
 }
 
 # ---------------------------------------------------------- argument parsing
-# `--rollback` is decided FIRST and in isolation: a safety action must remain
-# callable even when the release identity cannot be proven, so a rollback
-# invocation ignores every other argument rather than being blocked by one.
+# `--rollback` is detected first so a safety action remains callable even when the
+# release identity cannot be proven -- but the scan deliberately SKIPS the value
+# position of `--expected-sha`. Otherwise `--expected-sha --rollback` would read the
+# value token as the flag and silently turn a malformed proof into a state-changing
+# rollback.
 ROLLBACK_MODE=0
-for _arg in "$@"; do
+_arg_index=1
+while [[ "$_arg_index" -le "$#" ]]; do
+  _arg="${!_arg_index}"
+  if [[ "$_arg" == "--expected-sha" ]]; then
+    # Consume the value, whatever it is, so it can never be read as a flag.
+    _arg_index=$((_arg_index + 2))
+    continue
+  fi
   if [[ "$_arg" == "--rollback" ]]; then
     ROLLBACK_MODE=1
   fi
+  _arg_index=$((_arg_index + 1))
 done
 
 EXPECTED_SHA=""
@@ -155,7 +165,7 @@ if [[ "$ROLLBACK_MODE" -eq 0 ]]; then
         shift 2
         ;;
       *)
-        echo "usage: verify-committee-shadow.sh [--expected-sha <40-char-sha>] [--rollback]" >&2
+        echo "usage: verify-committee-shadow.sh --expected-sha <40-char-sha> | --rollback" >&2
         exit 64
         ;;
     esac

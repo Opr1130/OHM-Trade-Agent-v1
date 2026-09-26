@@ -3387,6 +3387,57 @@ def test_f2_rollback_is_not_obstructed_by_the_binding_arguments(
         assert _file_mode(plane) == "off", args
 
 
+def test_f2_a_rollback_token_in_a_value_position_is_not_a_rollback(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """F2: `--expected-sha --rollback` must NOT silently become a rollback.
+
+    The value of `--expected-sha` is consumed before the rollback scan, so a
+    malformed proof invocation cannot turn into a state-changing rollback. This is
+    asserted behaviourally: the plane must be untouched, not returned to OFF.
+    """
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="shadow")
+    _pin_allow(
+        plane,
+        _STUB_PLANE_ADDRESSES,
+        resolv=_STUB_PLANE_RESOLV,
+        providers=_STUB_PLANE_PROVIDERS,
+    )
+    proc = _run_script(
+        bash,
+        COMMITTEE_DEPLOY / "verify-committee-shadow.sh",
+        ["--expected-sha", "--rollback"],
+        plane,
+    )
+    assert "ROLLBACK_PROOF=PASS" not in proc.stdout
+    assert "ROLLBACK_APPLIED" not in proc.stdout
+    assert proc.returncode != 0
+    # The plane was not mutated: still shadow, drop-ins intact.
+    assert _file_mode(plane) == "shadow"
+    assert (plane["dropin"] / "20-shadow-mode.conf").exists()
+
+
+@pytest.mark.parametrize("token", ["--rollbackx", "x--rollback", "--ROLLBACK", "-rollback"])
+def test_f2_a_similar_token_is_not_treated_as_rollback(
+    tmp_path: pathlib.Path, fork_bash: str, token: str
+) -> None:
+    bash = fork_bash
+    plane = _plane(tmp_path / token.replace("-", "d"), mode="shadow")
+    _pin_allow(
+        plane,
+        _STUB_PLANE_ADDRESSES,
+        resolv=_STUB_PLANE_RESOLV,
+        providers=_STUB_PLANE_PROVIDERS,
+    )
+    proc = _run_script(
+        bash, COMMITTEE_DEPLOY / "verify-committee-shadow.sh", [token], plane
+    )
+    assert proc.returncode == 64, (token, proc.stdout + proc.stderr)
+    assert "usage" in (proc.stdout + proc.stderr)
+    assert "ROLLBACK_PROOF=PASS" not in proc.stdout
+
+
 def test_l11_prior_a_to_k_protections_are_present_and_behavioral() -> None:
     """L11: the earlier protections survive as executable guarantees.
 

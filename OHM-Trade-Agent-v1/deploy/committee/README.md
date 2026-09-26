@@ -241,23 +241,35 @@ prints a credential value.
 **Drift recovery procedure.** If `main` advances after activation, the worker is
 genuinely drifted and a canary or timer command for the new SHA is correctly
 refused with `release_compatibility_status=RELEASE_DRIFT`. That is the intended
-fail-closed behaviour, not a false negative. The recovery is to re-activate at the
-new SHA, which is idempotent, and then retry the operation:
+fail-closed behaviour, not a false negative.
+
+Recovery must return the plane to **OFF first**. A SHADOW plane carries
+`10-provider-egress.conf` and `20-shadow-mode.conf` under the unit's `.d`
+directory, and `/deploy-committee` proves OFF-mode isolation — which requires the
+unit-level mode to be `off` and `IPAddressAllow` to be empty. So deploying over a
+live SHADOW plane fails its own isolation proof; the drop-ins have to be removed
+first.
 
 ```text
-/deploy-committee <new-main-sha>          # install the worker at the new release
+/rollback-committee                        # returns OFF, removes both drop-ins
+/deploy-committee <new-main-sha>           # installs the worker at the new release
 /shadow-committee <new-main-sha> <not-before-iso8601> <review-by-iso8601>
 /committee-canary <new-main-sha>
+/committee-timer <new-main-sha>            # only after a successful canary
 ```
+
+Skipping the rollback and running `/shadow-committee` directly is **not** a valid
+shortcut: activation rewrites the declared release SHA and would then prove
+`CURRENT` while the installed application tree is still the previous release.
 
 The same sequence applies when a proof reports `UNVERIFIED`: confirm the host's
 `OPIP_COMMITTEE_RELEASE_SHA` is a full lowercase SHA matching the requested target
 before retrying.
 
-`--rollback` is released-independent by construction: it ignores every other
-argument (including `--expected-sha`), never consults the canonicalizer, and proves
-the resulting OFF state. A safety action must remain callable even when release
-identity cannot be proven.
+`--rollback` is release-independent by construction: it never consults the
+canonicalizer and never compares releases, and it is detected before the release
+comparison. A safety action must remain callable even when release identity cannot
+be proven.
 
 ### Runtime structure of a SHADOW caseA SHADOW case is governed by the **seven roles**, not by two provider families:
 
