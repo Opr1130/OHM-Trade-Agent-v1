@@ -148,6 +148,7 @@ jobs:
           TARGET_SHA: ${{ steps.target.outputs.sha }}
         run: |
           set +e
+          set -u
           PORT="${PORT:-22}"
           RELEASE_DIR="/var/tmp/opip-committee-$TARGET_SHA-$GITHUB_RUN_ID"
           # Only the committed artifact from the exact release tree is invoked. Mode is
@@ -188,6 +189,7 @@ jobs:
           PORT: ${{ secrets.OPIP_LEARNING_PORT }}
         run: |
           set +e
+          set -u
           PORT="${PORT:-22}"
           RELEASE_DIR="/var/tmp/opip-committee-${{ steps.target.outputs.sha }}-$GITHUB_RUN_ID"
           ssh \
@@ -220,6 +222,7 @@ jobs:
           PORT: ${{ secrets.OPIP_LEARNING_PORT }}
         run: |
           set +e
+          set -u
           PORT="${PORT:-22}"
           RELEASE_DIR="/var/tmp/opip-committee-${{ steps.target.outputs.sha }}-$GITHUB_RUN_ID"
           ssh \
@@ -250,6 +253,7 @@ jobs:
           TARGET_SHA: ${{ steps.target.outputs.sha }}
         run: |
           set +e
+          set -u
           PORT="${PORT:-22}"
           RELEASE_DIR="/var/tmp/opip-committee-$TARGET_SHA-$GITHUB_RUN_ID"
           ssh \

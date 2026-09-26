@@ -199,6 +199,31 @@ on_activation_error() {
 }
 trap on_activation_error ERR
 
+# A command failure converges through the ERR trap. A SIGNAL or an aborted
+# transport does not raise ERR, so an EXIT/signal trap converges those too: a
+# plane that has been mutated but never completed must not be left carrying a
+# provider egress allowlist while mode is still `off`, which would make the
+# "OFF means deny-all" boundary briefly false.
+#
+# `activation_completed` is set only on the line immediately before the success
+# marker, so a completed activation is never rolled back by this trap.
+activation_completed=0
+on_activation_exit() {
+  local status=$?
+  trap - EXIT TERM INT HUP ERR
+  if [[ "$activation_completed" -eq 0 \
+    && "$safe_off_started" -eq 0 \
+    && ( "$mutated" -eq 1 || "$recovery_required" -eq 1 ) ]]; then
+    safe_off_started=1
+    converge_to_safe_off "activation did not complete" || true
+  fi
+  exit "$status"
+}
+trap on_activation_exit EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+trap 'exit 129' HUP
+
 # True when the plane is already SHADOW or mixed. A later failure must not
 # leave that state in place, even if this process has not written yet.
 plane_requires_recovery() {
@@ -554,9 +579,14 @@ proof_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/verify-committee-sha
 if [[ ! -f "$proof_script" ]]; then
   fail_closed "the independent shadow proof script is absent"
 fi
-if ! bash "$proof_script"; then
+# Bound to the exact SHA this activation was authorized for, so activation cannot
+# report PASS while the worker release is anything other than TARGET_SHA.
+if ! bash "$proof_script" --expected-sha "$TARGET_SHA"; then
   fail_closed "the independent shadow proof failed"
 fi
 
 echo
+# Set only here: from this point the activation is complete, so the EXIT trap
+# must not treat a normal exit as an aborted activation.
+activation_completed=1
 echo "SHADOW_ACTIVATION=PASS release=$TARGET_SHA not_before=$NOT_BEFORE review_by=$REVIEW_BY timer_enabled=$ENABLE_TIMER"

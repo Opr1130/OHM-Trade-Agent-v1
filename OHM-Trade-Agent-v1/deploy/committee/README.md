@@ -213,6 +213,84 @@ that still allowlists egress or forces shadow mode, then proves the effective
 network policy. A pending rollback must be cancelled before a corrected
 activation.
 
+### Release-SHA binding and the drift recovery procedure
+
+Every SHADOW proof must be bound to the exact release SHA the requested operation
+was authorized for:
+
+```text
+verify-committee-shadow.sh --expected-sha <40-char-sha>
+```
+
+The proof classifies release compatibility the same way the shell learning runner
+does, and only `CURRENT` may pass:
+
+| Worker release vs expected | `release_compatibility_status` | Proof |
+| --- | --- | --- |
+| both full lowercase 40-char SHAs, equal | `CURRENT` | `SHADOW_PROOF=PASS` |
+| both valid, unequal | `RELEASE_DRIFT` | `SHADOW_PROOF=FAIL` |
+| missing, malformed, uppercase, short, branch or symbolic ref | `UNVERIFIED` | `SHADOW_PROOF=FAIL` |
+
+The comparison is against the **declared** release identity
+(`OPIP_COMMITTEE_RELEASE_SHA` in the worker environment file), not against the
+provenance of the installed application tree. A worker whose declared SHA matches the
+expected SHA reports `CURRENT`; binding the installed tree itself is a separate,
+tracked follow-up.
+
+An **unbound** proof (no `--expected-sha`) reports `UNVERIFIED` and fails, so it can
+never return a false PASS; the full diagnostics still run so the reason is visible.
+A missing or empty flag value and a duplicated flag are refused as usage errors
+(exit 64). The proof prints
+`release_compatibility_status=<status> observed=<sha> expected=<sha>` and never
+prints a credential value.
+
+**Drift recovery procedure.** If `main` advances after activation, the worker is
+genuinely drifted and a canary or timer command for the new SHA is correctly
+refused with `release_compatibility_status=RELEASE_DRIFT`. That is the intended
+fail-closed behaviour, not a false negative.
+
+Recovery must return the plane to **OFF first**. A SHADOW plane carries
+`10-provider-egress.conf` and `20-shadow-mode.conf` under the unit's `.d`
+directory, and `/deploy-committee` proves OFF-mode isolation — which requires the
+unit-level mode to be `off` and `IPAddressAllow` to be empty. So deploying over a
+live SHADOW plane fails its own isolation proof; the drop-ins have to be removed
+first.
+
+```text
+/rollback-committee                        # returns OFF, removes both drop-ins
+/deploy-committee <new-main-sha>           # installs the worker at the new release
+/shadow-committee <new-main-sha> <not-before-iso8601> <review-by-iso8601>
+/committee-canary <new-main-sha>
+/committee-timer <new-main-sha>            # only after a successful canary
+```
+
+Skipping the rollback and running `/shadow-committee` directly is **not** a valid
+shortcut: activation rewrites the declared release SHA and would then prove
+`CURRENT` while the installed application tree is still the previous release.
+
+The same sequence applies when a proof reports `UNVERIFIED`: confirm the host's
+`OPIP_COMMITTEE_RELEASE_SHA` is a full lowercase SHA matching the requested target
+before retrying.
+
+`--rollback` is release-independent by construction: it never consults the
+canonicalizer and never compares releases, and it is detected before the release
+comparison. A safety action must remain callable even when release identity cannot
+be proven.
+
+`/rollback-committee` accepts an **optional** 40-character SHA:
+
+```text
+/rollback-committee                # uses the installed durable helper
+/rollback-committee <40-char-sha>  # uploads that release tree and uses it instead
+```
+
+The durable helper is the normal vehicle. Supplying a SHA selects the pinned release
+tree as the vehicle, which matters when the durable helper is absent or broken: the
+safety action must not depend on a single artifact. Note that a SHA-bearing rollback
+uploads the release tree, so it is subject to the same `target == current main` and
+exact-SHA `pytest` gates as the other SHA-bearing commands; the no-SHA form is not,
+and remains available when those gates cannot be met.
+
 ### Runtime structure of a SHADOW case
 
 A SHADOW case is governed by the **seven roles**, not by two provider families:

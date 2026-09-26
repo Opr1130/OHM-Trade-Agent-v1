@@ -8,13 +8,25 @@
 # credential, or a credential value.
 #
 # Usage:
-#   verify-committee-shadow.sh
+#   verify-committee-shadow.sh --expected-sha <40-char-sha>
 #   verify-committee-shadow.sh --rollback
 #
-# `--rollback` first returns the plane to OFF (removing the provider egress drop-in
-# and the shadow mode drop-in, and restoring mode=off), then proves the OFF state.
-# Advisory evidence is left in place: rollback disables measurement, it does not
-# destroy it.
+# `--expected-sha` is REQUIRED for a SHADOW proof and is the authority binding: the
+# proof is only meaningful when it states which release the requested operation was
+# authorized for. Invoking a SHADOW proof WITHOUT it is a usage error (exit 64),
+# reported distinctly from a genuine release mismatch (exit 1), so "the operator
+# omitted the binding" can never be confused with "the host is on the wrong
+# release". The remaining diagnostics still run so the plane's state is visible.
+#
+# The proof classifies release compatibility the same way the SHELL learning runner
+# does (`deploy/learning/opip-learning-job.sh`): CURRENT / RELEASE_DRIFT /
+# UNVERIFIED, comparing case-sensitively, so a non-canonical value (uppercase,
+# short, branch name, symbolic ref) is never admitted as CURRENT.
+#
+# `--rollback` is release-independent by construction: it is decided before any
+# other argument is interpreted and ignores the rest, because a safety action must
+# not depend on the condition it exists to remediate. It removes both drop-ins and
+# restores mode=off, then proves the OFF state. Advisory evidence is left in place.
 set -uo pipefail
 
 UNIT="opip-committee-shadow.service"
@@ -113,8 +125,79 @@ env_value() {
   return 0
 }
 
+# ---------------------------------------------------------- argument parsing
+# `--rollback` is detected first so a safety action remains callable even when the
+# release identity cannot be proven -- but the scan deliberately SKIPS the value
+# position of `--expected-sha`. Otherwise `--expected-sha --rollback` would read the
+# value token as the flag and silently turn a malformed proof into a state-changing
+# rollback.
+ROLLBACK_MODE=0
+_arg_index=1
+while [[ "$_arg_index" -le "$#" ]]; do
+  _arg="${!_arg_index}"
+  if [[ "$_arg" == "--expected-sha" ]]; then
+    # Consume the value, whatever it is, so it can never be read as a flag.
+    _arg_index=$((_arg_index + 2))
+    continue
+  fi
+  if [[ "$_arg" == "--rollback" ]]; then
+    ROLLBACK_MODE=1
+  fi
+  _arg_index=$((_arg_index + 1))
+done
+
+EXPECTED_SHA=""
+if [[ "$ROLLBACK_MODE" -eq 0 ]]; then
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --expected-sha)
+        if [[ "$#" -lt 2 || -z "${2:-}" ]]; then
+          echo "usage: verify-committee-shadow.sh --expected-sha <40-char-sha> | --rollback" >&2
+          exit 64
+        fi
+        if [[ -n "$EXPECTED_SHA" ]]; then
+          # A duplicate binding is ambiguous, so it is refused rather than
+          # silently resolved last-wins.
+          echo "verify-committee-shadow.sh: --expected-sha supplied more than once" >&2
+          exit 64
+        fi
+        EXPECTED_SHA="$2"
+        shift 2
+        ;;
+      *)
+        echo "usage: verify-committee-shadow.sh --expected-sha <40-char-sha> | --rollback" >&2
+        exit 64
+        ;;
+    esac
+  done
+fi
+
+# Exact-SHA equality, mirroring the SHELL learning runner
+# (`deploy/learning/opip-learning-job.sh`), which is the implementation that
+# actually gates learning work.
+#
+# It deliberately does NOT lowercase. The Python helper
+# (`app/opip/learning/job_disposition.py`) normalizes case before validating, so it
+# would report CURRENT for an uppercase 40-hex value; for an authority-binding
+# equality check that widens the accepted identity set, and canonical git object
+# ids are lowercase. Never normalizing a non-canonical value into CURRENT is the
+# fail-closed behaviour, so the Committee is intentionally stricter than the Python
+# helper and matches the shell runner.
+classify_release_compatibility() {
+  local worker="$1"
+  local expected="$2"
+  if [[ ! "$worker" =~ ^[0-9a-f]{40}$ || ! "$expected" =~ ^[0-9a-f]{40}$ ]]; then
+    printf 'UNVERIFIED\n'
+  elif [[ "$worker" == "$expected" ]]; then
+    printf 'CURRENT\n'
+  else
+    printf 'RELEASE_DRIFT\n'
+  fi
+  return 0
+}
+
 # --------------------------------------------------------------- rollback mode
-if [[ "${1:-}" == "--rollback" ]]; then
+if [[ "$ROLLBACK_MODE" -eq 1 ]]; then
   # Restore OFF first, then prove the resulting state. The order matters: proving
   # OFF before actually returning to OFF would report a state that does not exist
   # yet. Rollback removes both drop-ins. The provider egress allowlist must be
@@ -122,6 +205,10 @@ if [[ "${1:-}" == "--rollback" ]]; then
   # is not deleted.
   systemctl disable "$TIMER" >/dev/null 2>&1 || true
   systemctl stop "$TIMER" >/dev/null 2>&1 || true
+  # A oneshot cycle already in flight is bounded by TimeoutStartSec, but it is
+  # stopped explicitly so rollback does not report a proven OFF state while a
+  # committee process is still running.
+  systemctl stop "$UNIT" >/dev/null 2>&1 || true
   rm -f "$DROPIN"
   rm -f "$MODE_DROPIN"
   # A renamed drop-in is still SHADOW configuration. Remove any sibling that
@@ -369,11 +456,27 @@ if [[ "$cycle_cap" == "1" ]]; then
 else
   fail "cycle case cap is '${cycle_cap:-unset}', expected 1"
 fi
+# --------------------------------------------------- release identity binding
+# The proof must bind the worker release to the exact SHA the requested operation
+# was authorized for. A syntactically valid SHA is not sufficient: after main
+# advances, an older worker would otherwise be able to return SHADOW_PROOF=PASS
+# for a newer target and then run or enable Committee work.
 release="$(env_value OPIP_COMMITTEE_RELEASE_SHA)"
-if [[ "$release" =~ ^[0-9a-f]{40}$ ]]; then
-  pass "release identity is an exact 40-character SHA"
+release_status="$(classify_release_compatibility "$release" "$EXPECTED_SHA")"
+echo "release_compatibility_status=${release_status} observed=${release:-none} expected=${EXPECTED_SHA:-none}"
+#: Distinguishes "the operator omitted the binding" (a usage error) from "the host
+#: is on the wrong release" (a proof failure). Both fail closed.
+binding_omitted=0
+if [[ "$release_status" == "CURRENT" ]]; then
+  # Precisely worded: this proves the DECLARED release identity matches the
+  # authorized SHA. It does not prove the installed application tree was built
+  # from it (see the README limitation paragraph).
+  pass "declared release identity matches the authorized SHA (release_compatibility_status=CURRENT)"
+elif [[ -z "$EXPECTED_SHA" ]]; then
+  binding_omitted=1
+  fail "no expected release SHA was supplied; a SHADOW proof must be bound to the authorized release (release_compatibility_status=UNVERIFIED)"
 else
-  fail "release identity is not an exact 40-character SHA"
+  fail "release_compatibility_status=${release_status}: the worker release is not the authorized SHA"
 fi
 
 # --------------------------------------------------------------- no trading credentials
@@ -444,4 +547,11 @@ if [[ "$failures" -eq 0 ]]; then
   exit 0
 fi
 echo "${PROOF_LABEL}=FAIL failures=$failures"
+# A SHADOW proof invoked without its authority binding is a usage error, reported
+# distinctly from a genuine mismatch so the two cannot be confused. Rollback never
+# sets this flag, so the safety action keeps its own exit semantics.
+if [[ "${PROOF_LABEL}" == "SHADOW_PROOF" && "${binding_omitted:-0}" -eq 1 ]]; then
+  echo "the proof requires --expected-sha <40-char-sha>" >&2
+  exit 64
+fi
 exit 1
