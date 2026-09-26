@@ -60,10 +60,13 @@ def _bash() -> str | None:
 
 
 def _run_bash(
-    argv: list[str], *, cwd: pathlib.Path | None = None
+    argv: list[str],
+    *,
+    cwd: pathlib.Path | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     for _ in range(3):
-        proc = subprocess.run(argv, capture_output=True, text=True, cwd=cwd)
+        proc = subprocess.run(argv, capture_output=True, text=True, cwd=cwd, env=env)
         if proc.returncode == _BASH_LAUNCH_FAILURE and not proc.stdout and not proc.stderr:
             continue
         return proc
@@ -2190,13 +2193,23 @@ def _run_workflow_step(
     env.update(scenario or {})
     # Run in the temporary directory so the step's `tee` logs land there rather
     # than in the checkout.
-    proc = _run_bash([bash, str(script)], cwd=tmp_path)
+    proc = _run_bash([bash, str(script)], cwd=tmp_path, env=env)
     parsed: dict[str, str] = {}
     for line in harness["outputs"].read_text(encoding="utf-8").splitlines():
         if "=" in line:
             key, value = line.split("=", 1)
             parsed[key] = value
-    return proc, parsed, harness["log"].read_text(encoding="utf-8")
+    ssh_log = harness["log"].read_text(encoding="utf-8")
+    # The step bodies are meaningless if the harnessed environment was not applied:
+    # without the prepended PATH the real `ssh` runs and every verdict is empty.
+    # Fail loudly here instead of leaving a confusing assertion behind.
+    if "ssh" in body and not ssh_log:
+        pytest.fail(
+            "the fake ssh was never used, so the step environment was not applied: "
+            f"{(proc.stdout + proc.stderr)[:400]}"
+        )
+    assert "Could not resolve hostname" not in proc.stdout, proc.stdout
+    return proc, parsed, ssh_log
 
 
 def _installed_bundle(
