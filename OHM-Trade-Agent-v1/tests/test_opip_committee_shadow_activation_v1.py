@@ -2992,8 +2992,16 @@ def test_l5_a_missing_expected_sha_argument_value_is_refused(
     assert "usage" in (proc.stdout + proc.stderr)
 
 
-def test_the_proof_reuses_the_learning_plane_release_vocabulary() -> None:
-    """The classification must mirror the existing contract, not a new one."""
+def test_the_committee_classifier_matches_the_shell_learning_runner() -> None:
+    """The Committee mirrors the SHELL runner, which is what actually gates work.
+
+    The Python helper (`app/opip/learning/job_disposition.py`) lowercases before
+    validating, so it reports CURRENT for an uppercase 40-hex value. The shell
+    runner does not, and neither does the Committee. For an authority-binding
+    equality check, normalizing case widens the accepted identity set, so the
+    stricter behaviour is the correct one. This test states the divergence
+    explicitly rather than asserting an agreement that does not exist.
+    """
     from app.opip.learning.job_disposition import (
         RELEASE_CURRENT,
         RELEASE_DRIFT,
@@ -3006,12 +3014,29 @@ def test_the_proof_reuses_the_learning_plane_release_vocabulary() -> None:
     )
     for token in (RELEASE_CURRENT, RELEASE_DRIFT, RELEASE_UNVERIFIED):
         assert token in script, token
-    # The Committee classifier must agree with the learning plane's on every case.
+    # The shell classifier must not lowercase, or a non-canonical value could pass.
+    assert ".lower()" not in script
+    assert "tolower" not in script
+
+    # Agreement on every canonical case.
     assert classify_release_compatibility(_SHA, _SHA) == RELEASE_CURRENT
     assert classify_release_compatibility(_SHA, _DRIFT_SHA) == RELEASE_DRIFT
     assert classify_release_compatibility(_SHA, "") == RELEASE_UNVERIFIED
     assert classify_release_compatibility("main", _SHA) == RELEASE_UNVERIFIED
+
+    # Documented divergence: the Python helper normalizes case, the Committee
+    # (like the shell runner) does not. L3/L4 prove the shell behaviour
+    # executably; this asserts the Python side so the divergence cannot drift
+    # silently in either direction.
     assert classify_release_compatibility(_SHA.upper(), _SHA) == RELEASE_CURRENT
+    shell_runner = (
+        REPO_ROOT / "OHM-Trade-Agent-v1" / "deploy" / "learning" / "opip-learning-job.sh"
+    ).read_text(encoding="utf-8")
+    shell_classifier = shell_runner.split("classify_release_compatibility()")[1].split(
+        "\n}"
+    )[0]
+    # The shell runner compares case-sensitively, which is why the Committee does.
+    assert "lower" not in shell_classifier
 
 
 # ------------------------------------------------ binding of each proof call site
@@ -3189,3 +3214,135 @@ def test_l10_rollback_remains_release_independent(
         assert proc.returncode == 0, (observed, proc.stdout + proc.stderr)
         assert "ROLLBACK_PROOF=PASS" in proc.stdout
         assert _file_mode(plane) == "off"
+
+
+def test_t1_the_installed_durable_helper_rejects_release_drift(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """T1: the DURABLE artifact is proven bound, not just the release-tree copy.
+
+    String-level assertions on the workflow cannot show that the installed helper
+    itself enforces the binding, and the installed copy is the artifact an operator
+    can run on the host. This binds the installed helper to a different SHA and
+    requires it to fail closed.
+    """
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="shadow")
+    _pin_allow(
+        plane,
+        _STUB_PLANE_ADDRESSES,
+        resolv=_STUB_PLANE_RESOLV,
+        providers=_STUB_PLANE_PROVIDERS,
+    )
+    installed = _installed_bundle(tmp_path / "usr-local-sbin")
+    proc = _run_script(bash, installed, ["--expected-sha", _DRIFT_SHA], plane)
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert _release_status(proc) == "RELEASE_DRIFT"
+    assert "SHADOW_PROOF=FAIL" in proc.stdout
+    assert "SHADOW_PROOF=PASS" not in proc.stdout
+
+
+def test_t1_the_installed_durable_helper_rejects_an_unbound_proof(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """T1: an operator running the installed helper by hand cannot get a false PASS."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="shadow")
+    _pin_allow(
+        plane,
+        _STUB_PLANE_ADDRESSES,
+        resolv=_STUB_PLANE_RESOLV,
+        providers=_STUB_PLANE_PROVIDERS,
+    )
+    installed = _installed_bundle(tmp_path / "usr-local-sbin")
+    proc = _run_script(bash, installed, [], plane)
+    assert proc.returncode != 0
+    assert _release_status(proc) == "UNVERIFIED"
+    assert "SHADOW_PROOF=PASS" not in proc.stdout
+
+
+def test_f1_a_duplicate_expected_sha_is_refused(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """F1: two bindings are ambiguous and must not resolve last-wins."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="shadow")
+    proc = _run_script(
+        bash,
+        COMMITTEE_DEPLOY / "verify-committee-shadow.sh",
+        ["--expected-sha", _SHA, "--expected-sha", _DRIFT_SHA],
+        plane,
+    )
+    assert proc.returncode == 64
+    assert "more than once" in (proc.stdout + proc.stderr)
+    assert "SHADOW_PROOF=PASS" not in proc.stdout
+
+
+def test_f1_an_unknown_argument_is_rejected(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="shadow")
+    proc = _run_script(
+        bash,
+        COMMITTEE_DEPLOY / "verify-committee-shadow.sh",
+        ["--not-a-flag"],
+        plane,
+    )
+    assert proc.returncode == 64
+    assert "usage" in (proc.stdout + proc.stderr)
+
+
+def test_f2_rollback_is_not_obstructed_by_the_binding_arguments(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """F2: no release-flag shape may prevent the safety action from running."""
+    bash = fork_bash
+    for extra in (
+        [],
+        ["--rollback"],
+        ["--expected-sha", _DRIFT_SHA, "--rollback"],
+        ["--rollback", "--expected-sha"],
+        ["--rollback", "--expected-sha", "not-a-sha"],
+        ["--rollback", "--not-a-flag"],
+    ):
+        args = extra if extra else ["--rollback"]
+        plane = _plane(tmp_path / f"rb-{len(args)}-{abs(hash(tuple(args))) % 10000}", mode="shadow")
+        _pin_allow(
+            plane,
+            _STUB_PLANE_ADDRESSES,
+            resolv=_STUB_PLANE_RESOLV,
+            providers=_STUB_PLANE_PROVIDERS,
+        )
+        proc = _run_script(
+            bash, COMMITTEE_DEPLOY / "verify-committee-shadow.sh", args, plane
+        )
+        assert proc.returncode == 0, (args, proc.stdout + proc.stderr)
+        assert "ROLLBACK_PROOF=PASS" in proc.stdout, args
+        assert _file_mode(plane) == "off", args
+
+
+def test_l11_prior_a_to_k_protections_are_present_and_behavioral() -> None:
+    """L11: the earlier protections survive as executable guarantees.
+
+    Each marker this asserts is paired with a behavioral case elsewhere in this
+    module, so this test documents the contract rather than replacing it.
+    """
+    script = (COMMITTEE_DEPLOY / "verify-committee-shadow.sh").read_text(
+        encoding="utf-8"
+    )
+    activate = (COMMITTEE_DEPLOY / "activate-committee-shadow.sh").read_text(
+        encoding="utf-8"
+    )
+    # Exact-set allowlist comparison, still delegated to one implementation.
+    assert "ip_allow_policy.py" in script
+    assert "canonicalizer is absent" in script
+    # Install failure and unusable durable proof both converge to safe off.
+    assert "converge_to_safe_off" in activate
+    assert "SAFE_OFF=PROVEN" in activate
+    assert "SAFE_OFF=FAIL" in activate
+    # Activation converges on abort as well as on command failure.
+    assert "trap on_activation_exit EXIT" in activate
+    assert "activation_completed=1" in activate
+    # Rollback stays non-destructive to advisory evidence.
+    assert "advisory evidence directory survived rollback" in script

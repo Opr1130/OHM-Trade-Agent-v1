@@ -8,13 +8,19 @@
 # credential, or a credential value.
 #
 # Usage:
-#   verify-committee-shadow.sh
+#   verify-committee-shadow.sh --expected-sha <40-char-sha>
 #   verify-committee-shadow.sh --rollback
 #
-# `--rollback` first returns the plane to OFF (removing the provider egress drop-in
-# and the shadow mode drop-in, and restoring mode=off), then proves the OFF state.
-# Advisory evidence is left in place: rollback disables measurement, it does not
-# destroy it.
+# A SHADOW proof must be bound to the exact release SHA the requested operation was
+# authorized for, and its release compatibility must classify as CURRENT. The
+# classification mirrors the SHELL learning runner (`deploy/learning/opip-learning-job.sh`):
+# CURRENT / RELEASE_DRIFT / UNVERIFIED, with no case normalization, so a
+# non-canonical value is never admitted as CURRENT.
+#
+# `--rollback` is release-independent by construction: it ignores every other
+# argument, because a safety action must not depend on the condition it exists to
+# remediate. It removes both drop-ins and restores mode=off, then proves the OFF
+# state. Advisory evidence is left in place.
 set -uo pipefail
 
 UNIT="opip-committee-shadow.service"
@@ -114,36 +120,53 @@ env_value() {
 }
 
 # ---------------------------------------------------------- argument parsing
-# A SHADOW proof is only meaningful when it is bound to the exact release SHA the
-# requested operation was authorized for. `--rollback` is deliberately exempt: a
-# safety action must never depend on the condition it is intended to remediate.
-EXPECTED_SHA=""
+# `--rollback` is decided FIRST and in isolation: a safety action must remain
+# callable even when the release identity cannot be proven, so a rollback
+# invocation ignores every other argument rather than being blocked by one.
 ROLLBACK_MODE=0
-while [[ "$#" -gt 0 ]]; do
-  case "$1" in
-    --rollback)
-      ROLLBACK_MODE=1
-      shift
-      ;;
-    --expected-sha)
-      if [[ "$#" -lt 2 || -z "${2:-}" ]]; then
-        echo "usage: verify-committee-shadow.sh --expected-sha <40-char-sha>" >&2
-        exit 64
-      fi
-      EXPECTED_SHA="$2"
-      shift 2
-      ;;
-    *)
-      echo "usage: verify-committee-shadow.sh [--expected-sha <40-char-sha>] [--rollback]" >&2
-      exit 64
-      ;;
-  esac
+for _arg in "$@"; do
+  if [[ "$_arg" == "--rollback" ]]; then
+    ROLLBACK_MODE=1
+  fi
 done
 
-# Exact-SHA equality, mirroring the learning plane's contract
-# (`app/opip/learning/job_disposition.py`) so the Committee reuses one vocabulary
-# rather than inventing a second, weaker one. A branch name, short SHA, tag,
-# symbolic ref, or malformed value is never normalized into CURRENT.
+EXPECTED_SHA=""
+if [[ "$ROLLBACK_MODE" -eq 0 ]]; then
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --expected-sha)
+        if [[ "$#" -lt 2 || -z "${2:-}" ]]; then
+          echo "usage: verify-committee-shadow.sh --expected-sha <40-char-sha>" >&2
+          exit 64
+        fi
+        if [[ -n "$EXPECTED_SHA" ]]; then
+          # A duplicate binding is ambiguous, so it is refused rather than
+          # silently resolved last-wins.
+          echo "verify-committee-shadow.sh: --expected-sha supplied more than once" >&2
+          exit 64
+        fi
+        EXPECTED_SHA="$2"
+        shift 2
+        ;;
+      *)
+        echo "usage: verify-committee-shadow.sh [--expected-sha <40-char-sha>] [--rollback]" >&2
+        exit 64
+        ;;
+    esac
+  done
+fi
+
+# Exact-SHA equality, mirroring the SHELL learning runner
+# (`deploy/learning/opip-learning-job.sh`), which is the implementation that
+# actually gates learning work.
+#
+# It deliberately does NOT lowercase. The Python helper
+# (`app/opip/learning/job_disposition.py`) normalizes case before validating, so it
+# would report CURRENT for an uppercase 40-hex value; for an authority-binding
+# equality check that widens the accepted identity set, and canonical git object
+# ids are lowercase. Never normalizing a non-canonical value into CURRENT is the
+# fail-closed behaviour, so the Committee is intentionally stricter than the Python
+# helper and matches the shell runner.
 classify_release_compatibility() {
   local worker="$1"
   local expected="$2"

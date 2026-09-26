@@ -213,9 +213,53 @@ that still allowlists egress or forces shadow mode, then proves the effective
 network policy. A pending rollback must be cancelled before a corrected
 activation.
 
-### Runtime structure of a SHADOW case
+### Release-SHA binding and the drift recovery procedure
 
-A SHADOW case is governed by the **seven roles**, not by two provider families:
+Every SHADOW proof must be bound to the exact release SHA the requested operation
+was authorized for:
+
+```text
+verify-committee-shadow.sh --expected-sha <40-char-sha>
+```
+
+The proof classifies release compatibility the same way the shell learning runner
+does, and only `CURRENT` may pass:
+
+| Worker release vs expected | `release_compatibility_status` | Proof |
+| --- | --- | --- |
+| both full lowercase 40-char SHAs, equal | `CURRENT` | `SHADOW_PROOF=PASS` |
+| both valid, unequal | `RELEASE_DRIFT` | `SHADOW_PROOF=FAIL` |
+| missing, malformed, uppercase, short, branch or symbolic ref | `UNVERIFIED` | `SHADOW_PROOF=FAIL` |
+
+An **unbound** proof (no `--expected-sha`) reports `UNVERIFIED` and fails, so it can
+never return a false PASS; the full diagnostics still run so the reason is visible.
+A missing or empty flag value and a duplicated flag are refused as usage errors
+(exit 64). The proof prints
+`release_compatibility_status=<status> observed=<sha> expected=<sha>` and never
+prints a credential value.
+
+**Drift recovery procedure.** If `main` advances after activation, the worker is
+genuinely drifted and a canary or timer command for the new SHA is correctly
+refused with `release_compatibility_status=RELEASE_DRIFT`. That is the intended
+fail-closed behaviour, not a false negative. The recovery is to re-activate at the
+new SHA, which is idempotent, and then retry the operation:
+
+```text
+/deploy-committee <new-main-sha>          # install the worker at the new release
+/shadow-committee <new-main-sha> <not-before-iso8601> <review-by-iso8601>
+/committee-canary <new-main-sha>
+```
+
+The same sequence applies when a proof reports `UNVERIFIED`: confirm the host's
+`OPIP_COMMITTEE_RELEASE_SHA` is a full lowercase SHA matching the requested target
+before retrying.
+
+`--rollback` is released-independent by construction: it ignores every other
+argument (including `--expected-sha`), never consults the canonicalizer, and proves
+the resulting OFF state. A safety action must remain callable even when release
+identity cannot be proven.
+
+### Runtime structure of a SHADOW caseA SHADOW case is governed by the **seven roles**, not by two provider families:
 
 ```text
 verified canonical replica
