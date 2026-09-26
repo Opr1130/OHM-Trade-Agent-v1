@@ -152,7 +152,7 @@ if [[ "$ROLLBACK_MODE" -eq 0 ]]; then
     case "$1" in
       --expected-sha)
         if [[ "$#" -lt 2 || -z "${2:-}" ]]; then
-          echo "usage: verify-committee-shadow.sh --expected-sha <40-char-sha>" >&2
+          echo "usage: verify-committee-shadow.sh --expected-sha <40-char-sha> | --rollback" >&2
           exit 64
         fi
         if [[ -n "$EXPECTED_SHA" ]]; then
@@ -205,6 +205,10 @@ if [[ "$ROLLBACK_MODE" -eq 1 ]]; then
   # is not deleted.
   systemctl disable "$TIMER" >/dev/null 2>&1 || true
   systemctl stop "$TIMER" >/dev/null 2>&1 || true
+  # A oneshot cycle already in flight is bounded by TimeoutStartSec, but it is
+  # stopped explicitly so rollback does not report a proven OFF state while a
+  # committee process is still running.
+  systemctl stop "$UNIT" >/dev/null 2>&1 || true
   rm -f "$DROPIN"
   rm -f "$MODE_DROPIN"
   # A renamed drop-in is still SHADOW configuration. Remove any sibling that
@@ -464,7 +468,10 @@ echo "release_compatibility_status=${release_status} observed=${release:-none} e
 #: is on the wrong release" (a proof failure). Both fail closed.
 binding_omitted=0
 if [[ "$release_status" == "CURRENT" ]]; then
-  pass "release compatibility is CURRENT: the worker release is the authorized SHA"
+  # Precisely worded: this proves the DECLARED release identity matches the
+  # authorized SHA. It does not prove the installed application tree was built
+  # from it (see the README limitation paragraph).
+  pass "declared release identity matches the authorized SHA (release_compatibility_status=CURRENT)"
 elif [[ -z "$EXPECTED_SHA" ]]; then
   binding_omitted=1
   fail "no expected release SHA was supplied; a SHADOW proof must be bound to the authorized release (release_compatibility_status=UNVERIFIED)"
