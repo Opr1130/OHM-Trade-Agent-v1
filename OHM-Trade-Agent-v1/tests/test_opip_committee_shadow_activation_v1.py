@@ -2724,7 +2724,8 @@ def test_abort_traps_are_installed_and_the_success_line_clears_them() -> None:
     assert "on_activation_exit" in script
     assert "trap on_activation_exit EXIT" in script
     for signal_name in ("TERM", "INT", "HUP"):
-        assert f"trap 'exit 1" in script and signal_name in script, signal_name
+        assert f"trap 'exit 1" in script, signal_name
+        assert signal_name in script, signal_name
     # The completion flag must be set before the success marker, so the trap can
     # distinguish a finished activation from an aborted one.
     completed = script.index("activation_completed=1")
