@@ -2228,6 +2228,31 @@ def _step_declared_env(
     }
 
 
+def _substitute_expressions(text: str, outputs: dict[str, str]) -> str:
+    """Expand `${{ … }}` the way the real runner does, before bash ever sees it.
+
+    GitHub substitutes these server-side, so a body reaching bash with a literal
+    `${{ … }}` is a harness artefact, not production behaviour. Resolving them keeps
+    the harness faithful - which now matters, because a failed substitution leaves a
+    variable unset and the step bodies run with `set -u`.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        expression = match.group(1)
+        step_ref = re.fullmatch(
+            r"steps\.([A-Za-z0-9_-]+)\.outputs\.([A-Za-z0-9_-]+)", expression
+        )
+        if step_ref:
+            return outputs.get(f"{step_ref.group(1)}.{step_ref.group(2)}", "")
+        if expression.startswith("secrets."):
+            return "harness-secret"
+        # Any other context (github.*, env.*, inputs.*): a stable placeholder is
+        # enough for the harness, and is never a credential value.
+        return "harness-context"
+
+    return _GITHUB_EXPRESSION.sub(replace, text)
+
+
 def _run_workflow_step(
     bash: str,
     tmp_path: pathlib.Path,
@@ -2246,11 +2271,11 @@ def _run_workflow_step(
     class of defect where a step body uses a variable the runner never provides.
     """
     harness = _step_harness(tmp_path)
-    body = _step_run_body(activation, step_id)
-    script = tmp_path / f"step-{step_id}.sh"
-    script.write_text(body, encoding="utf-8", newline="\n")
     outputs_map = {"command.sha": _SHA}
     outputs_map.update(command_outputs or {})
+    body = _substitute_expressions(_step_run_body(activation, step_id), outputs_map)
+    script = tmp_path / f"step-{step_id}.sh"
+    script.write_text(body, encoding="utf-8", newline="\n")
     declared = _step_declared_env(activation, step_id, outputs_map)
 
     env = os.environ.copy()
