@@ -2228,6 +2228,11 @@ def _step_declared_env(
     }
 
 
+#: Matches a GitHub expression in a run body or env value, e.g.
+#: `${{ steps.command.outputs.sha }}`.
+_GITHUB_EXPRESSION = re.compile(r"\$\{\{\s*([^}]+?)\s*\}\}")
+
+
 def _substitute_expressions(text: str, outputs: dict[str, str]) -> str:
     """Expand `${{ … }}` the way the real runner does, before bash ever sees it.
 
