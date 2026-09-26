@@ -113,8 +113,52 @@ env_value() {
   return 0
 }
 
+# ---------------------------------------------------------- argument parsing
+# A SHADOW proof is only meaningful when it is bound to the exact release SHA the
+# requested operation was authorized for. `--rollback` is deliberately exempt: a
+# safety action must never depend on the condition it is intended to remediate.
+EXPECTED_SHA=""
+ROLLBACK_MODE=0
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --rollback)
+      ROLLBACK_MODE=1
+      shift
+      ;;
+    --expected-sha)
+      if [[ "$#" -lt 2 || -z "${2:-}" ]]; then
+        echo "usage: verify-committee-shadow.sh --expected-sha <40-char-sha>" >&2
+        exit 64
+      fi
+      EXPECTED_SHA="$2"
+      shift 2
+      ;;
+    *)
+      echo "usage: verify-committee-shadow.sh [--expected-sha <40-char-sha>] [--rollback]" >&2
+      exit 64
+      ;;
+  esac
+done
+
+# Exact-SHA equality, mirroring the learning plane's contract
+# (`app/opip/learning/job_disposition.py`) so the Committee reuses one vocabulary
+# rather than inventing a second, weaker one. A branch name, short SHA, tag,
+# symbolic ref, or malformed value is never normalized into CURRENT.
+classify_release_compatibility() {
+  local worker="$1"
+  local expected="$2"
+  if [[ ! "$worker" =~ ^[0-9a-f]{40}$ || ! "$expected" =~ ^[0-9a-f]{40}$ ]]; then
+    printf 'UNVERIFIED\n'
+  elif [[ "$worker" == "$expected" ]]; then
+    printf 'CURRENT\n'
+  else
+    printf 'RELEASE_DRIFT\n'
+  fi
+  return 0
+}
+
 # --------------------------------------------------------------- rollback mode
-if [[ "${1:-}" == "--rollback" ]]; then
+if [[ "$ROLLBACK_MODE" -eq 1 ]]; then
   # Restore OFF first, then prove the resulting state. The order matters: proving
   # OFF before actually returning to OFF would report a state that does not exist
   # yet. Rollback removes both drop-ins. The provider egress allowlist must be
@@ -369,11 +413,20 @@ if [[ "$cycle_cap" == "1" ]]; then
 else
   fail "cycle case cap is '${cycle_cap:-unset}', expected 1"
 fi
+# --------------------------------------------------- release identity binding
+# The proof must bind the worker release to the exact SHA the requested operation
+# was authorized for. A syntactically valid SHA is not sufficient: after main
+# advances, an older worker would otherwise be able to return SHADOW_PROOF=PASS
+# for a newer target and then run or enable Committee work.
 release="$(env_value OPIP_COMMITTEE_RELEASE_SHA)"
-if [[ "$release" =~ ^[0-9a-f]{40}$ ]]; then
-  pass "release identity is an exact 40-character SHA"
+release_status="$(classify_release_compatibility "$release" "$EXPECTED_SHA")"
+echo "release_compatibility_status=${release_status} observed=${release:-none} expected=${EXPECTED_SHA:-none}"
+if [[ "$release_status" == "CURRENT" ]]; then
+  pass "release compatibility is CURRENT: the worker release is the authorized SHA"
+elif [[ -z "$EXPECTED_SHA" ]]; then
+  fail "no expected release SHA was supplied, so the worker release cannot be bound to the authorized operation (release_compatibility_status=UNVERIFIED)"
 else
-  fail "release identity is not an exact 40-character SHA"
+  fail "release_compatibility_status=${release_status}: the worker release is not the authorized SHA"
 fi
 
 # --------------------------------------------------------------- no trading credentials

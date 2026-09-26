@@ -210,7 +210,7 @@ jobs:
             -o StrictHostKeyChecking=yes \
             -p "$PORT" \
             "$USER@$HOST" \
-            "sudo -n bash '$RELEASE_DIR/OHM-Trade-Agent-v1/deploy/committee/verify-committee-shadow.sh'" \
+            "sudo -n bash '$RELEASE_DIR/OHM-Trade-Agent-v1/deploy/committee/verify-committee-shadow.sh' --expected-sha '$TARGET_SHA'" \
             2>&1 | tee committee-pre-operation-proof.log
           rc=${PIPESTATUS[0]}
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
@@ -322,7 +322,11 @@ jobs:
 
           # The durable proof must work, not merely exist. The installed helper
           # proves the plane itself, from the stable path an operator will use.
-          remote "sudo -n bash '$STABLE_PROOF'" 2>&1 | tee committee-stable-proof.log
+          # Bound to the requested TARGET_SHA: a worker activated at any other
+          # SHA classifies RELEASE_DRIFT and this step fails, so the canary (or
+          # the timer) is unreachable.
+          remote "sudo -n bash '$STABLE_PROOF' --expected-sha '$TARGET_SHA'" \
+            2>&1 | tee committee-stable-proof.log
           stable_rc=${PIPESTATUS[0]}
           if [[ "$stable_rc" -eq 0 ]] && grep -q '^SHADOW_PROOF=PASS$' committee-stable-proof.log; then
             echo "STABLE_PROOF=PROVEN"
@@ -344,6 +348,7 @@ jobs:
           HOST: ${{ secrets.OPIP_LEARNING_HOST }}
           USER: ${{ secrets.OPIP_LEARNING_USER }}
           PORT: ${{ secrets.OPIP_LEARNING_PORT }}
+          TARGET_SHA: ${{ steps.command.outputs.sha }}
         run: |
           set +e
           PORT="${PORT:-22}"
@@ -355,7 +360,7 @@ jobs:
             -o StrictHostKeyChecking=yes \
             -p "$PORT" \
             "$USER@$HOST" \
-            "sudo -n bash '$RELEASE_DIR/OHM-Trade-Agent-v1/deploy/committee/verify-committee-shadow.sh'" \
+            "sudo -n bash '$RELEASE_DIR/OHM-Trade-Agent-v1/deploy/committee/verify-committee-shadow.sh' --expected-sha '$TARGET_SHA'" \
             2>&1 | tee committee-shadow-proof.log
           RC=${PIPESTATUS[0]}
           echo "rc=$RC" >> "$GITHUB_OUTPUT"
@@ -533,7 +538,7 @@ jobs:
           set -euo pipefail
           RUN_URL="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           PROOF="$(
-            grep -hE '^(PASS|FAIL|INFO|ROLLBACK_APPLIED=|ROLLBACK_PROOF=|SHADOW_ACTIVATION=|SHADOW_PROOF=|STABLE_BUNDLE=|STABLE_PROOF=|SAFE_OFF=|pre_operation_shadow=)' \
+            grep -hE '^(PASS|FAIL|INFO|ROLLBACK_APPLIED=|ROLLBACK_PROOF=|SHADOW_ACTIVATION=|SHADOW_PROOF=|STABLE_BUNDLE=|STABLE_PROOF=|SAFE_OFF=|pre_operation_shadow=|release_compatibility_status=)' \
               committee-pre-operation-proof.log committee-activate.log \
               committee-stable-install.log committee-stable-proof.log \
               committee-stable-safeoff.log committee-shadow-proof.log \

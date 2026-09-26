@@ -177,7 +177,7 @@ def test_activation_always_cleans_the_remote_release(activation_text: str) -> No
 
 def test_activation_receipt_never_dumps_the_environment(activation_text: str) -> None:
     # The receipt prints proof lines and machine-readable markers only.
-    assert "grep -hE '^(PASS|FAIL|INFO|ROLLBACK_APPLIED=|ROLLBACK_PROOF=|SHADOW_ACTIVATION=|SHADOW_PROOF=|STABLE_BUNDLE=|STABLE_PROOF=|SAFE_OFF=|pre_operation_shadow=)'" in (
+    assert "grep -hE '^(PASS|FAIL|INFO|ROLLBACK_APPLIED=|ROLLBACK_PROOF=|SHADOW_ACTIVATION=|SHADOW_PROOF=|STABLE_BUNDLE=|STABLE_PROOF=|SAFE_OFF=|pre_operation_shadow=|release_compatibility_status=)'" in (
         activation_text
     )
     assert "gh api --method POST \"repos/$GITHUB_REPOSITORY/issues/64/comments\"" in (
@@ -304,7 +304,9 @@ def test_the_rollback_path_is_non_destructive_to_advisory_evidence() -> None:
     script = (COMMITTEE_DEPLOY / "verify-committee-shadow.sh").read_text(
         encoding="utf-8"
     )
-    rollback = script.split('if [[ "${1:-}" == "--rollback" ]]')[1].split("else")[0]
+    rollback = script.split('if [[ "$ROLLBACK_MODE" -eq 1 ]]; then')[1].split(
+        "# ------------------------------------------------------------- SHADOW-mode only"
+    )[0]
     # Rollback removes the egress drop-in and restores mode off; it deletes no
     # evidence and stops no trading path.
     assert "rm -f \"$DROPIN\"" in rollback
@@ -498,7 +500,7 @@ def test_the_rollback_proof_does_not_require_the_allowlist_it_just_removed() -> 
     script = (COMMITTEE_DEPLOY / "verify-committee-shadow.sh").read_text(
         encoding="utf-8"
     )
-    rollback = script.split('if [[ "${1:-}" == "--rollback" ]]')[1].split(
+    rollback = script.split('if [[ "$ROLLBACK_MODE" -eq 1 ]]; then')[1].split(
         "# ------------------------------------------------------------- SHADOW-mode only"
     )[0]
     assert "ROLLBACK_PROOF=PASS" in rollback
@@ -1004,6 +1006,18 @@ def _file_mode(plane: dict[str, pathlib.Path]) -> str:
         if line.startswith("OPIP_COMMITTEE_MODE="):
             return line.split("=", 1)[1]
     return ""
+
+
+def _set_release_sha(plane: dict[str, pathlib.Path], value: str) -> None:
+    """Rewrite the worker release SHA an existing plane fixture reports."""
+    path = plane["env"]
+    lines = [
+        line
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if not line.startswith("OPIP_COMMITTEE_RELEASE_SHA=")
+    ]
+    lines.append(f"OPIP_COMMITTEE_RELEASE_SHA={value}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
 
 
 def _show_environment(bash: str, plane: dict[str, pathlib.Path]) -> str:
@@ -1754,11 +1768,20 @@ def _prove_shadow(
     bash: str,
     plane: dict[str, pathlib.Path],
     extra: dict[str, str] | None = None,
+    *,
+    expected_sha: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    """Run SHADOW proof bound to the plane's release SHA unless told otherwise.
+
+    An unbound proof cannot PASS, so the default binds to the SHA the plane
+    fixture actually wrote, and a caller can bind a different expected SHA to
+    exercise release drift.
+    """
+    args = ["--expected-sha", _SHA if expected_sha is None else expected_sha]
     return _run_script(
         bash,
         COMMITTEE_DEPLOY / "verify-committee-shadow.sh",
-        [],
+        args,
         plane,
         extra=extra,
     )
@@ -2789,3 +2812,351 @@ def test_a_completed_activation_is_not_rolled_back_on_exit(
     assert (plane["dropin"] / "10-provider-egress.conf").exists()
     assert (plane["dropin"] / "20-shadow-mode.conf").exists()
     assert _file_mode(plane) == "shadow"
+
+
+# ===========================================================================
+# Release-SHA binding (IC-046).
+#
+# The defect this section exists to prevent: SHADOW proof validated only that
+# OPIP_COMMITTEE_RELEASE_SHA was a syntactically valid 40-character SHA. It never
+# compared it against the SHA the requested operation was authorized for, so after
+# main advanced an older worker could return SHADOW_PROOF=PASS and then permit a
+# canary cycle or timer enablement that the receipt attributed to a newer target.
+#
+# Semantics reuse the learning plane's contract exactly
+# (`app/opip/learning/job_disposition.py`, `deploy/learning/opip-learning-job.sh`):
+# both full lowercase 40-character SHAs and equal -> CURRENT; both valid and
+# unequal -> RELEASE_DRIFT; anything missing, malformed, or unverifiable ->
+# UNVERIFIED. Only CURRENT may pass.
+# ===========================================================================
+
+#: A second, valid, different SHA, used to model a drifted worker.
+_DRIFT_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+
+def _release_status(proc: subprocess.CompletedProcess[str]) -> str:
+    for line in proc.stdout.splitlines():
+        if line.startswith("release_compatibility_status="):
+            return line.split("=", 1)[1].split()[0]
+    return ""
+
+
+def test_l1_current_release_binding_passes(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """L1: observed == expected -> CURRENT, and the proof passes."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="shadow")
+    _pin_allow(
+        plane,
+        _STUB_PLANE_ADDRESSES,
+        resolv=_STUB_PLANE_RESOLV,
+        providers=_STUB_PLANE_PROVIDERS,
+    )
+    proc = _prove_shadow(bash, plane, expected_sha=_SHA)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _release_status(proc) == "CURRENT"
+    assert "SHADOW_PROOF=PASS" in proc.stdout
+
+
+def test_l2_release_drift_fails_closed(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """L2: both valid but different -> RELEASE_DRIFT and SHADOW_PROOF=FAIL."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="shadow")
+    _pin_allow(
+        plane,
+        _STUB_PLANE_ADDRESSES,
+        resolv=_STUB_PLANE_RESOLV,
+        providers=_STUB_PLANE_PROVIDERS,
+    )
+    proc = _prove_shadow(bash, plane, expected_sha=_DRIFT_SHA)
+    assert proc.returncode != 0
+    assert _release_status(proc) == "RELEASE_DRIFT"
+    assert "SHADOW_PROOF=FAIL" in proc.stdout
+    assert "SHADOW_PROOF=PASS" not in proc.stdout
+
+
+@pytest.mark.parametrize(
+    "observed",
+    ["", "CHANGEME", "not-a-sha", _SHA[:12], _SHA.upper(), "main", "HEAD"],
+)
+def test_l3_unverifiable_observed_release_fails_closed(
+    tmp_path: pathlib.Path, fork_bash: str, observed: str
+) -> None:
+    """L3: absent/short/malformed/uppercase observed -> UNVERIFIED, never PASS."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="shadow")
+    _pin_allow(
+        plane,
+        _STUB_PLANE_ADDRESSES,
+        resolv=_STUB_PLANE_RESOLV,
+        providers=_STUB_PLANE_PROVIDERS,
+    )
+    _set_release_sha(plane, observed)
+    proc = _prove_shadow(bash, plane, expected_sha=_SHA)
+    assert proc.returncode != 0
+    assert _release_status(proc) == "UNVERIFIED"
+    assert "SHADOW_PROOF=FAIL" in proc.stdout
+    assert "SHADOW_PROOF=PASS" not in proc.stdout
+
+
+@pytest.mark.parametrize(
+    "expected",
+    ["", "not-a-sha", _SHA[:12], _SHA.upper(), "main", "refs/heads/main"],
+)
+def test_l4_unverifiable_expected_release_fails_closed(
+    tmp_path: pathlib.Path, fork_bash: str, expected: str
+) -> None:
+    """L4: a malformed expected SHA must never normalize into CURRENT."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="shadow")
+    _pin_allow(
+        plane,
+        _STUB_PLANE_ADDRESSES,
+        resolv=_STUB_PLANE_RESOLV,
+        providers=_STUB_PLANE_PROVIDERS,
+    )
+    proc = _prove_shadow(bash, plane, expected_sha=expected)
+    assert proc.returncode != 0
+    assert _release_status(proc) == "UNVERIFIED"
+    assert "SHADOW_PROOF=PASS" not in proc.stdout
+
+
+def test_l5_an_unbound_shadow_proof_cannot_pass(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """L5: no expected binding -> UNVERIFIED and FAIL, with diagnostics intact."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="shadow")
+    _pin_allow(
+        plane,
+        _STUB_PLANE_ADDRESSES,
+        resolv=_STUB_PLANE_RESOLV,
+        providers=_STUB_PLANE_PROVIDERS,
+    )
+    proc = _run_script(
+        bash, COMMITTEE_DEPLOY / "verify-committee-shadow.sh", [], plane
+    )
+    assert proc.returncode != 0
+    assert _release_status(proc) == "UNVERIFIED"
+    assert "SHADOW_PROOF=FAIL" in proc.stdout
+    assert "SHADOW_PROOF=PASS" not in proc.stdout
+    # Diagnostics still ran: an operator still learns why the plane is unsuitable.
+    assert "mode is shadow in the environment file" in proc.stdout
+    assert "PASS  " in proc.stdout
+
+
+def test_l5_a_missing_expected_sha_argument_value_is_refused(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="shadow")
+    proc = _run_script(
+        bash,
+        COMMITTEE_DEPLOY / "verify-committee-shadow.sh",
+        ["--expected-sha"],
+        plane,
+    )
+    assert proc.returncode == 64
+    assert "usage" in (proc.stdout + proc.stderr)
+
+
+def test_the_proof_reuses_the_learning_plane_release_vocabulary() -> None:
+    """The classification must mirror the existing contract, not a new one."""
+    from app.opip.learning.job_disposition import (
+        RELEASE_CURRENT,
+        RELEASE_DRIFT,
+        RELEASE_UNVERIFIED,
+        classify_release_compatibility,
+    )
+
+    script = (COMMITTEE_DEPLOY / "verify-committee-shadow.sh").read_text(
+        encoding="utf-8"
+    )
+    for token in (RELEASE_CURRENT, RELEASE_DRIFT, RELEASE_UNVERIFIED):
+        assert token in script, token
+    # The Committee classifier must agree with the learning plane's on every case.
+    assert classify_release_compatibility(_SHA, _SHA) == RELEASE_CURRENT
+    assert classify_release_compatibility(_SHA, _DRIFT_SHA) == RELEASE_DRIFT
+    assert classify_release_compatibility(_SHA, "") == RELEASE_UNVERIFIED
+    assert classify_release_compatibility("main", _SHA) == RELEASE_UNVERIFIED
+    assert classify_release_compatibility(_SHA.upper(), _SHA) == RELEASE_CURRENT
+
+
+# ------------------------------------------------ binding of each proof call site
+
+
+def test_l8_activation_internal_proof_is_bound_to_its_target(
+    activation_text: str,
+) -> None:
+    """L8: activation proves the exact SHA it was authorized to activate."""
+    script = (COMMITTEE_DEPLOY / "activate-committee-shadow.sh").read_text(
+        encoding="utf-8"
+    )
+    assert 'bash "$proof_script" --expected-sha "$TARGET_SHA"' in script
+    # An unbound internal proof would let activation report PASS on any valid SHA.
+    assert 'if ! bash "$proof_script"; then' not in script
+
+
+def test_l9_stable_installed_proof_is_bound_to_its_target(
+    activation: dict,
+) -> None:
+    """L9: the installed durable helper is invoked bound to the activation target."""
+    body = _step_run_body(activation, "activate")
+    # The DURABLE installed helper is invoked, bound to the activation target. This
+    # is what makes both guarantees hold at once: the installed artifact is proven
+    # usable, and it is proven for the exact SHA that was authorized.
+    assert "bash '$STABLE_PROOF' --expected-sha '$TARGET_SHA'" in body
+    # Every SHADOW proof invocation in the activate step carries the binding.
+    # Rollback is the deliberate exception: it is a safety action and must not
+    # depend on the release identity it exists to remediate. Install lines name
+    # the same file as a source and are not proof invocations.
+    proof_calls = [
+        line
+        for line in body.splitlines()
+        if "sudo -n bash" in line
+        and ("$STABLE_PROOF'" in line or "verify-committee-shadow.sh'" in line)
+        and "--rollback" not in line
+    ]
+    assert proof_calls, body
+    for line in proof_calls:
+        assert "--expected-sha '$TARGET_SHA'" in line, line
+    # And the one deliberately unbound call is the rollback vehicle.
+    rollback_calls = [
+        line
+        for line in body.splitlines()
+        if "sudo -n bash" in line and "--rollback" in line
+    ]
+    assert rollback_calls, body
+    for line in rollback_calls:
+        assert "--expected-sha" not in line, line
+
+
+def test_b_workflow_pre_operation_proof_is_bound_to_the_target(
+    activation: dict,
+) -> None:
+    body = _step_run_body(activation, "pre_operation_shadow")
+    assert "verify-committee-shadow.sh' --expected-sha '$TARGET_SHA'" in body
+
+
+def test_d_post_activation_proof_step_is_bound_to_the_target(
+    activation: dict,
+) -> None:
+    body = _step_run_body(activation, "shadow_proof")
+    assert "verify-committee-shadow.sh' --expected-sha '$TARGET_SHA'" in body
+    steps = _control_steps(activation)
+    assert "TARGET_SHA" in steps["shadow_proof"]["env"]
+
+
+def test_e_rollback_call_sites_carry_no_release_binding(activation: dict) -> None:
+    """E: a safety action must not depend on the condition it remediates."""
+    body = _step_run_body(activation, "rollback")
+    assert "--rollback" in body
+    assert "--expected-sha" not in body
+    script = (COMMITTEE_DEPLOY / "verify-committee-shadow.sh").read_text(
+        encoding="utf-8"
+    )
+    rollback = script.split('if [[ "$ROLLBACK_MODE" -eq 1 ]]; then')[1].split(
+        "# ------------------------------------------------------------- SHADOW-mode only"
+    )[0]
+    assert "--expected-sha" not in rollback
+    assert "RELEASE_DRIFT" not in rollback
+
+
+def test_no_production_shadow_proof_path_is_left_unbound() -> None:
+    """Every SHADOW proof call must bind a SHA; rollback is the only exception."""
+    workflow = ACTIVATION.read_text(encoding="utf-8")
+    unbound: list[str] = []
+    for line in workflow.splitlines():
+        # Match an actual invocation of the proof script, not a comment or a path.
+        if " -n bash " not in line or "verify-committee-shadow.sh'" not in line:
+            continue
+        if "--rollback" in line:
+            continue
+        if "--expected-sha '$TARGET_SHA'" not in line:
+            unbound.append(line.strip())
+    assert unbound == [], unbound
+    # The activation script's own internal proof is bound too.
+    activate = (COMMITTEE_DEPLOY / "activate-committee-shadow.sh").read_text(
+        encoding="utf-8"
+    )
+    for line in activate.splitlines():
+        if "proof_script" not in line or "--expected-sha" not in line:
+            continue
+        assert '"$TARGET_SHA"' in line, line
+    assert 'bash "$proof_script" --expected-sha "$TARGET_SHA"' in activate
+
+
+# ------------------------------------------------ drift blocks the operations
+
+
+def test_l6_release_drift_blocks_the_canary_service_start(
+    tmp_path: pathlib.Path, fork_bash: str, activation: dict
+) -> None:
+    """L6: workflow target B against host release A must not start the service."""
+    bash = fork_bash
+    gate = _step_if(activation, "canary")
+    # The pre-operation proof for target B against a plane whose release is A.
+    plane = _plane(tmp_path, mode="shadow")
+    _pin_allow(
+        plane,
+        _STUB_PLANE_ADDRESSES,
+        resolv=_STUB_PLANE_RESOLV,
+        providers=_STUB_PLANE_PROVIDERS,
+    )
+    proof = _prove_shadow(bash, plane, expected_sha=_DRIFT_SHA)
+    assert proof.returncode != 0
+    outputs = {
+        ("command", "command"): "canary",
+        ("pre_operation_shadow", "result"): "FAILED",
+    }
+    assert not _evaluate_if(gate, outputs)
+    # And the drift evidence itself is machine-readable and fail-closed.
+    assert "release_compatibility_status=RELEASE_DRIFT" in proof.stdout
+    assert "SHADOW_PROOF=FAIL" in proof.stdout
+
+
+def test_l7_release_drift_blocks_the_timer_enable(
+    tmp_path: pathlib.Path, fork_bash: str, activation: dict
+) -> None:
+    """L7: the higher-authority boundary is blocked by drift the same way."""
+    bash = fork_bash
+    gate = _step_if(activation, "timer")
+    plane = _plane(tmp_path, mode="shadow")
+    _pin_allow(
+        plane,
+        _STUB_PLANE_ADDRESSES,
+        resolv=_STUB_PLANE_RESOLV,
+        providers=_STUB_PLANE_PROVIDERS,
+    )
+    proof = _prove_shadow(bash, plane, expected_sha=_DRIFT_SHA)
+    assert proof.returncode != 0
+    outputs = {
+        ("command", "command"): "timer",
+        ("pre_operation_shadow", "result"): "FAILED",
+    }
+    assert not _evaluate_if(gate, outputs)
+
+
+def test_l10_rollback_remains_release_independent(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """L10: rollback proves OFF even with a drifted or malformed release."""
+    bash = fork_bash
+    for observed in (_DRIFT_SHA, "CHANGEME", "main", ""):
+        plane = _plane(tmp_path / observed.replace("/", "_") or "empty", mode="shadow")
+        _pin_allow(
+            plane,
+            _STUB_PLANE_ADDRESSES,
+            resolv=_STUB_PLANE_RESOLV,
+            providers=_STUB_PLANE_PROVIDERS,
+        )
+        _set_release_sha(plane, observed)
+        proc = _run_script(
+            bash, COMMITTEE_DEPLOY / "verify-committee-shadow.sh", ["--rollback"], plane
+        )
+        assert proc.returncode == 0, (observed, proc.stdout + proc.stderr)
+        assert "ROLLBACK_PROOF=PASS" in proc.stdout
+        assert _file_mode(plane) == "off"

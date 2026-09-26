@@ -579,7 +579,9 @@ proof_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/verify-committee-sha
 if [[ ! -f "$proof_script" ]]; then
   fail_closed "the independent shadow proof script is absent"
 fi
-if ! bash "$proof_script"; then
+# Bound to the exact SHA this activation was authorized for, so activation cannot
+# report PASS while the worker release is anything other than TARGET_SHA.
+if ! bash "$proof_script" --expected-sha "$TARGET_SHA"; then
   fail_closed "the independent shadow proof failed"
 fi
 
