@@ -184,6 +184,45 @@ jobs:
           "${SSH[@]}" "$REMOTE" "sudo -n install -d -o root -g root -m 0700 '$RELEASE_DIR'"
           git archive --format=tar "$TARGET_SHA" | "${SSH[@]}" "$REMOTE" "sudo -n tar -xf - -C '$RELEASE_DIR'"
 
+      # -------------------------------------------------- pre-operation proof
+      # No state-changing Committee operation may run on an unproven plane, and a
+      # controller-side check is not enforcement. The proof runs from the exact
+      # uploaded release tree, which is pinned to TARGET_SHA and carries the
+      # canonicalizer the helper resolves as a sibling.
+      - name: Prove SHADOW before the requested operation
+        id: pre_operation_shadow
+        if: >-
+          steps.command.outputs.command == 'canary' ||
+          steps.command.outputs.command == 'timer'
+        continue-on-error: true
+        env:
+          HOST: ${{ secrets.OPIP_LEARNING_HOST }}
+          USER: ${{ secrets.OPIP_LEARNING_USER }}
+          PORT: ${{ secrets.OPIP_LEARNING_PORT }}
+        run: |
+          set +e
+          PORT="${PORT:-22}"
+          RELEASE_DIR="/var/tmp/opip-committee-${{ steps.command.outputs.sha }}-$GITHUB_RUN_ID"
+          ssh \
+            -i ~/.ssh/opip_committee \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -p "$PORT" \
+            "$USER@$HOST" \
+            "sudo -n bash '$RELEASE_DIR/OHM-Trade-Agent-v1/deploy/committee/verify-committee-shadow.sh'" \
+            2>&1 | tee committee-pre-operation-proof.log
+          rc=${PIPESTATUS[0]}
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [[ "$rc" -eq 0 ]] && grep -q '^SHADOW_PROOF=PASS$' committee-pre-operation-proof.log; then
+            echo "pre_operation_shadow=PROVEN"
+            echo "result=PROVEN" >> "$GITHUB_OUTPUT"
+          else
+            echo "pre_operation_shadow=FAILED"
+            echo "result=FAILED" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+
       # ------------------------------------------------------------ activate
       - name: Activate credentialled SHADOW (timer stays disabled)
         id: activate
@@ -211,34 +250,90 @@ jobs:
             "$USER@$HOST" \
             "sudo -n bash '$RELEASE_DIR/OHM-Trade-Agent-v1/deploy/committee/activate-committee-shadow.sh' '$TARGET_SHA' '$NOT_BEFORE' '$REVIEW_BY'" \
             2>&1 | tee committee-activate.log
-          RC=${PIPESTATUS[0]}
-          ACT_MARKER=0
-          if [[ "$RC" -eq 0 ]] && grep -q '^SHADOW_ACTIVATION=PASS' committee-activate.log; then
-            ACT_MARKER=1
-          fi
+          rc=${PIPESTATUS[0]}
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          echo "bundle=NOT_ATTEMPTED" >> "$GITHUB_OUTPUT"
+          echo "stable_proof=NOT_ATTEMPTED" >> "$GITHUB_OUTPUT"
+          echo "safe_off=NOT_ATTEMPTED" >> "$GITHUB_OUTPUT"
+
           if grep -q '^SHADOW_ACTIVATION=BLOCKED' committee-activate.log; then
             echo "result=BLOCKED" >> "$GITHUB_OUTPUT"
-            echo "rc=$RC" >> "$GITHUB_OUTPUT"
             exit 0
-          fi          # Install the proof helper at a stable path so the rollback command can
-          # return the plane to OFF without needing a release tree. It is the same
-          # reviewed artifact from the exact release SHA, never inline logic.
-          if [[ "$ACT_MARKER" -eq 1 ]]; then
+          fi
+          if [[ "$rc" -ne 0 ]] || ! grep -q '^SHADOW_ACTIVATION=PASS' committee-activate.log; then
+            echo "result=FAILED" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          RELEASE_COMMITTEE="$RELEASE_DIR/OHM-Trade-Agent-v1/deploy/committee"
+          STABLE_PROOF="/usr/local/sbin/opip-committee-shadow-proof"
+          STABLE_POLICY="/usr/local/sbin/ip_allow_policy.py"
+
+          remote() {
             ssh \
               -i ~/.ssh/opip_committee \
               -o BatchMode=yes \
               -o IdentitiesOnly=yes \
               -o StrictHostKeyChecking=yes \
+              -o ServerAliveInterval=30 \
+              -o ServerAliveCountMax=20 \
               -p "$PORT" \
-              "$USER@$HOST" \
-              "sudo -n install -m 0755 -o root -g root '$RELEASE_DIR/OHM-Trade-Agent-v1/deploy/committee/verify-committee-shadow.sh' /usr/local/sbin/opip-committee-shadow-proof"
-          fi
-          echo "rc=$RC" >> "$GITHUB_OUTPUT"
-          if [[ "$ACT_MARKER" -eq 1 ]]; then
-            echo "result=ACTIVATED" >> "$GITHUB_OUTPUT"
-          else
+              "$USER@$HOST" "$@"
+          }
+
+          # A proven SHADOW plane must never be left active without a usable durable
+          # proof artifact: the activation contract is "activate AND prove". The
+          # rollback vehicle is the release tree, which is pinned to the authorized
+          # SHA and carries both reviewed files, so SAFE-OFF is provable even when
+          # the durable bundle is what failed.
+          stable_safe_off() {
+            remote "sudo -n bash '$RELEASE_COMMITTEE/verify-committee-shadow.sh' --rollback" \
+              2>&1 | tee committee-stable-safeoff.log
+            local safe_rc=${PIPESTATUS[0]}
+            if [[ "$safe_rc" -eq 0 ]] && grep -q '^ROLLBACK_PROOF=PASS$' committee-stable-safeoff.log; then
+              echo "SAFE_OFF=PROVEN"
+              echo "safe_off=PROVEN" >> "$GITHUB_OUTPUT"
+              return 0
+            fi
+            echo "SAFE_OFF=FAIL the plane could not be returned to a proven OFF state" >&2
+            echo "safe_off=FAIL" >> "$GITHUB_OUTPUT"
+            return 1
+          }
+
+          # The stable proof artifact is a BUNDLE, not a script. The helper resolves
+          # its canonicalizer as a sibling, so installing only the script leaves the
+          # durable proof permanently unable to run its allowlist comparison. Both
+          # reviewed files from the exact authorized release SHA are installed, and
+          # the installation is fail-closed: this step's `set +e` must never let a
+          # failed install reach result=ACTIVATED.
+          remote "sudo -n install -m 0755 -o root -g root '$RELEASE_COMMITTEE/verify-committee-shadow.sh' '$STABLE_PROOF' && sudo -n install -m 0644 -o root -g root '$RELEASE_COMMITTEE/ip_allow_policy.py' '$STABLE_POLICY'" \
+            2>&1 | tee committee-stable-install.log
+          install_rc=${PIPESTATUS[0]}
+          bundle_state="$(remote "sudo -n sh -c 'if [ -x \"$STABLE_PROOF\" ] && [ -f \"$STABLE_POLICY\" ]; then echo READY; else echo INCOMPLETE; fi'" 2>/dev/null | tr -d '\r' | tail -n1)"
+          if [[ "$install_rc" -ne 0 || "$bundle_state" != "READY" ]]; then
+            echo "STABLE_BUNDLE=FAILED install_rc=${install_rc} observed=${bundle_state:-none}"
+            echo "bundle=FAILED" >> "$GITHUB_OUTPUT"
+            stable_safe_off || true
             echo "result=FAILED" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          echo "STABLE_BUNDLE=READY both reviewed proof artifacts installed"
+          echo "bundle=READY" >> "$GITHUB_OUTPUT"
+
+          # The durable proof must work, not merely exist. The installed helper
+          # proves the plane itself, from the stable path an operator will use.
+          remote "sudo -n bash '$STABLE_PROOF'" 2>&1 | tee committee-stable-proof.log
+          stable_rc=${PIPESTATUS[0]}
+          if [[ "$stable_rc" -eq 0 ]] && grep -q '^SHADOW_PROOF=PASS$' committee-stable-proof.log; then
+            echo "STABLE_PROOF=PROVEN"
+            echo "stable_proof=PROVEN" >> "$GITHUB_OUTPUT"
+            echo "result=ACTIVATED" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "STABLE_PROOF=FAILED the installed stable helper could not prove the plane"
+          echo "stable_proof=FAILED" >> "$GITHUB_OUTPUT"
+          stable_safe_off || true
+          echo "result=FAILED" >> "$GITHUB_OUTPUT"
           exit 0
 
       - name: Prove SHADOW mode
@@ -274,7 +369,9 @@ jobs:
       # -------------------------------------------------------------- canary
       - name: Run one bounded credentialled canary cycle (timer disabled)
         id: canary
-        if: steps.command.outputs.command == 'canary'
+        if: >-
+          steps.command.outputs.command == 'canary' &&
+          steps.pre_operation_shadow.outputs.result == 'PROVEN'
         continue-on-error: true
         env:
           HOST: ${{ secrets.OPIP_LEARNING_HOST }}
@@ -327,7 +424,9 @@ jobs:
       # --------------------------------------------------------------- timer
       - name: Enable the bounded recurring timer
         id: timer
-        if: steps.command.outputs.command == 'timer'
+        if: >-
+          steps.command.outputs.command == 'timer' &&
+          steps.pre_operation_shadow.outputs.result == 'PROVEN'
         continue-on-error: true
         env:
           HOST: ${{ secrets.OPIP_LEARNING_HOST }}
@@ -420,6 +519,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           COMMAND: ${{ steps.command.outputs.command }}
           TARGET_SHA: ${{ steps.command.outputs.sha }}
+          PRE_OPERATION_SHADOW: ${{ steps.pre_operation_shadow.outputs.result }}
+          STABLE_BUNDLE: ${{ steps.activate.outputs.bundle }}
+          STABLE_PROOF: ${{ steps.activate.outputs.stable_proof }}
+          SAFE_OFF: ${{ steps.activate.outputs.safe_off }}
           RESULTS: >-
             activate=${{ steps.activate.outputs.result }} shadow=${{ steps.shadow_proof.outputs.result }}
             canary=${{ steps.canary.outputs.result }} timer=${{ steps.timer.outputs.result }}
@@ -430,9 +533,11 @@ jobs:
           set -euo pipefail
           RUN_URL="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           PROOF="$(
-            grep -hE '^(PASS|FAIL|INFO|ROLLBACK_APPLIED=|SHADOW_ACTIVATION=|SHADOW_PROOF=)' \
-              committee-activate.log committee-shadow-proof.log committee-canary.log \
-              committee-timer.log committee-rollback.log 2>/dev/null || true
+            grep -hE '^(PASS|FAIL|INFO|ROLLBACK_APPLIED=|ROLLBACK_PROOF=|SHADOW_ACTIVATION=|SHADOW_PROOF=|STABLE_BUNDLE=|STABLE_PROOF=|SAFE_OFF=|pre_operation_shadow=)' \
+              committee-pre-operation-proof.log committee-activate.log \
+              committee-stable-install.log committee-stable-proof.log \
+              committee-stable-safeoff.log committee-shadow-proof.log \
+              committee-canary.log committee-timer.log committee-rollback.log 2>/dev/null || true
           )"
           BODY=$(cat <<EOF
           ## O'Pip Intelligence Committee Activation Receipt
@@ -440,6 +545,8 @@ jobs:
           - **Command:** \`$COMMAND\`
           - **SHA:** \`$TARGET_SHA\`
           - **Stage results:** ${RESULTS//$'\n'/ }
+          - **Pre-operation SHADOW proof:** ${PRE_OPERATION_SHADOW:-NOT RUN}
+          - **Stable proof bundle:** ${STABLE_BUNDLE:-NOT ATTEMPTED} / ${STABLE_PROOF:-NOT ATTEMPTED} (safe-off: ${SAFE_OFF:-NOT ATTEMPTED})
           - **Remote cleanup:** ${CLEANUP_RESULT:-NOT RUN} (rc=${CLEANUP_RC:-N/A})
           - **Workflow run:** $RUN_URL
 
@@ -462,7 +569,11 @@ jobs:
         env:
           COMMAND: ${{ steps.command.outputs.command }}
           ACTIVATE_RESULT: ${{ steps.activate.outputs.result }}
+          STABLE_BUNDLE: ${{ steps.activate.outputs.bundle }}
+          STABLE_PROOF: ${{ steps.activate.outputs.stable_proof }}
+          SAFE_OFF: ${{ steps.activate.outputs.safe_off }}
           SHADOW_RESULT: ${{ steps.shadow_proof.outputs.result }}
+          PRE_OPERATION_SHADOW: ${{ steps.pre_operation_shadow.outputs.result }}
           CANARY_RESULT: ${{ steps.canary.outputs.result }}
           TIMER_RESULT: ${{ steps.timer.outputs.result }}
           ROLLBACK_RESULT: ${{ steps.rollback.outputs.result }}
@@ -476,12 +587,18 @@ jobs:
                 exit 1
               fi
               test "$ACTIVATE_RESULT" = "ACTIVATED" || { echo "SHADOW activation did not succeed." >&2; exit 1; }
+              # A durable proof artifact that cannot be installed or cannot prove the
+              # plane is a failed activation, never a successful one.
+              test "$STABLE_BUNDLE" = "READY" || { echo "The stable proof bundle was not installed." >&2; exit 1; }
+              test "$STABLE_PROOF" = "PROVEN" || { echo "The installed stable proof helper could not prove the plane." >&2; exit 1; }
               test "$SHADOW_RESULT" = "PROVEN" || { echo "SHADOW mode was not proven." >&2; exit 1; }
               ;;
             canary)
+              test "$PRE_OPERATION_SHADOW" = "PROVEN" || { echo "Pre-canary SHADOW proof failed; the canary was not started." >&2; exit 1; }
               test "$CANARY_RESULT" = "RAN" || { echo "Canary cycle did not run." >&2; exit 1; }
               ;;
             timer)
+              test "$PRE_OPERATION_SHADOW" = "PROVEN" || { echo "Pre-timer SHADOW proof failed; the timer was not enabled." >&2; exit 1; }
               test "$TIMER_RESULT" = "ENABLED" || { echo "The recurring timer was not enabled." >&2; exit 1; }
               ;;
             rollback)

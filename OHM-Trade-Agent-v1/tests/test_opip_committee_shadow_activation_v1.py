@@ -18,6 +18,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import pathlib
+import re
 import shutil
 import stat
 import subprocess
@@ -58,9 +59,11 @@ def _bash() -> str | None:
     return None
 
 
-def _run_bash(argv: list[str]) -> subprocess.CompletedProcess:
+def _run_bash(
+    argv: list[str], *, cwd: pathlib.Path | None = None
+) -> subprocess.CompletedProcess:
     for _ in range(3):
-        proc = subprocess.run(argv, capture_output=True, text=True)
+        proc = subprocess.run(argv, capture_output=True, text=True, cwd=cwd)
         if proc.returncode == _BASH_LAUNCH_FAILURE and not proc.stdout and not proc.stderr:
             continue
         return proc
@@ -169,7 +172,8 @@ def test_activation_always_cleans_the_remote_release(activation_text: str) -> No
 
 
 def test_activation_receipt_never_dumps_the_environment(activation_text: str) -> None:
-    assert "grep -hE '^(PASS|FAIL|INFO|ROLLBACK_APPLIED=|SHADOW_ACTIVATION=|SHADOW_PROOF=)'" in (
+    # The receipt prints proof lines and machine-readable markers only.
+    assert "grep -hE '^(PASS|FAIL|INFO|ROLLBACK_APPLIED=|ROLLBACK_PROOF=|SHADOW_ACTIVATION=|SHADOW_PROOF=|STABLE_BUNDLE=|STABLE_PROOF=|SAFE_OFF=|pre_operation_shadow=)'" in (
         activation_text
     )
     assert "gh api --method POST \"repos/$GITHUB_REPOSITORY/issues/64/comments\"" in (
@@ -180,8 +184,12 @@ def test_activation_receipt_never_dumps_the_environment(activation_text: str) ->
 def test_activation_fails_closed_per_command(activation_text: str) -> None:
     for token in (
         "SHADOW activation did not succeed.",
+        "The stable proof bundle was not installed.",
+        "The installed stable proof helper could not prove the plane.",
         "SHADOW mode was not proven.",
+        "Pre-canary SHADOW proof failed; the canary was not started.",
         "Canary cycle did not run.",
+        "Pre-timer SHADOW proof failed; the timer was not enabled.",
         "The recurring timer was not enabled.",
         "Rollback was not proven.",
         "The temporary remote release directory was not removed.",
@@ -2047,3 +2055,595 @@ def test_shadow_proof_accepts_production_shaped_nine_entry_policy(
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "SHADOW_PROOF=PASS" in proc.stdout
     assert "SHADOW_PROOF=FAIL" not in proc.stdout
+
+
+# ===========================================================================
+# Stable proof bundle (IC-045): the installed durable proof must be USABLE.
+#
+# The incident this section exists to prevent: the activation workflow installed
+# only `verify-committee-shadow.sh` to the stable path. That helper resolves its
+# canonicalizer as a SIBLING, so the installed artifact permanently failed
+# `FAIL  IP allowlist canonicalizer is absent` while the same script run from the
+# release tree passed. Activation reported PASS and the durable proof was unusable.
+#
+# The workflow steps are exercised by executing their real `run:` bodies from the
+# committed YAML with a fake `ssh`, and their real `if:` expressions are evaluated
+# against simulated step outputs. Nothing here contacts a host.
+# ===========================================================================
+
+#: Absolute destinations the stable bundle must install to.
+STABLE_PROOF_PATH = "/usr/local/sbin/opip-committee-shadow-proof"
+STABLE_POLICY_PATH = "/usr/local/sbin/ip_allow_policy.py"
+
+
+def _control_steps(activation: dict) -> dict[str, dict]:
+    return {
+        step["id"]: step
+        for step in activation["jobs"]["control"]["steps"]
+        if step.get("id")
+    }
+
+
+def _step_run_body(activation: dict, step_id: str) -> str:
+    return _control_steps(activation)[step_id]["run"]
+
+
+def _step_if(activation: dict, step_id: str) -> str:
+    return _control_steps(activation)[step_id].get("if", "")
+
+
+def _evaluate_if(expression: str, outputs: dict[tuple[str, str], str]) -> bool:
+    """Evaluate a GitHub `if:` expression over simulated step outputs.
+
+    Supports the subset the control plane uses: ``steps.<id>.outputs.<key>``
+    references compared with ``==`` or ``!=`` against a single-quoted literal,
+    combined with ``&&`` and ``||``. An absent output is the empty string, which
+    is how GitHub treats a skipped step's outputs.
+    """
+    text = " ".join(expression.split())
+
+    def leaf(part: str) -> bool:
+        match = re.fullmatch(
+            r"\s*steps\.([A-Za-z0-9_-]+)\.outputs\.([A-Za-z0-9_-]+)\s*(==|!=)\s*'([^']*)'\s*",
+            part,
+        )
+        assert match, f"unsupported gate expression: {part!r}"
+        step_id, key, operator, literal = match.groups()
+        observed = outputs.get((step_id, key), "")
+        return (observed == literal) if operator == "==" else (observed != literal)
+
+    def conjunction(part: str) -> bool:
+        return all(leaf(item) for item in part.split("&&"))
+
+    return any(conjunction(item) for item in text.split("||"))
+
+
+#: A fake `ssh` that answers each remote command the control plane issues. It logs
+#: every invocation, so a test can prove a command was NOT executed.
+_FAKE_SSH = r"""#!/usr/bin/env bash
+set -uo pipefail
+printf '%s\n' "$*" >> "$FAKE_SSH_LOG"
+command="${!#}"
+case "$command" in
+  *"sudo -n install "*) printf 'install output\n'; exit "${FAKE_INSTALL_RC:-0}" ;;
+  *"echo READY"*) printf '%s\n' "${FAKE_BUNDLE_STATE:-READY}"; exit "${FAKE_BUNDLE_RC:-0}" ;;
+  *activate-committee-shadow.sh*) printf '%s\n' "${FAKE_ACT_OUTPUT:-SHADOW_ACTIVATION=PASS}"; exit "${FAKE_ACT_RC:-0}" ;;
+  *--rollback*) printf '%s\n' "${FAKE_SAFEOFF_OUTPUT:-ROLLBACK_PROOF=PASS}"; exit "${FAKE_SAFEOFF_RC:-0}" ;;
+  *opip-committee-shadow-proof*) printf '%s\n' "${FAKE_STABLE_OUTPUT:-SHADOW_PROOF=PASS}"; exit "${FAKE_STABLE_RC:-0}" ;;
+  *systemctl\ start*) printf 'canary started\n'; exit "${FAKE_START_RC:-0}" ;;
+  *systemctl\ enable*) printf 'timer enabled\n'; exit "${FAKE_ENABLE_RC:-0}" ;;
+  *journalctl*|*role_results.jsonl*|*--no-pager*) printf 'logged\n'; exit 0 ;;
+  *verify-committee-shadow.sh*) printf '%s\n' "${FAKE_PREOP_OUTPUT:-SHADOW_PROOF=PASS}"; exit "${FAKE_PREOP_RC:-0}" ;;
+  *) printf 'ok\n'; exit 0 ;;
+esac
+"""
+
+#: The address set the proof's own expectation is derived from, for a loopback
+#: stub resolver: the provider address, the configured resolver, and the loopback
+#: addresses the deny-all default also denies. The installed drop-in has to equal
+#: this set exactly, because comparison is equality, not containment.
+_STUB_PLANE_ADDRESSES = ["203.0.113.10", "127.0.0.53", "127.0.0.1", "::1"]
+_STUB_PLANE_PROVIDERS = {"api.openai.com": ["203.0.113.10"], "api.anthropic.com": []}
+_STUB_PLANE_RESOLV = "nameserver 127.0.0.53\n"
+
+
+def _step_harness(tmp_path: pathlib.Path, **scenario: str) -> dict[str, pathlib.Path]:
+    bin_dir = tmp_path / "workflow-bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    _write_exe(bin_dir / "ssh", _FAKE_SSH)
+    log = tmp_path / "ssh.log"
+    log.write_text("", encoding="utf-8")
+    outputs = tmp_path / "github_output.txt"
+    outputs.write_text("", encoding="utf-8")
+    return {"bin": bin_dir, "log": log, "outputs": outputs}
+
+
+def _run_workflow_step(
+    bash: str,
+    tmp_path: pathlib.Path,
+    activation: dict,
+    step_id: str,
+    *,
+    command: str = "shadow",
+    scenario: dict[str, str] | None = None,
+) -> tuple[subprocess.CompletedProcess[str], dict[str, str], str]:
+    """Execute one real workflow step body and return (proc, outputs, ssh log)."""
+    harness = _step_harness(tmp_path)
+    body = _step_run_body(activation, step_id)
+    script = tmp_path / f"step-{step_id}.sh"
+    script.write_text(body, encoding="utf-8", newline="\n")
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": _bash_path(harness["bin"]) + os.pathsep + env.get("PATH", ""),
+            "GITHUB_OUTPUT": _bash_path(harness["outputs"]),
+            "FAKE_SSH_LOG": _bash_path(harness["log"]),
+            "GITHUB_RUN_ID": "12345",
+            "PORT": "22",
+            "USER": "deploy",
+            "HOST": "fake.invalid",
+            "TARGET_SHA": _SHA,
+            "NOT_BEFORE": _NOT_BEFORE,
+            "REVIEW_BY": _REVIEW_BY,
+        }
+    )
+    env.update(scenario or {})
+    # Run in the temporary directory so the step's `tee` logs land there rather
+    # than in the checkout.
+    proc = _run_bash([bash, str(script)], cwd=tmp_path)
+    parsed: dict[str, str] = {}
+    for line in harness["outputs"].read_text(encoding="utf-8").splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            parsed[key] = value
+    return proc, parsed, harness["log"].read_text(encoding="utf-8")
+
+
+def _installed_bundle(
+    destination: pathlib.Path, *, with_policy: bool = True
+) -> pathlib.Path:
+    """Reproduce the installed stable layout, including the renamed helper."""
+    destination.mkdir(parents=True, exist_ok=True)
+    proof = destination / "opip-committee-shadow-proof"
+    shutil.copyfile(COMMITTEE_DEPLOY / "verify-committee-shadow.sh", proof)
+    proof.chmod(0o755)
+    if with_policy:
+        shutil.copyfile(
+            COMMITTEE_DEPLOY / "ip_allow_policy.py",
+            destination / "ip_allow_policy.py",
+        )
+    return proof
+
+
+# ------------------------------------------- Case A: stable bundle completeness
+
+
+def test_case_a_the_workflow_installs_both_stable_proof_artifacts(
+    activation: dict,
+) -> None:
+    """Case A: installing only the script must fail, because the helper needs it."""
+    body = _step_run_body(activation, "activate")
+    assert STABLE_PROOF_PATH in body
+    assert STABLE_POLICY_PATH in body
+    # Both come from the exact authorized release tree, never inline logic.
+    assert "RELEASE_COMMITTEE" in body
+    assert "/verify-committee-shadow.sh" in body
+    assert "/ip_allow_policy.py" in body
+    assert "deploy/committee" in body
+    # The reviewed permissions and ownership.
+    assert "install -m 0755 -o root -g root" in body
+    assert "install -m 0644 -o root -g root" in body
+    # No second semantic implementation of canonicalization.
+    assert "ipaddress" not in body
+    assert "ip_network" not in body
+
+
+# ------------------------------------------- Case B: stable path resolution
+
+
+def test_case_b_the_installed_stable_helper_resolves_its_sibling_policy(
+    tmp_path: pathlib.Path, fork_bash: str, activation: dict
+) -> None:
+    """Case B: the INSTALLED helper must be able to prove the plane itself."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="shadow")
+    addresses = [
+        "203.0.113.10",
+        "203.0.113.11",
+        "2001:db8::10",
+        "203.0.113.20",
+        "203.0.113.21",
+        "2001:db8::20",
+        "127.0.0.53",
+        "127.0.0.1",
+        "::1",
+    ]
+    _pin_allow(
+        plane,
+        addresses,
+        resolv="nameserver 127.0.0.53\n",
+        providers={
+            "api.openai.com": ["203.0.113.10", "203.0.113.11", "2001:db8::10"],
+            "api.anthropic.com": ["203.0.113.20", "203.0.113.21", "2001:db8::20"],
+        },
+    )
+    # systemd prints a bare host as /32 or /128; the canonicalizer must accept that.
+    installed = _installed_bundle(tmp_path / "usr-local-sbin")
+    proc = _run_script(bash, installed, [], plane)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "SHADOW_PROOF=PASS" in proc.stdout
+    assert "SHADOW_PROOF=FAIL" not in proc.stdout
+    assert "canonicalizer" not in proc.stdout
+
+
+# ------------------------------------------- Case C: missing stable policy
+
+
+def test_case_c_the_installed_helper_fails_closed_without_the_policy(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """Case C: the exact incident — policy absent, proof must FAIL, not pass."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="shadow")
+    _pin_allow(
+        plane,
+        _STUB_PLANE_ADDRESSES,
+        resolv=_STUB_PLANE_RESOLV,
+        providers=_STUB_PLANE_PROVIDERS,
+    )
+    installed = _installed_bundle(tmp_path / "usr-local-sbin", with_policy=False)
+    assert not (installed.parent / "ip_allow_policy.py").exists()
+    proc = _run_script(bash, installed, [], plane)
+    assert proc.returncode != 0
+    assert "SHADOW_PROOF=FAIL" in proc.stdout
+    assert "FAIL  IP allowlist canonicalizer is absent" in proc.stdout
+    assert "SHADOW_PROOF=PASS" not in proc.stdout
+
+
+def test_case_c_the_release_tree_helper_still_proves_the_same_plane(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """Case C: the same plane passes from the release tree, which has both files."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="shadow")
+    _pin_allow(
+        plane,
+        _STUB_PLANE_ADDRESSES,
+        resolv=_STUB_PLANE_RESOLV,
+        providers=_STUB_PLANE_PROVIDERS,
+    )
+    proc = _prove_shadow(bash, plane)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "SHADOW_PROOF=PASS" in proc.stdout
+
+
+# ------------------------------------------- Case D: install failure propagation
+
+
+def test_case_d_a_failed_stable_install_cannot_report_activation(
+    tmp_path: pathlib.Path, fork_bash: str, activation: dict
+) -> None:
+    """Case D: `set +e` must not let a failed install reach result=ACTIVATED."""
+    proc, outputs, log = _run_workflow_step(
+        fork_bash,
+        tmp_path,
+        activation,
+        "activate",
+        scenario={"FAKE_INSTALL_RC": "1"},
+    )
+    assert outputs.get("result") == "FAILED", (outputs, proc.stdout, proc.stderr)
+    assert outputs.get("result") != "ACTIVATED"
+    assert outputs.get("bundle") == "FAILED"
+    assert outputs.get("safe_off") == "PROVEN"
+    assert "STABLE_BUNDLE=FAILED" in proc.stdout
+    assert "STABLE_PROOF=PROVEN" not in proc.stdout
+    # The plane must not be left activated, and the durable proof is not claimed.
+    assert f"opip-committee-shadow-proof'" not in log
+
+
+def test_case_d_an_incomplete_bundle_cannot_report_activation(
+    tmp_path: pathlib.Path, fork_bash: str, activation: dict
+) -> None:
+    """Case D: install returning 0 while the bundle is incomplete still fails."""
+    proc, outputs, _ = _run_workflow_step(
+        fork_bash,
+        tmp_path,
+        activation,
+        "activate",
+        scenario={"FAKE_INSTALL_RC": "0", "FAKE_BUNDLE_STATE": "INCOMPLETE"},
+    )
+    assert outputs.get("result") == "FAILED", (outputs, proc.stdout)
+    assert outputs.get("bundle") == "FAILED"
+    assert outputs.get("safe_off") == "PROVEN"
+    assert "observed=INCOMPLETE" in proc.stdout
+
+
+def test_case_d_a_failed_stable_install_returns_the_plane_to_off(
+    tmp_path: pathlib.Path, fork_bash: str, activation: dict
+) -> None:
+    """Case D: the rollback vehicle is the release tree, so SAFE-OFF is provable."""
+    _proc, outputs, log = _run_workflow_step(
+        fork_bash,
+        tmp_path,
+        activation,
+        "activate",
+        scenario={"FAKE_INSTALL_RC": "1"},
+    )
+    assert "--rollback" in log
+    assert "deploy/committee/verify-committee-shadow.sh" in log
+    assert outputs.get("safe_off") == "PROVEN"
+
+
+def test_case_d_an_unprovable_safe_off_is_reported_not_hidden(
+    tmp_path: pathlib.Path, fork_bash: str, activation: dict
+) -> None:
+    proc, outputs, _ = _run_workflow_step(
+        fork_bash,
+        tmp_path,
+        activation,
+        "activate",
+        scenario={
+            "FAKE_INSTALL_RC": "1",
+            "FAKE_SAFEOFF_OUTPUT": "ROLLBACK_PROOF=FAIL failures=2",
+            "FAKE_SAFEOFF_RC": "1",
+        },
+    )
+    assert outputs.get("safe_off") == "FAIL"
+    assert outputs.get("result") == "FAILED"
+
+
+# ------------------------------------------- Case E: stable proof verification
+
+
+def test_case_e_an_unusable_installed_helper_cannot_report_activation(
+    tmp_path: pathlib.Path, fork_bash: str, activation: dict
+) -> None:
+    """Case E: the incident itself — bundle installed yet unusable."""
+    proc, outputs, _ = _run_workflow_step(
+        fork_bash,
+        tmp_path,
+        activation,
+        "activate",
+        scenario={
+            "FAKE_STABLE_OUTPUT": "FAIL  IP allowlist canonicalizer is absent\nSHADOW_PROOF=FAIL failures=1",
+            "FAKE_STABLE_RC": "1",
+        },
+    )
+    assert outputs.get("result") == "FAILED", (outputs, proc.stdout)
+    assert outputs.get("stable_proof") == "FAILED"
+    assert outputs.get("safe_off") == "PROVEN"
+    assert "STABLE_PROOF=FAILED" in proc.stdout
+
+
+def test_case_e_a_missing_pass_marker_cannot_report_activation(
+    tmp_path: pathlib.Path, fork_bash: str, activation: dict
+) -> None:
+    """Case E: exit 0 without `SHADOW_PROOF=PASS` is not proof."""
+    proc, outputs, _ = _run_workflow_step(
+        fork_bash,
+        tmp_path,
+        activation,
+        "activate",
+        scenario={"FAKE_STABLE_OUTPUT": "SHADOW_PROOF=FAIL failures=1", "FAKE_STABLE_RC": "0"},
+    )
+    assert outputs.get("result") == "FAILED", (outputs, proc.stdout)
+    assert outputs.get("stable_proof") == "FAILED"
+
+
+def test_case_e_a_proven_bundle_reports_activation(
+    tmp_path: pathlib.Path, fork_bash: str, activation: dict
+) -> None:
+    """Case E: only a proven installed helper may claim activation."""
+    proc, outputs, log = _run_workflow_step(
+        fork_bash, tmp_path, activation, "activate"
+    )
+    assert outputs.get("result") == "ACTIVATED", (outputs, proc.stdout)
+    assert outputs.get("bundle") == "READY"
+    assert outputs.get("stable_proof") == "PROVEN"
+    assert outputs.get("safe_off") == "NOT_ATTEMPTED"
+    assert "STABLE_BUNDLE=READY" in proc.stdout
+    assert "STABLE_PROOF=PROVEN" in proc.stdout
+    assert "--rollback" not in log
+
+
+def test_case_e_the_final_gate_requires_a_usable_durable_proof(
+    activation: dict, activation_text: str
+) -> None:
+    """Case E: the workflow terminal gate pins every activation precondition."""
+    for token in (
+        'test "$STABLE_BUNDLE" = "READY"',
+        'test "$STABLE_PROOF" = "PROVEN"',
+        'test "$ACTIVATE_RESULT" = "ACTIVATED"',
+        'test "$SHADOW_RESULT" = "PROVEN"',
+    ):
+        assert token in activation_text, token
+    final_body = activation["jobs"]["control"]["steps"][-1]["run"]
+    assert 'test "$STABLE_BUNDLE" = "READY"' in final_body
+    assert 'test "$STABLE_PROOF" = "PROVEN"' in final_body
+
+
+# ------------------------------------------- Cases F-I: pre-operation proof gate
+
+
+def test_case_f_the_pre_operation_proof_runs_from_the_pinned_release_tree(
+    activation: dict,
+) -> None:
+    """Case F: proof comes from the uploaded release tree, which has its sibling."""
+    body = _step_run_body(activation, "pre_operation_shadow")
+    assert "verify-committee-shadow.sh" in body
+    assert "RELEASE_DIR" in body
+    assert "steps.command.outputs.sha" in body
+    assert "grep -q '^SHADOW_PROOF=PASS$'" in body
+    assert "pre_operation_shadow=PROVEN" in body
+    assert "pre_operation_shadow=FAILED" in body
+
+
+def test_case_f_a_successful_pre_operation_proof_is_machine_readable(
+    tmp_path: pathlib.Path, fork_bash: str, activation: dict
+) -> None:
+    proc, outputs, _ = _run_workflow_step(
+        fork_bash, tmp_path, activation, "pre_operation_shadow"
+    )
+    assert outputs.get("result") == "PROVEN", (outputs, proc.stdout)
+    assert "pre_operation_shadow=PROVEN" in proc.stdout
+
+
+def test_case_g_a_failed_pre_operation_proof_is_reported(
+    tmp_path: pathlib.Path, fork_bash: str, activation: dict
+) -> None:
+    proc, outputs, _ = _run_workflow_step(
+        fork_bash,
+        tmp_path,
+        activation,
+        "pre_operation_shadow",
+        scenario={"FAKE_PREOP_OUTPUT": "SHADOW_PROOF=FAIL failures=1", "FAKE_PREOP_RC": "1"},
+    )
+    assert outputs.get("result") == "FAILED", (outputs, proc.stdout)
+    assert "pre_operation_shadow=FAILED" in proc.stdout
+
+
+def test_case_g_the_canary_gate_requires_the_pre_operation_proof(
+    activation: dict, activation_text: str
+) -> None:
+    """Case G: `systemctl start` must be unreachable without a proven plane."""
+    gate = _step_if(activation, "canary")
+    assert "steps.command.outputs.command == 'canary'" in gate
+    assert "steps.pre_operation_shadow.outputs.result == 'PROVEN'" in gate
+    assert _evaluate_if(
+        gate, {("command", "command"): "canary", ("pre_operation_shadow", "result"): "PROVEN"}
+    )
+    assert not _evaluate_if(
+        gate, {("command", "command"): "canary", ("pre_operation_shadow", "result"): "FAILED"}
+    )
+    # A skipped prerequisite step yields an empty output, which must not pass.
+    assert not _evaluate_if(gate, {("command", "command"): "canary"})
+    assert not _evaluate_if(gate, {("command", "command"): "timer"})
+    assert 'test "$PRE_OPERATION_SHADOW" = "PROVEN"' in activation_text
+
+
+def test_case_g_the_canary_body_starts_the_service_only_when_it_runs(
+    tmp_path: pathlib.Path, fork_bash: str, activation: dict
+) -> None:
+    """Case G: the gate is what prevents the start, so prove both directions."""
+    gate = _step_if(activation, "canary")
+
+    def run_if(proven: bool) -> str:
+        scenario = {"FAKE_PREOP_OUTPUT": "SHADOW_PROOF=PASS"} if proven else {
+            "FAKE_PREOP_OUTPUT": "SHADOW_PROOF=FAIL failures=1",
+            "FAKE_PREOP_RC": "1",
+        }
+        _proc, pre_outputs, _log = _run_workflow_step(
+            fork_bash,
+            tmp_path / ("proven" if proven else "unproven"),
+            activation,
+            "pre_operation_shadow",
+            scenario=scenario,
+        )
+        outputs = {("command", "command"): "canary", ("pre_operation_shadow", "result"): pre_outputs.get("result", "")}
+        if not _evaluate_if(gate, outputs):
+            return ""
+        _p, _o, canary_log = _run_workflow_step(
+            fork_bash, tmp_path / ("run" if proven else "skip"), activation, "canary"
+        )
+        return canary_log
+
+    assert "systemctl start" in run_if(True)
+    assert "systemctl start" not in run_if(False)
+
+
+def test_case_h_the_timer_gate_requires_the_pre_operation_proof(
+    tmp_path: pathlib.Path, fork_bash: str, activation: dict, activation_text: str
+) -> None:
+    """Case H: the higher-authority boundary has the same gate."""
+    bash = fork_bash
+    gate = _step_if(activation, "timer")
+    assert "steps.command.outputs.command == 'timer'" in gate
+    assert "steps.pre_operation_shadow.outputs.result == 'PROVEN'" in gate
+    assert _evaluate_if(
+        gate, {("command", "command"): "timer", ("pre_operation_shadow", "result"): "PROVEN"}
+    )
+    assert not _evaluate_if(
+        gate, {("command", "command"): "timer", ("pre_operation_shadow", "result"): "FAILED"}
+    )
+    assert not _evaluate_if(gate, {("command", "command"): "timer"})
+    assert 'test "$PRE_OPERATION_SHADOW" = "PROVEN"' in activation_text
+
+    def run_if(proven: bool) -> str:
+        scenario = {"FAKE_PREOP_OUTPUT": "SHADOW_PROOF=PASS"} if proven else {
+            "FAKE_PREOP_OUTPUT": "SHADOW_PROOF=FAIL failures=1",
+            "FAKE_PREOP_RC": "1",
+        }
+        _proc, pre_outputs, _log = _run_workflow_step(
+            bash,
+            tmp_path / ("tproven" if proven else "tunproven"),
+            activation,
+            "pre_operation_shadow",
+            scenario=scenario,
+        )
+        outputs = {
+            ("command", "command"): "timer",
+            ("pre_operation_shadow", "result"): pre_outputs.get("result", ""),
+        }
+        if not _evaluate_if(gate, outputs):
+            return ""
+        _p, _o, timer_log = _run_workflow_step(
+            bash, tmp_path / ("tenable" if proven else "tblocked"), activation, "timer"
+        )
+        return timer_log
+
+    assert "systemctl enable" in run_if(True)
+    assert "systemctl enable" not in run_if(False)
+
+
+def test_case_i_only_a_proven_plane_makes_the_timer_step_eligible(
+    activation: dict,
+) -> None:
+    """Case I: workflow eligibility only; nothing here authorizes a real timer."""
+    gate = _step_if(activation, "timer")
+    assert _evaluate_if(
+        gate,
+        {
+            ("command", "command"): "timer",
+            ("pre_operation_shadow", "result"): "PROVEN",
+        },
+    )
+    # The gate is not bypassable by the command alone.
+    for other in ("shadow", "canary", "rollback", ""):
+        assert not _evaluate_if(gate, {("command", "command"): other})
+
+
+# ------------------------------------------- Case K: rollback stays usable
+
+
+def test_case_k_rollback_is_not_gated_on_a_proof(activation: dict) -> None:
+    """Case K: a safety action must never be blocked by a proof failure."""
+    gate = _step_if(activation, "rollback")
+    assert gate == "steps.command.outputs.command == 'rollback'"
+    assert "pre_operation_shadow" not in gate
+    assert _evaluate_if(
+        gate,
+        {
+            ("command", "command"): "rollback",
+            ("pre_operation_shadow", "result"): "FAILED",
+        },
+    )
+
+
+def test_case_k_the_installed_helper_still_supports_rollback_without_the_policy(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """Case K: rollback never needs the canonicalizer, even when it is absent."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="shadow")
+    _pin_allow(
+        plane,
+        _STUB_PLANE_ADDRESSES,
+        resolv=_STUB_PLANE_RESOLV,
+        providers=_STUB_PLANE_PROVIDERS,
+    )
+    installed = _installed_bundle(tmp_path / "usr-local-sbin", with_policy=False)
+    proc = _run_script(bash, installed, ["--rollback"], plane)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "ROLLBACK_PROOF=PASS" in proc.stdout
+    assert "SHADOW_PROOF=PASS" not in proc.stdout
+    assert _file_mode(plane) == "off"
