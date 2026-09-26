@@ -2956,7 +2956,13 @@ def test_l4_an_empty_expected_value_is_refused_as_a_usage_error(
 def test_l5_an_unbound_shadow_proof_cannot_pass(
     tmp_path: pathlib.Path, fork_bash: str
 ) -> None:
-    """L5: no expected binding -> UNVERIFIED and FAIL, with diagnostics intact."""
+    """L5: no expected binding -> UNVERIFIED, FAIL, and a distinct usage exit.
+
+    A SHADOW proof without its authority binding is a usage error (exit 64), which
+    is reported distinctly from a genuine release mismatch (exit 1) so an operator
+    can tell "I omitted the binding" from "the host is on the wrong release". The
+    diagnostics still run, so the plane's state remains visible.
+    """
     bash = fork_bash
     plane = _plane(tmp_path, mode="shadow")
     _pin_allow(
@@ -2968,13 +2974,31 @@ def test_l5_an_unbound_shadow_proof_cannot_pass(
     proc = _run_script(
         bash, COMMITTEE_DEPLOY / "verify-committee-shadow.sh", [], plane
     )
-    assert proc.returncode != 0
+    assert proc.returncode == 64, proc.stdout + proc.stderr
     assert _release_status(proc) == "UNVERIFIED"
     assert "SHADOW_PROOF=FAIL" in proc.stdout
     assert "SHADOW_PROOF=PASS" not in proc.stdout
+    assert "--expected-sha" in (proc.stdout + proc.stderr)
     # Diagnostics still ran: an operator still learns why the plane is unsuitable.
     assert "mode is shadow in the environment file" in proc.stdout
     assert "PASS  " in proc.stdout
+
+
+def test_l5_a_genuine_release_mismatch_keeps_the_proof_failure_exit(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """L5: a real mismatch exits 1, so the two failure modes stay distinguishable."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="shadow")
+    _pin_allow(
+        plane,
+        _STUB_PLANE_ADDRESSES,
+        resolv=_STUB_PLANE_RESOLV,
+        providers=_STUB_PLANE_PROVIDERS,
+    )
+    proc = _prove_shadow(bash, plane, expected_sha=_DRIFT_SHA)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert _release_status(proc) == "RELEASE_DRIFT"
 
 
 def test_l5_a_missing_expected_sha_argument_value_is_refused(

@@ -11,16 +11,22 @@
 #   verify-committee-shadow.sh --expected-sha <40-char-sha>
 #   verify-committee-shadow.sh --rollback
 #
-# A SHADOW proof must be bound to the exact release SHA the requested operation was
-# authorized for, and its release compatibility must classify as CURRENT. The
-# classification mirrors the SHELL learning runner (`deploy/learning/opip-learning-job.sh`):
-# CURRENT / RELEASE_DRIFT / UNVERIFIED, with no case normalization, so a
-# non-canonical value is never admitted as CURRENT.
+# `--expected-sha` is REQUIRED for a SHADOW proof and is the authority binding: the
+# proof is only meaningful when it states which release the requested operation was
+# authorized for. Invoking a SHADOW proof WITHOUT it is a usage error (exit 64),
+# reported distinctly from a genuine release mismatch (exit 1), so "the operator
+# omitted the binding" can never be confused with "the host is on the wrong
+# release". The remaining diagnostics still run so the plane's state is visible.
 #
-# `--rollback` is release-independent by construction: it ignores every other
-# argument, because a safety action must not depend on the condition it exists to
-# remediate. It removes both drop-ins and restores mode=off, then proves the OFF
-# state. Advisory evidence is left in place.
+# The proof classifies release compatibility the same way the SHELL learning runner
+# does (`deploy/learning/opip-learning-job.sh`): CURRENT / RELEASE_DRIFT /
+# UNVERIFIED, comparing case-sensitively, so a non-canonical value (uppercase,
+# short, branch name, symbolic ref) is never admitted as CURRENT.
+#
+# `--rollback` is release-independent by construction: it is decided before any
+# other argument is interpreted and ignores the rest, because a safety action must
+# not depend on the condition it exists to remediate. It removes both drop-ins and
+# restores mode=off, then proves the OFF state. Advisory evidence is left in place.
 set -uo pipefail
 
 UNIT="opip-committee-shadow.service"
@@ -444,10 +450,14 @@ fi
 release="$(env_value OPIP_COMMITTEE_RELEASE_SHA)"
 release_status="$(classify_release_compatibility "$release" "$EXPECTED_SHA")"
 echo "release_compatibility_status=${release_status} observed=${release:-none} expected=${EXPECTED_SHA:-none}"
+#: Distinguishes "the operator omitted the binding" (a usage error) from "the host
+#: is on the wrong release" (a proof failure). Both fail closed.
+binding_omitted=0
 if [[ "$release_status" == "CURRENT" ]]; then
   pass "release compatibility is CURRENT: the worker release is the authorized SHA"
 elif [[ -z "$EXPECTED_SHA" ]]; then
-  fail "no expected release SHA was supplied, so the worker release cannot be bound to the authorized operation (release_compatibility_status=UNVERIFIED)"
+  binding_omitted=1
+  fail "no expected release SHA was supplied; a SHADOW proof must be bound to the authorized release (release_compatibility_status=UNVERIFIED)"
 else
   fail "release_compatibility_status=${release_status}: the worker release is not the authorized SHA"
 fi
@@ -520,4 +530,11 @@ if [[ "$failures" -eq 0 ]]; then
   exit 0
 fi
 echo "${PROOF_LABEL}=FAIL failures=$failures"
+# A SHADOW proof invoked without its authority binding is a usage error, reported
+# distinctly from a genuine mismatch so the two cannot be confused. Rollback never
+# sets this flag, so the safety action keeps its own exit semantics.
+if [[ "${PROOF_LABEL}" == "SHADOW_PROOF" && "${binding_omitted:-0}" -eq 1 ]]; then
+  echo "the proof requires --expected-sha <40-char-sha>" >&2
+  exit 64
+fi
 exit 1
