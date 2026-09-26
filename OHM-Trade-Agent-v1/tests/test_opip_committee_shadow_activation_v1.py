@@ -408,9 +408,9 @@ def _resolve_owner_command(body: str, tmp_path):
     output_path = tmp_path / "github_output.txt"
     output_path.write_text("", encoding="utf-8")
     env = {**os.environ, "COMMENT_BODY": body, "GITHUB_OUTPUT": str(output_path)}
-    proc = subprocess.run(
-        [bash, str(script_path)], capture_output=True, text=True, env=env
-    )
+    # Use the guarded runner: a Git-bash launch failure must skip rather than fail,
+    # exactly as every other bash invocation in this module does.
+    proc = _run_bash([bash, str(script_path)], env=env)
     return proc, output_path.read_text(encoding="utf-8")
 
 
