@@ -2351,7 +2351,9 @@ def test_case_d_a_failed_stable_install_cannot_report_activation(
     assert "STABLE_BUNDLE=FAILED" in proc.stdout
     assert "STABLE_PROOF=PROVEN" not in proc.stdout
     # The plane must not be left activated, and the durable proof is not claimed.
-    assert f"opip-committee-shadow-proof'" not in log
+    # The install destination contains the stable path, so the check is on the
+    # proof INVOCATION form rather than on a bare substring.
+    assert f"bash '{STABLE_PROOF_PATH}'" not in log
 
 
 def test_case_d_an_incomplete_bundle_cannot_report_activation(
