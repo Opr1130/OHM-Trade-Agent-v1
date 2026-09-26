@@ -597,6 +597,9 @@ jobs:
         if: always()
         env:
           COMMAND: ${{ steps.command.outputs.command }}
+          # Declared because the cleanup requirement below is keyed on it: an
+          # undeclared variable would expand to empty and silently skip the check.
+          TARGET_SHA: ${{ steps.command.outputs.sha }}
           ACTIVATE_RESULT: ${{ steps.activate.outputs.result }}
           STABLE_BUNDLE: ${{ steps.activate.outputs.bundle }}
           STABLE_PROOF: ${{ steps.activate.outputs.stable_proof }}
@@ -638,6 +641,11 @@ jobs:
               exit 1
               ;;
           esac
-          if [[ "$COMMAND" != "rollback" ]]; then
+          if [[ -n "${TARGET_SHA:-}" ]]; then
+            # Every command that uploaded a release tree must have removed it, on the
+            # cleanup step's own condition (a SHA was supplied). A leftover release
+            # tree on the host is a real finding, so this is a success requirement for
+            # those commands, rollback included. A no-SHA rollback uploads nothing,
+            # runs no cleanup, and is not subject to it.
             test "$CLEANUP_RESULT" = "CLEANED" || { echo "The temporary remote release directory was not removed." >&2; exit 1; }
           fi

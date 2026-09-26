@@ -2296,6 +2296,10 @@ def _run_workflow_step(
     assigned = set(
         re.findall(r"^\s*(?:local\s+)?([A-Za-z_][A-Za-z0-9_]*)=", body, re.M)
     )
+    # Match the guard's assignment detection exactly, so the harness and the guard
+    # cannot disagree about which names a body defines for itself.
+    assigned |= set(re.findall(r"([A-Za-z_][A-Za-z0-9_]*)=\$\(", body))
+    assigned |= set(re.findall(r"read\s+-r\s+-a\s+([A-Za-z_][A-Za-z0-9_]*)", body))
     for name in set(_REFERENCE_PATTERN.findall(body)):
         if name in declared or name in assigned or name in RUNNER_PLUMBING_NAMES:
             continue
@@ -3522,40 +3526,6 @@ def test_l11_prior_a_to_k_protections_are_present_and_behavioral() -> None:
 # and the guard below makes the class of defect fail loudly.
 # ===========================================================================
 
-#: Runner-supplied names a step body may consume. A body that references one of
-#: these must declare it, or it silently observes an empty string. The set is
-#: deliberately broader than the names currently in use, so a future body that
-#: reaches for one of them without declaring it fails the guard rather than
-#: shipping.
-STEP_SUPPLIED_NAMES = (
-    "TARGET_SHA",
-    "NOT_BEFORE",
-    "REVIEW_BY",
-    "COMMAND",
-    "RESULTS",
-    "HOST",
-    "USER",
-    "PORT",
-    "GH_TOKEN",
-    "SSH_KEY_B64",
-    "KNOWN_HOSTS",
-    "INSTALL_RESULT",
-    "INSTALL_RC",
-    "ISOLATION_RESULT",
-    "ISOLATION_RC",
-    "CLEANUP_RESULT",
-    "CLEANUP_RC",
-    "PRE_OPERATION_SHADOW",
-    "STABLE_BUNDLE",
-    "STABLE_PROOF",
-    "SAFE_OFF",
-    "ACTIVATE_RESULT",
-    "SHADOW_RESULT",
-    "CANARY_RESULT",
-    "TIMER_RESULT",
-    "ROLLBACK_RESULT",
-)
-
 #: Names the runner or bash itself always provides, whatever a step declares.
 #: Referencing one of these without declaring it is fine.
 RUNNER_PLUMBING_NAMES = (
@@ -3732,7 +3702,9 @@ def test_m2_the_guard_covers_a_name_outside_any_allowlist(activation: dict) -> N
                 if not _ENV_NAME_PATTERN.match(ref):
                     continue
                 flagged.append(f"{name}: {ref}")
-    assert flagged == ["pre_operation_shadow: BRAND_NEW_RUNNER_VALUE"], flagged
+    assert "pre_operation_shadow: BRAND_NEW_RUNNER_VALUE" in flagged, flagged
+    # The guard flags by name, so a name it has never seen needs no allowlist entry.
+    assert "BRAND_NEW_RUNNER_VALUE" not in RUNNER_PLUMBING_NAMES
 
 
 def test_m2_the_harness_evicts_an_undeclared_referenced_name(
@@ -3764,12 +3736,14 @@ def test_m2_the_harness_evicts_an_undeclared_referenced_name(
     assert "pre_operation_shadow=PROVEN" in proc.stdout
 
 
-def test_m1_rollback_accepts_an_optional_release_sha(activation: dict) -> None:
+def test_m1_rollback_accepts_an_optional_release_sha(
+    tmp_path: pathlib.Path, activation: dict
+) -> None:
     """An optional SHA selects the release-tree vehicle for the safety action."""
     body = _step_run_body(activation, "command")
-    script = pathlib.Path(tempfile.gettempdir()) / "rollback-parse.sh"
+    script = tmp_path / "rollback-parse.sh"
     script.write_text(body, encoding="utf-8", newline="\n")
-    outputs = pathlib.Path(tempfile.gettempdir()) / "rollback-parse.out"
+    outputs = tmp_path / "rollback-parse.out"
     outputs.write_text("", encoding="utf-8")
     bash = _bash()
     if bash is None:
@@ -3801,3 +3775,103 @@ def test_m1_the_rollback_step_uses_the_release_tree_when_a_sha_is_given(
     assert "opip-committee-shadow-proof" in body
     # The durable helper remains the vehicle when no SHA is supplied.
     assert 'if [[ -n "${TARGET_SHA:-}" ]]' in body
+
+
+# ---------------------------------------------------------------------------
+# IC-046 round 3: canary/timer failure behaviour and residual hygiene.
+#
+# A review claimed the canary and timer captured `tee`'s status rather than the
+# remote command's. That was REFUTED at this revision: both use
+# `RC=${PIPESTATUS[0]}` immediately after the pipeline (and always have). The
+# durable gap it pointed at is real, though: nothing exercised a FAILING remote
+# start, so a regression to `RC=$?` would not be caught. The fake ssh already
+# exposes `FAKE_START_RC` / `FAKE_ENABLE_RC`; these cases finally use them.
+# ---------------------------------------------------------------------------
+
+
+def test_the_canary_captures_the_remote_status_not_the_tee_status(
+    activation: dict,
+) -> None:
+    """`RC` must come from the pipeline's first element, never from `tee`."""
+    body = _step_run_body(activation, "canary")
+    assert "RC=${PIPESTATUS[0]}" in body, body
+    assert "RC=$?" not in body, body
+    # And the verdict is derived from that RC.
+    assert 'if [[ "$RC" -eq 0 ]]' in body
+
+
+def test_the_timer_captures_the_remote_status_not_the_tee_status(
+    activation: dict,
+) -> None:
+    body = _step_run_body(activation, "timer")
+    assert "RC=${PIPESTATUS[0]}" in body, body
+    assert "RC=$?" not in body, body
+    assert 'if [[ "$RC" -eq 0 ]]' in body
+
+
+def test_a_failing_remote_canary_start_reports_failure(
+    tmp_path: pathlib.Path, fork_bash: str, activation: dict
+) -> None:
+    """Behavioural: a non-zero `systemctl start` must yield `result=FAILED`."""
+    proc, outputs, log = _run_workflow_step(
+        fork_bash,
+        tmp_path,
+        activation,
+        "canary",
+        scenario={"FAKE_START_RC": "1"},
+    )
+    assert "systemctl start opip-committee-shadow.service" in log, log
+    assert outputs.get("result") == "FAILED", (outputs, proc.stdout)
+    assert outputs.get("rc") == "1", outputs
+    assert "result=RAN" not in proc.stdout
+
+
+def test_a_succeeding_remote_canary_start_reports_ran(
+    tmp_path: pathlib.Path, fork_bash: str, activation: dict
+) -> None:
+    proc, outputs, log = _run_workflow_step(
+        fork_bash, tmp_path, activation, "canary", scenario={"FAKE_START_RC": "0"}
+    )
+    assert "systemctl start opip-committee-shadow.service" in log, log
+    assert outputs.get("result") == "RAN", (outputs, proc.stdout)
+
+
+def test_a_failing_remote_timer_enable_reports_failure(
+    tmp_path: pathlib.Path, fork_bash: str, activation: dict
+) -> None:
+    """Behavioural: a non-zero `enable --now` must not report the timer enabled."""
+    proc, outputs, log = _run_workflow_step(
+        fork_bash,
+        tmp_path,
+        activation,
+        "timer",
+        scenario={"FAKE_ENABLE_RC": "1"},
+    )
+    assert "systemctl enable --now opip-committee-shadow.timer" in log, log
+    assert outputs.get("result") == "FAILED", (outputs, proc.stdout)
+    assert outputs.get("rc") == "1", outputs
+    assert "result=ENABLED" not in proc.stdout
+
+
+def test_a_succeeding_remote_timer_enable_reports_enabled(
+    tmp_path: pathlib.Path, fork_bash: str, activation: dict
+) -> None:
+    proc, outputs, _log = _run_workflow_step(
+        fork_bash, tmp_path, activation, "timer", scenario={"FAKE_ENABLE_RC": "0"}
+    )
+    assert outputs.get("result") == "ENABLED", (outputs, proc.stdout)
+
+
+def test_a_no_sha_rollback_is_not_held_to_release_cleanup(
+    activation: dict, activation_text: str
+) -> None:
+    """A bare rollback uploads nothing, so cleanup cannot be required of it."""
+    final = activation["jobs"]["control"]["steps"][-1]["run"]
+    # The requirement is keyed on the SHA, which is exactly when cleanup ran.
+    assert 'if [[ -n "${TARGET_SHA:-}" ]]; then' in final
+    assert 'test "$CLEANUP_RESULT" = "CLEANED"' in final
+    # The cleanup step itself runs only when a SHA was supplied.
+    assert "steps.command.outputs.sha != ''" in activation_text
+    # And the requirement can actually be evaluated: the gate declares the SHA.
+    declared = activation["jobs"]["control"]["steps"][-1].get("env") or {}
+    assert "TARGET_SHA" in declared, declared

@@ -231,6 +231,12 @@ does, and only `CURRENT` may pass:
 | both valid, unequal | `RELEASE_DRIFT` | `SHADOW_PROOF=FAIL` |
 | missing, malformed, uppercase, short, branch or symbolic ref | `UNVERIFIED` | `SHADOW_PROOF=FAIL` |
 
+The comparison is against the **declared** release identity
+(`OPIP_COMMITTEE_RELEASE_SHA` in the worker environment file), not against the
+provenance of the installed application tree. A worker whose declared SHA matches the
+expected SHA reports `CURRENT`; binding the installed tree itself is a separate,
+tracked follow-up.
+
 An **unbound** proof (no `--expected-sha`) reports `UNVERIFIED` and fails, so it can
 never return a false PASS; the full diagnostics still run so the reason is visible.
 A missing or empty flag value and a duplicated flag are refused as usage errors
@@ -280,9 +286,14 @@ be proven.
 
 The durable helper is the normal vehicle. Supplying a SHA selects the pinned release
 tree as the vehicle, which matters when the durable helper is absent or broken: the
-safety action must not depend on a single artifact.
+safety action must not depend on a single artifact. Note that a SHA-bearing rollback
+uploads the release tree, so it is subject to the same `target == current main` and
+exact-SHA `pytest` gates as the other SHA-bearing commands; the no-SHA form is not,
+and remains available when those gates cannot be met.
 
-### Runtime structure of a SHADOW caseA SHADOW case is governed by the **seven roles**, not by two provider families:
+### Runtime structure of a SHADOW case
+
+A SHADOW case is governed by the **seven roles**, not by two provider families:
 
 ```text
 verified canonical replica
