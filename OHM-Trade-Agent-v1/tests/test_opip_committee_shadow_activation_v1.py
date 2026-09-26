@@ -3736,24 +3736,32 @@ def test_m2_the_guard_covers_a_name_outside_any_allowlist(activation: dict) -> N
 
 
 def test_m2_the_harness_evicts_an_undeclared_referenced_name(
-    tmp_path: pathlib.Path, fork_bash: str, activation: dict
+    tmp_path: pathlib.Path, fork_bash: str, activation: dict, monkeypatch
 ) -> None:
-    """An ambient value for an undeclared referenced name must not leak into the step."""
+    """An AMBIENT value for an undeclared referenced name must not leak into the step.
+
+    The vector is the process environment, not the `scenario` overrides: those are
+    applied after eviction by design, so injecting through them would test the wrong
+    path.
+    """
     document = yaml.safe_load(ACTIVATION.read_text(encoding="utf-8"))
     for step in document["jobs"]["control"]["steps"]:
         if step.get("id") == "pre_operation_shadow":
             step["run"] = step["run"].replace(
                 "set +e",
-                "set +e\n          if [[ -n \"${LEAK_CANARY:-}\" ]]; then echo LEAKED; fi",
+                'set +e\n          if [[ -n "${LEAK_CANARY:-}" ]]; then echo LEAKED; fi',
             )
+    monkeypatch.setenv("LEAK_CANARY", "ambient-value-that-must-not-be-visible")
     proc, _outputs, _log = _run_workflow_step(
         fork_bash,
         tmp_path,
         document,
         "pre_operation_shadow",
-        scenario={"LEAK_CANARY": "should-not-be-visible", "command.sha": _SHA},
+        command_outputs={"command.sha": _SHA},
     )
     assert "LEAKED" not in proc.stdout, proc.stdout
+    # The step still worked, so this is eviction rather than an aborted step.
+    assert "pre_operation_shadow=PROVEN" in proc.stdout
 
 
 def test_m1_rollback_accepts_an_optional_release_sha(activation: dict) -> None:
