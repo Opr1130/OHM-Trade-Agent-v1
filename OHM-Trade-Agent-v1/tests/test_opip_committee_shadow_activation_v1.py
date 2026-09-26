@@ -1099,7 +1099,12 @@ def test_shadow_proof_fails_when_unit_stays_off(tmp_path: pathlib.Path, fork_bas
     bash = fork_bash
     plane = _plane(tmp_path, mode="shadow")
     _egress(plane["dropin"])
-    proc = _run_script(bash, COMMITTEE_DEPLOY / "verify-committee-shadow.sh", [], plane)
+    proc = _run_script(
+        bash,
+        COMMITTEE_DEPLOY / "verify-committee-shadow.sh",
+        ["--expected-sha", _SHA],
+        plane,
+    )
     assert proc.returncode == 1
     assert "SHADOW_PROOF=FAIL" in proc.stdout
     assert _DISAGREEMENT in proc.stdout
@@ -1113,7 +1118,12 @@ def test_shadow_proof_passes_when_mode_dropin_overrides_base_off(
     plane = _plane(tmp_path, mode="shadow")
     _egress(plane["dropin"])
     _mode_dropin(plane["dropin"])
-    proc = _run_script(bash, COMMITTEE_DEPLOY / "verify-committee-shadow.sh", [], plane)
+    proc = _run_script(
+        bash,
+        COMMITTEE_DEPLOY / "verify-committee-shadow.sh",
+        ["--expected-sha", _SHA],
+        plane,
+    )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "SHADOW_PROOF=PASS" in proc.stdout
     assert "unit-level mode agrees with the environment file (shadow)" in proc.stdout
@@ -2306,7 +2316,7 @@ def test_case_b_the_installed_stable_helper_resolves_its_sibling_policy(
     )
     # systemd prints a bare host as /32 or /128; the canonicalizer must accept that.
     installed = _installed_bundle(tmp_path / "usr-local-sbin")
-    proc = _run_script(bash, installed, [], plane)
+    proc = _run_script(bash, installed, ["--expected-sha", _SHA], plane)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "SHADOW_PROOF=PASS" in proc.stdout
     assert "SHADOW_PROOF=FAIL" not in proc.stdout
@@ -2330,7 +2340,7 @@ def test_case_c_the_installed_helper_fails_closed_without_the_policy(
     )
     installed = _installed_bundle(tmp_path / "usr-local-sbin", with_policy=False)
     assert not (installed.parent / "ip_allow_policy.py").exists()
-    proc = _run_script(bash, installed, [], plane)
+    proc = _run_script(bash, installed, ["--expected-sha", _SHA], plane)
     assert proc.returncode != 0
     assert "SHADOW_PROOF=FAIL" in proc.stdout
     assert "FAIL  IP allowlist canonicalizer is absent" in proc.stdout
@@ -2904,7 +2914,7 @@ def test_l3_unverifiable_observed_release_fails_closed(
 
 @pytest.mark.parametrize(
     "expected",
-    ["", "not-a-sha", _SHA[:12], _SHA.upper(), "main", "refs/heads/main"],
+    ["not-a-sha", _SHA[:12], _SHA.upper(), "main", "refs/heads/main", " "],
 )
 def test_l4_unverifiable_expected_release_fails_closed(
     tmp_path: pathlib.Path, fork_bash: str, expected: str
@@ -2921,6 +2931,24 @@ def test_l4_unverifiable_expected_release_fails_closed(
     proc = _prove_shadow(bash, plane, expected_sha=expected)
     assert proc.returncode != 0
     assert _release_status(proc) == "UNVERIFIED"
+    assert "SHADOW_PROOF=PASS" not in proc.stdout
+
+
+def test_l4_an_empty_expected_value_is_refused_as_a_usage_error(
+    tmp_path: pathlib.Path, fork_bash: str
+) -> None:
+    """L4: an empty binding is a usage error, not a silent unbound proof."""
+    bash = fork_bash
+    plane = _plane(tmp_path, mode="shadow")
+    _pin_allow(
+        plane,
+        _STUB_PLANE_ADDRESSES,
+        resolv=_STUB_PLANE_RESOLV,
+        providers=_STUB_PLANE_PROVIDERS,
+    )
+    proc = _prove_shadow(bash, plane, expected_sha="")
+    assert proc.returncode == 64
+    assert "usage" in (proc.stdout + proc.stderr)
     assert "SHADOW_PROOF=PASS" not in proc.stdout
 
 
