@@ -3482,22 +3482,33 @@ def test_c11_the_pre_operation_step_is_provable_with_faithful_env(
     assert "pre_operation_shadow=PROVEN" in proc.stdout
 
 
-def test_c11_an_undeclared_target_blocks_the_pre_operation_proof(
+def test_c11_an_undeclared_target_would_corrupt_the_remote_command(
     tmp_path: pathlib.Path, fork_bash: str, activation: dict
 ) -> None:
-    """Contrapositive: the defect's mechanism is reproduced and is fail-closed.
+    """The defect's mechanism, pinned on the REMOTE COMMAND rather than a verdict.
 
-    With TARGET_SHA empty - what an undeclared variable would produce - the proof is
-    refused as a usage error, so the operation is blocked rather than permitted.
+    An undeclared `$TARGET_SHA` expands to empty, so the proof is invoked as
+    `--expected-sha ''`. That is the corruption the defect caused. The fake ssh
+    echoes its arguments into the log, so the command line itself is the evidence -
+    asserting on a verdict instead would only exercise the stub's canned reply.
     """
-    proc, outputs, _ = _run_workflow_step(
+    # Declared and resolved: the binding carries the requested SHA.
+    _proc, _outputs, good_log = _run_workflow_step(
         fork_bash,
-        tmp_path,
+        tmp_path / "bound",
+        activation,
+        "pre_operation_shadow",
+        command_outputs={"command.sha": _SHA},
+    )
+    assert f"--expected-sha '{_SHA}'" in good_log, good_log
+    assert "--expected-sha ''" not in good_log, good_log
+
+    # Undeclared/empty: the binding is empty, which the parser refuses with exit 64.
+    _proc2, _outputs2, bad_log = _run_workflow_step(
+        fork_bash,
+        tmp_path / "unbound",
         activation,
         "pre_operation_shadow",
         command_outputs={"command.sha": ""},
     )
-    assert outputs.get("result") == "FAILED", (outputs, proc.stdout)
-    assert "pre_operation_shadow=FAILED" in proc.stdout
-    # Fail-closed: nothing was started or enabled.
-    assert outputs.get("result") != "PROVEN"
+    assert "--expected-sha ''" in bad_log, bad_log
