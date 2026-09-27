@@ -203,6 +203,12 @@ def _has_fill_evidence(rows: Sequence[ReconciledPaperTrade]) -> bool:
     return False
 
 
+#: The canonical terminal reconciliation state meaning "economics unverifiable".
+#: Matches ``TerminalReconciliationState.UNRESOLVED_EVIDENCE`` and the published
+#: ``paper.unresolved_count`` definition exactly.
+_UNRESOLVED_EVIDENCE_STATE = "UNRESOLVED_EVIDENCE"
+
+
 def _component_availability(
     component: EconomicComponent,
     *,
@@ -212,15 +218,21 @@ def _component_availability(
 ) -> FactAvailability:
     """Availability for one component inside one population.
 
-    Cost components cannot exist without a fill. Realized values are ``KNOWN``
-    (the canonical writer verified them); the same value in the indicative
-    population is ``DERIVED`` because it is a deterministic function of
-    unverified evidence, not a settled fact.
+    Cost components cannot exist without a fill. Reservation evidence is
+    different: capital is reserved at admission, **before** any fill, and a
+    terminal zero-fill reconciliation still records it, so its availability
+    follows the population rather than fill evidence. Realized values are
+    ``KNOWN`` (the canonical writer verified them); the same value in the
+    indicative population is ``DERIVED`` because it is a deterministic function
+    of unverified evidence, not a settled fact.
     """
-    if component in SUPPORTED_COST_COMPONENTS or component in {
-        EconomicComponent.EXECUTION_COSTS,
-        EconomicComponent.RESERVED_CAPITAL,
-    }:
+    if component is EconomicComponent.RESERVED_CAPITAL:
+        if not has_rows:
+            return FactAvailability.NOT_APPLICABLE
+        return FactAvailability.KNOWN if realized else FactAvailability.DERIVED
+    if component in SUPPORTED_COST_COMPONENTS or component is (
+        EconomicComponent.EXECUTION_COSTS
+    ):
         if not has_fills:
             return FactAvailability.NOT_APPLICABLE
         return FactAvailability.KNOWN if realized else FactAvailability.DERIVED
@@ -325,11 +337,17 @@ def _residual(rows: Sequence[ReconciledPaperTrade]) -> float:
 
 
 def _count_unresolved(rows: Sequence[ReconciledPaperTrade]) -> int:
-    """Rows that are not verified but have reached a terminal reconciliation."""
+    """Rows whose terminal reconciliation is ``UNRESOLVED_EVIDENCE``.
+
+    Deliberately narrow so the count means exactly what the published
+    ``paper.unresolved_count`` means. Counting any non-final row with any
+    reconciliation state would overstate unresolved lifecycles by including
+    valid intermediate states.
+    """
     return sum(
         1
         for row in rows
-        if not row.net_pnl_definitive and row.terminal_reconciliation_state
+        if row.terminal_reconciliation_state == _UNRESOLVED_EVIDENCE_STATE
     )
 
 

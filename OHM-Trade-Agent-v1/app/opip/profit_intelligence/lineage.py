@@ -28,7 +28,6 @@ from datetime import datetime
 from typing import Any, Callable, Mapping
 
 from app.opip.cockpit.ledger import (
-    ExecutionResult,
     LifecycleStatus,
     ReconciledPaperTrade,
 )
@@ -120,8 +119,39 @@ class TradeLineage:
         raise KeyError(f"unknown lineage stage: {stage}")
 
 
-def _not_applicable_reason(row: ReconciledPaperTrade) -> bool:
-    return row.execution_result is ExecutionResult.NO_FILL
+def _is_terminal(row: ReconciledPaperTrade) -> bool:
+    """Whether the trade's lifecycle can no longer change.
+
+    A non-terminal trade (pending or open) may still acquire evidence, so a fact
+    that is merely absent for it is ``UNAVAILABLE``, never ``NOT_APPLICABLE``:
+    asserting impossibility would be wrong while the entry can still complete.
+    """
+    return row.lifecycle_status in {
+        LifecycleStatus.CLOSED,
+        LifecycleStatus.UNRESOLVED,
+    }
+
+
+def _has_fill_evidence(row: ReconciledPaperTrade) -> bool:
+    """A committed entry fill, evidenced by its instant OR its quantity.
+
+    Temporal evidence can legitimately be BOUNDED or UNKNOWN precision, in which
+    case ``temporal_point`` yields no instant even though the fill is readable.
+    """
+    return (
+        row.first_entry_fill_at is not None
+        or row.entry_quantity > _QUANTITY_TOLERANCE
+    )
+
+
+def _intent_evidence_present(row: ReconciledPaperTrade) -> bool:
+    """Whether a committed entry intent exists.
+
+    Mirrors the fill rule: the intent is evidenced by its instant OR by the
+    requested quantity retained from the committed order intent, so bounded
+    temporal evidence does not erase a real intent.
+    """
+    return row.entry_intent_at is not None or row.requested_entry_quantity is not None
 
 
 def _presence(
@@ -184,13 +214,13 @@ def _stage_policy_provenance(row: ReconciledPaperTrade) -> StageEvidence:
 
 
 def _stage_intent(row: ReconciledPaperTrade) -> StageEvidence:
-    known = row.entry_intent_at is not None
+    known = _intent_evidence_present(row)
     return StageEvidence(
         stage=LineageStage.INTENT,
         availability=FactAvailability.KNOWN if known else FactAvailability.UNAVAILABLE,
         occurred_at=row.entry_intent_at,
         facts={"requested_entry_quantity": row.requested_entry_quantity},
-        note=None if known else "no canonical entry order intent instant",
+        note=None if known else "no canonical entry order intent evidence is retained",
     )
 
 
@@ -198,8 +228,8 @@ def _stage_attempt(row: ReconciledPaperTrade) -> StageEvidence:
     availability, note = _presence(
         row.entry_attempt_at is not None,
         absent_note="entry intent exists but no attempt instant is recorded",
-        impossible=row.entry_intent_at is None,
-        impossible_note="no entry intent was recorded, so no attempt can exist",
+        impossible=not _intent_evidence_present(row),
+        impossible_note="no entry intent evidence was recorded, so no attempt can exist",
     )
     return StageEvidence(
         stage=LineageStage.ATTEMPT,
@@ -211,17 +241,18 @@ def _stage_attempt(row: ReconciledPaperTrade) -> StageEvidence:
 
 
 def _stage_fill(row: ReconciledPaperTrade) -> StageEvidence:
-    # Mirrors the EXIT stage: a committed fill is evidenced by its timestamp OR by
-    # the recorded quantity. Temporal evidence can legitimately be BOUNDED or
-    # UNKNOWN precision, in which case `temporal_point` yields no instant even
-    # though the fill itself is readable evidence - reporting that as UNAVAILABLE
-    # would deny evidence the store actually holds.
+    has_fill = _has_fill_evidence(row)
+    terminal = _is_terminal(row)
     availability, note = _presence(
-        row.first_entry_fill_at is not None
-        or row.entry_quantity > _QUANTITY_TOLERANCE,
-        absent_note="no entry fill quantity or instant is readable",
-        impossible=_not_applicable_reason(row),
-        impossible_note="execution returned NO_FILL, so no entry fill can exist",
+        has_fill,
+        absent_note=(
+            "no entry fill is readable"
+            if terminal
+            else "entry has not filled yet and the trade is not terminal, so a fill "
+            "may still occur"
+        ),
+        impossible=terminal and not has_fill,
+        impossible_note="trade is terminal with no entry fill, so no fill can exist",
     )
     return StageEvidence(
         stage=LineageStage.FILL,
@@ -243,10 +274,13 @@ def _stage_protection(row: ReconciledPaperTrade) -> StageEvidence:
         or row.planned_stop_price is not None
         or bool(row.planned_targets)
     )
+    terminal = _is_terminal(row)
     availability, note = _presence(
         has_plan,
-        absent_note="position evidence exists but no protection plan is recorded",
-        impossible=_not_applicable_reason(row),
+        absent_note="no protection plan is recorded",
+        # Only a terminal trade with no entry fill proves no position existed and
+        # therefore that no protection plan can exist.
+        impossible=terminal and not _has_fill_evidence(row),
         impossible_note="no position was opened, so no protection plan can exist",
     )
     return StageEvidence(
@@ -266,12 +300,17 @@ def _stage_protection(row: ReconciledPaperTrade) -> StageEvidence:
 
 
 def _stage_exit(row: ReconciledPaperTrade) -> StageEvidence:
+    has_exit = row.last_exit_fill_at is not None or (
+        row.exited_quantity > _QUANTITY_TOLERANCE
+    )
+    terminal = _is_terminal(row)
     availability, note = _presence(
-        row.last_exit_fill_at is not None
-        or row.exited_quantity > _QUANTITY_TOLERANCE,
-        absent_note="trade is flat but no exit fill evidence is readable",
-        impossible=row.lifecycle_status in {LifecycleStatus.PENDING, LifecycleStatus.OPEN},
-        impossible_note="the position has not been exited yet",
+        has_exit,
+        absent_note="no exit fill evidence is readable",
+        # Only a terminal trade that never filled proves no position existed and
+        # therefore that no exit can exist. A non-terminal trade may still exit.
+        impossible=terminal and not _has_fill_evidence(row),
+        impossible_note="no position was ever opened, so no exit can exist",
     )
     return StageEvidence(
         stage=LineageStage.EXIT,
@@ -329,8 +368,8 @@ def _stage_reconciliation(row: ReconciledPaperTrade) -> StageEvidence:
     availability, note = _presence(
         row.terminal_reconciliation_state is not None,
         absent_note="no terminal reconciliation state is recorded",
-        impossible=row.lifecycle_status is LifecycleStatus.PENDING,
-        impossible_note="the trade has not reached a reconciliation point",
+        impossible=not _is_terminal(row),
+        impossible_note="the trade is not terminal, so no terminal reconciliation exists",
     )
     return StageEvidence(
         stage=LineageStage.RECONCILIATION,

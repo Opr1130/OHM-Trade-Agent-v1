@@ -29,6 +29,7 @@ import pytest
 from app.api import cockpit
 from app.opip.canonical.models import PaperV2Ledger, PaperV2LedgerEntry
 from app.opip.cockpit.ledger import (
+    LifecycleStatus,
     PaperLedger,
     ReconciledPaperTrade,
     build_ledger,
@@ -98,6 +99,7 @@ def _entry(
     with_decision_context: bool = True,
     with_policy: bool = True,
     with_intent_time: bool = True,
+    with_intent_evidence: bool = True,
     with_attempt_time: bool = True,
     with_protection: bool = True,
     with_exit: bool = True,
@@ -149,9 +151,15 @@ def _entry(
         ),
         first_entry_fill_time=_exact(0),
         last_exit_fill_time=_exact(600) if with_exit else None,
-        entry_intent_time=_exact(-5) if with_intent_time else None,
+        entry_intent_time=(
+            _exact(-5) if (with_intent_evidence and with_intent_time) else None
+        ),
         entry_attempt_time=_exact(-3) if with_attempt_time else None,
-        entry_order_intent={"requested_quantity": 5.0},
+        # The committed order intent is independent evidence: the requested
+        # quantity survives even when no exact intent instant exists.
+        entry_order_intent=(
+            {"requested_quantity": 5.0} if with_intent_evidence else None
+        ),
         protection_plan=(
             {
                 "protection_plan_id": "PPLAN:1",
@@ -186,8 +194,10 @@ def _no_fill_row(
     quote_currency: str = "USD",
     execution_costs: float = 0.0,
     net_pnl: float = 0.0,
+    reserved_capital: float = 0.0,
+    lifecycle_status: LifecycleStatus = LifecycleStatus.CLOSED,
 ) -> ReconciledPaperTrade:
-    """A genuine no-fill trade: no fills, no entry quantity, no exit.
+    """A genuine no-fill trade: no fills, no entry quantity, terminal by default.
 
     Built directly (rather than through a fixture that still records a fill) so a
     no-fill assertion actually exercises the no-fill population.
@@ -199,9 +209,11 @@ def _no_fill_row(
         exited_quantity=0.0,
         remaining_quantity=0.0,
         first_entry_fill_at=None,
+        lifecycle_status=lifecycle_status,
         gross_pnl=0.0,
         execution_costs=execution_costs,
         net_pnl=net_pnl,
+        reserved_capital=reserved_capital,
     )
 
 
@@ -452,7 +464,7 @@ def test_lineage_fully_evidenced_trade_is_known_at_every_applicable_stage():
 
 
 def test_lineage_no_fill_is_not_applicable_and_not_a_zero():
-    """A trade that never filled cannot have fill/protection/exit evidence."""
+    """A terminal trade that never filled cannot have fill/protection/exit evidence."""
     lineage = build_trade_lineage(_no_fill_row())
     for stage in (
         LineageStage.FILL,
@@ -463,6 +475,44 @@ def test_lineage_no_fill_is_not_applicable_and_not_a_zero():
             stage
         )
         assert lineage.stage(stage).note
+
+
+def test_lineage_non_terminal_zero_fill_is_unavailable_not_impossible():
+    """A pending entry may still fill, so absence is UNAVAILABLE, not NOT_APPLICABLE.
+
+    Review finding (chatgpt-codex-connector): `build_trade_row` sets
+    `ExecutionResult.NO_FILL` purely from a zero entry quantity, including for
+    admitted PENDING trades whose attempt may still complete. Treating that enum
+    as proof of impossibility marked FILL and PROTECTION NOT_APPLICABLE too early.
+    """
+    pending = _no_fill_row(lifecycle_status=LifecycleStatus.PENDING)
+    lineage = build_trade_lineage(pending)
+    for stage in (LineageStage.FILL, LineageStage.PROTECTION):
+        assert lineage.stage(stage).availability is FactAvailability.UNAVAILABLE, stage
+        assert lineage.stage(stage).note
+
+
+def test_lineage_intent_evidenced_only_by_retained_quantity_is_known():
+    """A committed intent with bounded temporal evidence is still a real intent.
+
+    Review finding (chatgpt-codex-connector): the requested quantity is retained
+    from the committed intent even when no exact instant exists, so testing the
+    point timestamp alone denied a real intent and could wrongly make its attempt
+    NOT_APPLICABLE.
+    """
+    intent_row = ReconciledPaperTrade(
+        paper_trade_id="PTV2:" + "7" * 64,
+        quote_currency="USD",
+        entry_intent_at=None,
+        requested_entry_quantity=5.0,
+        lifecycle_status=LifecycleStatus.PENDING,
+    )
+    lineage = build_trade_lineage(intent_row)
+    assert lineage.stage(LineageStage.INTENT).availability is FactAvailability.KNOWN
+    # Its attempt is a genuine gap, not an impossibility.
+    assert lineage.stage(LineageStage.ATTEMPT).availability is (
+        FactAvailability.UNAVAILABLE
+    )
 
 
 def test_lineage_fill_without_a_point_instant_is_still_known():
@@ -485,7 +535,13 @@ def test_lineage_fill_without_a_point_instant_is_still_known():
 
 
 def test_lineage_missing_entry_intent_is_unavailable_not_zero():
-    lineage = build_trade_lineage(_row(with_intent_time=False))
+    """No retained intent evidence at all is a gap, not an impossibility.
+
+    Note the fixture distinction: `with_intent_time=False` alone is NOT an absent
+    intent, because the committed order intent still retains its requested
+    quantity. Removing intent evidence requires `with_intent_evidence=False`.
+    """
+    lineage = build_trade_lineage(_row(with_intent_evidence=False))
     stage = lineage.stage(LineageStage.INTENT)
     assert stage.availability is FactAvailability.UNAVAILABLE
     assert stage.note
@@ -493,10 +549,23 @@ def test_lineage_missing_entry_intent_is_unavailable_not_zero():
 
 
 def test_lineage_attempt_is_not_applicable_when_no_intent_exists():
-    """An attempt cannot exist without an intent - an impossibility, not a gap."""
-    lineage = build_trade_lineage(_row(with_intent_time=False, with_attempt_time=False))
+    """An attempt cannot exist without any intent evidence - an impossibility."""
+    lineage = build_trade_lineage(
+        _row(with_intent_evidence=False, with_attempt_time=False)
+    )
     assert lineage.stage(LineageStage.ATTEMPT).availability is (
         FactAvailability.NOT_APPLICABLE
+    )
+
+
+def test_lineage_intent_survives_a_missing_exact_instant():
+    """Bounded/unknown temporal evidence must not erase a committed intent."""
+    lineage = build_trade_lineage(_row(with_intent_time=False, with_attempt_time=False))
+    assert lineage.stage(LineageStage.INTENT).availability is FactAvailability.KNOWN
+    # The attempt is a genuine gap, NOT an impossibility - before the fix the
+    # missing instant made the intent look absent and the attempt NOT_APPLICABLE.
+    assert lineage.stage(LineageStage.ATTEMPT).availability is (
+        FactAvailability.UNAVAILABLE
     )
 
 
@@ -507,13 +576,16 @@ def test_lineage_attempt_is_unavailable_when_intent_exists_but_attempt_does_not(
     )
 
 
-def test_lineage_open_position_exit_is_not_applicable():
+def test_lineage_open_position_exit_is_unavailable_not_impossible():
+    """An open (non-terminal) position may still exit, so it is not impossible."""
     row = build_trade_row(_entry(with_exit=False))
+    assert row.lifecycle_status is LifecycleStatus.OPEN
     lineage = build_trade_lineage(row)
-    assert lineage.stage(LineageStage.EXIT).availability is (
-        FactAvailability.NOT_APPLICABLE
-    )
-    assert lineage.stage(LineageStage.EXIT).note
+    stage = lineage.stage(LineageStage.EXIT)
+    assert stage.availability is FactAvailability.UNAVAILABLE
+    assert stage.note
+    # ...and it must not be reported as a gap-free impossibility either.
+    assert stage.availability is not FactAvailability.NOT_APPLICABLE
 
 
 def test_lineage_indicative_economics_are_derived_never_known():
@@ -904,6 +976,75 @@ def test_nested_integrity_trust_is_the_authority_for_economic_health():
 def test_overview_rejects_a_non_ledger_input():
     with pytest.raises(TypeError):
         build_profit_intelligence_overview("nope")  # type: ignore[arg-type]
+
+
+def test_reserved_capital_is_available_without_any_fill():
+    """Reservation is pre-fill admission evidence, not a fill-derived cost.
+
+    Review finding (sourcery-ai / chatgpt-codex-connector): reserved capital was
+    grouped with fill-dependent cost components, so a zero-fill population with a
+    real nonzero reservation reported a nonzero total while declaring that value
+    NOT_APPLICABLE - an impossible availability state.
+    """
+    reserved = _no_fill_row(
+        suffix="8" * 64, reserved_capital=250.0, lifecycle_status=LifecycleStatus.PENDING
+    )
+    summary = build_economic_integrity([reserved])[0]
+    evidence = summary.component(EconomicComponent.RESERVED_CAPITAL, realized=False)
+    assert evidence.total == pytest.approx(250.0)
+    assert evidence.availability is FactAvailability.DERIVED
+    # Cost components remain genuinely inapplicable here.
+    assert summary.component(
+        EconomicComponent.FEE_COST, realized=False
+    ).availability is FactAvailability.NOT_APPLICABLE
+
+
+def test_reserved_capital_is_not_applicable_only_for_an_empty_population():
+    summary = build_economic_integrity([_row()])[0]
+    assert summary.component(
+        EconomicComponent.RESERVED_CAPITAL, realized=True
+    ).availability is FactAvailability.KNOWN
+
+
+def test_unresolved_counts_only_the_published_unresolved_evidence_state():
+    """Must match `paper.unresolved_count` exactly.
+
+    Review finding (chatgpt-codex-connector): counting every non-final row with
+    any reconciliation state included valid intermediate states and overstated
+    unresolved lifecycles.
+    """
+    open_row = ReconciledPaperTrade(
+        paper_trade_id="PTV2:" + "9" * 64,
+        quote_currency="USD",
+        entry_quantity=1.0,
+        first_entry_fill_at=None,
+        lifecycle_status=LifecycleStatus.OPEN,
+        terminal_reconciliation_state="FLAT_AWAITING_RECONCILIATION",
+    )
+    unresolved_row = ReconciledPaperTrade(
+        paper_trade_id="PTV2:" + "a" * 63 + "b",
+        quote_currency="USD",
+        lifecycle_status=LifecycleStatus.UNRESOLVED,
+        terminal_reconciliation_state="UNRESOLVED_EVIDENCE",
+    )
+    summary = build_economic_integrity([open_row, unresolved_row])[0]
+    assert summary.unresolved == 1
+
+
+def test_lineage_refuses_to_project_from_an_unhealthy_ledger():
+    """An unreadable ledger cannot prove a trade exists or is absent.
+
+    Review finding (sourcery-ai): the lineage lookup searched entries without
+    checking trust, so a non-authoritative ledger could yield a lineage for an
+    embedded row, and `None` was indistinguishable from a verified absence.
+    """
+    unreadable = PaperLedger(
+        entries=(),
+        trust=unavailable("CANONICAL_REPLICA_UNAVAILABLE"),
+        details=("CANONICAL_REPLICA_UNAVAILABLE",),
+    )
+    with pytest.raises(ValueError):
+        build_lineage_for_trade(unreadable, "PTV2:any")
 
 
 def test_build_lineage_for_trade_returns_none_when_the_trade_is_absent():

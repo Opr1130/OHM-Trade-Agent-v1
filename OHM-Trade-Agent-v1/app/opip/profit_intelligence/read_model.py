@@ -175,13 +175,25 @@ def build_lineage_for_trade(
 ) -> TradeLineage | None:
     """Build the lineage for one trade, or ``None`` when it is not present.
 
-    ``None`` means "not found in this ledger". A caller must not read ``None`` as
-    proof of absence unless the ledger's own trust envelope is healthy - an
-    unreadable ledger cannot prove a trade does not exist.
+    ``None`` means "not found in this ledger", and it is only ever returned for a
+    **trusted** read. A ledger whose own trust envelope is not healthy cannot
+    prove either the contents or the absence of a trade, so projecting from it
+    would present non-authoritative evidence as authoritative and a missing row as
+    a verified absence. That case fails closed with ``ValueError`` instead.
     """
     wanted = str(paper_trade_id or "").strip()
     if not wanted:
         raise ValueError("paper_trade_id is required")
+    if not ledger.trust.is_healthy:
+        reason = (
+            (ledger.details[0] if ledger.details else None)
+            or ",".join(ledger.trust.reasons)
+            or "LEDGER_NOT_HEALTHY"
+        )
+        raise ValueError(
+            "ledger is not healthy, so a trade lineage cannot be proven: "
+            f"{reason}"
+        )
     match = next(
         (row for row in ledger.entries if row.paper_trade_id == wanted), None
     )
