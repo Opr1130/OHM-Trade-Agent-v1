@@ -203,8 +203,16 @@ def _build_stage(
         )
 
     if stage is LineageStage.FILL:
-        known = row.first_entry_fill_at is not None
-        if known:
+        # Mirrors the EXIT stage: a committed fill is evidenced by its timestamp
+        # OR by the recorded quantity. Temporal evidence can legitimately be
+        # BOUNDED or UNKNOWN precision, in which case `temporal_point` yields no
+        # instant even though the fill itself is readable evidence - reporting
+        # that as UNAVAILABLE would deny evidence the store actually holds.
+        has_fill = (
+            row.first_entry_fill_at is not None
+            or row.entry_quantity > _QUANTITY_TOLERANCE
+        )
+        if has_fill:
             availability = FactAvailability.KNOWN
             note = None
         elif _not_applicable_reason(row):
@@ -212,7 +220,7 @@ def _build_stage(
             note = "execution returned NO_FILL, so no entry fill can exist"
         else:
             availability = FactAvailability.UNAVAILABLE
-            note = "entry quantity is recorded but no entry fill instant is"
+            note = "no entry fill quantity or instant is readable"
         return StageEvidence(
             stage=stage,
             availability=availability,

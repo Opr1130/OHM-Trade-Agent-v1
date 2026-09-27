@@ -179,6 +179,31 @@ def _row(**kwargs) -> ReconciledPaperTrade:
     return build_trade_row(_entry(**kwargs))
 
 
+def _no_fill_row(
+    *,
+    suffix: str = "0" * 64,
+    quote_currency: str = "USD",
+    execution_costs: float = 0.0,
+    net_pnl: float = 0.0,
+) -> ReconciledPaperTrade:
+    """A genuine no-fill trade: no fills, no entry quantity, no exit.
+
+    Built directly (rather than through a fixture that still records a fill) so a
+    no-fill assertion actually exercises the no-fill population.
+    """
+    return ReconciledPaperTrade(
+        paper_trade_id="PTV2:" + suffix,
+        quote_currency=quote_currency,
+        entry_quantity=0.0,
+        exited_quantity=0.0,
+        remaining_quantity=0.0,
+        first_entry_fill_at=None,
+        gross_pnl=0.0,
+        execution_costs=execution_costs,
+        net_pnl=net_pnl,
+    )
+
+
 def _canonical(*entries: PaperV2LedgerEntry) -> PaperV2Ledger:
     """A healthy canonical ledger over ``PaperV2LedgerEntry`` facts.
 
@@ -355,14 +380,37 @@ def test_supported_costs_sum_is_order_independent():
     high_low = {
         EconomicComponent.FEE_COST: 0.1,
         EconomicComponent.SPREAD_COST: 0.2,
+        EconomicComponent.SLIPPAGE_COST: 0.0,
+        EconomicComponent.OTHER_SUPPORTED_COST: 0.0,
     }
     low_high = {
+        EconomicComponent.OTHER_SUPPORTED_COST: 0.0,
+        EconomicComponent.SLIPPAGE_COST: 0.0,
         EconomicComponent.SPREAD_COST: 0.2,
         EconomicComponent.FEE_COST: 0.1,
     }
     assert pi_semantics.supported_costs_sum(
         high_low
     ) == pi_semantics.supported_costs_sum(low_high)
+
+
+def test_supported_costs_sum_refuses_to_treat_a_missing_cost_as_zero():
+    """The canonical fill contract carries all four; a missing one is not a zero."""
+    with pytest.raises(ValueError):
+        pi_semantics.supported_costs_sum({EconomicComponent.FEE_COST: 0.1})
+
+
+def test_net_pnl_tolerance_matches_the_canonical_writer():
+    """A stricter tolerance would report a conserving row as a violation."""
+    assert pi_semantics.PNL_TOLERANCE == 1e-6
+    # A row the canonical writer accepts must be accepted here too.
+    assert net_pnl_reconciles(gross_pnl=50.0, execution_costs=0.2, net_pnl=49.8 + 1e-7)
+    assert not net_pnl_reconciles(gross_pnl=50.0, execution_costs=0.2, net_pnl=49.9)
+
+
+def test_gross_profit_borrows_no_registered_metric_id():
+    """`paper.realized_net_pnl` is gross - costs; gross is not that metric."""
+    assert "gross_pnl" not in pi_semantics.METRIC_AUTHORITY
 
 
 # ---------------------------------------------------------------------------
@@ -404,13 +452,35 @@ def test_lineage_fully_evidenced_trade_is_known_at_every_applicable_stage():
 
 def test_lineage_no_fill_is_not_applicable_and_not_a_zero():
     """A trade that never filled cannot have fill/protection/exit evidence."""
+    lineage = build_trade_lineage(_no_fill_row())
+    for stage in (
+        LineageStage.FILL,
+        LineageStage.PROTECTION,
+        LineageStage.EXIT,
+    ):
+        assert lineage.stage(stage).availability is FactAvailability.NOT_APPLICABLE, (
+            stage
+        )
+        assert lineage.stage(stage).note
+
+
+def test_lineage_fill_without_a_point_instant_is_still_known():
+    """A committed fill evidenced by quantity must not be denied as UNAVAILABLE.
+
+    Canonical temporal evidence can legitimately be BOUNDED or UNKNOWN precision,
+    in which case no single instant exists even though the fill is readable.
+    """
     row = build_trade_row(_entry(fully_filled=False, with_exit=False))
-    lineage = build_trade_lineage(row)
-    # (the entry still records a fill in this fixture; use an explicit no-fill row)
-    assert lineage.stage(LineageStage.EXIT).availability in {
-        FactAvailability.KNOWN,
-        FactAvailability.NOT_APPLICABLE,
-    }
+    row_no_instant = ReconciledPaperTrade(
+        paper_trade_id=row.paper_trade_id,
+        quote_currency=row.quote_currency,
+        entry_quantity=row.entry_quantity,
+        first_entry_fill_at=None,
+        execution_result=row.execution_result,
+    )
+    stage = build_trade_lineage(row_no_instant).stage(LineageStage.FILL)
+    assert stage.availability is FactAvailability.KNOWN
+    assert stage.occurred_at is None
 
 
 def test_lineage_missing_entry_intent_is_unavailable_not_zero():
@@ -540,24 +610,10 @@ def test_economic_integrity_groups_by_currency_and_never_sums_them():
 
 def test_costs_without_any_fill_are_not_applicable_not_a_measured_zero():
     """A zero with no fill is an impossibility, not a measured cost of zero."""
-    row = build_trade_row(
-        _entry(fully_filled=False, with_exit=False, gross=0.0, costs=0.0, net=0.0)
-    )
-    # Force the no-fill population: strip fill evidence entirely.
-    stripped = ReconciledPaperTrade(
-        paper_trade_id=row.paper_trade_id,
-        quote_currency=row.quote_currency,
-        entry_quantity=0.0,
-        first_entry_fill_at=None,
-        gross_pnl=0.0,
-        execution_costs=0.0,
-        net_pnl=0.0,
-    )
-    summary = build_economic_integrity([stripped])[0]
-    assert summary.component(EconomicComponent.FEE_COST).availability is (
-        FactAvailability.NOT_APPLICABLE
-    )
-    assert summary.component(EconomicComponent.FEE_COST).total == 0.0
+    summary = build_economic_integrity([_no_fill_row()])[0]
+    evidence = summary.component(EconomicComponent.FEE_COST, realized=False)
+    assert evidence.availability is FactAvailability.NOT_APPLICABLE
+    assert evidence.total == 0.0
     assert any("NOT_APPLICABLE" in detail for detail in summary.details)
 
 
@@ -570,9 +626,74 @@ def test_costs_with_fills_are_known_even_when_the_total_is_zero():
         EconomicComponent.SLIPPAGE_COST,
         EconomicComponent.OTHER_SUPPORTED_COST,
     ):
-        evidence = summary.component(component)
+        evidence = summary.component(component, realized=True)
         assert evidence.availability is FactAvailability.KNOWN
         assert evidence.total == 0.0
+
+
+def test_indicative_population_costs_are_derived_never_known():
+    """The same value in the unverified population is not a settled fact."""
+    unverified = _row(final_verified=False, fee_cost=0.25)
+    summary = build_economic_integrity([unverified])[0]
+    evidence = summary.component(EconomicComponent.FEE_COST, realized=False)
+    assert evidence.availability is FactAvailability.DERIVED
+    assert evidence.total == pytest.approx(2 * 0.25)
+    # Nothing verified exists, so the realized list carries no evidence.
+    assert summary.component(
+        EconomicComponent.FEE_COST, realized=True
+    ).availability is FactAvailability.NOT_APPLICABLE
+
+
+def test_realized_net_pnl_metric_id_is_never_attached_to_a_mixed_total():
+    """A total containing unverified rows must not claim the realized metric.
+
+    `paper.realized_net_pnl` declares its eligible population as
+    ACTUAL_REALIZED and FINAL_VERIFIED and excludes UNRESOLVED_EVIDENCE, so a
+    mixed total carrying that metric id would be a competing definition.
+    """
+    verified = _row(trade_suffix="a" * 64, final_verified=True, gross=50.0, costs=0.2)
+    unverified = _row(
+        trade_suffix="b" * 64, final_verified=False, gross=10.0, costs=0.1
+    )
+    summary = build_economic_integrity([verified, unverified])[0]
+
+    realized = summary.component(EconomicComponent.NET_PNL, realized=True)
+    assert realized.metric_id == "paper.realized_net_pnl"
+    assert realized.total == pytest.approx(verified.net_pnl)
+
+    indicative = summary.component(EconomicComponent.NET_PNL, realized=False)
+    assert indicative.metric_id is None
+    assert indicative.availability is FactAvailability.DERIVED
+    assert indicative.total == pytest.approx(unverified.net_pnl)
+
+    # The realized subtotal must not silently contain the unverified row, and the
+    # two subtotals must never be presented as one blended number.
+    assert realized.total != pytest.approx(verified.net_pnl + unverified.net_pnl)
+
+
+def test_gross_profit_carries_no_registered_metric_id():
+    summary = build_economic_integrity([_row()])[0]
+    assert summary.component(EconomicComponent.GROSS_PNL, realized=True).metric_id is None
+
+
+def test_an_entirely_unverified_population_is_not_complete_or_healthy():
+    """Indicative economics must never read as settled, complete or healthy."""
+    summary = build_economic_integrity(
+        [_row(final_verified=False), _row(trade_suffix="c" * 64, final_verified=False)]
+    )[0]
+    assert summary.definitive == 0
+    assert summary.indicative == 2
+    assert summary.trust.completeness is Completeness.INCOMPLETE
+    assert summary.trust.is_healthy is False
+    assert "ECONOMICS_NOT_FINAL_VERIFIED" in summary.trust.reasons
+
+
+def test_a_fully_verified_population_is_complete_and_healthy():
+    summary = build_economic_integrity([_row()])[0]
+    assert summary.indicative == 0
+    assert summary.trust.completeness is Completeness.COMPLETE
+    assert summary.trust.is_healthy is True
+    assert summary.trust.reasons == ()
 
 
 def test_definitive_and_indicative_population_stay_separate():
@@ -653,11 +774,18 @@ def test_economic_integrity_is_json_safe():
 
 def test_economic_components_never_use_a_float_nan_placeholder():
     """Missing evidence must be availability, never NaN silently serialised."""
-    summary = build_economic_integrity(
-        [ReconciledPaperTrade(paper_trade_id="PTV2:" + "d" * 64, quote_currency="USD")]
-    )[0]
-    for component in summary.components:
+    summary = build_economic_integrity([_no_fill_row()])[0]
+    for component in (*summary.realized_components, *summary.indicative_components):
         assert not (component.total != component.total), "NaN leaked into a total"
+
+
+def test_costs_recorded_without_fill_evidence_are_reported_not_zeroed():
+    """A cost with no fill is a contradiction, not a residual of zero."""
+    contradictory = _no_fill_row(suffix="e" * 64, execution_costs=1.5, net_pnl=-1.5)
+    summary = build_economic_integrity([contradictory])[0]
+    assert any("no fill" in detail for detail in summary.details)
+    # The recorded cost is still surfaced rather than disappearing.
+    assert summary.indicative_cost_residual == pytest.approx(1.5)
 
 
 # ---------------------------------------------------------------------------
@@ -715,6 +843,13 @@ def test_unavailable_overview_is_never_healthy_or_complete():
     assert payload["trust"]["is_healthy"] is False
     assert payload["trust"]["completeness"] == Completeness.UNKNOWN.value
     assert payload["details"]
+
+
+def test_unavailable_overview_fabricates_no_numeric_zero():
+    """'Could not read' must never be presented as a measured count of zero."""
+    payload = unavailable_profit_intelligence("CANONICAL_REPLICA_UNAVAILABLE").to_dict()
+    assert payload["populations"] == {}
+    assert payload["economic_integrity"] == []
 
 
 def test_overview_rejects_a_non_ledger_input():

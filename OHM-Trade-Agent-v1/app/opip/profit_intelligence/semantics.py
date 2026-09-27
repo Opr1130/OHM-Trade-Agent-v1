@@ -61,9 +61,12 @@ from typing import Any, Mapping
 #: response can be recognised as predating the change.
 PROFIT_INTELLIGENCE_CONTRACT_VERSION = "profit-intelligence-contract-v1"
 
-#: Comparison tolerance for money equality. Deliberately the same value the
-#: cockpit ledger uses, so "conserves" means the same thing on both surfaces.
-PNL_TOLERANCE = 1e-9
+#: Comparison tolerance for money equality. Deliberately the same tolerance the
+#: canonical writer's own reconciliation validator uses
+#: (``paper_execution_events``: ``abs(net - (gross - costs)) <= 1e-6``), so
+#: "conserves" means exactly what the writer means by it. A stricter tolerance
+#: would report a canonically-conserving row as a violation.
+PNL_TOLERANCE = 1e-6
 
 
 class FactAvailability(str, Enum):
@@ -265,7 +268,10 @@ EVIDENCE_GAPS: tuple[EvidenceGap, ...] = (
     EvidenceGap(
         fact="QUALIFICATION_FUNNEL_PROGRESSION",
         availability=FactAvailability.UNAVAILABLE,
-        producer="app.opip.decision.store (scan_opportunities / scan_movers)",
+        producer=(
+            "app.jobs.scan_opportunities / app.jobs.scan_movers, persisted "
+            "through app.opip.decision.store"
+        ),
         plane=EvidencePlane.TRADING_HOST_FILE_WAL,
         reason=(
             "Stage-0 screening evaluations and funnel gate history are appended to "
@@ -371,9 +377,13 @@ EVIDENCE_GAPS: tuple[EvidenceGap, ...] = (
 #: Which registered metric owns each quantity Profit Intelligence reports.
 #: The registry (``app.opip.contracts.paper_metrics``) stays the single
 #: definition of the formula; this plane only names it.
+#:
+#: ``gross_pnl`` is deliberately absent: the registry defines
+#: ``paper.realized_net_pnl`` as ``gross - costs``, so gross is an *input* to
+#: that metric and has no registered metric of its own. Borrowing the net
+#: metric's id for a gross total would mislabel it.
 METRIC_AUTHORITY: Mapping[str, str] = MappingProxyType(
     {
-        "gross_pnl": "paper.realized_net_pnl",
         "net_pnl": "paper.realized_net_pnl",
         "execution_costs": "paper.execution_cost",
         "net_expectancy": "paper.net_expectancy",
@@ -411,12 +421,23 @@ def supported_costs_sum(
     """Sum the four supported cost components in canonical contract order.
 
     Order is fixed by :data:`SUPPORTED_COST_COMPONENTS` so the total is
-    reproducible rather than dependent on mapping iteration order.
+    reproducible rather than dependent on mapping iteration order. All four
+    components are **required**: the canonical fill contract requires every one
+    of them on every fill, so a missing component means the caller's evidence is
+    incomplete, and defaulting it to ``0.0`` would silently assert a measured
+    zero for a cost that was never recorded.
     """
-    return sum(
-        float(components.get(component, 0.0))
+    missing = [
+        component.value
         for component in SUPPORTED_COST_COMPONENTS
-    )
+        if component not in components
+    ]
+    if missing:
+        raise ValueError(
+            "supported cost components are incomplete; refusing to treat a "
+            f"missing cost as zero: {sorted(missing)}"
+        )
+    return sum(float(components[component]) for component in SUPPORTED_COST_COMPONENTS)
 
 
 __all__ = [

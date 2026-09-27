@@ -25,7 +25,6 @@ apparently healthy empty result, and it never raises into the caller.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import Any, Mapping
 
 from app.opip.cockpit.ledger import PaperLedger, ReconciledPaperTrade
@@ -55,15 +54,7 @@ from app.opip.profit_intelligence.semantics import (
 )
 
 #: Bumped whenever the composition of this envelope changes.
-PROFIT_INTELLIGENCE_READ_MODEL_VERSION = "profit-intelligence-read-model-v1"
-
-#: Upper bound on lineage stages returned, so the response cannot grow without
-#: bound even if the stage vocabulary is extended later.
-MAX_LINEAGE_STAGES = 64
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+PROFIT_INTELLIGENCE_READ_MODEL_VERSION = "profit-intelligence-read-model-v2"
 
 
 def _counts(values: list[str]) -> dict[str, int]:
@@ -151,9 +142,14 @@ def unavailable_profit_intelligence(reason: str) -> ProfitIntelligenceOverview:
 
     Structurally identical to the healthy envelope so a consumer has one code
     path, and never an apparently healthy empty result.
+
+    ``populations`` is left empty rather than populated with zeros: "the store
+    could not be read" and "the store was read and held nothing" are different
+    truths, and a fabricated ``0`` would assert the second while meaning the
+    first.
     """
     return ProfitIntelligenceOverview(
-        populations=_population_counts(()),
+        populations={},
         economic_integrity=(),
         trust=unavailable(reason),
         details=(reason,),
@@ -182,7 +178,6 @@ def build_lineage_for_trade(
 
 
 __all__ = [
-    "MAX_LINEAGE_STAGES",
     "PROFIT_INTELLIGENCE_READ_MODEL_VERSION",
     "ProfitIntelligenceOverview",
     "build_lineage_for_trade",

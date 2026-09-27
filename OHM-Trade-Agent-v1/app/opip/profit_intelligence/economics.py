@@ -11,11 +11,24 @@ statement or a derivation using the same relationship the writer validates. This
 module only:
 
 * re-checks conservation, so a projection defect is caught rather than shown;
-* separates definitive from indicative population, so an unverified number never
-  reads as a settled result;
+* separates the **realized** population (canonically FINAL_VERIFIED) from the
+  **indicative** population, so an unverified number never reads as a settled
+  result and is never summed into one;
 * states per-component availability, so a missing or inapplicable cost is never
   rendered as a measured zero;
 * never mixes quote currencies, because USD and USDT are distinct portfolios.
+
+Why realized and indicative are reported separately
+---------------------------------------------------
+The registered metric ``paper.realized_net_pnl`` declares its eligible
+population as *ACTUAL_REALIZED and FINAL_VERIFIED outcomes* and explicitly
+excludes ``UNRESOLVED_EVIDENCE``. A total that mixed unverified rows into a
+component carrying that metric id would be a competing definition of the
+registered metric, so realized components are computed **only** over rows whose
+economics the canonical writer verified. Unverified rows are reported in their
+own structurally identical component list, labelled ``DERIVED`` and carrying no
+metric id. The same separation is what
+:mod:`app.opip.cockpit.portfolio` already applies to the currency portfolio.
 
 Cost-component availability
 ---------------------------
@@ -27,11 +40,11 @@ reported differently rather than both shown as ``0``.
 
 Residual (unmodelled) cost
 --------------------------
-When economics come from canonical reconciliation, ``execution_costs`` is the
-writer's recorded aggregate and may exceed the sum of the four supported fill
-components. That residual is surfaced explicitly as
-``unmodelled_cost_residual`` and is never silently folded into a component or
-dropped.
+``execution_costs`` is the writer's recorded aggregate and may exceed the sum of
+the four supported fill components. That residual is surfaced per population and
+is never silently folded into a component or dropped. A population that records
+costs but no fills is a contradiction, and it is reported as one rather than
+being zeroed into silence.
 
 Metric semantics stay in the registry
 -------------------------------------
@@ -56,10 +69,16 @@ from app.opip.profit_intelligence.semantics import (
 )
 
 #: Bumped whenever a derived definition in this projection changes.
-ECONOMIC_INTEGRITY_VERSION = "profit-intelligence-economics-v1"
+ECONOMIC_INTEGRITY_VERSION = "profit-intelligence-economics-v2"
 
-#: Same tolerance the cockpit ledger and the canonical writer use for money.
-_MONEY_TOLERANCE = 1e-9
+#: Same tolerance the canonical writer uses for money equality
+#: (``paper_execution_events``: ``abs(net - (gross - costs)) <= 1e-6``). Using a
+#: stricter tolerance would report a canonically-conserving row as a violation,
+#: which is a false defect claim rather than a safety margin.
+_MONEY_TOLERANCE = 1e-6
+
+#: Quantity tolerance for "this population recorded a fill".
+_QUANTITY_TOLERANCE = 1e-9
 
 #: The canonical presentation order of the reported components.
 _COMPONENT_ORDER: tuple[EconomicComponent, ...] = (
@@ -84,6 +103,14 @@ _COMPONENT_FIELDS: Mapping[EconomicComponent, str] = {
     EconomicComponent.RESERVED_CAPITAL: "reserved_capital",
 }
 
+#: Components whose value is only meaningful once economics are verified.
+_REALIZED_ONLY_COMPONENTS: frozenset[EconomicComponent] = frozenset(
+    {
+        EconomicComponent.GROSS_PNL,
+        EconomicComponent.NET_PNL,
+    }
+)
+
 
 @dataclass(frozen=True)
 class CostComponentEvidence:
@@ -105,15 +132,24 @@ class CostComponentEvidence:
 
 @dataclass(frozen=True)
 class EconomicIntegrity:
-    """Conservation and completeness posture for one quote-currency portfolio."""
+    """Conservation and completeness posture for one quote-currency portfolio.
+
+    ``realized_components`` covers only canonically verified rows and is the only
+    list allowed to carry a registered metric id. ``indicative_components``
+    covers the remaining rows and is structurally identical but labelled
+    ``DERIVED``. Consumers must not add the two lists together: that would
+    recreate the mixed population this split exists to prevent.
+    """
 
     quote_currency: str
     population: int = 0
     definitive: int = 0
     indicative: int = 0
     unresolved: int = 0
-    components: tuple[CostComponentEvidence, ...] = ()
+    realized_components: tuple[CostComponentEvidence, ...] = ()
+    indicative_components: tuple[CostComponentEvidence, ...] = ()
     unmodelled_cost_residual: float = 0.0
+    indicative_cost_residual: float = 0.0
     conservation_violations: tuple[str, ...] = ()
     version: str = ECONOMIC_INTEGRITY_VERSION
     trust: TrustEnvelope = field(
@@ -132,26 +168,37 @@ class EconomicIntegrity:
             "definitive": self.definitive,
             "indicative": self.indicative,
             "unresolved": self.unresolved,
-            "components": [item.to_dict() for item in self.components],
+            "realized_components": [item.to_dict() for item in self.realized_components],
+            "indicative_components": [
+                item.to_dict() for item in self.indicative_components
+            ],
             "unmodelled_cost_residual": self.unmodelled_cost_residual,
+            "indicative_cost_residual": self.indicative_cost_residual,
             "conservation_violations": list(self.conservation_violations),
             "metric_authority": dict(METRIC_AUTHORITY),
             "trust": self.trust.to_dict(),
             "details": list(self.details),
         }
 
-    def component(self, component: EconomicComponent) -> CostComponentEvidence:
-        for item in self.components:
+    def component(
+        self, component: EconomicComponent, *, realized: bool = True
+    ) -> CostComponentEvidence:
+        """Look a component up in one population's component list."""
+        source = self.realized_components if realized else self.indicative_components
+        for item in source:
             if item.component is component:
                 return item
-        raise KeyError(f"unknown economic component: {component}")
+        raise KeyError(
+            f"unknown economic component {component} in "
+            f"{'realized' if realized else 'indicative'} population"
+        )
 
 
 def _has_fill_evidence(rows: Sequence[ReconciledPaperTrade]) -> bool:
     for row in rows:
         if row.first_entry_fill_at is not None:
             return True
-        if float(row.entry_quantity) > _MONEY_TOLERANCE:
+        if float(row.entry_quantity) > _QUANTITY_TOLERANCE:
             return True
     return False
 
@@ -161,31 +208,76 @@ def _component_availability(
     *,
     has_fills: bool,
     has_rows: bool,
+    realized: bool,
 ) -> FactAvailability:
-    """Availability for one component, derived from the fill contract.
+    """Availability for one component inside one population.
 
-    Cost components cannot exist without a fill. Realised values are ``KNOWN``
-    only when at least one row is canonically verified, otherwise ``DERIVED``.
+    Cost components cannot exist without a fill. Realized values are ``KNOWN``
+    (the canonical writer verified them); the same value in the indicative
+    population is ``DERIVED`` because it is a deterministic function of
+    unverified evidence, not a settled fact.
     """
     if component in SUPPORTED_COST_COMPONENTS or component in {
         EconomicComponent.EXECUTION_COSTS,
         EconomicComponent.RESERVED_CAPITAL,
     }:
-        return FactAvailability.KNOWN if has_fills else FactAvailability.NOT_APPLICABLE
-    if component in {
-        EconomicComponent.NET_PNL,
-        EconomicComponent.GROSS_PNL,
-    }:
-        return FactAvailability.DERIVED if has_rows else FactAvailability.NOT_APPLICABLE
+        if not has_fills:
+            return FactAvailability.NOT_APPLICABLE
+        return FactAvailability.KNOWN if realized else FactAvailability.DERIVED
+    if component in _REALIZED_ONLY_COMPONENTS:
+        if not has_rows:
+            return FactAvailability.NOT_APPLICABLE
+        return FactAvailability.KNOWN if realized else FactAvailability.DERIVED
     return FactAvailability.KNOWN if has_rows else FactAvailability.NOT_APPLICABLE
 
 
-def _metric_for(component: EconomicComponent) -> str | None:
+def _metric_for(component: EconomicComponent, *, realized: bool) -> str | None:
+    """The registered metric owning a component, only in the realized list.
+
+    Gross profit has no registered metric of its own, so it deliberately maps to
+    ``None`` rather than borrowing the net metric's id.
+    """
+    if not realized:
+        return None
     if component is EconomicComponent.EXECUTION_COSTS:
         return METRIC_AUTHORITY.get("execution_costs")
-    if component in {EconomicComponent.NET_PNL, EconomicComponent.GROSS_PNL}:
+    if component is EconomicComponent.NET_PNL:
         return METRIC_AUTHORITY.get("net_pnl")
     return None
+
+
+def _components_for(
+    rows: Sequence[ReconciledPaperTrade],
+    *,
+    realized: bool,
+) -> tuple[CostComponentEvidence, ...]:
+    has_rows = bool(rows)
+    has_fills = _has_fill_evidence(rows)
+    return tuple(
+        CostComponentEvidence(
+            component=component,
+            total=sum(float(getattr(row, _COMPONENT_FIELDS[component])) for row in rows),
+            availability=_component_availability(
+                component,
+                has_fills=has_fills,
+                has_rows=has_rows,
+                realized=realized,
+            ),
+            metric_id=_metric_for(component, realized=realized),
+        )
+        for component in _COMPONENT_ORDER
+    )
+
+
+def _supported_costs_of(row: ReconciledPaperTrade) -> float:
+    return supported_costs_sum(
+        {
+            EconomicComponent.FEE_COST: row.fee_cost,
+            EconomicComponent.SPREAD_COST: row.spread_cost,
+            EconomicComponent.SLIPPAGE_COST: row.slippage_cost,
+            EconomicComponent.OTHER_SUPPORTED_COST: row.other_cost,
+        }
+    )
 
 
 def build_economic_integrity(
@@ -212,42 +304,10 @@ def _build_one(
     quote_currency: str,
     rows: list[ReconciledPaperTrade],
 ) -> EconomicIntegrity:
-    has_fills = _has_fill_evidence(rows)
-    has_rows = bool(rows)
-
-    totals: dict[EconomicComponent, float] = {
-        component: sum(float(getattr(row, _COMPONENT_FIELDS[component])) for row in rows)
-        for component in _COMPONENT_ORDER
-    }
-
-    definitive_flags = [row.net_pnl_definitive for row in rows]
-    realised_availability = (
-        FactAvailability.KNOWN
-        if any(definitive_flags)
-        else (FactAvailability.DERIVED if has_rows else FactAvailability.NOT_APPLICABLE)
-    )
-
-    components = tuple(
-        CostComponentEvidence(
-            component=component,
-            total=totals[component],
-            availability=(
-                realised_availability
-                if component
-                in {EconomicComponent.NET_PNL, EconomicComponent.GROSS_PNL}
-                else _component_availability(
-                    component, has_fills=has_fills, has_rows=has_rows
-                )
-            ),
-            metric_id=_metric_for(component),
-        )
-        for component in _COMPONENT_ORDER
-    )
+    realized_rows = [row for row in rows if row.net_pnl_definitive]
+    indicative_rows = [row for row in rows if not row.net_pnl_definitive]
 
     violations: list[str] = []
-    residual = 0.0
-    definitive = 0
-    unresolved = 0
     for row in rows:
         if not net_pnl_reconciles(
             gross_pnl=row.gross_pnl,
@@ -255,56 +315,88 @@ def _build_one(
             net_pnl=row.net_pnl,
         ):
             violations.append(row.paper_trade_id)
-        if has_fills:
-            supported = supported_costs_sum(
-                {
-                    EconomicComponent.FEE_COST: row.fee_cost,
-                    EconomicComponent.SPREAD_COST: row.spread_cost,
-                    EconomicComponent.SLIPPAGE_COST: row.slippage_cost,
-                    EconomicComponent.OTHER_SUPPORTED_COST: row.other_cost,
-                }
-            )
-            residual += float(row.execution_costs) - supported
-        if row.net_pnl_definitive:
-            definitive += 1
-        if not row.net_pnl_definitive and row.terminal_reconciliation_state:
-            unresolved += 1
 
+    residual_realized = sum(
+        float(row.execution_costs) - _supported_costs_of(row) for row in realized_rows
+    )
+    residual_indicative = sum(
+        float(row.execution_costs) - _supported_costs_of(row)
+        for row in indicative_rows
+    )
+
+    definitive = len(realized_rows)
+    indicative = len(indicative_rows)
     total = len(rows)
-    indicative = total - definitive
+    unresolved = sum(
+        1
+        for row in rows
+        if not row.net_pnl_definitive and row.terminal_reconciliation_state
+    )
 
     details: list[str] = []
     if violations:
         details.append(
             f"{len(violations)} row(s) violate net = gross - execution_costs"
         )
-    if not has_fills and has_rows:
+    if indicative:
         details.append(
-            "no entry fill exists in this population, so cost components are "
-            "NOT_APPLICABLE rather than a measured zero"
+            f"{indicative} row(s) are not canonically FINAL_VERIFIED; their "
+            "economics are indicative (DERIVED) and are reported separately from "
+            "the realized population"
         )
-    if abs(residual) > _MONEY_TOLERANCE and has_fills:
-        details.append(
-            "canonical recorded execution cost exceeds the four supported fill "
-            "components by the reported unmodelled residual"
-        )
+    for label, population_rows, residual in (
+        ("realized", realized_rows, residual_realized),
+        ("indicative", indicative_rows, residual_indicative),
+    ):
+        if not population_rows:
+            continue
+        if not _has_fill_evidence(population_rows):
+            details.append(
+                f"the {label} population records no entry fill, so cost "
+                "components are NOT_APPLICABLE rather than a measured zero"
+            )
+            recorded = sum(float(row.execution_costs) for row in population_rows)
+            if abs(recorded) > _MONEY_TOLERANCE:
+                # A cost with no underlying fill is a contradiction, not a zero.
+                details.append(
+                    f"the {label} population records execution costs with no fill "
+                    "evidence; the residual is reported rather than dropped"
+                )
+        if abs(residual) > _MONEY_TOLERANCE:
+            details.append(
+                f"canonical recorded execution cost exceeds the four supported "
+                f"fill components in the {label} population by the reported "
+                "unmodelled residual"
+            )
 
-    healthy = not violations
+    # Completeness follows the evidence, not merely the absence of violations:
+    # an entirely unverified population is never reported complete or healthy.
+    complete = not violations and indicative == 0
+    reasons: list[str] = []
+    if violations:
+        reasons.append("ECONOMIC_CONSERVATION_VIOLATION")
+    if indicative:
+        reasons.append("ECONOMICS_NOT_FINAL_VERIFIED")
+
     return EconomicIntegrity(
         quote_currency=quote_currency,
         population=total,
         definitive=definitive,
         indicative=indicative,
         unresolved=unresolved,
-        components=components,
-        unmodelled_cost_residual=residual if has_fills else 0.0,
+        realized_components=_components_for(realized_rows, realized=True),
+        indicative_components=_components_for(indicative_rows, realized=False),
+        unmodelled_cost_residual=(
+            residual_realized if realized_rows else 0.0
+        ),
+        indicative_cost_residual=(
+            residual_indicative if indicative_rows else 0.0
+        ),
         conservation_violations=tuple(sorted(violations)),
         trust=TrustEnvelope(
             freshness=Freshness.LIVE,
-            completeness=(
-                Completeness.COMPLETE if healthy else Completeness.INCOMPLETE
-            ),
-            reasons=() if healthy else ("ECONOMIC_CONSERVATION_VIOLATION",),
+            completeness=Completeness.COMPLETE if complete else Completeness.INCOMPLETE,
+            reasons=tuple(reasons),
         ),
         details=tuple(details),
     )
