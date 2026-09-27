@@ -861,3 +861,71 @@ def test_unreadable_forward_record_degrades_trust_not_silently_complete():
     assert projection.trust.completeness.value == "INCOMPLETE"
     assert projection.trust.is_healthy is False
     assert "FORWARD_RECORDS_UNAVAILABLE" in projection.trust.reasons
+
+
+def test_join_with_an_unreadable_source_reports_source_unavailable_not_no_match():
+    broken = unavailable_forward_outcomes(
+        "ABSENT", source=ForwardOutcomeSource.PHASE3C, generated_at=_NOW
+    )
+    result = join_funnel_record_to_forward_outcomes(_funnel_record("EP:1"), [broken])
+    assert result.status is ForwardOutcomeJoinStatus.SOURCE_UNAVAILABLE
+
+
+def test_join_with_no_readable_source_reports_source_unavailable():
+    broken = unavailable_forward_outcomes(
+        "ABSENT", source=ForwardOutcomeSource.DISCOVERY, generated_at=_NOW
+    )
+    result = join_funnel_record_to_forward_outcomes(_funnel_record("EP:1"), [broken])
+    assert result.status is ForwardOutcomeJoinStatus.SOURCE_UNAVAILABLE
+
+
+def test_join_partial_unreadable_source_is_not_no_match():
+    healthy_no_match = build_forward_outcome_projection(
+        [_phase3c_row(episode_id="EP:OTHER")],
+        source=ForwardOutcomeSource.PHASE3C,
+        generated_at=_NOW,
+    )
+    broken = unavailable_forward_outcomes(
+        "ABSENT", source=ForwardOutcomeSource.DISCOVERY, generated_at=_NOW
+    )
+    result = join_funnel_record_to_forward_outcomes(
+        _funnel_record("EP:1"), [healthy_no_match, broken]
+    )
+    assert result.status is ForwardOutcomeJoinStatus.SOURCE_UNAVAILABLE
+
+
+def test_join_match_in_a_healthy_source_still_wins():
+    healthy_match = build_forward_outcome_projection(
+        [_phase3c_row(episode_id="EP:1")],
+        source=ForwardOutcomeSource.PHASE3C,
+        generated_at=_NOW,
+    )
+    broken = unavailable_forward_outcomes(
+        "ABSENT", source=ForwardOutcomeSource.DISCOVERY, generated_at=_NOW
+    )
+    result = join_funnel_record_to_forward_outcomes(
+        _funnel_record("EP:1"), [healthy_match, broken]
+    )
+    assert result.status is ForwardOutcomeJoinStatus.MATCHED
+
+
+def test_distinct_unreadable_rows_do_not_collapse_into_one_replay():
+    first = _funnel_row(decision=DecisionOutcome.QUALIFIED.value)
+    first["scan_id"] = None
+    first["candidate_id"] = None
+    second = dict(first)
+    projection = build_qualification_funnel_projection(
+        [first, second], generated_at=_NOW
+    )
+    assert len(projection.records) == 2
+    assert projection.duplicate_rows_ignored == 0
+    assert projection.conservation.unattributed == 2
+    assert projection.conservation.holds is False
+
+
+def test_disposition_cause_names_match_the_preregistered_cause_classes():
+    from app.opip.profit_intelligence import MissedOpportunityCause
+
+    buckets = {member.value for member in QualificationDisposition}
+    for cause in MissedOpportunityCause:
+        assert cause.value in buckets, f"cause {cause.value} missing a bucket"

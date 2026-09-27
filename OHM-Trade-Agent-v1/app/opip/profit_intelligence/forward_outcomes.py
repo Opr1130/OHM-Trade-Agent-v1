@@ -620,12 +620,17 @@ def build_forward_outcome_projection(
     latest: dict[str, ForwardOutcomeRecord] = {}
     order: list[str] = []
     duplicates = 0
-    for record in parsed:
-        if record.identity in latest:
+    for index, record in enumerate(parsed):
+        key = record.identity
+        if not key:
+            # Keep an unreadable row addressable instead of collapsing distinct
+            # lost rows onto one blank identity and mislabelling them as replays.
+            key = f"<unidentified>:{index}"
+        if key in latest:
             duplicates += 1
         else:
-            order.append(record.identity)
-        latest[record.identity] = record
+            order.append(key)
+        latest[key] = record
     records = tuple(latest[key] for key in order)
 
     horizon_ids = sorted(

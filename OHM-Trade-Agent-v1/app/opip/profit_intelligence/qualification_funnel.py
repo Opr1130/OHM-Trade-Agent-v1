@@ -33,9 +33,13 @@ These are the evidence.
 *Derived* (this projection's own grouping, versioned by
 :data:`QUALIFICATION_FUNNEL_PROJECTION_VERSION`): :class:`QualificationDisposition`,
 a coarse bucketing of the canonical terminal facts for owner-facing questions.
-It is deliberately conservative and **class-aligned**: it never contradicts the
-canonical ``ReasonClass`` it came from, and it fails closed to ``UNKNOWN`` when no
-rule matches. It is a view, never a competing rejection taxonomy.
+It starts from the canonical ``ReasonClass`` and may **narrow** it through a
+documented, closed reason-code refinement (for example ``NO_CAPITAL`` is
+canonically ``POLICY`` but is bucketed as ``CAPACITY_BLOCKED`` because that is the
+actionable fact), and it fails closed to ``UNKNOWN`` when no rule matches. The
+canonical ``decision`` / ``terminal_reason_code`` / ``terminal_reason_class`` are
+always published unchanged on every record, so the view never replaces the
+taxonomy. It is a view, never a competing rejection taxonomy.
 
 Honesty rules
 -------------
@@ -128,10 +132,12 @@ class QualificationDisposition(str, Enum):
     Every record still carries the canonical ``decision``, ``terminal_reason_code``
     and ``terminal_reason_class`` unchanged.
 
-    The bucket names deliberately mirror the cause classes already pre-registered
-    in :mod:`app.opip.profit_intelligence.semantics` (``MissedOpportunityCause``),
-    so the plane does not carry two rival vocabularies; they are not re-declared
-    here and the canonical taxonomy remains the single authority.
+    The cause-class bucket names are intentionally the same vocabulary as
+    :class:`app.opip.profit_intelligence.semantics.MissedOpportunityCause`. This
+    enum re-states those names plus ``QUALIFIED`` / ``INCOMPLETE``; the shared
+    names are held equal to ``MissedOpportunityCause`` by test, so the plane
+    cannot drift into two rival vocabularies. The canonical decision/reason
+    taxonomy remains the single authority and is published unchanged.
     """
 
     QUALIFIED = "QUALIFIED"
@@ -475,8 +481,9 @@ def _identity_key(record: QualificationFunnelRecord) -> tuple[str, str]:
 
     The funnel writes one row per candidate per scan, so a repeated
     ``(scan_id, candidate_id)`` is a replayed/retried append, not a second
-    opportunity. Falling back to a blank identity keeps a malformed row
-    addressable rather than silently dropped.
+    opportunity. A row missing either part returns a blank pair, which the
+    caller replaces with a unique sentinel so distinct unreadable rows stay
+    addressable rather than being collapsed as replays.
     """
     return (record.scan_id or "", record.candidate_id or "")
 
@@ -524,7 +531,10 @@ def funnel_conservation(
     if holds:
         detail = "terminal dispositions reconcile to the entering population"
     elif unattributed:
-        detail = f"{unattributed} record(s) carry no readable canonical identity"
+        detail = (
+            f"{unattributed} record(s) carry no readable canonical "
+            "identity/decision"
+        )
     else:
         detail = (
             "terminal dispositions do not reconcile: "
@@ -660,8 +670,12 @@ def build_qualification_funnel_projection(
     latest: dict[tuple[str, str], QualificationFunnelRecord] = {}
     order: list[tuple[str, str]] = []
     duplicates = 0
-    for record in parsed:
+    for index, record in enumerate(parsed):
         key = _identity_key(record)
+        if key == ("", ""):
+            # Keep an unreadable row addressable instead of collapsing distinct
+            # lost rows onto one blank identity and mislabelling them as replays.
+            key = ("<unidentified>", str(index))
         if key in latest:
             duplicates += 1
         else:

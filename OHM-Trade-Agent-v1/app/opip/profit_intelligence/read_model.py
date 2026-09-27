@@ -144,6 +144,13 @@ def join_funnel_record_to_forward_outcomes(
     match rather than a coincidence of symbol and direction. A forward family
     that carries no episode identity (Discovery is instrument-level) cannot
     match and is reported as no match, not guessed.
+
+    Only **healthy** projections are searched. A projection that could not be
+    authoritatively read is never treated as an empty-but-certain source: if no
+    supplied projection is readable, or a search across the readable ones finds
+    nothing while some source was unreadable, the join reports
+    ``SOURCE_UNAVAILABLE`` rather than ``NO_MATCH``. ``NO_MATCH`` means a
+    verified absence across every supplied, readable source.
     """
     if not projections:
         return ForwardOutcomeJoin(
@@ -151,6 +158,19 @@ def join_funnel_record_to_forward_outcomes(
             funnel_candidate_id=record.candidate_id,
             episode_id=record.episode_id,
             detail="no forward-outcome projection was supplied",
+        )
+    healthy = tuple(
+        projection for projection in projections if projection.trust.is_healthy
+    )
+    if not healthy:
+        return ForwardOutcomeJoin(
+            status=ForwardOutcomeJoinStatus.SOURCE_UNAVAILABLE,
+            funnel_candidate_id=record.candidate_id,
+            episode_id=record.episode_id,
+            detail=(
+                "no forward-outcome source could be authoritatively read; "
+                "absence cannot be asserted"
+            ),
         )
     if not record.episode_id:
         return ForwardOutcomeJoin(
@@ -161,12 +181,23 @@ def join_funnel_record_to_forward_outcomes(
         )
 
     matches: list[ForwardOutcomeRecord] = []
-    for projection in projections:
+    for projection in healthy:
         for forward in projection.records:
             if forward.canonical_episode_id == record.episode_id:
                 matches.append(forward)
 
     if not matches:
+        if len(healthy) < len(projections):
+            return ForwardOutcomeJoin(
+                status=ForwardOutcomeJoinStatus.SOURCE_UNAVAILABLE,
+                funnel_candidate_id=record.candidate_id,
+                episode_id=record.episode_id,
+                detail=(
+                    "no readable forward-outcome source contains this episode, but "
+                    "at least one supplied source was unreadable, so absence is not "
+                    "verified"
+                ),
+            )
         return ForwardOutcomeJoin(
             status=ForwardOutcomeJoinStatus.NO_MATCH,
             funnel_candidate_id=record.candidate_id,

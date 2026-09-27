@@ -68,8 +68,11 @@ Availability reuses `app.opip.cockpit.trust` (`Freshness`, `Completeness`,
 - Decision-time facts (`reference_at`, `reference_price`, direction) are kept in
   separate fields from every horizon's future facts.
 - A forward window must be anchored strictly after the sealed cutoff;
-  `forward_window_is_point_in_time` proves it, and a violation marks the horizon
-  `UNAVAILABLE` rather than being trusted.
+  `forward_window_is_point_in_time` proves the declared window arithmetic given
+  the sealed `reference_at` (a violation marks the horizon `UNAVAILABLE` rather
+  than being trusted). It does not independently validate the upstream
+  observations that produced the values; those remain the canonical producers'
+  responsibility, and consumption here is `EVIDENCE_ONLY`.
 - Incomplete windows stay incomplete and unavailable market data stays
   unavailable.
 - Consumption is `EVIDENCE_ONLY`. Nothing here can change a threshold, a
@@ -80,9 +83,12 @@ Availability reuses `app.opip.cockpit.trust` (`Freshness`, `Completeness`,
 `join_funnel_record_to_forward_outcomes` joins on the canonical episode identity
 (`funnel.episode_id` ↔ `forward.canonical_episode_id`). It reports
 `MATCHED` / `NO_MATCH` / `AMBIGUOUS` / `IDENTITY_UNAVAILABLE` /
-`SOURCE_UNAVAILABLE` and never chooses a row from an ambiguous match. Even on a
-match it returns `classification = MISSED_PROFIT_CLASSIFICATION_UNAVAILABLE`:
-a positive market outcome is not executable profit.
+`SOURCE_UNAVAILABLE` and never chooses a row from an ambiguous match. `NO_MATCH`
+means a verified absence across every supplied **readable** source; if any
+supplied source was unreadable (or none was read), the join reports
+`SOURCE_UNAVAILABLE` rather than asserting absence. Even on a match it returns
+`classification = MISSED_PROFIT_CLASSIFICATION_UNAVAILABLE`: a positive market
+outcome is not executable profit.
 
 ## Missed profitable opportunity
 
