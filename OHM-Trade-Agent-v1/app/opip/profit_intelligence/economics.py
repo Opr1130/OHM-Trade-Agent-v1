@@ -300,39 +300,99 @@ def build_economic_integrity(
     )
 
 
-def _build_one(
-    quote_currency: str,
-    rows: list[ReconciledPaperTrade],
-) -> EconomicIntegrity:
-    realized_rows = [row for row in rows if row.net_pnl_definitive]
-    indicative_rows = [row for row in rows if not row.net_pnl_definitive]
-
-    violations: list[str] = []
-    for row in rows:
-        if not net_pnl_reconciles(
-            gross_pnl=row.gross_pnl,
-            execution_costs=row.execution_costs,
-            net_pnl=row.net_pnl,
-        ):
-            violations.append(row.paper_trade_id)
-
-    residual_realized = sum(
-        float(row.execution_costs) - _supported_costs_of(row) for row in realized_rows
-    )
-    residual_indicative = sum(
-        float(row.execution_costs) - _supported_costs_of(row)
-        for row in indicative_rows
+def _conservation_violations(
+    rows: Sequence[ReconciledPaperTrade],
+) -> tuple[str, ...]:
+    """Ids of rows that do not conserve net = gross - execution costs."""
+    return tuple(
+        sorted(
+            row.paper_trade_id
+            for row in rows
+            if not net_pnl_reconciles(
+                gross_pnl=row.gross_pnl,
+                execution_costs=row.execution_costs,
+                net_pnl=row.net_pnl,
+            )
+        )
     )
 
-    definitive = len(realized_rows)
-    indicative = len(indicative_rows)
-    total = len(rows)
-    unresolved = sum(
+
+def _residual(rows: Sequence[ReconciledPaperTrade]) -> float:
+    """Recorded aggregate cost minus the four supported fill components."""
+    return sum(
+        float(row.execution_costs) - _supported_costs_of(row) for row in rows
+    )
+
+
+def _count_unresolved(rows: Sequence[ReconciledPaperTrade]) -> int:
+    """Rows that are not verified but have reached a terminal reconciliation."""
+    return sum(
         1
         for row in rows
         if not row.net_pnl_definitive and row.terminal_reconciliation_state
     )
 
+
+def _completeness(
+    violations: tuple[str, ...],
+    indicative: int,
+) -> tuple[Completeness, tuple[str, ...]]:
+    """Completeness and reasons, derived from the evidence rather than violations alone.
+
+    An entirely unverified population is never reported complete or healthy:
+    completeness requires both conservation and verified economics.
+    """
+    reasons: list[str] = []
+    if violations:
+        reasons.append("ECONOMIC_CONSERVATION_VIOLATION")
+    if indicative:
+        reasons.append("ECONOMICS_NOT_FINAL_VERIFIED")
+    complete = not violations and indicative == 0
+    return (
+        Completeness.COMPLETE if complete else Completeness.INCOMPLETE,
+        tuple(reasons),
+    )
+
+
+def _population_details(
+    label: str,
+    population_rows: Sequence[ReconciledPaperTrade],
+    residual: float,
+) -> list[str]:
+    """Honest notes for one population: what cannot exist, and any residual."""
+    if not population_rows:
+        return []
+    notes: list[str] = []
+    if not _has_fill_evidence(population_rows):
+        notes.append(
+            f"the {label} population records no entry fill, so cost components "
+            "are NOT_APPLICABLE rather than a measured zero"
+        )
+        recorded = sum(float(row.execution_costs) for row in population_rows)
+        if abs(recorded) > _MONEY_TOLERANCE:
+            # A cost with no underlying fill is a contradiction, not a zero.
+            notes.append(
+                f"the {label} population records execution costs with no fill "
+                "evidence; the residual is reported rather than dropped"
+            )
+    if abs(residual) > _MONEY_TOLERANCE:
+        notes.append(
+            f"canonical recorded execution cost exceeds the four supported fill "
+            f"components in the {label} population by the reported unmodelled "
+            "residual"
+        )
+    return notes
+
+
+def _integrity_details(
+    *,
+    violations: tuple[str, ...],
+    indicative: int,
+    realized_rows: Sequence[ReconciledPaperTrade],
+    indicative_rows: Sequence[ReconciledPaperTrade],
+    residual_realized: float,
+    residual_indicative: float,
+) -> tuple[str, ...]:
     details: list[str] = []
     if violations:
         details.append(
@@ -344,61 +404,53 @@ def _build_one(
             "economics are indicative (DERIVED) and are reported separately from "
             "the realized population"
         )
-    for label, population_rows, residual in (
-        ("realized", realized_rows, residual_realized),
-        ("indicative", indicative_rows, residual_indicative),
-    ):
-        if not population_rows:
-            continue
-        if not _has_fill_evidence(population_rows):
-            details.append(
-                f"the {label} population records no entry fill, so cost "
-                "components are NOT_APPLICABLE rather than a measured zero"
-            )
-            recorded = sum(float(row.execution_costs) for row in population_rows)
-            if abs(recorded) > _MONEY_TOLERANCE:
-                # A cost with no underlying fill is a contradiction, not a zero.
-                details.append(
-                    f"the {label} population records execution costs with no fill "
-                    "evidence; the residual is reported rather than dropped"
-                )
-        if abs(residual) > _MONEY_TOLERANCE:
-            details.append(
-                f"canonical recorded execution cost exceeds the four supported "
-                f"fill components in the {label} population by the reported "
-                "unmodelled residual"
-            )
+    details.extend(_population_details("realized", realized_rows, residual_realized))
+    details.extend(
+        _population_details("indicative", indicative_rows, residual_indicative)
+    )
+    return tuple(details)
 
-    # Completeness follows the evidence, not merely the absence of violations:
-    # an entirely unverified population is never reported complete or healthy.
-    complete = not violations and indicative == 0
-    reasons: list[str] = []
-    if violations:
-        reasons.append("ECONOMIC_CONSERVATION_VIOLATION")
-    if indicative:
-        reasons.append("ECONOMICS_NOT_FINAL_VERIFIED")
+
+def _build_one(
+    quote_currency: str,
+    rows: list[ReconciledPaperTrade],
+) -> EconomicIntegrity:
+    realized_rows = [row for row in rows if row.net_pnl_definitive]
+    indicative_rows = [row for row in rows if not row.net_pnl_definitive]
+
+    violations = _conservation_violations(rows)
+    residual_realized = _residual(realized_rows)
+    residual_indicative = _residual(indicative_rows)
+    definitive = len(realized_rows)
+    indicative = len(indicative_rows)
+    completeness, reasons = _completeness(violations, indicative)
 
     return EconomicIntegrity(
         quote_currency=quote_currency,
-        population=total,
+        population=len(rows),
         definitive=definitive,
         indicative=indicative,
-        unresolved=unresolved,
+        unresolved=_count_unresolved(rows),
         realized_components=_components_for(realized_rows, realized=True),
         indicative_components=_components_for(indicative_rows, realized=False),
-        unmodelled_cost_residual=(
-            residual_realized if realized_rows else 0.0
-        ),
+        unmodelled_cost_residual=(residual_realized if realized_rows else 0.0),
         indicative_cost_residual=(
             residual_indicative if indicative_rows else 0.0
         ),
-        conservation_violations=tuple(sorted(violations)),
+        conservation_violations=violations,
         trust=TrustEnvelope(
             freshness=Freshness.LIVE,
-            completeness=Completeness.COMPLETE if complete else Completeness.INCOMPLETE,
-            reasons=tuple(reasons),
+            completeness=completeness,
+            reasons=reasons,
         ),
-        details=tuple(details),
+        details=_integrity_details(
+            violations=violations,
+            indicative=indicative,
+            realized_rows=realized_rows,
+            indicative_rows=indicative_rows,
+            residual_realized=residual_realized,
+            residual_indicative=residual_indicative,
+        ),
     )
 
 

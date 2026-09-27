@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 import pathlib
 from datetime import datetime, timedelta, timezone
 
@@ -776,7 +777,7 @@ def test_economic_components_never_use_a_float_nan_placeholder():
     """Missing evidence must be availability, never NaN silently serialised."""
     summary = build_economic_integrity([_no_fill_row()])[0]
     for component in (*summary.realized_components, *summary.indicative_components):
-        assert not (component.total != component.total), "NaN leaked into a total"
+        assert math.isfinite(component.total), "NaN leaked into a total"
 
 
 def test_costs_recorded_without_fill_evidence_are_reported_not_zeroed():

@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from app.opip.cockpit.ledger import (
     ExecutionResult,
@@ -124,250 +124,270 @@ def _not_applicable_reason(row: ReconciledPaperTrade) -> bool:
     return row.execution_result is ExecutionResult.NO_FILL
 
 
+def _presence(
+    present: bool,
+    *,
+    absent_note: str,
+    impossible: bool = False,
+    impossible_note: str | None = None,
+) -> tuple[FactAvailability, str | None]:
+    """Resolve presence into an availability and its explanatory note.
+
+    ``impossible`` means the fact *cannot* exist for this trade, which is
+    ``NOT_APPLICABLE``; otherwise an absent fact that should exist is
+    ``UNAVAILABLE``. Keeping the distinction in one place stops a caller from
+    collapsing the two by accident.
+    """
+    if present:
+        return FactAvailability.KNOWN, None
+    if impossible:
+        return FactAvailability.NOT_APPLICABLE, impossible_note
+    return FactAvailability.UNAVAILABLE, absent_note
+
+
+def _stage_decision_context(row: ReconciledPaperTrade) -> StageEvidence:
+    known = row.decision_context_id is not None
+    return StageEvidence(
+        stage=LineageStage.DECISION_CONTEXT,
+        availability=FactAvailability.KNOWN if known else FactAvailability.UNAVAILABLE,
+        occurred_at=row.evaluation_at,
+        facts={
+            "decision_context_id": row.decision_context_id,
+            "disposition_id": row.disposition_id,
+            "candidate_id": row.candidate_id,
+            "episode_id": row.episode_id,
+            "cohort_id": row.cohort_id,
+            "instrument_version": row.instrument_version,
+            "native_symbol": row.native_symbol,
+            "quote_currency": row.quote_currency,
+        },
+        note=None if known else "canonical decision context is not recorded",
+    )
+
+
+def _stage_policy_provenance(row: ReconciledPaperTrade) -> StageEvidence:
+    known = row.policy_version is not None and row.policy_fingerprint is not None
+    return StageEvidence(
+        stage=LineageStage.POLICY_PROVENANCE,
+        availability=FactAvailability.KNOWN if known else FactAvailability.UNAVAILABLE,
+        occurred_at=None,
+        facts={
+            "policy_version": row.policy_version,
+            "policy_fingerprint": row.policy_fingerprint,
+            "execution_model_version": row.execution_model_version,
+            "economic_model_version": row.economic_model_version,
+        },
+        note=(
+            None if known else "policy version/fingerprint pair is not both recorded"
+        ),
+    )
+
+
+def _stage_intent(row: ReconciledPaperTrade) -> StageEvidence:
+    known = row.entry_intent_at is not None
+    return StageEvidence(
+        stage=LineageStage.INTENT,
+        availability=FactAvailability.KNOWN if known else FactAvailability.UNAVAILABLE,
+        occurred_at=row.entry_intent_at,
+        facts={"requested_entry_quantity": row.requested_entry_quantity},
+        note=None if known else "no canonical entry order intent instant",
+    )
+
+
+def _stage_attempt(row: ReconciledPaperTrade) -> StageEvidence:
+    availability, note = _presence(
+        row.entry_attempt_at is not None,
+        absent_note="entry intent exists but no attempt instant is recorded",
+        impossible=row.entry_intent_at is None,
+        impossible_note="no entry intent was recorded, so no attempt can exist",
+    )
+    return StageEvidence(
+        stage=LineageStage.ATTEMPT,
+        availability=availability,
+        occurred_at=row.entry_attempt_at,
+        facts={},
+        note=note,
+    )
+
+
+def _stage_fill(row: ReconciledPaperTrade) -> StageEvidence:
+    # Mirrors the EXIT stage: a committed fill is evidenced by its timestamp OR by
+    # the recorded quantity. Temporal evidence can legitimately be BOUNDED or
+    # UNKNOWN precision, in which case `temporal_point` yields no instant even
+    # though the fill itself is readable evidence - reporting that as UNAVAILABLE
+    # would deny evidence the store actually holds.
+    availability, note = _presence(
+        row.first_entry_fill_at is not None
+        or row.entry_quantity > _QUANTITY_TOLERANCE,
+        absent_note="no entry fill quantity or instant is readable",
+        impossible=_not_applicable_reason(row),
+        impossible_note="execution returned NO_FILL, so no entry fill can exist",
+    )
+    return StageEvidence(
+        stage=LineageStage.FILL,
+        availability=availability,
+        occurred_at=row.first_entry_fill_at,
+        facts={
+            "entry_quantity": row.entry_quantity,
+            "entry_price_vwap": row.entry_price_vwap,
+            "entry_notional": row.entry_notional,
+            "execution_result": row.execution_result.value,
+        },
+        note=note,
+    )
+
+
+def _stage_protection(row: ReconciledPaperTrade) -> StageEvidence:
+    has_plan = (
+        row.plan_seq is not None
+        or row.planned_stop_price is not None
+        or bool(row.planned_targets)
+    )
+    availability, note = _presence(
+        has_plan,
+        absent_note="position evidence exists but no protection plan is recorded",
+        impossible=_not_applicable_reason(row),
+        impossible_note="no position was opened, so no protection plan can exist",
+    )
+    return StageEvidence(
+        stage=LineageStage.PROTECTION,
+        availability=availability,
+        occurred_at=None,
+        facts={
+            "plan_seq": row.plan_seq,
+            "planned_stop_price": row.planned_stop_price,
+            "planned_targets": [dict(target) for target in row.planned_targets],
+            "planned_max_hold_seconds": row.planned_max_hold_seconds,
+            "protection_state": row.protection_state,
+            "early_close": row.early_close,
+        },
+        note=note,
+    )
+
+
+def _stage_exit(row: ReconciledPaperTrade) -> StageEvidence:
+    availability, note = _presence(
+        row.last_exit_fill_at is not None
+        or row.exited_quantity > _QUANTITY_TOLERANCE,
+        absent_note="trade is flat but no exit fill evidence is readable",
+        impossible=row.lifecycle_status in {LifecycleStatus.PENDING, LifecycleStatus.OPEN},
+        impossible_note="the position has not been exited yet",
+    )
+    return StageEvidence(
+        stage=LineageStage.EXIT,
+        availability=availability,
+        occurred_at=row.last_exit_fill_at,
+        facts={
+            "exited_quantity": row.exited_quantity,
+            "remaining_quantity": row.remaining_quantity,
+            "exit_price_vwap": row.exit_price_vwap,
+            "exit_notional": row.exit_notional,
+            "exit_mechanism": row.exit_mechanism.value,
+            "exit_mechanisms": [item.value for item in row.exit_mechanisms],
+            "holding_seconds": row.holding_seconds,
+        },
+        note=note,
+    )
+
+
+def _stage_economics(row: ReconciledPaperTrade) -> StageEvidence:
+    conserves = net_pnl_reconciles(
+        gross_pnl=row.gross_pnl,
+        execution_costs=row.execution_costs,
+        net_pnl=row.net_pnl,
+    )
+    definitive = row.net_pnl_definitive
+    return StageEvidence(
+        stage=LineageStage.ECONOMICS,
+        availability=(
+            FactAvailability.KNOWN if definitive else FactAvailability.DERIVED
+        ),
+        occurred_at=None,
+        facts={
+            "gross_pnl": row.gross_pnl,
+            "fee_cost": row.fee_cost,
+            "spread_cost": row.spread_cost,
+            "slippage_cost": row.slippage_cost,
+            "other_cost": row.other_cost,
+            "execution_costs": row.execution_costs,
+            "net_pnl": row.net_pnl,
+            "reserved_capital": row.reserved_capital,
+            "economics_source": row.economics_source.value,
+            "net_pnl_definitive": definitive,
+            "economic_result": row.economic_result.value,
+            "conserves_net_equals_gross_minus_costs": conserves,
+        },
+        note=(
+            None
+            if definitive
+            else "economics are indicative until canonical FINAL_VERIFIED"
+        ),
+    )
+
+
+def _stage_reconciliation(row: ReconciledPaperTrade) -> StageEvidence:
+    availability, note = _presence(
+        row.terminal_reconciliation_state is not None,
+        absent_note="no terminal reconciliation state is recorded",
+        impossible=row.lifecycle_status is LifecycleStatus.PENDING,
+        impossible_note="the trade has not reached a reconciliation point",
+    )
+    return StageEvidence(
+        stage=LineageStage.RECONCILIATION,
+        availability=availability,
+        occurred_at=None,
+        facts={
+            "terminal_reconciliation_state": row.terminal_reconciliation_state,
+            "net_pnl_definitive": row.net_pnl_definitive,
+        },
+        note=note,
+    )
+
+
+def _stage_traceability(row: ReconciledPaperTrade) -> StageEvidence:
+    known = bool(row.event_ids)
+    return StageEvidence(
+        stage=LineageStage.TRACEABILITY,
+        availability=FactAvailability.KNOWN if known else FactAvailability.UNAVAILABLE,
+        occurred_at=None,
+        facts={"event_id_count": len(row.event_ids)},
+        evidence_event_ids=tuple(row.event_ids),
+        note=(
+            None
+            if known
+            else f"no canonical event ids recorded for {row.paper_trade_id}"
+        ),
+    )
+
+
+#: One builder per stage. A dispatch table keeps :func:`_build_stage` trivial and
+#: gives every stage its own small, independently testable function rather than a
+#: single deeply-branching routine.
+_STAGE_BUILDERS: Mapping[
+    LineageStage, Callable[[ReconciledPaperTrade], StageEvidence]
+] = {
+    LineageStage.DECISION_CONTEXT: _stage_decision_context,
+    LineageStage.POLICY_PROVENANCE: _stage_policy_provenance,
+    LineageStage.INTENT: _stage_intent,
+    LineageStage.ATTEMPT: _stage_attempt,
+    LineageStage.FILL: _stage_fill,
+    LineageStage.PROTECTION: _stage_protection,
+    LineageStage.EXIT: _stage_exit,
+    LineageStage.ECONOMICS: _stage_economics,
+    LineageStage.RECONCILIATION: _stage_reconciliation,
+    LineageStage.TRACEABILITY: _stage_traceability,
+}
+
+
 def _build_stage(
     row: ReconciledPaperTrade,
     stage: LineageStage,
 ) -> StageEvidence:
-    trade_id = row.paper_trade_id
-    if stage is LineageStage.DECISION_CONTEXT:
-        known = row.decision_context_id is not None
-        return StageEvidence(
-            stage=stage,
-            availability=(
-                FactAvailability.KNOWN if known else FactAvailability.UNAVAILABLE
-            ),
-            occurred_at=row.evaluation_at,
-            facts={
-                "decision_context_id": row.decision_context_id,
-                "disposition_id": row.disposition_id,
-                "candidate_id": row.candidate_id,
-                "episode_id": row.episode_id,
-                "cohort_id": row.cohort_id,
-                "instrument_version": row.instrument_version,
-                "native_symbol": row.native_symbol,
-                "quote_currency": row.quote_currency,
-            },
-            note=None if known else "canonical decision context is not recorded",
-        )
-
-    if stage is LineageStage.POLICY_PROVENANCE:
-        known = row.policy_version is not None and row.policy_fingerprint is not None
-        return StageEvidence(
-            stage=stage,
-            availability=(
-                FactAvailability.KNOWN if known else FactAvailability.UNAVAILABLE
-            ),
-            occurred_at=None,
-            facts={
-                "policy_version": row.policy_version,
-                "policy_fingerprint": row.policy_fingerprint,
-                "execution_model_version": row.execution_model_version,
-                "economic_model_version": row.economic_model_version,
-            },
-            note=(
-                None
-                if known
-                else "policy version/fingerprint pair is not both recorded"
-            ),
-        )
-
-    if stage is LineageStage.INTENT:
-        known = row.entry_intent_at is not None
-        return StageEvidence(
-            stage=stage,
-            availability=(
-                FactAvailability.KNOWN if known else FactAvailability.UNAVAILABLE
-            ),
-            occurred_at=row.entry_intent_at,
-            facts={"requested_entry_quantity": row.requested_entry_quantity},
-            note=None if known else "no canonical entry order intent instant",
-        )
-
-    if stage is LineageStage.ATTEMPT:
-        known = row.entry_attempt_at is not None
-        if known:
-            availability = FactAvailability.KNOWN
-            note = None
-        elif row.entry_intent_at is None:
-            availability = FactAvailability.NOT_APPLICABLE
-            note = "no entry intent was recorded, so no attempt can exist"
-        else:
-            availability = FactAvailability.UNAVAILABLE
-            note = "entry intent exists but no attempt instant is recorded"
-        return StageEvidence(
-            stage=stage,
-            availability=availability,
-            occurred_at=row.entry_attempt_at,
-            facts={},
-            note=note,
-        )
-
-    if stage is LineageStage.FILL:
-        # Mirrors the EXIT stage: a committed fill is evidenced by its timestamp
-        # OR by the recorded quantity. Temporal evidence can legitimately be
-        # BOUNDED or UNKNOWN precision, in which case `temporal_point` yields no
-        # instant even though the fill itself is readable evidence - reporting
-        # that as UNAVAILABLE would deny evidence the store actually holds.
-        has_fill = (
-            row.first_entry_fill_at is not None
-            or row.entry_quantity > _QUANTITY_TOLERANCE
-        )
-        if has_fill:
-            availability = FactAvailability.KNOWN
-            note = None
-        elif _not_applicable_reason(row):
-            availability = FactAvailability.NOT_APPLICABLE
-            note = "execution returned NO_FILL, so no entry fill can exist"
-        else:
-            availability = FactAvailability.UNAVAILABLE
-            note = "no entry fill quantity or instant is readable"
-        return StageEvidence(
-            stage=stage,
-            availability=availability,
-            occurred_at=row.first_entry_fill_at,
-            facts={
-                "entry_quantity": row.entry_quantity,
-                "entry_price_vwap": row.entry_price_vwap,
-                "entry_notional": row.entry_notional,
-                "execution_result": row.execution_result.value,
-            },
-            note=note,
-        )
-
-    if stage is LineageStage.PROTECTION:
-        has_plan = (
-            row.plan_seq is not None
-            or row.planned_stop_price is not None
-            or bool(row.planned_targets)
-        )
-        if has_plan:
-            availability = FactAvailability.KNOWN
-            note = None
-        elif _not_applicable_reason(row):
-            availability = FactAvailability.NOT_APPLICABLE
-            note = "no position was opened, so no protection plan can exist"
-        else:
-            availability = FactAvailability.UNAVAILABLE
-            note = "position evidence exists but no protection plan is recorded"
-        return StageEvidence(
-            stage=stage,
-            availability=availability,
-            occurred_at=None,
-            facts={
-                "plan_seq": row.plan_seq,
-                "planned_stop_price": row.planned_stop_price,
-                "planned_targets": [dict(target) for target in row.planned_targets],
-                "planned_max_hold_seconds": row.planned_max_hold_seconds,
-                "protection_state": row.protection_state,
-                "early_close": row.early_close,
-            },
-            note=note,
-        )
-
-    if stage is LineageStage.EXIT:
-        has_exit = (
-            row.last_exit_fill_at is not None
-            or row.exited_quantity > _QUANTITY_TOLERANCE
-        )
-        if has_exit:
-            availability = FactAvailability.KNOWN
-            note = None
-        elif row.lifecycle_status in {
-            LifecycleStatus.PENDING,
-            LifecycleStatus.OPEN,
-        }:
-            availability = FactAvailability.NOT_APPLICABLE
-            note = "the position has not been exited yet"
-        else:
-            availability = FactAvailability.UNAVAILABLE
-            note = "trade is flat but no exit fill evidence is readable"
-        return StageEvidence(
-            stage=stage,
-            availability=availability,
-            occurred_at=row.last_exit_fill_at,
-            facts={
-                "exited_quantity": row.exited_quantity,
-                "remaining_quantity": row.remaining_quantity,
-                "exit_price_vwap": row.exit_price_vwap,
-                "exit_notional": row.exit_notional,
-                "exit_mechanism": row.exit_mechanism.value,
-                "exit_mechanisms": [item.value for item in row.exit_mechanisms],
-                "holding_seconds": row.holding_seconds,
-            },
-            note=note,
-        )
-
-    if stage is LineageStage.ECONOMICS:
-        conserves = net_pnl_reconciles(
-            gross_pnl=row.gross_pnl,
-            execution_costs=row.execution_costs,
-            net_pnl=row.net_pnl,
-        )
-        return StageEvidence(
-            stage=stage,
-            availability=(
-                FactAvailability.KNOWN
-                if row.net_pnl_definitive
-                else FactAvailability.DERIVED
-            ),
-            occurred_at=None,
-            facts={
-                "gross_pnl": row.gross_pnl,
-                "fee_cost": row.fee_cost,
-                "spread_cost": row.spread_cost,
-                "slippage_cost": row.slippage_cost,
-                "other_cost": row.other_cost,
-                "execution_costs": row.execution_costs,
-                "net_pnl": row.net_pnl,
-                "reserved_capital": row.reserved_capital,
-                "economics_source": row.economics_source.value,
-                "net_pnl_definitive": row.net_pnl_definitive,
-                "economic_result": row.economic_result.value,
-                "conserves_net_equals_gross_minus_costs": conserves,
-            },
-            note=(
-                None
-                if row.net_pnl_definitive
-                else "economics are indicative until canonical FINAL_VERIFIED"
-            ),
-        )
-
-    if stage is LineageStage.RECONCILIATION:
-        known = row.terminal_reconciliation_state is not None
-        if known:
-            availability = FactAvailability.KNOWN
-            note = None
-        elif row.lifecycle_status is LifecycleStatus.PENDING:
-            availability = FactAvailability.NOT_APPLICABLE
-            note = "the trade has not reached a reconciliation point"
-        else:
-            availability = FactAvailability.UNAVAILABLE
-            note = "no terminal reconciliation state is recorded"
-        return StageEvidence(
-            stage=stage,
-            availability=availability,
-            occurred_at=None,
-            facts={
-                "terminal_reconciliation_state": row.terminal_reconciliation_state,
-                "net_pnl_definitive": row.net_pnl_definitive,
-            },
-            note=note,
-        )
-
-    if stage is LineageStage.TRACEABILITY:
-        known = bool(row.event_ids)
-        return StageEvidence(
-            stage=stage,
-            availability=(
-                FactAvailability.KNOWN if known else FactAvailability.UNAVAILABLE
-            ),
-            occurred_at=None,
-            facts={"event_id_count": len(row.event_ids)},
-            evidence_event_ids=tuple(row.event_ids),
-            note=None if known else f"no canonical event ids recorded for {trade_id}",
-        )
-
-    raise KeyError(f"unsupported lineage stage: {stage}")
+    try:
+        builder = _STAGE_BUILDERS[stage]
+    except KeyError as exc:
+        raise KeyError(f"unsupported lineage stage: {stage}") from exc
+    return builder(row)
 
 
 def build_trade_lineage(row: ReconciledPaperTrade) -> TradeLineage:
