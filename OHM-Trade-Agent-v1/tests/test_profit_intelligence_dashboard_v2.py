@@ -757,9 +757,12 @@ def test_economic_integrity_rejects_non_row_input():
 
 def test_economic_integrity_is_deterministic():
     rows = [_row(trade_suffix="a" * 64), _row(trade_suffix="b" * 64)]
-    assert [item.to_dict() for item in build_economic_integrity(rows)] == [
-        item.to_dict() for item in build_economic_integrity(rows)
-    ]
+    # Evaluated twice into distinct bindings on purpose: determinism means the same
+    # input yields the same output, so the assertion is that two independent runs
+    # agree - not that an expression equals its own text.
+    first = [item.to_dict() for item in build_economic_integrity(rows)]
+    second = [item.to_dict() for item in build_economic_integrity(rows)]
+    assert first == second
 
 
 def test_economic_integrity_component_lookup_rejects_unknown_component():
