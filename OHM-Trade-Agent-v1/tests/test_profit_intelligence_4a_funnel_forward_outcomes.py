@@ -50,6 +50,8 @@ from app.opip.profit_intelligence import (
     forward_window_is_point_in_time,
     horizon_duration_seconds,
     join_funnel_record_to_forward_outcomes,
+    read_forward_outcome_projection,
+    read_qualification_funnel_projection,
     unavailable_forward_outcomes,
     unavailable_profit_intelligence,
     unavailable_qualification_funnel,
@@ -786,3 +788,76 @@ def test_overview_publishes_missed_opportunity_unblock_evidence():
 def test_unblock_evidence_declares_the_blocked_disposition():
     payload = MISSED_OPPORTUNITY_UNBLOCK.to_dict()
     assert payload["disposition"] == "BLOCKED_AT_FROZEN_BOUNDARY"
+
+
+# ---------------------------------------------------------------------------
+# Read paths: evidence on disk, and absent evidence fails closed
+# ---------------------------------------------------------------------------
+
+
+def test_read_phase3c_projection_from_disk(tmp_path):
+    path = tmp_path / "phase3c.jsonl"
+    path.write_text(
+        json.dumps(_phase3c_row()) + "\n", encoding="utf-8"
+    )
+    projection = read_forward_outcome_projection(
+        source=ForwardOutcomeSource.PHASE3C, path=path, generated_at=_NOW
+    )
+    assert len(projection.records) == 1
+    assert projection.trust.is_healthy is True
+
+
+def test_read_discovery_projection_from_disk(tmp_path):
+    path = tmp_path / "discovery.jsonl"
+    path.write_text(
+        json.dumps(_discovery_row()) + "\n", encoding="utf-8"
+    )
+    projection = read_forward_outcome_projection(
+        source=ForwardOutcomeSource.DISCOVERY, path=path, generated_at=_NOW
+    )
+    assert len(projection.records) == 1
+    assert projection.records[0].identity_kind == "observation_id"
+
+
+def test_absent_forward_evidence_is_unavailable_not_healthy_empty(tmp_path):
+    missing = tmp_path / "absent.jsonl"
+    for source in (ForwardOutcomeSource.PHASE3C, ForwardOutcomeSource.DISCOVERY):
+        projection = read_forward_outcome_projection(
+            source=source, path=missing, generated_at=_NOW
+        )
+        assert projection.records == ()
+        assert projection.trust.is_healthy is False
+
+
+def test_read_funnel_projection_from_disk(tmp_path):
+    path = tmp_path / "funnel.jsonl"
+    path.write_text(
+        "\n".join(json.dumps(row) for row in _normal_population()) + "\n",
+        encoding="utf-8",
+    )
+    projection = read_qualification_funnel_projection(
+        funnel_events_path=path, generated_at=_NOW
+    )
+    assert projection.conservation.entered == 4
+    assert projection.trust.is_healthy is True
+
+
+def test_absent_funnel_evidence_is_unavailable_not_healthy_empty(tmp_path):
+    projection = read_qualification_funnel_projection(
+        funnel_events_path=tmp_path / "absent.jsonl", generated_at=_NOW
+    )
+    assert projection.records == ()
+    assert projection.bucket_counts == {}
+    assert projection.trust.is_healthy is False
+
+
+def test_unreadable_forward_record_degrades_trust_not_silently_complete():
+    row = _phase3c_row()
+    row["reference_price"] = None
+    projection = build_forward_outcome_projection(
+        [row], source=ForwardOutcomeSource.PHASE3C, generated_at=_NOW
+    )
+    assert projection.records[0].availability.value == "UNAVAILABLE"
+    assert projection.trust.completeness.value == "INCOMPLETE"
+    assert projection.trust.is_healthy is False
+    assert "FORWARD_RECORDS_UNAVAILABLE" in projection.trust.reasons

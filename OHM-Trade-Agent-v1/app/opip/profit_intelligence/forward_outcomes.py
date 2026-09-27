@@ -34,7 +34,9 @@ Hard boundary, enforced structurally and by validation:
   separate from every horizon's future fields;
 * a forward window's ``window_end`` must be strictly after its ``reference_at``;
   :func:`forward_window_is_point_in_time` proves it, and a violation marks the
-  horizon ``UNAVAILABLE`` rather than being silently trusted;
+  horizon ``UNAVAILABLE`` rather than being silently trusted (the check proves the
+  declared window arithmetic given ``reference_at``; it does not independently
+  validate the upstream observations, which remain the producers' responsibility);
 * incomplete windows stay incomplete and unavailable market data stays
   unavailable - neither is ever written as a ``0`` return;
 * the projection has no policy authority and its output is ``EVIDENCE_ONLY``:
@@ -80,10 +82,11 @@ FORWARD_OUTCOME_POPULATION_SEMANTICS = (
 
 #: How to read availability in this projection.
 FORWARD_OUTCOME_AVAILABILITY_SEMANTICS = (
-    "A horizon whose forward window has not matured is INCOMPLETE and its return "
-    "and excursions are null, never zero. An unavailable market print leaves the "
-    "horizon UNAVAILABLE, never a measured zero. Only a complete window with a real "
-    "forward observation yields KNOWN values."
+    "A horizon is KNOWN only when its window is complete and a real forward "
+    "observation produced its value. A partially observed window is INCOMPLETE and "
+    "its return/excursions are DERIVED, never KNOWN; an unobserved horizon is "
+    "UNAVAILABLE with null values. Neither an incomplete nor an unavailable horizon "
+    "is ever written as a measured zero."
 )
 
 #: Canonical horizon labels -> duration, for window arithmetic only. The label
@@ -545,6 +548,32 @@ def _completion(records: Sequence[ForwardOutcomeRecord]) -> ForwardOutcomeComple
     )
 
 
+def _trust_for(
+    records: Sequence[ForwardOutcomeRecord],
+    completion: ForwardOutcomeCompletion,
+) -> TrustEnvelope:
+    """Trust envelope for a healthy read, degraded by any untrusted record.
+
+    Completeness is INCOMPLETE when any window has not matured *or* any record
+    could not be read (for example a missing reference price). An unreadable
+    record is named in ``reasons`` rather than left to look complete.
+    """
+    reasons: list[str] = []
+    if completion.incomplete_windows:
+        reasons.append("FORWARD_WINDOWS_NOT_MATURED")
+    if any(
+        record.availability is FactAvailability.UNAVAILABLE for record in records
+    ):
+        reasons.append("FORWARD_RECORDS_UNAVAILABLE")
+    if reasons:
+        return TrustEnvelope(
+            freshness=Freshness.LIVE,
+            completeness=Completeness.INCOMPLETE,
+            reasons=tuple(reasons),
+        )
+    return TrustEnvelope(freshness=Freshness.LIVE, completeness=Completeness.COMPLETE)
+
+
 def _producer_version(records: Sequence[ForwardOutcomeRecord]) -> str | None:
     versions = sorted(
         {
@@ -572,8 +601,8 @@ def build_forward_outcome_projection(
     """Project one canonical forward-outcome family into a versioned read model.
 
     Deterministic and read-only. Duplicate identities are collapsed so a replayed
-    append cannot inflate the population, and the earliest record for an identity
-    is kept (a decision point does not move).
+    append cannot inflate the population; the latest record for an identity is
+    kept, matching the producers' append-only revision semantics.
     """
     try:
         resolved_source = ForwardOutcomeSource(source)
@@ -623,19 +652,7 @@ def build_forward_outcome_projection(
             f"{duplicates} duplicate forward-outcome row(s) ignored by identity"
         )
 
-    resolved_trust = trust or TrustEnvelope(
-        freshness=Freshness.LIVE,
-        completeness=(
-            Completeness.COMPLETE
-            if completion.incomplete_windows == 0
-            else Completeness.INCOMPLETE
-        ),
-        reasons=(
-            ()
-            if completion.incomplete_windows == 0
-            else ("FORWARD_WINDOWS_NOT_MATURED",)
-        ),
-    )
+    resolved_trust = trust or _trust_for(records, completion)
 
     return ForwardOutcomeProjection(
         source=resolved_source,
@@ -693,17 +710,33 @@ def read_forward_outcome_projection(
         raise ValueError("generated_at must be timezone-aware")
     moment = moment.astimezone(timezone.utc)
 
+    from pathlib import Path
+
+    # The canonical readers return [] for an absent file, so an absent canonical
+    # stream must be reported UNAVAILABLE rather than as a healthy empty family.
+    if resolved_source is ForwardOutcomeSource.PHASE3C:
+        expected = Path(path) if path is not None else _default_phase3c_path()
+    else:
+        from app.opip.discovery.store import FORWARD_OUTCOMES_FILE
+
+        expected = Path(path) if path is not None else Path(FORWARD_OUTCOMES_FILE)
+
+    if not expected.exists():
+        return unavailable_forward_outcomes(
+            f"FORWARD_OUTCOME_EVIDENCE_ABSENT:{resolved_source.value}",
+            source=resolved_source,
+            generated_at=moment,
+        )
+
     try:
         if resolved_source is ForwardOutcomeSource.PHASE3C:
             from app.services.signal_quality_phase3c import read_jsonl
 
-            rows = read_jsonl(
-                path if path is not None else _default_phase3c_path()
-            )
+            rows = read_jsonl(expected)
         else:
             from app.opip.discovery.store import read_discovery_forward_outcomes
 
-            rows = read_discovery_forward_outcomes(path)
+            rows = read_discovery_forward_outcomes(path=expected)
     except OSError:
         return unavailable_forward_outcomes(
             f"FORWARD_OUTCOME_EVIDENCE_UNREADABLE:{resolved_source.value}",

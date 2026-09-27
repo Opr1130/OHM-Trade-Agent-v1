@@ -76,7 +76,6 @@ from app.opip.cockpit.trust import (
 )
 from app.opip.decision.models import (
     DecisionOutcome,
-    GateStatus,
     ReasonClass,
     ReasonCode,
 )
@@ -98,7 +97,7 @@ QUALIFICATION_FUNNEL_SCOPE = (
     "Pre-trade qualification progression for one directional candidate per scan: "
     "the ordered gate history, the terminal disposition and its canonical reason, "
     "from the O'Pip qualification funnel evidence. Stage-0 instrument screening is "
-    "summarised as a separate evidence family and is not identity-joined here. "
+    "a separate evidence family that this version does not project. "
     "Execution, fill, exit and economics are out of scope and are projected by the "
     "trade lineage."
 )
@@ -108,8 +107,8 @@ QUALIFICATION_FUNNEL_SCOPE = (
 QUALIFICATION_FUNNEL_POPULATION_SEMANTICS = (
     "One population = registered directional candidates in the qualification "
     "funnel, de-duplicated by (scan_id, candidate_id). Screening evaluations are a "
-    "distinct population (venue instruments per scanner per scan) and are reported "
-    "separately, never added to the candidate population."
+    "distinct population (venue instruments per scanner per scan) that this version "
+    "does not project and never adds to the candidate population."
 )
 
 #: How to read a bucket value in this projection.
@@ -121,10 +120,6 @@ QUALIFICATION_FUNNEL_AVAILABILITY_SEMANTICS = (
     "from bucket counts and reported in the conservation remainder."
 )
 
-#: A reason-class-to-disposition rule. The canonical ``ReasonClass`` is the primary
-#: key; the mapping never contradicts the class it came from.
-_REASON_CLASS_DISPOSITION: Mapping[ReasonClass, "QualificationDisposition"] = {}
-
 
 class QualificationDisposition(str, Enum):
     """Derived coarse disposition of one candidate in one scan.
@@ -132,6 +127,11 @@ class QualificationDisposition(str, Enum):
     This is a *view* over the canonical terminal facts, not a canonical taxonomy.
     Every record still carries the canonical ``decision``, ``terminal_reason_code``
     and ``terminal_reason_class`` unchanged.
+
+    The bucket names deliberately mirror the cause classes already pre-registered
+    in :mod:`app.opip.profit_intelligence.semantics` (``MissedOpportunityCause``),
+    so the plane does not carry two rival vocabularies; they are not re-declared
+    here and the canonical taxonomy remains the single authority.
     """
 
     QUALIFIED = "QUALIFIED"
@@ -521,11 +521,16 @@ def funnel_conservation(
     holds = unattributed == 0 and (
         entered == qualified + rejected + operational + incomplete
     )
-    detail = (
-        "terminal dispositions reconcile to the entering population"
-        if holds
-        else f"{unattributed} record(s) carry no readable canonical identity"
-    )
+    if holds:
+        detail = "terminal dispositions reconcile to the entering population"
+    elif unattributed:
+        detail = f"{unattributed} record(s) carry no readable canonical identity"
+    else:
+        detail = (
+            "terminal dispositions do not reconcile: "
+            f"entered={entered} but attributed terminal buckets sum to "
+            f"{qualified + rejected + operational + incomplete}"
+        )
     return FunnelConservation(
         entered=entered,
         qualified=qualified,
@@ -740,18 +745,22 @@ def unavailable_qualification_funnel(
 def read_qualification_funnel_projection(
     *,
     funnel_events_path: Any = None,
-    screening_evaluations_path: Any = None,
     generated_at: datetime | None = None,
     window_hours: int | None = None,
 ) -> QualificationFunnelProjection:
     """Read persisted qualification evidence and project it.
 
-    Read-only. Uses the canonical store's tolerant reader so a single malformed
-    line cannot make the whole projection unavailable, and resolves the default
-    trading-host paths only when a path is not supplied.
+    Read-only. The canonical store's tolerant reader skips a single malformed
+    line rather than failing the whole read, but it also returns ``[]`` for an
+    absent file, so this function distinguishes an **absent** canonical evidence
+    file (``UNAVAILABLE``) from a file that was read and held nothing (a healthy
+    empty population). Resolves the default trading-host path only when a path is
+    not supplied.
     """
     # Imported lazily so this pure read model does not pull the store's write
     # machinery or filesystem paths into module import time.
+    from pathlib import Path
+
     from app.opip.decision.store import (
         FUNNEL_EVENTS_FILE,
         read_jsonl,
@@ -762,10 +771,14 @@ def read_qualification_funnel_projection(
         raise ValueError("generated_at must be timezone-aware")
     moment = moment.astimezone(timezone.utc)
 
-    path = funnel_events_path or FUNNEL_EVENTS_FILE
+    expected = Path(funnel_events_path or FUNNEL_EVENTS_FILE)
+    if not expected.exists():
+        return unavailable_qualification_funnel(
+            "QUALIFICATION_EVIDENCE_ABSENT", generated_at=moment
+        )
     try:
-        rows = read_jsonl(path)
-    except OSError as exc:  # pragma: no cover - defensive; read_jsonl swallows OSError
+        rows = read_jsonl(expected)
+    except OSError as exc:
         return unavailable_qualification_funnel(
             f"QUALIFICATION_EVIDENCE_UNREADABLE:{type(exc).__name__}",
             generated_at=moment,
