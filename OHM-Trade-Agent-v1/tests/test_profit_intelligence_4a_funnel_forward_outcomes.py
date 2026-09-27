@@ -923,6 +923,38 @@ def test_distinct_unreadable_rows_do_not_collapse_into_one_replay():
     assert projection.conservation.holds is False
 
 
+def test_row_missing_one_identity_component_stays_addressable():
+    # scan_id present, candidate_id missing: still an unreadable row, so two
+    # distinct rows must not collapse into one "replay".
+    first = _funnel_row(
+        decision=DecisionOutcome.QUALIFIED.value, scan_id="S1", candidate_id="C1"
+    )
+    first["candidate_id"] = None
+    second = dict(first)
+    projection = build_qualification_funnel_projection(
+        [first, second], generated_at=_NOW
+    )
+    assert len(projection.records) == 2
+    assert projection.duplicate_rows_ignored == 0
+    assert projection.conservation.unattributed == 2
+    assert projection.conservation.holds is False
+
+
+def test_same_identity_replay_still_deduplicates_when_decision_is_missing():
+    # Identity is present but the decision is unreadable: the two rows are the
+    # same candidate, so they are a genuine replay and must de-duplicate.
+    row = _funnel_row(
+        decision=DecisionOutcome.QUALIFIED.value, scan_id="S1", candidate_id="C1"
+    )
+    row["decision"] = None
+    projection = build_qualification_funnel_projection(
+        [row, dict(row)], generated_at=_NOW
+    )
+    assert len(projection.records) == 1
+    assert projection.duplicate_rows_ignored == 1
+    assert projection.conservation.unattributed == 1
+
+
 def test_disposition_cause_names_match_the_preregistered_cause_classes():
     from app.opip.profit_intelligence import MissedOpportunityCause
 

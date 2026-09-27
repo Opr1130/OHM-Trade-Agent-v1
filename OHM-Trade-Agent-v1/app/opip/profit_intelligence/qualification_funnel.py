@@ -476,16 +476,22 @@ def _record_from_row(row: Mapping[str, Any]) -> QualificationFunnelRecord:
     )
 
 
-def _identity_key(record: QualificationFunnelRecord) -> tuple[str, str]:
+def _identity_key(
+    record: QualificationFunnelRecord,
+) -> tuple[object, ...] | None:
     """Canonical de-duplication identity for one candidate in one scan.
 
     The funnel writes one row per candidate per scan, so a repeated
     ``(scan_id, candidate_id)`` is a replayed/retried append, not a second
-    opportunity. A row missing either part returns a blank pair, which the
-    caller replaces with a unique sentinel so distinct unreadable rows stay
-    addressable rather than being collapsed as replays.
+    opportunity. A row missing either identity part has no canonical identity to
+    de-duplicate on, so it returns ``None`` and the caller assigns a unique
+    sentinel: distinct unreadable rows stay addressable rather than being
+    collapsed as replays. Real identities are tuple-tagged, so no real identity
+    can collide with a sentinel.
     """
-    return (record.scan_id or "", record.candidate_id or "")
+    if not record.scan_id or not record.candidate_id:
+        return None
+    return ("id", record.scan_id, record.candidate_id)
 
 
 def funnel_conservation(
@@ -667,15 +673,15 @@ def build_qualification_funnel_projection(
 
     parsed = [_record_from_row(row) for row in rows if isinstance(row, Mapping)]
 
-    latest: dict[tuple[str, str], QualificationFunnelRecord] = {}
-    order: list[tuple[str, str]] = []
+    latest: dict[tuple[object, ...], QualificationFunnelRecord] = {}
+    order: list[tuple[object, ...]] = []
     duplicates = 0
     for index, record in enumerate(parsed):
         key = _identity_key(record)
-        if key == ("", ""):
-            # Keep an unreadable row addressable instead of collapsing distinct
-            # lost rows onto one blank identity and mislabelling them as replays.
-            key = ("<unidentified>", str(index))
+        if key is None:
+            # No canonical identity to de-duplicate on: keep the row addressable
+            # instead of collapsing distinct unreadable rows as replays.
+            key = ("anon", index)
         if key in latest:
             duplicates += 1
         else:

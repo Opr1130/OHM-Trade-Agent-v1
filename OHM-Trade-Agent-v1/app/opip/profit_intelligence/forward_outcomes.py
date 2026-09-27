@@ -617,15 +617,16 @@ def build_forward_outcome_projection(
     builder = _RECORD_BUILDERS[resolved_source]
     parsed = [builder(row) for row in rows if isinstance(row, Mapping)]
 
-    latest: dict[str, ForwardOutcomeRecord] = {}
-    order: list[str] = []
+    latest: dict[tuple[object, ...], ForwardOutcomeRecord] = {}
+    order: list[tuple[object, ...]] = []
     duplicates = 0
     for index, record in enumerate(parsed):
-        key = record.identity
-        if not key:
-            # Keep an unreadable row addressable instead of collapsing distinct
-            # lost rows onto one blank identity and mislabelling them as replays.
-            key = f"<unidentified>:{index}"
+        # Real identities are tuple-tagged so no real identity can collide with
+        # a sentinel; a row with no identity is kept addressable rather than
+        # collapsed as a replay.
+        key: tuple[object, ...] = (
+            ("id", record.identity) if record.identity else ("anon", index)
+        )
         if key in latest:
             duplicates += 1
         else:
