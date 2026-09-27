@@ -23,11 +23,24 @@ vocabulary, and the machine-readable evidence-gap registry.
 
 from __future__ import annotations
 
+from app.opip.profit_intelligence.economics import (
+    ECONOMIC_INTEGRITY_VERSION,
+    CostComponentEvidence,
+    EconomicIntegrity,
+    build_economic_integrity,
+)
 from app.opip.profit_intelligence.lineage import (
     LINEAGE_PROJECTION_VERSION,
     StageEvidence,
     TradeLineage,
     build_trade_lineage,
+)
+from app.opip.profit_intelligence.read_model import (
+    PROFIT_INTELLIGENCE_READ_MODEL_VERSION,
+    ProfitIntelligenceOverview,
+    build_lineage_for_trade,
+    build_profit_intelligence_overview,
+    unavailable_profit_intelligence,
 )
 from app.opip.profit_intelligence.semantics import (
     PROFIT_INTELLIGENCE_CONTRACT_VERSION,
@@ -46,21 +59,30 @@ from app.opip.profit_intelligence.semantics import (
 )
 
 __all__ = [
+    "ECONOMIC_INTEGRITY_VERSION",
     "EVIDENCE_GAPS",
     "LINEAGE_PROJECTION_VERSION",
     "LINEAGE_STAGE_ORDER",
     "MISSED_OPPORTUNITY_DISPOSITION",
     "MISSED_OPPORTUNITY_SAFEGUARDS",
     "PROFIT_INTELLIGENCE_CONTRACT_VERSION",
+    "PROFIT_INTELLIGENCE_READ_MODEL_VERSION",
+    "CostComponentEvidence",
     "EconomicComponent",
+    "EconomicIntegrity",
     "EvidenceGap",
     "EvidencePlane",
     "FactAvailability",
     "LineageStage",
     "MissedOpportunityCause",
     "MissedOpportunitySafeguards",
+    "ProfitIntelligenceOverview",
     "StageEvidence",
     "TradeLineage",
+    "build_economic_integrity",
+    "build_lineage_for_trade",
+    "build_profit_intelligence_overview",
     "build_trade_lineage",
     "net_pnl_reconciles",
+    "unavailable_profit_intelligence",
 ]
