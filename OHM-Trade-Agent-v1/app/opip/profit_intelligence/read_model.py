@@ -119,9 +119,22 @@ def build_profit_intelligence_overview(ledger: PaperLedger) -> ProfitIntelligenc
     """Compose the overview envelope from an already-read ledger.
 
     Deterministic and pure: the same ledger always yields the same envelope.
+
+    An unreadable ledger is reported as unavailable rather than counted. A ledger
+    whose trust envelope is not healthy could not be authoritatively read, so
+    emitting population counts for it would fabricate measured zeros for evidence
+    that was never observed - the failure mode this plane exists to prevent.
     """
     if not isinstance(ledger, PaperLedger):
         raise TypeError("ledger must be a PaperLedger")
+
+    if not ledger.trust.is_healthy:
+        reason = (
+            (ledger.details[0] if ledger.details else None)
+            or ",".join(ledger.trust.reasons)
+            or "LEDGER_NOT_HEALTHY"
+        )
+        return unavailable_profit_intelligence(reason)
 
     rows = ledger.entries
     integrity = build_economic_integrity(rows)

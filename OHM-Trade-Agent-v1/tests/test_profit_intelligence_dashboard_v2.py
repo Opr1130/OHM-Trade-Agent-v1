@@ -33,7 +33,7 @@ from app.opip.cockpit.ledger import (
     build_ledger,
     build_trade_row,
 )
-from app.opip.cockpit.trust import Completeness
+from app.opip.cockpit.trust import Completeness, unavailable
 from app.opip.contracts.paper_metrics import PAPER_METRICS
 from app.opip.profit_intelligence import (
     EVIDENCE_GAPS,
@@ -850,6 +850,50 @@ def test_unavailable_overview_fabricates_no_numeric_zero():
     payload = unavailable_profit_intelligence("CANONICAL_REPLICA_UNAVAILABLE").to_dict()
     assert payload["populations"] == {}
     assert payload["economic_integrity"] == []
+
+
+def test_an_unreadable_ledger_yields_no_fabricated_population_counts():
+    """The primary builder must honour an unhealthy read trust, not count it.
+
+    Review finding NB-2: composing an overview from a ledger whose own trust says
+    it could not be authoritatively read used to emit `trades: 0, settled: 0`,
+    which asserts a measured emptiness that was never observed.
+    """
+    unreadable = PaperLedger(
+        entries=(),
+        trust=unavailable("CANONICAL_REPLICA_UNAVAILABLE"),
+        details=("CANONICAL_REPLICA_UNAVAILABLE",),
+    )
+    assert unreadable.trust.is_healthy is False
+
+    payload = build_profit_intelligence_overview(unreadable).to_dict()
+
+    assert payload["populations"] == {}
+    assert payload["economic_integrity"] == []
+    assert payload["trust"]["is_healthy"] is False
+    assert payload["trust"]["completeness"] == Completeness.UNKNOWN.value
+    assert payload["details"]
+
+
+def test_nested_integrity_trust_is_the_authority_for_economic_health():
+    """Guide consumers to the nested trust when economics are unverified.
+
+    Review finding NB-1: the overview's top-level trust describes the *read*
+    (matching the established cockpit portfolio semantics), so it can read healthy
+    while the economics inside it are indicative. The nested integrity trust is
+    what a consumer must consult before presenting an economic result as settled.
+    """
+    payload = build_profit_intelligence_overview(
+        _ledger(_entry(final_verified=False))
+    ).to_dict()
+
+    # The read succeeded, so the read trust is healthy...
+    assert payload["trust"]["is_healthy"] is True
+    # ...but the economics it carries are explicitly not settled.
+    integrity = payload["economic_integrity"][0]
+    assert integrity["trust"]["is_healthy"] is False
+    assert "ECONOMICS_NOT_FINAL_VERIFIED" in integrity["trust"]["reasons"]
+    assert integrity["indicative"] == 1
 
 
 def test_overview_rejects_a_non_ledger_input():
