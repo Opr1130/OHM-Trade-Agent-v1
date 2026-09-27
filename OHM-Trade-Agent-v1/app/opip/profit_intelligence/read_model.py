@@ -145,12 +145,17 @@ def join_funnel_record_to_forward_outcomes(
     that carries no episode identity (Discovery is instrument-level) cannot
     match and is reported as no match, not guessed.
 
-    Only **healthy** projections are searched. A projection that could not be
+    Only **readable** projections are searched. A projection that could not be
     authoritatively read is never treated as an empty-but-certain source: if no
     supplied projection is readable, or a search across the readable ones finds
     nothing while some source was unreadable, the join reports
     ``SOURCE_UNAVAILABLE`` rather than ``NO_MATCH``. ``NO_MATCH`` means a
     verified absence across every supplied, readable source.
+
+    "Readable" is the source being retrievable, *not* fully matured: a source
+    that was read but still has unmatured windows is searched, so a partial
+    window never hides a real match or masks a second match that should make the
+    join ``AMBIGUOUS``.
     """
     if not projections:
         return ForwardOutcomeJoin(
@@ -159,10 +164,12 @@ def join_funnel_record_to_forward_outcomes(
             episode_id=record.episode_id,
             detail="no forward-outcome projection was supplied",
         )
-    healthy = tuple(
-        projection for projection in projections if projection.trust.is_healthy
+    readable = tuple(
+        projection
+        for projection in projections
+        if projection.trust.freshness is not Freshness.UNAVAILABLE
     )
-    if not healthy:
+    if not readable:
         return ForwardOutcomeJoin(
             status=ForwardOutcomeJoinStatus.SOURCE_UNAVAILABLE,
             funnel_candidate_id=record.candidate_id,
@@ -181,13 +188,13 @@ def join_funnel_record_to_forward_outcomes(
         )
 
     matches: list[ForwardOutcomeRecord] = []
-    for projection in healthy:
+    for projection in readable:
         for forward in projection.records:
             if forward.canonical_episode_id == record.episode_id:
                 matches.append(forward)
 
     if not matches:
-        if len(healthy) < len(projections):
+        if len(readable) < len(projections):
             return ForwardOutcomeJoin(
                 status=ForwardOutcomeJoinStatus.SOURCE_UNAVAILABLE,
                 funnel_candidate_id=record.candidate_id,

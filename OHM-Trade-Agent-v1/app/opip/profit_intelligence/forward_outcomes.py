@@ -627,11 +627,19 @@ def build_forward_outcome_projection(
         key: tuple[object, ...] = (
             ("id", record.identity) if record.identity else ("anon", index)
         )
-        if key in latest:
-            duplicates += 1
-        else:
+        existing = latest.get(key)
+        if existing is None:
             order.append(key)
-        latest[key] = record
+            latest[key] = record
+            continue
+        duplicates += 1
+        # A later unreadable replay must not erase an earlier readable record;
+        # otherwise the latest revision wins.
+        if (
+            existing.availability is not FactAvailability.KNOWN
+            and record.availability is FactAvailability.KNOWN
+        ):
+            latest[key] = record
     records = tuple(latest[key] for key in order)
 
     horizon_ids = sorted(
@@ -746,6 +754,15 @@ def read_forward_outcome_projection(
     except OSError:
         return unavailable_forward_outcomes(
             f"FORWARD_OUTCOME_EVIDENCE_UNREADABLE:{resolved_source.value}",
+            source=resolved_source,
+            generated_at=moment,
+        )
+
+    if not rows and expected.stat().st_size > 0:
+        # Present but wholly unparseable: not the same as a read-and-empty
+        # family, so it must not read as a healthy zero.
+        return unavailable_forward_outcomes(
+            f"FORWARD_OUTCOME_EVIDENCE_UNPARSEABLE:{resolved_source.value}",
             source=resolved_source,
             generated_at=moment,
         )

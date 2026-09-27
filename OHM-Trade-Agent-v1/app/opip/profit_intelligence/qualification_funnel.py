@@ -682,11 +682,19 @@ def build_qualification_funnel_projection(
             # No canonical identity to de-duplicate on: keep the row addressable
             # instead of collapsing distinct unreadable rows as replays.
             key = ("anon", index)
-        if key in latest:
-            duplicates += 1
-        else:
+        existing = latest.get(key)
+        if existing is None:
             order.append(key)
-        latest[key] = record
+            latest[key] = record
+            continue
+        duplicates += 1
+        # A later unreadable replay must not erase an earlier readable decision;
+        # otherwise the latest revision wins.
+        if (
+            existing.availability is not FactAvailability.KNOWN
+            and record.availability is FactAvailability.KNOWN
+        ):
+            latest[key] = record
     records = tuple(latest[key] for key in order)
 
     conservation = funnel_conservation(records)
@@ -802,6 +810,12 @@ def read_qualification_funnel_projection(
         return unavailable_qualification_funnel(
             f"QUALIFICATION_EVIDENCE_UNREADABLE:{type(exc).__name__}",
             generated_at=moment,
+        )
+    if not rows and expected.stat().st_size > 0:
+        # Present but wholly unparseable: not the same as a read-and-empty
+        # population, so it must not read as a healthy zero.
+        return unavailable_qualification_funnel(
+            "QUALIFICATION_EVIDENCE_UNPARSEABLE", generated_at=moment
         )
 
     window_start = None

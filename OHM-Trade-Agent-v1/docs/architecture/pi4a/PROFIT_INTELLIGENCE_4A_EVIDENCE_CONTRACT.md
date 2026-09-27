@@ -49,9 +49,9 @@ Availability reuses `app.opip.cockpit.trust` (`Freshness`, `Completeness`,
   `EXECUTION_FAILED`: risk gates and execution attempts are downstream of this
   family.
 - `UNAVAILABLE` / `UNKNOWN` / `INCOMPLETE` are never converted into `0`.
-- An unreadable store yields a structurally identical envelope with
-  `UNAVAILABLE` freshness and `UNKNOWN` completeness — never an empty-but-healthy
-  result.
+- An absent evidence file, and a present-but-wholly-unparseable file, both yield
+  a structurally identical envelope with `UNAVAILABLE` freshness and `UNKNOWN`
+  completeness — never an empty-but-healthy result.
 
 ## Conservation and idempotency
 
@@ -83,12 +83,13 @@ Availability reuses `app.opip.cockpit.trust` (`Freshness`, `Completeness`,
 `join_funnel_record_to_forward_outcomes` joins on the canonical episode identity
 (`funnel.episode_id` ↔ `forward.canonical_episode_id`). It reports
 `MATCHED` / `NO_MATCH` / `AMBIGUOUS` / `IDENTITY_UNAVAILABLE` /
-`SOURCE_UNAVAILABLE` and never chooses a row from an ambiguous match. `NO_MATCH`
-means a verified absence across every supplied **readable** source; if any
-supplied source was unreadable (or none was read), the join reports
-`SOURCE_UNAVAILABLE` rather than asserting absence. Even on a match it returns
-`classification = MISSED_PROFIT_CLASSIFICATION_UNAVAILABLE`: a positive market
-outcome is not executable profit.
+`SOURCE_UNAVAILABLE` and never chooses a row from an ambiguous match. "Readable"
+means the source was retrievable, not fully matured, so a partially matured source
+is still searched. `NO_MATCH` means a verified absence across every supplied
+**readable** source; if any supplied source was unreadable (or none was read), the
+join reports `SOURCE_UNAVAILABLE` rather than asserting absence. Even on a match
+it returns `classification = MISSED_PROFIT_CLASSIFICATION_UNAVAILABLE`: a positive
+market outcome is not executable profit.
 
 ## Missed profitable opportunity
 

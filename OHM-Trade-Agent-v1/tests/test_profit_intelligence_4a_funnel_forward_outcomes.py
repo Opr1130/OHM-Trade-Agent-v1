@@ -961,3 +961,69 @@ def test_disposition_cause_names_match_the_preregistered_cause_classes():
     buckets = {member.value for member in QualificationDisposition}
     for cause in MissedOpportunityCause:
         assert cause.value in buckets, f"cause {cause.value} missing a bucket"
+
+
+def test_join_searches_a_readable_but_incomplete_source():
+    # A readable source with an unmatured window is still readable, so a real
+    # match must be found rather than suppressed as unavailable.
+    incomplete = build_forward_outcome_projection(
+        [_phase3c_row(window_complete=False, episode_id="EP:1")],
+        source=ForwardOutcomeSource.PHASE3C,
+        generated_at=_NOW,
+    )
+    assert incomplete.trust.is_healthy is False  # INCOMPLETE, not COMPLETE
+    result = join_funnel_record_to_forward_outcomes(_funnel_record("EP:1"), [incomplete])
+    assert result.status is ForwardOutcomeJoinStatus.MATCHED
+
+
+def test_join_preserves_ambiguity_across_a_readable_incomplete_source():
+    incomplete = build_forward_outcome_projection(
+        [
+            _phase3c_row(snapshot_id="S1", episode_id="EP:1", window_complete=False),
+            _phase3c_row(snapshot_id="S2", episode_id="EP:1", window_complete=False),
+        ],
+        source=ForwardOutcomeSource.PHASE3C,
+        generated_at=_NOW,
+    )
+    result = join_funnel_record_to_forward_outcomes(_funnel_record("EP:1"), [incomplete])
+    assert result.status is ForwardOutcomeJoinStatus.AMBIGUOUS
+
+
+def test_present_but_unparseable_funnel_file_is_unavailable(tmp_path):
+    path = tmp_path / "funnel.jsonl"
+    path.write_text("this is not json\nneither is this\n", encoding="utf-8")
+    projection = read_qualification_funnel_projection(
+        funnel_events_path=path, generated_at=_NOW
+    )
+    assert projection.records == ()
+    assert projection.trust.is_healthy is False
+
+
+def test_present_but_unparseable_forward_file_is_unavailable(tmp_path):
+    path = tmp_path / "fwd.jsonl"
+    path.write_text("garbage\n", encoding="utf-8")
+    for source in (ForwardOutcomeSource.PHASE3C, ForwardOutcomeSource.DISCOVERY):
+        projection = read_forward_outcome_projection(
+            source=source, path=path, generated_at=_NOW
+        )
+        assert projection.records == ()
+        assert projection.trust.is_healthy is False
+
+
+def test_later_unreadable_replay_does_not_erase_a_readable_decision():
+    readable = _funnel_row(
+        decision=DecisionOutcome.QUALIFIED.value, scan_id="S1", candidate_id="C1"
+    )
+    unreadable = dict(readable)
+    unreadable["decision"] = None
+    projection = build_qualification_funnel_projection(
+        [readable, unreadable], generated_at=_NOW
+    )
+    assert len(projection.records) == 1
+    assert projection.records[0].availability.value == "KNOWN"
+    assert projection.records[0].decision == DecisionOutcome.QUALIFIED.value
+    # Reverse order (readable arrives last) also keeps the readable record.
+    rev = build_qualification_funnel_projection(
+        [unreadable, readable], generated_at=_NOW
+    )
+    assert rev.records[0].availability.value == "KNOWN"
