@@ -522,7 +522,8 @@ def test_lineage_indicative_economics_are_derived_never_known():
     lineage = build_trade_lineage(row)
     stage = lineage.stage(LineageStage.ECONOMICS)
     assert stage.availability is FactAvailability.DERIVED
-    assert stage.note and "indicative" in stage.note
+    assert stage.note
+    assert "indicative" in stage.note
 
 
 def test_lineage_economics_surfaces_conservation_flag():
@@ -910,8 +911,9 @@ def test_build_lineage_for_trade_returns_none_when_the_trade_is_absent():
 
 
 def test_build_lineage_for_trade_rejects_a_blank_identifier():
+    ledger = _ledger()
     with pytest.raises(ValueError):
-        build_lineage_for_trade(_ledger(), "   ")
+        build_lineage_for_trade(ledger, "   ")
 
 
 def test_build_lineage_for_trade_finds_the_matching_row():
