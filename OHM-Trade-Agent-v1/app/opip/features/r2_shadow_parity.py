@@ -283,7 +283,7 @@ def capture_replay_evidence(
 def load_replay_evidence(
     payload: ReplayEvidence | Mapping[str, Any],
 ) -> ReplayEvidence:
-    """Rebuild captured evidence, refusing anything outside the declared shape."""
+    """Rebuild captured evidence, refusing anything outside the declared fields."""
     if isinstance(payload, ReplayEvidence):
         return payload
     if not isinstance(payload, Mapping):
