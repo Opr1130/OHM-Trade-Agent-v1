@@ -279,6 +279,8 @@ class QualificationGateObservation:
     @classmethod
     def from_row(cls, row: Mapping[str, Any]) -> "QualificationGateObservation":
         def _finite(value: Any) -> float | None:
+            if isinstance(value, bool):
+                return None
             try:
                 number = float(value)
             except (TypeError, ValueError):
@@ -672,6 +674,17 @@ def build_qualification_funnel_projection(
     moment = moment.astimezone(timezone.utc)
 
     parsed = [_record_from_row(row) for row in rows if isinstance(row, Mapping)]
+
+    if window_start is not None and window_end is not None:
+        # Apply the declared window: keep dated rows inside it, and keep rows
+        # whose decision time could not be read (absence of a timestamp is not
+        # proof that the row is outside the window).
+        parsed = [
+            record
+            for record in parsed
+            if record.decided_at is None
+            or window_start <= record.decided_at <= window_end
+        ]
 
     latest: dict[tuple[object, ...], QualificationFunnelRecord] = {}
     order: list[tuple[object, ...]] = []

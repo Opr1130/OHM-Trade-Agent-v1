@@ -324,6 +324,18 @@ def _build_horizon(
         window_start=window_start,
         window_end=window_end,
     )
+    availability = _horizon_availability(
+        observed=observed,
+        window_complete=window_complete,
+        point_in_time=point_in_time,
+        has_return=return_pct is not None,
+    )
+    if availability is FactAvailability.UNAVAILABLE:
+        # An unavailable horizon must not carry a numeric value: the value would
+        # be an assertion the projection itself refuses to certify.
+        return_pct = None
+        mfe_pct = None
+        mae_pct = None
     return ForwardOutcomeHorizon(
         horizon_id=label,
         horizon_seconds=seconds,
@@ -336,12 +348,7 @@ def _build_horizon(
         return_pct=return_pct,
         mfe_pct=mfe_pct,
         mae_pct=mae_pct,
-        availability=_horizon_availability(
-            observed=observed,
-            window_complete=window_complete,
-            point_in_time=point_in_time,
-            has_return=return_pct is not None,
-        ),
+        availability=availability,
     )
 
 

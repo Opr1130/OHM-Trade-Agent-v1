@@ -529,6 +529,57 @@ def test_unavailable_market_data_is_never_a_zero_return():
     assert hour.availability.value == "UNAVAILABLE"
 
 
+def test_unavailable_horizon_carries_no_numeric_value():
+    # A value present in the row but marked unobserved must not be published as a
+    # number on an UNAVAILABLE horizon.
+    row = _phase3c_row()
+    row["horizon_returns_pct"] = {"1h": 5.0}
+    row["horizon_observed"] = {"1h": False}
+    projection = build_forward_outcome_projection(
+        [row], source=ForwardOutcomeSource.PHASE3C, generated_at=_NOW
+    )
+    hour = next(h for h in projection.records[0].horizons if h.horizon_id == "1h")
+    assert hour.availability.value == "UNAVAILABLE"
+    assert hour.return_pct is None
+    assert hour.observed is False
+
+
+def test_funnel_window_filters_dated_rows_and_keeps_undated_ones():
+    inside = _funnel_row(
+        decision=DecisionOutcome.QUALIFIED.value, scan_id="S1", candidate_id="C1"
+    )
+    outside = _funnel_row(
+        decision=DecisionOutcome.QUALIFIED.value, scan_id="S1", candidate_id="C2"
+    )
+    outside["decided_at"] = (_NOW - timedelta(days=10)).isoformat()
+    outside["decision_at_utc"] = outside["decided_at"]
+    undated = _funnel_row(
+        decision=DecisionOutcome.QUALIFIED.value, scan_id="S1", candidate_id="C3"
+    )
+    undated["decided_at"] = None
+    undated["decision_at_utc"] = None
+    projection = build_qualification_funnel_projection(
+        [inside, outside, undated],
+        generated_at=_NOW,
+        window_start=_NOW - timedelta(hours=24),
+        window_end=_NOW,
+    )
+    kept = {record.candidate_id for record in projection.records}
+    assert kept == {"C1", "C3"}
+
+
+def test_gate_boolean_measurement_is_not_coerced_to_a_number():
+    row = _funnel_row(
+        decision=DecisionOutcome.REJECTED.value,
+        reason_code=ReasonCode.ECONOMIC_GATE_FAILED.value,
+        reason_class=ReasonClass.POLICY.value,
+        gate="ECONOMIC_QUALITY",
+    )
+    row["gate_results"][0]["measured_value"] = True
+    projection = build_qualification_funnel_projection([row], generated_at=_NOW)
+    assert projection.records[0].gates[0].measured_value is None
+
+
 def test_unknown_horizon_label_fails_closed_to_unavailable():
     row = _phase3c_row()
     row["horizon_returns_pct"] = {"7h": 1.0}
