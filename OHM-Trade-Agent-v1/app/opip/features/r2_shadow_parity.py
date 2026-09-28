@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import math
 from typing import Any, Mapping, Sequence
 
 from app.opip.contracts.enums import CoverageState, PayloadKind
@@ -36,7 +37,6 @@ from app.opip.features.engine import (
     PERCENTILE_LOOKBACK_INTERVALS,
     VALUE_PRECISION,
     build_feature_snapshot,
-    compute_features,
 )
 from app.opip.features.indicators import (
     safe_atr_percentage_series,
@@ -48,8 +48,14 @@ from app.opip.features.parity import (
     compare_against_production_indicators,
     percentile_definition_divergence,
 )
+from app.opip.features.pipeline import CycleIdentityMismatch, _assert_cycle_identity
 from app.opip.features.replay import assert_snapshot_determinism
-from app.opip.market.aggregates import AlignmentResult, align_minute_observations, contiguous_tail
+from app.opip.market.aggregates import (
+    DEFAULT_INTERVAL_SECONDS,
+    AlignmentResult,
+    align_minute_observations,
+    contiguous_tail,
+)
 
 EXACT_EQUALITY_RULE = "exact_absolute_tolerance_0"
 NOT_COMPARABLE_RULE = "not_comparable_legacy_value_absent"
@@ -91,6 +97,7 @@ _EVIDENCE_KEYS: tuple[str, ...] = (
     "instrument_version_id",
     "venue",
     "venue_instrument_id",
+    "observation_id",
     "source_event_time",
     "receipt_time",
     "ingestion_order",
@@ -110,6 +117,10 @@ _EVIDENCE_KEYS: tuple[str, ...] = (
 
 class FeatureVersionMismatch(ValueError):
     """Replay refused because the declared feature version is not this engine."""
+
+
+class WatermarkIntegrityError(ValueError):
+    """Replay refused because the consumed watermark cannot be proven honest."""
 
 
 @dataclass(frozen=True)
@@ -213,10 +224,63 @@ def source_evidence_identity(
 def load_observation_evidence(
     payload: Sequence[Mapping[str, Any]],
 ) -> tuple[Observation, ...]:
-    """Rebuild observations from a captured payload. Missing keys fail closed."""
+    """Rebuild observations from a captured payload.
+
+    Every row must carry its ``observation_id`` and that id must equal the id
+    the contract derives from the reconstructed record. Missing or mismatched
+    identity fails closed; the serialized id is never trusted on its own.
+    """
     if isinstance(payload, (str, bytes)) or not isinstance(payload, Sequence):
         raise ValueError("replay evidence must be a sequence of observation records")
     return tuple(_observation_from_evidence(item) for item in payload)
+
+
+def _assert_replay_identity(
+    observations: Sequence[Observation],
+    *,
+    instrument_version: InstrumentVersion,
+) -> None:
+    """Same identity semantics the live feature-bus cycle enforces.
+
+    The rule is owned by ``pipeline._assert_cycle_identity`` and reused here so
+    replay cannot accept evidence for a different instrument than the one the
+    snapshot will be labelled with.
+    """
+    _assert_cycle_identity(
+        observations,
+        instrument_version=instrument_version,
+        state=None,
+        interval_seconds=DEFAULT_INTERVAL_SECONDS,
+    )
+
+
+def _require_consumed_watermark(
+    observations: Sequence[Observation],
+    *,
+    consumed_input_watermark: ConsumedInputWatermark,
+) -> None:
+    """Refuse a watermark that is earlier than consumed captured evidence.
+
+    A snapshot may not claim it has not consumed evidence that is in its own
+    values. Evidence with no commit order at all carries no consumed claim;
+    partially committed evidence cannot prove its watermark and fails closed.
+    """
+    committed = [
+        item.commit_order for item in observations if item.commit_order is not None
+    ]
+    if not committed:
+        return
+    if len(committed) != len(observations):
+        raise WatermarkIntegrityError(
+            "replay evidence mixes committed and uncommitted observations; "
+            "the consumed input watermark cannot be proven"
+        )
+    highest = max(committed)
+    if consumed_input_watermark < highest:
+        raise WatermarkIntegrityError(
+            f"consumed input watermark {consumed_input_watermark.to_dict()} precedes "
+            f"captured evidence commit order {highest.to_dict()}"
+        )
 
 
 def replay_feature_snapshot(
@@ -232,9 +296,16 @@ def replay_feature_snapshot(
     """Feed frozen observations through the existing feature bus.
 
     A declared feature version other than this engine's ``FEATURE_VERSION``
-    is refused before any value is computed.
+    is refused before any value is computed. Evidence that does not belong to
+    the supplied ``InstrumentVersion`` is refused before alignment, and a
+    watermark earlier than the captured evidence is refused before the
+    snapshot is sealed.
     """
     _require_feature_version(declared_feature_version)
+    _assert_replay_identity(observations, instrument_version=instrument_version)
+    _require_consumed_watermark(
+        observations, consumed_input_watermark=consumed_input_watermark
+    )
     alignment = align_minute_observations(observations, cutoff=evaluation_cutoff)
     return build_feature_snapshot(
         alignment,
@@ -280,6 +351,7 @@ def replay_captured_evidence(
     assert_snapshot_determinism((first, second))
     report = classify_shadow_parity(
         align_minute_observations(loaded, cutoff=evaluation_cutoff),
+        bus_values=first.values,
         instrument_version=instrument_version,
         evaluated_at_utc=evaluated_at_utc,
         evidence_identity=source_evidence_identity(
@@ -294,20 +366,24 @@ def replay_captured_evidence(
 def classify_shadow_parity(
     alignment: AlignmentResult,
     *,
+    bus_values: Mapping[str, Any],
     instrument_version: InstrumentVersion,
     evaluated_at_utc: datetime,
     evidence_identity: str,
     feature_version: str,
     snapshot_id: str | None = None,
 ) -> ClassifiedParityReport:
-    """Field-level parity. Tolerance stays at the existing zero."""
+    """Field-level parity for one sealed snapshot.
+
+    ``bus_values`` must be the ``FeatureSnapshot.values`` being reported, so
+    the artifact describes the exact snapshot it names. The feature-bus side is
+    never recomputed here; only the legacy reference values are produced, by
+    calling the existing production indicator functions.
+    """
     if ABSOLUTE_TOLERANCE != 0.0:
         raise AssertionError("R2 parity refuses a non-zero tolerance")
-    computed = compute_features(
-        alignment,
-        instrument_version=instrument_version,
-        evaluated_at_utc=evaluated_at_utc,
-    ).values
+    if set(bus_values) != set(FEATURE_NAMES):
+        raise AssertionError("parity bus values do not cover FEATURE_NAMES")
     indicator_report = compare_against_production_indicators(
         alignment,
         instrument_version=instrument_version,
@@ -320,10 +396,12 @@ def classify_shadow_parity(
     percentile_refs = _percentile_references(alignment)
     rows: list[ClassifiedParityRow] = []
     for name in FEATURE_NAMES:
+        bus_value = bus_values[name]
         if name in indicator_by_name:
             rows.append(
                 _indicator_row(
                     indicator_by_name[name],
+                    bus_value=bus_value,
                     evidence_identity=evidence_identity,
                     feature_version=feature_version,
                 )
@@ -333,7 +411,7 @@ def classify_shadow_parity(
             rows.extend(
                 _percentile_rows(
                     name,
-                    feature_bus_value=computed.get(name),
+                    feature_bus_value=bus_value,
                     reference=percentile_refs[name],
                     evidence_identity=evidence_identity,
                     feature_version=feature_version,
@@ -344,7 +422,7 @@ def classify_shadow_parity(
             rows.append(
                 _not_retained_row(
                     name,
-                    feature_bus_value=computed.get(name),
+                    feature_bus_value=bus_value,
                     evidence_identity=evidence_identity,
                     feature_version=feature_version,
                 )
@@ -353,7 +431,7 @@ def classify_shadow_parity(
         rows.append(
             _unavailable_row(
                 name,
-                feature_bus_value=computed.get(name),
+                feature_bus_value=bus_value,
                 evidence_identity=evidence_identity,
                 feature_version=feature_version,
             )
@@ -378,25 +456,43 @@ def _require_feature_version(declared_feature_version: str) -> None:
         )
 
 
+def _exactly_equal(left: Any, right: Any) -> bool:
+    """Exact equality under the frozen zero-tolerance parity rule.
+
+    ``math.isclose`` with both tolerances pinned to the module's
+    non-configurable ``ABSOLUTE_TOLERANCE`` states the comparison rule
+    directly, so no hidden epsilon is introduced and absence only matches
+    absence.
+    """
+    if left is None or right is None:
+        return left is None and right is None
+    return math.isclose(
+        float(left), float(right), rel_tol=0.0, abs_tol=ABSOLUTE_TOLERANCE
+    )
+
+
 def _indicator_row(
     check: Any,
     *,
+    bus_value: Any,
     evidence_identity: str,
     feature_version: str,
 ) -> ClassifiedParityRow:
-    matched = bool(check.matched)
+    bus = _round(bus_value)
+    reference = check.reference_value
+    matched = _exactly_equal(bus, reference)
     return ClassifiedParityRow(
         feature_name=check.feature,
-        legacy_value=check.reference_value,
-        feature_bus_value=check.feature_bus_value,
+        legacy_value=reference,
+        feature_bus_value=bus,
         equality_rule=EXACT_EQUALITY_RULE,
         classification="MATCH" if matched else "IMPLEMENTATION_DEFECT",
         reason=(
-            f"Feature bus value equals {check.reference} "
+            f"Snapshot value equals {check.reference} "
             f"under absolute tolerance {ABSOLUTE_TOLERANCE}."
             if matched
             else (
-                f"Feature bus value differs from {check.reference} "
+                f"Snapshot value differs from {check.reference} "
                 f"under absolute tolerance {ABSOLUTE_TOLERANCE}."
             )
         ),
@@ -416,7 +512,7 @@ def _percentile_rows(
 ) -> tuple[ClassifiedParityRow, ...]:
     bus = _round(feature_bus_value)
     indicator = reference.indicator_value
-    if bus == indicator:
+    if _exactly_equal(bus, indicator):
         primary = ClassifiedParityRow(
             feature_name=name,
             legacy_value=indicator,
@@ -448,7 +544,7 @@ def _percentile_rows(
         )
     if reference.scan_value is None:
         return (primary,)
-    scan_equal = bus == reference.scan_value
+    scan_equal = _exactly_equal(bus, reference.scan_value)
     secondary = ClassifiedParityRow(
         feature_name=name,
         legacy_value=reference.scan_value,
@@ -595,7 +691,10 @@ def _observation_from_evidence(raw: Mapping[str, Any]) -> Observation:
     provenance = raw["provenance"]
     if not isinstance(provenance, Mapping):
         raise ValueError("replay evidence provenance must be an object")
-    return Observation(
+    captured_id = raw["observation_id"]
+    if not isinstance(captured_id, str) or not captured_id.strip():
+        raise ValueError("replay evidence observation_id must be a non-empty string")
+    reconstructed = Observation(
         instrument_version_id=str(raw["instrument_version_id"]),
         venue=str(raw["venue"]),
         venue_instrument_id=str(raw["venue_instrument_id"]),
@@ -620,6 +719,13 @@ def _observation_from_evidence(raw: Mapping[str, Any]) -> Observation:
         commit_order=commit_order,
         schema_version=int(raw["schema_version"]),
     )
+    if reconstructed.observation_id != captured_id:
+        raise ValueError(
+            "replay evidence observation_id does not match the reconstructed "
+            f"record: captured {captured_id!r} != reconstructed "
+            f"{reconstructed.observation_id!r}"
+        )
+    return reconstructed
 
 
 def _parse_time(value: Any, field_name: str) -> datetime:
@@ -632,7 +738,9 @@ def _parse_time(value: Any, field_name: str) -> datetime:
 __all__ = [
     "CLASSIFICATIONS",
     "EXACT_EQUALITY_RULE",
+    "CycleIdentityMismatch",
     "FeatureVersionMismatch",
+    "WatermarkIntegrityError",
     "ClassifiedParityReport",
     "ClassifiedParityRow",
     "capture_observation_evidence",

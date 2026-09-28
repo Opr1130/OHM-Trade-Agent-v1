@@ -14,15 +14,22 @@ import pytest
 
 from app.opip.contracts.enums import Missingness
 from app.opip.contracts.identity import ConsumedInputWatermark, InstrumentVersion
-from app.opip.features.engine import FEATURE_VERSION, FEATURE_WINDOW_INTERVALS
+from app.opip.features.engine import (
+    FEATURE_NAMES,
+    FEATURE_VERSION,
+    FEATURE_WINDOW_INTERVALS,
+)
+from app.opip.features.pipeline import CycleIdentityMismatch
 from app.opip.features.publisher import resolve_feature_bus_mode
 from app.opip.features.r2_shadow_parity import (
     CLASSIFICATIONS,
     FeatureVersionMismatch,
+    WatermarkIntegrityError,
     capture_observation_evidence,
     load_observation_evidence,
     replay_captured_evidence,
     replay_feature_snapshot,
+    source_evidence_identity,
 )
 from app.opip.features.replay import compare_resumed_state, reconstruct_state
 from app.opip.features.state import advance_state, initial_state, to_checkpoint
@@ -34,19 +41,21 @@ CUTOFF = datetime(2026, 9, 11, 15, 1, 0, tzinfo=timezone.utc)
 SOURCE = "r2-shadow-parity-test"
 
 
-def _instrument() -> InstrumentVersion:
-    return InstrumentVersion(
-        venue="kraken",
-        base_asset="SOL",
-        quote_currency="USD",
-        venue_instrument_id="SOLUSD",
-        version=1,
-        reference_data_version="opip-evidence-identity-v1",
-        observed_at_utc=NOW,
-        price_decimals=2,
-        tick_size=0.01,
-        min_order_size=0.2,
-    )
+def _instrument(**overrides) -> InstrumentVersion:
+    params = {
+        "venue": "kraken",
+        "base_asset": "SOL",
+        "quote_currency": "USD",
+        "venue_instrument_id": "SOLUSD",
+        "version": 1,
+        "reference_data_version": "opip-evidence-identity-v1",
+        "observed_at_utc": NOW,
+        "price_decimals": 2,
+        "tick_size": 0.01,
+        "min_order_size": 0.2,
+    }
+    params.update(overrides)
+    return InstrumentVersion(**params)
 
 
 def _rows(
@@ -78,8 +87,14 @@ def _rows(
     return rows
 
 
-def _observations(rows, *, receipt_time: datetime = NOW, now: datetime = NOW):
-    instrument = _instrument()
+def _observations(
+    rows,
+    *,
+    instrument: InstrumentVersion | None = None,
+    receipt_time: datetime = NOW,
+    now: datetime = NOW,
+):
+    instrument = instrument or _instrument()
     result = normalize_interval_rows(
         rows,
         instrument_version=instrument,
@@ -115,16 +130,20 @@ def _replay(
     cutoff: datetime = CUTOFF,
     version: str = FEATURE_VERSION,
     evaluated_at: datetime | None = None,
+    instrument: InstrumentVersion | None = None,
+    watermark: ConsumedInputWatermark | None = None,
 ):
     payload = capture_observation_evidence(observations)
     if evaluated_at is None:
         evaluated_at = NOW if NOW >= cutoff else cutoff
     return replay_captured_evidence(
         payload,
-        instrument_version=_instrument(),
+        instrument_version=instrument or _instrument(),
         evaluation_cutoff=cutoff,
         evaluated_at_utc=evaluated_at,
-        consumed_input_watermark=_watermark(observations),
+        consumed_input_watermark=(
+            watermark if watermark is not None else _watermark(observations)
+        ),
         source_version=SOURCE,
         declared_feature_version=version,
     )
@@ -400,3 +419,210 @@ def test_feature_bus_mode_stays_off_and_cycle_does_not_call_it():
     cycle = (root / "app" / "jobs" / "run_cycle.py").read_text(encoding="utf-8")
     assert "run_feature_bus_pilot" not in cycle
     assert "opip.features" not in cycle
+
+
+# --------------------------------------------------------------------------- #
+# Finding 1 - replay fails closed on instrument identity mismatch
+# --------------------------------------------------------------------------- #
+
+
+def test_replay_refuses_foreign_instrument_version_id():
+    observations, _normalized = _observations(_rows(count=5))
+    foreign = _instrument(version=2)
+    with pytest.raises(CycleIdentityMismatch, match="instrument_version_id"):
+        _replay(observations, instrument=foreign)
+
+
+def test_replay_refuses_foreign_venue():
+    observations, _normalized = _observations(_rows(count=5))
+    tampered = tuple(replace(item, venue="binance") for item in observations)
+    # instrument_version_id already encodes the venue, so this row is corrupt
+    # evidence whose derived id must be reconciled, not relabelled.
+    assert all(item.instrument_version_id == _instrument().instrument_version_id for item in tampered)
+    with pytest.raises(CycleIdentityMismatch, match="venue"):
+        _replay(tampered)
+
+
+def test_replay_refuses_foreign_venue_instrument_id():
+    observations, _normalized = _observations(_rows(count=5))
+    tampered = tuple(
+        replace(item, venue_instrument_id="BTCUSD") for item in observations
+    )
+    with pytest.raises(CycleIdentityMismatch, match="venue_instrument_id"):
+        _replay(tampered)
+
+
+def test_replay_refuses_mixed_instrument_evidence_before_alignment():
+    first, _normalized = _observations(_rows(count=5))
+    second, _normalized = _observations(
+        _rows(count=5), instrument=_instrument(version=2)
+    )
+    # Identical timestamps across two instruments are exactly the collision
+    # hazard: identity is refused rather than deduplicated into one series.
+    assert {item.source_event_time for item in first} == {
+        item.source_event_time for item in second
+    }
+    with pytest.raises(CycleIdentityMismatch, match="instrument_version_id"):
+        _replay(first + second)
+
+
+def test_matching_instrument_evidence_still_replays_identically():
+    observations, _normalized = _observations(_rows(count=FEATURE_WINDOW_INTERVALS))
+    first, first_report = _replay(observations)
+    again, again_report = _replay(observations)
+    assert again.snapshot_id == first.snapshot_id
+    assert again.content_hash() == first.content_hash()
+    assert again_report.to_dict() == first_report.to_dict()
+
+
+# --------------------------------------------------------------------------- #
+# Finding 2 - parity describes the exact snapshot it names
+# --------------------------------------------------------------------------- #
+
+
+def test_parity_uses_snapshot_values_when_the_last_bar_precedes_cutoff():
+    observations, _normalized = _observations(
+        _rows(count=FEATURE_WINDOW_INTERVALS, end_before=CUTOFF - timedelta(minutes=10))
+    )
+    snapshot, report = _replay(observations, cutoff=CUTOFF)
+    staleness = snapshot.values["staleness_seconds"]
+    assert staleness == 600.0
+    rows = {
+        row.feature_name: row
+        for row in report.rows
+        if row.feature_name == "staleness_seconds"
+    }
+    assert rows["staleness_seconds"].feature_bus_value == 600.0
+    assert report.counts()["IMPLEMENTATION_DEFECT"] == 0
+    assert report.snapshot_id == snapshot.snapshot_id
+    assert report.source_evidence_identity == source_evidence_identity(
+        observations, evaluation_cutoff=CUTOFF
+    )
+    assert report.feature_version == snapshot.feature_version
+    indicator_rows = {
+        row.feature_name: row
+        for row in report.rows
+        if row.feature_name in ("ema_fast_9", "atr_pct_14", "bandwidth_20")
+    }
+    assert tuple(indicator_rows[name].feature_bus_value for name in indicator_rows) == tuple(
+        snapshot.values[name] for name in indicator_rows
+    )
+    assert all(row.classification == "MATCH" for row in indicator_rows.values())
+    assert set(snapshot.values) == set(FEATURE_NAMES)
+
+
+# --------------------------------------------------------------------------- #
+# Finding 3 - the consumed input watermark cannot lie
+# --------------------------------------------------------------------------- #
+
+
+def test_watermark_equal_to_max_captured_commit_order_is_allowed():
+    observations, _normalized = _observations(_rows(count=5))
+    highest = max(item.commit_order for item in observations)
+    snapshot, _report = _replay(observations, watermark=highest)
+    assert snapshot.consumed_input_watermark == highest
+
+
+def test_watermark_later_than_max_captured_commit_order_is_allowed():
+    observations, _normalized = _observations(_rows(count=5))
+    later = ConsumedInputWatermark(history_epoch=1, local_sequence=99999)
+    snapshot, _report = _replay(observations, watermark=later)
+    assert snapshot.consumed_input_watermark == later
+
+
+def test_watermark_earlier_than_captured_evidence_is_rejected():
+    observations, _normalized = _observations(_rows(count=5))
+    earlier = ConsumedInputWatermark(history_epoch=1, local_sequence=0)
+    with pytest.raises(WatermarkIntegrityError, match="precedes"):
+        _replay(observations, watermark=earlier)
+
+
+def test_mixed_commit_order_evidence_cannot_prove_its_watermark():
+    observations, _normalized = _observations(_rows(count=5))
+    payload = list(capture_observation_evidence(observations))
+    payload[0] = dict(payload[0])
+    payload[0]["history_epoch"] = None
+    payload[0]["local_sequence"] = None
+    loaded = load_observation_evidence(payload)
+    assert loaded[0].commit_order is None
+    assert loaded[-1].commit_order is not None
+    with pytest.raises(WatermarkIntegrityError, match="mixes committed"):
+        replay_captured_evidence(
+            payload,
+            instrument_version=_instrument(),
+            evaluation_cutoff=CUTOFF,
+            evaluated_at_utc=NOW,
+            consumed_input_watermark=_watermark(observations),
+            source_version=SOURCE,
+        )
+
+
+def test_fully_uncommitted_evidence_carries_no_watermark_claim():
+    observations, _normalized = _observations(_rows(count=5))
+    payload = list(capture_observation_evidence(observations))
+    for index, row in enumerate(payload):
+        row = dict(row)
+        row["history_epoch"] = None
+        row["local_sequence"] = None
+        payload[index] = row
+    assert all(item.commit_order is None for item in load_observation_evidence(payload))
+    snapshot, _report = replay_captured_evidence(
+        payload,
+        instrument_version=_instrument(),
+        evaluation_cutoff=CUTOFF,
+        evaluated_at_utc=NOW,
+        consumed_input_watermark=ConsumedInputWatermark(0, 0),
+        source_version=SOURCE,
+    )
+    committed, _report = _replay(observations)
+    assert snapshot.consumed_input_watermark == ConsumedInputWatermark(0, 0)
+    assert snapshot.values == committed.values
+
+
+# --------------------------------------------------------------------------- #
+# Finding 4 - captured observation_id is integrity-checked
+# --------------------------------------------------------------------------- #
+
+
+def test_captured_observation_id_round_trips():
+    observations, _normalized = _observations(_rows(count=5))
+    payload = capture_observation_evidence(observations)
+    assert all(
+        row["observation_id"] == item.observation_id
+        for row, item in zip(payload, observations)
+    )
+    loaded = load_observation_evidence(payload)
+    assert tuple(item.observation_id for item in loaded) == tuple(
+        item.observation_id for item in observations
+    )
+
+
+def test_missing_observation_id_is_rejected():
+    observations, _normalized = _observations(_rows(count=5))
+    payload = [dict(row) for row in capture_observation_evidence(observations)]
+    del payload[0]["observation_id"]
+    with pytest.raises(ValueError, match="observation_id"):
+        load_observation_evidence(payload)
+
+
+def test_mutated_observation_id_is_rejected():
+    observations, _normalized = _observations(_rows(count=5))
+    payload = [dict(row) for row in capture_observation_evidence(observations)]
+    payload[2]["observation_id"] = "OBS:tampered"
+    with pytest.raises(ValueError, match="does not match"):
+        load_observation_evidence(payload)
+
+
+def test_identity_bearing_mutation_with_stale_observation_id_is_rejected():
+    observations, _normalized = _observations(_rows(count=5))
+    payload = [dict(row) for row in capture_observation_evidence(observations)]
+    original_id = payload[1]["observation_id"]
+    shifted = datetime.fromisoformat(
+        payload[1]["source_event_time"][:-1] + "+00:00"
+    ) + timedelta(minutes=5)
+    payload[1]["source_event_time"] = (
+        shifted.strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
+    assert payload[1]["observation_id"] == original_id
+    with pytest.raises(ValueError, match="does not match"):
+        load_observation_evidence(payload)
