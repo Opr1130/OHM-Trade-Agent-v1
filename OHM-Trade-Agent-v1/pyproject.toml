@@ -15,3 +15,9 @@ ignore = ["E501"]
 # Scan application code only. Tests are excluded to avoid assert/fixture noise.
 targets = ["app"]
 exclude_dirs = ["tests", "test", ".venv", "venv"]
+
+[tool.pytest.ini_options]
+# Registers the ATDD acceptance marker only. No addopts, so existing suite selection stays unchanged.
+markers = [
+    "acceptance: increment-level tests that prove an OWNER-approved ATDD scope contract",
+]
