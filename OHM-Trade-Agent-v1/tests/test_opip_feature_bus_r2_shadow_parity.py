@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from app.opip.contracts.enums import Missingness
+from app.opip.contracts.enums import CoverageState, Missingness
 from app.opip.contracts.identity import ConsumedInputWatermark, InstrumentVersion
 from app.opip.contracts.observation import OBSERVATION_SCHEMA_VERSION
 from app.opip.contracts.temporal import TemporalIntegrityError
@@ -623,6 +623,38 @@ def test_fully_uncommitted_evidence_carries_no_watermark_claim():
 # --------------------------------------------------------------------------- #
 # Findings 4-6 - captured identity and replay admissibility
 # --------------------------------------------------------------------------- #
+
+
+def test_ambiguous_duplicate_revision_rank_is_rejected():
+    observations, _normalized = _observations(_rows(count=5))
+    original = observations[-1]
+    # Same interval, revision, ingestion order and OHLCV, different coverage.
+    ambiguous = replace(original, coverage=CoverageState.INCOMPLETE_COVERAGE)
+    assert ambiguous.observation_id == original.observation_id
+    with pytest.raises(EvidenceIntegrityError, match="ambiguous rows"):
+        _replay(observations + (ambiguous,))
+
+
+def test_non_boolean_interval_forming_is_rejected():
+    observations, _normalized = _observations(_rows(count=5))
+    payload = list(capture_observation_evidence(observations))
+    payload[0] = dict(payload[0])
+    payload[0]["interval_forming"] = "false"
+    with pytest.raises(ValueError, match="interval_forming"):
+        load_observation_evidence(payload)
+
+
+def test_non_integer_numeric_fields_are_rejected():
+    observations, _normalized = _observations(_rows(count=5))
+    for field, value in (
+        ("revision", "2"),
+        ("ingestion_order", 2.5),
+        ("schema_version", True),
+    ):
+        payload = [dict(row) for row in capture_observation_evidence(observations)]
+        payload[0][field] = value
+        with pytest.raises(ValueError, match=field):
+            load_observation_evidence(payload)
 
 
 def test_observation_schema_version_must_be_supported():

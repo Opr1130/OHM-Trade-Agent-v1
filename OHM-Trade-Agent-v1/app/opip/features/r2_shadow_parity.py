@@ -27,7 +27,7 @@ from app.opip.contracts.observation import (
     OBSERVATION_SCHEMA_VERSION,
     Observation,
 )
-from app.opip.contracts.serialization import iso_z, stable_hash
+from app.opip.contracts.serialization import canonical_json_bytes, iso_z, stable_hash
 from app.opip.contracts.temporal import assert_point_in_time, require_utc
 from app.opip.features.engine import (
     ATR_PERIOD,
@@ -302,26 +302,42 @@ def _eligible_evidence(alignment: AlignmentResult) -> tuple[Observation, ...]:
 
 
 def _require_consistent_content(eligible: Sequence[Observation]) -> None:
-    """One interval revision must not carry two different contents.
+    """One interval revision must not carry two different stories.
 
     Canonical reconstruction refuses conflicting content fingerprints for the
     same interval and revision. Replay refuses the same evidence instead of
-    silently selecting a winner by ingestion order.
+    silently selecting a winner by ingestion order, and additionally refuses
+    two rows that tie on revision rank but differ in any other persisted field,
+    because alignment would then keep whichever arrived first.
     """
-    seen: dict[tuple[int, int], str] = {}
+    fingerprints: dict[tuple[int, int], str] = {}
+    ranks: dict[tuple[int, int, int], bytes] = {}
     for item in eligible:
         if item.payload_kind is not PayloadKind.FIXED_INTERVAL_AGGREGATE:
             continue
-        key = (int(item.source_event_time.timestamp()), int(item.revision))
+        epoch = int(item.source_event_time.timestamp())
+        revision = int(item.revision)
+        key = (epoch, revision)
         fingerprint = aggregate_content_fingerprint(dict(item.values))
-        prior = seen.get(key)
-        if prior is not None and prior != fingerprint:
+        prior_fingerprint = fingerprints.get(key)
+        if prior_fingerprint is not None and prior_fingerprint != fingerprint:
             raise EvidenceIntegrityError(
                 "replay evidence has conflicting content for interval epoch "
-                f"{key[0]} revision {key[1]}; refusing to hide incompatible "
+                f"{epoch} revision {revision}; refusing to hide incompatible "
                 "canonical evidence"
             )
-        seen[key] = fingerprint
+        fingerprints[key] = fingerprint
+        rank = (epoch, revision, int(item.ingestion_order))
+        payload = canonical_json_bytes(item.to_dict())
+        prior_payload = ranks.get(rank)
+        if prior_payload is not None and prior_payload != payload:
+            raise EvidenceIntegrityError(
+                "replay evidence has ambiguous rows for interval epoch "
+                f"{epoch} revision {revision} ingestion order "
+                f"{item.ingestion_order}; the winner is not determined by "
+                "identity"
+            )
+        ranks[rank] = payload
 
 
 def _assert_replay_visibility(
@@ -730,6 +746,32 @@ def _round(value: Any) -> float | None:
     return round(float(value), VALUE_PRECISION)
 
 
+def _require_int(value: Any, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"replay evidence {field_name} must be an integer")
+    return int(value)
+
+
+def _optional_int(value: Any, field_name: str) -> int | None:
+    if value is None:
+        return None
+    return _require_int(value, field_name)
+
+
+def _require_bool(value: Any, field_name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"replay evidence {field_name} must be a boolean")
+    return value
+
+
+def _optional_str(value: Any, field_name: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"replay evidence {field_name} must be a string or null")
+    return value
+
+
 def _commit_order_from_evidence(
     raw: Mapping[str, Any],
 ) -> ConsumedInputWatermark | None:
@@ -740,8 +782,8 @@ def _commit_order_from_evidence(
     if history_epoch is None or local_sequence is None:
         raise ValueError("replay evidence commit order is incomplete")
     return ConsumedInputWatermark(
-        history_epoch=int(history_epoch),
-        local_sequence=int(local_sequence),
+        history_epoch=_require_int(history_epoch, "history_epoch"),
+        local_sequence=_require_int(local_sequence, "local_sequence"),
     )
 
 
@@ -760,7 +802,7 @@ def _observation_from_evidence(raw: Mapping[str, Any]) -> Observation:
         raise ValueError(f"replay evidence missing required keys: {sorted(missing)}")
     if raw["record_type"] != OBSERVATION_RECORD_TYPE:
         raise ValueError("replay evidence record_type is not Observation")
-    declared_schema = int(raw["schema_version"])
+    declared_schema = _require_int(raw["schema_version"], "schema_version")
     if declared_schema != OBSERVATION_SCHEMA_VERSION:
         raise ValueError(
             "replay refused: captured observation schema_version "
@@ -784,21 +826,17 @@ def _observation_from_evidence(raw: Mapping[str, Any]) -> Observation:
         venue_instrument_id=str(raw["venue_instrument_id"]),
         source_event_time=_parse_time(raw["source_event_time"], "source_event_time"),
         receipt_time=_parse_time(raw["receipt_time"], "receipt_time"),
-        ingestion_order=int(raw["ingestion_order"]),
+        ingestion_order=_require_int(raw["ingestion_order"], "ingestion_order"),
         payload_kind=payload_kind,
         values=dict(values),
         coverage=CoverageState(str(raw["coverage"])),
-        aggregate_interval_seconds=(
-            None
-            if raw["aggregate_interval_seconds"] is None
-            else int(raw["aggregate_interval_seconds"])
+        aggregate_interval_seconds=_optional_int(
+            raw["aggregate_interval_seconds"], "aggregate_interval_seconds"
         ),
-        source_sequence=(
-            None if raw["source_sequence"] is None else str(raw["source_sequence"])
-        ),
-        revision=int(raw["revision"]),
-        supersedes=None if raw["supersedes"] is None else str(raw["supersedes"]),
-        interval_forming=bool(raw["interval_forming"]),
+        source_sequence=_optional_str(raw["source_sequence"], "source_sequence"),
+        revision=_require_int(raw["revision"], "revision"),
+        supersedes=_optional_str(raw["supersedes"], "supersedes"),
+        interval_forming=_require_bool(raw["interval_forming"], "interval_forming"),
         provenance=_provenance_from_evidence(raw),
         commit_order=commit_order,
         schema_version=declared_schema,
