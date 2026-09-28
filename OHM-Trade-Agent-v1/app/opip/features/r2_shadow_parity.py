@@ -140,6 +140,8 @@ _ROLLING_STATE_KEYS: tuple[str, ...] = (
 
 _PRIOR_STATE_KEYS: tuple[str, ...] = ("checkpoint", "resumed_from_checkpoint")
 
+_WRITE_WATERMARK_KEYS: tuple[str, ...] = ("history_epoch", "local_sequence")
+
 #: Exactly ``FeatureStateCheckpoint.to_dict()``. A durable checkpoint that this
 #: replay does not fully model must be refused rather than reinterpreted under
 #: today's rolling-state assumptions.
@@ -589,13 +591,29 @@ def _write_watermarks_from_evidence(raw: Any) -> tuple[ConsumedInputWatermark, .
             raise ValueError(
                 "replay evidence committed_write_watermarks entries must be objects"
             )
+        missing = [
+            key
+            for key in _WRITE_WATERMARK_KEYS
+            if key not in item
+        ]
+        if missing:
+            raise ValueError(
+                "replay evidence committed_write_watermarks entry missing keys: "
+                f"{sorted(missing)}"
+            )
+        unexpected = sorted(set(item) - set(_WRITE_WATERMARK_KEYS))
+        if unexpected:
+            raise ValueError(
+                "replay evidence committed_write_watermarks entry has unexpected "
+                f"keys: {unexpected}"
+            )
         positions.append(
             ConsumedInputWatermark(
                 history_epoch=_require_int(
-                    item.get("history_epoch"), "committed_write_watermarks.history_epoch"
+                    item["history_epoch"], "committed_write_watermarks.history_epoch"
                 ),
                 local_sequence=_require_int(
-                    item.get("local_sequence"),
+                    item["local_sequence"],
                     "committed_write_watermarks.local_sequence",
                 ),
             )
@@ -729,13 +747,15 @@ def _assert_retained_state_availability(
     if last_receipt is None:
         return
     received = datetime.fromtimestamp(float(last_receipt), tz=timezone.utc)
-    if received > evaluated_at_utc:
+    if received > created:
         raise TemporalIntegrityError(
             "captured retained state holds an interval received at "
-            f"{iso_z(received, field_name='last_receipt_epoch')}, after "
-            f"{iso_z(evaluated_at_utc, field_name='evaluated_at_utc')}; its "
-            "values were not available at the replay instant"
+            f"{iso_z(received, field_name='last_receipt_epoch')}, after its own "
+            f"creation at {iso_z(created, field_name='created_at_utc')}; a cycle "
+            "cannot retain a receipt it had not yet received"
         )
+    # No separate comparison against ``evaluated_at_utc`` is needed: the receipt
+    # bound above plus ``created <= evaluated_at`` already imply it.
 
 
 def _assert_checkpoint_identity(

@@ -236,6 +236,7 @@ def _replay_result(
     prior_state=None,
     coverage_only=(),
     committed_write_watermarks=(),
+    created_at: datetime | None = None,
     cutoff: datetime = CUTOFF,
     evaluated_at: datetime | None = None,
     instrument: InstrumentVersion | None = None,
@@ -252,6 +253,7 @@ def _replay_result(
         prior_state=prior_state,
         coverage_only=coverage_only,
         committed_write_watermarks=committed_write_watermarks,
+        created_at=created_at,
     )
     return _replay_evidence_result(
         evidence,
@@ -1122,30 +1124,43 @@ def test_domain_invalid_retained_slots_are_refused():
 
 
 def test_retained_state_received_after_the_replay_instant_is_refused():
-    """A retained receipt clock may not postdate the replay instant."""
+    """A retained state may not outrun either of its own clocks."""
     later = CUTOFF + timedelta(minutes=5)
     observations, _normalized = _observations(
         _rows(count=30, end_before=later), receipt_time=later, now=later
     )
     retained = advance_state(initial_state(_instrument()), observations).state
-    assert retained.last_receipt_epoch is not None
-    with pytest.raises(TemporalIntegrityError, match="received at"):
+    assert retained.last_receipt_epoch == later.timestamp()
+    # A receipt later than the state's own creation clock is impossible.
+    with pytest.raises(TemporalIntegrityError, match="had not yet received"):
         _replay_result(
             (),
             prior_state=retained,
             cutoff=later,
-            evaluated_at=later - timedelta(minutes=1),
+            evaluated_at=later,
+            created_at=NOW,
             watermark=retained.consumed_input_watermark,
         )
-    # Visible at the later instant, the same state is admissible.
+    # Visible at the later instant the same state is admissible, and replaying it
+    # at an earlier instant is refused because the state did not exist yet.
     result = _replay_result(
         (),
         prior_state=retained,
         cutoff=later,
         evaluated_at=later,
+        created_at=later,
         watermark=retained.consumed_input_watermark,
     )
     assert result.snapshot.values["contiguous_intervals"] == retained.interval_count
+    with pytest.raises(TemporalIntegrityError, match="not available at the replay"):
+        _replay_result(
+            (),
+            prior_state=retained,
+            cutoff=later,
+            evaluated_at=later - timedelta(minutes=4),
+            created_at=later,
+            watermark=retained.consumed_input_watermark,
+        )
 
 
 def test_unsupported_reconstruction_dependency_is_refused():
@@ -1187,6 +1202,53 @@ def test_tampered_checkpoint_id_is_refused():
         payload["prior_state"]["checkpoint"]["checkpoint_id"] = value
         with pytest.raises(EvidenceIntegrityError, match="checkpoint_id"):
             _replay_evidence_result(load_replay_evidence(payload))
+
+
+def test_receipt_later_than_checkpoint_creation_is_refused():
+    """A cycle cannot retain a receipt it had not yet received."""
+    observations, _normalized = _observations(_rows(count=30))
+    retained = advance_state(initial_state(_instrument()), observations).state
+    assert retained.last_receipt_epoch is not None
+    early = datetime.fromtimestamp(
+        retained.last_receipt_epoch, tz=timezone.utc
+    ) - timedelta(minutes=5)
+    payload = _capture(
+        (), prior_state=retained, created_at=early
+    ).to_dict()
+    assert payload["prior_state"]["checkpoint"]["created_at_utc"] is not None
+    with pytest.raises(TemporalIntegrityError, match="had not yet received"):
+        _replay_evidence_result(load_replay_evidence(payload))
+    # A creation clock at or after the receipt is fine.
+    assert (
+        _replay_evidence_result(
+            load_replay_evidence(_capture((), prior_state=retained).to_dict())
+        ).state.interval_count
+        == retained.interval_count
+    )
+
+
+def test_write_watermark_entry_shape_is_validated():
+    observations, _normalized = _observations(_rows(count=5))
+    written = ConsumedInputWatermark(history_epoch=1, local_sequence=99999)
+    good = _capture(
+        observations, committed_write_watermarks=(written,)
+    ).to_dict()
+    assert good["committed_write_watermarks"] == [
+        {"history_epoch": 1, "local_sequence": 99999}
+    ]
+    for mutate, message in (
+        (lambda entry: entry.update({"extra": True}), "unexpected keys"),
+        (lambda entry: entry.pop("local_sequence"), "missing keys"),
+        (lambda entry: entry.update({"local_sequence": "1"}), "must be an integer"),
+    ):
+        payload = _capture(
+            observations, committed_write_watermarks=(written,)
+        ).to_dict()
+        entry = dict(payload["committed_write_watermarks"][0])
+        mutate(entry)
+        payload["committed_write_watermarks"] = [entry]
+        with pytest.raises(ValueError, match=message):
+            load_replay_evidence(payload)
 
 
 def test_retained_state_at_a_different_cadence_is_refused():
@@ -1406,6 +1468,7 @@ def test_retained_state_past_the_cutoff_is_refused():
             prior_state=retained,
             cutoff=CUTOFF,
             evaluated_at=later,
+            created_at=later,
             watermark=retained.consumed_input_watermark,
         )
     # The same state is admissible once the cutoff is past its horizon.
@@ -1414,6 +1477,7 @@ def test_retained_state_past_the_cutoff_is_refused():
         prior_state=retained,
         cutoff=later,
         evaluated_at=later,
+        created_at=later,
         watermark=retained.consumed_input_watermark,
     )
     assert result.snapshot.evaluation_cutoff == later
