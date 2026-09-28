@@ -107,8 +107,34 @@ _REPLAY_EVIDENCE_KEYS: tuple[str, ...] = (
     "prior_state",
     "window_start",
     "source_incomplete",
+    "committed_write_watermarks",
     "evidence",
     "coverage_only",
+)
+
+#: Exactly ``to_checkpoint``'s ``rolling_state`` payload. The nested durable
+#: state is versioned by the same envelope, so an unmodelled field there is
+#: producer drift that replay must refuse rather than ignore.
+_ROLLING_STATE_KEYS: tuple[str, ...] = (
+    "opens",
+    "opens_known",
+    "opens_retained",
+    "closes",
+    "highs",
+    "lows",
+    "volumes",
+    "revisions",
+    "content_fingerprints",
+    "venue",
+    "first_interval_epoch",
+    "last_receipt_epoch",
+    "interval_seconds",
+    "interval_count",
+    "persistence_intervals",
+    "gap_resets",
+    "last_gap_epoch",
+    "window_complete",
+    "ema_fast",
 )
 
 _PRIOR_STATE_KEYS: tuple[str, ...] = ("checkpoint", "resumed_from_checkpoint")
@@ -311,6 +337,9 @@ class ReplayEvidence:
     coverage_only: tuple[Mapping[str, Any], ...] = ()
     prior_state: Mapping[str, Any] | None = None
     prior_state_resumed_from_checkpoint: bool = False
+    #: Canonical write positions the cycle's own writes returned, folded into the
+    #: sealed consumed-input watermark. Empty for a dry-run capture.
+    committed_write_watermarks: tuple[ConsumedInputWatermark, ...] = ()
     window_start: datetime | None = None
     source_incomplete: bool = False
 
@@ -339,6 +368,9 @@ class ReplayEvidence:
                 else None
             ),
             "source_incomplete": bool(self.source_incomplete),
+            "committed_write_watermarks": [
+                item.to_dict() for item in self.committed_write_watermarks
+            ],
             "evidence": [dict(item) for item in self.evidence],
             "coverage_only": [dict(item) for item in self.coverage_only],
         }
@@ -347,8 +379,9 @@ class ReplayEvidence:
 def capture_replay_evidence(
     evidence: Sequence[Observation],
     *,
-    prior_state: RollingState | FeatureStateCheckpoint | None = None,
+    prior_state: RollingState | FeatureStateCheckpoint | Mapping[str, Any] | None = None,
     coverage_only: Sequence[Observation] = (),
+    committed_write_watermarks: Sequence[ConsumedInputWatermark] = (),
     window_start: datetime | None = None,
     source_incomplete: bool = False,
 ) -> ReplayEvidence:
@@ -356,6 +389,9 @@ def capture_replay_evidence(
 
     The origin is derived from ``prior_state`` rather than declared, so a
     capture cannot claim a cold start while holding retained history.
+    ``committed_write_watermarks`` are the canonical positions the cycle's own
+    writes returned; without them the sealed watermark could not be derived and
+    replay would have to trust it.
     """
     captured_state: Mapping[str, Any] | None = None
     resumed_from_checkpoint = False
@@ -383,6 +419,13 @@ def capture_replay_evidence(
         coverage_only=capture_observation_evidence(coverage_only),
         prior_state=captured_state,
         prior_state_resumed_from_checkpoint=resumed_from_checkpoint,
+        committed_write_watermarks=tuple(
+            ConsumedInputWatermark(
+                history_epoch=int(item.history_epoch),
+                local_sequence=int(item.local_sequence),
+            )
+            for item in committed_write_watermarks
+        ),
         window_start=window_start,
         source_incomplete=bool(source_incomplete),
     )
@@ -416,7 +459,52 @@ def _checkpoint_evidence(payload: Mapping[str, Any]) -> Mapping[str, Any]:
             "replay refused: captured retained state schema_version "
             f"{schema} is not the supported {FEATURE_BUS_SCHEMA_VERSION}"
         )
+    _rolling_state_evidence(payload)
     return dict(payload)
+
+
+def _rolling_state_evidence(payload: Mapping[str, Any]) -> None:
+    """The nested retained series is versioned evidence too, not a bag of keys."""
+    rolling = payload.get("rolling_state")
+    if not isinstance(rolling, Mapping):
+        raise ValueError("captured retained state rolling_state must be an object")
+    missing = [key for key in _ROLLING_STATE_KEYS if key not in rolling]
+    if missing:
+        raise ValueError(
+            f"captured retained state rolling_state missing keys: {sorted(missing)}"
+        )
+    unexpected = sorted(set(rolling) - set(_ROLLING_STATE_KEYS))
+    if unexpected:
+        raise ValueError(
+            f"captured retained state rolling_state has unexpected keys: {unexpected}"
+        )
+
+
+def _write_watermarks_from_evidence(raw: Any) -> tuple[ConsumedInputWatermark, ...]:
+    if raw is None:
+        return ()
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
+        raise ValueError(
+            "replay evidence committed_write_watermarks must be a sequence"
+        )
+    positions: list[ConsumedInputWatermark] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            raise ValueError(
+                "replay evidence committed_write_watermarks entries must be objects"
+            )
+        positions.append(
+            ConsumedInputWatermark(
+                history_epoch=_require_int(
+                    item.get("history_epoch"), "committed_write_watermarks.history_epoch"
+                ),
+                local_sequence=_require_int(
+                    item.get("local_sequence"),
+                    "committed_write_watermarks.local_sequence",
+                ),
+            )
+        )
+    return tuple(positions)
 
 
 def load_replay_evidence(
@@ -455,11 +543,19 @@ def load_replay_evidence(
     )
     evidence = _observation_rows(payload["evidence"], "evidence")
     coverage_only = _observation_rows(payload["coverage_only"], "coverage_only")
+    committed_writes = _write_watermarks_from_evidence(
+        payload["committed_write_watermarks"]
+    )
     if cycle_origin == CYCLE_ORIGIN_COLD_START and coverage_only:
         raise ValueError(
             "replay evidence declares a cold start with coverage-only rows; a "
             "cold-start planner has no retained history to keep a re-poll "
             "coverage-only, so the evidence-role context is inconsistent"
+        )
+    if cycle_origin == CYCLE_ORIGIN_COLD_START and committed_writes:
+        raise ValueError(
+            "replay evidence declares a cold start with committed write "
+            "watermarks; a cycle that consumed what it wrote is not a cold start"
         )
     return ReplayEvidence(
         cycle_origin=cycle_origin,
@@ -467,6 +563,7 @@ def load_replay_evidence(
         coverage_only=coverage_only,
         prior_state=prior_state[0],
         prior_state_resumed_from_checkpoint=prior_state[1],
+        committed_write_watermarks=committed_writes,
         window_start=window_start,
         source_incomplete=source_incomplete,
     )
@@ -509,6 +606,30 @@ def _prior_state_from_evidence(
     return _checkpoint_evidence(checkpoint), resumed_from_checkpoint
 
 
+def _assert_retained_state_availability(
+    checkpoint: FeatureStateCheckpoint,
+    *,
+    evaluated_at_utc: datetime,
+) -> None:
+    """Retained evidence must have existed at the replay instant.
+
+    ``checkpoint_from_payload`` parses ``created_at_utc`` and nothing here used
+    it, so a checkpoint written after ``evaluated_at_utc`` was accepted as long
+    as its interval horizon sat inside the cutoff. A replay cannot read state
+    that did not exist yet.
+    """
+    created = checkpoint.created_at_utc
+    if created is None:
+        return
+    if created > evaluated_at_utc:
+        raise TemporalIntegrityError(
+            "captured retained state was created at "
+            f"{iso_z(created, field_name='created_at_utc')}, after "
+            f"{iso_z(evaluated_at_utc, field_name='evaluated_at_utc')}; it was "
+            "not available at the replay instant"
+        )
+
+
 def _observation_rows(raw: Any, field_name: str) -> tuple[Mapping[str, Any], ...]:
     if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
         raise ValueError(f"replay evidence {field_name} must be a sequence")
@@ -530,7 +651,10 @@ def _retained_state(
     start as a restart warmup.
     """
     if evidence.prior_state is None:
-        return initial_state(instrument_version, interval_seconds=interval_seconds)
+        return (
+            initial_state(instrument_version, interval_seconds=interval_seconds),
+            None,
+        )
     try:
         checkpoint = checkpoint_from_payload(evidence.prior_state)
     except (KeyError, TypeError, ValueError) as exc:
@@ -556,10 +680,13 @@ def _retained_state(
             "replay refused: captured retained state cannot be resumed "
             f"({type(exc).__name__}); refusing to synthesize the missing context"
         ) from exc
-    return replace(
-        restored,
-        resumed_from_checkpoint=evidence.prior_state_resumed_from_checkpoint,
-        restart_state=checkpoint.restart_state,
+    return (
+        replace(
+            restored,
+            resumed_from_checkpoint=evidence.prior_state_resumed_from_checkpoint,
+            restart_state=checkpoint.restart_state,
+        ),
+        checkpoint,
     )
 
 
@@ -644,6 +771,9 @@ def source_evidence_identity(
                 else None
             ),
             "source_incomplete": bool(evidence.source_incomplete),
+            "committed_write_watermarks": [
+                item.to_dict() for item in evidence.committed_write_watermarks
+            ],
             "evidence": [dict(item) for item in evidence.evidence],
             "coverage_only": [dict(item) for item in evidence.coverage_only],
         },
@@ -695,35 +825,52 @@ def _require_consumed_watermark(
     eligible: Sequence[Observation],
     *,
     prior_state: RollingState,
+    candidate_state: RollingState,
+    committed_write_watermarks: Sequence[ConsumedInputWatermark],
     consumed_input_watermark: ConsumedInputWatermark,
 ) -> None:
-    """Refuse a watermark earlier than the evidence the snapshot consumed.
+    """The sealed watermark must be the one production derives, exactly.
 
-    A snapshot may not claim it has not consumed evidence that is in its own
-    values, and it may not claim less than the state it resumed from. The
-    checked population is every row that can change a sealed field:
+    A snapshot may not claim it has consumed evidence that is in its own values,
+    nor less than the state it resumed from, and it may not claim more than the
+    cycle actually consumed. Production derives the position from the candidate
+    state and folds in the canonical write positions its own writes returned, so
+    the captured value must equal that maximum — a lower-bound-only check would
+    accept an invented position and seal consumption of canonical evidence the
+    capture does not contain.
+
+    The checked population is every row that can change a sealed field:
     alignment-admitted winners, their deduped losers, coverage-only continuity
     rows, and the misaligned exclusions that decide coverage. A forming or
     unclosed row is discarded by alignment, cannot change a sealed field, and
     therefore makes no consumed-input claim. Evidence with no commit order at
-    all carries no claim; partially committed snapshot-affecting evidence
-    cannot prove its watermark and fails closed.
+    all carries no claim; partially committed snapshot-affecting evidence cannot
+    prove its watermark and fails closed.
     """
+    expected = max(prior_state.consumed_input_watermark, candidate_state.consumed_input_watermark)
+    for position in committed_write_watermarks:
+        expected = max(expected, position)
+    if consumed_input_watermark != expected:
+        raise WatermarkIntegrityError(
+            f"consumed input watermark {consumed_input_watermark.to_dict()} is not the "
+            f"position this cycle consumed {expected.to_dict()}; refusing to seal a "
+            "position the captured evidence does not support"
+        )
     committed = [
         item.commit_order for item in eligible if item.commit_order is not None
     ]
-    if committed and len(committed) != len(eligible):
+    if not committed:
+        return
+    if len(committed) != len(eligible):
         raise WatermarkIntegrityError(
             "replay evidence mixes committed and uncommitted observations; "
             "the consumed input watermark cannot be proven"
         )
-    floor = prior_state.consumed_input_watermark
-    if committed:
-        floor = max(floor, max(committed))
-    if consumed_input_watermark < floor:
+    highest = max(committed)
+    if consumed_input_watermark < highest:
         raise WatermarkIntegrityError(
             f"consumed input watermark {consumed_input_watermark.to_dict()} precedes "
-            f"consumed evidence position {floor.to_dict()}"
+            f"consumed evidence position {highest.to_dict()}"
         )
 
 
@@ -931,11 +1078,15 @@ def replay_cycle(
     refused before any value is computed.
     """
     _require_feature_version(declared_feature_version)
-    prior = _retained_state(
+    prior, prior_checkpoint = _retained_state(
         evidence,
         instrument_version=instrument_version,
         interval_seconds=interval_seconds,
     )
+    if prior_checkpoint is not None:
+        _assert_retained_state_availability(
+            prior_checkpoint, evaluated_at_utc=evaluated_at_utc
+        )
     _assert_retained_state_population(
         prior,
         evaluation_cutoff=evaluation_cutoff,
@@ -964,12 +1115,14 @@ def replay_cycle(
     _assert_cutoff_population(alignment, evaluation_cutoff=evaluation_cutoff)
     eligible = _eligible_evidence(alignment)
     _require_consistent_content(captured, eligible)
+    candidate = advance_state(prior, alignment.observations).state
     _require_consumed_watermark(
         eligible,
         prior_state=prior,
+        candidate_state=candidate,
+        committed_write_watermarks=evidence.committed_write_watermarks,
         consumed_input_watermark=consumed_input_watermark,
     )
-    candidate = advance_state(prior, alignment.observations).state
     rolling = alignment_from_state(candidate)
     snapshot = build_feature_snapshot(
         rolling,

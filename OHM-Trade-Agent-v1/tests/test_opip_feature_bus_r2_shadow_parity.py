@@ -139,11 +139,12 @@ def _observations(
 
 
 def _watermark(observations) -> ConsumedInputWatermark:
+    """Highest commit position among the supplied rows, or the zero position."""
     orders = [
         item.commit_order for item in observations if item.commit_order is not None
     ]
     if not orders:
-        return ConsumedInputWatermark(history_epoch=1, local_sequence=0)
+        return ConsumedInputWatermark.zero()
     return max(orders)
 
 
@@ -159,11 +160,13 @@ def _replay(
     source_incomplete: bool = False,
     prior_state=None,
     coverage_only=(),
+    committed_writes=(),
 ):
     evidence = capture_replay_evidence(
         observations,
         prior_state=prior_state,
         coverage_only=coverage_only,
+        committed_write_watermarks=committed_writes,
         window_start=window_start,
         source_incomplete=source_incomplete,
     )
@@ -195,6 +198,10 @@ def _replay_evidence_result(evidence, **kwargs):
         for rows in (evidence.evidence, evidence.coverage_only):
             if rows:
                 watermark = max(watermark, _watermark(load_observation_evidence(rows)))
+        for position in evidence.committed_write_watermarks:
+            watermark = max(
+                watermark, position
+            )
     return replay_cycle(
         evidence,
         instrument_version=kwargs.pop("instrument", None) or _instrument(),
@@ -208,9 +215,10 @@ def _replay_evidence_result(evidence, **kwargs):
 def _retained_state_for_tests(evidence):
     from app.opip.features.r2_shadow_parity import _retained_state
 
-    return _retained_state(
+    state, _checkpoint = _retained_state(
         evidence, instrument_version=_instrument(), interval_seconds=60
     )
+    return state
 
 
 def _replay_result(
@@ -218,6 +226,7 @@ def _replay_result(
     *,
     prior_state=None,
     coverage_only=(),
+    committed_writes=(),
     cutoff: datetime = CUTOFF,
     evaluated_at: datetime | None = None,
     instrument: InstrumentVersion | None = None,
@@ -225,14 +234,16 @@ def _replay_result(
 ):
     """Replay a captured cycle and keep the whole result, not just the snapshot.
 
-    When a prior state is supplied the watermark defaults to that state's, since
-    the cycle it resumed from necessarily consumed at least that much.
+    When a watermark is not supplied it is derived from the capture, which is
+    what the replay contract now requires: the sealed position must equal the
+    position the captured evidence supports.
     """
     evidence = capture_replay_evidence(
-        observations, prior_state=prior_state, coverage_only=coverage_only
+        observations,
+        prior_state=prior_state,
+        coverage_only=coverage_only,
+        committed_write_watermarks=committed_writes,
     )
-    # Let the declared-watermark default be derived from the envelope, which
-    # already floors it at the resumed state's own position.
     return _replay_evidence_result(
         evidence,
         cutoff=cutoff,
@@ -351,7 +362,6 @@ def test_missing_required_inputs_fail_closed():
     payload[0]["values"]["close"] = None
     with pytest.raises(ValueError, match="missing values"):
         load_observation_evidence(payload)
-
 
 def test_stale_input_is_visible_and_does_not_change_indicator_parity():
     rows = _rows(count=FEATURE_WINDOW_INTERVALS)
@@ -631,17 +641,28 @@ def test_watermark_equal_to_max_captured_commit_order_is_allowed():
     assert snapshot.consumed_input_watermark == highest
 
 
-def test_watermark_later_than_max_captured_commit_order_is_allowed():
+def test_watermark_later_than_the_captured_position_is_refused():
+    """A position the capture does not support may not be sealed."""
     observations, _normalized = _observations(_rows(count=5))
     later = ConsumedInputWatermark(history_epoch=1, local_sequence=99999)
-    snapshot, _report = _replay(observations, watermark=later)
-    assert snapshot.consumed_input_watermark == later
+    with pytest.raises(WatermarkIntegrityError, match="is not the position"):
+        _replay(observations, watermark=later)
+
+
+def test_declared_canonical_write_position_is_allowed():
+    """A cycle that wrote must declare the write it consumed."""
+    observations, _normalized = _observations(_rows(count=5))
+    written = ConsumedInputWatermark(history_epoch=1, local_sequence=99999)
+    snapshot, _report = _replay(
+        observations, watermark=written, committed_writes=(written,)
+    )
+    assert snapshot.consumed_input_watermark == written
 
 
 def test_watermark_earlier_than_captured_evidence_is_rejected():
     observations, _normalized = _observations(_rows(count=5))
     earlier = ConsumedInputWatermark(history_epoch=1, local_sequence=0)
-    with pytest.raises(WatermarkIntegrityError, match="precedes"):
+    with pytest.raises(WatermarkIntegrityError, match="is not the position"):
         _replay(observations, watermark=earlier)
 
 
@@ -978,6 +999,57 @@ def test_retained_state_identity_and_version_mismatch_fails_closed():
         )
 
 
+def test_checkpoint_created_after_the_replay_instant_is_refused():
+    """Retained evidence must have existed at the replay instant."""
+    observations, _normalized = _observations(_rows(count=30))
+    base = advance_state(initial_state(_instrument()), observations).state
+    late = NOW + timedelta(hours=2)
+    checkpoint = to_checkpoint(
+        replace(base, resumed_from_checkpoint=True, restart_state=RestartState.RESTART_WARMUP),
+        created_at_utc=late,
+    )
+    assert checkpoint.created_at_utc == late
+    captured = capture_replay_evidence((), prior_state=checkpoint)
+    assert captured.prior_state_resumed_from_checkpoint is True
+    with pytest.raises(TemporalIntegrityError, match="not available at the replay"):
+        _replay_evidence_result(captured)
+    # The same retained state is admissible once the replay instant has passed it.
+    later = late + timedelta(minutes=1)
+    result = _replay_evidence_result(captured, evaluated_at=later)
+    assert result.snapshot.restart_state is RestartState.RESTART_WARMUP
+    # And an in-time checkpoint is unaffected.
+    in_time = to_checkpoint(base, created_at_utc=NOW)
+    assert (
+        _replay_evidence_result(
+            capture_replay_evidence((), prior_state=in_time)
+        ).state.interval_count
+        == base.interval_count
+    )
+
+
+def test_unsupported_nested_rolling_state_is_refused():
+    observations, _normalized = _observations(_rows(count=5))
+    retained = advance_state(initial_state(_instrument()), observations).state
+    for mutate, message in (
+        (lambda rs: rs.update({"future_field": "drift"}), "unexpected keys"),
+        (lambda rs: rs.pop("ema_fast"), "missing keys"),
+        (lambda rs: rs.update({"venue": 7}), None),
+    ):
+        payload = capture_replay_evidence(observations, prior_state=retained).to_dict()
+        payload["prior_state"] = dict(payload["prior_state"])
+        payload["prior_state"]["checkpoint"] = dict(payload["prior_state"]["checkpoint"])
+        rolling = dict(payload["prior_state"]["checkpoint"]["rolling_state"])
+        mutate(rolling)
+        payload["prior_state"]["checkpoint"]["rolling_state"] = rolling
+        if message is None:
+            # A mistyped venue is refused by the contract, not reinterpreted.
+            with pytest.raises(ValueError):
+                _replay_evidence_result(load_replay_evidence(payload))
+            continue
+        with pytest.raises(ValueError, match=message):
+            load_replay_evidence(payload)
+
+
 def test_retained_state_at_a_different_cadence_is_refused():
     """The interval check must use the cycle's cadence, not the state's own."""
     observations, _normalized = _observations(_rows(count=5))
@@ -1014,7 +1086,7 @@ def test_watermark_may_not_precede_the_resumed_state():
     below = ConsumedInputWatermark(
         history_epoch=1, local_sequence=retained.consumed_input_watermark.local_sequence - 1
     )
-    with pytest.raises(WatermarkIntegrityError, match="precedes"):
+    with pytest.raises(WatermarkIntegrityError, match="is not the position"):
         _replay(observations[-2:], prior_state=retained, watermark=below)
 
 
@@ -1254,13 +1326,18 @@ def test_retained_state_changes_the_evidence_identity():
 
 def test_committed_misaligned_row_above_the_watermark_is_refused():
     observations, _normalized = _observations(_rows(count=5))
+    position = ConsumedInputWatermark(history_epoch=1, local_sequence=5000)
     misaligned = replace(
         _wrong_cadence(observations[2], epoch=CUTOFF - timedelta(minutes=6)),
-        commit_order=ConsumedInputWatermark(history_epoch=1, local_sequence=5000),
+        commit_order=position,
     )
     below = max(item.commit_order for item in observations)
-    with pytest.raises(WatermarkIntegrityError, match="precedes"):
-        _replay(observations + (misaligned,), watermark=below)
+    with pytest.raises(WatermarkIntegrityError, match="is not the position"):
+        _replay(
+            observations + (misaligned,),
+            watermark=below,
+            committed_writes=(position,),
+        )
 
 
 def test_misaligned_row_equal_to_the_watermark_is_accepted():
@@ -1270,19 +1347,27 @@ def test_misaligned_row_equal_to_the_watermark_is_accepted():
         _wrong_cadence(observations[2], epoch=CUTOFF - timedelta(minutes=6)),
         commit_order=highest,
     )
-    snapshot, _report = _replay(observations + (misaligned,), watermark=highest)
+    snapshot, _report = _replay(
+        observations + (misaligned,),
+        watermark=highest,
+        committed_writes=(highest,),
+    )
     assert snapshot.consumed_input_watermark == highest
     assert snapshot.coverage is CoverageState.INCOMPLETE_COVERAGE
 
 
-def test_misaligned_row_below_a_later_watermark_is_accepted():
+def test_misaligned_row_below_a_later_declared_write_is_accepted():
     observations, _normalized = _observations(_rows(count=5))
     misaligned = replace(
         _wrong_cadence(observations[2], epoch=CUTOFF - timedelta(minutes=6)),
         commit_order=ConsumedInputWatermark(history_epoch=1, local_sequence=5000),
     )
     later = ConsumedInputWatermark(history_epoch=1, local_sequence=99999)
-    snapshot, _report = _replay(observations + (misaligned,), watermark=later)
+    snapshot, _report = _replay(
+        observations + (misaligned,),
+        watermark=later,
+        committed_writes=(later,),
+    )
     assert snapshot.consumed_input_watermark == later
 
 
@@ -1656,4 +1741,5 @@ def test_identity_bearing_mutation_with_stale_observation_id_is_rejected():
     assert payload[1]["observation_id"] == original_id
     with pytest.raises(ValueError, match="does not match"):
         load_observation_evidence(payload)
+
 
