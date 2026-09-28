@@ -599,6 +599,37 @@ def test_forward_duplicate_identity_does_not_inflate_the_population():
     assert projection.duplicate_rows_ignored == 1
 
 
+def test_forward_later_revision_wins():
+    # Append-only producers write increasing revisions; the projection must keep
+    # the latest, not the earliest, so it does not publish the least-mature row.
+    immature = _phase3c_row(
+        snapshot_id="S1", window_complete=False, observed=False, return_pct=None
+    )
+    mature = _phase3c_row(
+        snapshot_id="S1", window_complete=True, observed=True, return_pct=2.0
+    )
+    projection = build_forward_outcome_projection(
+        [immature, mature], source=ForwardOutcomeSource.PHASE3C, generated_at=_NOW
+    )
+    assert len(projection.records) == 1
+    assert projection.records[0].window_complete is True
+    hour = next(
+        h for h in projection.records[0].horizons if h.horizon_id == "1h"
+    )
+    assert hour.return_pct == 2.0
+
+
+def test_forward_later_unreadable_revision_does_not_erase_a_readable_one():
+    readable = _phase3c_row(snapshot_id="S1", window_complete=True)
+    unreadable = _phase3c_row(snapshot_id="S1")
+    unreadable["reference_price"] = None
+    projection = build_forward_outcome_projection(
+        [readable, unreadable], source=ForwardOutcomeSource.PHASE3C, generated_at=_NOW
+    )
+    assert projection.records[0].availability.value == "KNOWN"
+    assert projection.records[0].window_complete is True
+
+
 def test_forward_projection_does_not_mutate_decision_time_context():
     projection = build_forward_outcome_projection(
         [_phase3c_row()], source=ForwardOutcomeSource.PHASE3C, generated_at=_NOW

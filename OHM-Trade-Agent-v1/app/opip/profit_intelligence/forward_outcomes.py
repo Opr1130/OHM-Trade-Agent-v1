@@ -633,13 +633,15 @@ def build_forward_outcome_projection(
             latest[key] = record
             continue
         duplicates += 1
-        # A later unreadable replay must not erase an earlier readable record;
-        # otherwise the latest revision wins.
+        # Latest revision wins (the producers are append-only and write
+        # increasing revisions), except that an unreadable revision never erases
+        # an earlier readable one.
         if (
-            existing.availability is not FactAvailability.KNOWN
-            and record.availability is FactAvailability.KNOWN
+            record.availability is FactAvailability.KNOWN
+            or existing.availability is not FactAvailability.KNOWN
         ):
             latest[key] = record
+
     records = tuple(latest[key] for key in order)
 
     horizon_ids = sorted(
@@ -758,14 +760,20 @@ def read_forward_outcome_projection(
             generated_at=moment,
         )
 
-    if not rows and expected.stat().st_size > 0:
-        # Present but wholly unparseable: not the same as a read-and-empty
-        # family, so it must not read as a healthy zero.
-        return unavailable_forward_outcomes(
-            f"FORWARD_OUTCOME_EVIDENCE_UNPARSEABLE:{resolved_source.value}",
-            source=resolved_source,
-            generated_at=moment,
-        )
+    if not rows:
+        try:
+            unparseable = expected.stat().st_size > 0
+        except OSError:
+            # Vanished between read and stat: treat as unreadable, never healthy.
+            unparseable = True
+        if unparseable:
+            # Present but wholly unparseable: not the same as a read-and-empty
+            # family, so it must not read as a healthy zero.
+            return unavailable_forward_outcomes(
+                f"FORWARD_OUTCOME_EVIDENCE_UNPARSEABLE:{resolved_source.value}",
+                source=resolved_source,
+                generated_at=moment,
+            )
 
     return build_forward_outcome_projection(
         rows, source=resolved_source, generated_at=moment
@@ -773,9 +781,11 @@ def read_forward_outcome_projection(
 
 
 def _default_phase3c_path() -> Any:
-    from pathlib import Path
+    # Import the canonical producer constant so the path cannot drift from the
+    # job that writes it.
+    from app.jobs.build_phase3c_forward_outcomes import DEFAULT_OUTPUT
 
-    return Path("/app/data/phase3c_forward_outcomes.jsonl")
+    return DEFAULT_OUTPUT
 
 
 __all__ = [

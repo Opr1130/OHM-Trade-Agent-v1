@@ -811,12 +811,18 @@ def read_qualification_funnel_projection(
             f"QUALIFICATION_EVIDENCE_UNREADABLE:{type(exc).__name__}",
             generated_at=moment,
         )
-    if not rows and expected.stat().st_size > 0:
-        # Present but wholly unparseable: not the same as a read-and-empty
-        # population, so it must not read as a healthy zero.
-        return unavailable_qualification_funnel(
-            "QUALIFICATION_EVIDENCE_UNPARSEABLE", generated_at=moment
-        )
+    if not rows:
+        try:
+            unparseable = expected.stat().st_size > 0
+        except OSError:
+            # Vanished between read and stat: treat as unreadable, never healthy.
+            unparseable = True
+        if unparseable:
+            # Present but wholly unparseable: not the same as a read-and-empty
+            # population, so it must not read as a healthy zero.
+            return unavailable_qualification_funnel(
+                "QUALIFICATION_EVIDENCE_UNPARSEABLE", generated_at=moment
+            )
 
     window_start = None
     window_end = None
