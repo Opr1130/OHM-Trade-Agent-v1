@@ -56,10 +56,14 @@ Acceptance tests use the registered marker:
 ```python
 @pytest.mark.acceptance
 def test_example():
-    """AC-001: behavior under test."""
+    """ATDD-000-scope-control/AC-001: behavior under test."""
 ```
 
-The docstring must contain the `AC-NNN` id. The checker reads that docstring. Fixture text inside the test body is not a criterion.
+The docstring must contain `INCREMENT/AC-NNN`. The checker reads that pair. A bare `AC-NNN` does not attach the test to a contract. Fixture text inside the test body is not a criterion.
+
+Supported acceptance marks are `@pytest.mark.acceptance` on a module-level test, an `async def` test, or a test method; the same decorator on a test class; and `pytestmark = pytest.mark.acceptance` or a list containing that mark on the module or class. Node ids keep the class, for example `tests/test_x.py::TestSomething::test_behavior`. A marker alias such as `mark = pytest.mark.acceptance` is rejected. The checker does not silently skip a form it cannot classify.
+
+`GIVEN:`, `WHEN:`, and `THEN:` must each include non-whitespace text.
 
 From `OHM-Trade-Agent-v1/`:
 
@@ -67,7 +71,7 @@ From `OHM-Trade-Agent-v1/`:
 python -m pytest -m acceptance
 ```
 
-`pytest.yml` already runs the full suite, including these tests. This increment does not add a CI job.
+`.github/workflows/pytest.yml` runs that suite and an `atdd-scope` job. The job reads `docs/atdd/ACTIVE_INCREMENT` and compares the pull-request diff with that increment only.
 
 ## Scope-drift stop
 
@@ -82,13 +86,15 @@ Do not implement it. Do not silently broaden an existing criterion. Record the p
 
 Adjacent bugs, refactors, observability, and future requirements go under `DEFERRED DISCOVERIES`. They are not acceptance criteria and do not enter the increment.
 
-Check a diff from `OHM-Trade-Agent-v1/`:
+`docs/atdd/ACTIVE_INCREMENT` names the one increment allowed to authorize files. An older contract's implementation map does not authorize a later increment. A missing, ambiguous, or unknown active increment fails closed.
+
+Check the branch diff from `OHM-Trade-Agent-v1/`:
 
 ```bash
-python tests/atdd_scope.py path/to/changed_file.py
+python tests/atdd_scope.py --increment ATDD-000-scope-control --git-base origin/main
 ```
 
-Paths may be app-relative or `OHM-Trade-Agent-v1/...` from the wrapper root. Exit `0` is `PASS`. Exit `2` is `SCOPE_CHANGE_REQUIRED`. Exit `1` is `TRACEABILITY_GAP` (an approved criterion has no matching acceptance test, or a trace does not match).
+`--git-base` includes additions, modifications, renames, and deletions. Omitting both `--git-base` and explicit paths fails closed. Exit `0` is `PASS`. Exit `2` is `SCOPE_CHANGE_REQUIRED`. Exit `1` is `TRACEABILITY_GAP`.
 
 ## Implementation agent
 

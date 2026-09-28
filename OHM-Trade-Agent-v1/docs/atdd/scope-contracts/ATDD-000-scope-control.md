@@ -22,9 +22,17 @@ no pytest acceptance test cites that criterion
 THEN:
 the scope check does not pass and the increment is not complete
 WHEN:
-every approved criterion is cited by a matching acceptance test
+every approved criterion is cited by a matching acceptance test as INCREMENT/AC-NNN
 THEN:
 the scope check can pass
+WHEN:
+a criterion has an empty GIVEN, WHEN, or THEN label
+THEN:
+the scope check does not pass
+WHEN:
+two increments each define AC-001 and cite INCREMENT/AC-001 on their own tests
+THEN:
+each increment validates independently
 
 AC-002:
 GIVEN:
@@ -46,9 +54,17 @@ AC-004:
 GIVEN:
 a changed file is absent from the approved implementation map
 WHEN:
-the scope check compares that file with the contract
+the scope check compares that file with the active increment contract
 THEN:
 the result is SCOPE_CHANGE_REQUIRED and the file is not authorized
+WHEN:
+an older contract mapped a file and the active increment did not
+THEN:
+changing that older file is SCOPE_CHANGE_REQUIRED
+WHEN:
+the check runs without an explicit changed-file set
+THEN:
+the result is SCOPE_CHANGE_REQUIRED
 
 AC-005:
 GIVEN:
@@ -62,7 +78,7 @@ EXPLICITLY OUT OF SCOPE:
 - Product features, including Decision Intelligence, Committee, dashboard, detector, and execution behavior
 - v1.4.3 section 13 platform acceptance scenarios (replay, duplicate intents, AI disabled, dashboard reconciliation)
 - Copying the v1.4.3 architecture package into the repository
-- A BDD framework, a new CI job, SonarQube changes, or new Semgrep/Pyright installation
+- A BDD framework, a separate CI system, SonarQube changes, or new Semgrep/Pyright installation. The atdd-scope job in the existing pytest workflow is the changed-file gate for this increment.
 - Weakening existing tests or changing production runtime behavior
 
 FROZEN BOUNDARIES:
@@ -74,9 +90,15 @@ FROZEN BOUNDARIES:
 
 ACCEPTANCE TEST TRACEABILITY:
 AC-001 -> tests/test_atdd_scope_control.py::test_ac_001_unmapped_criterion_fails_and_mapped_contract_passes
+AC-001 -> tests/test_atdd_scope_control.py::test_ac_001_reused_criterion_numbers_stay_independent
+AC-001 -> tests/test_atdd_scope_control.py::test_ac_001_discovers_pytest_acceptance_forms
+AC-001 -> tests/test_atdd_scope_control.py::test_ac_001_empty_behavior_labels_fail
 AC-002 -> tests/test_atdd_scope_control.py::test_ac_002_unapproved_scope_change_stops
 AC-003 -> tests/test_atdd_scope_control.py::test_ac_003_deferred_discovery_is_not_approved
 AC-004 -> tests/test_atdd_scope_control.py::test_ac_004_unmapped_changed_file_requires_scope_change
+AC-004 -> tests/test_atdd_scope_control.py::test_ac_004_only_active_increment_authorizes_files
+AC-004 -> tests/test_atdd_scope_control.py::test_ac_004_omitted_changed_file_set_fails_closed
+AC-004 -> tests/test_atdd_scope_control.py::test_ac_004_git_diff_includes_rename_and_delete
 AC-005 -> tests/test_atdd_scope_control.py::test_ac_005_checker_stays_outside_runtime_and_architecture
 
 IMPLEMENTATION MAP:
@@ -91,6 +113,8 @@ AC-003 -> tests/atdd_scope.py
 AC-003 -> tests/test_atdd_scope_control.py
 AC-004 -> tests/atdd_scope.py
 AC-004 -> tests/test_atdd_scope_control.py
+AC-004 -> docs/atdd/ACTIVE_INCREMENT
+AC-004 -> .github/workflows/pytest.yml
 AC-005 -> tests/atdd_scope.py
 AC-005 -> tests/test_atdd_scope_control.py
 AC-005 -> pyproject.toml

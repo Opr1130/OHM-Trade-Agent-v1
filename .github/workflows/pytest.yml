@@ -76,3 +76,33 @@ jobs:
         run: |
           sudo -E "$(which python)" -m pytest -q \
             tests/test_canonical_learning_replica_transfer_e2e_v1.py -rs
+
+  atdd-scope:
+    name: atdd scope
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Enforce the active ATDD increment against the changed-file set
+        working-directory: OHM-Trade-Agent-v1
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch origin "${{ github.base_ref }}"
+            base="origin/${{ github.base_ref }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+          case "$base" in
+            ""|0000000000000000000000000000000000000000)
+              echo "changed-file base is missing" >&2
+              exit 2
+              ;;
+          esac
+          git rev-parse --verify "$base"
+          increment="$(tr -d '\r\n' < docs/atdd/ACTIVE_INCREMENT)"
+          python tests/atdd_scope.py --increment "$increment" --git-base "$base"
