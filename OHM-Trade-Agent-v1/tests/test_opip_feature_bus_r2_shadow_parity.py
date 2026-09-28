@@ -287,7 +287,11 @@ def _row_map(report):
     return grouped
 
 
+@pytest.mark.acceptance
 def test_complete_observation_matches_indicator_math_and_replays():
+    """Deterministic replay of a complete observation.
+    ATDD-R2-feature-bus-shadow-parity/AC-001
+    """
     observations, normalized = _observations(
         _rows(count=FEATURE_WINDOW_INTERVALS)
     )
@@ -478,7 +482,11 @@ def test_timestamp_boundary_is_grid_exact():
         _replay(observations, cutoff=CUTOFF.replace(microsecond=1))
 
 
+@pytest.mark.acceptance
 def test_same_evidence_replayed_twice_is_byte_identical():
+    """The same evidence replays byte for byte.
+    ATDD-R2-feature-bus-shadow-parity/AC-001
+    """
     observations, _normalized = _observations(_rows(count=FEATURE_WINDOW_INTERVALS))
     payload = capture_observation_evidence(observations)
     loaded = load_observation_evidence(payload)
@@ -541,7 +549,11 @@ def test_fields_without_a_legacy_emitter_stay_unavailable():
     assert all(row.legacy_value is None for row in report.rows if row.feature_name in unavailable)
 
 
+@pytest.mark.acceptance
 def test_feature_bus_mode_stays_off_and_cycle_does_not_call_it():
+    """Feature Bus stays off and the production cycle does not call it.
+    ATDD-R2-feature-bus-shadow-parity/AC-008
+    """
     assert resolve_feature_bus_mode(type("S", (), {"opip_feature_bus_mode": "off"})()) == "off"
     root = Path(__file__).resolve().parents[1]
     compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
@@ -556,7 +568,11 @@ def test_feature_bus_mode_stays_off_and_cycle_does_not_call_it():
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.acceptance
 def test_replay_refuses_foreign_instrument_version_id():
+    """A foreign instrument identity fails closed.
+    ATDD-R2-feature-bus-shadow-parity/AC-002
+    """
     observations, _normalized = _observations(_rows(count=5))
     foreign = _instrument(version=2)
     with pytest.raises(
@@ -612,7 +628,11 @@ def test_matching_instrument_evidence_still_replays_identically():
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.acceptance
 def test_parity_uses_snapshot_values_when_the_last_bar_precedes_cutoff():
+    """Parity describes the sealed snapshot, not a recomputed value.
+    ATDD-R2-feature-bus-shadow-parity/AC-001
+    """
     observations, _normalized = _observations(
         _rows(count=FEATURE_WINDOW_INTERVALS, end_before=CUTOFF - timedelta(minutes=10))
     )
@@ -655,8 +675,12 @@ def test_watermark_equal_to_max_captured_commit_order_is_allowed():
     assert snapshot.consumed_input_watermark == highest
 
 
+@pytest.mark.acceptance
 def test_watermark_later_than_the_captured_position_is_refused():
-    """A position the capture does not support may not be sealed."""
+    """A position the capture does not support may not be sealed.
+
+    ATDD-R2-feature-bus-shadow-parity/AC-003
+    """
     observations, _normalized = _observations(_rows(count=5))
     later = ConsumedInputWatermark(history_epoch=1, local_sequence=99999)
     with pytest.raises(WatermarkIntegrityError, match="is not the position"):
@@ -887,8 +911,12 @@ def test_availability_matches_the_production_derivation():
     assert result.snapshot.availability.visible_at_utc == NOW
 
 
+@pytest.mark.acceptance
 def test_roll_forward_uses_retained_state_not_the_flat_fetch():
-    """A resumed cycle must not be reproduced from the tip rows alone."""
+    """A resumed cycle must not be reproduced from the tip rows alone.
+
+    ATDD-R2-feature-bus-shadow-parity/AC-004
+    """
     _all, retained, tip = _resumed_case()
     cold = _replay_result(tip)
     resumed = _replay_result(tip, prior_state=retained)
@@ -904,8 +932,12 @@ def test_roll_forward_uses_retained_state_not_the_flat_fetch():
     assert resumed.snapshot.content_hash() != cold.snapshot.content_hash()
 
 
+@pytest.mark.acceptance
 def test_replay_matches_the_production_cycle_snapshot():
-    """The replayed snapshot is byte-identical to the production path's."""
+    """The replayed snapshot is byte-identical to the production path's.
+
+    ATDD-R2-feature-bus-shadow-parity/AC-004
+    """
     from app.opip.features import pipeline
 
     _all, retained, tip = _resumed_case()
@@ -926,8 +958,12 @@ def test_replay_matches_the_production_cycle_snapshot():
     assert result.snapshot.snapshot_id == expected.snapshot_id
 
 
+@pytest.mark.acceptance
 def test_coverage_only_rows_are_not_treated_as_feature_evidence():
-    """A withheld tip re-poll keeps continuity without adding feature values."""
+    """A withheld tip re-poll keeps continuity without adding feature values.
+
+    ATDD-R2-feature-bus-shadow-parity/AC-004
+    """
     observations, _normalized = _observations(
         _rows(count=FEATURE_WINDOW_INTERVALS)
     )
@@ -956,7 +992,11 @@ def test_coverage_only_rows_are_not_treated_as_feature_evidence():
     assert withheld.snapshot.content_hash() != plain.snapshot.content_hash()
 
 
+@pytest.mark.acceptance
 def test_resumed_cycle_without_retained_state_fails_closed():
+    """A resume without retained state fails closed.
+    ATDD-R2-feature-bus-shadow-parity/AC-004
+    """
     observations, _normalized = _observations(_rows(count=5))
     # A hand-written envelope cannot claim a resume and omit the retained state.
     payload = _capture(observations).to_dict()
@@ -1051,7 +1091,11 @@ def test_checkpoint_created_after_the_replay_instant_is_refused():
     )
 
 
+@pytest.mark.acceptance
 def test_unsupported_nested_rolling_state_is_refused():
+    """Unsupported nested rolling-state values are refused.
+    ATDD-R2-feature-bus-shadow-parity/AC-007
+    """
     observations, _normalized = _observations(_rows(count=5))
     retained = advance_state(initial_state(_instrument()), observations).state
     for mutate, message in (
@@ -1286,8 +1330,12 @@ def test_write_watermark_entry_shape_is_validated():
             load_replay_evidence(payload)
 
 
+@pytest.mark.acceptance
 def test_reference_metadata_is_bound_to_the_capture():
-    """Reference metadata drives tick_size_pct, so it must be verified."""
+    """Reference metadata drives tick_size_pct, so it must be verified.
+
+    ATDD-R2-feature-bus-shadow-parity/AC-006
+    """
     observations, _normalized = _observations(_rows(count=5))
     captured = _capture(observations)
     assert captured.reference_fingerprint == _instrument().reference_fingerprint()
@@ -1353,7 +1401,11 @@ def test_reference_metadata_is_bound_to_the_capture():
     )
 
 
+@pytest.mark.acceptance
 def test_future_reference_metadata_is_refused():
+    """Future reference metadata fails closed.
+    ATDD-R2-feature-bus-shadow-parity/AC-006
+    """
     observations, _normalized = _observations(_rows(count=5))
     future = NOW + timedelta(hours=1)
     version = _instrument(observed_at_utc=future)
@@ -1383,7 +1435,11 @@ def test_future_reference_metadata_is_refused():
     )
 
 
+@pytest.mark.acceptance
 def test_missing_reference_binding_fails_closed():
+    """Missing reference binding fails closed.
+    ATDD-R2-feature-bus-shadow-parity/AC-006
+    """
     observations, _normalized = _observations(_rows(count=5))
     payload = _capture(observations).to_dict()
     payload["reference_fingerprint"] = None
@@ -1500,7 +1556,11 @@ def _durable_resume_state(observations):
     return from_checkpoint(checkpoint_from_payload(payload)), base
 
 
+@pytest.mark.acceptance
 def test_checkpoint_resume_reports_restart_warmup():
+    """Checkpoint resume reproduces restart warmup.
+    ATDD-R2-feature-bus-shadow-parity/AC-005
+    """
     # Enough history for the fast EMA, but short of the warm threshold.
     observations, _normalized = _observations(_rows(count=30))
     durable, base = _durable_resume_state(observations)
@@ -1516,8 +1576,12 @@ def test_checkpoint_resume_reports_restart_warmup():
     assert result.snapshot.values["ema_slow_21"] is not None
 
 
+@pytest.mark.acceptance
 def test_in_process_resume_keeps_its_cold_start_provenance():
-    """An in-process state is not a checkpoint resume and must not become one."""
+    """An in-process state is not a checkpoint resume and must not become one.
+
+    ATDD-R2-feature-bus-shadow-parity/AC-005
+    """
     observations, _normalized = _observations(_rows(count=30))
     in_process = advance_state(initial_state(_instrument()), observations).state
     assert in_process.resumed_from_checkpoint is False
@@ -1579,7 +1643,11 @@ def test_restart_state_survives_the_evidence_round_trip():
     )
 
 
+@pytest.mark.acceptance
 def test_corrupt_restart_state_evidence_fails_closed():
+    """Corrupt restart-state evidence fails closed, never defaulted.
+    ATDD-R2-feature-bus-shadow-parity/AC-005
+    """
     observations, _normalized = _observations(_rows(count=5))
     retained = advance_state(initial_state(_instrument()), observations).state
     for value in ("NOT_A_STATE", None, 7):
@@ -1776,7 +1844,11 @@ def test_misaligned_row_below_a_later_declared_write_is_accepted():
     assert snapshot.consumed_input_watermark == later
 
 
+@pytest.mark.acceptance
 def test_uncommitted_misaligned_row_fails_closed():
+    """An uncommitted misaligned row fails closed.
+    ATDD-R2-feature-bus-shadow-parity/AC-003
+    """
     observations, _normalized = _observations(_rows(count=5))
     misaligned = replace(
         _wrong_cadence(observations[2], epoch=CUTOFF - timedelta(minutes=6)),
@@ -2025,7 +2097,11 @@ def test_non_integer_numeric_fields_are_rejected():
             load_observation_evidence(payload)
 
 
+@pytest.mark.acceptance
 def test_domain_invalid_aggregate_values_are_rejected():
+    """Domain-invalid aggregate values fail closed.
+    ATDD-R2-feature-bus-shadow-parity/AC-002
+    """
     observations, _normalized = _observations(_rows(count=5))
     originals = [dict(row) for row in capture_observation_evidence(observations)]
     for field, value, reason in (
@@ -2061,7 +2137,11 @@ def test_future_misaligned_row_cannot_change_coverage():
         _replay(observations + (future,))
 
 
+@pytest.mark.acceptance
 def test_observation_schema_version_must_be_supported():
+    """An unsupported observation schema fails closed.
+    ATDD-R2-feature-bus-shadow-parity/AC-002
+    """
     observations, _normalized = _observations(_rows(count=5))
     payload = list(capture_observation_evidence(observations))
     assert all(row["schema_version"] == OBSERVATION_SCHEMA_VERSION for row in payload)
@@ -2071,7 +2151,11 @@ def test_observation_schema_version_must_be_supported():
         load_observation_evidence(payload)
 
 
+@pytest.mark.acceptance
 def test_conflicting_content_for_one_interval_revision_is_rejected():
+    """Conflicting content for one interval revision fails closed.
+    ATDD-R2-feature-bus-shadow-parity/AC-002
+    """
     observations, _normalized = _observations(_rows(count=5))
     original = observations[-1]
     conflicting_values = dict(original.values)
@@ -2087,7 +2171,11 @@ def test_conflicting_content_for_one_interval_revision_is_rejected():
         _replay(observations + (conflicting,))
 
 
+@pytest.mark.acceptance
 def test_input_not_visible_at_the_replay_instant_is_rejected():
+    """Input not visible at the replay instant fails closed.
+    ATDD-R2-feature-bus-shadow-parity/AC-003
+    """
     observations, _normalized = _observations(
         _rows(count=FEATURE_WINDOW_INTERVALS + 20)
     )
@@ -2117,7 +2205,11 @@ def test_captured_observation_id_round_trips():
     )
 
 
+@pytest.mark.acceptance
 def test_missing_observation_id_is_rejected():
+    """Evidence without an observation identity fails closed.
+    ATDD-R2-feature-bus-shadow-parity/AC-002
+    """
     observations, _normalized = _observations(_rows(count=5))
     payload = [dict(row) for row in capture_observation_evidence(observations)]
     del payload[0]["observation_id"]
