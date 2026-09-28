@@ -651,7 +651,7 @@ def test_post_cutoff_wrong_cadence_row_is_refused():
     post = _wrong_cadence(observations[-1], epoch=CUTOFF + timedelta(minutes=4))
     assert post.source_event_time > CUTOFF
     assert post.receipt_time <= NOW
-    with pytest.raises(TemporalIntegrityError, match="post-cutoff misaligned"):
+    with pytest.raises(TemporalIntegrityError, match="misaligned fact that closes"):
         _replay(observations + (post,))
 
 
@@ -660,7 +660,7 @@ def test_post_cutoff_non_aggregate_row_is_refused():
     post = _ticker(observations[-1], epoch=CUTOFF + timedelta(minutes=2))
     assert post.source_event_time > CUTOFF
     assert post.receipt_time <= NOW
-    with pytest.raises(TemporalIntegrityError, match="post-cutoff misaligned"):
+    with pytest.raises(TemporalIntegrityError, match="misaligned fact that closes"):
         _replay(observations + (post,))
 
 
@@ -691,6 +691,56 @@ def test_post_cutoff_closed_aggregate_cannot_change_the_snapshot():
     assert with_extra.coverage is baseline.coverage
     assert with_extra.values == baseline.values
     assert with_extra.content_hash() == baseline.content_hash()
+
+
+def test_misaligned_row_open_at_the_cutoff_is_refused():
+    observations, _normalized = _observations(_rows(count=7))
+    # A five-minute bar starting one minute before the cutoff is still open at
+    # it, even though its source event time is inside the population.
+    opened = _wrong_cadence(observations[6], epoch=CUTOFF - timedelta(minutes=1))
+    assert opened.source_event_time <= CUTOFF
+    assert opened.interval_end is not None and opened.interval_end > CUTOFF
+    with pytest.raises(TemporalIntegrityError, match="closes at"):
+        _replay(observations + (opened,))
+
+
+def test_same_epoch_at_a_different_cadence_is_not_a_conflict():
+    observations, _normalized = _observations(_rows(count=7))
+    admitted = observations[1]
+    assert admitted.source_event_time == CUTOFF - timedelta(minutes=6)
+    overlapping = replace(
+        _wrong_cadence(admitted, epoch=admitted.source_event_time, ingestion_offset=0),
+        values={**dict(admitted.values), "volume": float(admitted.values["volume"]) + 5.0},
+    )
+    assert overlapping.aggregate_interval_seconds != admitted.aggregate_interval_seconds
+    assert overlapping.ingestion_order == admitted.ingestion_order
+    assert overlapping.interval_end <= CUTOFF
+    snapshot, report = _replay(observations + (overlapping,))
+    assert snapshot.coverage is CoverageState.INCOMPLETE_COVERAGE
+    assert report.counts()["IMPLEMENTATION_DEFECT"] == 0
+
+
+def test_visibility_understating_its_inputs_is_refused():
+    observations, _normalized = _observations(_rows(count=5))
+    later = NOW + timedelta(minutes=30)
+    # Pre-cutoff, pre-evaluation, received after the admitted bars: it changes
+    # coverage, so the snapshot may not claim an earlier visible_at than this.
+    covered = replace(
+        _wrong_cadence(observations[2], epoch=CUTOFF - timedelta(minutes=6)),
+        receipt_time=later,
+    )
+    assert covered.receipt_time > max(item.receipt_time for item in observations)
+    with pytest.raises(TemporalIntegrityError, match="understate"):
+        _replay(
+            observations + (covered,),
+            evaluated_at=later + timedelta(minutes=1),
+        )
+    # The same row, received with the admitted bars, is admissible.
+    on_time = replace(covered, receipt_time=NOW)
+    snapshot, report = _replay(observations + (on_time,))
+    assert snapshot.coverage is CoverageState.INCOMPLETE_COVERAGE
+    assert snapshot.availability.visible_at_utc == NOW
+    assert report.counts()["IMPLEMENTATION_DEFECT"] == 0
 
 
 def test_committed_misaligned_row_above_the_watermark_is_refused():

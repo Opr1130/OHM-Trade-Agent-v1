@@ -332,57 +332,124 @@ def _eligible_evidence(alignment: AlignmentResult) -> tuple[Observation, ...]:
 def _assert_cutoff_population(
     alignment: AlignmentResult, *, evaluation_cutoff: datetime
 ) -> None:
-    """No post-cutoff fact may reach the sealed snapshot.
+    """No fact that was still open at the cutoff may reach the snapshot.
 
     Alignment classifies a non-aggregate, wrong-cadence, or off-grid row as
     misaligned, and that classification is what ``AlignmentResult.coverage``
     consumes. It is the only excluded category whose rows can still change a
-    sealed field, so a post-cutoff misaligned row would let a fact that did not
-    exist at the cutoff time alter an earlier snapshot. Such a row is refused,
-    never dropped.
+    sealed field, so such a row would let a fact that did not exist at the
+    cutoff time alter an earlier snapshot.
+
+    The boundary is the fact's own close, not its start:
+    ``_admit_closed_intervals`` tests cadence before ``interval_end``, so a
+    wrong-cadence aggregate can start before the cutoff and still be open at it.
+    A row without an interval is bounded by its source event time. The row is
+    refused, never dropped.
 
     Every other category is already bounded by the cutoff: admitted rows and
     their superseded losers only qualify when their interval closed at or
     before it, and forming and unclosed rows cannot change a sealed field.
     """
     for item in alignment.excluded_misaligned_rows:
-        if item.source_event_time > evaluation_cutoff:
+        closed_at = item.interval_end or item.source_event_time
+        if closed_at > evaluation_cutoff:
             raise TemporalIntegrityError(
-                "replay evidence contains a post-cutoff misaligned fact at "
-                f"{iso_z(item.source_event_time, field_name='source_event_time')} "
-                "after evaluation_cutoff "
+                "replay evidence contains a misaligned fact that closes at "
+                f"{iso_z(closed_at, field_name='closed_at')} after "
+                "evaluation_cutoff "
                 f"{iso_z(evaluation_cutoff, field_name='evaluation_cutoff')}; it "
                 "cannot belong to the cutoff population"
             )
 
 
+def _assert_visibility_covers_inputs(
+    snapshot: FeatureSnapshot,
+    eligible: Sequence[Observation],
+    *,
+    source_version: str,
+) -> None:
+    """The sealed stamp must not understate the evidence the snapshot depends on.
+
+    ``build_feature_snapshot`` derives availability from the contiguous feature
+    tail, while coverage and lateness come from the whole alignment. A
+    snapshot-affecting row outside that tail can therefore be received later
+    than the ``visible_at_utc`` the snapshot declares, letting a consumer read
+    the snapshot as available before the evidence its own coverage state
+    depends on.
+
+    Widening availability's scope would change canonical evidence for the live
+    path, and recomputing it only here would give replay a second availability
+    semantics that no longer equals the engine's output for the same inputs.
+    Replay therefore refuses evidence the sealed stamp cannot cover.
+    """
+    if not eligible:
+        return
+    stamps = tuple(
+        item.availability_stamp(source_version=source_version) for item in eligible
+    )
+    latest_visible = max(stamp.visible_at_utc for stamp in stamps)
+    if latest_visible > snapshot.availability.visible_at_utc:
+        raise TemporalIntegrityError(
+            "replay evidence became visible at "
+            f"{iso_z(latest_visible, field_name='visible_at_utc')}, later than the "
+            "sealed snapshot visibility "
+            f"{iso_z(snapshot.availability.visible_at_utc, field_name='visible_at_utc')}; "
+            "the snapshot would understate the evidence it depends on"
+        )
+    declared_source = snapshot.availability.source_at_utc
+    if declared_source is None:
+        return
+    latest_source = max(
+        (
+            stamp.source_at_utc
+            for stamp in stamps
+            if stamp.source_at_utc is not None
+        ),
+        default=None,
+    )
+    if latest_source is not None and latest_source > declared_source:
+        raise TemporalIntegrityError(
+            "replay evidence carries a source event at "
+            f"{iso_z(latest_source, field_name='source_at_utc')}, later than the "
+            "sealed snapshot source time "
+            f"{iso_z(declared_source, field_name='source_at_utc')}; the snapshot "
+            "would understate the evidence it depends on"
+        )
+
+
 def _require_consistent_content(eligible: Sequence[Observation]) -> None:
-    """One interval revision must not carry two different stories.
+    """One interval revision of one cadence must not carry two stories.
 
     Canonical reconstruction refuses conflicting content fingerprints for the
     same interval and revision. Replay refuses the same evidence instead of
     silently selecting a winner by ingestion order, and additionally refuses
     two rows that tie on revision rank but differ in any other persisted field,
     because alignment would then keep whichever arrived first.
+
+    Both keys include the aggregate cadence. A one-minute bar and a five-minute
+    bar sharing an epoch are different facts, not two revisions of one
+    interval, and alignment never lets them compete because it tests cadence
+    before it ranks revisions.
     """
-    fingerprints: dict[tuple[int, int], str] = {}
-    ranks: dict[tuple[int, int, int], bytes] = {}
+    fingerprints: dict[tuple[int, int, int | None], str] = {}
+    ranks: dict[tuple[int, int, int | None, int], bytes] = {}
     for item in eligible:
         if item.payload_kind is not PayloadKind.FIXED_INTERVAL_AGGREGATE:
             continue
         epoch = int(item.source_event_time.timestamp())
         revision = int(item.revision)
-        key = (epoch, revision)
+        cadence = item.aggregate_interval_seconds
+        key = (epoch, revision, cadence)
         fingerprint = aggregate_content_fingerprint(dict(item.values))
         prior_fingerprint = fingerprints.get(key)
         if prior_fingerprint is not None and prior_fingerprint != fingerprint:
             raise EvidenceIntegrityError(
                 "replay evidence has conflicting content for interval epoch "
-                f"{epoch} revision {revision}; refusing to hide incompatible "
-                "canonical evidence"
+                f"{epoch} revision {revision} cadence {cadence}; refusing to "
+                "hide incompatible canonical evidence"
             )
         fingerprints[key] = fingerprint
-        rank = (epoch, revision, int(item.ingestion_order))
+        rank = (epoch, revision, cadence, int(item.ingestion_order))
         payload = canonical_json_bytes(item.to_dict())
         prior_payload = ranks.get(rank)
         if prior_payload is not None and prior_payload != payload:
@@ -432,10 +499,11 @@ def replay_feature_snapshot(
     A declared feature version other than this engine's ``FEATURE_VERSION``
     is refused before any value is computed. Evidence that does not belong to
     the supplied ``InstrumentVersion``, or that was not visible at
-    ``evaluated_at_utc``, is refused before alignment. No post-cutoff fact may
-    reach the sealed snapshot through coverage. The evidence the snapshot then
-    depends on must be self-consistent and covered by
-    ``consumed_input_watermark`` before the snapshot is sealed.
+    ``evaluated_at_utc``, is refused before alignment. No fact still open at
+    ``evaluation_cutoff`` may reach the sealed snapshot through coverage. The
+    evidence the snapshot then depends on must be self-consistent, must be
+    covered by ``consumed_input_watermark``, and must be visible no later than
+    the snapshot itself claims.
     """
     _require_feature_version(declared_feature_version)
     _assert_replay_identity(observations, instrument_version=instrument_version)
@@ -450,7 +518,7 @@ def replay_feature_snapshot(
         eligible,
         consumed_input_watermark=consumed_input_watermark,
     )
-    return build_feature_snapshot(
+    snapshot = build_feature_snapshot(
         alignment,
         instrument_version=instrument_version,
         evaluation_cutoff=evaluation_cutoff,
@@ -458,6 +526,10 @@ def replay_feature_snapshot(
         consumed_input_watermark=consumed_input_watermark,
         source_version=source_version,
     )
+    _assert_visibility_covers_inputs(
+        snapshot, eligible, source_version=source_version
+    )
+    return snapshot
 
 
 def replay_captured_evidence(
