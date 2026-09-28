@@ -108,6 +108,9 @@ _REPLAY_EVIDENCE_KEYS: tuple[str, ...] = (
     "prior_state",
     "window_start",
     "source_incomplete",
+    "instrument_version_id",
+    "reference_fingerprint",
+    "reference_observed_at_utc",
     "committed_write_watermarks",
     "evidence",
     "coverage_only",
@@ -343,6 +346,12 @@ class ReplayEvidence:
     #: Canonical write positions the cycle's own writes returned, folded into the
     #: sealed consumed-input watermark. Empty for a dry-run capture.
     committed_write_watermarks: tuple[ConsumedInputWatermark, ...] = ()
+    #: The reference identity the cycle consumed. ``build_feature_snapshot`` reads
+    #: ``tick_size`` and ``min_order_size`` off it, so the envelope has to bind
+    #: the metadata, not just the ids the observations already carry.
+    instrument_version_id: str | None = None
+    reference_fingerprint: str | None = None
+    reference_observed_at_utc: datetime | None = None
     window_start: datetime | None = None
     source_incomplete: bool = False
 
@@ -371,6 +380,13 @@ class ReplayEvidence:
                 else None
             ),
             "source_incomplete": bool(self.source_incomplete),
+            "instrument_version_id": self.instrument_version_id,
+            "reference_fingerprint": self.reference_fingerprint,
+            "reference_observed_at_utc": (
+                iso_z(self.reference_observed_at_utc, field_name="reference_observed_at_utc")
+                if self.reference_observed_at_utc is not None
+                else None
+            ),
             "committed_write_watermarks": [
                 item.to_dict() for item in self.committed_write_watermarks
             ],
@@ -382,6 +398,7 @@ class ReplayEvidence:
 def capture_replay_evidence(
     evidence: Sequence[Observation],
     *,
+    instrument_version: InstrumentVersion | None = None,
     prior_state: RollingState | FeatureStateCheckpoint | Mapping[str, Any] | None = None,
     prior_state_created_at_utc: datetime | None = None,
     coverage_only: Sequence[Observation] = (),
@@ -393,6 +410,7 @@ def capture_replay_evidence(
 
     The origin is derived from ``prior_state`` rather than declared, so a
     capture cannot claim a cold start while holding retained history.
+    ``instrument_version`` binds the reference metadata the snapshot reads.
     ``prior_state_created_at_utc`` is required for an in-memory state and records
     when it was observed; without it replay cannot bound when the retained
     values arrived. ``committed_write_watermarks`` are the canonical positions
@@ -432,6 +450,15 @@ def capture_replay_evidence(
         coverage_only=capture_observation_evidence(coverage_only),
         prior_state=captured_state,
         prior_state_resumed_from_checkpoint=resumed_from_checkpoint,
+        instrument_version_id=(
+            None if instrument_version is None else instrument_version.instrument_version_id
+        ),
+        reference_fingerprint=(
+            None if instrument_version is None else instrument_version.reference_fingerprint()
+        ),
+        reference_observed_at_utc=(
+            None if instrument_version is None else instrument_version.observed_at_utc
+        ),
         committed_write_watermarks=tuple(
             ConsumedInputWatermark(
                 history_epoch=int(item.history_epoch),
@@ -624,9 +651,15 @@ def _write_watermarks_from_evidence(raw: Any) -> tuple[ConsumedInputWatermark, .
 def load_replay_evidence(
     payload: ReplayEvidence | Mapping[str, Any],
 ) -> ReplayEvidence:
-    """Rebuild captured evidence, refusing anything outside the declared fields."""
+    """Rebuild captured evidence, refusing anything outside the declared fields.
+
+    A ``ReplayEvidence`` instance is serialized and re-validated rather than
+    returned unchanged: the public dataclass can be constructed or replaced
+    directly, and trusting it would skip every envelope, checkpoint, and
+    retained-series check.
+    """
     if isinstance(payload, ReplayEvidence):
-        return payload
+        payload = payload.to_dict()
     if not isinstance(payload, Mapping):
         raise ValueError("replay evidence must be a captured evidence object")
     missing = [key for key in _REPLAY_EVIDENCE_KEYS if key not in payload]
@@ -666,6 +699,23 @@ def load_replay_evidence(
             "cold-start planner has no retained history to keep a re-poll "
             "coverage-only, so the evidence-role context is inconsistent"
         )
+    reference_fingerprint = payload["reference_fingerprint"]
+    if not isinstance(reference_fingerprint, str) or not reference_fingerprint.strip():
+        raise ValueError(
+            "replay evidence must declare reference_fingerprint; the snapshot "
+            "reads tick size and minimum order size off the instrument version"
+        )
+    raw_reference_time = payload["reference_observed_at_utc"]
+    reference_observed_at = (
+        None
+        if raw_reference_time is None
+        else _parse_time(raw_reference_time, "reference_observed_at_utc")
+    )
+    instrument_version_id = payload["instrument_version_id"]
+    if not isinstance(instrument_version_id, str) or not instrument_version_id.strip():
+        raise ValueError(
+            "replay evidence instrument_version_id must be a non-empty string"
+        )
     return ReplayEvidence(
         cycle_origin=cycle_origin,
         evidence=evidence,
@@ -673,6 +723,9 @@ def load_replay_evidence(
         prior_state=prior_state[0],
         prior_state_resumed_from_checkpoint=prior_state[1],
         committed_write_watermarks=committed_writes,
+        instrument_version_id=instrument_version_id,
+        reference_fingerprint=reference_fingerprint,
+        reference_observed_at_utc=reference_observed_at,
         window_start=window_start,
         source_incomplete=source_incomplete,
     )
@@ -838,6 +891,48 @@ def _retained_state(
     )
 
 
+def _assert_reference_identity(
+    evidence: ReplayEvidence,
+    *,
+    instrument_version: InstrumentVersion,
+    evaluated_at_utc: datetime,
+) -> None:
+    """The supplied instrument version must be the one the capture consumed.
+
+    ``build_feature_snapshot`` reads ``tick_size`` and ``min_order_size`` off the
+    instrument version, so two versions sharing ids but differing in reference
+    metadata produce different ``tick_size_pct`` and ``min_order_notional`` under
+    the same snapshot id. The envelope therefore binds the reference fingerprint
+    and the time it was observed, and replay refuses a mismatch or metadata
+    observed after the replay instant.
+    """
+    if evidence.reference_fingerprint is None:
+        raise EvidenceIntegrityError(
+            "replay refused: captured evidence declares no reference fingerprint, "
+            "so the instrument version it consumed cannot be verified"
+        )
+    supplied = instrument_version.reference_fingerprint()
+    if supplied != evidence.reference_fingerprint:
+        raise CycleIdentityMismatch(
+            "instrument version reference fingerprint "
+            f"{supplied!r} != captured {evidence.reference_fingerprint!r}; the "
+            "reference metadata behind tick size and minimum order size differs"
+        )
+    if evidence.instrument_version_id != instrument_version.instrument_version_id:
+        raise CycleIdentityMismatch(
+            f"instrument version {instrument_version.instrument_version_id!r} != "
+            f"captured {evidence.instrument_version_id!r}"
+        )
+    observed = evidence.reference_observed_at_utc
+    if observed is not None and observed > evaluated_at_utc:
+        raise TemporalIntegrityError(
+            "captured reference metadata was observed at "
+            f"{iso_z(observed, field_name='reference_observed_at_utc')}, after "
+            f"{iso_z(evaluated_at_utc, field_name='evaluated_at_utc')}; it was "
+            "not available at the replay instant"
+        )
+
+
 def _assert_retained_state_population(
     prior_state: RollingState,
     *,
@@ -919,6 +1014,16 @@ def source_evidence_identity(
                 else None
             ),
             "source_incomplete": bool(evidence.source_incomplete),
+            "instrument_version_id": evidence.instrument_version_id,
+            "reference_fingerprint": evidence.reference_fingerprint,
+            "reference_observed_at_utc": (
+                iso_z(
+                    evidence.reference_observed_at_utc,
+                    field_name="reference_observed_at_utc",
+                )
+                if evidence.reference_observed_at_utc is not None
+                else None
+            ),
             "committed_write_watermarks": [
                 item.to_dict() for item in evidence.committed_write_watermarks
             ],
@@ -1226,6 +1331,14 @@ def replay_cycle(
     refused before any value is computed.
     """
     _require_feature_version(declared_feature_version)
+    # A ReplayEvidence instance is re-validated here, not trusted: the public
+    # dataclass can be constructed or replaced directly.
+    evidence = load_replay_evidence(evidence)
+    _assert_reference_identity(
+        evidence,
+        instrument_version=instrument_version,
+        evaluated_at_utc=evaluated_at_utc,
+    )
     prior, prior_checkpoint = _retained_state(
         evidence,
         instrument_version=instrument_version,
@@ -1315,6 +1428,7 @@ def replay_feature_snapshot(
     """
     evidence = capture_replay_evidence(
         observations,
+        instrument_version=instrument_version,
         window_start=window_start,
         source_incomplete=source_incomplete,
     )

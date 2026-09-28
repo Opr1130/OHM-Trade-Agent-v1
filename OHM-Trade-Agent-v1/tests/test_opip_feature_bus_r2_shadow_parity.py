@@ -191,6 +191,7 @@ def _capture(observations, *, prior_state=None, created_at: datetime | None = No
         kwargs["prior_state_created_at_utc"] = (
             created_at if created_at is not None else NOW
         )
+    kwargs.setdefault("instrument_version", _instrument())
     return capture_replay_evidence(observations, prior_state=prior_state, **kwargs)
 
 
@@ -558,7 +559,9 @@ def test_feature_bus_mode_stays_off_and_cycle_does_not_call_it():
 def test_replay_refuses_foreign_instrument_version_id():
     observations, _normalized = _observations(_rows(count=5))
     foreign = _instrument(version=2)
-    with pytest.raises(CycleIdentityMismatch, match="instrument_version_id"):
+    with pytest.raises(
+        CycleIdentityMismatch, match="instrument_version_id|instrument version"
+    ):
         _replay(observations, instrument=foreign)
 
 
@@ -1249,6 +1252,110 @@ def test_write_watermark_entry_shape_is_validated():
         payload["committed_write_watermarks"] = [entry]
         with pytest.raises(ValueError, match=message):
             load_replay_evidence(payload)
+
+
+def test_reference_metadata_is_bound_to_the_capture():
+    """Reference metadata drives tick_size_pct, so it must be verified."""
+    observations, _normalized = _observations(_rows(count=5))
+    captured = _capture(observations)
+    assert captured.reference_fingerprint == _instrument().reference_fingerprint()
+    assert captured.instrument_version_id == _instrument().instrument_version_id
+    # Different reference metadata under the same ids is refused.
+    drifted = _instrument(tick_size=0.05)
+    assert drifted.instrument_version_id == _instrument().instrument_version_id
+    assert drifted.reference_fingerprint() != _instrument().reference_fingerprint()
+    with pytest.raises(CycleIdentityMismatch, match="reference fingerprint"):
+        replay_cycle(
+            captured,
+            instrument_version=drifted,
+            evaluation_cutoff=CUTOFF,
+            evaluated_at_utc=NOW,
+            consumed_input_watermark=_watermark(observations),
+            source_version=SOURCE,
+        )
+    # And the drift really would have changed sealed values.
+    drifted_snapshot = replay_cycle(
+        _capture(observations, instrument_version=drifted),
+        instrument_version=drifted,
+        evaluation_cutoff=CUTOFF,
+        evaluated_at_utc=NOW,
+        consumed_input_watermark=_watermark(observations),
+        source_version=SOURCE,
+    ).snapshot
+    baseline = _replay_result(observations).snapshot
+    assert (
+        drifted_snapshot.values["tick_size_pct"]
+        != baseline.values["tick_size_pct"]
+    )
+    assert drifted_snapshot.snapshot_id == baseline.snapshot_id
+
+
+def test_future_reference_metadata_is_refused():
+    observations, _normalized = _observations(_rows(count=5))
+    future = NOW + timedelta(hours=1)
+    version = _instrument(observed_at_utc=future)
+    captured = _capture(observations, instrument_version=version)
+    assert captured.reference_observed_at_utc == future
+    with pytest.raises(TemporalIntegrityError, match="reference metadata"):
+        replay_cycle(
+            captured,
+            instrument_version=version,
+            evaluation_cutoff=CUTOFF,
+            evaluated_at_utc=NOW,
+            consumed_input_watermark=_watermark(observations),
+            source_version=SOURCE,
+        )
+    # Observed in time, the same version replays.
+    ok = _instrument(observed_at_utc=NOW)
+    assert (
+        replay_cycle(
+            _capture(observations, instrument_version=ok),
+            instrument_version=ok,
+            evaluation_cutoff=CUTOFF,
+            evaluated_at_utc=NOW,
+            consumed_input_watermark=_watermark(observations),
+            source_version=SOURCE,
+        ).snapshot.values["tick_size_pct"]
+        is not None
+    )
+
+
+def test_missing_reference_binding_fails_closed():
+    observations, _normalized = _observations(_rows(count=5))
+    payload = _capture(observations).to_dict()
+    payload["reference_fingerprint"] = None
+    with pytest.raises(ValueError, match="reference_fingerprint"):
+        load_replay_evidence(payload)
+    payload = _capture(observations).to_dict()
+    del payload["instrument_version_id"]
+    with pytest.raises(ValueError, match="missing required keys"):
+        load_replay_evidence(payload)
+
+
+def test_directly_constructed_evidence_is_validated():
+    """A hand-built instance must not bypass the envelope checks."""
+    from dataclasses import replace as dataclass_replace
+
+    observations, _normalized = _observations(_rows(count=5))
+    retained = advance_state(initial_state(_instrument()), observations).state
+    captured = _capture(observations, prior_state=retained)
+    # Mutating the retained series while keeping the envelope intact is caught.
+    poisoned = dict(captured.prior_state)
+    rolling = dict(poisoned["rolling_state"])
+    closes = list(rolling["closes"])
+    closes[-1] = -1.0
+    rolling["closes"] = closes
+    poisoned["rolling_state"] = rolling
+    tampered = dataclass_replace(captured, prior_state=poisoned)
+    with pytest.raises(ValueError, match="non_positive_price"):
+        _replay_evidence_result(tampered)
+    # An instance that lost a required field is caught too.
+    with pytest.raises(ValueError, match="reference_fingerprint"):
+        _replay_evidence_result(
+            dataclass_replace(captured, reference_fingerprint=None)
+        )
+    # And the unmodified instance still replays.
+    assert _replay_evidence_result(captured).snapshot.snapshot_id
 
 
 def test_retained_state_at_a_different_cadence_is_refused():
