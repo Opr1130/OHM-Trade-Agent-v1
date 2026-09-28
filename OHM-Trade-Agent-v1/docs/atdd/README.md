@@ -96,6 +96,8 @@ python tests/atdd_scope.py --increment ATDD-000-scope-control --git-base origin/
 
 `--git-base` includes additions, modifications, renames, and deletions. Omitting both `--git-base` and explicit paths fails closed. Exit `0` is `PASS`. Exit `2` is `SCOPE_CHANGE_REQUIRED`. Exit `1` is `TRACEABILITY_GAP`.
 
+Every authorized path is relative to the repository root. `OHM-Trade-Agent-v1/pyproject.toml` and `pyproject.toml` are different files. `.github/workflows/pytest.yml` and `OHM-Trade-Agent-v1/.github/workflows/pytest.yml` are different files. The checker keeps the `OHM-Trade-Agent-v1/` prefix from the Git diff. A leading `./` and backslashes are normalized before that comparison. A `..` segment is rejected. Positional paths must already be repository-root paths; the checker does not treat a shorter suffix as the same file.
+
 ## Implementation agent
 
 1. Read approved architecture.

@@ -69,13 +69,31 @@ class ScopeCheckResult:
 
 
 def normalize_repo_path(path: str) -> str:
+    """Return one repository-root path.
+
+    Git diffs and implementation-map entries already use this namespace.
+    A leading ``./`` and Windows separators are normalized. The
+    ``OHM-Trade-Agent-v1/`` prefix is preserved, so an application file and a
+    wrapper-root file with the same suffix stay distinct. ``..`` and other
+    escaping forms are rejected.
+    """
     normalized = path.strip().replace("\\", "/")
-    while normalized.startswith("./"):
-        normalized = normalized[2:]
-    prefix = "OHM-Trade-Agent-v1/"
-    if normalized.startswith(prefix):
-        normalized = normalized[len(prefix) :]
-    return normalized
+    if normalized.startswith("/") or (len(normalized) >= 2 and normalized[1] == ":"):
+        raise ValueError(f"path escapes the repository: {path}")
+    parts: list[str] = []
+    for part in normalized.split("/"):
+        if part == ".":
+            continue
+        if part == "":
+            if parts:
+                raise ValueError(f"path escapes the repository: {path}")
+            continue
+        if part == "..":
+            raise ValueError(f"path escapes the repository: {path}")
+        parts.append(part)
+    if not parts:
+        raise ValueError(f"path escapes the repository: {path}")
+    return "/".join(parts)
 
 
 def parse_scope_contract(text: str) -> ScopeContract:
@@ -215,13 +233,7 @@ def check_scope(
     for ac_id in contract.implementation_map:
         if ac_id not in contract.acceptance_criteria:
             scope_reasons.append(f"implementation map cites unapproved {ac_id}")
-    allow = _allow_paths(contract)
-    for changed in changed_files:
-        normalized = normalize_repo_path(changed)
-        if normalized not in allow:
-            scope_reasons.append(
-                f"changed file not mapped to an approved AC: {normalized}"
-            )
+    _authorize_changed_files(changed_files, _allow_paths(contract), scope_reasons)
     return _result(scope_reasons, trace_reasons)
 
 
@@ -258,13 +270,7 @@ def check_contracts(
     if changed_files is None:
         scope_reasons.append("changed-file set was not provided")
     else:
-        allow = _allow_paths(selected)
-        for changed in changed_files:
-            normalized = normalize_repo_path(changed)
-            if normalized not in allow:
-                scope_reasons.append(
-                    f"changed file not mapped to an approved AC: {normalized}"
-                )
+        _authorize_changed_files(changed_files, _allow_paths(selected), scope_reasons)
     return _result(scope_reasons, trace_reasons)
 
 
@@ -405,6 +411,23 @@ def _select_active(
     if len(matches) != 1:
         return f"active increment is unknown or ambiguous: {active_increment}"
     return matches[0]
+
+
+def _authorize_changed_files(
+    changed_files: tuple[str, ...],
+    allow: set[str],
+    scope_reasons: list[str],
+) -> None:
+    for changed in changed_files:
+        try:
+            normalized = normalize_repo_path(changed)
+        except ValueError as exc:
+            scope_reasons.append(str(exc))
+            continue
+        if normalized not in allow:
+            scope_reasons.append(
+                f"changed file not mapped to an approved AC: {normalized}"
+            )
 
 
 def _allow_paths(contract: ScopeContract) -> set[str]:

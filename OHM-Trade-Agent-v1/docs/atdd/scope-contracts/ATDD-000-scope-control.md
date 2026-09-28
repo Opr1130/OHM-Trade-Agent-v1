@@ -65,6 +65,10 @@ WHEN:
 the check runs without an explicit changed-file set
 THEN:
 the result is SCOPE_CHANGE_REQUIRED
+WHEN:
+a changed path differs from a mapped repository-root path only by an OHM-Trade-Agent-v1/ prefix, or the path escapes the repository
+THEN:
+the result is SCOPE_CHANGE_REQUIRED and the two paths are not the same file
 
 AC-005:
 GIVEN:
@@ -99,25 +103,26 @@ AC-004 -> tests/test_atdd_scope_control.py::test_ac_004_unmapped_changed_file_re
 AC-004 -> tests/test_atdd_scope_control.py::test_ac_004_only_active_increment_authorizes_files
 AC-004 -> tests/test_atdd_scope_control.py::test_ac_004_omitted_changed_file_set_fails_closed
 AC-004 -> tests/test_atdd_scope_control.py::test_ac_004_git_diff_includes_rename_and_delete
+AC-004 -> tests/test_atdd_scope_control.py::test_ac_004_repo_root_paths_do_not_collapse
 AC-005 -> tests/test_atdd_scope_control.py::test_ac_005_checker_stays_outside_runtime_and_architecture
 
 IMPLEMENTATION MAP:
-AC-001 -> docs/atdd/README.md
-AC-001 -> docs/atdd/scope-contracts/ATDD-000-scope-control.md
-AC-001 -> tests/atdd_scope.py
-AC-001 -> tests/test_atdd_scope_control.py
-AC-001 -> pyproject.toml
-AC-002 -> tests/atdd_scope.py
-AC-002 -> tests/test_atdd_scope_control.py
-AC-003 -> tests/atdd_scope.py
-AC-003 -> tests/test_atdd_scope_control.py
-AC-004 -> tests/atdd_scope.py
-AC-004 -> tests/test_atdd_scope_control.py
-AC-004 -> docs/atdd/ACTIVE_INCREMENT
+AC-001 -> OHM-Trade-Agent-v1/docs/atdd/README.md
+AC-001 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-000-scope-control.md
+AC-001 -> OHM-Trade-Agent-v1/tests/atdd_scope.py
+AC-001 -> OHM-Trade-Agent-v1/tests/test_atdd_scope_control.py
+AC-001 -> OHM-Trade-Agent-v1/pyproject.toml
+AC-002 -> OHM-Trade-Agent-v1/tests/atdd_scope.py
+AC-002 -> OHM-Trade-Agent-v1/tests/test_atdd_scope_control.py
+AC-003 -> OHM-Trade-Agent-v1/tests/atdd_scope.py
+AC-003 -> OHM-Trade-Agent-v1/tests/test_atdd_scope_control.py
+AC-004 -> OHM-Trade-Agent-v1/tests/atdd_scope.py
+AC-004 -> OHM-Trade-Agent-v1/tests/test_atdd_scope_control.py
+AC-004 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
 AC-004 -> .github/workflows/pytest.yml
-AC-005 -> tests/atdd_scope.py
-AC-005 -> tests/test_atdd_scope_control.py
-AC-005 -> pyproject.toml
+AC-005 -> OHM-Trade-Agent-v1/tests/atdd_scope.py
+AC-005 -> OHM-Trade-Agent-v1/tests/test_atdd_scope_control.py
+AC-005 -> OHM-Trade-Agent-v1/pyproject.toml
 
 DEFERRED DISCOVERIES:
 - The checked-in architecture package is v1.2. Attached v1.4.3, and the v1.4.2 document named by AGENTS.md, are not in the repository. Vendoring them needs a separate OWNER decision.

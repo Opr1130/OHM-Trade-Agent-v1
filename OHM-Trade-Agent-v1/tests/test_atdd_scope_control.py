@@ -21,6 +21,7 @@ from tests.atdd_scope import (  # noqa: E402
     SCOPE_CHANGE_REQUIRED,
     TRACEABILITY_GAP,
     AcceptanceIndex,
+    ScopeContract,
     acceptance_ids_in_source,
     check_contracts,
     check_scope,
@@ -43,7 +44,7 @@ def _contract_text(
     *,
     criteria: str | None = None,
     trace: str = f"AC-001 -> {SYNTHETIC_NODE}",
-    implementation: str = "AC-001 -> docs/atdd/README.md",
+    implementation: str = "AC-001 -> OHM-Trade-Agent-v1/docs/atdd/README.md",
     deferred: str = "- none recorded for this synthetic contract",
     unapproved: str = "NONE",
     increment: str = "ATDD-SYNTHETIC",
@@ -113,7 +114,7 @@ def test_ac_001_unmapped_criterion_fails_and_mapped_contract_passes() -> None:
     suite = check_contracts(
         loaded,
         load_acceptance_index(APP_ROOT / "tests"),
-        ("docs/atdd/README.md",),
+        ("OHM-Trade-Agent-v1/docs/atdd/README.md",),
         active_increment="ATDD-000-scope-control",
     )
     assert suite.status == "PASS"
@@ -186,9 +187,9 @@ def test_ac_005_checker_stays_outside_runtime_and_architecture() -> None:
         mapped.update(paths)
     assert mapped
     for path in mapped:
-        assert not path.startswith("docs/architecture/")
-        assert not path.startswith("app/")
-        assert (APP_ROOT / path).is_file() or (APP_ROOT.parent / path).is_file()
+        assert not path.startswith("OHM-Trade-Agent-v1/docs/architecture/")
+        assert not path.startswith("OHM-Trade-Agent-v1/app/")
+        assert (APP_ROOT.parent / path).is_file()
 
     pyproject = (APP_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     parsed = tomllib.loads(pyproject)
@@ -414,3 +415,70 @@ def test_ac_004_git_diff_includes_rename_and_delete(tmp_path: Path) -> None:
     git("commit", "-m", "change")
     changed = set(git_changed_paths(tmp_path, base))
     assert changed == {"old.py", "new.py", "gone.py"}
+    renamed = parse_scope_contract(
+        _contract_text(implementation="AC-001 -> app/to.py")
+    )
+    only_new = check_contracts(
+        (renamed,),
+        _index(),
+        ("app/from.py", "app/to.py"),
+        active_increment="ATDD-SYNTHETIC",
+    )
+    assert only_new.status == SCOPE_CHANGE_REQUIRED
+    assert any("app/from.py" in reason for reason in only_new.scope_reasons)
+    assert all("app/to.py" not in reason for reason in only_new.scope_reasons)
+
+
+@pytest.mark.acceptance
+def test_ac_004_repo_root_paths_do_not_collapse() -> None:
+    """ATDD-000-scope-control/AC-004: a repository-root path is not an application-root path."""
+    index = _index()
+
+    def gate(contract: ScopeContract, changed: tuple[str, ...]):
+        return check_contracts(
+            (contract,),
+            index,
+            changed,
+            active_increment="ATDD-SYNTHETIC",
+        )
+
+    app_file = parse_scope_contract(
+        _contract_text(implementation="AC-001 -> OHM-Trade-Agent-v1/pyproject.toml")
+    )
+    assert gate(app_file, ("OHM-Trade-Agent-v1/pyproject.toml",)).status == "PASS"
+    assert gate(app_file, ("./OHM-Trade-Agent-v1/pyproject.toml",)).status == "PASS"
+    assert gate(app_file, ("OHM-Trade-Agent-v1\\pyproject.toml",)).status == "PASS"
+    root_pyproject = gate(app_file, ("pyproject.toml",))
+    assert root_pyproject.status == SCOPE_CHANGE_REQUIRED
+    assert any(
+        reason.endswith(": pyproject.toml") for reason in root_pyproject.scope_reasons
+    )
+
+    workflow = parse_scope_contract(
+        _contract_text(implementation="AC-001 -> .github/workflows/pytest.yml")
+    )
+    assert gate(workflow, (".github/workflows/pytest.yml",)).status == "PASS"
+    assert gate(workflow, ("./.github/workflows/pytest.yml",)).status == "PASS"
+    nested_workflow = gate(
+        workflow,
+        ("OHM-Trade-Agent-v1/.github/workflows/pytest.yml",),
+    )
+    assert nested_workflow.status == SCOPE_CHANGE_REQUIRED
+    assert any(
+        "OHM-Trade-Agent-v1/.github/workflows/pytest.yml" in reason
+        for reason in nested_workflow.scope_reasons
+    )
+
+    for escaped in (
+        "../pyproject.toml",
+        "OHM-Trade-Agent-v1/../pyproject.toml",
+        "OHM-Trade-Agent-v1/docs/../../pyproject.toml",
+        "/tmp/pyproject.toml",
+        "OHM-Trade-Agent-v1//pyproject.toml",
+    ):
+        rejected = gate(app_file, (escaped,))
+        assert rejected.status == SCOPE_CHANGE_REQUIRED
+        assert any("escapes the repository" in reason for reason in rejected.scope_reasons)
+
+    with pytest.raises(ValueError, match="escapes the repository"):
+        parse_scope_contract(_contract_text(implementation="AC-001 -> ../pyproject.toml"))
