@@ -161,7 +161,7 @@ class ClassifiedParityReport:
     snapshot_id: str | None
 
     def counts(self) -> dict[str, int]:
-        totals = {name: 0 for name in CLASSIFICATIONS}
+        totals = dict.fromkeys(CLASSIFICATIONS, 0)
         for row in self.rows:
             totals[row.classification] += 1
         totals["total"] = len(self.rows)
@@ -380,7 +380,7 @@ def classify_shadow_parity(
     never recomputed here; only the legacy reference values are produced, by
     calling the existing production indicator functions.
     """
-    if ABSOLUTE_TOLERANCE != 0.0:
+    if not _exactly_equal(ABSOLUTE_TOLERANCE, 0.0):
         raise AssertionError("R2 parity refuses a non-zero tolerance")
     if set(bus_values) != set(FEATURE_NAMES):
         raise AssertionError("parity bus values do not cover FEATURE_NAMES")
@@ -661,6 +661,28 @@ def _round(value: Any) -> float | None:
     return round(float(value), VALUE_PRECISION)
 
 
+def _commit_order_from_evidence(
+    raw: Mapping[str, Any],
+) -> ConsumedInputWatermark | None:
+    history_epoch = raw["history_epoch"]
+    local_sequence = raw["local_sequence"]
+    if history_epoch is None and local_sequence is None:
+        return None
+    if history_epoch is None or local_sequence is None:
+        raise ValueError("replay evidence commit order is incomplete")
+    return ConsumedInputWatermark(
+        history_epoch=int(history_epoch),
+        local_sequence=int(local_sequence),
+    )
+
+
+def _provenance_from_evidence(raw: Mapping[str, Any]) -> dict[str, str]:
+    provenance = raw["provenance"]
+    if not isinstance(provenance, Mapping):
+        raise ValueError("replay evidence provenance must be an object")
+    return {str(key): str(value) for key, value in provenance.items()}
+
+
 def _observation_from_evidence(raw: Mapping[str, Any]) -> Observation:
     if not isinstance(raw, Mapping):
         raise ValueError("replay evidence row must be an object")
@@ -677,20 +699,7 @@ def _observation_from_evidence(raw: Mapping[str, Any]) -> Observation:
         absent = [key for key in AGGREGATE_REQUIRED_KEYS if values.get(key) is None]
         if absent:
             raise ValueError(f"aggregate is missing values: {sorted(absent)}")
-    history_epoch = raw["history_epoch"]
-    local_sequence = raw["local_sequence"]
-    if history_epoch is None and local_sequence is None:
-        commit_order = None
-    elif history_epoch is None or local_sequence is None:
-        raise ValueError("replay evidence commit order is incomplete")
-    else:
-        commit_order = ConsumedInputWatermark(
-            history_epoch=int(history_epoch),
-            local_sequence=int(local_sequence),
-        )
-    provenance = raw["provenance"]
-    if not isinstance(provenance, Mapping):
-        raise ValueError("replay evidence provenance must be an object")
+    commit_order = _commit_order_from_evidence(raw)
     captured_id = raw["observation_id"]
     if not isinstance(captured_id, str) or not captured_id.strip():
         raise ValueError("replay evidence observation_id must be a non-empty string")
@@ -715,7 +724,7 @@ def _observation_from_evidence(raw: Mapping[str, Any]) -> Observation:
         revision=int(raw["revision"]),
         supersedes=None if raw["supersedes"] is None else str(raw["supersedes"]),
         interval_forming=bool(raw["interval_forming"]),
-        provenance={str(key): str(value) for key, value in provenance.items()},
+        provenance=_provenance_from_evidence(raw),
         commit_order=commit_order,
         schema_version=int(raw["schema_version"]),
     )
