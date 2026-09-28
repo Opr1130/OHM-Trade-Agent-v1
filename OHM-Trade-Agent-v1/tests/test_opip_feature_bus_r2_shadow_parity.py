@@ -22,6 +22,7 @@ from app.opip.contracts.enums import (
 from app.opip.contracts.identity import ConsumedInputWatermark, InstrumentVersion
 from app.opip.contracts.observation import OBSERVATION_SCHEMA_VERSION
 from app.opip.contracts.temporal import TemporalIntegrityError
+from app.opip.features.checkpoint_store import checkpoint_from_payload
 from app.opip.features.engine import (
     FEATURE_NAMES,
     FEATURE_VERSION,
@@ -51,6 +52,7 @@ from app.opip.features.replay import compare_resumed_state, reconstruct_state
 from app.opip.features.state import (
     RollingState,
     advance_state,
+    from_checkpoint,
     initial_state,
     to_checkpoint,
 )
@@ -949,14 +951,18 @@ def test_retained_state_identity_and_version_mismatch_fails_closed():
         _replay(observations, prior_state=other)
     payload = capture_replay_evidence(observations, prior_state=retained).to_dict()
     payload["prior_state"] = dict(payload["prior_state"])
-    payload["prior_state"]["feature_version"] = "features-v0"
+    payload["prior_state"]["checkpoint"] = dict(payload["prior_state"]["checkpoint"])
+    payload["prior_state"]["checkpoint"]["feature_version"] = "features-v0"
     with pytest.raises(CycleIdentityMismatch, match="feature_version"):
         _replay(observations, prior_state=load_replay_evidence(payload).prior_state)
     # Corrupt retained state is refused by the canonical loader, not repaired.
     payload = capture_replay_evidence(observations, prior_state=retained).to_dict()
     payload["prior_state"] = dict(payload["prior_state"])
-    payload["prior_state"]["consumed_input_watermark"] = {"history_epoch": True}
-    with pytest.raises(ValueError):
+    payload["prior_state"]["checkpoint"] = dict(payload["prior_state"]["checkpoint"])
+    payload["prior_state"]["checkpoint"]["consumed_input_watermark"] = {
+        "history_epoch": True
+    }
+    with pytest.raises(EvidenceIntegrityError, match="retained state"):
         _replay_result(
             observations,
             prior_state=load_replay_evidence(payload).prior_state,
@@ -1029,13 +1035,20 @@ def test_warm_state_reports_warm():
     assert resumed.snapshot.restart_state is resumed.state.restart_state
 
 
-def test_checkpoint_warmup_state_matches_production():
+def _durable_resume_state(observations):
+    """A state as the pilot would load it from canonical evidence."""
+    base = advance_state(initial_state(_instrument()), observations).state
+    payload = to_checkpoint(base).to_dict()
+    return from_checkpoint(checkpoint_from_payload(payload)), base
+
+
+def test_checkpoint_resume_reports_restart_warmup():
     # Enough history for the fast EMA, but short of the warm threshold.
     observations, _normalized = _observations(_rows(count=30))
-    retained = advance_state(initial_state(_instrument()), observations).state
-    assert not retained.warm
-    # A checkpoint resume that has not reached the warm threshold.
-    result = _replay_result((), prior_state=retained)
+    durable, base = _durable_resume_state(observations)
+    assert durable.resumed_from_checkpoint is True
+    assert not durable.warm
+    result = _replay_result((), prior_state=durable)
     assert result.prior_state.resumed_from_checkpoint is True
     assert result.snapshot.restart_state is RestartState.RESTART_WARMUP
     assert result.state.restart_state is RestartState.RESTART_WARMUP
@@ -1043,6 +1056,30 @@ def test_checkpoint_warmup_state_matches_production():
     assert result.snapshot.restart_state is not RestartState.WARM
     assert result.snapshot.values["ema_fast_9"] is not None
     assert result.snapshot.values["ema_slow_21"] is not None
+
+
+def test_in_process_resume_keeps_its_cold_start_provenance():
+    """An in-process state is not a checkpoint resume and must not become one."""
+    observations, _normalized = _observations(_rows(count=30))
+    in_process = advance_state(initial_state(_instrument()), observations).state
+    assert in_process.resumed_from_checkpoint is False
+    assert in_process.restart_state is RestartState.NEW_LISTING_COLD_START
+    captured = capture_replay_evidence(observations, prior_state=in_process)
+    assert captured.prior_state_resumed_from_checkpoint is False
+    result = _replay_result(observations, prior_state=in_process)
+    # The checkpoint contract cannot express this, so the envelope carries it.
+    assert result.prior_state.resumed_from_checkpoint is False
+    assert result.snapshot.restart_state is RestartState.NEW_LISTING_COLD_START
+    assert result.state.restart_state is RestartState.NEW_LISTING_COLD_START
+    round_tripped = load_replay_evidence(captured.to_dict())
+    replay_again = _replay_result(
+        observations, prior_state=round_tripped.prior_state
+    )
+    assert replay_again.snapshot.to_dict() == result.snapshot.to_dict()
+    # A durable resume of the same bars is a different, correctly-classified state.
+    durable, _base = _durable_resume_state(observations)
+    diverted = _replay_result((), prior_state=durable)
+    assert diverted.snapshot.restart_state is RestartState.RESTART_WARMUP
 
 
 def test_restart_state_survives_the_evidence_round_trip():
@@ -1063,7 +1100,8 @@ def test_corrupt_restart_state_evidence_fails_closed():
     for value in ("NOT_A_STATE", None, 7):
         payload = capture_replay_evidence(observations, prior_state=retained).to_dict()
         payload["prior_state"] = dict(payload["prior_state"])
-        payload["prior_state"]["restart_state"] = value
+        payload["prior_state"]["checkpoint"] = dict(payload["prior_state"]["checkpoint"])
+        payload["prior_state"]["checkpoint"]["restart_state"] = value
         with pytest.raises(EvidenceIntegrityError, match="retained state"):
             _replay_result(
                 observations,
@@ -1073,12 +1111,81 @@ def test_corrupt_restart_state_evidence_fails_closed():
     # defaulted to WARM.
     payload = capture_replay_evidence(observations, prior_state=retained).to_dict()
     payload["prior_state"] = dict(payload["prior_state"])
-    del payload["prior_state"]["restart_state"]
-    with pytest.raises(EvidenceIntegrityError, match="retained state"):
+    payload["prior_state"]["checkpoint"] = dict(payload["prior_state"]["checkpoint"])
+    del payload["prior_state"]["checkpoint"]["restart_state"]
+    with pytest.raises(ValueError, match="missing required keys"):
+        load_replay_evidence(payload)
+
+
+def test_unsupported_retained_checkpoint_schema_is_refused():
+    observations, _normalized = _observations(_rows(count=5))
+    retained = advance_state(initial_state(_instrument()), observations).state
+    for mutate, message in (
+        (
+            lambda cp: cp.update({"schema_version": 999}),
+            "schema_version",
+        ),
+        (lambda cp: cp.update({"future_field": "drift"}), "unexpected keys"),
+        (lambda cp: cp.update({"record_type": "Other"}), "record_type"),
+    ):
+        payload = capture_replay_evidence(observations, prior_state=retained).to_dict()
+        payload["prior_state"] = dict(payload["prior_state"])
+        payload["prior_state"]["checkpoint"] = dict(payload["prior_state"]["checkpoint"])
+        mutate(payload["prior_state"]["checkpoint"])
+        with pytest.raises(ValueError, match=message):
+            load_replay_evidence(payload)
+    # The supported schema still round-trips.
+    good = capture_replay_evidence(observations, prior_state=retained).to_dict()
+    assert load_replay_evidence(good).prior_state is not None
+
+
+def test_retained_state_past_the_cutoff_is_refused():
+    """Rolling values may not come from a fact that postdates the cutoff."""
+    later = CUTOFF + timedelta(minutes=5)
+    observations, _normalized = _observations(
+        _rows(count=FEATURE_WINDOW_INTERVALS, end_before=later),
+        receipt_time=later,
+        now=later,
+    )
+    retained = advance_state(initial_state(_instrument()), observations).state
+    horizon = retained.first_interval_epoch + retained.interval_seconds * (
+        retained.interval_count
+    )
+    assert horizon > int(CUTOFF.timestamp())
+    assert horizon == int(later.timestamp())
+    with pytest.raises(TemporalIntegrityError, match="past evaluation_cutoff"):
         _replay_result(
-            observations,
-            prior_state=load_replay_evidence(payload).prior_state,
+            (),
+            prior_state=retained,
+            cutoff=CUTOFF,
+            evaluated_at=later,
+            watermark=retained.consumed_input_watermark,
         )
+    # The same state is admissible once the cutoff is past its horizon.
+    result = _replay_result(
+        (),
+        prior_state=retained,
+        cutoff=later,
+        evaluated_at=later,
+        watermark=retained.consumed_input_watermark,
+    )
+    assert result.snapshot.evaluation_cutoff == later
+    assert result.snapshot.values["contiguous_intervals"] == retained.interval_count
+    assert result.snapshot.coverage is CoverageState.COMPLETE
+
+
+def test_retained_state_must_be_grid_aligned_and_bounded():
+    observations, _normalized = _observations(_rows(count=5))
+    retained = advance_state(initial_state(_instrument()), observations).state
+    payload = capture_replay_evidence(observations, prior_state=retained).to_dict()
+    payload["prior_state"] = dict(payload["prior_state"])
+    payload["prior_state"]["checkpoint"] = dict(payload["prior_state"]["checkpoint"])
+    rolling = dict(payload["prior_state"]["checkpoint"]["rolling_state"])
+    rolling["first_interval_epoch"] = int(rolling["first_interval_epoch"]) + 30
+    payload["prior_state"]["checkpoint"]["rolling_state"] = rolling
+    restored = load_replay_evidence(payload)
+    with pytest.raises(EvidenceIntegrityError, match="grid aligned"):
+        _replay_result((), prior_state=restored.prior_state)
 
 
 def test_replayed_snapshot_is_deterministic_for_a_resumed_cycle():
@@ -1300,6 +1407,16 @@ def test_captured_evidence_envelope_is_strictly_validated():
         ),
         (lambda row: row.update({"schema_version": 1}), "schema_version"),
         (lambda row: row.update({"evidence": "nope"}), "evidence must be a sequence"),
+        (
+            lambda row: row.update({"prior_state": {"checkpoint": {}}}),
+            "prior_state missing required keys",
+        ),
+        (
+            lambda row: row.update(
+                {"prior_state": {"checkpoint": {}, "extra": True}}
+            ),
+            "prior_state missing required keys",
+        ),
     ):
         payload = capture_replay_evidence(observations).to_dict()
         mutate(payload)

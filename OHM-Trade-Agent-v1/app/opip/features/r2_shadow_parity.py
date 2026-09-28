@@ -20,12 +20,17 @@ watermark.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timezone
 import math
 from typing import Any, Mapping, Sequence
 
 from app.opip.contracts.enums import CoverageState, PayloadKind, RestartState
-from app.opip.contracts.features import FeatureSnapshot, FeatureStateCheckpoint
+from app.opip.contracts.features import (
+    FEATURE_BUS_SCHEMA_VERSION,
+    FEATURE_CHECKPOINT_RECORD_TYPE,
+    FeatureSnapshot,
+    FeatureStateCheckpoint,
+)
 from app.opip.contracts.identity import ConsumedInputWatermark, InstrumentVersion
 from app.opip.contracts.observation import (
     AGGREGATE_REQUIRED_KEYS,
@@ -104,6 +109,25 @@ _REPLAY_EVIDENCE_KEYS: tuple[str, ...] = (
     "source_incomplete",
     "evidence",
     "coverage_only",
+)
+
+_PRIOR_STATE_KEYS: tuple[str, ...] = ("checkpoint", "resumed_from_checkpoint")
+
+#: Exactly ``FeatureStateCheckpoint.to_dict()``. A durable checkpoint that this
+#: replay does not fully model must be refused rather than reinterpreted under
+#: today's rolling-state assumptions.
+_CHECKPOINT_EVIDENCE_KEYS: tuple[str, ...] = (
+    "record_type",
+    "schema_version",
+    "checkpoint_id",
+    "feature_version",
+    "instrument_version_id",
+    "consumed_input_watermark",
+    "reconstruction_dependencies",
+    "rolling_state",
+    "restart_state",
+    "venue_instrument_id",
+    "created_at_utc",
 )
 
 CLASSIFICATIONS: tuple[str, ...] = (
@@ -272,12 +296,18 @@ class ReplayEvidence:
     start. ``coverage_only`` holds rows the live planner withheld from feature
     evidence; they keep continuity and coverage honest without contributing
     feature values, exactly as in production.
+
+    ``prior_state_resumed_from_checkpoint`` records whether the retained state
+    came from durable evidence or was still in process memory. The checkpoint
+    contract cannot express the latter, and ``from_checkpoint`` assumes a
+    resume, so without it a short in-process cold start would be reclassified.
     """
 
     cycle_origin: str
     evidence: tuple[Mapping[str, Any], ...] = ()
     coverage_only: tuple[Mapping[str, Any], ...] = ()
     prior_state: Mapping[str, Any] | None = None
+    prior_state_resumed_from_checkpoint: bool = False
     window_start: datetime | None = None
     source_incomplete: bool = False
 
@@ -291,7 +321,14 @@ class ReplayEvidence:
             "schema_version": REPLAY_EVIDENCE_SCHEMA_VERSION,
             "cycle_origin": self.cycle_origin,
             "prior_state": (
-                dict(self.prior_state) if self.prior_state is not None else None
+                {
+                    "checkpoint": dict(self.prior_state),
+                    "resumed_from_checkpoint": bool(
+                        self.prior_state_resumed_from_checkpoint
+                    ),
+                }
+                if self.prior_state is not None
+                else None
             ),
             "window_start": (
                 iso_z(self.window_start, field_name="window_start")
@@ -318,10 +355,16 @@ def capture_replay_evidence(
     capture cannot claim a cold start while holding retained history.
     """
     captured_state: Mapping[str, Any] | None = None
+    resumed_from_checkpoint = False
     if isinstance(prior_state, RollingState):
         captured_state = to_checkpoint(prior_state).to_dict()
+        resumed_from_checkpoint = bool(prior_state.resumed_from_checkpoint)
     elif isinstance(prior_state, Mapping):
-        captured_state = dict(prior_state)
+        captured_state = _checkpoint_evidence(prior_state)
+        resumed_from_checkpoint = _require_bool(
+            prior_state.get("resumed_from_checkpoint", False),
+            "prior_state.resumed_from_checkpoint",
+        )
     elif prior_state is not None:
         captured_state = prior_state.to_dict()
     return ReplayEvidence(
@@ -331,9 +374,41 @@ def capture_replay_evidence(
         evidence=capture_observation_evidence(evidence),
         coverage_only=capture_observation_evidence(coverage_only),
         prior_state=captured_state,
+        prior_state_resumed_from_checkpoint=resumed_from_checkpoint,
         window_start=window_start,
         source_incomplete=bool(source_incomplete),
     )
+
+
+def _checkpoint_evidence(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Validate a captured checkpoint payload before it is reconstructed.
+
+    ``checkpoint_from_payload`` accepts any positive schema version and ignores
+    fields it does not model, so a durable checkpoint written by a future
+    engine would be silently reinterpreted under today's rolling-state
+    assumptions. Replay refuses it instead.
+    """
+    missing = [key for key in _CHECKPOINT_EVIDENCE_KEYS if key not in payload]
+    if missing:
+        raise ValueError(
+            f"captured retained state missing required keys: {sorted(missing)}"
+        )
+    unexpected = sorted(set(payload) - set(_CHECKPOINT_EVIDENCE_KEYS))
+    if unexpected:
+        raise ValueError(
+            f"captured retained state has unexpected keys: {unexpected}"
+        )
+    if payload["record_type"] != FEATURE_CHECKPOINT_RECORD_TYPE:
+        raise ValueError(
+            "captured retained state record_type is not FeatureStateCheckpoint"
+        )
+    schema = _require_int(payload["schema_version"], "prior_state.schema_version")
+    if schema != FEATURE_BUS_SCHEMA_VERSION:
+        raise ValueError(
+            "replay refused: captured retained state schema_version "
+            f"{schema} is not the supported {FEATURE_BUS_SCHEMA_VERSION}"
+        )
+    return dict(payload)
 
 
 def load_replay_evidence(
@@ -382,7 +457,8 @@ def load_replay_evidence(
         cycle_origin=cycle_origin,
         evidence=evidence,
         coverage_only=coverage_only,
-        prior_state=prior_state,
+        prior_state=prior_state[0],
+        prior_state_resumed_from_checkpoint=prior_state[1],
         window_start=window_start,
         source_incomplete=source_incomplete,
     )
@@ -390,23 +466,39 @@ def load_replay_evidence(
 
 def _prior_state_from_evidence(
     raw: Any, *, cycle_origin: str
-) -> Mapping[str, Any] | None:
-    """Retained state is mandatory exactly when the capture was a resume."""
+) -> tuple[Mapping[str, Any] | None, bool]:
+    """Retained state and its provenance, mandatory exactly when resumed."""
     if raw is None:
         if cycle_origin == CYCLE_ORIGIN_RESUMED:
             raise ValueError(
                 "replay refused: a resumed cycle requires prior retained state, "
                 "and the captured evidence does not carry prior_state"
             )
-        return None
+        return None, False
     if not isinstance(raw, Mapping):
         raise ValueError("replay evidence prior_state must be an object or null")
+    missing = [key for key in _PRIOR_STATE_KEYS if key not in raw]
+    if missing:
+        raise ValueError(
+            f"replay evidence prior_state missing required keys: {sorted(missing)}"
+        )
+    unexpected = sorted(set(raw) - set(_PRIOR_STATE_KEYS))
+    if unexpected:
+        raise ValueError(
+            f"replay evidence prior_state has unexpected keys: {unexpected}"
+        )
     if cycle_origin != CYCLE_ORIGIN_RESUMED:
         raise ValueError(
             "replay evidence declares a cold start but carries prior retained "
             "state; the captured cycle origin is inconsistent"
         )
-    return dict(raw)
+    checkpoint = raw["checkpoint"]
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError("replay evidence prior_state.checkpoint must be an object")
+    resumed_from_checkpoint = _require_bool(
+        raw["resumed_from_checkpoint"], "prior_state.resumed_from_checkpoint"
+    )
+    return _checkpoint_evidence(checkpoint), resumed_from_checkpoint
 
 
 def _observation_rows(raw: Any, field_name: str) -> tuple[Mapping[str, Any], ...]:
@@ -421,7 +513,14 @@ def _retained_state(
     instrument_version: InstrumentVersion,
     interval_seconds: int,
 ) -> RollingState:
-    """The prior state the cycle actually resumed from, or a declared cold start."""
+    """The prior state the cycle actually resumed from, or a declared cold start.
+
+    ``from_checkpoint`` assumes durable evidence and recomputes ``restart_state``
+    from that assumption, so the captured provenance is restored afterwards:
+    those two values are inputs to production's own ``_resolve_restart_state``,
+    not feature values, and dropping them would reclassify an in-process cold
+    start as a restart warmup.
+    """
     if evidence.prior_state is None:
         return initial_state(instrument_version, interval_seconds=interval_seconds)
     try:
@@ -442,7 +541,67 @@ def _retained_state(
             f"retained state feature_version {checkpoint.feature_version!r} != "
             f"{FEATURE_VERSION!r}"
         )
-    return from_checkpoint(checkpoint)
+    try:
+        restored = from_checkpoint(checkpoint)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise EvidenceIntegrityError(
+            "replay refused: captured retained state cannot be resumed "
+            f"({type(exc).__name__}); refusing to synthesize the missing context"
+        ) from exc
+    return replace(
+        restored,
+        resumed_from_checkpoint=evidence.prior_state_resumed_from_checkpoint,
+        restart_state=checkpoint.restart_state,
+    )
+
+
+def _assert_retained_state_population(
+    prior_state: RollingState,
+    *,
+    evaluation_cutoff: datetime,
+    evaluated_at_utc: datetime,
+) -> None:
+    """Retained history must sit inside the replay boundaries.
+
+    Production resumes from a checkpoint written by an earlier cycle, so its
+    retained window always ends at or before the current cutoff. Replay must not
+    accept a capture whose retained state already reaches past
+    ``evaluation_cutoff``: rolling values would come from a fact that did not
+    exist at the cutoff while freshness came from the cycle alignment, sealing a
+    ``COMPLETE`` snapshot that production could not have produced. Retained
+    intervals carry synthetic receipts derived from their close, so bounding the
+    horizon by the cutoff also keeps them visible at ``evaluated_at_utc``.
+    """
+    if prior_state.interval_count == 0:
+        return
+    first_epoch = prior_state.first_interval_epoch
+    interval_seconds = int(prior_state.interval_seconds)
+    if first_epoch is None or interval_seconds <= 0:
+        raise EvidenceIntegrityError(
+            "replay refused: retained state declares no usable interval horizon"
+        )
+    if int(first_epoch) % interval_seconds != 0:
+        raise EvidenceIntegrityError(
+            "replay refused: retained state horizon is not grid aligned"
+        )
+    horizon = datetime.fromtimestamp(
+        int(first_epoch) + interval_seconds * prior_state.interval_count,
+        tz=timezone.utc,
+    )
+    if horizon > evaluation_cutoff:
+        raise TemporalIntegrityError(
+            "retained state reaches "
+            f"{iso_z(horizon, field_name='retained_horizon')}, past evaluation_cutoff "
+            f"{iso_z(evaluation_cutoff, field_name='evaluation_cutoff')}; its "
+            "rolling values would come from a fact that did not exist at the cutoff"
+        )
+    if horizon > evaluated_at_utc:
+        raise TemporalIntegrityError(
+            "retained state reaches "
+            f"{iso_z(horizon, field_name='retained_horizon')}, past "
+            f"{iso_z(evaluated_at_utc, field_name='evaluated_at_utc')}; its "
+            "intervals were not visible at the replay instant"
+        )
 
 
 def source_evidence_identity(
@@ -462,7 +621,12 @@ def source_evidence_identity(
             "evaluation_cutoff": cutoff,
             "cycle_origin": evidence.cycle_origin,
             "prior_state": (
-                dict(evidence.prior_state)
+                {
+                    "checkpoint": dict(evidence.prior_state),
+                    "resumed_from_checkpoint": bool(
+                        evidence.prior_state_resumed_from_checkpoint
+                    ),
+                }
                 if evidence.prior_state is not None
                 else None
             ),
@@ -763,6 +927,11 @@ def replay_cycle(
         evidence,
         instrument_version=instrument_version,
         interval_seconds=interval_seconds,
+    )
+    _assert_retained_state_population(
+        prior,
+        evaluation_cutoff=evaluation_cutoff,
+        evaluated_at_utc=evaluated_at_utc,
     )
     loaded_evidence = load_observation_evidence(evidence.evidence)
     loaded_coverage_only = load_observation_evidence(evidence.coverage_only)
