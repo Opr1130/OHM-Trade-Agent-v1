@@ -68,6 +68,7 @@ from app.opip.features.parity import (
 from app.opip.features.pipeline import CycleIdentityMismatch, _assert_cycle_identity
 from app.opip.features.replay import assert_snapshot_determinism
 from app.opip.features.state import (
+    AGGREGATE_DEPENDENCY,
     RollingState,
     advance_state,
     alignment_from_state,
@@ -460,7 +461,36 @@ def _checkpoint_evidence(payload: Mapping[str, Any]) -> Mapping[str, Any]:
             f"{schema} is not the supported {FEATURE_BUS_SCHEMA_VERSION}"
         )
     _rolling_state_evidence(payload)
+    _assert_reconstruction_dependencies(payload)
     return dict(payload)
+
+
+def _assert_reconstruction_dependencies(payload: Mapping[str, Any]) -> None:
+    """A checkpoint names what a resume still needs; replay must already have it.
+
+    ``FeatureStateCheckpoint.reconstruction_dependencies`` exists so a
+    checkpoint is never treated as self-sufficient when it is not. Replay reads
+    the retained series and nothing else, so it can satisfy exactly the set
+    ``to_checkpoint`` declares; anything else means the capture is missing
+    evidence this engine does not supply, and certifying from it would assert a
+    snapshot the durable record says is not reconstructable.
+    """
+    required = {
+        AGGREGATE_DEPENDENCY,
+        f"retained_intervals:{FEATURE_WINDOW_INTERVALS}",
+    }
+    raw = payload["reconstruction_dependencies"]
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
+        raise ValueError(
+            "captured retained state reconstruction_dependencies must be a sequence"
+        )
+    declared = {str(item) for item in raw}
+    if declared != required:
+        raise ValueError(
+            "replay refused: captured retained state requires reconstruction "
+            f"evidence {sorted(declared)} that replay does not supply "
+            f"({sorted(required)})"
+        )
 
 
 def _rolling_state_evidence(payload: Mapping[str, Any]) -> None:
@@ -552,11 +582,6 @@ def load_replay_evidence(
             "cold-start planner has no retained history to keep a re-poll "
             "coverage-only, so the evidence-role context is inconsistent"
         )
-    if cycle_origin == CYCLE_ORIGIN_COLD_START and committed_writes:
-        raise ValueError(
-            "replay evidence declares a cold start with committed write "
-            "watermarks; a cycle that consumed what it wrote is not a cold start"
-        )
     return ReplayEvidence(
         cycle_origin=cycle_origin,
         evidence=evidence,
@@ -613,20 +638,52 @@ def _assert_retained_state_availability(
 ) -> None:
     """Retained evidence must have existed at the replay instant.
 
-    ``checkpoint_from_payload`` parses ``created_at_utc`` and nothing here used
-    it, so a checkpoint written after ``evaluated_at_utc`` was accepted as long
-    as its interval horizon sat inside the cutoff. A replay cannot read state
-    that did not exist yet.
+    Two retained clocks say when the state's own evidence arrived. The
+    checkpoint's ``created_at_utc`` says when the state was written, and
+    ``last_receipt_epoch`` says when its newest folded interval was received.
+    Neither was checked, so a state holding a bar received after
+    ``evaluated_at_utc`` was accepted — and ``alignment_from_state`` then
+    replaces receipts with the interval close, hiding it and letting the
+    snapshot incorporate values that were not available while claiming earlier
+    visibility.
     """
     created = checkpoint.created_at_utc
-    if created is None:
-        return
-    if created > evaluated_at_utc:
+    if created is not None and created > evaluated_at_utc:
         raise TemporalIntegrityError(
             "captured retained state was created at "
             f"{iso_z(created, field_name='created_at_utc')}, after "
             f"{iso_z(evaluated_at_utc, field_name='evaluated_at_utc')}; it was "
             "not available at the replay instant"
+        )
+    last_receipt = checkpoint.rolling_state.get("last_receipt_epoch")
+    if last_receipt is None:
+        return
+    received = datetime.fromtimestamp(float(last_receipt), tz=timezone.utc)
+    if received > evaluated_at_utc:
+        raise TemporalIntegrityError(
+            "captured retained state holds an interval received at "
+            f"{iso_z(received, field_name='last_receipt_epoch')}, after "
+            f"{iso_z(evaluated_at_utc, field_name='evaluated_at_utc')}; its "
+            "values were not available at the replay instant"
+        )
+
+
+def _assert_checkpoint_identity(
+    captured: Mapping[str, Any], checkpoint: FeatureStateCheckpoint
+) -> None:
+    """The declared canonical checkpoint identity must match the reconstruction.
+
+    ``checkpoint_from_payload`` rebuilds a checkpoint without consulting the
+    supplied ``checkpoint_id``, and that id binds the schema version, venue
+    instrument, feature version, and consumed watermark. A stale or tampered id
+    would otherwise let replay certify retained evidence whose declared
+    canonical identity disagrees with its contents.
+    """
+    declared = captured["checkpoint_id"]
+    if not isinstance(declared, str) or declared != checkpoint.checkpoint_id:
+        raise EvidenceIntegrityError(
+            f"captured retained state checkpoint_id {declared!r} does not match "
+            f"the reconstructed identity {checkpoint.checkpoint_id!r}"
         )
 
 
@@ -662,6 +719,7 @@ def _retained_state(
             "replay refused: captured retained state cannot be reconstructed "
             f"({type(exc).__name__}); refusing to synthesize the missing context"
         ) from exc
+    _assert_checkpoint_identity(evidence.prior_state, checkpoint)
     if checkpoint.instrument_version_id != instrument_version.instrument_version_id:
         raise CycleIdentityMismatch(
             "retained state instrument_version_id "

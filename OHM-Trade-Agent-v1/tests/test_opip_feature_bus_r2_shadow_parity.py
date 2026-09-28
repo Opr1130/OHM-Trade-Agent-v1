@@ -983,8 +983,16 @@ def test_retained_state_identity_and_version_mismatch_fails_closed():
     payload["prior_state"] = dict(payload["prior_state"])
     payload["prior_state"]["checkpoint"] = dict(payload["prior_state"]["checkpoint"])
     payload["prior_state"]["checkpoint"]["feature_version"] = "features-v0"
-    with pytest.raises(CycleIdentityMismatch, match="feature_version"):
+    # The checkpoint id binds the feature version, so a bare edit is caught as a
+    # tampered identity rather than accepted.
+    with pytest.raises(EvidenceIntegrityError, match="checkpoint_id"):
         _replay(observations, prior_state=load_replay_evidence(payload).prior_state)
+    # A consistently stamped older engine version is refused by the identity rule.
+    older = to_checkpoint(replace(retained, feature_version="features-v0"))
+    with pytest.raises(CycleIdentityMismatch, match="feature_version"):
+        _replay(observations, prior_state=capture_replay_evidence(
+            observations, prior_state=older
+        ).prior_state)
     # Corrupt retained state is refused by the canonical loader, not repaired.
     payload = capture_replay_evidence(observations, prior_state=retained).to_dict()
     payload["prior_state"] = dict(payload["prior_state"])
@@ -1048,6 +1056,93 @@ def test_unsupported_nested_rolling_state_is_refused():
             continue
         with pytest.raises(ValueError, match=message):
             load_replay_evidence(payload)
+
+
+def test_cold_start_capture_with_committed_writes_round_trips():
+    """A first cycle publishes its own observations, so it has writes too."""
+    observations, _normalized = _observations(_rows(count=5))
+    written = ConsumedInputWatermark(history_epoch=1, local_sequence=99999)
+    captured = capture_replay_evidence(
+        observations, committed_write_watermarks=(written,)
+    )
+    assert captured.cycle_origin == CYCLE_ORIGIN_COLD_START
+    restored = load_replay_evidence(captured.to_dict())
+    assert restored.committed_write_watermarks == (written,)
+    first = _replay_evidence_result(captured)
+    second = _replay_evidence_result(restored)
+    assert first.snapshot.to_dict() == second.snapshot.to_dict()
+    assert first.snapshot.consumed_input_watermark == written
+    # And the position genuinely has to be declared.
+    with pytest.raises(WatermarkIntegrityError, match="is not the position"):
+        _replay(observations, watermark=written)
+
+
+def test_retained_state_received_after_the_replay_instant_is_refused():
+    """A retained receipt clock may not postdate the replay instant."""
+    later = CUTOFF + timedelta(minutes=5)
+    observations, _normalized = _observations(
+        _rows(count=30, end_before=later), receipt_time=later, now=later
+    )
+    retained = advance_state(initial_state(_instrument()), observations).state
+    assert retained.last_receipt_epoch is not None
+    with pytest.raises(TemporalIntegrityError, match="received at"):
+        _replay_result(
+            (),
+            prior_state=retained,
+            cutoff=later,
+            evaluated_at=later - timedelta(minutes=1),
+            watermark=retained.consumed_input_watermark,
+        )
+    # Visible at the later instant, the same state is admissible.
+    result = _replay_result(
+        (),
+        prior_state=retained,
+        cutoff=later,
+        evaluated_at=later,
+        watermark=retained.consumed_input_watermark,
+    )
+    assert result.snapshot.values["contiguous_intervals"] == retained.interval_count
+
+
+def test_unsupported_reconstruction_dependency_is_refused():
+    """A checkpoint that names evidence replay cannot supply must be refused."""
+    observations, _normalized = _observations(_rows(count=5))
+    retained = advance_state(initial_state(_instrument()), observations).state
+    for declared in (
+        ["trade_tape"],
+        ["fixed_interval_aggregate:60s"],
+        [],
+    ):
+        payload = capture_replay_evidence(observations, prior_state=retained).to_dict()
+        payload["prior_state"] = dict(payload["prior_state"])
+        payload["prior_state"]["checkpoint"] = dict(payload["prior_state"]["checkpoint"])
+        payload["prior_state"]["checkpoint"]["reconstruction_dependencies"] = declared
+        with pytest.raises(ValueError, match="reconstruction"):
+            load_replay_evidence(payload)
+    # The declared set round-trips untouched.
+    assert load_replay_evidence(
+        capture_replay_evidence(observations, prior_state=retained).to_dict()
+    ).prior_state is not None
+
+
+def test_tampered_checkpoint_id_is_refused():
+    """The declared canonical checkpoint identity must match its contents."""
+    observations, _normalized = _observations(_rows(count=5))
+    retained = advance_state(initial_state(_instrument()), observations).state
+    payload = capture_replay_evidence(observations, prior_state=retained).to_dict()
+    payload["prior_state"] = dict(payload["prior_state"])
+    payload["prior_state"]["checkpoint"] = dict(payload["prior_state"]["checkpoint"])
+    payload["prior_state"]["checkpoint"]["checkpoint_id"] = "FSC:1:solusd:features-v1:1-1"
+    with pytest.raises(EvidenceIntegrityError, match="checkpoint_id"):
+        _replay_evidence_result(load_replay_evidence(payload))
+    # A missing or mistyped id is refused too.
+    for value in (None, 7):
+        payload = capture_replay_evidence(observations, prior_state=retained).to_dict()
+        payload["prior_state"] = dict(payload["prior_state"])
+        payload["prior_state"]["checkpoint"] = dict(payload["prior_state"]["checkpoint"])
+        payload["prior_state"]["checkpoint"]["checkpoint_id"] = value
+        with pytest.raises(EvidenceIntegrityError, match="checkpoint_id"):
+            _replay_evidence_result(load_replay_evidence(payload))
 
 
 def test_retained_state_at_a_different_cadence_is_refused():
