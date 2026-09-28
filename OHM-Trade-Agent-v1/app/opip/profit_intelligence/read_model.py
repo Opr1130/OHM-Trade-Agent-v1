@@ -187,11 +187,14 @@ def join_funnel_record_to_forward_outcomes(
             detail="funnel record carries no canonical episode identity to join on",
         )
 
-    matches: list[ForwardOutcomeRecord] = []
+    # De-duplicate matches by (source, identity) so passing the same projection
+    # twice cannot manufacture a false AMBIGUOUS.
+    seen: dict[tuple[str, str], ForwardOutcomeRecord] = {}
     for projection in readable:
         for forward in projection.records:
             if forward.canonical_episode_id == record.episode_id:
-                matches.append(forward)
+                seen[(forward.source.value, forward.identity)] = forward
+    matches: list[ForwardOutcomeRecord] = list(seen.values())
 
     if not matches:
         if len(readable) < len(projections):

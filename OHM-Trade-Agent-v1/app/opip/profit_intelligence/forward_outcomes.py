@@ -292,11 +292,12 @@ def _horizon_availability(
     point_in_time: bool,
     has_return: bool,
 ) -> FactAvailability:
-    if not point_in_time:
+    if not point_in_time or not observed or not has_return:
+        # No certifiable value exists: unobserved, unanchored, or a matured
+        # window that produced no value all leave the horizon unavailable rather
+        # than implying a computed number.
         return FactAvailability.UNAVAILABLE
-    if not observed:
-        return FactAvailability.UNAVAILABLE
-    if window_complete and has_return:
+    if window_complete:
         return FactAvailability.KNOWN
     return FactAvailability.DERIVED
 
@@ -406,8 +407,10 @@ def _phase3c_record(row: Mapping[str, Any]) -> ForwardOutcomeRecord:
         outcome_revision=_int_or_none(row.get("outcome_revision")),
         outcome_source=_text(row.get("outcome_source")),
         primary_horizon=None,
-        mfe_pct=_finite(row.get("mfe_pct")),
-        mae_pct=_finite(row.get("mae_pct")),
+        # An unanchored record must not publish excursions: without a readable
+        # reference the future values have no base to be measured against.
+        mfe_pct=None if missing else _finite(row.get("mfe_pct")),
+        mae_pct=None if missing else _finite(row.get("mae_pct")),
         window_complete=window_complete,
         maturation_status=maturation,
         producer="app.jobs.build_phase3c_forward_outcomes",
@@ -474,8 +477,10 @@ def _discovery_record(row: Mapping[str, Any]) -> ForwardOutcomeRecord:
         primary_horizon=(
             _text(row.get("primary_horizon")) or DISCOVERY_PRIMARY_HORIZON
         ),
-        mfe_pct=_finite(row.get("mfe_pct")),
-        mae_pct=_finite(row.get("mae_pct")),
+        # An unanchored record must not publish excursions: without a readable
+        # reference the future values have no base to be measured against.
+        mfe_pct=None if missing else _finite(row.get("mfe_pct")),
+        mae_pct=None if missing else _finite(row.get("mae_pct")),
         window_complete=bool(row.get("window_complete", False)),
         maturation_status=str(row.get("maturation_status") or ""),
         producer="app.jobs.build_discovery_forward_outcomes",
@@ -642,6 +647,17 @@ def build_forward_outcome_projection(
 
     builder = _RECORD_BUILDERS[resolved_source]
     parsed = [builder(row) for row in rows if isinstance(row, Mapping)]
+
+    if window_start is not None and window_end is not None:
+        # Apply the declared window on the sealed decision time: keep dated rows
+        # inside it, and keep rows whose reference time could not be read (a
+        # missing timestamp is not proof of falling outside the window).
+        parsed = [
+            record
+            for record in parsed
+            if record.reference_at is None
+            or window_start <= record.reference_at <= window_end
+        ]
 
     latest: dict[tuple[object, ...], ForwardOutcomeRecord] = {}
     order: list[tuple[object, ...]] = []

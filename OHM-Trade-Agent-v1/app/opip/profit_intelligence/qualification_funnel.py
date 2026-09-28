@@ -408,10 +408,6 @@ class FunnelConservation:
         }
 
 
-#: Required identity fields for a funnel record to be considered attributable.
-_REQUIRED_FIELDS = ("scan_id", "candidate_id", "decision")
-
-
 def _record_from_row(row: Mapping[str, Any]) -> QualificationFunnelRecord:
     scan_id = _text(row.get("scan_id"))
     candidate_id = _text(row.get("candidate_id"))

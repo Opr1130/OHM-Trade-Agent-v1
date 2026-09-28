@@ -580,6 +580,54 @@ def test_gate_boolean_measurement_is_not_coerced_to_a_number():
     assert projection.records[0].gates[0].measured_value is None
 
 
+def test_complete_window_without_a_value_is_unavailable():
+    row = _phase3c_row(window_complete=True, observed=True, return_pct=None)
+    projection = build_forward_outcome_projection(
+        [row], source=ForwardOutcomeSource.PHASE3C, generated_at=_NOW
+    )
+    hour = next(h for h in projection.records[0].horizons if h.horizon_id == "1h")
+    assert hour.availability.value == "UNAVAILABLE"
+    assert hour.return_pct is None
+
+
+def test_unanchored_record_publishes_no_excursions():
+    row = _phase3c_row()
+    row["reference_price"] = None
+    projection = build_forward_outcome_projection(
+        [row], source=ForwardOutcomeSource.PHASE3C, generated_at=_NOW
+    )
+    record = projection.records[0]
+    assert record.availability.value == "UNAVAILABLE"
+    assert record.mfe_pct is None
+    assert record.mae_pct is None
+
+
+def test_forward_window_filters_dated_rows_and_keeps_undated_ones():
+    inside = _phase3c_row(snapshot_id="S1")
+    outside = _phase3c_row(snapshot_id="S2")
+    outside["reference_at"] = (_NOW - timedelta(days=10)).isoformat()
+    projection = build_forward_outcome_projection(
+        [inside, outside],
+        source=ForwardOutcomeSource.PHASE3C,
+        generated_at=_NOW,
+        window_start=_NOW - timedelta(hours=24),
+        window_end=_NOW,
+    )
+    assert {record.identity for record in projection.records} == {"S1"}
+
+
+def test_duplicate_supplied_projection_does_not_force_ambiguous():
+    forward = build_forward_outcome_projection(
+        [_phase3c_row(episode_id="EP:1")],
+        source=ForwardOutcomeSource.PHASE3C,
+        generated_at=_NOW,
+    )
+    result = join_funnel_record_to_forward_outcomes(
+        _funnel_record("EP:1"), [forward, forward]
+    )
+    assert result.status is ForwardOutcomeJoinStatus.MATCHED
+
+
 def test_unknown_horizon_label_fails_closed_to_unavailable():
     row = _phase3c_row()
     row["horizon_returns_pct"] = {"7h": 1.0}
