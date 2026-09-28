@@ -1,16 +1,20 @@
 # O’Pip recovery roadmap
 
-Audit SHA: `a416be0a068dc58543a4b6cd254d5c42fcaf4c96`
+Historical audit base: `a416be0a068dc58543a4b6cd254d5c42fcaf4c96`
+
+Current reconciled code/production baseline: `facf8e369e1251697bf9799bc9b1c575a9cdc3ec`
 
 Architecture: v1.4.3, 22 September 2026. See `docs/architecture/v1.4.3/SOURCE.md`.
 
-This roadmap does not authorize implementation, activation, merge, or deploy. The next increment starts only after owner review of this audit.
+This roadmap does not authorize implementation, activation, merge, or deploy. It records the phase order; each phase starts only after owner review.
 
 ## Why this order
 
-The live cycle is `app.jobs.run_cycle` → protection → `scan_opportunities` → Top-8 technical gate → profit-ranking comparator → Freqtrade dry-run paper. That path is authoritative today.
+The live cycle is `app.jobs.run_cycle` → protection → `scan_opportunities` → Top-8 technical gate → profit-ranking comparator → Freqtrade dry-run paper. That legacy path remains the code path `run_cycle` executes.
 
-The v1.4.3 spine is FeatureSnapshot → IGNITION detector → opportunity lifecycle → feasibility → forecast → constrained portfolio selection → realistic paper. F3 and F6 are missing. F4 is fragmented. F5 and F7 are legacy gates and a ranking score. The Feature Bus that F3 requires is implemented and pinned off.
+The identity of the *live* paper authority is not fully observed. The Freqtrade dry-run containers are healthy and the code routes to them when Paper v2 is not requested, but the live `OPIP_PAPER_V2_MODE` value and Paper v1 `control.json` are unobserved. Treat the live paper authority as `UNKNOWN_NEEDS_EVIDENCE` until those values are actually observed; do not select an engine from defaults and container health.
+
+The v1.4.3 spine is FeatureSnapshot → IGNITION detector → opportunity lifecycle → feasibility → forecast → constrained portfolio selection → realistic paper. F3 and F6 are missing. F4 is fragmented. F5 and F7 are legacy gates and a ranking score. The Feature Bus that F3 requires is implemented and pinned off, and its R2 shadow parity/replay evidence is now accepted.
 
 Paper v2 is implemented and inactive. Turning it on now would paper the legacy selector. The Committee package is present, shadow-only, and has no path into `run_cycle`. Its last activation proof had an inactive timer and zero role results, on a SHA older than this core. Dashboard surfaces do not share one semantic model and cannot show detector, forecast, or Committee facts that the runtime does not emit.
 
@@ -18,29 +22,32 @@ Signal Quality Trade Lifecycle v2 (`OPIP_SIGNAL_QUALITY_TRADE_LIFECYCLE_V2.md`) 
 
 ## Sequence
 
-### R2 — Feature Bus shadow proof
+### R2 — Feature Bus shadow proof (COMPLETE)
 
 Prove the existing bus. Do not build another feature calculator.
 
-Exit evidence:
+Status: **COMPLETE, merged, deployed.** PR #284 merged to `main` as `facf8e369e1251697bf9799bc9b1c575a9cdc3ec`; exact pre-merge head `b26dab8d58116c5560e5bbed73ce95f0c814fbeb`.
 
-- Parity against `app.indicators.technical` on a frozen input set, using `app/opip/features/parity.py`
-- Replay from checkpoints equals stored snapshots, using `app/opip/features/replay.py`
-- Capture remains dual-gated on `OPIP_FEATURE_BUS_MODE=shadow` and `OPIP_CANONICAL_WRITER_MODE=shadow`
-- The production compose pin stays `off` until that evidence is accepted
-- `run_cycle` still does not call the pilot
+Actual completed exit evidence:
 
-### R3 — F3 through F7 on that evidence
+- Deterministic point-in-time shadow replay and parity for the existing Feature Bus, sealed under the R2 increment `ATDD-R2-feature-bus-shadow-parity`. A frozen evidence envelope replays more than once to a byte-identical `FeatureSnapshot`, and the parity report describes the sealed snapshot values rather than recomputing a competing Feature Bus value.
+- Replay fails closed on invalid or inconsistent instrument, observation identity, schema, type, aggregate domain value, revision or content identity, ambiguous revision rank, facts not visible at the declared instant, inputs beyond the declared consumed watermark, and corrupt or missing retained/restart state.
+- Retained `RollingState`, reference-identity binding, restart-state (`cold start`/`warm`/`checkpoint recovery`) reproduction, and typed retained values are all validated rather than defaulted or inferred.
+- Exact-head `test` and `atdd scope` CI PASS; 0 valid unresolved non-outdated review blockers at merge.
+- `OPIP_FEATURE_BUS_MODE` remained `off` throughout, and `run_cycle` still does not call the Feature Bus. The Feature Bus has **no production runtime authority**.
+- Production deploy run `36473910247` for `facf8e369e1251697bf9799bc9b1c575a9cdc3ec` SUCCESS.
 
-One chain, in this order, each naming the legacy path it will replace:
+### R3 — F3 through F7 on that evidence (NEXT, not started)
 
-1. IGNITION `evaluate(FeatureSnapshot, DetectorState, evaluation_time)` in shadow. The explosion-phase string is not this detector.
+One chain, in this order, each naming the legacy path it will replace. R3 is shadow/evidence-first: it adds no production runtime authority, activates no Paper v2 cutover, and deletes no legacy path.
+
+1. IGNITION pure detector runtime `evaluate(FeatureSnapshot, DetectorState, evaluation_time)`, in shadow. The explosion-phase string is not this detector.
 2. One opportunity lifecycle for defer, deadline, expiry, and terminal reason. Fold watch, radar, pending, and signal-quality episode clocks into it only after a consumer census.
 3. One feasibility seam that calls the existing vetoes and can abstain with `INSUFFICIENT_EVIDENCE`.
-4. A forecast owner for probability, expected return, uncertainty, and validity horizon. Scores and Committee confidence stay out of this owner.
-5. A constrained selector for portfolio net dollars against cash and the frozen profit-ranking comparator. Top-8 remains live until that comparison exists.
+4. One calibrated forecast owner for probability, expected return, uncertainty, and validity horizon. Scores and Committee confidence stay out of this owner.
+5. One constrained economic/portfolio selector for portfolio net dollars against cash and the frozen profit-ranking comparator. Top-8 remains live until that comparison exists.
 
-No approved allocation and no Paper v2 activation in this slice.
+No approved allocation, no Paper v2 activation, and no legacy deletion in R3. The Feature Bus mode stays `off` during R3 unless a separate owner approval changes it.
 
 ### R4 — Paper v2 cutover proof
 
@@ -81,15 +88,15 @@ One paper authority. Then stop legacy writers. Deletion is a later owner decisio
 
 ## Operations item that is not the next code increment
 
-Core `a416be0a` was deployed on 2026-09-27. The last successful learning-worker install found in Actions is `ef8b23aa` on 2026-09-22. Analytics last succeeded at that same older SHA. Committee shadow was proved at `86d5290b` on 2026-09-25.
+Core `facf8e36` was deployed on 2026-09-28 (run `36473910247`). The last successful learning-worker install found in Actions is `ef8b23aa` on 2026-09-22.
 
-A matching `/deploy-learning` for `a416be0a` is an owner control-plane action. It is required before learning capture is expected to be healthy. It does not replace R2.
+A matching `/deploy-learning` for `facf8e36` is an owner control-plane action. It is required before learning capture is expected to be healthy. It does not replace R3.
 
 ## Single next implementation increment
 
-R2 only: shadow parity and replay proof for the existing Feature Bus, with the production pin left off.
+R3 only: F3 IGNITION pure detector runtime first, then the opportunity lifecycle, then the feasibility seam, then the calibrated forecast owner, then the constrained economic/portfolio selector — shadow/evidence-first.
 
-Do not start R3, enable Paper v2, enable the Committee timer, or redesign the dashboard in that increment.
+Do not start a later phase, enable Paper v2, enable the Committee timer, activate the Feature Bus, or redesign the dashboard in that increment.
 
 ## Signal Quality v2 disposition
 

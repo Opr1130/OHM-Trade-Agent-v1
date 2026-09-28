@@ -1,10 +1,12 @@
 # O’Pip conformance ledger
 
-Audit SHA: `a416be0a068dc58543a4b6cd254d5c42fcaf4c96`
+Historical audit base: `a416be0a068dc58543a4b6cd254d5c42fcaf4c96`
+
+Current reconciled code/production baseline: `facf8e369e1251697bf9799bc9b1c575a9cdc3ec`
 
 Architecture source: v1.4.3 DOCX pinned in `docs/architecture/v1.4.3/SOURCE.md`.
 
-Runtime observations are summarized here and detailed in `OPIP_RUNTIME_TRUTH_2026-09-27.md`. Code status is from that SHA. A green test is not production proof.
+Runtime observations are summarized here and detailed in `OPIP_RUNTIME_TRUTH_2026-09-28.md`, with `OPIP_RUNTIME_TRUTH_2026-09-27.md` preserved as the preceding historical observation. Code status is from the current reconciled baseline unless a row says otherwise. A green test is not production proof. The reconciliation updates status only where evidence changed; it does not convert absence of evidence into completion.
 
 Status values: `IMPLEMENTED_VERIFIED`, `IMPLEMENTED_NOT_ACTIVE`, `IMPLEMENTED_AWAITING_RUNTIME_EVIDENCE`, `SHADOW`, `LEGACY_ACTIVE`, `PARTIAL`, `MISSING`, `SUPERSEDED`, `RETIRE_AFTER_CUTOVER`, `UNKNOWN_NEEDS_EVIDENCE`.
 
@@ -33,20 +35,21 @@ Status values: `IMPLEMENTED_VERIFIED`, `IMPLEMENTED_NOT_ACTIVE`, `IMPLEMENTED_AW
 | Field | Evidence |
 | --- | --- |
 | ARCHITECTURE_REQUIREMENT | Bounded, reproducible features over retained inputs and checkpoints. Versioned feature values. PR #237 stays the Feature Bus foundation and does not absorb detector, selector, Committee, or dashboard work. |
-| CURRENT_IMPLEMENTATION | `app/opip/contracts/features.py`, `app/opip/features/engine.py`, `pipeline.py`, `publisher.py`, `parity.py`, `replay.py`, `app/jobs/run_feature_bus_pilot.py` |
+| CURRENT_IMPLEMENTATION | `app/opip/contracts/features.py`, `app/opip/features/engine.py`, `pipeline.py`, `publisher.py`, `parity.py`, `replay.py`, `app/opip/features/r2_shadow_parity.py`, `app/jobs/run_feature_bus_pilot.py` |
 | CURRENT_OWNER | Feature-bus package |
 | CURRENT_WRITER | Publisher, only when feature-bus mode and canonical-writer mode are both `shadow` |
 | CURRENT_CONSUMERS | Pilot and tests. `app/jobs/run_cycle.py` does not call it. |
-| CURRENT_RUNTIME_AUTHORITY | None. Compose pins `OPIP_FEATURE_BUS_MODE=off` on the core service. Pilot docstring: manual only, never scheduled. |
-| TEST_EVIDENCE | `tests/test_opip_feature_bus_pr3.py`, `tests/test_opip_feature_bus_pr3_integrity.py` |
-| IMPLEMENTATION_STATUS | `IMPLEMENTED_NOT_ACTIVE` |
+| CURRENT_RUNTIME_AUTHORITY | **None.** Compose pins `OPIP_FEATURE_BUS_MODE=off` on the core service and `run_cycle` does not call the Feature Bus. The R2 shadow proof produced evidence only; it did not act as an authority. |
+| TEST_EVIDENCE | `tests/test_opip_feature_bus_pr3.py`, `tests/test_opip_feature_bus_pr3_integrity.py`, `tests/test_opip_feature_bus_r2_shadow_parity.py` |
+| IMPLEMENTATION_STATUS | `IMPLEMENTED_NOT_ACTIVE` in runtime. R2 shadow parity/replay evidence is accepted (see below); runtime authority is unchanged. |
+| VERIFIED_SHADOW_EVIDENCE | R2 `ATDD-R2-feature-bus-shadow-parity` passed and merged via PR #284 (`facf8e369e1251697bf9799bc9b1c575a9cdc3ec`). Deterministic point-in-time replay/parity is proven: sealed snapshots replay byte-identically, invalid or out-of-time inputs fail closed, retained state and restart state are reproduced, and the parity report describes sealed `FeatureSnapshot` values rather than recomputing a competing value. 0 valid unresolved non-outdated review blockers at merge. |
 | DUPLICATE_OR_OVERLAPPING_PATHS | `app/scanner/technical_scorer.py`, `app/scanner/short_technical_scorer.py`, `app/services/signal_features.py`, `app/services/explosion_state.py` |
 | TARGET_AUTHORITY | Shared Feature Bus |
-| CUTOVER_GATE | Shadow parity/replay evidence against legacy indicators, then an owner decision to remove the compose pin |
+| CUTOVER_GATE | Shadow parity/replay evidence against legacy indicators (now supplied by R2), then a separate owner decision to remove the compose pin. No cutover occurred. |
 | RETIREMENT_CANDIDATE | Legacy technical feature calculations, after cutover |
 | DELETE_GATE | Consumer census of scorer callers, archive of parity fixtures, rollback to the pinned-off compose |
 | BLOCKERS | Not scheduled. Explicitly pinned off so a stale `.env` cannot enable it when the writer is shadow. |
-| NOTES | `replay.py` prepares detector replay input and does not evaluate a detector. |
+| NOTES | `replay.py` prepares detector replay input and does not evaluate a detector. The accepted R2 evidence does not grant the Feature Bus any production runtime authority, and `run_cycle` still does not call it. |
 
 ## F3 — Stateful Detector Runtime / IGNITION
 
@@ -157,7 +160,7 @@ Status values: `IMPLEMENTED_VERIFIED`, `IMPLEMENTED_NOT_ACTIVE`, `IMPLEMENTED_AW
 | CURRENT_OWNER | When Paper v2 is not requested, scan treats Freqtrade dry-run as the paper engine and Paper v1 as the shadow simulator. |
 | CURRENT_WRITER | Paper v1 JSON ledger. Freqtrade dry-run state. Canonical SQLite for Paper v2 events if that mode is active. |
 | CURRENT_CONSUMERS | Dashboard, learning export, cockpit derivation |
-| CURRENT_RUNTIME_AUTHORITY | Freqtrade paper containers were healthy in the 2026-09-27 deploy log. Paper v2 mode was not printed. Settings default is `off`. Host `.env` was not read. |
+| CURRENT_RUNTIME_AUTHORITY | Freqtrade paper containers were healthy in the 2026-09-28 deploy log. Paper v2 mode was not printed. Settings default is `off`. Host `.env` was not read. |
 | TEST_EVIDENCE | `tests/test_paper_trading_v1_core.py`, `tests/test_opip_paper_v2_*bc3.py` |
 | IMPLEMENTATION_STATUS | Paper v1 `LEGACY_ACTIVE`. Freqtrade dry-run `LEGACY_ACTIVE` as the current paper engine in code when v2 is off. Paper v2 `IMPLEMENTED_NOT_ACTIVE`. Live Paper v2 mode `UNKNOWN_NEEDS_EVIDENCE`. |
 | DUPLICATE_OR_OVERLAPPING_PATHS | Paper v1, Freqtrade dry-run, Paper v2 |
@@ -237,7 +240,8 @@ Status values: `IMPLEMENTED_VERIFIED`, `IMPLEMENTED_NOT_ACTIVE`, `IMPLEMENTED_AW
 | CURRENT_OWNER | Committee package, shadow only |
 | CURRENT_WRITER | Committee JSONL store when a cycle runs |
 | CURRENT_CONSUMERS | Trust report inside the committee package |
-| CURRENT_RUNTIME_AUTHORITY | Last control-plane observation 2026-09-25: mode shadow at SHA `86d5290b`, timer disabled, zero role results. Not this core SHA. |
+| CURRENT_RUNTIME_AUTHORITY | Last control-plane observation 2026-09-25: mode shadow at SHA `86d5290b`, timer disabled, zero role results. Not this core SHA. Committee still has zero runtime trading authority. |
+| MODEL_ROUTE_DRIFT | Implementation drift, recorded without inventing conformance. The v1.4.3 registry (sections 16–18) names *provisional benchmark candidates* across OpenAI, Google, and DeepSeek (for example `gpt-5.6-terra`, `gemini-3.8-flash`, `deepseek-v4-pro`). The approved in-code shadow registry routes only OpenAI (`gpt-5.6-terra`) and Anthropic (`claude-sonnet-5`). Anthropic is not in the v1.4.3 provisional candidate table, and the Google and DeepSeek candidates are not implemented. This is release-specific routing, not conformance. Treating either set as the other would overstate conformance; owner review or a registry change is required before committee evidence is claimed against the v1.4.3 bake-off. |
 | TEST_EVIDENCE | `tests/test_opip_committee_safety_v1.py` and IC contract tests |
 | IMPLEMENTATION_STATUS | `SHADOW` in code and in the last activation proof. Live cases `IMPLEMENTED_AWAITING_RUNTIME_EVIDENCE`. |
 | DUPLICATE_OR_OVERLAPPING_PATHS | None back into the trading cycle |
@@ -246,7 +250,7 @@ Status values: `IMPLEMENTED_VERIFIED`, `IMPLEMENTED_NOT_ACTIVE`, `IMPLEMENTED_AW
 | RETIREMENT_CANDIDATE | None |
 | DELETE_GATE | Not a deletion candidate |
 | BLOCKERS | Release SHA is behind `main`. Timer was inactive. Weakness registry is in-process, not a durable JSONL stream. |
-| NOTES | No additional Committee feature work is required to start the next implementation increment. |
+| NOTES | No additional Committee feature work is required to start the next implementation increment. The Committee remains advisory and shadow-only with no runtime trading authority; the model-route drift above is recorded, not resolved, by this reconciliation. |
 
 ## Adjacent authorities
 
@@ -268,6 +272,6 @@ The in-tree `docs/MODULE2_INTELLIGENCE_COMMITTEE.md` IC-042 sentence that says t
 | --- | --- | --- |
 | IC-001–IC-004, IC-006, IC-007, IC-009–IC-018, IC-023, IC-024, IC-028–IC-040, IC-044, IC-045 | `IMPLEMENTED_NOT_ACTIVE` or `SHADOW` contract present. No trading path. | Timer last observed disabled |
 | IC-005, IC-008, IC-019–IC-022, IC-025–IC-027, IC-041, IC-043 | `IMPLEMENTED_AWAITING_RUNTIME_EVIDENCE` | No real provider results in the activation proof (`role_results=0`) |
-| IC-042 | Deployment artifacts exist. Last activation proved shadow mode and an inactive timer at `86d5290b`. | Not aligned to `a416be0a` |
+| IC-042 | Deployment artifacts exist. Last activation proved shadow mode and an inactive timer at `86d5290b`. | Not aligned to `facf8e36` |
 
 Weakness registry, trust report, economics, and matched-baseline types exist in code. They are not populated by production baseline results. A test passing is not a real-provider result.

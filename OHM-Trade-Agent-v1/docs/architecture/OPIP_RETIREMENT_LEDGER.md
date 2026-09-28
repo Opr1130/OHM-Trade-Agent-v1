@@ -1,8 +1,10 @@
 # O’Pip retirement ledger
 
-Audit SHA: `a416be0a068dc58543a4b6cd254d5c42fcaf4c96`
+Historical audit base: `a416be0a068dc58543a4b6cd254d5c42fcaf4c96`
 
-Nothing in this ledger is deleted, frozen, or cut over by the audit. Deletion requires a proven replacement, a completed cutover, a consumer census, preserved history, a rollback path, and a separate owner approval.
+Current reconciled code/production baseline: `facf8e369e1251697bf9799bc9b1c575a9cdc3ec`
+
+Nothing in this ledger is deleted, frozen, or cut over by the audit or by the R0/R1 reconciliation. Deletion requires a proven replacement, a completed cutover, a consumer census, preserved history, a rollback path, and a separate owner approval. Prerequisites are updated only where R2 evidence satisfies a prior condition; the live legacy feature and scanner path stays available until an owner-approved future cutover and consumer migration.
 
 | Component | Current authority | Target authority | Why both exist | Freeze point | Cutover proof | Consumer census | Archive | Rollback | Retirement trigger | Delete trigger |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -10,7 +12,7 @@ Nothing in this ledger is deleted, frozen, or cut over by the audit. Deletion re
 | Movement discovery | Legacy cycle calls the learning scheduler. Trading host is `REMOTE_ONLY` for compute. | F1–F4 observation and lifecycle | Early discovery predates the bus | No new movement strategy | Discovery facts are projections of canonical observations | Outcome JSONL, reports | Retain outcome files | Leave the job installed | Canonical observation covers the same pairs and windows | After consumers read the projection only |
 | Top-8 technical gate | `app/scanner/candidates.py`, score ≥ 80, keep 8. `CLEANUP_MATRIX.md` says KEEP (live). | F7 selector | Historical ranking cap | No threshold edits during R2–R3 | Selector comparison includes the Top-8 population | Scan, alerts | Parity fixtures | Restore the cap in the scan | Owner records technical cutover | 14-day post-cutover gate in v1.2, only with owner approval |
 | Profit-ranking comparator | `rank_profit_opportunities` in the scan | F7 net-dollar selector | Ranking is the live sort. Selector does not exist. | Keep weights frozen | Matched window against cash and this comparator | Alerts, paper routing | Score breakdowns | Scan calls the ranker again | Selector is admission source | Same delete gate as Top-8 |
-| Duplicate technical features | Scanner scorers, `signal_features.py`, explosion vector | Feature Bus | Bus is pinned off, so live math stayed | Do not add a third calculator | R2 parity at tolerance 0 | Scanner, explosion learner, parity tests | Parity report | Bus mode back to `off` | Bus is the feature source for admission | After scorer callers are listed and moved |
+| Duplicate technical features | Scanner scorers, `signal_features.py`, explosion vector | Feature Bus | Bus is pinned off, so live math stayed | Do not add a third calculator | R2 shadow parity/replay evidence accepted (PR #284); cutover not performed | Scanner, explosion learner, parity tests | Parity report | Bus mode back to `off` | Bus is the feature source for admission | After scorer callers are listed and moved |
 | Paper v1 | JSON ledger and monitor on the unified cycle. New entries depend on `control.json`, contents unknown. | Paper v2 on the canonical ledger | v2 is off. v1 still tracks lifecycles. | No new Paper v1 features | v2 mode `active` and drain `READY` | Monitor, outbox, dashboard, export bundle | `state.json`, `events.jsonl` | v2 mode `off`, v1 monitor still runs | New enrollments stopped and open book is flat | Monitor removed only after zero open obligations |
 | Freqtrade dry-run as O’Pip paper engine | Healthy containers in the 2026-09-27 deploy log. Code uses it when v2 is not requested. | Paper v2 | Isolation contract for dry-run still stands | Do not point it at funded keys | Drain `READY` includes zero Freqtrade opens | Scan authority resolver | Freqtrade dry-run data stays on the paper plane | Keep containers up | O’Pip paper entries no longer route there | Container retirement is a separate owner decision. This audit does not stop them. |
 | Legacy JSONL writers | Census in `docs/architecture/v1.2/CONSUMER_CENSUS.md`. `p1_shadow_outbox` is superseded and compose pins it off. | Canonical writer for operational facts. Projections rebuild. | Writer is shadow, not the sole paper ledger | No new JSONL domain stores | Reader comparison at one watermark | Each file in the census | STOP → ARCHIVE → DELETE | Writers re-enabled only by owner | Named stop time per file | After archive checksum and consumer sign-off |
@@ -25,5 +27,5 @@ Nothing in this ledger is deleted, frozen, or cut over by the audit. Deletion re
 - Active-trade protection stays until R4 proves an independent replacement.
 - Canonical writer stays. It is the target evidence store, currently shadow.
 - Committee package stays. It is advisory. Missing live cases are not a reason to remove it.
-- Feature Bus code stays. It is the R2 subject.
+- Feature Bus code stays. R2 proved it in shadow; no cutover has occurred and the compose pin remains `off`.
 - Paper v2 code stays. It is inactive, not obsolete.
