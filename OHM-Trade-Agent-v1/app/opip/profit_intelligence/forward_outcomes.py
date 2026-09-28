@@ -56,6 +56,7 @@ from app.opip.cockpit.trust import (
     TrustEnvelope,
     unavailable as unavailable_trust,
 )
+from app.opip.discovery.constants import DISCOVERY_PRIMARY_HORIZON
 from app.opip.profit_intelligence.semantics import FactAvailability
 
 #: Bumped whenever a derived definition in this projection changes.
@@ -137,6 +138,15 @@ def _text(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _int_or_none(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _finite(value: Any) -> float | None:
@@ -233,6 +243,7 @@ class ForwardOutcomeRecord:
     move_episode_id: str | None = None
     outcome_definition: str | None = None
     outcome_calculation_version: str | int | None = None
+    outcome_revision: int | None = None
     outcome_source: str | None = None
     primary_horizon: str | None = None
     mfe_pct: float | None = None
@@ -260,6 +271,7 @@ class ForwardOutcomeRecord:
             "move_episode_id": self.move_episode_id,
             "outcome_definition": self.outcome_definition,
             "outcome_calculation_version": self.outcome_calculation_version,
+            "outcome_revision": self.outcome_revision,
             "outcome_source": self.outcome_source,
             "primary_horizon": self.primary_horizon,
             "mfe_pct": self.mfe_pct,
@@ -384,6 +396,7 @@ def _phase3c_record(row: Mapping[str, Any]) -> ForwardOutcomeRecord:
         signal_episode_id=_text(row.get("signal_episode_id")),
         move_episode_id=_text(row.get("move_episode_id")),
         outcome_calculation_version=version if version is not None else None,
+        outcome_revision=_int_or_none(row.get("outcome_revision")),
         outcome_source=_text(row.get("outcome_source")),
         primary_horizon=None,
         mfe_pct=_finite(row.get("mfe_pct")),
@@ -447,7 +460,13 @@ def _discovery_record(row: Mapping[str, Any]) -> ForwardOutcomeRecord:
         canonical_underlying_asset=_text(row.get("canonical_underlying_asset")),
         outcome_definition=_text(row.get("outcome_definition")),
         outcome_calculation_version=version if version is not None else None,
-        primary_horizon=_text(row.get("primary_horizon")),
+        outcome_revision=_int_or_none(row.get("outcome_revision")),
+        # The Discovery producer does not stamp primary_horizon on the row; the
+        # canonical definition lives in discovery.constants, so fall back to it
+        # rather than dropping a canonical fact.
+        primary_horizon=(
+            _text(row.get("primary_horizon")) or DISCOVERY_PRIMARY_HORIZON
+        ),
         mfe_pct=_finite(row.get("mfe_pct")),
         mae_pct=_finite(row.get("mae_pct")),
         window_complete=bool(row.get("window_complete", False)),
@@ -633,14 +652,24 @@ def build_forward_outcome_projection(
             latest[key] = record
             continue
         duplicates += 1
-        # Latest revision wins (the producers are append-only and write
-        # increasing revisions), except that an unreadable revision never erases
-        # an earlier readable one.
-        if (
-            record.availability is FactAvailability.KNOWN
-            or existing.availability is not FactAvailability.KNOWN
-        ):
+        # Precedence: (1) a readable record is never erased by an unreadable one;
+        # (2) a newer canonical revision supersedes an older one; (3) otherwise
+        # the latest in read order wins.
+        new_known = record.availability is FactAvailability.KNOWN
+        old_known = existing.availability is FactAvailability.KNOWN
+        if old_known and not new_known:
+            continue
+        if new_known and not old_known:
             latest[key] = record
+            continue
+        if (
+            record.outcome_revision is not None
+            and existing.outcome_revision is not None
+        ):
+            if record.outcome_revision >= existing.outcome_revision:
+                latest[key] = record
+            continue
+        latest[key] = record
 
     records = tuple(latest[key] for key in order)
 
@@ -753,7 +782,7 @@ def read_forward_outcome_projection(
             from app.opip.discovery.store import read_discovery_forward_outcomes
 
             rows = read_discovery_forward_outcomes(path=expected)
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return unavailable_forward_outcomes(
             f"FORWARD_OUTCOME_EVIDENCE_UNREADABLE:{resolved_source.value}",
             source=resolved_source,

@@ -51,7 +51,10 @@ Availability reuses `app.opip.cockpit.trust` (`Freshness`, `Completeness`,
 - `UNAVAILABLE` / `UNKNOWN` / `INCOMPLETE` are never converted into `0`.
 - An absent evidence file, and a present-but-wholly-unparseable file, both yield
   a structurally identical envelope with `UNAVAILABLE` freshness and `UNKNOWN`
-  completeness — never an empty-but-healthy result.
+  completeness — never an empty-but-healthy result. (A file that is *partially*
+  corrupt is handled by the canonical readers, which skip individual malformed
+  lines; that tolerance is inherited deliberately and not separately counted
+  here.)
 
 ## Conservation and idempotency
 

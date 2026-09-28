@@ -222,12 +222,18 @@ def join_funnel_record_to_forward_outcomes(
                 "refusing to choose one"
             ),
         )
+    detail = "matched on canonical episode identity"
+    if len(readable) < len(projections):
+        detail += (
+            "; some supplied sources were unreadable and not searched, so an "
+            "additional match cannot be excluded"
+        )
     return ForwardOutcomeJoin(
         status=ForwardOutcomeJoinStatus.MATCHED,
         funnel_candidate_id=record.candidate_id,
         episode_id=record.episode_id,
         matches=(matches[0],),
-        detail="matched on canonical episode identity",
+        detail=detail,
     )
 
 

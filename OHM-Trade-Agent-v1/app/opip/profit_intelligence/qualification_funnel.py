@@ -688,8 +688,9 @@ def build_qualification_funnel_projection(
             latest[key] = record
             continue
         duplicates += 1
-        # A later unreadable replay must not erase an earlier readable decision;
-        # otherwise the latest revision wins.
+        # The funnel writes one terminal row per candidate per scan and has no
+        # revision field, so the first readable row is authoritative for the
+        # identity; a later unreadable replay must not erase it.
         if (
             existing.availability is not FactAvailability.KNOWN
             and record.availability is FactAvailability.KNOWN
@@ -806,7 +807,7 @@ def read_qualification_funnel_projection(
         )
     try:
         rows = read_jsonl(expected)
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         return unavailable_qualification_funnel(
             f"QUALIFICATION_EVIDENCE_UNREADABLE:{type(exc).__name__}",
             generated_at=moment,

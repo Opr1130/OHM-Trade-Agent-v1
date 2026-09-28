@@ -456,7 +456,6 @@ def _discovery_row(
         "venue_instrument_id": "KRAKEN:BTCUSD",
         "canonical_underlying_asset": "BTC",
         "maturation_status": "COMPLETE_HORIZON",
-        "primary_horizon": "12h",
         "window_complete": True,
         "mfe_pct": 3.0,
         "mae_pct": -1.0,
@@ -566,12 +565,17 @@ def test_phase3c_excursions_are_record_level_not_misattributed_per_horizon():
 
 
 def test_discovery_horizons_carry_per_horizon_excursions():
+    from app.opip.discovery.constants import DISCOVERY_PRIMARY_HORIZON
+
     projection = build_forward_outcome_projection(
         [_discovery_row()], source=ForwardOutcomeSource.DISCOVERY, generated_at=_NOW
     )
     record = projection.records[0]
     assert record.direction == "LONG"
     assert record.venue_instrument_id == "KRAKEN:BTCUSD"
+    # primary_horizon is not stamped by the producer row; it resolves from the
+    # canonical constant rather than being dropped.
+    assert record.primary_horizon == DISCOVERY_PRIMARY_HORIZON
     assert {horizon.horizon_id for horizon in record.horizons} == {"1h", "12h"}
     assert all(horizon.mfe_pct == 1.5 for horizon in record.horizons)
 
@@ -627,6 +631,18 @@ def test_forward_later_unreadable_revision_does_not_erase_a_readable_one():
         [readable, unreadable], source=ForwardOutcomeSource.PHASE3C, generated_at=_NOW
     )
     assert projection.records[0].availability.value == "KNOWN"
+    assert projection.records[0].window_complete is True
+
+
+def test_forward_higher_revision_wins_regardless_of_read_order():
+    low = _phase3c_row(snapshot_id="S1", window_complete=False, return_pct=None)
+    low["outcome_revision"] = 1
+    high = _phase3c_row(snapshot_id="S1", window_complete=True, return_pct=2.0)
+    high["outcome_revision"] = 2
+    projection = build_forward_outcome_projection(
+        [high, low], source=ForwardOutcomeSource.PHASE3C, generated_at=_NOW
+    )
+    assert projection.records[0].outcome_revision == 2
     assert projection.records[0].window_complete is True
 
 
