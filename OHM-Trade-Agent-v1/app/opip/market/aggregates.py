@@ -107,6 +107,13 @@ class AlignmentResult:
     excluded_forming: int = 0
     excluded_unclosed: int = 0
     excluded_misaligned: int = 0
+    #: The rows behind the three counters above, retained rather than only
+    #: counted. ``excluded_misaligned_rows`` decide ``coverage``, so a consumer
+    #: that must reason about what a snapshot depended on has to see them; the
+    #: classification itself stays here, in the one place that defines it.
+    excluded_forming_rows: tuple[Observation, ...] = ()
+    excluded_unclosed_rows: tuple[Observation, ...] = ()
+    excluded_misaligned_rows: tuple[Observation, ...] = ()
     expected_intervals: int = 0
     source_incomplete: bool = False
 
@@ -171,17 +178,21 @@ def align_minute_observations(
     if not is_grid_aligned(cutoff_utc, interval_seconds=interval_seconds):
         raise ValueError("cutoff must sit on the interval grid")
 
-    evidence_best, evidence_super, ef, eu, em = _admit_closed_intervals(
-        observations,
-        cutoff_utc=cutoff_utc,
-        interval_seconds=interval_seconds,
-        window_start=window_start,
+    evidence_best, evidence_super, evidence_forming, evidence_unclosed, evidence_misaligned = (
+        _admit_closed_intervals(
+            observations,
+            cutoff_utc=cutoff_utc,
+            interval_seconds=interval_seconds,
+            window_start=window_start,
+        )
     )
-    coverage_best, coverage_super, cf, cu, cm = _admit_closed_intervals(
-        coverage_only,
-        cutoff_utc=cutoff_utc,
-        interval_seconds=interval_seconds,
-        window_start=window_start,
+    coverage_best, coverage_super, coverage_forming, coverage_unclosed, coverage_misaligned = (
+        _admit_closed_intervals(
+            coverage_only,
+            cutoff_utc=cutoff_utc,
+            interval_seconds=interval_seconds,
+            window_start=window_start,
+        )
     )
     # Evidence wins a shared interval; coverage-only only fills holes.
     coverage_only_best = {
@@ -231,9 +242,14 @@ def align_minute_observations(
         late_arrivals=late,
         superseded=tuple(evidence_super + coverage_super),
         coverage_only=tuple(coverage_ordered),
-        excluded_forming=ef + cf,
-        excluded_unclosed=eu + cu,
-        excluded_misaligned=em + cm,
+        excluded_forming=len(evidence_forming) + len(coverage_forming),
+        excluded_unclosed=len(evidence_unclosed) + len(coverage_unclosed),
+        excluded_misaligned=len(evidence_misaligned) + len(coverage_misaligned),
+        excluded_forming_rows=tuple(evidence_forming) + tuple(coverage_forming),
+        excluded_unclosed_rows=tuple(evidence_unclosed) + tuple(coverage_unclosed),
+        excluded_misaligned_rows=(
+            tuple(evidence_misaligned) + tuple(coverage_misaligned)
+        ),
         expected_intervals=expected,
     )
 
@@ -244,30 +260,36 @@ def _admit_closed_intervals(
     cutoff_utc: datetime,
     interval_seconds: int,
     window_start: datetime | None,
-) -> tuple[dict[datetime, Observation], list[Observation], int, int, int]:
-    excluded_forming = 0
-    excluded_unclosed = 0
-    excluded_misaligned = 0
+) -> tuple[
+    dict[datetime, Observation],
+    list[Observation],
+    list[Observation],
+    list[Observation],
+    list[Observation],
+]:
+    excluded_forming: list[Observation] = []
+    excluded_unclosed: list[Observation] = []
+    excluded_misaligned: list[Observation] = []
     best: dict[datetime, Observation] = {}
     superseded: list[Observation] = []
 
     for observation in observations:
         if observation.payload_kind is not PayloadKind.FIXED_INTERVAL_AGGREGATE:
-            excluded_misaligned += 1
+            excluded_misaligned.append(observation)
             continue
         if observation.aggregate_interval_seconds != interval_seconds:
-            excluded_misaligned += 1
+            excluded_misaligned.append(observation)
             continue
         if observation.interval_forming:
-            excluded_forming += 1
+            excluded_forming.append(observation)
             continue
         start = observation.source_event_time
         if not is_grid_aligned(start, interval_seconds=interval_seconds):
-            excluded_misaligned += 1
+            excluded_misaligned.append(observation)
             continue
         end = observation.interval_end
         if end is None or end > cutoff_utc:
-            excluded_unclosed += 1
+            excluded_unclosed.append(observation)
             continue
         if window_start is not None and start < window_start.astimezone(timezone.utc):
             continue
