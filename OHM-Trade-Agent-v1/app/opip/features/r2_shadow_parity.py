@@ -524,6 +524,11 @@ def _assert_retained_ohlcv(payload: Mapping[str, Any]) -> None:
     state does not carry ``vwap`` or ``trade_count``, which are part of the
     fingerprint input, so a mismatch there would not distinguish corruption from
     a source that simply reported them.
+
+    ``_rolling_state_evidence`` has already proven ``first_interval_epoch`` and
+    ``interval_seconds`` are exact integers before this runs, so the horizon can
+    be reconstructed here without the truncating coercion that would otherwise
+    hide a fractional payload.
     """
     rolling = payload["rolling_state"]
     opens = list(rolling.get("opens") or ())
@@ -536,7 +541,7 @@ def _assert_retained_ohlcv(payload: Mapping[str, Any]) -> None:
     interval_seconds = rolling.get("interval_seconds")
     if not closes:
         return
-    if first_epoch is None or not isinstance(interval_seconds, int):
+    if first_epoch is None:
         raise ValueError(
             "captured retained state needs first_interval_epoch and interval_seconds "
             "before its series can be validated"
@@ -545,14 +550,14 @@ def _assert_retained_ohlcv(payload: Mapping[str, Any]) -> None:
         known_open = bool(opens_known[index]) if index < len(opens_known) else False
         open_value = opens[index] if known_open and index < len(opens) else close
         row = IntervalRow(
-            interval_start_epoch=int(first_epoch) + int(interval_seconds) * index,
+            interval_start_epoch=first_epoch + interval_seconds * index,
             open=open_value,
             high=highs[index],
             low=lows[index],
             close=close,
             volume=volumes[index],
         )
-        reason = _validate_row(row, interval_seconds=int(interval_seconds))
+        reason = _validate_row(row, interval_seconds=interval_seconds)
         if reason is not None:
             raise ValueError(
                 "replay refused: retained slot "
@@ -589,7 +594,18 @@ def _assert_reconstruction_dependencies(payload: Mapping[str, Any]) -> None:
 
 
 def _rolling_state_evidence(payload: Mapping[str, Any]) -> None:
-    """The nested retained series is versioned evidence too, not a bag of keys."""
+    """The nested retained series is versioned evidence too, not a bag of keys.
+
+    The horizon fields are checked for their exact type before any conversion.
+    ``first_interval_epoch`` may be null for an empty state but is otherwise an
+    exact integer, and ``interval_seconds`` is always a positive integer. A
+    payload declaring an aligned integer plus a fraction is therefore refused
+    here rather than truncated by ``from_checkpoint``: without this check the
+    durable payload would declare one interval horizon while replay silently
+    reconstructed another. Booleans are rejected even though they are ``int``
+    subclasses, and ``last_receipt_epoch`` is validated as a finite number so a
+    NaN or infinity cannot reach ``datetime.fromtimestamp``.
+    """
     rolling = payload.get("rolling_state")
     if not isinstance(rolling, Mapping):
         raise ValueError("captured retained state rolling_state must be an object")
@@ -603,6 +619,32 @@ def _rolling_state_evidence(payload: Mapping[str, Any]) -> None:
         raise ValueError(
             f"captured retained state rolling_state has unexpected keys: {unexpected}"
         )
+    _optional_int(
+        rolling["first_interval_epoch"],
+        "prior_state.rolling_state.first_interval_epoch",
+    )
+    interval_seconds = _require_int(
+        rolling["interval_seconds"], "prior_state.rolling_state.interval_seconds"
+    )
+    if interval_seconds <= 0:
+        raise ValueError(
+            "replay evidence prior_state.rolling_state.interval_seconds must be "
+            "positive"
+        )
+    last_receipt = rolling["last_receipt_epoch"]
+    if last_receipt is not None:
+        if isinstance(last_receipt, bool) or not isinstance(
+            last_receipt, (int, float)
+        ):
+            raise ValueError(
+                "replay evidence prior_state.rolling_state.last_receipt_epoch must "
+                "be a number or null"
+            )
+        if not math.isfinite(float(last_receipt)):
+            raise ValueError(
+                "replay evidence prior_state.rolling_state.last_receipt_epoch must "
+                "be finite"
+            )
 
 
 def _write_watermarks_from_evidence(raw: Any) -> tuple[ConsumedInputWatermark, ...]:
@@ -706,10 +748,14 @@ def load_replay_evidence(
             "reads tick size and minimum order size off the instrument version"
         )
     raw_reference_time = payload["reference_observed_at_utc"]
-    reference_observed_at = (
-        None
-        if raw_reference_time is None
-        else _parse_time(raw_reference_time, "reference_observed_at_utc")
+    if raw_reference_time is None:
+        raise ValueError(
+            "replay evidence must declare reference_observed_at_utc; without the "
+            "instant the reference metadata was observed, a version whose "
+            "fingerprint matches cannot be bound to a replay instant"
+        )
+    reference_observed_at = _parse_time(
+        raw_reference_time, "reference_observed_at_utc"
     )
     instrument_version_id = payload["instrument_version_id"]
     if not isinstance(instrument_version_id, str) or not instrument_version_id.strip():
@@ -903,8 +949,14 @@ def _assert_reference_identity(
     instrument version, so two versions sharing ids but differing in reference
     metadata produce different ``tick_size_pct`` and ``min_order_notional`` under
     the same snapshot id. The envelope therefore binds the reference fingerprint
-    and the time it was observed, and replay refuses a mismatch or metadata
-    observed after the replay instant.
+    and the time it was observed.
+
+    The fingerprint alone is not sufficient: it deliberately excludes
+    ``observed_at_utc``, so it cannot distinguish two observations of identical
+    metadata taken at different instants. The captured time must therefore equal
+    the supplied version's ``observed_at_utc`` exactly, so a future version whose
+    fingerprint matches cannot certify a historical snapshot, and it must not be
+    after the replay instant, so metadata not yet seen cannot be admitted.
     """
     if evidence.reference_fingerprint is None:
         raise EvidenceIntegrityError(
@@ -924,7 +976,22 @@ def _assert_reference_identity(
             f"captured {evidence.instrument_version_id!r}"
         )
     observed = evidence.reference_observed_at_utc
-    if observed is not None and observed > evaluated_at_utc:
+    if observed is None:
+        raise EvidenceIntegrityError(
+            "replay refused: captured evidence declares no reference observation "
+            "time, so the instrument version it consumed cannot be bound to the "
+            "instant its metadata was seen"
+        )
+    supplied_observed = instrument_version.observed_at_utc
+    if observed != supplied_observed:
+        raise CycleIdentityMismatch(
+            "captured reference metadata was observed at "
+            f"{iso_z(observed, field_name='reference_observed_at_utc')}, but the "
+            "supplied instrument version was observed at "
+            f"{iso_z(supplied_observed, field_name='observed_at_utc')}; the "
+            "reference metadata behind tick size and minimum order size differs"
+        )
+    if observed > evaluated_at_utc:
         raise TemporalIntegrityError(
             "captured reference metadata was observed at "
             f"{iso_z(observed, field_name='reference_observed_at_utc')}, after "
@@ -952,18 +1019,20 @@ def _assert_retained_state_population(
     """
     if prior_state.interval_count == 0:
         return
+    # The horizon fields were proven exact integers when the checkpoint payload
+    # was validated, so they are read here without a second truncating coercion.
     first_epoch = prior_state.first_interval_epoch
-    interval_seconds = int(prior_state.interval_seconds)
+    interval_seconds = prior_state.interval_seconds
     if first_epoch is None or interval_seconds <= 0:
         raise EvidenceIntegrityError(
             "replay refused: retained state declares no usable interval horizon"
         )
-    if int(first_epoch) % interval_seconds != 0:
+    if first_epoch % interval_seconds != 0:
         raise EvidenceIntegrityError(
             "replay refused: retained state horizon is not grid aligned"
         )
     horizon = datetime.fromtimestamp(
-        int(first_epoch) + interval_seconds * prior_state.interval_count,
+        first_epoch + interval_seconds * prior_state.interval_count,
         tz=timezone.utc,
     )
     if horizon > evaluation_cutoff:

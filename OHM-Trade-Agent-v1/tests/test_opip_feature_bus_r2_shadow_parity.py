@@ -1058,6 +1058,30 @@ def test_unsupported_nested_rolling_state_is_refused():
         (lambda rs: rs.update({"future_field": "drift"}), "unexpected keys"),
         (lambda rs: rs.pop("ema_fast"), "missing keys"),
         (lambda rs: rs.update({"venue": 7}), None),
+        # A fractional horizon must be refused before any conversion, not
+        # truncated into a different interval the durable payload never declared.
+        (
+            lambda rs: rs.update(
+                {"first_interval_epoch": rs["first_interval_epoch"] + 0.5}
+            ),
+            "first_interval_epoch",
+        ),
+        (
+            lambda rs: rs.update(
+                {"first_interval_epoch": str(rs["first_interval_epoch"])}
+            ),
+            "first_interval_epoch",
+        ),
+        (lambda rs: rs.update({"first_interval_epoch": True}), "first_interval_epoch"),
+        (lambda rs: rs.update({"interval_seconds": 60.0}), "interval_seconds"),
+        (lambda rs: rs.update({"interval_seconds": "60"}), "interval_seconds"),
+        (lambda rs: rs.update({"interval_seconds": True}), "interval_seconds"),
+        (lambda rs: rs.update({"interval_seconds": 0}), "interval_seconds"),
+        (
+            lambda rs: rs.update({"last_receipt_epoch": float("nan")}),
+            "last_receipt_epoch",
+        ),
+        (lambda rs: rs.update({"last_receipt_epoch": True}), "last_receipt_epoch"),
     ):
         payload = _capture(observations, prior_state=retained).to_dict()
         payload["prior_state"] = dict(payload["prior_state"])
@@ -1072,6 +1096,14 @@ def test_unsupported_nested_rolling_state_is_refused():
             continue
         with pytest.raises(ValueError, match=message):
             load_replay_evidence(payload)
+    # An intact retained horizon still round-trips and replays identically.
+    intact = _capture(observations, prior_state=retained)
+    restored = load_replay_evidence(intact.to_dict())
+    assert restored.prior_state is not None
+    assert (
+        _replay_evidence_result(intact).snapshot.to_dict()
+        == _replay_evidence_result(restored).snapshot.to_dict()
+    )
 
 
 def test_cold_start_capture_with_committed_write_watermarks_round_trips():
@@ -1289,6 +1321,37 @@ def test_reference_metadata_is_bound_to_the_capture():
     )
     assert drifted_snapshot.snapshot_id == baseline.snapshot_id
 
+    # ``observed_at_utc`` is excluded from the fingerprint, so matching metadata
+    # seen at a different instant still has to be refused: a future version whose
+    # fingerprint matches must not certify a historical snapshot.
+    earlier = _instrument(observed_at_utc=NOW - timedelta(minutes=1))
+    assert earlier.reference_fingerprint() == _instrument().reference_fingerprint()
+    assert earlier.instrument_version_id == _instrument().instrument_version_id
+    stale_capture = _capture(observations, instrument_version=earlier)
+    assert stale_capture.reference_observed_at_utc == NOW - timedelta(minutes=1)
+    with pytest.raises(CycleIdentityMismatch, match="reference metadata"):
+        replay_cycle(
+            stale_capture,
+            instrument_version=_instrument(),
+            evaluation_cutoff=CUTOFF,
+            evaluated_at_utc=NOW,
+            consumed_input_watermark=_watermark(observations),
+            source_version=SOURCE,
+        )
+    # Metadata observed in time by the supplied version still replays.
+    in_time = _instrument(observed_at_utc=NOW)
+    assert (
+        replay_cycle(
+            _capture(observations, instrument_version=in_time),
+            instrument_version=in_time,
+            evaluation_cutoff=CUTOFF,
+            evaluated_at_utc=NOW,
+            consumed_input_watermark=_watermark(observations),
+            source_version=SOURCE,
+        ).snapshot.values["tick_size_pct"]
+        is not None
+    )
+
 
 def test_future_reference_metadata_is_refused():
     observations, _normalized = _observations(_rows(count=5))
@@ -1329,6 +1392,12 @@ def test_missing_reference_binding_fails_closed():
     payload = _capture(observations).to_dict()
     del payload["instrument_version_id"]
     with pytest.raises(ValueError, match="missing required keys"):
+        load_replay_evidence(payload)
+    # A null observation time is not a usable binding: the fingerprint cannot
+    # stand in for it, so the payload is refused rather than treated as timeless.
+    payload = _capture(observations).to_dict()
+    payload["reference_observed_at_utc"] = None
+    with pytest.raises(ValueError, match="reference_observed_at_utc"):
         load_replay_evidence(payload)
 
 
