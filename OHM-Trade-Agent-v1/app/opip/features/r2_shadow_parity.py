@@ -417,7 +417,9 @@ def _assert_visibility_covers_inputs(
         )
 
 
-def _require_consistent_content(eligible: Sequence[Observation]) -> None:
+def _require_consistent_content(
+    captured: Sequence[Observation], eligible: Sequence[Observation]
+) -> None:
     """One observation identity must not carry two different stories.
 
     ``observation_idempotency_key`` keys a market observation by its identity
@@ -426,6 +428,12 @@ def _require_consistent_content(eligible: Sequence[Observation]) -> None:
     payload per identity and treats any divergence as integrity corruption.
     Replay must refuse the same evidence instead of letting alignment pick a
     winner by process-local ingestion order.
+
+    The identity check spans every captured row, because excluding a row from
+    the sealed snapshot does not stop it from colliding with one that is in it:
+    a forming and a closed version of one interval share an identity while only
+    the closed one is eligible. ``eligible`` bounds the values-level check,
+    which is about rows competing for one interval.
 
     The identity already encodes instrument, cadence, interval and revision, so
     keys are scoped by cadence without a second rule: a one-minute bar and a
@@ -448,7 +456,7 @@ def _require_consistent_content(eligible: Sequence[Observation]) -> None:
         fingerprints[identity] = fingerprint
 
     payloads: dict[str, bytes] = {}
-    for item in eligible:
+    for item in captured:
         identity = item.observation_id
         payload = canonical_json_bytes(item.to_dict())
         prior_payload = payloads.get(identity)
@@ -512,7 +520,7 @@ def replay_feature_snapshot(
     alignment = align_minute_observations(observations, cutoff=evaluation_cutoff)
     _assert_cutoff_population(alignment, evaluation_cutoff=evaluation_cutoff)
     eligible = _eligible_evidence(alignment)
-    _require_consistent_content(eligible)
+    _require_consistent_content(observations, eligible)
     _require_consumed_watermark(
         eligible,
         consumed_input_watermark=consumed_input_watermark,
@@ -525,9 +533,7 @@ def replay_feature_snapshot(
         consumed_input_watermark=consumed_input_watermark,
         source_version=source_version,
     )
-    _assert_visibility_covers_inputs(
-        snapshot, eligible, source_version=source_version
-    )
+    _assert_visibility_covers_inputs(snapshot, eligible, source_version=source_version)
     return snapshot
 
 
@@ -893,6 +899,21 @@ def _require_bool(value: Any, field_name: str) -> bool:
     return value
 
 
+def _required_string(raw: Mapping[str, Any], field_name: str) -> str:
+    """Identity fields are persisted as strings; a numeric twin is not one.
+
+    Coercing ``7`` to ``"7"`` would let a rewritten record pass the identity
+    check, and ``source_evidence_identity`` would then name the reconstruction
+    rather than the durable payload supplied.
+    """
+    value = raw[field_name]
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(
+            f"replay evidence {field_name} must be a non-empty string"
+        )
+    return value
+
+
 def _optional_str(value: Any, field_name: str) -> str | None:
     if value is None:
         return None
@@ -983,9 +1004,9 @@ def _observation_from_evidence(raw: Mapping[str, Any]) -> Observation:
     if not isinstance(captured_id, str) or not captured_id.strip():
         raise ValueError("replay evidence observation_id must be a non-empty string")
     reconstructed = Observation(
-        instrument_version_id=str(raw["instrument_version_id"]),
-        venue=str(raw["venue"]),
-        venue_instrument_id=str(raw["venue_instrument_id"]),
+        instrument_version_id=_required_string(raw, "instrument_version_id"),
+        venue=_required_string(raw, "venue"),
+        venue_instrument_id=_required_string(raw, "venue_instrument_id"),
         source_event_time=source_event_time,
         receipt_time=_parse_time(raw["receipt_time"], "receipt_time"),
         ingestion_order=_require_int(raw["ingestion_order"], "ingestion_order"),

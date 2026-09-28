@@ -873,6 +873,36 @@ def test_duplicated_non_aggregate_identity_is_rejected():
         )
 
 
+def test_forming_and_closed_versions_of_one_identity_are_rejected():
+    observations, _normalized = _observations(_rows(count=5))
+    closed = observations[-1]
+    assert closed.interval_forming is False
+    forming = replace(
+        closed,
+        interval_forming=True,
+        coverage=CoverageState.INCOMPLETE_COVERAGE,
+    )
+    assert forming.observation_id == closed.observation_id
+    assert forming.to_dict() != closed.to_dict()
+    # The forming twin is excluded from the sealed snapshot, but it still shares
+    # an identity with a row that is in it.
+    with pytest.raises(EvidenceIntegrityError, match="one observation identity"):
+        _replay(observations + (forming,))
+
+
+def test_non_string_identity_fields_are_rejected():
+    observations, _normalized = _observations(_rows(count=5))
+    for field, value in (
+        ("instrument_version_id", 1),
+        ("venue", 7),
+        ("venue_instrument_id", 7),
+    ):
+        payload = [dict(row) for row in capture_observation_evidence(observations)]
+        payload[0][field] = value
+        with pytest.raises(ValueError, match=f"{field} must be a non-empty string"):
+            load_observation_evidence(payload)
+
+
 def test_unexpected_evidence_keys_are_rejected():
     observations, _normalized = _observations(_rows(count=5))
     payload = [dict(row) for row in capture_observation_evidence(observations)]
