@@ -67,6 +67,7 @@ guessed bridge.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -285,10 +286,9 @@ class QualificationGateObservation:
                 number = float(value)
             except (TypeError, ValueError):
                 return None
-            return number if number == number and number not in (
-                float("inf"),
-                float("-inf"),
-            ) else None
+            if math.isnan(number) or math.isinf(number):
+                return None
+            return number
 
         return cls(
             gate=str(row.get("gate") or ""),

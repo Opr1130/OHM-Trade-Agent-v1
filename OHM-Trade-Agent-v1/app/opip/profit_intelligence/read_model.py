@@ -58,7 +58,6 @@ from app.opip.profit_intelligence.forward_outcomes import (
     ForwardOutcomeRecord,
 )
 from app.opip.profit_intelligence.lineage import (
-    LINEAGE_PROJECTION_VERSION,
     LINEAGE_SCOPE,
     TradeLineage,
     build_trade_lineage,

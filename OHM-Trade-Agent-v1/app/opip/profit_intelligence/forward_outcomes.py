@@ -45,6 +45,7 @@ Hard boundary, enforced structurally and by validation:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -156,7 +157,7 @@ def _finite(value: Any) -> float | None:
         number = float(value)
     except (TypeError, ValueError):
         return None
-    if number != number or number in (float("inf"), float("-inf")):
+    if math.isnan(number) or math.isinf(number):
         return None
     return number
 
