@@ -497,6 +497,7 @@ def _assert_replay_identity(
     *,
     instrument_version: InstrumentVersion,
     state: RollingState | None = None,
+    interval_seconds: int = DEFAULT_INTERVAL_SECONDS,
 ) -> None:
     """Same identity semantics the live feature-bus cycle enforces.
 
@@ -504,14 +505,17 @@ def _assert_replay_identity(
     replay cannot accept evidence for a different instrument than the one the
     snapshot will be labelled with, nor retained state whose identity, feature
     version, or interval disagrees with the cycle being replayed.
+
+    ``interval_seconds`` is the interval the cycle is replayed at, passed in by
+    the caller. It must not be read back off ``state``: that would compare the
+    retained state against itself and let a checkpoint taken at a different
+    cadence through, which production refuses.
     """
     _assert_cycle_identity(
         observations,
         instrument_version=instrument_version,
         state=state,
-        interval_seconds=(
-            DEFAULT_INTERVAL_SECONDS if state is None else int(state.interval_seconds)
-        ),
+        interval_seconds=interval_seconds,
     )
 
 
@@ -764,7 +768,10 @@ def replay_cycle(
     loaded_coverage_only = load_observation_evidence(evidence.coverage_only)
     captured = (*loaded_evidence, *loaded_coverage_only)
     _assert_replay_identity(
-        captured, instrument_version=instrument_version, state=prior
+        captured,
+        instrument_version=instrument_version,
+        state=prior,
+        interval_seconds=interval_seconds,
     )
     _assert_replay_visibility(
         captured, evaluated_at_utc=evaluated_at_utc, source_version=source_version

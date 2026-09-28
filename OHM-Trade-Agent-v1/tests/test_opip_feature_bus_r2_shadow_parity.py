@@ -963,6 +963,35 @@ def test_retained_state_identity_and_version_mismatch_fails_closed():
         )
 
 
+def test_retained_state_at_a_different_cadence_is_refused():
+    """The interval check must use the cycle's cadence, not the state's own."""
+    observations, _normalized = _observations(_rows(count=5))
+    retained = advance_state(initial_state(_instrument()), observations).state
+    assert retained.interval_seconds == 60
+    evidence = capture_replay_evidence(observations, prior_state=retained)
+    with pytest.raises(CycleIdentityMismatch, match="interval_seconds"):
+        replay_cycle(
+            evidence,
+            instrument_version=_instrument(),
+            evaluation_cutoff=CUTOFF,
+            evaluated_at_utc=NOW,
+            consumed_input_watermark=_watermark(observations),
+            source_version=SOURCE,
+            interval_seconds=300,
+        )
+    # The state's own cadence is still accepted.
+    result = replay_cycle(
+        evidence,
+        instrument_version=_instrument(),
+        evaluation_cutoff=CUTOFF,
+        evaluated_at_utc=NOW,
+        consumed_input_watermark=_watermark(observations),
+        source_version=SOURCE,
+        interval_seconds=60,
+    )
+    assert result.state.interval_seconds == 60
+
+
 def test_watermark_may_not_precede_the_resumed_state():
     observations, _normalized = _observations(_rows(count=FEATURE_WINDOW_INTERVALS))
     retained = advance_state(initial_state(_instrument()), observations).state
