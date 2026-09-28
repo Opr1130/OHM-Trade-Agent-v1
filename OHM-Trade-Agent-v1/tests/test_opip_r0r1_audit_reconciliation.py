@@ -48,9 +48,12 @@ def _section(text: str, heading: str, next_heading: str) -> str:
 
 @pytest.mark.acceptance
 def test_active_increment_authorizes_only_reconciliation_docs():
-    """ATDD-R0R1-audit-reconciliation/AC-001: the pointer and only this contract authorize files."""
+    """ATDD-R0R1-audit-reconciliation/AC-001: only this contract authorizes files, and only docs."""
     pointer = _read(ATDD / "ACTIVE_INCREMENT").strip()
-    assert pointer == INCREMENT
+    # The active pointer must always name an existing scope contract. It is expected
+    # to move to the next increment later, so this test does not pin its value; the
+    # scope checker itself enforces that the active pointer matches the checked increment.
+    assert (ATDD / "scope-contracts" / f"{pointer}.md").is_file(), pointer
 
     contract = parse_scope_contract(_read(CONTRACT_PATH))
     assert contract.increment == INCREMENT

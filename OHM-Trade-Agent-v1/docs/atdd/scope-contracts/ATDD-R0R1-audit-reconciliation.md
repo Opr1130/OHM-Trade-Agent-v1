@@ -17,9 +17,9 @@ AC-001:
 GIVEN:
 the approved reconciliation scope contract and the active increment pointer
 WHEN:
-the pointer is read and a file outside this contract's implementation map is changed
+the pointer is read and this contract is parsed
 THEN:
-the pointer names ATDD-R0R1-audit-reconciliation, this contract is the single authorizer for the increment, and any unmapped changed path fails the scope check closed
+the pointer names an existing scope contract, this contract is the single authorizer for the increment, its implementation map authorizes only governance documentation and acceptance tests, and any changed path outside that map fails the scope check closed
 
 AC-002:
 GIVEN:
