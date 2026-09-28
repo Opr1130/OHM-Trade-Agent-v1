@@ -381,6 +381,7 @@ def capture_replay_evidence(
     evidence: Sequence[Observation],
     *,
     prior_state: RollingState | FeatureStateCheckpoint | Mapping[str, Any] | None = None,
+    prior_state_created_at_utc: datetime | None = None,
     coverage_only: Sequence[Observation] = (),
     committed_write_watermarks: Sequence[ConsumedInputWatermark] = (),
     window_start: datetime | None = None,
@@ -390,15 +391,24 @@ def capture_replay_evidence(
 
     The origin is derived from ``prior_state`` rather than declared, so a
     capture cannot claim a cold start while holding retained history.
-    ``committed_write_watermarks`` are the canonical positions the cycle's own
-    writes returned; without them the sealed watermark could not be derived and
-    replay would have to trust it.
+    ``prior_state_created_at_utc`` is required for an in-memory state and records
+    when it was observed; without it replay cannot bound when the retained
+    values arrived. ``committed_write_watermarks`` are the canonical positions
+    the cycle's own writes returned.
     """
     captured_state: Mapping[str, Any] | None = None
     resumed_from_checkpoint = False
     if isinstance(prior_state, RollingState):
         # Only an in-memory state can be either; its own flag decides.
-        captured_state = to_checkpoint(prior_state).to_dict()
+        if prior_state_created_at_utc is None:
+            raise ValueError(
+                "capturing an in-memory RollingState requires "
+                "prior_state_created_at_utc; retained state without an "
+                "observation clock cannot be bounded by replay"
+            )
+        captured_state = _checkpoint_evidence(
+            to_checkpoint(prior_state, created_at_utc=prior_state_created_at_utc).to_dict()
+        )
         resumed_from_checkpoint = bool(prior_state.resumed_from_checkpoint)
     elif isinstance(prior_state, FeatureStateCheckpoint):
         captured_state = _checkpoint_evidence(prior_state.to_dict())
@@ -461,8 +471,64 @@ def _checkpoint_evidence(payload: Mapping[str, Any]) -> Mapping[str, Any]:
             f"{schema} is not the supported {FEATURE_BUS_SCHEMA_VERSION}"
         )
     _rolling_state_evidence(payload)
+    _assert_retained_ohlcv(payload)
     _assert_reconstruction_dependencies(payload)
+    if payload["created_at_utc"] is None:
+        raise ValueError(
+            "replay refused: captured retained state must declare created_at_utc; "
+            "without an observation clock replay cannot bound when its values arrived"
+        )
+    _parse_time(payload["created_at_utc"], "created_at_utc")
     return dict(payload)
+
+
+def _assert_retained_ohlcv(payload: Mapping[str, Any]) -> None:
+    """Retained slots must satisfy the same source rules as ingested rows.
+
+    ``from_checkpoint`` accepts any numeric series, so a retained negative
+    close or a high below its candle body would be sealed into features that the
+    source normalization path would have rejected. Each slot is validated with
+    ``observations._validate_row`` for the invariants that do not depend on the
+    open, and with the retained open when it is known.
+
+    Stored ``content_fingerprints`` are deliberately not recomputed: retained
+    state does not carry ``vwap`` or ``trade_count``, which are part of the
+    fingerprint input, so a mismatch there would not distinguish corruption from
+    a source that simply reported them.
+    """
+    rolling = payload["rolling_state"]
+    opens = list(rolling.get("opens") or ())
+    opens_known = list(rolling.get("opens_known") or ())
+    highs = list(rolling.get("highs") or ())
+    lows = list(rolling.get("lows") or ())
+    closes = list(rolling.get("closes") or ())
+    volumes = list(rolling.get("volumes") or ())
+    first_epoch = rolling.get("first_interval_epoch")
+    interval_seconds = rolling.get("interval_seconds")
+    if not closes:
+        return
+    if first_epoch is None or not isinstance(interval_seconds, int):
+        raise ValueError(
+            "captured retained state needs first_interval_epoch and interval_seconds "
+            "before its series can be validated"
+        )
+    for index, close in enumerate(closes):
+        known_open = bool(opens_known[index]) if index < len(opens_known) else False
+        open_value = opens[index] if known_open and index < len(opens) else close
+        row = IntervalRow(
+            interval_start_epoch=int(first_epoch) + int(interval_seconds) * index,
+            open=open_value,
+            high=highs[index],
+            low=lows[index],
+            close=close,
+            volume=volumes[index],
+        )
+        reason = _validate_row(row, interval_seconds=int(interval_seconds))
+        if reason is not None:
+            raise ValueError(
+                "replay refused: retained slot "
+                f"{index} rejected by source rules: {reason}"
+            )
 
 
 def _assert_reconstruction_dependencies(payload: Mapping[str, Any]) -> None:
@@ -638,17 +704,21 @@ def _assert_retained_state_availability(
 ) -> None:
     """Retained evidence must have existed at the replay instant.
 
-    Two retained clocks say when the state's own evidence arrived. The
-    checkpoint's ``created_at_utc`` says when the state was written, and
-    ``last_receipt_epoch`` says when its newest folded interval was received.
-    Neither was checked, so a state holding a bar received after
-    ``evaluated_at_utc`` was accepted — and ``alignment_from_state`` then
-    replaces receipts with the interval close, hiding it and letting the
-    snapshot incorporate values that were not available while claiming earlier
-    visibility.
+    The checkpoint's ``created_at_utc`` is the sound bound: a state written at
+    that instant contains only facts already received. ``last_receipt_epoch`` is
+    checked too, but it is the receipt of the last interval folded in
+    *source-time* order, not the maximum receipt across the window, so it is a
+    necessary condition rather than a sufficient one — the creation clock is
+    what actually closes the gap. ``alignment_from_state`` replaces receipts with
+    the interval close, which is why this cannot be checked after alignment.
     """
     created = checkpoint.created_at_utc
-    if created is not None and created > evaluated_at_utc:
+    if created is None:
+        raise EvidenceIntegrityError(
+            "replay refused: captured retained state has no creation clock, so "
+            "the availability of its values cannot be bounded"
+        )
+    if created > evaluated_at_utc:
         raise TemporalIntegrityError(
             "captured retained state was created at "
             f"{iso_z(created, field_name='created_at_utc')}, after "

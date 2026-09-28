@@ -160,13 +160,13 @@ def _replay(
     source_incomplete: bool = False,
     prior_state=None,
     coverage_only=(),
-    committed_writes=(),
+    committed_write_watermarks=(),
 ):
-    evidence = capture_replay_evidence(
+    evidence = _capture(
         observations,
         prior_state=prior_state,
         coverage_only=coverage_only,
-        committed_write_watermarks=committed_writes,
+        committed_write_watermarks=committed_write_watermarks,
         window_start=window_start,
         source_incomplete=source_incomplete,
     )
@@ -183,6 +183,15 @@ def _replay(
         source_version=SOURCE,
         declared_feature_version=version,
     )
+
+
+def _capture(observations, *, prior_state=None, created_at: datetime | None = None, **kwargs):
+    """Capture with the observation clock replay now requires for retained state."""
+    if isinstance(prior_state, RollingState):
+        kwargs["prior_state_created_at_utc"] = (
+            created_at if created_at is not None else NOW
+        )
+    return capture_replay_evidence(observations, prior_state=prior_state, **kwargs)
 
 
 def _replay_evidence_result(evidence, **kwargs):
@@ -226,7 +235,7 @@ def _replay_result(
     *,
     prior_state=None,
     coverage_only=(),
-    committed_writes=(),
+    committed_write_watermarks=(),
     cutoff: datetime = CUTOFF,
     evaluated_at: datetime | None = None,
     instrument: InstrumentVersion | None = None,
@@ -238,11 +247,11 @@ def _replay_result(
     what the replay contract now requires: the sealed position must equal the
     position the captured evidence supports.
     """
-    evidence = capture_replay_evidence(
+    evidence = _capture(
         observations,
         prior_state=prior_state,
         coverage_only=coverage_only,
-        committed_write_watermarks=committed_writes,
+        committed_write_watermarks=committed_write_watermarks,
     )
     return _replay_evidence_result(
         evidence,
@@ -614,7 +623,7 @@ def test_parity_uses_snapshot_values_when_the_last_bar_precedes_cutoff():
     assert report.counts()["IMPLEMENTATION_DEFECT"] == 0
     assert report.snapshot_id == snapshot.snapshot_id
     assert report.source_evidence_identity == source_evidence_identity(
-        capture_replay_evidence(observations), evaluation_cutoff=CUTOFF
+        _capture(observations), evaluation_cutoff=CUTOFF
     )
     assert report.feature_version == snapshot.feature_version
     indicator_rows = {
@@ -654,7 +663,7 @@ def test_declared_canonical_write_position_is_allowed():
     observations, _normalized = _observations(_rows(count=5))
     written = ConsumedInputWatermark(history_epoch=1, local_sequence=99999)
     snapshot, _report = _replay(
-        observations, watermark=written, committed_writes=(written,)
+        observations, watermark=written, committed_write_watermarks=(written,)
     )
     assert snapshot.consumed_input_watermark == written
 
@@ -668,7 +677,7 @@ def test_watermark_earlier_than_captured_evidence_is_rejected():
 
 def test_mixed_commit_order_evidence_cannot_prove_its_watermark():
     observations, _normalized = _observations(_rows(count=5))
-    payload = capture_replay_evidence(observations).to_dict()
+    payload = _capture(observations).to_dict()
     payload["evidence"][0] = dict(payload["evidence"][0])
     payload["evidence"][0]["history_epoch"] = None
     payload["evidence"][0]["local_sequence"] = None
@@ -702,7 +711,7 @@ def test_uncommitted_forming_bar_does_not_break_the_watermark():
     closed = tuple(item for item in observations if not item.interval_forming)
     assert len(forming) == 1
     assert max(item.commit_order for item in closed) < forming[0].commit_order
-    payload = capture_replay_evidence(observations).to_dict()
+    payload = _capture(observations).to_dict()
     for index, row in enumerate(payload["evidence"]):
         if row["observation_id"] == forming[0].observation_id:
             row = dict(row)
@@ -726,7 +735,7 @@ def test_uncommitted_forming_bar_does_not_break_the_watermark():
 
 def test_fully_uncommitted_evidence_carries_no_watermark_claim():
     observations, _normalized = _observations(_rows(count=5))
-    payload = capture_replay_evidence(observations).to_dict()
+    payload = _capture(observations).to_dict()
     for index, row in enumerate(payload["evidence"]):
         row = dict(row)
         row["history_epoch"] = None
@@ -945,12 +954,12 @@ def test_coverage_only_rows_are_not_treated_as_feature_evidence():
 def test_resumed_cycle_without_retained_state_fails_closed():
     observations, _normalized = _observations(_rows(count=5))
     # A hand-written envelope cannot claim a resume and omit the retained state.
-    payload = capture_replay_evidence(observations).to_dict()
+    payload = _capture(observations).to_dict()
     payload["cycle_origin"] = CYCLE_ORIGIN_RESUMED
     with pytest.raises(ValueError, match="requires prior retained state"):
         load_replay_evidence(payload)
     # Nor can it omit the field entirely.
-    payload = capture_replay_evidence(observations).to_dict()
+    payload = _capture(observations).to_dict()
     del payload["prior_state"]
     with pytest.raises(ValueError, match="missing required keys"):
         load_replay_evidence(payload)
@@ -959,17 +968,17 @@ def test_resumed_cycle_without_retained_state_fails_closed():
 def test_cold_start_cannot_declare_retained_state_or_coverage_only():
     observations, _normalized = _observations(_rows(count=5))
     retained = advance_state(initial_state(_instrument()), observations).state
-    payload = capture_replay_evidence(observations, prior_state=retained).to_dict()
+    payload = _capture(observations, prior_state=retained).to_dict()
     payload["cycle_origin"] = CYCLE_ORIGIN_COLD_START
     with pytest.raises(ValueError, match="cold start but carries prior"):
         load_replay_evidence(payload)
-    payload = capture_replay_evidence(observations).to_dict()
+    payload = _capture(observations).to_dict()
     payload["coverage_only"] = [dict(item) for item in payload["evidence"]]
     with pytest.raises(ValueError, match="cold start with coverage-only"):
         load_replay_evidence(payload)
     with pytest.raises(ValueError, match="not one of"):
         load_replay_evidence(
-            {**capture_replay_evidence(observations).to_dict(), "cycle_origin": "mid"}
+            {**_capture(observations).to_dict(), "cycle_origin": "mid"}
         )
 
 
@@ -979,7 +988,7 @@ def test_retained_state_identity_and_version_mismatch_fails_closed():
     other = advance_state(initial_state(_instrument(version=2)), observations).state
     with pytest.raises(CycleIdentityMismatch, match="instrument_version_id"):
         _replay(observations, prior_state=other)
-    payload = capture_replay_evidence(observations, prior_state=retained).to_dict()
+    payload = _capture(observations, prior_state=retained).to_dict()
     payload["prior_state"] = dict(payload["prior_state"])
     payload["prior_state"]["checkpoint"] = dict(payload["prior_state"]["checkpoint"])
     payload["prior_state"]["checkpoint"]["feature_version"] = "features-v0"
@@ -988,13 +997,15 @@ def test_retained_state_identity_and_version_mismatch_fails_closed():
     with pytest.raises(EvidenceIntegrityError, match="checkpoint_id"):
         _replay(observations, prior_state=load_replay_evidence(payload).prior_state)
     # A consistently stamped older engine version is refused by the identity rule.
-    older = to_checkpoint(replace(retained, feature_version="features-v0"))
+    older = to_checkpoint(
+        replace(retained, feature_version="features-v0"), created_at_utc=NOW
+    )
     with pytest.raises(CycleIdentityMismatch, match="feature_version"):
-        _replay(observations, prior_state=capture_replay_evidence(
+        _replay(observations, prior_state=_capture(
             observations, prior_state=older
         ).prior_state)
     # Corrupt retained state is refused by the canonical loader, not repaired.
-    payload = capture_replay_evidence(observations, prior_state=retained).to_dict()
+    payload = _capture(observations, prior_state=retained).to_dict()
     payload["prior_state"] = dict(payload["prior_state"])
     payload["prior_state"]["checkpoint"] = dict(payload["prior_state"]["checkpoint"])
     payload["prior_state"]["checkpoint"]["consumed_input_watermark"] = {
@@ -1017,7 +1028,7 @@ def test_checkpoint_created_after_the_replay_instant_is_refused():
         created_at_utc=late,
     )
     assert checkpoint.created_at_utc == late
-    captured = capture_replay_evidence((), prior_state=checkpoint)
+    captured = _capture((), prior_state=checkpoint)
     assert captured.prior_state_resumed_from_checkpoint is True
     with pytest.raises(TemporalIntegrityError, match="not available at the replay"):
         _replay_evidence_result(captured)
@@ -1029,7 +1040,7 @@ def test_checkpoint_created_after_the_replay_instant_is_refused():
     in_time = to_checkpoint(base, created_at_utc=NOW)
     assert (
         _replay_evidence_result(
-            capture_replay_evidence((), prior_state=in_time)
+            _capture((), prior_state=in_time)
         ).state.interval_count
         == base.interval_count
     )
@@ -1043,7 +1054,7 @@ def test_unsupported_nested_rolling_state_is_refused():
         (lambda rs: rs.pop("ema_fast"), "missing keys"),
         (lambda rs: rs.update({"venue": 7}), None),
     ):
-        payload = capture_replay_evidence(observations, prior_state=retained).to_dict()
+        payload = _capture(observations, prior_state=retained).to_dict()
         payload["prior_state"] = dict(payload["prior_state"])
         payload["prior_state"]["checkpoint"] = dict(payload["prior_state"]["checkpoint"])
         rolling = dict(payload["prior_state"]["checkpoint"]["rolling_state"])
@@ -1058,11 +1069,11 @@ def test_unsupported_nested_rolling_state_is_refused():
             load_replay_evidence(payload)
 
 
-def test_cold_start_capture_with_committed_writes_round_trips():
+def test_cold_start_capture_with_committed_write_watermarks_round_trips():
     """A first cycle publishes its own observations, so it has writes too."""
     observations, _normalized = _observations(_rows(count=5))
     written = ConsumedInputWatermark(history_epoch=1, local_sequence=99999)
-    captured = capture_replay_evidence(
+    captured = _capture(
         observations, committed_write_watermarks=(written,)
     )
     assert captured.cycle_origin == CYCLE_ORIGIN_COLD_START
@@ -1075,6 +1086,39 @@ def test_cold_start_capture_with_committed_writes_round_trips():
     # And the position genuinely has to be declared.
     with pytest.raises(WatermarkIntegrityError, match="is not the position"):
         _replay(observations, watermark=written)
+
+
+def test_domain_invalid_retained_slots_are_refused():
+    """Retained values must satisfy the source rules, not just be numeric."""
+    observations, _normalized = _observations(_rows(count=5))
+    retained = advance_state(initial_state(_instrument()), observations).state
+    for field, mutate, reason in (
+        ("closes", lambda rolling: rolling["closes"].__setitem__(-1, -1.0), "non_positive_price"),
+        ("volumes", lambda rolling: rolling["volumes"].__setitem__(-1, -5.0), "negative_volume"),
+        (
+            "highs",
+            # Between the low and the close: legal against the low, below the body.
+            lambda rolling: rolling["highs"].__setitem__(
+                -1, rolling["closes"][-1] * 0.999
+            ),
+            "high_below_body",
+        ),
+    ):
+        payload = _capture(observations, prior_state=retained).to_dict()
+        payload["prior_state"] = dict(payload["prior_state"])
+        payload["prior_state"]["checkpoint"] = dict(payload["prior_state"]["checkpoint"])
+        rolling = {
+            key: list(value) if isinstance(value, (list, tuple)) else value
+            for key, value in payload["prior_state"]["checkpoint"]["rolling_state"].items()
+        }
+        mutate(rolling)
+        payload["prior_state"]["checkpoint"]["rolling_state"] = rolling
+        with pytest.raises(ValueError, match=reason):
+            load_replay_evidence(payload)
+    # An intact retained series still round-trips.
+    assert load_replay_evidence(
+        _capture(observations, prior_state=retained).to_dict()
+    ).prior_state is not None
 
 
 def test_retained_state_received_after_the_replay_instant_is_refused():
@@ -1113,7 +1157,7 @@ def test_unsupported_reconstruction_dependency_is_refused():
         ["fixed_interval_aggregate:60s"],
         [],
     ):
-        payload = capture_replay_evidence(observations, prior_state=retained).to_dict()
+        payload = _capture(observations, prior_state=retained).to_dict()
         payload["prior_state"] = dict(payload["prior_state"])
         payload["prior_state"]["checkpoint"] = dict(payload["prior_state"]["checkpoint"])
         payload["prior_state"]["checkpoint"]["reconstruction_dependencies"] = declared
@@ -1121,7 +1165,7 @@ def test_unsupported_reconstruction_dependency_is_refused():
             load_replay_evidence(payload)
     # The declared set round-trips untouched.
     assert load_replay_evidence(
-        capture_replay_evidence(observations, prior_state=retained).to_dict()
+        _capture(observations, prior_state=retained).to_dict()
     ).prior_state is not None
 
 
@@ -1129,7 +1173,7 @@ def test_tampered_checkpoint_id_is_refused():
     """The declared canonical checkpoint identity must match its contents."""
     observations, _normalized = _observations(_rows(count=5))
     retained = advance_state(initial_state(_instrument()), observations).state
-    payload = capture_replay_evidence(observations, prior_state=retained).to_dict()
+    payload = _capture(observations, prior_state=retained).to_dict()
     payload["prior_state"] = dict(payload["prior_state"])
     payload["prior_state"]["checkpoint"] = dict(payload["prior_state"]["checkpoint"])
     payload["prior_state"]["checkpoint"]["checkpoint_id"] = "FSC:1:solusd:features-v1:1-1"
@@ -1137,7 +1181,7 @@ def test_tampered_checkpoint_id_is_refused():
         _replay_evidence_result(load_replay_evidence(payload))
     # A missing or mistyped id is refused too.
     for value in (None, 7):
-        payload = capture_replay_evidence(observations, prior_state=retained).to_dict()
+        payload = _capture(observations, prior_state=retained).to_dict()
         payload["prior_state"] = dict(payload["prior_state"])
         payload["prior_state"]["checkpoint"] = dict(payload["prior_state"]["checkpoint"])
         payload["prior_state"]["checkpoint"]["checkpoint_id"] = value
@@ -1150,7 +1194,7 @@ def test_retained_state_at_a_different_cadence_is_refused():
     observations, _normalized = _observations(_rows(count=5))
     retained = advance_state(initial_state(_instrument()), observations).state
     assert retained.interval_seconds == 60
-    evidence = capture_replay_evidence(observations, prior_state=retained)
+    evidence = _capture(observations, prior_state=retained)
     with pytest.raises(CycleIdentityMismatch, match="interval_seconds"):
         replay_cycle(
             evidence,
@@ -1214,7 +1258,7 @@ def test_warm_state_reports_warm():
 def _durable_resume_state(observations):
     """A state as the pilot would load it from canonical evidence."""
     base = advance_state(initial_state(_instrument()), observations).state
-    payload = to_checkpoint(base).to_dict()
+    payload = to_checkpoint(base, created_at_utc=NOW).to_dict()
     return from_checkpoint(checkpoint_from_payload(payload)), base
 
 
@@ -1240,7 +1284,7 @@ def test_in_process_resume_keeps_its_cold_start_provenance():
     in_process = advance_state(initial_state(_instrument()), observations).state
     assert in_process.resumed_from_checkpoint is False
     assert in_process.restart_state is RestartState.NEW_LISTING_COLD_START
-    captured = capture_replay_evidence(observations, prior_state=in_process)
+    captured = _capture(observations, prior_state=in_process)
     assert captured.prior_state_resumed_from_checkpoint is False
     result = _replay_result(observations, prior_state=in_process)
     # The checkpoint contract cannot express this, so the envelope carries it.
@@ -1259,7 +1303,7 @@ def test_in_process_resume_keeps_its_cold_start_provenance():
 def test_restart_state_survives_the_evidence_round_trip():
     observations, _normalized = _observations(_rows(count=30))
     retained = advance_state(initial_state(_instrument()), observations).state
-    captured = capture_replay_evidence(observations, prior_state=retained)
+    captured = _capture(observations, prior_state=retained)
     restored = load_replay_evidence(captured.to_dict())
     first = _replay_result(observations, prior_state=retained)
     second = _replay_evidence_result(restored)
@@ -1269,7 +1313,7 @@ def test_restart_state_survives_the_evidence_round_trip():
     # A durable resume of the same bars keeps its own provenance across the
     # envelope, because a checkpoint payload is durable by definition.
     durable, _base = _durable_resume_state(observations)
-    durable_capture = capture_replay_evidence((), prior_state=durable)
+    durable_capture = _capture((), prior_state=durable)
     assert durable_capture.prior_state_resumed_from_checkpoint is True
     durable_first = _replay_result((), prior_state=durable)
     durable_second = _replay_evidence_result(
@@ -1278,14 +1322,18 @@ def test_restart_state_survives_the_evidence_round_trip():
     assert durable_first.snapshot.to_dict() == durable_second.snapshot.to_dict()
     assert durable_second.snapshot.restart_state is RestartState.RESTART_WARMUP
     # And a validated checkpoint payload is treated as a resume too.
-    as_payload = capture_replay_evidence((), prior_state=to_checkpoint(durable).to_dict())
+    as_payload = _capture(
+        (), prior_state=to_checkpoint(durable, created_at_utc=NOW).to_dict()
+    )
     assert as_payload.prior_state_resumed_from_checkpoint is True
     assert (
         _replay_evidence_result(as_payload).snapshot.restart_state
         is RestartState.RESTART_WARMUP
     )
-    checkpoint_object = checkpoint_from_payload(to_checkpoint(durable).to_dict())
-    as_object = capture_replay_evidence((), prior_state=checkpoint_object)
+    checkpoint_object = checkpoint_from_payload(
+        to_checkpoint(durable, created_at_utc=NOW).to_dict()
+    )
+    as_object = _capture((), prior_state=checkpoint_object)
     assert as_object.prior_state_resumed_from_checkpoint is True
     assert (
         _replay_evidence_result(as_object).snapshot.restart_state
@@ -1297,7 +1345,7 @@ def test_corrupt_restart_state_evidence_fails_closed():
     observations, _normalized = _observations(_rows(count=5))
     retained = advance_state(initial_state(_instrument()), observations).state
     for value in ("NOT_A_STATE", None, 7):
-        payload = capture_replay_evidence(observations, prior_state=retained).to_dict()
+        payload = _capture(observations, prior_state=retained).to_dict()
         payload["prior_state"] = dict(payload["prior_state"])
         payload["prior_state"]["checkpoint"] = dict(payload["prior_state"]["checkpoint"])
         payload["prior_state"]["checkpoint"]["restart_state"] = value
@@ -1308,7 +1356,7 @@ def test_corrupt_restart_state_evidence_fails_closed():
             )
     # A retained state missing its restart-state evidence is refused, not
     # defaulted to WARM.
-    payload = capture_replay_evidence(observations, prior_state=retained).to_dict()
+    payload = _capture(observations, prior_state=retained).to_dict()
     payload["prior_state"] = dict(payload["prior_state"])
     payload["prior_state"]["checkpoint"] = dict(payload["prior_state"]["checkpoint"])
     del payload["prior_state"]["checkpoint"]["restart_state"]
@@ -1327,14 +1375,14 @@ def test_unsupported_retained_checkpoint_schema_is_refused():
         (lambda cp: cp.update({"future_field": "drift"}), "unexpected keys"),
         (lambda cp: cp.update({"record_type": "Other"}), "record_type"),
     ):
-        payload = capture_replay_evidence(observations, prior_state=retained).to_dict()
+        payload = _capture(observations, prior_state=retained).to_dict()
         payload["prior_state"] = dict(payload["prior_state"])
         payload["prior_state"]["checkpoint"] = dict(payload["prior_state"]["checkpoint"])
         mutate(payload["prior_state"]["checkpoint"])
         with pytest.raises(ValueError, match=message):
             load_replay_evidence(payload)
     # The supported schema still round-trips.
-    good = capture_replay_evidence(observations, prior_state=retained).to_dict()
+    good = _capture(observations, prior_state=retained).to_dict()
     assert load_replay_evidence(good).prior_state is not None
 
 
@@ -1376,20 +1424,42 @@ def test_retained_state_past_the_cutoff_is_refused():
 def test_retained_state_must_be_grid_aligned_and_bounded():
     observations, _normalized = _observations(_rows(count=5))
     retained = advance_state(initial_state(_instrument()), observations).state
-    payload = capture_replay_evidence(observations, prior_state=retained).to_dict()
+    payload = _capture(observations, prior_state=retained).to_dict()
     payload["prior_state"] = dict(payload["prior_state"])
     payload["prior_state"]["checkpoint"] = dict(payload["prior_state"]["checkpoint"])
     rolling = dict(payload["prior_state"]["checkpoint"]["rolling_state"])
     rolling["first_interval_epoch"] = int(rolling["first_interval_epoch"]) + 30
     payload["prior_state"]["checkpoint"]["rolling_state"] = rolling
-    restored = load_replay_evidence(payload)
-    with pytest.raises(EvidenceIntegrityError, match="grid aligned"):
-        _replay_result((), prior_state=restored.prior_state)
+    # A misaligned retained horizon is refused by slot validation.
+    with pytest.raises(ValueError, match="grid_aligned"):
+        load_replay_evidence(payload)
+    # And by the population check, for a retention window that is aligned but
+    # unreachable for the declared interval.
+    skewed = dict(rolling)
+    skewed["interval_seconds"] = 45
+    payload["prior_state"]["checkpoint"]["rolling_state"] = skewed
+    with pytest.raises((ValueError, CycleIdentityMismatch)):
+        _replay_evidence_result(load_replay_evidence(payload))
+
+
+def test_retained_state_needs_an_observation_clock():
+    observations, _normalized = _observations(_rows(count=5))
+    retained = advance_state(initial_state(_instrument()), observations).state
+    # An in-memory state cannot be captured without the instant it was observed.
+    with pytest.raises(ValueError, match="prior_state_created_at_utc"):
+        capture_replay_evidence(observations, prior_state=retained)
+    # And a checkpoint payload without a creation clock is refused.
+    payload = _capture(observations, prior_state=retained).to_dict()
+    payload["prior_state"] = dict(payload["prior_state"])
+    payload["prior_state"]["checkpoint"] = dict(payload["prior_state"]["checkpoint"])
+    payload["prior_state"]["checkpoint"]["created_at_utc"] = None
+    with pytest.raises(ValueError, match="created_at_utc"):
+        load_replay_evidence(payload)
 
 
 def test_replayed_snapshot_is_deterministic_for_a_resumed_cycle():
     _all, retained, tip = _resumed_case()
-    evidence = capture_replay_evidence(tip, prior_state=retained)
+    evidence = _capture(tip, prior_state=retained)
     first, first_report = _replay(tip, prior_state=retained)
     second, second_report = _replay(tip, prior_state=retained)
     assert first.to_dict() == second.to_dict()
@@ -1410,8 +1480,8 @@ def test_replayed_snapshot_is_deterministic_for_a_resumed_cycle():
 def test_retained_state_changes_the_evidence_identity():
     observations, _normalized = _observations(_rows(count=5))
     retained = advance_state(initial_state(_instrument()), observations).state
-    cold = capture_replay_evidence(observations)
-    resumed = capture_replay_evidence(observations, prior_state=retained)
+    cold = _capture(observations)
+    resumed = _capture(observations, prior_state=retained)
     assert cold.cycle_origin == CYCLE_ORIGIN_COLD_START
     assert resumed.cycle_origin == CYCLE_ORIGIN_RESUMED
     assert source_evidence_identity(
@@ -1431,7 +1501,7 @@ def test_committed_misaligned_row_above_the_watermark_is_refused():
         _replay(
             observations + (misaligned,),
             watermark=below,
-            committed_writes=(position,),
+            committed_write_watermarks=(position,),
         )
 
 
@@ -1445,7 +1515,7 @@ def test_misaligned_row_equal_to_the_watermark_is_accepted():
     snapshot, _report = _replay(
         observations + (misaligned,),
         watermark=highest,
-        committed_writes=(highest,),
+        committed_write_watermarks=(highest,),
     )
     assert snapshot.consumed_input_watermark == highest
     assert snapshot.coverage is CoverageState.INCOMPLETE_COVERAGE
@@ -1461,7 +1531,7 @@ def test_misaligned_row_below_a_later_declared_write_is_accepted():
     snapshot, _report = _replay(
         observations + (misaligned,),
         watermark=later,
-        committed_writes=(later,),
+        committed_write_watermarks=(later,),
     )
     assert snapshot.consumed_input_watermark == later
 
@@ -1566,7 +1636,7 @@ def test_window_start_is_replayed_and_bound_into_the_identity():
     rows = _rows(count=5)
     observations, _normalized = _observations(rows)
     window_start = CUTOFF - timedelta(minutes=30)
-    with_window = capture_replay_evidence(observations, window_start=window_start)
+    with_window = _capture(observations, window_start=window_start)
     assert with_window.window_start == window_start
     assert load_replay_evidence(with_window.to_dict()) == with_window
     left, left_report = _replay(observations)
@@ -1598,7 +1668,7 @@ def test_source_incomplete_is_replayed_and_bound_into_the_identity():
 
 def test_captured_evidence_envelope_is_strictly_validated():
     observations, _normalized = _observations(_rows(count=5))
-    good = capture_replay_evidence(observations).to_dict()
+    good = _capture(observations).to_dict()
     assert good["record_type"] == REPLAY_EVIDENCE_RECORD_TYPE
     assert good["schema_version"] == REPLAY_EVIDENCE_SCHEMA_VERSION
     assert good["cycle_origin"] == CYCLE_ORIGIN_COLD_START
@@ -1630,7 +1700,7 @@ def test_captured_evidence_envelope_is_strictly_validated():
             "prior_state missing required keys",
         ),
     ):
-        payload = capture_replay_evidence(observations).to_dict()
+        payload = _capture(observations).to_dict()
         mutate(payload)
         with pytest.raises(ValueError, match=message):
             load_replay_evidence(payload)
@@ -1836,5 +1906,7 @@ def test_identity_bearing_mutation_with_stale_observation_id_is_rejected():
     assert payload[1]["observation_id"] == original_id
     with pytest.raises(ValueError, match="does not match"):
         load_observation_evidence(payload)
+
+
 
 
