@@ -304,11 +304,11 @@ def test_duplicate_input_does_not_double_count():
     assert any(item.reason == "duplicate_interval" for item in normalized.rejected)
 
     observations, _normalized = _observations(rows)
-    extra = replace(observations[-1], ingestion_order=observations[-1].ingestion_order + 50)
-    once, _report = _replay(observations)
-    twice, _report = _replay(observations + (extra,))
+    once, once_report = _replay(observations)
+    twice, twice_report = _replay(observations + (observations[-1],))
     assert twice.snapshot_id == once.snapshot_id
     assert twice.values == once.values
+    assert twice_report.counts() == once_report.counts()
 
 
 def test_boundary_numeric_values_match_exactly():
@@ -835,14 +835,38 @@ def test_unclosed_row_above_the_watermark_cannot_change_the_snapshot():
 # --------------------------------------------------------------------------- #
 
 
-def test_ambiguous_duplicate_revision_rank_is_rejected():
-    observations, _normalized = _observations(_rows(count=5))
+def test_same_identity_with_a_divergent_payload_is_rejected():
+    observations, _normalized = _observations(_rows(count=7))
     original = observations[-1]
-    # Same interval, revision, ingestion order and OHLCV, different coverage.
-    ambiguous = replace(original, coverage=CoverageState.INCOMPLETE_COVERAGE)
-    assert ambiguous.observation_id == original.observation_id
-    with pytest.raises(EvidenceIntegrityError, match="ambiguous rows"):
-        _replay(observations + (ambiguous,))
+    # Same identity, same values, different coverage: canonical history holds
+    # one payload per identity, so this cannot be resolved by arrival order.
+    divergent = replace(
+        original,
+        coverage=CoverageState.INCOMPLETE_COVERAGE,
+        ingestion_order=original.ingestion_order + 10,
+    )
+    assert divergent.observation_id == original.observation_id
+    with pytest.raises(EvidenceIntegrityError, match="one observation identity"):
+        _replay(observations + (divergent,))
+
+
+def test_identical_duplicate_row_is_not_a_conflict():
+    observations, _normalized = _observations(_rows(count=5))
+    once, once_report = _replay(observations)
+    twice, twice_report = _replay(observations + (observations[-1],))
+    assert twice.values == once.values
+    assert twice.content_hash() == once.content_hash()
+    assert twice_report.counts() == once_report.counts()
+
+
+def test_non_string_provenance_is_rejected():
+    observations, _normalized = _observations(_rows(count=5))
+    for key, value in ((1, "x"), ("source", 7)):
+        payload = [dict(row) for row in capture_observation_evidence(observations)]
+        payload[0]["provenance"] = dict(payload[0]["provenance"])
+        payload[0]["provenance"][key] = value
+        with pytest.raises(ValueError, match="provenance keys and values"):
+            load_observation_evidence(payload)
 
 
 def test_non_boolean_interval_forming_is_rejected():
@@ -927,15 +951,6 @@ def test_conflicting_content_for_one_interval_revision_is_rejected():
     assert conflicting.observation_id == original.observation_id
     with pytest.raises(EvidenceIntegrityError, match="conflicting content"):
         _replay(observations + (conflicting,))
-
-
-def test_identical_duplicate_content_is_not_a_conflict():
-    observations, _normalized = _observations(_rows(count=5))
-    original = observations[-1]
-    duplicate = replace(original, ingestion_order=original.ingestion_order + 1)
-    once, _report = _replay(observations)
-    twice, _report = _replay(observations + (duplicate,))
-    assert twice.values == once.values
 
 
 def test_input_not_visible_at_the_replay_instant_is_rejected():

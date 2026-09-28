@@ -418,48 +418,44 @@ def _assert_visibility_covers_inputs(
 
 
 def _require_consistent_content(eligible: Sequence[Observation]) -> None:
-    """One interval revision of one cadence must not carry two stories.
+    """One observation identity must not carry two different stories.
 
-    Canonical reconstruction refuses conflicting content fingerprints for the
-    same interval and revision. Replay refuses the same evidence instead of
-    silently selecting a winner by ingestion order, and additionally refuses
-    two rows that tie on revision rank but differ in any other persisted field,
-    because alignment would then keep whichever arrived first.
+    ``observation_idempotency_key`` keys a market observation by its identity
+    alone, and ``_idempotency_payload_json`` strips no field for
+    ``MARKET_OBSERVATION_RECORDED``, so the canonical writer holds exactly one
+    payload per identity and treats any divergence as integrity corruption.
+    Replay must refuse the same evidence instead of letting alignment pick a
+    winner by process-local ingestion order.
 
-    Both keys include the aggregate cadence. A one-minute bar and a five-minute
-    bar sharing an epoch are different facts, not two revisions of one
-    interval, and alignment never lets them compete because it tests cadence
-    before it ranks revisions.
+    The identity already encodes instrument, cadence, interval and revision, so
+    keys are scoped by cadence without a second rule: a one-minute bar and a
+    five-minute bar sharing an epoch are different facts, and alignment never
+    lets them compete because it tests cadence before it ranks revisions.
     """
-    fingerprints: dict[tuple[int, int, int | None], str] = {}
-    ranks: dict[tuple[int, int, int | None, int], bytes] = {}
+    fingerprints: dict[str, str] = {}
+    payloads: dict[str, bytes] = {}
     for item in eligible:
         if item.payload_kind is not PayloadKind.FIXED_INTERVAL_AGGREGATE:
             continue
-        epoch = int(item.source_event_time.timestamp())
-        revision = int(item.revision)
-        cadence = item.aggregate_interval_seconds
-        key = (epoch, revision, cadence)
+        identity = item.observation_id
         fingerprint = aggregate_content_fingerprint(dict(item.values))
-        prior_fingerprint = fingerprints.get(key)
+        prior_fingerprint = fingerprints.get(identity)
         if prior_fingerprint is not None and prior_fingerprint != fingerprint:
             raise EvidenceIntegrityError(
-                "replay evidence has conflicting content for interval epoch "
-                f"{epoch} revision {revision} cadence {cadence}; refusing to "
-                "hide incompatible canonical evidence"
+                "replay evidence has conflicting content for observation "
+                f"identity {identity!r}; refusing to hide incompatible "
+                "canonical evidence"
             )
-        fingerprints[key] = fingerprint
-        rank = (epoch, revision, cadence, int(item.ingestion_order))
+        fingerprints[identity] = fingerprint
         payload = canonical_json_bytes(item.to_dict())
-        prior_payload = ranks.get(rank)
+        prior_payload = payloads.get(identity)
         if prior_payload is not None and prior_payload != payload:
             raise EvidenceIntegrityError(
-                "replay evidence has ambiguous rows for interval epoch "
-                f"{epoch} revision {revision} ingestion order "
-                f"{item.ingestion_order}; the winner is not determined by "
-                "identity"
+                "replay evidence has conflicting payloads under one observation "
+                f"identity {identity!r}; canonical history holds one payload per "
+                "identity, so the winner is not determined by identity"
             )
-        ranks[rank] = payload
+        payloads[identity] = payload
 
 
 def _assert_replay_visibility(
@@ -918,10 +914,24 @@ def _commit_order_from_evidence(
 
 
 def _provenance_from_evidence(raw: Mapping[str, Any]) -> dict[str, str]:
+    """Provenance is ``Mapping[str, str]``; malformed evidence is refused.
+
+    Coercing a key or value would rewrite the record, and because an aggregate's
+    ``observation_id`` does not bind provenance, the identity check would still
+    pass and ``source_evidence_identity`` would hash something the caller never
+    supplied.
+    """
     provenance = raw["provenance"]
     if not isinstance(provenance, Mapping):
         raise ValueError("replay evidence provenance must be an object")
-    return {str(key): str(value) for key, value in provenance.items()}
+    cleaned: dict[str, str] = {}
+    for key, value in provenance.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise ValueError(
+                "replay evidence provenance keys and values must be strings"
+            )
+        cleaned[key] = value
+    return cleaned
 
 
 def _observation_from_evidence(raw: Mapping[str, Any]) -> Observation:
