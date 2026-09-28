@@ -182,6 +182,37 @@ def _replay(
     )
 
 
+def _replay_evidence_result(evidence, **kwargs):
+    """Replay a pre-built capture, preserving its retained-state provenance."""
+    watermark = kwargs.pop("watermark", None)
+    if watermark is None:
+        watermark = ConsumedInputWatermark.zero()
+        if evidence.prior_state is None:
+            prior = initial_state(_instrument())
+        else:
+            prior = _retained_state_for_tests(evidence)
+        watermark = max(watermark, prior.consumed_input_watermark)
+        for rows in (evidence.evidence, evidence.coverage_only):
+            if rows:
+                watermark = max(watermark, _watermark(load_observation_evidence(rows)))
+    return replay_cycle(
+        evidence,
+        instrument_version=kwargs.pop("instrument", None) or _instrument(),
+        evaluation_cutoff=kwargs.pop("cutoff", CUTOFF),
+        evaluated_at_utc=kwargs.pop("evaluated_at", None) or NOW,
+        consumed_input_watermark=watermark,
+        source_version=SOURCE,
+    )
+
+
+def _retained_state_for_tests(evidence):
+    from app.opip.features.r2_shadow_parity import _retained_state
+
+    return _retained_state(
+        evidence, instrument_version=_instrument(), interval_seconds=60
+    )
+
+
 def _replay_result(
     observations,
     *,
@@ -197,39 +228,17 @@ def _replay_result(
     When a prior state is supplied the watermark defaults to that state's, since
     the cycle it resumed from necessarily consumed at least that much.
     """
-    if watermark is None:
-        watermark = ConsumedInputWatermark.zero()
-        prior_mapping = None
-        if isinstance(prior_state, RollingState):
-            watermark = max(watermark, prior_state.consumed_input_watermark)
-        elif isinstance(prior_state, Mapping):
-            prior_mapping = prior_state
-        elif prior_state is not None:
-            prior_mapping = prior_state.to_dict()
-        if prior_mapping is not None:
-            raw = prior_mapping.get("consumed_input_watermark")
-            if isinstance(raw, Mapping):
-                watermark = max(
-                    watermark,
-                    ConsumedInputWatermark(
-                        history_epoch=int(raw.get("history_epoch", 0) or 0),
-                        local_sequence=int(raw.get("local_sequence", 0) or 0),
-                    ),
-                )
-        if observations:
-            watermark = max(watermark, _watermark(observations))
-        if coverage_only:
-            watermark = max(watermark, _watermark(coverage_only))
     evidence = capture_replay_evidence(
         observations, prior_state=prior_state, coverage_only=coverage_only
     )
-    return replay_cycle(
+    # Let the declared-watermark default be derived from the envelope, which
+    # already floors it at the resumed state's own position.
+    return _replay_evidence_result(
         evidence,
-        instrument_version=instrument or _instrument(),
-        evaluation_cutoff=cutoff,
-        evaluated_at_utc=evaluated_at if evaluated_at is not None else NOW,
-        consumed_input_watermark=watermark,
-        source_version=SOURCE,
+        cutoff=cutoff,
+        evaluated_at=evaluated_at,
+        instrument=instrument,
+        watermark=watermark,
     )
 
 
@@ -1072,9 +1081,7 @@ def test_in_process_resume_keeps_its_cold_start_provenance():
     assert result.snapshot.restart_state is RestartState.NEW_LISTING_COLD_START
     assert result.state.restart_state is RestartState.NEW_LISTING_COLD_START
     round_tripped = load_replay_evidence(captured.to_dict())
-    replay_again = _replay_result(
-        observations, prior_state=round_tripped.prior_state
-    )
+    replay_again = _replay_evidence_result(round_tripped)
     assert replay_again.snapshot.to_dict() == result.snapshot.to_dict()
     # A durable resume of the same bars is a different, correctly-classified state.
     durable, _base = _durable_resume_state(observations)
@@ -1088,10 +1095,35 @@ def test_restart_state_survives_the_evidence_round_trip():
     captured = capture_replay_evidence(observations, prior_state=retained)
     restored = load_replay_evidence(captured.to_dict())
     first = _replay_result(observations, prior_state=retained)
-    second = _replay_result(observations, prior_state=restored.prior_state)
+    second = _replay_evidence_result(restored)
     assert first.snapshot.to_dict() == second.snapshot.to_dict()
     assert first.snapshot.restart_state is second.snapshot.restart_state
     assert first.snapshot.content_hash() == second.snapshot.content_hash()
+    # A durable resume of the same bars keeps its own provenance across the
+    # envelope, because a checkpoint payload is durable by definition.
+    durable, _base = _durable_resume_state(observations)
+    durable_capture = capture_replay_evidence((), prior_state=durable)
+    assert durable_capture.prior_state_resumed_from_checkpoint is True
+    durable_first = _replay_result((), prior_state=durable)
+    durable_second = _replay_evidence_result(
+        load_replay_evidence(durable_capture.to_dict())
+    )
+    assert durable_first.snapshot.to_dict() == durable_second.snapshot.to_dict()
+    assert durable_second.snapshot.restart_state is RestartState.RESTART_WARMUP
+    # And a validated checkpoint payload is treated as a resume too.
+    as_payload = capture_replay_evidence((), prior_state=to_checkpoint(durable).to_dict())
+    assert as_payload.prior_state_resumed_from_checkpoint is True
+    assert (
+        _replay_evidence_result(as_payload).snapshot.restart_state
+        is RestartState.RESTART_WARMUP
+    )
+    checkpoint_object = checkpoint_from_payload(to_checkpoint(durable).to_dict())
+    as_object = capture_replay_evidence((), prior_state=checkpoint_object)
+    assert as_object.prior_state_resumed_from_checkpoint is True
+    assert (
+        _replay_evidence_result(as_object).snapshot.restart_state
+        is RestartState.RESTART_WARMUP
+    )
 
 
 def test_corrupt_restart_state_evidence_fails_closed():

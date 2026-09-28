@@ -301,6 +301,9 @@ class ReplayEvidence:
     came from durable evidence or was still in process memory. The checkpoint
     contract cannot express the latter, and ``from_checkpoint`` assumes a
     resume, so without it a short in-process cold start would be reclassified.
+    A ``FeatureStateCheckpoint`` or a validated checkpoint payload is durable by
+    definition and is always captured as a resume; only an in-memory
+    ``RollingState`` can be either.
     """
 
     cycle_origin: str
@@ -357,16 +360,21 @@ def capture_replay_evidence(
     captured_state: Mapping[str, Any] | None = None
     resumed_from_checkpoint = False
     if isinstance(prior_state, RollingState):
+        # Only an in-memory state can be either; its own flag decides.
         captured_state = to_checkpoint(prior_state).to_dict()
         resumed_from_checkpoint = bool(prior_state.resumed_from_checkpoint)
+    elif isinstance(prior_state, FeatureStateCheckpoint):
+        captured_state = _checkpoint_evidence(prior_state.to_dict())
+        resumed_from_checkpoint = True
     elif isinstance(prior_state, Mapping):
+        # A validated checkpoint payload is durable evidence by definition.
         captured_state = _checkpoint_evidence(prior_state)
-        resumed_from_checkpoint = _require_bool(
-            prior_state.get("resumed_from_checkpoint", False),
-            "prior_state.resumed_from_checkpoint",
-        )
+        resumed_from_checkpoint = True
     elif prior_state is not None:
-        captured_state = prior_state.to_dict()
+        raise ValueError(
+            "prior_state must be a RollingState, a FeatureStateCheckpoint "
+            f"payload, or None (got {type(prior_state).__name__})"
+        )
     return ReplayEvidence(
         cycle_origin=(
             CYCLE_ORIGIN_RESUMED if captured_state is not None else CYCLE_ORIGIN_COLD_START
