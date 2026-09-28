@@ -25,11 +25,15 @@ from app.opip.features.pipeline import CycleIdentityMismatch
 from app.opip.features.publisher import resolve_feature_bus_mode
 from app.opip.features.r2_shadow_parity import (
     CLASSIFICATIONS,
+    REPLAY_EVIDENCE_RECORD_TYPE,
+    REPLAY_EVIDENCE_SCHEMA_VERSION,
     EvidenceIntegrityError,
     FeatureVersionMismatch,
     WatermarkIntegrityError,
     capture_observation_evidence,
+    capture_replay_evidence,
     load_observation_evidence,
+    load_replay_evidence,
     replay_captured_evidence,
     replay_feature_snapshot,
     source_evidence_identity,
@@ -135,12 +139,16 @@ def _replay(
     evaluated_at: datetime | None = None,
     instrument: InstrumentVersion | None = None,
     watermark: ConsumedInputWatermark | None = None,
+    window_start: datetime | None = None,
+    source_incomplete: bool = False,
 ):
-    payload = capture_observation_evidence(observations)
+    evidence = capture_replay_evidence(
+        observations, window_start=window_start, source_incomplete=source_incomplete
+    )
     if evaluated_at is None:
         evaluated_at = NOW if NOW >= cutoff else cutoff
     return replay_captured_evidence(
-        payload,
+        evidence,
         instrument_version=instrument or _instrument(),
         evaluation_cutoff=cutoff,
         evaluated_at_utc=evaluated_at,
@@ -542,11 +550,11 @@ def test_watermark_earlier_than_captured_evidence_is_rejected():
 
 def test_mixed_commit_order_evidence_cannot_prove_its_watermark():
     observations, _normalized = _observations(_rows(count=5))
-    payload = list(capture_observation_evidence(observations))
-    payload[0] = dict(payload[0])
-    payload[0]["history_epoch"] = None
-    payload[0]["local_sequence"] = None
-    loaded = load_observation_evidence(payload)
+    payload = capture_replay_evidence(observations).to_dict()
+    payload["observations"][0] = dict(payload["observations"][0])
+    payload["observations"][0]["history_epoch"] = None
+    payload["observations"][0]["local_sequence"] = None
+    loaded = load_observation_evidence(payload["observations"])
     assert loaded[0].commit_order is None
     assert loaded[-1].commit_order is not None
     with pytest.raises(WatermarkIntegrityError, match="mixes committed"):
@@ -576,14 +584,14 @@ def test_uncommitted_forming_bar_does_not_break_the_watermark():
     closed = tuple(item for item in observations if not item.interval_forming)
     assert len(forming) == 1
     assert max(item.commit_order for item in closed) < forming[0].commit_order
-    payload = list(capture_observation_evidence(observations))
-    for index, row in enumerate(payload):
+    payload = capture_replay_evidence(observations).to_dict()
+    for index, row in enumerate(payload["observations"]):
         if row["observation_id"] == forming[0].observation_id:
             row = dict(row)
             row["history_epoch"] = None
             row["local_sequence"] = None
-            payload[index] = row
-    loaded = load_observation_evidence(payload)
+            payload["observations"][index] = row
+    loaded = load_observation_evidence(payload["observations"])
     assert tuple(item.commit_order for item in loaded if item.interval_forming) == (None,)
     snapshot, report = replay_captured_evidence(
         payload,
@@ -600,13 +608,16 @@ def test_uncommitted_forming_bar_does_not_break_the_watermark():
 
 def test_fully_uncommitted_evidence_carries_no_watermark_claim():
     observations, _normalized = _observations(_rows(count=5))
-    payload = list(capture_observation_evidence(observations))
-    for index, row in enumerate(payload):
+    payload = capture_replay_evidence(observations).to_dict()
+    for index, row in enumerate(payload["observations"]):
         row = dict(row)
         row["history_epoch"] = None
         row["local_sequence"] = None
-        payload[index] = row
-    assert all(item.commit_order is None for item in load_observation_evidence(payload))
+        payload["observations"][index] = row
+    assert all(
+        item.commit_order is None
+        for item in load_observation_evidence(payload["observations"])
+    )
     snapshot, _report = replay_captured_evidence(
         payload,
         instrument_version=_instrument(),
@@ -871,6 +882,76 @@ def test_duplicated_non_aggregate_identity_is_rejected():
             observations + (first, second),
             evaluated_at=NOW + timedelta(minutes=6),
         )
+
+
+def test_window_start_is_replayed_and_bound_into_the_identity():
+    rows = _rows(count=5)
+    observations, _normalized = _observations(rows)
+    window_start = CUTOFF - timedelta(minutes=30)
+    without = capture_replay_evidence(observations)
+    with_window = capture_replay_evidence(observations, window_start=window_start)
+    assert with_window.window_start == window_start
+    assert load_replay_evidence(with_window.to_dict()) == with_window
+    left, left_report = _replay(observations)
+    right, right_report = _replay(observations, window_start=window_start)
+    # A declared window with leading intervals absent is an outage, never COMPLETE.
+    assert left.coverage is not CoverageState.INCOMPLETE_COVERAGE
+    assert right.coverage is CoverageState.INCOMPLETE_COVERAGE
+    assert right.values["coverage_ratio"] != left.values["coverage_ratio"]
+    assert right.values["missing_intervals"] != left.values["missing_intervals"]
+    assert left_report.source_evidence_identity != right_report.source_evidence_identity
+    assert (
+        right_report.source_evidence_identity
+        == source_evidence_identity(
+            observations, evaluation_cutoff=CUTOFF, window_start=window_start
+        )
+    )
+
+
+def test_source_incomplete_is_replayed_and_bound_into_the_identity():
+    observations, _normalized = _observations(_rows(count=5))
+    plain, plain_report = _replay(observations)
+    incomplete, incomplete_report = _replay(observations, source_incomplete=True)
+    assert plain.coverage is CoverageState.COMPLETE
+    assert incomplete.coverage is CoverageState.INCOMPLETE_COVERAGE
+    assert incomplete.content_hash() != plain.content_hash()
+    assert (
+        incomplete_report.source_evidence_identity
+        != plain_report.source_evidence_identity
+    )
+
+
+def test_captured_evidence_envelope_is_strictly_validated():
+    observations, _normalized = _observations(_rows(count=5))
+    good = capture_replay_evidence(observations).to_dict()
+    assert good["record_type"] == REPLAY_EVIDENCE_RECORD_TYPE
+    assert good["schema_version"] == REPLAY_EVIDENCE_SCHEMA_VERSION
+    for mutate, message in (
+        (lambda row: row.pop("window_start"), "missing required keys"),
+        (lambda row: row.update({"notes": "drift"}), "unexpected keys"),
+        (lambda row: row.update({"record_type": "Other"}), "record_type"),
+        (
+            lambda row: row.update({"source_incomplete": "false"}),
+            "source_incomplete must be a boolean",
+        ),
+        (
+            lambda row: row.update({"window_start": "2026-09-11T15:00Z"}),
+            "not the canonical",
+        ),
+    ):
+        payload = capture_replay_evidence(observations).to_dict()
+        mutate(payload)
+        with pytest.raises(ValueError, match=message):
+            load_replay_evidence(payload)
+
+
+def test_non_canonical_observation_timestamps_are_rejected():
+    observations, _normalized = _observations(_rows(count=5))
+    for spelling in ("2026-09-11T15:00Z", "2026-09-11 15:00:00Z"):
+        payload = [dict(row) for row in capture_observation_evidence(observations)]
+        payload[0]["receipt_time"] = spelling
+        with pytest.raises(ValueError, match="not the canonical"):
+            load_observation_evidence(payload)
 
 
 def test_forming_and_closed_versions_of_one_identity_are_rejected():

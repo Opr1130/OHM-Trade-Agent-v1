@@ -19,7 +19,7 @@ watermark.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 import math
 from typing import Any, Mapping, Sequence
@@ -75,6 +75,17 @@ from app.opip.market.observations import (
 
 EXACT_EQUALITY_RULE = "exact_absolute_tolerance_0"
 NOT_COMPARABLE_RULE = "not_comparable_legacy_value_absent"
+
+REPLAY_EVIDENCE_RECORD_TYPE = "FeatureBusReplayEvidence"
+REPLAY_EVIDENCE_SCHEMA_VERSION = 1
+
+_REPLAY_EVIDENCE_KEYS: tuple[str, ...] = (
+    "record_type",
+    "schema_version",
+    "window_start",
+    "source_incomplete",
+    "observations",
+)
 
 CLASSIFICATIONS: tuple[str, ...] = (
     "MATCH",
@@ -226,16 +237,106 @@ def capture_observation_evidence(
     return tuple(item.to_dict() for item in observations)
 
 
+@dataclass(frozen=True)
+class ReplayEvidence:
+    """Rows plus the alignment context the live cycle was given.
+
+    ``window_start`` and ``source_coverage`` are alignment inputs, not market
+    history. Reconstructing a cycle without them can produce a different
+    ``coverage_ratio``, ``missing_intervals`` or ``coverage`` — and therefore a
+    different snapshot — from the production cycle being proved, so they are
+    captured here and bound into the evidence identity.
+    """
+
+    observations: tuple[Mapping[str, Any], ...]
+    window_start: datetime | None = None
+    source_incomplete: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "record_type": REPLAY_EVIDENCE_RECORD_TYPE,
+            "schema_version": REPLAY_EVIDENCE_SCHEMA_VERSION,
+            "window_start": (
+                iso_z(self.window_start, field_name="window_start")
+                if self.window_start is not None
+                else None
+            ),
+            "source_incomplete": bool(self.source_incomplete),
+            "observations": [dict(item) for item in self.observations],
+        }
+
+
+def capture_replay_evidence(
+    observations: Sequence[Observation],
+    *,
+    window_start: datetime | None = None,
+    source_incomplete: bool = False,
+) -> ReplayEvidence:
+    """Capture everything one replay needs to reconstruct the same cycle."""
+    return ReplayEvidence(
+        observations=capture_observation_evidence(observations),
+        window_start=window_start,
+        source_incomplete=bool(source_incomplete),
+    )
+
+
+def load_replay_evidence(
+    payload: ReplayEvidence | Mapping[str, Any],
+) -> ReplayEvidence:
+    """Rebuild captured evidence, refusing anything outside the declared shape."""
+    if isinstance(payload, ReplayEvidence):
+        return payload
+    if not isinstance(payload, Mapping):
+        raise ValueError("replay evidence must be a captured evidence object")
+    missing = [key for key in _REPLAY_EVIDENCE_KEYS if key not in payload]
+    if missing:
+        raise ValueError(f"replay evidence missing required keys: {sorted(missing)}")
+    unexpected = sorted(set(payload) - set(_REPLAY_EVIDENCE_KEYS))
+    if unexpected:
+        raise ValueError(f"replay evidence has unexpected keys: {unexpected}")
+    if payload["record_type"] != REPLAY_EVIDENCE_RECORD_TYPE:
+        raise ValueError("replay evidence record_type is not FeatureBusReplayEvidence")
+    schema = _require_int(payload["schema_version"], "schema_version")
+    if schema != REPLAY_EVIDENCE_SCHEMA_VERSION:
+        raise ValueError(
+            "replay refused: captured evidence schema_version "
+            f"{schema} is not the supported {REPLAY_EVIDENCE_SCHEMA_VERSION}"
+        )
+    source_incomplete = _require_bool(payload["source_incomplete"], "source_incomplete")
+    raw_window = payload["window_start"]
+    window_start = (
+        None
+        if raw_window is None
+        else _parse_time(raw_window, "window_start")
+    )
+    observations = payload["observations"]
+    if isinstance(observations, (str, bytes)) or not isinstance(observations, Sequence):
+        raise ValueError("replay evidence observations must be a sequence")
+    return ReplayEvidence(
+        observations=tuple(observations),
+        window_start=window_start,
+        source_incomplete=source_incomplete,
+    )
+
+
 def source_evidence_identity(
     observations: Sequence[Observation],
     *,
     evaluation_cutoff: datetime,
+    window_start: datetime | None = None,
+    source_incomplete: bool = False,
 ) -> str:
     cutoff = iso_z(evaluation_cutoff, field_name="evaluation_cutoff")
     return stable_hash(
         "R2EV",
         {
             "evaluation_cutoff": cutoff,
+            "window_start": (
+                iso_z(window_start, field_name="window_start")
+                if window_start is not None
+                else None
+            ),
+            "source_incomplete": bool(source_incomplete),
             "observations": [item.to_dict() for item in observations],
         },
     )
@@ -500,8 +601,14 @@ def replay_feature_snapshot(
     consumed_input_watermark: ConsumedInputWatermark,
     source_version: str,
     declared_feature_version: str = FEATURE_VERSION,
+    window_start: datetime | None = None,
+    source_incomplete: bool = False,
 ) -> FeatureSnapshot:
     """Feed frozen observations through the existing feature bus.
+
+    ``window_start`` and ``source_incomplete`` are the alignment context the
+    production cycle was given; replaying without them can derive a different
+    coverage verdict from the same rows.
 
     A declared feature version other than this engine's ``FEATURE_VERSION``
     is refused before any value is computed. Evidence that does not belong to
@@ -517,7 +624,12 @@ def replay_feature_snapshot(
     _assert_replay_visibility(
         observations, evaluated_at_utc=evaluated_at_utc, source_version=source_version
     )
-    alignment = align_minute_observations(observations, cutoff=evaluation_cutoff)
+    alignment = _replay_alignment(
+        observations,
+        evaluation_cutoff=evaluation_cutoff,
+        window_start=window_start,
+        source_incomplete=source_incomplete,
+    )
     _assert_cutoff_population(alignment, evaluation_cutoff=evaluation_cutoff)
     eligible = _eligible_evidence(alignment)
     _require_consistent_content(observations, eligible)
@@ -537,8 +649,24 @@ def replay_feature_snapshot(
     return snapshot
 
 
+def _replay_alignment(
+    observations: Sequence[Observation],
+    *,
+    evaluation_cutoff: datetime,
+    window_start: datetime | None,
+    source_incomplete: bool,
+) -> AlignmentResult:
+    """Alignment exactly as the production cycle would have derived it."""
+    alignment = align_minute_observations(
+        observations, cutoff=evaluation_cutoff, window_start=window_start
+    )
+    if source_incomplete:
+        return replace(alignment, source_incomplete=True)
+    return alignment
+
+
 def replay_captured_evidence(
-    payload: Sequence[Mapping[str, Any]],
+    payload: ReplayEvidence | Mapping[str, Any],
     *,
     instrument_version: InstrumentVersion,
     evaluation_cutoff: datetime,
@@ -549,33 +677,36 @@ def replay_captured_evidence(
 ) -> tuple[FeatureSnapshot, ClassifiedParityReport]:
     """Load captured evidence, replay it twice, and classify parity."""
     _require_feature_version(declared_feature_version)
-    loaded = load_observation_evidence(payload)
-    first = replay_feature_snapshot(
-        loaded,
-        instrument_version=instrument_version,
-        evaluation_cutoff=evaluation_cutoff,
-        evaluated_at_utc=evaluated_at_utc,
-        consumed_input_watermark=consumed_input_watermark,
-        source_version=source_version,
-        declared_feature_version=declared_feature_version,
-    )
-    second = replay_feature_snapshot(
-        loaded,
-        instrument_version=instrument_version,
-        evaluation_cutoff=evaluation_cutoff,
-        evaluated_at_utc=evaluated_at_utc,
-        consumed_input_watermark=consumed_input_watermark,
-        source_version=source_version,
-        declared_feature_version=declared_feature_version,
-    )
+    evidence = load_replay_evidence(payload)
+    loaded = load_observation_evidence(evidence.observations)
+    replay_kwargs = {
+        "instrument_version": instrument_version,
+        "evaluation_cutoff": evaluation_cutoff,
+        "evaluated_at_utc": evaluated_at_utc,
+        "consumed_input_watermark": consumed_input_watermark,
+        "source_version": source_version,
+        "declared_feature_version": declared_feature_version,
+        "window_start": evidence.window_start,
+        "source_incomplete": evidence.source_incomplete,
+    }
+    first = replay_feature_snapshot(loaded, **replay_kwargs)
+    second = replay_feature_snapshot(loaded, **replay_kwargs)
     assert_snapshot_determinism((first, second))
     report = classify_shadow_parity(
-        align_minute_observations(loaded, cutoff=evaluation_cutoff),
+        _replay_alignment(
+            loaded,
+            evaluation_cutoff=evaluation_cutoff,
+            window_start=evidence.window_start,
+            source_incomplete=evidence.source_incomplete,
+        ),
         bus_values=first.values,
         instrument_version=instrument_version,
         evaluated_at_utc=evaluated_at_utc,
         evidence_identity=source_evidence_identity(
-            loaded, evaluation_cutoff=evaluation_cutoff
+            loaded,
+            evaluation_cutoff=evaluation_cutoff,
+            window_start=evidence.window_start,
+            source_incomplete=evidence.source_incomplete,
         ),
         feature_version=first.feature_version,
         snapshot_id=first.snapshot_id,
@@ -1061,24 +1192,41 @@ def _require_source_valid_aggregate(
 
 
 def _parse_time(value: Any, field_name: str) -> datetime:
+    """Parse a Zulu timestamp and require the canonical spelling back.
+
+    ``datetime.fromisoformat`` also accepts forms such as ``15:00Z`` or a space
+    separator, which ``Observation.to_dict`` would rewrite. Accepting them would
+    give a rewritten payload the same evidence identity as canonical bytes.
+    """
     if not isinstance(value, str) or not value.endswith("Z"):
         raise ValueError(f"{field_name} must be a Zulu timestamp")
     parsed = datetime.fromisoformat(value[:-1] + "+00:00")
-    return require_utc(parsed, field_name=field_name)
+    canonical = require_utc(parsed, field_name=field_name)
+    if iso_z(canonical, field_name=field_name) != value:
+        raise ValueError(
+            f"replay evidence {field_name} {value!r} is not the canonical "
+            f"{iso_z(canonical, field_name=field_name)!r}"
+        )
+    return canonical
 
 
 __all__ = [
     "CLASSIFICATIONS",
     "EXACT_EQUALITY_RULE",
+    "REPLAY_EVIDENCE_RECORD_TYPE",
+    "REPLAY_EVIDENCE_SCHEMA_VERSION",
     "CycleIdentityMismatch",
     "EvidenceIntegrityError",
     "FeatureVersionMismatch",
+    "ReplayEvidence",
     "WatermarkIntegrityError",
     "ClassifiedParityReport",
     "ClassifiedParityRow",
     "capture_observation_evidence",
+    "capture_replay_evidence",
     "classify_shadow_parity",
     "load_observation_evidence",
+    "load_replay_evidence",
     "replay_captured_evidence",
     "replay_feature_snapshot",
     "source_evidence_identity",
