@@ -24,10 +24,11 @@ from app.opip.contracts.identity import ConsumedInputWatermark, InstrumentVersio
 from app.opip.contracts.observation import (
     AGGREGATE_REQUIRED_KEYS,
     OBSERVATION_RECORD_TYPE,
+    OBSERVATION_SCHEMA_VERSION,
     Observation,
 )
 from app.opip.contracts.serialization import iso_z, stable_hash
-from app.opip.contracts.temporal import require_utc
+from app.opip.contracts.temporal import assert_point_in_time, require_utc
 from app.opip.features.engine import (
     ATR_PERIOD,
     BANDWIDTH_PERIOD,
@@ -56,6 +57,7 @@ from app.opip.market.aggregates import (
     align_minute_observations,
     contiguous_tail,
 )
+from app.opip.market.observations import aggregate_content_fingerprint
 
 EXACT_EQUALITY_RULE = "exact_absolute_tolerance_0"
 NOT_COMPARABLE_RULE = "not_comparable_legacy_value_absent"
@@ -121,6 +123,10 @@ class FeatureVersionMismatch(ValueError):
 
 class WatermarkIntegrityError(ValueError):
     """Replay refused because the consumed watermark cannot be proven honest."""
+
+
+class EvidenceIntegrityError(ValueError):
+    """Replay refused because a captured row conflicts with its own identity."""
 
 
 @dataclass(frozen=True)
@@ -295,6 +301,50 @@ def _eligible_evidence(alignment: AlignmentResult) -> tuple[Observation, ...]:
     return (*alignment.observations, *alignment.superseded)
 
 
+def _require_consistent_content(eligible: Sequence[Observation]) -> None:
+    """One interval revision must not carry two different contents.
+
+    Canonical reconstruction refuses conflicting content fingerprints for the
+    same interval and revision. Replay refuses the same evidence instead of
+    silently selecting a winner by ingestion order.
+    """
+    seen: dict[tuple[int, int], str] = {}
+    for item in eligible:
+        if item.payload_kind is not PayloadKind.FIXED_INTERVAL_AGGREGATE:
+            continue
+        key = (int(item.source_event_time.timestamp()), int(item.revision))
+        fingerprint = aggregate_content_fingerprint(dict(item.values))
+        prior = seen.get(key)
+        if prior is not None and prior != fingerprint:
+            raise EvidenceIntegrityError(
+                "replay evidence has conflicting content for interval epoch "
+                f"{key[0]} revision {key[1]}; refusing to hide incompatible "
+                "canonical evidence"
+            )
+        seen[key] = fingerprint
+
+
+def _assert_replay_visibility(
+    eligible: Sequence[Observation],
+    *,
+    evaluated_at_utc: datetime,
+    source_version: str,
+) -> None:
+    """No admitted input may have become visible after the replay instant.
+
+    The snapshot's own point-in-time guard only sees the contiguous feature
+    tail, while coverage and lateness are derived from the full alignment. This
+    check covers every considered row, so a future receipt cannot enter a
+    sealed snapshot through a freshness field.
+    """
+    if not eligible:
+        return
+    stamps = tuple(
+        item.availability_stamp(source_version=source_version) for item in eligible
+    )
+    assert_point_in_time(stamps, decision_at_utc=evaluated_at_utc)
+
+
 def replay_feature_snapshot(
     observations: Sequence[Observation],
     *,
@@ -309,15 +359,21 @@ def replay_feature_snapshot(
 
     A declared feature version other than this engine's ``FEATURE_VERSION``
     is refused before any value is computed. Evidence that does not belong to
-    the supplied ``InstrumentVersion`` is refused before alignment, and a
-    watermark earlier than the consumed evidence that alignment admitted is
-    refused before the snapshot is sealed.
+    the supplied ``InstrumentVersion`` is refused before alignment. The
+    evidence alignment then admitted must be self-consistent, visible at
+    ``evaluated_at_utc``, and covered by ``consumed_input_watermark`` before the
+    snapshot is sealed.
     """
     _require_feature_version(declared_feature_version)
     _assert_replay_identity(observations, instrument_version=instrument_version)
     alignment = align_minute_observations(observations, cutoff=evaluation_cutoff)
+    eligible = _eligible_evidence(alignment)
+    _require_consistent_content(eligible)
+    _assert_replay_visibility(
+        eligible, evaluated_at_utc=evaluated_at_utc, source_version=source_version
+    )
     _require_consumed_watermark(
-        _eligible_evidence(alignment),
+        eligible,
         consumed_input_watermark=consumed_input_watermark,
     )
     return build_feature_snapshot(
@@ -704,6 +760,12 @@ def _observation_from_evidence(raw: Mapping[str, Any]) -> Observation:
         raise ValueError(f"replay evidence missing required keys: {sorted(missing)}")
     if raw["record_type"] != OBSERVATION_RECORD_TYPE:
         raise ValueError("replay evidence record_type is not Observation")
+    declared_schema = int(raw["schema_version"])
+    if declared_schema != OBSERVATION_SCHEMA_VERSION:
+        raise ValueError(
+            "replay refused: captured observation schema_version "
+            f"{declared_schema} is not the supported {OBSERVATION_SCHEMA_VERSION}"
+        )
     values = raw["values"]
     if not isinstance(values, Mapping):
         raise ValueError("replay evidence values must be an object")
@@ -739,7 +801,7 @@ def _observation_from_evidence(raw: Mapping[str, Any]) -> Observation:
         interval_forming=bool(raw["interval_forming"]),
         provenance=_provenance_from_evidence(raw),
         commit_order=commit_order,
-        schema_version=int(raw["schema_version"]),
+        schema_version=declared_schema,
     )
     if reconstructed.observation_id != captured_id:
         raise ValueError(
@@ -761,6 +823,7 @@ __all__ = [
     "CLASSIFICATIONS",
     "EXACT_EQUALITY_RULE",
     "CycleIdentityMismatch",
+    "EvidenceIntegrityError",
     "FeatureVersionMismatch",
     "WatermarkIntegrityError",
     "ClassifiedParityReport",

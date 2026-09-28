@@ -14,6 +14,8 @@ import pytest
 
 from app.opip.contracts.enums import Missingness
 from app.opip.contracts.identity import ConsumedInputWatermark, InstrumentVersion
+from app.opip.contracts.observation import OBSERVATION_SCHEMA_VERSION
+from app.opip.contracts.temporal import TemporalIntegrityError
 from app.opip.features.engine import (
     FEATURE_NAMES,
     FEATURE_VERSION,
@@ -23,6 +25,7 @@ from app.opip.features.pipeline import CycleIdentityMismatch
 from app.opip.features.publisher import resolve_feature_bus_mode
 from app.opip.features.r2_shadow_parity import (
     CLASSIFICATIONS,
+    EvidenceIntegrityError,
     FeatureVersionMismatch,
     WatermarkIntegrityError,
     capture_observation_evidence,
@@ -618,8 +621,60 @@ def test_fully_uncommitted_evidence_carries_no_watermark_claim():
 
 
 # --------------------------------------------------------------------------- #
-# Finding 4 - captured observation_id is integrity-checked
+# Findings 4-6 - captured identity and replay admissibility
 # --------------------------------------------------------------------------- #
+
+
+def test_observation_schema_version_must_be_supported():
+    observations, _normalized = _observations(_rows(count=5))
+    payload = list(capture_observation_evidence(observations))
+    assert all(row["schema_version"] == OBSERVATION_SCHEMA_VERSION for row in payload)
+    payload[0] = dict(payload[0])
+    payload[0]["schema_version"] = OBSERVATION_SCHEMA_VERSION + 1
+    with pytest.raises(ValueError, match="schema_version"):
+        load_observation_evidence(payload)
+
+
+def test_conflicting_content_for_one_interval_revision_is_rejected():
+    observations, _normalized = _observations(_rows(count=5))
+    original = observations[-1]
+    conflicting_values = dict(original.values)
+    conflicting_values["close"] = float(conflicting_values["close"]) + 5.0
+    conflicting = replace(
+        original,
+        values=conflicting_values,
+        ingestion_order=original.ingestion_order + 1,
+    )
+    # Same interval and revision means the same observation_id but different OHLCV.
+    assert conflicting.observation_id == original.observation_id
+    with pytest.raises(EvidenceIntegrityError, match="conflicting content"):
+        _replay(observations + (conflicting,))
+
+
+def test_identical_duplicate_content_is_not_a_conflict():
+    observations, _normalized = _observations(_rows(count=5))
+    original = observations[-1]
+    duplicate = replace(original, ingestion_order=original.ingestion_order + 1)
+    once, _report = _replay(observations)
+    twice, _report = _replay(observations + (duplicate,))
+    assert twice.values == once.values
+
+
+def test_input_not_visible_at_the_replay_instant_is_rejected():
+    observations, _normalized = _observations(
+        _rows(count=FEATURE_WINDOW_INTERVALS + 20)
+    )
+    future = NOW + timedelta(hours=1)
+    # The first bars fall outside the contiguous feature tail, so the snapshot's
+    # own availability guard cannot see this receipt; coverage and lateness can.
+    late = replace(observations[0], receipt_time=future)
+    with pytest.raises(TemporalIntegrityError, match="visibility"):
+        _replay(observations[1:] + (late,))
+    # The same evidence replays once the receipt is visible at the replay instant.
+    snapshot, report = _replay(observations)
+    assert snapshot.values["return_1m"] is not None
+    assert snapshot.values["late_arrival_count"] is not None
+    assert report.counts()["IMPLEMENTATION_DEFECT"] == 0
 
 
 def test_captured_observation_id_round_trips():
