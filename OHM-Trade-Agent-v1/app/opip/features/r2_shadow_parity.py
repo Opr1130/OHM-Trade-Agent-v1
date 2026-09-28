@@ -24,8 +24,8 @@ from datetime import datetime
 import math
 from typing import Any, Mapping, Sequence
 
-from app.opip.contracts.enums import CoverageState, PayloadKind
-from app.opip.contracts.features import FeatureSnapshot
+from app.opip.contracts.enums import CoverageState, PayloadKind, RestartState
+from app.opip.contracts.features import FeatureSnapshot, FeatureStateCheckpoint
 from app.opip.contracts.identity import ConsumedInputWatermark, InstrumentVersion
 from app.opip.contracts.observation import (
     AGGREGATE_REQUIRED_KEYS,
@@ -39,6 +39,7 @@ from app.opip.contracts.temporal import (
     assert_point_in_time,
     require_utc,
 )
+from app.opip.features.checkpoint_store import checkpoint_from_payload
 from app.opip.features.engine import (
     ATR_PERIOD,
     BANDWIDTH_PERIOD,
@@ -61,6 +62,14 @@ from app.opip.features.parity import (
 )
 from app.opip.features.pipeline import CycleIdentityMismatch, _assert_cycle_identity
 from app.opip.features.replay import assert_snapshot_determinism
+from app.opip.features.state import (
+    RollingState,
+    advance_state,
+    alignment_from_state,
+    from_checkpoint,
+    initial_state,
+    to_checkpoint,
+)
 from app.opip.market.aggregates import (
     DEFAULT_INTERVAL_SECONDS,
     AlignmentResult,
@@ -77,14 +86,24 @@ EXACT_EQUALITY_RULE = "exact_absolute_tolerance_0"
 NOT_COMPARABLE_RULE = "not_comparable_legacy_value_absent"
 
 REPLAY_EVIDENCE_RECORD_TYPE = "FeatureBusReplayEvidence"
-REPLAY_EVIDENCE_SCHEMA_VERSION = 1
+REPLAY_EVIDENCE_SCHEMA_VERSION = 2
+
+#: A capture either started from nothing or resumed retained history. The two
+#: produce different snapshots from identical rows, so the envelope states which
+#: it was instead of leaving replay to assume one.
+CYCLE_ORIGIN_COLD_START = "cold_start"
+CYCLE_ORIGIN_RESUMED = "resumed"
+CYCLE_ORIGINS: tuple[str, ...] = (CYCLE_ORIGIN_COLD_START, CYCLE_ORIGIN_RESUMED)
 
 _REPLAY_EVIDENCE_KEYS: tuple[str, ...] = (
     "record_type",
     "schema_version",
+    "cycle_origin",
+    "prior_state",
     "window_start",
     "source_incomplete",
-    "observations",
+    "evidence",
+    "coverage_only",
 )
 
 CLASSIFICATIONS: tuple[str, ...] = (
@@ -239,42 +258,79 @@ def capture_observation_evidence(
 
 @dataclass(frozen=True)
 class ReplayEvidence:
-    """Rows plus the alignment context the live cycle was given.
+    """One captured cycle: retained state, evidence roles, alignment context.
 
-    ``window_start`` and ``source_coverage`` are alignment inputs, not market
-    history. Reconstructing a cycle without them can produce a different
-    ``coverage_ratio``, ``missing_intervals`` or ``coverage`` — and therefore a
-    different snapshot — from the production cycle being proved, so they are
-    captured here and bound into the evidence identity.
+    ``run_cycle`` does not compute a snapshot from the fetched tuple alone. It
+    partitions the fetch into evidence and coverage-only rows, advances the
+    prior ``RollingState``, and builds the snapshot from that retained candidate
+    state, using the fetch only for freshness. A capture that recorded just one
+    flat row tuple could not reproduce a resumed cycle, so this envelope records
+    which of the two it was and carries everything the production path needs.
+
+    ``prior_state`` is a ``FeatureStateCheckpoint`` payload — the existing
+    durable form of retained state — and is ``None`` only for a declared cold
+    start. ``coverage_only`` holds rows the live planner withheld from feature
+    evidence; they keep continuity and coverage honest without contributing
+    feature values, exactly as in production.
     """
 
-    observations: tuple[Mapping[str, Any], ...]
+    cycle_origin: str
+    evidence: tuple[Mapping[str, Any], ...] = ()
+    coverage_only: tuple[Mapping[str, Any], ...] = ()
+    prior_state: Mapping[str, Any] | None = None
     window_start: datetime | None = None
     source_incomplete: bool = False
+
+    @property
+    def resumed(self) -> bool:
+        return self.cycle_origin == CYCLE_ORIGIN_RESUMED
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "record_type": REPLAY_EVIDENCE_RECORD_TYPE,
             "schema_version": REPLAY_EVIDENCE_SCHEMA_VERSION,
+            "cycle_origin": self.cycle_origin,
+            "prior_state": (
+                dict(self.prior_state) if self.prior_state is not None else None
+            ),
             "window_start": (
                 iso_z(self.window_start, field_name="window_start")
                 if self.window_start is not None
                 else None
             ),
             "source_incomplete": bool(self.source_incomplete),
-            "observations": [dict(item) for item in self.observations],
+            "evidence": [dict(item) for item in self.evidence],
+            "coverage_only": [dict(item) for item in self.coverage_only],
         }
 
 
 def capture_replay_evidence(
-    observations: Sequence[Observation],
+    evidence: Sequence[Observation],
     *,
+    prior_state: RollingState | FeatureStateCheckpoint | None = None,
+    coverage_only: Sequence[Observation] = (),
     window_start: datetime | None = None,
     source_incomplete: bool = False,
 ) -> ReplayEvidence:
-    """Capture everything one replay needs to reconstruct the same cycle."""
+    """Capture everything one replay needs to reconstruct the same cycle.
+
+    The origin is derived from ``prior_state`` rather than declared, so a
+    capture cannot claim a cold start while holding retained history.
+    """
+    captured_state: Mapping[str, Any] | None = None
+    if isinstance(prior_state, RollingState):
+        captured_state = to_checkpoint(prior_state).to_dict()
+    elif isinstance(prior_state, Mapping):
+        captured_state = dict(prior_state)
+    elif prior_state is not None:
+        captured_state = prior_state.to_dict()
     return ReplayEvidence(
-        observations=capture_observation_evidence(observations),
+        cycle_origin=(
+            CYCLE_ORIGIN_RESUMED if captured_state is not None else CYCLE_ORIGIN_COLD_START
+        ),
+        evidence=capture_observation_evidence(evidence),
+        coverage_only=capture_observation_evidence(coverage_only),
+        prior_state=captured_state,
         window_start=window_start,
         source_incomplete=bool(source_incomplete),
     )
@@ -302,42 +358,122 @@ def load_replay_evidence(
             "replay refused: captured evidence schema_version "
             f"{schema} is not the supported {REPLAY_EVIDENCE_SCHEMA_VERSION}"
         )
+    cycle_origin = payload["cycle_origin"]
+    if cycle_origin not in CYCLE_ORIGINS:
+        raise ValueError(
+            f"replay evidence cycle_origin {cycle_origin!r} is not one of "
+            f"{list(CYCLE_ORIGINS)}"
+        )
     source_incomplete = _require_bool(payload["source_incomplete"], "source_incomplete")
     raw_window = payload["window_start"]
-    window_start = (
-        None
-        if raw_window is None
-        else _parse_time(raw_window, "window_start")
+    window_start = None if raw_window is None else _parse_time(raw_window, "window_start")
+    prior_state = _prior_state_from_evidence(
+        payload["prior_state"], cycle_origin=cycle_origin
     )
-    observations = payload["observations"]
-    if isinstance(observations, (str, bytes)) or not isinstance(observations, Sequence):
-        raise ValueError("replay evidence observations must be a sequence")
+    evidence = _observation_rows(payload["evidence"], "evidence")
+    coverage_only = _observation_rows(payload["coverage_only"], "coverage_only")
+    if cycle_origin == CYCLE_ORIGIN_COLD_START and coverage_only:
+        raise ValueError(
+            "replay evidence declares a cold start with coverage-only rows; a "
+            "cold-start planner has no retained history to keep a re-poll "
+            "coverage-only, so the evidence-role context is inconsistent"
+        )
     return ReplayEvidence(
-        observations=tuple(observations),
+        cycle_origin=cycle_origin,
+        evidence=evidence,
+        coverage_only=coverage_only,
+        prior_state=prior_state,
         window_start=window_start,
         source_incomplete=source_incomplete,
     )
 
 
+def _prior_state_from_evidence(
+    raw: Any, *, cycle_origin: str
+) -> Mapping[str, Any] | None:
+    """Retained state is mandatory exactly when the capture was a resume."""
+    if raw is None:
+        if cycle_origin == CYCLE_ORIGIN_RESUMED:
+            raise ValueError(
+                "replay refused: a resumed cycle requires prior retained state, "
+                "and the captured evidence does not carry prior_state"
+            )
+        return None
+    if not isinstance(raw, Mapping):
+        raise ValueError("replay evidence prior_state must be an object or null")
+    if cycle_origin != CYCLE_ORIGIN_RESUMED:
+        raise ValueError(
+            "replay evidence declares a cold start but carries prior retained "
+            "state; the captured cycle origin is inconsistent"
+        )
+    return dict(raw)
+
+
+def _observation_rows(raw: Any, field_name: str) -> tuple[Mapping[str, Any], ...]:
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
+        raise ValueError(f"replay evidence {field_name} must be a sequence")
+    return tuple(raw)
+
+
+def _retained_state(
+    evidence: ReplayEvidence,
+    *,
+    instrument_version: InstrumentVersion,
+    interval_seconds: int,
+) -> RollingState:
+    """The prior state the cycle actually resumed from, or a declared cold start."""
+    if evidence.prior_state is None:
+        return initial_state(instrument_version, interval_seconds=interval_seconds)
+    try:
+        checkpoint = checkpoint_from_payload(evidence.prior_state)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise EvidenceIntegrityError(
+            "replay refused: captured retained state cannot be reconstructed "
+            f"({type(exc).__name__}); refusing to synthesize the missing context"
+        ) from exc
+    if checkpoint.instrument_version_id != instrument_version.instrument_version_id:
+        raise CycleIdentityMismatch(
+            "retained state instrument_version_id "
+            f"{checkpoint.instrument_version_id!r} != "
+            f"{instrument_version.instrument_version_id!r}"
+        )
+    if checkpoint.feature_version != FEATURE_VERSION:
+        raise CycleIdentityMismatch(
+            f"retained state feature_version {checkpoint.feature_version!r} != "
+            f"{FEATURE_VERSION!r}"
+        )
+    return from_checkpoint(checkpoint)
+
+
 def source_evidence_identity(
-    observations: Sequence[Observation],
+    evidence: ReplayEvidence,
     *,
     evaluation_cutoff: datetime,
-    window_start: datetime | None = None,
-    source_incomplete: bool = False,
 ) -> str:
+    """Identity of the exact captured cycle, not just its rows.
+
+    The retained state, the evidence roles, and the alignment context all change
+    the sealed snapshot from identical rows, so all of them are bound here.
+    """
     cutoff = iso_z(evaluation_cutoff, field_name="evaluation_cutoff")
     return stable_hash(
         "R2EV",
         {
             "evaluation_cutoff": cutoff,
-            "window_start": (
-                iso_z(window_start, field_name="window_start")
-                if window_start is not None
+            "cycle_origin": evidence.cycle_origin,
+            "prior_state": (
+                dict(evidence.prior_state)
+                if evidence.prior_state is not None
                 else None
             ),
-            "source_incomplete": bool(source_incomplete),
-            "observations": [item.to_dict() for item in observations],
+            "window_start": (
+                iso_z(evidence.window_start, field_name="window_start")
+                if evidence.window_start is not None
+                else None
+            ),
+            "source_incomplete": bool(evidence.source_incomplete),
+            "evidence": [dict(item) for item in evidence.evidence],
+            "coverage_only": [dict(item) for item in evidence.coverage_only],
         },
     )
 
@@ -360,52 +496,58 @@ def _assert_replay_identity(
     observations: Sequence[Observation],
     *,
     instrument_version: InstrumentVersion,
+    state: RollingState | None = None,
 ) -> None:
     """Same identity semantics the live feature-bus cycle enforces.
 
     The rule is owned by ``pipeline._assert_cycle_identity`` and reused here so
     replay cannot accept evidence for a different instrument than the one the
-    snapshot will be labelled with.
+    snapshot will be labelled with, nor retained state whose identity, feature
+    version, or interval disagrees with the cycle being replayed.
     """
     _assert_cycle_identity(
         observations,
         instrument_version=instrument_version,
-        state=None,
-        interval_seconds=DEFAULT_INTERVAL_SECONDS,
+        state=state,
+        interval_seconds=(
+            DEFAULT_INTERVAL_SECONDS if state is None else int(state.interval_seconds)
+        ),
     )
 
 
 def _require_consumed_watermark(
     eligible: Sequence[Observation],
     *,
+    prior_state: RollingState,
     consumed_input_watermark: ConsumedInputWatermark,
 ) -> None:
-    """Refuse a watermark that is earlier than consumed captured evidence.
+    """Refuse a watermark earlier than the evidence the snapshot consumed.
 
     A snapshot may not claim it has not consumed evidence that is in its own
-    values. Only rows that can change the sealed snapshot are checked:
-    alignment-admitted winners, their deduped losers, and the misaligned
-    exclusions that decide coverage. A forming or unclosed row is discarded by
-    alignment, cannot change a sealed field, and therefore makes no
-    consumed-input claim. Evidence with no commit order at all carries no
-    claim; partially committed snapshot-affecting evidence cannot prove its
-    watermark and fails closed.
+    values, and it may not claim less than the state it resumed from. The
+    checked population is every row that can change a sealed field:
+    alignment-admitted winners, their deduped losers, coverage-only continuity
+    rows, and the misaligned exclusions that decide coverage. A forming or
+    unclosed row is discarded by alignment, cannot change a sealed field, and
+    therefore makes no consumed-input claim. Evidence with no commit order at
+    all carries no claim; partially committed snapshot-affecting evidence
+    cannot prove its watermark and fails closed.
     """
     committed = [
         item.commit_order for item in eligible if item.commit_order is not None
     ]
-    if not committed:
-        return
-    if len(committed) != len(eligible):
+    if committed and len(committed) != len(eligible):
         raise WatermarkIntegrityError(
             "replay evidence mixes committed and uncommitted observations; "
             "the consumed input watermark cannot be proven"
         )
-    highest = max(committed)
-    if consumed_input_watermark < highest:
+    floor = prior_state.consumed_input_watermark
+    if committed:
+        floor = max(floor, max(committed))
+    if consumed_input_watermark < floor:
         raise WatermarkIntegrityError(
             f"consumed input watermark {consumed_input_watermark.to_dict()} precedes "
-            f"captured evidence commit order {highest.to_dict()}"
+            f"consumed evidence position {floor.to_dict()}"
         )
 
 
@@ -413,10 +555,11 @@ def _eligible_evidence(alignment: AlignmentResult) -> tuple[Observation, ...]:
     """Committed inputs whose existence can change the sealed snapshot.
 
     Admitted winners and their deduped losers set values, gaps and lateness.
-    ``excluded_misaligned_rows`` carry no values but still decide
-    ``AlignmentResult.coverage``, so they belong to the same population: a
-    snapshot may not record incomplete coverage from a row it claims not to
-    have consumed.
+    Coverage-only rows fill expected-window continuity, so they move
+    ``coverage_ratio`` and ``missing_intervals``. ``excluded_misaligned_rows``
+    carry no values but still decide ``AlignmentResult.coverage``. All three
+    belong to the same population: a snapshot may not record coverage from rows
+    it claims not to have consumed.
 
     Forming and unclosed rows are deliberately absent. Alignment reaches them
     only through ``excluded_forming`` and ``excluded_unclosed``, and ``coverage``
@@ -426,6 +569,7 @@ def _eligible_evidence(alignment: AlignmentResult) -> tuple[Observation, ...]:
     return (
         *alignment.observations,
         *alignment.superseded,
+        *alignment.coverage_only,
         *alignment.excluded_misaligned_rows,
     )
 
@@ -463,58 +607,38 @@ def _assert_cutoff_population(
             )
 
 
-def _assert_visibility_covers_inputs(
+def _assert_availability_matches_production(
     snapshot: FeatureSnapshot,
-    eligible: Sequence[Observation],
+    cycle_alignment: AlignmentResult,
+    rolling_alignment: AlignmentResult,
     *,
     source_version: str,
 ) -> None:
-    """The sealed stamp must not understate the evidence the snapshot depends on.
+    """The sealed stamp must be the one production derives from these inputs.
 
-    ``build_feature_snapshot`` derives availability from the contiguous feature
-    tail, while coverage and lateness come from the whole alignment. A
-    snapshot-affecting row outside that tail can therefore be received later
-    than the ``visible_at_utc`` the snapshot declares, letting a consumer read
-    the snapshot as available before the evidence its own coverage state
-    depends on.
-
-    Widening availability's scope would change canonical evidence for the live
-    path, and recomputing it only here would give replay a second availability
-    semantics that no longer equals the engine's output for the same inputs.
-    Replay therefore refuses evidence the sealed stamp cannot cover.
+    ``build_feature_snapshot`` takes availability from the contiguous tail of
+    the *cycle* alignment, falling back to the rolling alignment when the cycle
+    contributed no admitted rows. Rolling values come from retained state, so a
+    replay that assembles the snapshot itself — rather than through the
+    production path — can quietly seal a different ``visible_at_utc`` for the
+    same evidence. Recomputing it here mirrors that exact fallback: it is a
+    wiring assertion, not a second semantics.
     """
-    if not eligible:
-        return
-    stamps = tuple(
-        item.availability_stamp(source_version=source_version) for item in eligible
+    inputs = contiguous_tail(cycle_alignment)[-FEATURE_WINDOW_INTERVALS:] or (
+        contiguous_tail(rolling_alignment)[-FEATURE_WINDOW_INTERVALS:]
     )
-    latest_visible = max(stamp.visible_at_utc for stamp in stamps)
-    if latest_visible > snapshot.availability.visible_at_utc:
+    if not inputs:
+        return
+    expected = max(
+        item.availability_stamp(source_version=source_version).visible_at_utc
+        for item in inputs
+    )
+    if snapshot.availability.visible_at_utc != expected:
         raise TemporalIntegrityError(
-            "replay evidence became visible at "
-            f"{iso_z(latest_visible, field_name='visible_at_utc')}, later than the "
             "sealed snapshot visibility "
-            f"{iso_z(snapshot.availability.visible_at_utc, field_name='visible_at_utc')}; "
-            "the snapshot would understate the evidence it depends on"
-        )
-    declared_source = snapshot.availability.source_at_utc
-    if declared_source is None:
-        return
-    latest_source = max(
-        (
-            stamp.source_at_utc
-            for stamp in stamps
-            if stamp.source_at_utc is not None
-        ),
-        default=None,
-    )
-    if latest_source is not None and latest_source > declared_source:
-        raise TemporalIntegrityError(
-            "replay evidence carries a source event at "
-            f"{iso_z(latest_source, field_name='source_at_utc')}, later than the "
-            "sealed snapshot source time "
-            f"{iso_z(declared_source, field_name='source_at_utc')}; the snapshot "
-            "would understate the evidence it depends on"
+            f"{iso_z(snapshot.availability.visible_at_utc, field_name='visible_at_utc')} "
+            "does not match the production derivation from these inputs "
+            f"{iso_z(expected, field_name='visible_at_utc')}"
         )
 
 
@@ -578,11 +702,11 @@ def _assert_replay_visibility(
 ) -> None:
     """No captured input may have become visible after the replay instant.
 
-    The snapshot's own point-in-time guard only sees the contiguous feature
-    tail, while coverage and lateness are derived from the full alignment. A
-    row alignment discards can still change the coverage verdict, so this
-    check covers every captured row rather than only the admitted ones. It is
-    not a silent filter: an invisible row is refused, never dropped.
+    The snapshot's own point-in-time guard only sees the inputs its availability
+    tail covers, while coverage and lateness come from the whole alignment. A
+    row alignment discards can still change the coverage verdict, so this check
+    covers every captured row rather than only the admitted ones. It is not a
+    silent filter: an invisible row is refused, never dropped.
     """
     if not observations:
         return
@@ -590,6 +714,99 @@ def _assert_replay_visibility(
         item.availability_stamp(source_version=source_version) for item in observations
     )
     assert_point_in_time(stamps, decision_at_utc=evaluated_at_utc)
+
+
+@dataclass(frozen=True)
+class ReplayResult:
+    """One replayed cycle: the sealed snapshot plus the inputs it came from."""
+
+    snapshot: FeatureSnapshot
+    prior_state: RollingState
+    state: RollingState
+    cycle_alignment: AlignmentResult
+    rolling_alignment: AlignmentResult
+
+
+def replay_cycle(
+    evidence: ReplayEvidence,
+    *,
+    instrument_version: InstrumentVersion,
+    evaluation_cutoff: datetime,
+    evaluated_at_utc: datetime,
+    consumed_input_watermark: ConsumedInputWatermark,
+    source_version: str,
+    declared_feature_version: str = FEATURE_VERSION,
+    interval_seconds: int = DEFAULT_INTERVAL_SECONDS,
+) -> ReplayResult:
+    """Replay one captured cycle through the production Feature Bus path.
+
+    The order mirrors ``pipeline.run_cycle`` exactly, minus publication:
+
+        prior state -> align(evidence, coverage_only) -> advance state
+                    -> snapshot from retained candidate state
+
+    The snapshot is therefore built from ``alignment_from_state(candidate)``
+    with the cycle alignment supplied as freshness and
+    ``candidate.restart_state`` passed through, which is what production does.
+    Building it from the fetched rows alone would misreport any resumed cycle.
+
+    A declared feature version other than this engine's ``FEATURE_VERSION``, or
+    retained state that is missing when the capture declares a resume, is
+    refused before any value is computed.
+    """
+    _require_feature_version(declared_feature_version)
+    prior = _retained_state(
+        evidence,
+        instrument_version=instrument_version,
+        interval_seconds=interval_seconds,
+    )
+    loaded_evidence = load_observation_evidence(evidence.evidence)
+    loaded_coverage_only = load_observation_evidence(evidence.coverage_only)
+    captured = (*loaded_evidence, *loaded_coverage_only)
+    _assert_replay_identity(
+        captured, instrument_version=instrument_version, state=prior
+    )
+    _assert_replay_visibility(
+        captured, evaluated_at_utc=evaluated_at_utc, source_version=source_version
+    )
+    alignment = _replay_alignment(
+        loaded_evidence,
+        coverage_only=loaded_coverage_only,
+        evaluation_cutoff=evaluation_cutoff,
+        interval_seconds=interval_seconds,
+        window_start=evidence.window_start,
+        source_incomplete=evidence.source_incomplete,
+    )
+    _assert_cutoff_population(alignment, evaluation_cutoff=evaluation_cutoff)
+    eligible = _eligible_evidence(alignment)
+    _require_consistent_content(captured, eligible)
+    _require_consumed_watermark(
+        eligible,
+        prior_state=prior,
+        consumed_input_watermark=consumed_input_watermark,
+    )
+    candidate = advance_state(prior, alignment.observations).state
+    rolling = alignment_from_state(candidate)
+    snapshot = build_feature_snapshot(
+        rolling,
+        instrument_version=instrument_version,
+        evaluation_cutoff=evaluation_cutoff,
+        evaluated_at_utc=evaluated_at_utc,
+        consumed_input_watermark=consumed_input_watermark,
+        restart_state=candidate.restart_state,
+        source_version=source_version,
+        freshness_alignment=alignment,
+    )
+    _assert_availability_matches_production(
+        snapshot, alignment, rolling, source_version=source_version
+    )
+    return ReplayResult(
+        snapshot=snapshot,
+        prior_state=prior,
+        state=candidate,
+        cycle_alignment=alignment,
+        rolling_alignment=rolling,
+    )
 
 
 def replay_feature_snapshot(
@@ -604,61 +821,50 @@ def replay_feature_snapshot(
     window_start: datetime | None = None,
     source_incomplete: bool = False,
 ) -> FeatureSnapshot:
-    """Feed frozen observations through the existing feature bus.
+    """Replay a declared cold start whose whole history is in one fetch.
 
-    ``window_start`` and ``source_incomplete`` are the alignment context the
-    production cycle was given; replaying without them can derive a different
-    coverage verdict from the same rows.
-
-    A declared feature version other than this engine's ``FEATURE_VERSION``
-    is refused before any value is computed. Evidence that does not belong to
-    the supplied ``InstrumentVersion``, or that was not visible at
-    ``evaluated_at_utc``, is refused before alignment. No fact still open at
-    ``evaluation_cutoff`` may reach the sealed snapshot through coverage. The
-    evidence the snapshot then depends on must be self-consistent, must be
-    covered by ``consumed_input_watermark``, and must be visible no later than
-    the snapshot itself claims.
+    This is the convenience form for a first cycle: every row is feature
+    evidence, no retained state exists, and the capture says so. A resumed
+    cycle must go through :func:`replay_cycle` with its retained state, because
+    identical rows produce a different snapshot once history is retained.
     """
-    _require_feature_version(declared_feature_version)
-    _assert_replay_identity(observations, instrument_version=instrument_version)
-    _assert_replay_visibility(
-        observations, evaluated_at_utc=evaluated_at_utc, source_version=source_version
-    )
-    alignment = _replay_alignment(
+    evidence = capture_replay_evidence(
         observations,
-        evaluation_cutoff=evaluation_cutoff,
         window_start=window_start,
         source_incomplete=source_incomplete,
     )
-    _assert_cutoff_population(alignment, evaluation_cutoff=evaluation_cutoff)
-    eligible = _eligible_evidence(alignment)
-    _require_consistent_content(observations, eligible)
-    _require_consumed_watermark(
-        eligible,
-        consumed_input_watermark=consumed_input_watermark,
-    )
-    snapshot = build_feature_snapshot(
-        alignment,
+    return replay_cycle(
+        evidence,
         instrument_version=instrument_version,
         evaluation_cutoff=evaluation_cutoff,
         evaluated_at_utc=evaluated_at_utc,
         consumed_input_watermark=consumed_input_watermark,
         source_version=source_version,
-    )
-    _assert_visibility_covers_inputs(snapshot, eligible, source_version=source_version)
-    return snapshot
+        declared_feature_version=declared_feature_version,
+    ).snapshot
 
 
 def _replay_alignment(
     observations: Sequence[Observation],
     *,
+    coverage_only: Sequence[Observation] = (),
     evaluation_cutoff: datetime,
+    interval_seconds: int = DEFAULT_INTERVAL_SECONDS,
     window_start: datetime | None,
     source_incomplete: bool,
 ) -> AlignmentResult:
-    """Alignment exactly as the production cycle would have derived it."""
+    """Alignment exactly as the production cycle would have derived it.
+
+    ``coverage_only`` keeps expected-window continuity without contributing
+    feature evidence, and ``window_start`` bounds gap detection; omitting
+    either derives a different coverage verdict from the same rows.
+    """
     alignment = align_minute_observations(
-        observations, cutoff=evaluation_cutoff, window_start=window_start
+        observations,
+        cutoff=evaluation_cutoff,
+        interval_seconds=interval_seconds,
+        window_start=window_start,
+        coverage_only=coverage_only,
     )
     if source_incomplete:
         return replace(alignment, source_incomplete=True)
@@ -675,43 +881,42 @@ def replay_captured_evidence(
     source_version: str,
     declared_feature_version: str = FEATURE_VERSION,
 ) -> tuple[FeatureSnapshot, ClassifiedParityReport]:
-    """Load captured evidence, replay it twice, and classify parity."""
+    """Replay a captured cycle twice and classify parity on the sealed snapshot."""
     _require_feature_version(declared_feature_version)
     evidence = load_replay_evidence(payload)
-    loaded = load_observation_evidence(evidence.observations)
-    replay_kwargs = {
-        "instrument_version": instrument_version,
-        "evaluation_cutoff": evaluation_cutoff,
-        "evaluated_at_utc": evaluated_at_utc,
-        "consumed_input_watermark": consumed_input_watermark,
-        "source_version": source_version,
-        "declared_feature_version": declared_feature_version,
-        "window_start": evidence.window_start,
-        "source_incomplete": evidence.source_incomplete,
-    }
-    first = replay_feature_snapshot(loaded, **replay_kwargs)
-    second = replay_feature_snapshot(loaded, **replay_kwargs)
-    assert_snapshot_determinism((first, second))
+    first = replay_cycle(
+        evidence,
+        instrument_version=instrument_version,
+        evaluation_cutoff=evaluation_cutoff,
+        evaluated_at_utc=evaluated_at_utc,
+        consumed_input_watermark=consumed_input_watermark,
+        source_version=source_version,
+        declared_feature_version=declared_feature_version,
+    )
+    second = replay_cycle(
+        evidence,
+        instrument_version=instrument_version,
+        evaluation_cutoff=evaluation_cutoff,
+        evaluated_at_utc=evaluated_at_utc,
+        consumed_input_watermark=consumed_input_watermark,
+        source_version=source_version,
+        declared_feature_version=declared_feature_version,
+    )
+    assert_snapshot_determinism(
+        (first.snapshot, second.snapshot)
+    )
     report = classify_shadow_parity(
-        _replay_alignment(
-            loaded,
-            evaluation_cutoff=evaluation_cutoff,
-            window_start=evidence.window_start,
-            source_incomplete=evidence.source_incomplete,
-        ),
-        bus_values=first.values,
+        first.rolling_alignment,
+        bus_values=first.snapshot.values,
         instrument_version=instrument_version,
         evaluated_at_utc=evaluated_at_utc,
         evidence_identity=source_evidence_identity(
-            loaded,
-            evaluation_cutoff=evaluation_cutoff,
-            window_start=evidence.window_start,
-            source_incomplete=evidence.source_incomplete,
+            evidence, evaluation_cutoff=evaluation_cutoff
         ),
-        feature_version=first.feature_version,
-        snapshot_id=first.snapshot_id,
+        feature_version=first.snapshot.feature_version,
+        snapshot_id=first.snapshot.snapshot_id,
     )
-    return first, report
+    return first.snapshot, report
 
 
 def classify_shadow_parity(
@@ -1212,6 +1417,9 @@ def _parse_time(value: Any, field_name: str) -> datetime:
 
 __all__ = [
     "CLASSIFICATIONS",
+    "CYCLE_ORIGIN_COLD_START",
+    "CYCLE_ORIGIN_RESUMED",
+    "CYCLE_ORIGINS",
     "EXACT_EQUALITY_RULE",
     "REPLAY_EVIDENCE_RECORD_TYPE",
     "REPLAY_EVIDENCE_SCHEMA_VERSION",
@@ -1219,6 +1427,7 @@ __all__ = [
     "EvidenceIntegrityError",
     "FeatureVersionMismatch",
     "ReplayEvidence",
+    "ReplayResult",
     "WatermarkIntegrityError",
     "ClassifiedParityReport",
     "ClassifiedParityRow",
@@ -1228,6 +1437,7 @@ __all__ = [
     "load_observation_evidence",
     "load_replay_evidence",
     "replay_captured_evidence",
+    "replay_cycle",
     "replay_feature_snapshot",
     "source_evidence_identity",
 ]

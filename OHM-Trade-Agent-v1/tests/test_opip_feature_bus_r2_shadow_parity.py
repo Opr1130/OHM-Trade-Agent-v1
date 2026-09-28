@@ -9,10 +9,16 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Mapping
 
 import pytest
 
-from app.opip.contracts.enums import CoverageState, Missingness, PayloadKind
+from app.opip.contracts.enums import (
+    CoverageState,
+    Missingness,
+    PayloadKind,
+    RestartState,
+)
 from app.opip.contracts.identity import ConsumedInputWatermark, InstrumentVersion
 from app.opip.contracts.observation import OBSERVATION_SCHEMA_VERSION
 from app.opip.contracts.temporal import TemporalIntegrityError
@@ -25,6 +31,8 @@ from app.opip.features.pipeline import CycleIdentityMismatch
 from app.opip.features.publisher import resolve_feature_bus_mode
 from app.opip.features.r2_shadow_parity import (
     CLASSIFICATIONS,
+    CYCLE_ORIGIN_COLD_START,
+    CYCLE_ORIGIN_RESUMED,
     REPLAY_EVIDENCE_RECORD_TYPE,
     REPLAY_EVIDENCE_SCHEMA_VERSION,
     EvidenceIntegrityError,
@@ -35,11 +43,17 @@ from app.opip.features.r2_shadow_parity import (
     load_observation_evidence,
     load_replay_evidence,
     replay_captured_evidence,
+    replay_cycle,
     replay_feature_snapshot,
     source_evidence_identity,
 )
 from app.opip.features.replay import compare_resumed_state, reconstruct_state
-from app.opip.features.state import advance_state, initial_state, to_checkpoint
+from app.opip.features.state import (
+    RollingState,
+    advance_state,
+    initial_state,
+    to_checkpoint,
+)
 from app.opip.market.aggregates import align_minute_observations
 from app.opip.market.observations import IntervalRow, normalize_interval_rows
 
@@ -141,9 +155,15 @@ def _replay(
     watermark: ConsumedInputWatermark | None = None,
     window_start: datetime | None = None,
     source_incomplete: bool = False,
+    prior_state=None,
+    coverage_only=(),
 ):
     evidence = capture_replay_evidence(
-        observations, window_start=window_start, source_incomplete=source_incomplete
+        observations,
+        prior_state=prior_state,
+        coverage_only=coverage_only,
+        window_start=window_start,
+        source_incomplete=source_incomplete,
     )
     if evaluated_at is None:
         evaluated_at = NOW if NOW >= cutoff else cutoff
@@ -158,6 +178,72 @@ def _replay(
         source_version=SOURCE,
         declared_feature_version=version,
     )
+
+
+def _replay_result(
+    observations,
+    *,
+    prior_state=None,
+    coverage_only=(),
+    cutoff: datetime = CUTOFF,
+    evaluated_at: datetime | None = None,
+    instrument: InstrumentVersion | None = None,
+    watermark: ConsumedInputWatermark | None = None,
+):
+    """Replay a captured cycle and keep the whole result, not just the snapshot.
+
+    When a prior state is supplied the watermark defaults to that state's, since
+    the cycle it resumed from necessarily consumed at least that much.
+    """
+    if watermark is None:
+        watermark = ConsumedInputWatermark.zero()
+        prior_mapping = None
+        if isinstance(prior_state, RollingState):
+            watermark = max(watermark, prior_state.consumed_input_watermark)
+        elif isinstance(prior_state, Mapping):
+            prior_mapping = prior_state
+        elif prior_state is not None:
+            prior_mapping = prior_state.to_dict()
+        if prior_mapping is not None:
+            raw = prior_mapping.get("consumed_input_watermark")
+            if isinstance(raw, Mapping):
+                watermark = max(
+                    watermark,
+                    ConsumedInputWatermark(
+                        history_epoch=int(raw.get("history_epoch", 0) or 0),
+                        local_sequence=int(raw.get("local_sequence", 0) or 0),
+                    ),
+                )
+        if observations:
+            watermark = max(watermark, _watermark(observations))
+        if coverage_only:
+            watermark = max(watermark, _watermark(coverage_only))
+    evidence = capture_replay_evidence(
+        observations, prior_state=prior_state, coverage_only=coverage_only
+    )
+    return replay_cycle(
+        evidence,
+        instrument_version=instrument or _instrument(),
+        evaluation_cutoff=cutoff,
+        evaluated_at_utc=evaluated_at if evaluated_at is not None else NOW,
+        consumed_input_watermark=watermark,
+        source_version=SOURCE,
+    )
+
+
+def _resumed_case(*, retained_count: int = FEATURE_WINDOW_INTERVALS, tip_count: int = 2):
+    """A real resume: retained window plus genuinely new tip intervals."""
+    rows = _rows(count=retained_count + tip_count)
+    observations, _normalized = _observations(rows)
+    retained = advance_state(initial_state(_instrument()), observations[:retained_count]).state
+    tip = observations[retained_count:]
+    assert retained.interval_count == retained_count
+    assert tip, "the tip must contain new intervals"
+    assert min(item.source_event_time for item in tip) > max(
+        retained.interval_start_at(index)
+        for index in range(retained.interval_count)
+    )
+    return observations, retained, tip
 
 
 def _row_map(report):
@@ -507,7 +593,7 @@ def test_parity_uses_snapshot_values_when_the_last_bar_precedes_cutoff():
     assert report.counts()["IMPLEMENTATION_DEFECT"] == 0
     assert report.snapshot_id == snapshot.snapshot_id
     assert report.source_evidence_identity == source_evidence_identity(
-        observations, evaluation_cutoff=CUTOFF
+        capture_replay_evidence(observations), evaluation_cutoff=CUTOFF
     )
     assert report.feature_version == snapshot.feature_version
     indicator_rows = {
@@ -551,10 +637,10 @@ def test_watermark_earlier_than_captured_evidence_is_rejected():
 def test_mixed_commit_order_evidence_cannot_prove_its_watermark():
     observations, _normalized = _observations(_rows(count=5))
     payload = capture_replay_evidence(observations).to_dict()
-    payload["observations"][0] = dict(payload["observations"][0])
-    payload["observations"][0]["history_epoch"] = None
-    payload["observations"][0]["local_sequence"] = None
-    loaded = load_observation_evidence(payload["observations"])
+    payload["evidence"][0] = dict(payload["evidence"][0])
+    payload["evidence"][0]["history_epoch"] = None
+    payload["evidence"][0]["local_sequence"] = None
+    loaded = load_observation_evidence(payload["evidence"])
     assert loaded[0].commit_order is None
     assert loaded[-1].commit_order is not None
     with pytest.raises(WatermarkIntegrityError, match="mixes committed"):
@@ -585,13 +671,13 @@ def test_uncommitted_forming_bar_does_not_break_the_watermark():
     assert len(forming) == 1
     assert max(item.commit_order for item in closed) < forming[0].commit_order
     payload = capture_replay_evidence(observations).to_dict()
-    for index, row in enumerate(payload["observations"]):
+    for index, row in enumerate(payload["evidence"]):
         if row["observation_id"] == forming[0].observation_id:
             row = dict(row)
             row["history_epoch"] = None
             row["local_sequence"] = None
-            payload["observations"][index] = row
-    loaded = load_observation_evidence(payload["observations"])
+            payload["evidence"][index] = row
+    loaded = load_observation_evidence(payload["evidence"])
     assert tuple(item.commit_order for item in loaded if item.interval_forming) == (None,)
     snapshot, report = replay_captured_evidence(
         payload,
@@ -609,14 +695,14 @@ def test_uncommitted_forming_bar_does_not_break_the_watermark():
 def test_fully_uncommitted_evidence_carries_no_watermark_claim():
     observations, _normalized = _observations(_rows(count=5))
     payload = capture_replay_evidence(observations).to_dict()
-    for index, row in enumerate(payload["observations"]):
+    for index, row in enumerate(payload["evidence"]):
         row = dict(row)
         row["history_epoch"] = None
         row["local_sequence"] = None
-        payload["observations"][index] = row
+        payload["evidence"][index] = row
     assert all(
         item.commit_order is None
-        for item in load_observation_evidence(payload["observations"])
+        for item in load_observation_evidence(payload["evidence"])
     )
     snapshot, _report = replay_captured_evidence(
         payload,
@@ -731,27 +817,271 @@ def test_same_epoch_at_a_different_cadence_is_not_a_conflict():
     assert report.counts()["IMPLEMENTATION_DEFECT"] == 0
 
 
-def test_visibility_understating_its_inputs_is_refused():
+def test_availability_matches_the_production_derivation():
     observations, _normalized = _observations(_rows(count=5))
     later = NOW + timedelta(minutes=30)
-    # Pre-cutoff, pre-evaluation, received after the admitted bars: it changes
-    # coverage, so the snapshot may not claim an earlier visible_at than this.
+    # A coverage-affecting row received after the admitted bars. Production
+    # derives availability from the contiguous feature tail of the cycle
+    # alignment, so it does not move the sealed stamp; replay must reproduce
+    # that derivation rather than invent a wider one.
     covered = replace(
         _wrong_cadence(observations[2], epoch=CUTOFF - timedelta(minutes=6)),
         receipt_time=later,
     )
     assert covered.receipt_time > max(item.receipt_time for item in observations)
-    with pytest.raises(TemporalIntegrityError, match="understate"):
-        _replay(
-            observations + (covered,),
-            evaluated_at=later + timedelta(minutes=1),
+    result = _replay_result(
+        observations + (covered,),
+        evaluated_at=later + timedelta(minutes=1),
+    )
+    assert result.snapshot.coverage is CoverageState.INCOMPLETE_COVERAGE
+    tail = result.cycle_alignment.observations
+    assert result.snapshot.availability.visible_at_utc == max(
+        item.availability_stamp(source_version=SOURCE).visible_at_utc for item in tail
+    )
+    assert result.snapshot.availability.visible_at_utc == NOW
+
+
+def test_roll_forward_uses_retained_state_not_the_flat_fetch():
+    """A resumed cycle must not be reproduced from the tip rows alone."""
+    _all, retained, tip = _resumed_case()
+    cold = _replay_result(tip)
+    resumed = _replay_result(tip, prior_state=retained)
+    # The flat-fetch reconstruction cannot compute a slow EMA from two bars.
+    assert cold.snapshot.values["ema_slow_21"] is None
+    assert cold.state.interval_count == len(tip)
+    # The resumed replay rebuilds the full retained window, exactly as production.
+    assert resumed.state.interval_count == FEATURE_WINDOW_INTERVALS
+    assert resumed.snapshot.values["ema_slow_21"] is not None
+    assert resumed.snapshot.values["ema_slow_21"] != cold.snapshot.values["ema_slow_21"]
+    assert resumed.snapshot.values["contiguous_intervals"] == FEATURE_WINDOW_INTERVALS
+    assert resumed.snapshot.restart_state is RestartState.WARM
+    assert resumed.snapshot.content_hash() != cold.snapshot.content_hash()
+
+
+def test_replay_matches_the_production_cycle_snapshot():
+    """The replayed snapshot is byte-identical to the production path's."""
+    from app.opip.features import pipeline
+
+    _all, retained, tip = _resumed_case()
+    result = _replay_result(tip, prior_state=retained)
+    # Production's own snapshot builder, driven with the same inputs run_cycle
+    # would derive in dry-run mode: watermark advanced by the consumed rows.
+    candidate = result.state
+    expected, _checkpoint = pipeline._build_snapshot_and_checkpoint(
+        state=candidate,
+        alignment=result.cycle_alignment,
+        instrument_version=_instrument(),
+        evaluation_cutoff=CUTOFF,
+        evaluated_at_utc=NOW,
+        source_version=SOURCE,
+    )
+    assert result.snapshot.to_dict() == expected.to_dict()
+    assert result.snapshot.content_hash() == expected.content_hash()
+    assert result.snapshot.snapshot_id == expected.snapshot_id
+
+
+def test_coverage_only_rows_are_not_treated_as_feature_evidence():
+    """A withheld tip re-poll keeps continuity without adding feature values."""
+    observations, _normalized = _observations(
+        _rows(count=FEATURE_WINDOW_INTERVALS)
+    )
+    retained = advance_state(initial_state(_instrument()), observations).state
+    # The retained tip re-polled unchanged: production keeps it coverage-only.
+    repoll = observations[-1:]
+    watermark = max(
+        retained.consumed_input_watermark, _watermark(observations), _watermark(repoll)
+    )
+    plain = _replay_result((), prior_state=retained, watermark=watermark)
+    withheld = _replay_result(
+        (), prior_state=retained, coverage_only=repoll, watermark=watermark
+    )
+    # Coverage-only continuity fills the expected window but adds no bar.
+    assert withheld.snapshot.values["contiguous_intervals"] == retained.interval_count
+    assert withheld.snapshot.values["coverage_ratio"] == 1.0
+    assert plain.snapshot.values["coverage_ratio"] == 0.0
+    assert withheld.snapshot.values["missing_intervals"] == 0
+    # And it is never folded into feature evidence: the retained series is the
+    # same, so every rolling value is unchanged.
+    assert withheld.state.interval_count == retained.interval_count
+    for name, value in plain.snapshot.values.items():
+        if name in ("coverage_ratio", "missing_intervals", "late_arrival_count"):
+            continue
+        assert withheld.snapshot.values[name] == value, name
+    assert withheld.snapshot.content_hash() != plain.snapshot.content_hash()
+
+
+def test_resumed_cycle_without_retained_state_fails_closed():
+    observations, _normalized = _observations(_rows(count=5))
+    # A hand-written envelope cannot claim a resume and omit the retained state.
+    payload = capture_replay_evidence(observations).to_dict()
+    payload["cycle_origin"] = CYCLE_ORIGIN_RESUMED
+    with pytest.raises(ValueError, match="requires prior retained state"):
+        load_replay_evidence(payload)
+    # Nor can it omit the field entirely.
+    payload = capture_replay_evidence(observations).to_dict()
+    del payload["prior_state"]
+    with pytest.raises(ValueError, match="missing required keys"):
+        load_replay_evidence(payload)
+
+
+def test_cold_start_cannot_declare_retained_state_or_coverage_only():
+    observations, _normalized = _observations(_rows(count=5))
+    retained = advance_state(initial_state(_instrument()), observations).state
+    payload = capture_replay_evidence(observations, prior_state=retained).to_dict()
+    payload["cycle_origin"] = CYCLE_ORIGIN_COLD_START
+    with pytest.raises(ValueError, match="cold start but carries prior"):
+        load_replay_evidence(payload)
+    payload = capture_replay_evidence(observations).to_dict()
+    payload["coverage_only"] = [dict(item) for item in payload["evidence"]]
+    with pytest.raises(ValueError, match="cold start with coverage-only"):
+        load_replay_evidence(payload)
+    with pytest.raises(ValueError, match="not one of"):
+        load_replay_evidence(
+            {**capture_replay_evidence(observations).to_dict(), "cycle_origin": "mid"}
         )
-    # The same row, received with the admitted bars, is admissible.
-    on_time = replace(covered, receipt_time=NOW)
-    snapshot, report = _replay(observations + (on_time,))
-    assert snapshot.coverage is CoverageState.INCOMPLETE_COVERAGE
-    assert snapshot.availability.visible_at_utc == NOW
-    assert report.counts()["IMPLEMENTATION_DEFECT"] == 0
+
+
+def test_retained_state_identity_and_version_mismatch_fails_closed():
+    observations, _normalized = _observations(_rows(count=5))
+    retained = advance_state(initial_state(_instrument()), observations).state
+    other = advance_state(initial_state(_instrument(version=2)), observations).state
+    with pytest.raises(CycleIdentityMismatch, match="instrument_version_id"):
+        _replay(observations, prior_state=other)
+    payload = capture_replay_evidence(observations, prior_state=retained).to_dict()
+    payload["prior_state"] = dict(payload["prior_state"])
+    payload["prior_state"]["feature_version"] = "features-v0"
+    with pytest.raises(CycleIdentityMismatch, match="feature_version"):
+        _replay(observations, prior_state=load_replay_evidence(payload).prior_state)
+    # Corrupt retained state is refused by the canonical loader, not repaired.
+    payload = capture_replay_evidence(observations, prior_state=retained).to_dict()
+    payload["prior_state"] = dict(payload["prior_state"])
+    payload["prior_state"]["consumed_input_watermark"] = {"history_epoch": True}
+    with pytest.raises(ValueError):
+        _replay_result(
+            observations,
+            prior_state=load_replay_evidence(payload).prior_state,
+        )
+
+
+def test_watermark_may_not_precede_the_resumed_state():
+    observations, _normalized = _observations(_rows(count=FEATURE_WINDOW_INTERVALS))
+    retained = advance_state(initial_state(_instrument()), observations).state
+    assert retained.consumed_input_watermark.history_epoch == 1
+    below = ConsumedInputWatermark(
+        history_epoch=1, local_sequence=retained.consumed_input_watermark.local_sequence - 1
+    )
+    with pytest.raises(WatermarkIntegrityError, match="precedes"):
+        _replay(observations[-2:], prior_state=retained, watermark=below)
+
+
+# --------------------------------------------------------------------------- #
+# restart_state - cold start, warm, and checkpoint warmup
+# --------------------------------------------------------------------------- #
+
+
+def test_cold_start_short_history_reports_new_listing_cold_start():
+    observations, _normalized = _observations(_rows(count=5))
+    result = _replay_result(observations)
+    assert result.snapshot.restart_state is RestartState.NEW_LISTING_COLD_START
+    assert result.prior_state.interval_count == 0
+    assert result.state.restart_state is RestartState.NEW_LISTING_COLD_START
+    assert result.snapshot.values["ema_slow_21"] is None
+
+
+def test_warm_state_reports_warm():
+    observations, _normalized = _observations(_rows(count=FEATURE_WINDOW_INTERVALS))
+    retained = advance_state(initial_state(_instrument()), observations).state
+    assert retained.warm
+    cold = _replay_result(observations)
+    resumed = _replay_result(observations, prior_state=retained)
+    assert resumed.snapshot.restart_state is RestartState.WARM
+    assert cold.snapshot.restart_state is RestartState.WARM
+    # Identical rows, identical restart state here, but replay proves the pass-through.
+    assert resumed.snapshot.restart_state is resumed.state.restart_state
+
+
+def test_checkpoint_warmup_state_matches_production():
+    # Enough history for the fast EMA, but short of the warm threshold.
+    observations, _normalized = _observations(_rows(count=30))
+    retained = advance_state(initial_state(_instrument()), observations).state
+    assert not retained.warm
+    # A checkpoint resume that has not reached the warm threshold.
+    result = _replay_result((), prior_state=retained)
+    assert result.prior_state.resumed_from_checkpoint is True
+    assert result.snapshot.restart_state is RestartState.RESTART_WARMUP
+    assert result.state.restart_state is RestartState.RESTART_WARMUP
+    # And the snapshot keeps the state production passes, not a WARM default.
+    assert result.snapshot.restart_state is not RestartState.WARM
+    assert result.snapshot.values["ema_fast_9"] is not None
+    assert result.snapshot.values["ema_slow_21"] is not None
+
+
+def test_restart_state_survives_the_evidence_round_trip():
+    observations, _normalized = _observations(_rows(count=30))
+    retained = advance_state(initial_state(_instrument()), observations).state
+    captured = capture_replay_evidence(observations, prior_state=retained)
+    restored = load_replay_evidence(captured.to_dict())
+    first = _replay_result(observations, prior_state=retained)
+    second = _replay_result(observations, prior_state=restored.prior_state)
+    assert first.snapshot.to_dict() == second.snapshot.to_dict()
+    assert first.snapshot.restart_state is second.snapshot.restart_state
+    assert first.snapshot.content_hash() == second.snapshot.content_hash()
+
+
+def test_corrupt_restart_state_evidence_fails_closed():
+    observations, _normalized = _observations(_rows(count=5))
+    retained = advance_state(initial_state(_instrument()), observations).state
+    for value in ("NOT_A_STATE", None, 7):
+        payload = capture_replay_evidence(observations, prior_state=retained).to_dict()
+        payload["prior_state"] = dict(payload["prior_state"])
+        payload["prior_state"]["restart_state"] = value
+        with pytest.raises(EvidenceIntegrityError, match="retained state"):
+            _replay_result(
+                observations,
+                prior_state=load_replay_evidence(payload).prior_state,
+            )
+    # A retained state missing its restart-state evidence is refused, not
+    # defaulted to WARM.
+    payload = capture_replay_evidence(observations, prior_state=retained).to_dict()
+    payload["prior_state"] = dict(payload["prior_state"])
+    del payload["prior_state"]["restart_state"]
+    with pytest.raises(EvidenceIntegrityError, match="retained state"):
+        _replay_result(
+            observations,
+            prior_state=load_replay_evidence(payload).prior_state,
+        )
+
+
+def test_replayed_snapshot_is_deterministic_for_a_resumed_cycle():
+    _all, retained, tip = _resumed_case()
+    evidence = capture_replay_evidence(tip, prior_state=retained)
+    first, first_report = _replay(tip, prior_state=retained)
+    second, second_report = _replay(tip, prior_state=retained)
+    assert first.to_dict() == second.to_dict()
+    assert first_report.to_dict() == second_report.to_dict()
+    assert first_report.snapshot_id == first.snapshot_id
+    assert first_report.source_evidence_identity == source_evidence_identity(
+        evidence, evaluation_cutoff=CUTOFF
+    )
+    assert first_report.counts()["IMPLEMENTATION_DEFECT"] == 0
+    # The parity report describes the retained-state series the snapshot used,
+    # not just the two fetched tip rows.
+    result = _replay_result(tip, prior_state=retained)
+    assert len(result.rolling_alignment.observations) == FEATURE_WINDOW_INTERVALS
+    assert result.rolling_alignment.expected_intervals == FEATURE_WINDOW_INTERVALS
+    assert len(result.cycle_alignment.observations) == len(tip)
+
+
+def test_retained_state_changes_the_evidence_identity():
+    observations, _normalized = _observations(_rows(count=5))
+    retained = advance_state(initial_state(_instrument()), observations).state
+    cold = capture_replay_evidence(observations)
+    resumed = capture_replay_evidence(observations, prior_state=retained)
+    assert cold.cycle_origin == CYCLE_ORIGIN_COLD_START
+    assert resumed.cycle_origin == CYCLE_ORIGIN_RESUMED
+    assert source_evidence_identity(
+        cold, evaluation_cutoff=CUTOFF
+    ) != source_evidence_identity(resumed, evaluation_cutoff=CUTOFF)
 
 
 def test_committed_misaligned_row_above_the_watermark_is_refused():
@@ -888,7 +1218,6 @@ def test_window_start_is_replayed_and_bound_into_the_identity():
     rows = _rows(count=5)
     observations, _normalized = _observations(rows)
     window_start = CUTOFF - timedelta(minutes=30)
-    without = capture_replay_evidence(observations)
     with_window = capture_replay_evidence(observations, window_start=window_start)
     assert with_window.window_start == window_start
     assert load_replay_evidence(with_window.to_dict()) == with_window
@@ -902,9 +1231,7 @@ def test_window_start_is_replayed_and_bound_into_the_identity():
     assert left_report.source_evidence_identity != right_report.source_evidence_identity
     assert (
         right_report.source_evidence_identity
-        == source_evidence_identity(
-            observations, evaluation_cutoff=CUTOFF, window_start=window_start
-        )
+        == source_evidence_identity(with_window, evaluation_cutoff=CUTOFF)
     )
 
 
@@ -926,8 +1253,12 @@ def test_captured_evidence_envelope_is_strictly_validated():
     good = capture_replay_evidence(observations).to_dict()
     assert good["record_type"] == REPLAY_EVIDENCE_RECORD_TYPE
     assert good["schema_version"] == REPLAY_EVIDENCE_SCHEMA_VERSION
+    assert good["cycle_origin"] == CYCLE_ORIGIN_COLD_START
+    assert good["prior_state"] is None
+    assert load_replay_evidence(good).cycle_origin == CYCLE_ORIGIN_COLD_START
     for mutate, message in (
         (lambda row: row.pop("window_start"), "missing required keys"),
+        (lambda row: row.pop("coverage_only"), "missing required keys"),
         (lambda row: row.update({"notes": "drift"}), "unexpected keys"),
         (lambda row: row.update({"record_type": "Other"}), "record_type"),
         (
@@ -938,6 +1269,8 @@ def test_captured_evidence_envelope_is_strictly_validated():
             lambda row: row.update({"window_start": "2026-09-11T15:00Z"}),
             "not the canonical",
         ),
+        (lambda row: row.update({"schema_version": 1}), "schema_version"),
+        (lambda row: row.update({"evidence": "nope"}), "evidence must be a sequence"),
     ):
         payload = capture_replay_evidence(observations).to_dict()
         mutate(payload)
@@ -1145,3 +1478,4 @@ def test_identity_bearing_mutation_with_stale_observation_id_is_rejected():
     assert payload[1]["observation_id"] == original_id
     with pytest.raises(ValueError, match="does not match"):
         load_observation_evidence(payload)
+
