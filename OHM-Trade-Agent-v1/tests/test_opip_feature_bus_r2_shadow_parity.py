@@ -1126,6 +1126,14 @@ def test_unsupported_nested_rolling_state_is_refused():
             "last_receipt_epoch",
         ),
         (lambda rs: rs.update({"last_receipt_epoch": True}), "last_receipt_epoch"),
+        # ``revisions`` is an integer series that ``from_checkpoint`` rebuilds
+        # with ``int(...)``: a fractional, boolean, numeric-string, or mixed
+        # entry must be refused here rather than silently coerced into a
+        # revision the durable payload never declared.
+        (lambda rs: rs.update({"revisions": 1.5}), "revisions"),
+        (lambda rs: rs.update({"revisions": True}), "revisions"),
+        (lambda rs: rs.update({"revisions": "1"}), "revisions"),
+        (lambda rs: rs.update({"revisions": [1, 1.5]}), "revisions"),
     ):
         payload = _capture(observations, prior_state=retained).to_dict()
         payload["prior_state"] = dict(payload["prior_state"])
@@ -1147,6 +1155,28 @@ def test_unsupported_nested_rolling_state_is_refused():
     assert (
         _replay_evidence_result(intact).snapshot.to_dict()
         == _replay_evidence_result(restored).snapshot.to_dict()
+    )
+    # A genuine integer revision survives reconstruction unchanged: the replayed
+    # slot is the exact integer the payload declared, not a coerced twin.
+    integer_payload = _capture(observations, prior_state=retained).to_dict()
+    integer_payload["prior_state"] = dict(integer_payload["prior_state"])
+    integer_payload["prior_state"]["checkpoint"] = dict(
+        integer_payload["prior_state"]["checkpoint"]
+    )
+    integer_rolling = dict(
+        integer_payload["prior_state"]["checkpoint"]["rolling_state"]
+    )
+    expected_revision = 7
+    integer_rolling["revisions"] = [
+        *list(integer_rolling["revisions"])[:-1],
+        expected_revision,
+    ]
+    integer_payload["prior_state"]["checkpoint"]["rolling_state"] = integer_rolling
+    replayed = _replay_evidence_result(load_replay_evidence(integer_payload))
+    recovered_revision = replayed.state.revisions[-1]
+    assert recovered_revision == expected_revision
+    assert isinstance(recovered_revision, int) and not isinstance(
+        recovered_revision, bool
     )
 
 

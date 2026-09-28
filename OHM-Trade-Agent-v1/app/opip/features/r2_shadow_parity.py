@@ -602,7 +602,13 @@ def _rolling_state_evidence(payload: Mapping[str, Any]) -> None:
     payload declaring an aligned integer plus a fraction is therefore refused
     here rather than truncated by ``from_checkpoint``: without this check the
     durable payload would declare one interval horizon while replay silently
-    reconstructed another. Booleans are rejected even though they are ``int``
+    reconstructed another. ``revisions`` is held to the same rule for the same
+    reason: ``from_checkpoint`` rebuilds each slot through ``int(...)``, so a
+    fractional, boolean, or numeric-string entry would be coerced into a
+    different durable revision. The checkpoint contract stores numeric lists as
+    floats, so an exactly integral float is the canonical durable spelling of an
+    integer revision and is accepted; anything else is refused, which keeps that
+    coercion unreachable. Booleans are rejected even though they are ``int``
     subclasses, and ``last_receipt_epoch`` is validated as a finite number so a
     NaN or infinity cannot reach ``datetime.fromtimestamp``.
     """
@@ -619,6 +625,25 @@ def _rolling_state_evidence(payload: Mapping[str, Any]) -> None:
         raise ValueError(
             f"captured retained state rolling_state has unexpected keys: {unexpected}"
         )
+    revisions = rolling["revisions"]
+    if isinstance(revisions, (str, bytes)) or not isinstance(revisions, Sequence):
+        raise ValueError(
+            "replay evidence prior_state.rolling_state.revisions must be a "
+            "sequence of integers"
+        )
+    for revision in revisions:
+        if isinstance(revision, float):
+            # The checkpoint contract stores numeric lists as floats, so an
+            # integral float is the canonical durable spelling of an integer
+            # revision. A fractional one is refused here rather than truncated
+            # into a different revision by ``from_checkpoint``.
+            if not math.isfinite(revision) or not revision.is_integer():
+                raise ValueError(
+                    "replay evidence prior_state.rolling_state.revisions must be "
+                    "an exact integer"
+                )
+            continue
+        _require_int(revision, "prior_state.rolling_state.revisions")
     _optional_int(
         rolling["first_interval_epoch"],
         "prior_state.rolling_state.first_interval_epoch",
