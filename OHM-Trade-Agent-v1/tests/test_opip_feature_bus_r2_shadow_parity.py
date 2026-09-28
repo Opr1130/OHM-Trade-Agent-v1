@@ -621,6 +621,166 @@ def test_fully_uncommitted_evidence_carries_no_watermark_claim():
 
 
 # --------------------------------------------------------------------------- #
+# Findings A and B - cutoff population and consumed-input lineage
+# --------------------------------------------------------------------------- #
+
+
+def _wrong_cadence(observation, *, epoch: datetime, ingestion_offset: int = 10):
+    """A snapshot-affecting misaligned row: right shape, wrong cadence."""
+    return replace(
+        observation,
+        aggregate_interval_seconds=300,
+        source_event_time=epoch,
+        ingestion_order=observation.ingestion_order + ingestion_offset,
+    )
+
+
+def _ticker(observation, *, epoch: datetime, ingestion_offset: int = 10):
+    """A snapshot-affecting misaligned row that carries no aggregate at all."""
+    return replace(
+        observation,
+        payload_kind=PayloadKind.TICKER,
+        aggregate_interval_seconds=None,
+        source_event_time=epoch,
+        ingestion_order=observation.ingestion_order + ingestion_offset,
+    )
+
+
+def test_post_cutoff_wrong_cadence_row_is_refused():
+    observations, _normalized = _observations(_rows(count=5))
+    post = _wrong_cadence(observations[-1], epoch=CUTOFF + timedelta(minutes=4))
+    assert post.source_event_time > CUTOFF
+    assert post.receipt_time <= NOW
+    with pytest.raises(TemporalIntegrityError, match="post-cutoff misaligned"):
+        _replay(observations + (post,))
+
+
+def test_post_cutoff_non_aggregate_row_is_refused():
+    observations, _normalized = _observations(_rows(count=5))
+    post = _ticker(observations[-1], epoch=CUTOFF + timedelta(minutes=2))
+    assert post.source_event_time > CUTOFF
+    assert post.receipt_time <= NOW
+    with pytest.raises(TemporalIntegrityError, match="post-cutoff misaligned"):
+        _replay(observations + (post,))
+
+
+def test_pre_cutoff_misaligned_row_is_part_of_the_population():
+    observations, _normalized = _observations(_rows(count=5))
+    pre_cutoff = _wrong_cadence(observations[2], epoch=CUTOFF - timedelta(minutes=6))
+    alignment = align_minute_observations(observations + (pre_cutoff,), cutoff=CUTOFF)
+    assert alignment.excluded_misaligned == 1
+    assert alignment.excluded_misaligned_rows == (pre_cutoff,)
+    snapshot, report = _replay(observations + (pre_cutoff,))
+    assert snapshot.coverage is CoverageState.INCOMPLETE_COVERAGE
+    assert report.counts()["IMPLEMENTATION_DEFECT"] == 0
+
+
+def test_post_cutoff_closed_aggregate_cannot_change_the_snapshot():
+    observations, _normalized = _observations(_rows(count=5))
+    # Cadence and grid are correct, so this is only excluded as unclosed.
+    extra = replace(
+        observations[-1],
+        source_event_time=CUTOFF + timedelta(minutes=1),
+        ingestion_order=observations[-1].ingestion_order + 10,
+    )
+    alignment = align_minute_observations(observations + (extra,), cutoff=CUTOFF)
+    assert alignment.excluded_unclosed == 1
+    assert alignment.excluded_misaligned == 0
+    baseline, _report = _replay(observations)
+    with_extra, _report = _replay(observations + (extra,))
+    assert with_extra.coverage is baseline.coverage
+    assert with_extra.values == baseline.values
+    assert with_extra.content_hash() == baseline.content_hash()
+
+
+def test_committed_misaligned_row_above_the_watermark_is_refused():
+    observations, _normalized = _observations(_rows(count=5))
+    misaligned = replace(
+        _wrong_cadence(observations[2], epoch=CUTOFF - timedelta(minutes=6)),
+        commit_order=ConsumedInputWatermark(history_epoch=1, local_sequence=5000),
+    )
+    below = max(item.commit_order for item in observations)
+    with pytest.raises(WatermarkIntegrityError, match="precedes"):
+        _replay(observations + (misaligned,), watermark=below)
+
+
+def test_misaligned_row_equal_to_the_watermark_is_accepted():
+    observations, _normalized = _observations(_rows(count=5))
+    highest = ConsumedInputWatermark(history_epoch=1, local_sequence=5000)
+    misaligned = replace(
+        _wrong_cadence(observations[2], epoch=CUTOFF - timedelta(minutes=6)),
+        commit_order=highest,
+    )
+    snapshot, _report = _replay(observations + (misaligned,), watermark=highest)
+    assert snapshot.consumed_input_watermark == highest
+    assert snapshot.coverage is CoverageState.INCOMPLETE_COVERAGE
+
+
+def test_misaligned_row_below_a_later_watermark_is_accepted():
+    observations, _normalized = _observations(_rows(count=5))
+    misaligned = replace(
+        _wrong_cadence(observations[2], epoch=CUTOFF - timedelta(minutes=6)),
+        commit_order=ConsumedInputWatermark(history_epoch=1, local_sequence=5000),
+    )
+    later = ConsumedInputWatermark(history_epoch=1, local_sequence=99999)
+    snapshot, _report = _replay(observations + (misaligned,), watermark=later)
+    assert snapshot.consumed_input_watermark == later
+
+
+def test_uncommitted_misaligned_row_fails_closed():
+    observations, _normalized = _observations(_rows(count=5))
+    misaligned = replace(
+        _wrong_cadence(observations[2], epoch=CUTOFF - timedelta(minutes=6)),
+        commit_order=None,
+    )
+    with pytest.raises(WatermarkIntegrityError, match="mixes committed"):
+        _replay(observations + (misaligned,))
+
+
+def test_forming_row_above_the_watermark_cannot_change_the_snapshot():
+    rows = _rows(count=5) + [
+        IntervalRow(
+            interval_start_epoch=int(CUTOFF.timestamp()),
+            open=100.0,
+            high=100.5,
+            low=99.5,
+            close=100.2,
+            volume=10.0,
+        )
+    ]
+    observations, _normalized = _observations(rows, now=CUTOFF)
+    closed = tuple(item for item in observations if not item.interval_forming)
+    forming = tuple(item for item in observations if item.interval_forming)
+    assert len(forming) == 1
+    above = ConsumedInputWatermark(history_epoch=1, local_sequence=99999)
+    claimed_forming = replace(forming[0], commit_order=above)
+    baseline, _report = _replay(closed)
+    with_forming, _report = _replay(
+        closed + (claimed_forming,), watermark=_watermark(closed)
+    )
+    assert with_forming.consumed_input_watermark == _watermark(closed)
+    assert with_forming.values == baseline.values
+    assert with_forming.content_hash() == baseline.content_hash()
+
+
+def test_unclosed_row_above_the_watermark_cannot_change_the_snapshot():
+    observations, _normalized = _observations(_rows(count=5))
+    unclosed = replace(
+        observations[-1],
+        source_event_time=CUTOFF,
+        ingestion_order=observations[-1].ingestion_order + 10,
+        commit_order=ConsumedInputWatermark(history_epoch=1, local_sequence=99999),
+    )
+    closed = observations
+    baseline, _report = _replay(closed)
+    with_unclosed, _report = _replay(
+        closed + (unclosed,), watermark=_watermark(closed)
+    )
+    assert with_unclosed.consumed_input_watermark == _watermark(closed)
+    assert with_unclosed.content_hash() == baseline.content_hash()
+
+
+# --------------------------------------------------------------------------- #
 # Findings 4-6 - captured identity and replay admissibility
 # --------------------------------------------------------------------------- #
 

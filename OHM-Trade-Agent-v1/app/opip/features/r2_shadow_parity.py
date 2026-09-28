@@ -9,6 +9,12 @@ Identity stays on the existing contracts: ``Observation.to_dict`` is the
 captured input, ``FeatureSnapshot.snapshot_id`` / ``feature_version`` identify
 the output, and ``source_evidence_identity`` only names the input payload the
 report was computed from.
+
+Replay is fail-closed about admissibility. It refuses evidence that is not this
+instrument's, that was not visible at the replay instant, that carries a
+post-cutoff misaligned fact capable of moving coverage, that conflicts with its
+own captured identity, or that is not covered by the declared consumed-input
+watermark.
 """
 
 from __future__ import annotations
@@ -28,7 +34,11 @@ from app.opip.contracts.observation import (
     Observation,
 )
 from app.opip.contracts.serialization import canonical_json_bytes, iso_z, stable_hash
-from app.opip.contracts.temporal import assert_point_in_time, require_utc
+from app.opip.contracts.temporal import (
+    TemporalIntegrityError,
+    assert_point_in_time,
+    require_utc,
+)
 from app.opip.features.engine import (
     ATR_PERIOD,
     BANDWIDTH_PERIOD,
@@ -272,11 +282,13 @@ def _require_consumed_watermark(
     """Refuse a watermark that is earlier than consumed captured evidence.
 
     A snapshot may not claim it has not consumed evidence that is in its own
-    values. Only rows alignment actually considered are checked: a forming,
-    unclosed, or misaligned row is discarded by alignment, never published by
-    the live cycle, and therefore makes no consumed-input claim. Evidence with
-    no commit order at all carries no claim; partially committed eligible
-    evidence cannot prove its watermark and fails closed.
+    values. Only rows that can change the sealed snapshot are checked:
+    alignment-admitted winners, their deduped losers, and the misaligned
+    exclusions that decide coverage. A forming or unclosed row is discarded by
+    alignment, cannot change a sealed field, and therefore makes no
+    consumed-input claim. Evidence with no commit order at all carries no
+    claim; partially committed snapshot-affecting evidence cannot prove its
+    watermark and fails closed.
     """
     committed = [
         item.commit_order for item in eligible if item.commit_order is not None
@@ -297,12 +309,51 @@ def _require_consumed_watermark(
 
 
 def _eligible_evidence(alignment: AlignmentResult) -> tuple[Observation, ...]:
-    """Rows alignment considered: admitted winners plus their deduped losers.
+    """Committed inputs whose existence can change the sealed snapshot.
 
-    ``superseded`` holds duplicate and lower-revision rows that were consumed
-    as inputs even though they did not win their interval.
+    Admitted winners and their deduped losers set values, gaps and lateness.
+    ``excluded_misaligned_rows`` carry no values but still decide
+    ``AlignmentResult.coverage``, so they belong to the same population: a
+    snapshot may not record incomplete coverage from a row it claims not to
+    have consumed.
+
+    Forming and unclosed rows are deliberately absent. Alignment reaches them
+    only through ``excluded_forming`` and ``excluded_unclosed``, and ``coverage``
+    reads neither; they are also excluded from ``present``, from the window
+    origin, and from lateness, so they cannot change any sealed field.
     """
-    return (*alignment.observations, *alignment.superseded)
+    return (
+        *alignment.observations,
+        *alignment.superseded,
+        *alignment.excluded_misaligned_rows,
+    )
+
+
+def _assert_cutoff_population(
+    alignment: AlignmentResult, *, evaluation_cutoff: datetime
+) -> None:
+    """No post-cutoff fact may reach the sealed snapshot.
+
+    Alignment classifies a non-aggregate, wrong-cadence, or off-grid row as
+    misaligned, and that classification is what ``AlignmentResult.coverage``
+    consumes. It is the only excluded category whose rows can still change a
+    sealed field, so a post-cutoff misaligned row would let a fact that did not
+    exist at the cutoff time alter an earlier snapshot. Such a row is refused,
+    never dropped.
+
+    Every other category is already bounded by the cutoff: admitted rows and
+    their superseded losers only qualify when their interval closed at or
+    before it, and forming and unclosed rows cannot change a sealed field.
+    """
+    for item in alignment.excluded_misaligned_rows:
+        if item.source_event_time > evaluation_cutoff:
+            raise TemporalIntegrityError(
+                "replay evidence contains a post-cutoff misaligned fact at "
+                f"{iso_z(item.source_event_time, field_name='source_event_time')} "
+                "after evaluation_cutoff "
+                f"{iso_z(evaluation_cutoff, field_name='evaluation_cutoff')}; it "
+                "cannot belong to the cutoff population"
+            )
 
 
 def _require_consistent_content(eligible: Sequence[Observation]) -> None:
@@ -381,8 +432,9 @@ def replay_feature_snapshot(
     A declared feature version other than this engine's ``FEATURE_VERSION``
     is refused before any value is computed. Evidence that does not belong to
     the supplied ``InstrumentVersion``, or that was not visible at
-    ``evaluated_at_utc``, is refused before alignment. The evidence alignment
-    then admitted must be self-consistent and covered by
+    ``evaluated_at_utc``, is refused before alignment. No post-cutoff fact may
+    reach the sealed snapshot through coverage. The evidence the snapshot then
+    depends on must be self-consistent and covered by
     ``consumed_input_watermark`` before the snapshot is sealed.
     """
     _require_feature_version(declared_feature_version)
@@ -391,6 +443,7 @@ def replay_feature_snapshot(
         observations, evaluated_at_utc=evaluated_at_utc, source_version=source_version
     )
     alignment = align_minute_observations(observations, cutoff=evaluation_cutoff)
+    _assert_cutoff_population(alignment, evaluation_cutoff=evaluation_cutoff)
     eligible = _eligible_evidence(alignment)
     _require_consistent_content(eligible)
     _require_consumed_watermark(
