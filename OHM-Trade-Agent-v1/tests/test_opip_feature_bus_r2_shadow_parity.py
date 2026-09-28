@@ -557,6 +557,44 @@ def test_mixed_commit_order_evidence_cannot_prove_its_watermark():
         )
 
 
+def test_uncommitted_forming_bar_does_not_break_the_watermark():
+    rows = _rows(count=5) + [
+        IntervalRow(
+            interval_start_epoch=int(CUTOFF.timestamp()),
+            open=100.0,
+            high=100.5,
+            low=99.5,
+            close=100.2,
+            volume=10.0,
+        )
+    ]
+    observations, _normalized = _observations(rows, now=CUTOFF)
+    forming = tuple(item for item in observations if item.interval_forming)
+    closed = tuple(item for item in observations if not item.interval_forming)
+    assert len(forming) == 1
+    assert max(item.commit_order for item in closed) < forming[0].commit_order
+    payload = list(capture_observation_evidence(observations))
+    for index, row in enumerate(payload):
+        if row["observation_id"] == forming[0].observation_id:
+            row = dict(row)
+            row["history_epoch"] = None
+            row["local_sequence"] = None
+            payload[index] = row
+    loaded = load_observation_evidence(payload)
+    assert tuple(item.commit_order for item in loaded if item.interval_forming) == (None,)
+    snapshot, report = replay_captured_evidence(
+        payload,
+        instrument_version=_instrument(),
+        evaluation_cutoff=CUTOFF,
+        evaluated_at_utc=NOW,
+        consumed_input_watermark=_watermark(closed),
+        source_version=SOURCE,
+    )
+    assert snapshot.consumed_input_watermark == _watermark(closed)
+    assert snapshot.values["return_1m"] is not None
+    assert report.counts()["IMPLEMENTATION_DEFECT"] == 0
+
+
 def test_fully_uncommitted_evidence_carries_no_watermark_claim():
     observations, _normalized = _observations(_rows(count=5))
     payload = list(capture_observation_evidence(observations))

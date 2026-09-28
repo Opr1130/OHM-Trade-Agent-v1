@@ -255,22 +255,25 @@ def _assert_replay_identity(
 
 
 def _require_consumed_watermark(
-    observations: Sequence[Observation],
+    eligible: Sequence[Observation],
     *,
     consumed_input_watermark: ConsumedInputWatermark,
 ) -> None:
     """Refuse a watermark that is earlier than consumed captured evidence.
 
     A snapshot may not claim it has not consumed evidence that is in its own
-    values. Evidence with no commit order at all carries no consumed claim;
-    partially committed evidence cannot prove its watermark and fails closed.
+    values. Only rows alignment actually considered are checked: a forming,
+    unclosed, or misaligned row is discarded by alignment, never published by
+    the live cycle, and therefore makes no consumed-input claim. Evidence with
+    no commit order at all carries no claim; partially committed eligible
+    evidence cannot prove its watermark and fails closed.
     """
     committed = [
-        item.commit_order for item in observations if item.commit_order is not None
+        item.commit_order for item in eligible if item.commit_order is not None
     ]
     if not committed:
         return
-    if len(committed) != len(observations):
+    if len(committed) != len(eligible):
         raise WatermarkIntegrityError(
             "replay evidence mixes committed and uncommitted observations; "
             "the consumed input watermark cannot be proven"
@@ -281,6 +284,15 @@ def _require_consumed_watermark(
             f"consumed input watermark {consumed_input_watermark.to_dict()} precedes "
             f"captured evidence commit order {highest.to_dict()}"
         )
+
+
+def _eligible_evidence(alignment: AlignmentResult) -> tuple[Observation, ...]:
+    """Rows alignment considered: admitted winners plus their deduped losers.
+
+    ``superseded`` holds duplicate and lower-revision rows that were consumed
+    as inputs even though they did not win their interval.
+    """
+    return (*alignment.observations, *alignment.superseded)
 
 
 def replay_feature_snapshot(
@@ -298,15 +310,16 @@ def replay_feature_snapshot(
     A declared feature version other than this engine's ``FEATURE_VERSION``
     is refused before any value is computed. Evidence that does not belong to
     the supplied ``InstrumentVersion`` is refused before alignment, and a
-    watermark earlier than the captured evidence is refused before the
-    snapshot is sealed.
+    watermark earlier than the consumed evidence that alignment admitted is
+    refused before the snapshot is sealed.
     """
     _require_feature_version(declared_feature_version)
     _assert_replay_identity(observations, instrument_version=instrument_version)
-    _require_consumed_watermark(
-        observations, consumed_input_watermark=consumed_input_watermark
-    )
     alignment = align_minute_observations(observations, cutoff=evaluation_cutoff)
+    _require_consumed_watermark(
+        _eligible_evidence(alignment),
+        consumed_input_watermark=consumed_input_watermark,
+    )
     return build_feature_snapshot(
         alignment,
         instrument_version=instrument_version,
