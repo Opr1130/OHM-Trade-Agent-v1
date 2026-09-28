@@ -57,7 +57,11 @@ from app.opip.market.aggregates import (
     align_minute_observations,
     contiguous_tail,
 )
-from app.opip.market.observations import aggregate_content_fingerprint
+from app.opip.market.observations import (
+    IntervalRow,
+    _validate_row,
+    aggregate_content_fingerprint,
+)
 
 EXACT_EQUALITY_RULE = "exact_absolute_tolerance_0"
 NOT_COMPARABLE_RULE = "not_comparable_legacy_value_absent"
@@ -341,22 +345,23 @@ def _require_consistent_content(eligible: Sequence[Observation]) -> None:
 
 
 def _assert_replay_visibility(
-    eligible: Sequence[Observation],
+    observations: Sequence[Observation],
     *,
     evaluated_at_utc: datetime,
     source_version: str,
 ) -> None:
-    """No admitted input may have become visible after the replay instant.
+    """No captured input may have become visible after the replay instant.
 
     The snapshot's own point-in-time guard only sees the contiguous feature
-    tail, while coverage and lateness are derived from the full alignment. This
-    check covers every considered row, so a future receipt cannot enter a
-    sealed snapshot through a freshness field.
+    tail, while coverage and lateness are derived from the full alignment. A
+    row alignment discards can still change the coverage verdict, so this
+    check covers every captured row rather than only the admitted ones. It is
+    not a silent filter: an invisible row is refused, never dropped.
     """
-    if not eligible:
+    if not observations:
         return
     stamps = tuple(
-        item.availability_stamp(source_version=source_version) for item in eligible
+        item.availability_stamp(source_version=source_version) for item in observations
     )
     assert_point_in_time(stamps, decision_at_utc=evaluated_at_utc)
 
@@ -375,19 +380,19 @@ def replay_feature_snapshot(
 
     A declared feature version other than this engine's ``FEATURE_VERSION``
     is refused before any value is computed. Evidence that does not belong to
-    the supplied ``InstrumentVersion`` is refused before alignment. The
-    evidence alignment then admitted must be self-consistent, visible at
-    ``evaluated_at_utc``, and covered by ``consumed_input_watermark`` before the
-    snapshot is sealed.
+    the supplied ``InstrumentVersion``, or that was not visible at
+    ``evaluated_at_utc``, is refused before alignment. The evidence alignment
+    then admitted must be self-consistent and covered by
+    ``consumed_input_watermark`` before the snapshot is sealed.
     """
     _require_feature_version(declared_feature_version)
     _assert_replay_identity(observations, instrument_version=instrument_version)
+    _assert_replay_visibility(
+        observations, evaluated_at_utc=evaluated_at_utc, source_version=source_version
+    )
     alignment = align_minute_observations(observations, cutoff=evaluation_cutoff)
     eligible = _eligible_evidence(alignment)
     _require_consistent_content(eligible)
-    _assert_replay_visibility(
-        eligible, evaluated_at_utc=evaluated_at_utc, source_version=source_version
-    )
     _require_consumed_watermark(
         eligible,
         consumed_input_watermark=consumed_input_watermark,
@@ -812,10 +817,23 @@ def _observation_from_evidence(raw: Mapping[str, Any]) -> Observation:
     if not isinstance(values, Mapping):
         raise ValueError("replay evidence values must be an object")
     payload_kind = PayloadKind(str(raw["payload_kind"]))
+    source_event_time = _parse_time(raw["source_event_time"], "source_event_time")
+    interval_seconds = _optional_int(
+        raw["aggregate_interval_seconds"], "aggregate_interval_seconds"
+    )
     if payload_kind is PayloadKind.FIXED_INTERVAL_AGGREGATE:
         absent = [key for key in AGGREGATE_REQUIRED_KEYS if values.get(key) is None]
         if absent:
             raise ValueError(f"aggregate is missing values: {sorted(absent)}")
+        if interval_seconds is None:
+            raise ValueError(
+                "replay evidence aggregate requires aggregate_interval_seconds"
+            )
+        _require_source_valid_aggregate(
+            values,
+            interval_seconds=interval_seconds,
+            source_event_time=source_event_time,
+        )
     commit_order = _commit_order_from_evidence(raw)
     captured_id = raw["observation_id"]
     if not isinstance(captured_id, str) or not captured_id.strip():
@@ -824,15 +842,13 @@ def _observation_from_evidence(raw: Mapping[str, Any]) -> Observation:
         instrument_version_id=str(raw["instrument_version_id"]),
         venue=str(raw["venue"]),
         venue_instrument_id=str(raw["venue_instrument_id"]),
-        source_event_time=_parse_time(raw["source_event_time"], "source_event_time"),
+        source_event_time=source_event_time,
         receipt_time=_parse_time(raw["receipt_time"], "receipt_time"),
         ingestion_order=_require_int(raw["ingestion_order"], "ingestion_order"),
         payload_kind=payload_kind,
         values=dict(values),
         coverage=CoverageState(str(raw["coverage"])),
-        aggregate_interval_seconds=_optional_int(
-            raw["aggregate_interval_seconds"], "aggregate_interval_seconds"
-        ),
+        aggregate_interval_seconds=interval_seconds,
         source_sequence=_optional_str(raw["source_sequence"], "source_sequence"),
         revision=_require_int(raw["revision"], "revision"),
         supersedes=_optional_str(raw["supersedes"], "supersedes"),
@@ -848,6 +864,35 @@ def _observation_from_evidence(raw: Mapping[str, Any]) -> Observation:
             f"{reconstructed.observation_id!r}"
         )
     return reconstructed
+
+
+def _require_source_valid_aggregate(
+    values: Mapping[str, Any],
+    *,
+    interval_seconds: int,
+    source_event_time: datetime,
+) -> None:
+    """Apply the source normalization rules to persisted aggregate values.
+
+    ``Observation.__post_init__`` checks finiteness only. The venue-row rules
+    that reject a negative close, a high below its body, or a malformed trade
+    count live in ``observations._validate_row``; replay reuses that single
+    implementation so a corrupted row cannot retain its original
+    ``observation_id`` and still be sealed into a snapshot.
+    """
+    row = IntervalRow(
+        interval_start_epoch=int(source_event_time.timestamp()),
+        open=values.get("open"),
+        high=values.get("high"),
+        low=values.get("low"),
+        close=values.get("close"),
+        volume=values.get("volume"),
+        vwap=values.get("vwap"),
+        trade_count=values.get("trade_count"),
+    )
+    reason = _validate_row(row, interval_seconds=int(interval_seconds))
+    if reason is not None:
+        raise ValueError(f"replay evidence rejected by source rules: {reason}")
 
 
 def _parse_time(value: Any, field_name: str) -> datetime:

@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from app.opip.contracts.enums import CoverageState, Missingness
+from app.opip.contracts.enums import CoverageState, Missingness, PayloadKind
 from app.opip.contracts.identity import ConsumedInputWatermark, InstrumentVersion
 from app.opip.contracts.observation import OBSERVATION_SCHEMA_VERSION
 from app.opip.contracts.temporal import TemporalIntegrityError
@@ -657,6 +657,42 @@ def test_non_integer_numeric_fields_are_rejected():
             load_observation_evidence(payload)
 
 
+def test_domain_invalid_aggregate_values_are_rejected():
+    observations, _normalized = _observations(_rows(count=5))
+    originals = [dict(row) for row in capture_observation_evidence(observations)]
+    for field, value, reason in (
+        ("close", -1.0, "non_positive_price"),
+        ("volume", -5.0, "negative_volume"),
+    ):
+        payload = [dict(row) for row in originals]
+        payload[0]["values"] = dict(payload[0]["values"])
+        payload[0]["values"][field] = value
+        with pytest.raises(ValueError, match=reason):
+            load_observation_evidence(payload)
+    payload = [dict(row) for row in originals]
+    payload[0]["values"] = dict(payload[0]["values"])
+    payload[0]["values"]["close"] = payload[0]["values"]["high"] + 1.0
+    with pytest.raises(ValueError, match="high_below_body"):
+        load_observation_evidence(payload)
+
+
+def test_future_misaligned_row_cannot_change_coverage():
+    observations, _normalized = _observations(_rows(count=5))
+    misaligned = replace(
+        observations[0],
+        payload_kind=PayloadKind.TICKER,
+        aggregate_interval_seconds=None,
+        receipt_time=NOW,
+    )
+    # The misaligned row is discarded but still flips the coverage verdict, so
+    # an invisible copy of it must not be accepted.
+    snapshot, _report = _replay(observations + (misaligned,))
+    assert snapshot.coverage is CoverageState.INCOMPLETE_COVERAGE
+    future = replace(misaligned, receipt_time=NOW + timedelta(hours=1))
+    with pytest.raises(TemporalIntegrityError, match="visibility"):
+        _replay(observations + (future,))
+
+
 def test_observation_schema_version_must_be_supported():
     observations, _normalized = _observations(_rows(count=5))
     payload = list(capture_observation_evidence(observations))
@@ -671,7 +707,7 @@ def test_conflicting_content_for_one_interval_revision_is_rejected():
     observations, _normalized = _observations(_rows(count=5))
     original = observations[-1]
     conflicting_values = dict(original.values)
-    conflicting_values["close"] = float(conflicting_values["close"]) + 5.0
+    conflicting_values["volume"] = float(conflicting_values["volume"]) + 5.0
     conflicting = replace(
         original,
         values=conflicting_values,
