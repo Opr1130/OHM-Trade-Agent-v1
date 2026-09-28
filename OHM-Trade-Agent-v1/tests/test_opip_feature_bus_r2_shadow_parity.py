@@ -859,6 +859,28 @@ def test_identical_duplicate_row_is_not_a_conflict():
     assert twice_report.counts() == once_report.counts()
 
 
+def test_duplicated_non_aggregate_identity_is_rejected():
+    observations, _normalized = _observations(_rows(count=5))
+    first = _ticker(observations[2], epoch=observations[2].source_event_time)
+    second = replace(first, receipt_time=NOW + timedelta(minutes=5))
+    # Same source_sequence and revision means the same observation identity.
+    assert first.observation_id == second.observation_id
+    assert first.to_dict() != second.to_dict()
+    with pytest.raises(EvidenceIntegrityError, match="one observation identity"):
+        _replay(
+            observations + (first, second),
+            evaluated_at=NOW + timedelta(minutes=6),
+        )
+
+
+def test_unexpected_evidence_keys_are_rejected():
+    observations, _normalized = _observations(_rows(count=5))
+    payload = [dict(row) for row in capture_observation_evidence(observations)]
+    payload[0]["notes"] = "unversioned producer drift"
+    with pytest.raises(ValueError, match="unexpected keys"):
+        load_observation_evidence(payload)
+
+
 def test_non_string_provenance_is_rejected():
     observations, _normalized = _observations(_rows(count=5))
     for key, value in ((1, "x"), ("source", 7)):

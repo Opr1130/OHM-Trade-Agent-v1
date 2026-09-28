@@ -433,7 +433,6 @@ def _require_consistent_content(eligible: Sequence[Observation]) -> None:
     lets them compete because it tests cadence before it ranks revisions.
     """
     fingerprints: dict[str, str] = {}
-    payloads: dict[str, bytes] = {}
     for item in eligible:
         if item.payload_kind is not PayloadKind.FIXED_INTERVAL_AGGREGATE:
             continue
@@ -447,6 +446,10 @@ def _require_consistent_content(eligible: Sequence[Observation]) -> None:
                 "canonical evidence"
             )
         fingerprints[identity] = fingerprint
+
+    payloads: dict[str, bytes] = {}
+    for item in eligible:
+        identity = item.observation_id
         payload = canonical_json_bytes(item.to_dict())
         prior_payload = payloads.get(identity)
         if prior_payload is not None and prior_payload != payload:
@@ -940,6 +943,12 @@ def _observation_from_evidence(raw: Mapping[str, Any]) -> Observation:
     missing = [key for key in _EVIDENCE_KEYS if key not in raw]
     if missing:
         raise ValueError(f"replay evidence missing required keys: {sorted(missing)}")
+    unexpected = sorted(set(raw) - set(_EVIDENCE_KEYS))
+    if unexpected:
+        # An unmodelled field would be dropped by reconstruction, so
+        # ``source_evidence_identity`` would name a rewritten payload rather
+        # than the durable evidence actually supplied.
+        raise ValueError(f"replay evidence has unexpected keys: {unexpected}")
     if raw["record_type"] != OBSERVATION_RECORD_TYPE:
         raise ValueError("replay evidence record_type is not Observation")
     declared_schema = _require_int(raw["schema_version"], "schema_version")
