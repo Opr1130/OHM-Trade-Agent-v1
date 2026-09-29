@@ -964,6 +964,38 @@ def test_permanent_malformed_task_is_not_retried(tmp_path, monkeypatch):
 
 
 @pytest.mark.acceptance
+def test_completed_increment_pointer_is_not_pinned():
+    """ATDD-BRIDGE-v1/AC-014: a completed increment must not freeze the movable ATDD pointer."""
+    r3_test = b.APP / "tests" / "test_opip_r3_f3_ignition_detector.py"
+    source = r3_test.read_text(encoding="utf-8")
+
+    # The stale lifecycle pin is gone: this test no longer reads or asserts the pointer.
+    assert "ACTIVE_INCREMENT" not in source
+
+    # The completed increment stays historically identifiable through its own contract.
+    contract = (b.APP / "docs" / "atdd" / "scope-contracts"
+                / "ATDD-R3-F3-ignition-implementation.md")
+    assert contract.is_file()
+    lines = contract.read_text(encoding="utf-8").splitlines()
+    assert lines[0].strip() == "INCREMENT:"
+    assert lines[1].strip() == "ATDD-R3-F3-ignition-implementation"
+
+    # No substantive isolation, feature-bus or authority assertion was weakened.
+    for required in (
+        'OPIP_FEATURE_BUS_MODE: "off"',
+        "FORBIDDEN_MODULE_PREFIXES",
+        "FORBIDDEN_IMPORT_ROOTS",
+        "AUTHORITY_TOKENS",
+        "run_cycle.py",
+        "run_feature_bus_pilot.py",
+        "assert imported_modules(source).isdisjoint(",
+        'assert "opip.detectors" not in text',
+        "SCOPE_CONTRACT_PATH.is_file()",
+    ):
+        assert required in source, required
+
+
+@pytest.mark.acceptance
 def test_contract_and_runbook():
     """ATDD-BRIDGE-v1/AC-007: contract, detailed Windows instructions and frozen architecture remain traceable."""
     contract = b.parse_scope_contract((b.APP / "docs/atdd/scope-contracts/ATDD-BRIDGE-v1.md").read_text())

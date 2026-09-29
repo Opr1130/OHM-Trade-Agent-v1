@@ -117,6 +117,14 @@ required checks are configured/evaluated
 THEN:
 the bridge requires at minimum the repository's protected checks test, atdd scope, and semgrep/ci, and cannot approve with any of them missing, pending, failed, cancelled, stale, or represented only by a conflicting legacy status
 
+AC-014:
+GIVEN:
+a completed increment's acceptance test pins the globally active increment pointer
+WHEN:
+that stale lifecycle pin prevents every later approved increment from activating
+THEN:
+the OWNER may authorize removing only that pointer pin, the completed increment remains identifiable through its own scope contract, and no runtime, trading, feature-bus, import or isolation assertion is weakened
+
 EXPLICITLY OUT OF SCOPE:
 - Runtime/app, deploy, architecture, CI, agent-governance, risk, strategy, exchange, paper authority and canonical evidence changes.
 - Force-push, merge, deployment, arbitrary shell/test execution or dependency installation. Autonomous ordinary feature commit/push and isolated registered tests are authorized only under AC-008 through AC-010.
@@ -150,6 +158,7 @@ AC-011 -> tests/test_local_bridge_autonomy.py::test_waiting_ci_resume_through_wa
 AC-012 -> tests/test_local_agent_bridge.py::test_github_status_reporting
 AC-012 -> tests/test_local_agent_bridge.py::test_status_comment_identity_is_verified
 AC-013 -> tests/test_local_bridge_autonomy.py::test_protected_required_checks
+AC-014 -> tests/test_local_agent_bridge.py::test_completed_increment_pointer_is_not_pinned
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/tools/local_agent_bridge.py
@@ -196,6 +205,9 @@ AC-013 -> OHM-Trade-Agent-v1/tools/local_bridge_autonomy.py
 AC-013 -> OHM-Trade-Agent-v1/tests/test_local_bridge_autonomy.py
 AC-013 -> OHM-Trade-Agent-v1/docs/engineering/LOCAL_AGENT_BRIDGE_V1.md
 AC-013 -> OHM-Trade-Agent-v1/docs/engineering/local-bridge-autonomy.example.json
+AC-014 -> OHM-Trade-Agent-v1/tests/test_opip_r3_f3_ignition_detector.py
+AC-014 -> OHM-Trade-Agent-v1/tests/test_local_agent_bridge.py
+AC-014 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-BRIDGE-v1.md
 
 DEFERRED DISCOVERIES:
 - Native Cursor executable availability, verified tool-denial behavior and separate automation-account setup require OWNER machine validation before enablement.

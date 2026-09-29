@@ -258,7 +258,11 @@ DETECTORS_INIT_PATH = APP_ROOT / "app" / "opip" / "detectors" / "__init__.py"
 CONTRACTS_INIT_PATH = APP_ROOT / "app" / "opip" / "contracts" / "__init__.py"
 TEST_PATH = Path(__file__).resolve()
 COMPOSE_PATH = APP_ROOT / "docker-compose.yml"
-ACTIVE_INCREMENT_PATH = APP_ROOT / "docs" / "atdd" / "ACTIVE_INCREMENT"
+# The completed increment's own contract. It identifies the increment historically
+# without pinning the globally movable ATDD pointer.
+SCOPE_CONTRACT_PATH = (
+    APP_ROOT / "docs" / "atdd" / "scope-contracts" / f"{IMPLEMENTATION_INCREMENT}.md"
+)
 
 IGNITION_SOURCE = IGNITION_PATH.read_text(encoding="utf-8")
 CONTRACT_SOURCE = CONTRACT_PATH.read_text(encoding="utf-8")
@@ -861,10 +865,17 @@ def test_ac_010_shadow_isolation_grants_no_authority() -> None:
         for token in AUTHORITY_TOKENS:
             assert token not in lowered, (name, token)
 
-    # The active increment is the implementation increment: no activation happened.
-    assert ACTIVE_INCREMENT_PATH.read_text(encoding="utf-8").strip() == (
-        IMPLEMENTATION_INCREMENT
-    )
+    # The completed R3-F3 increment stays historically identifiable without pinning
+    # the globally movable active-increment pointer: its own scope contract must still
+    # exist and declare this increment. The pointer is intentionally allowed to advance
+    # to a later approved increment, so it is not asserted here. Shadow isolation and
+    # absence of authority are proven by the compose, runtime, import and export checks
+    # above, not by freezing the pointer.
+    assert SCOPE_CONTRACT_PATH.is_file(), SCOPE_CONTRACT_PATH
+    contract_lines = SCOPE_CONTRACT_PATH.read_text(encoding="utf-8").splitlines()
+    assert "INCREMENT:" in contract_lines, SCOPE_CONTRACT_PATH
+    contract_increment = contract_lines[contract_lines.index("INCREMENT:") + 1].strip()
+    assert contract_increment == IMPLEMENTATION_INCREMENT, contract_increment
 
 
 @pytest.mark.acceptance
