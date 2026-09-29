@@ -188,10 +188,14 @@ Discovery distinguishes four outcomes, and only the last two are durable decisio
 | --- | --- |
 | Transient GitHub/read failure | No task consumed; the same poll retries next cycle |
 | Approval not yet posted, issue closed/locked | No task consumed; retried later |
-| Permanently invalid (malformed, edited, unknown key, unauthorized) | Rejected once with a fixed reason code; never executed |
+| Permanently malformed body (bad JSON, oversized, unknown key, edited, unauthorized) | Rejected once with a fixed reason code; never retried, never executed |
 | Eligible | Executed once under the existing lock/receipt rules |
 
+A malformed or oversized `/opip-task` or decision body is translated from the transport parse code to the permanent `INVALID_TASK_ENVELOPE` / `INVALID_DECISION_ENVELOPE` at the envelope boundary, so it is refused once instead of being retried on every cycle. The transport-level parse code is deliberately left transient, so a malformed GitHub *response* is still retried rather than being mistaken for a bad comment.
+
 A comment that fails a temporary GitHub read is never marked "seen and done". An edited comment is never executed, and a comment whose approval is revoked before execution stops before any write. A failed or ambiguous execution still follows the section 9 recovery rules and is never silently retried.
+
+A published draft PR awaiting CI remains **resumable**: its receipt is `PUBLISHED_WAITING_CI`, which proves coding, tests, commit and push already happened. Later polls revisit only that task's exact-SHA CI/review state and submit the existing review action once CI reaches a terminal disposition. A resume never re-invokes Cursor, never re-runs tests, never re-commits and never re-pushes. Once a disposition is submitted the task becomes terminal and is no longer rediscovered.
 
 `--watch` with an explicit `--task-comment` is refused; use one or the other. The explicit one-shot form in section 6 remains the supported way to run one named task.
 
@@ -207,6 +211,8 @@ When execution is enabled (`--execute`), the bridge also maintains **one** bound
 States are drawn from a fixed set (`accepted`, `running`, `blocked`, `failed`, `applied`, `testing`, `pushed`, `waiting_ci`, `request_changes`, `approved`, `completed`) and the reason code is always one of the bridge's own fixed codes, never free text. The status comment never contains the task instructions, the Cursor prompt or response, file contents, environment values, API responses, exception text, local paths or tokens. Dry-run never writes to GitHub, so a dry-run has no status comment.
 
 Writing status is a bounded GitHub **write** use of the issue conversation. It requires only issue-comment write on this one repository; it grants no merge, deployment, workflow or administration permission. `gh` is authenticated outside the bridge, or `OPIP_BRIDGE_STATUS_TOKEN` may supply a narrower token; the token never appears on the command line, in a file, in a log, or in the Cursor environment. If a status write fails the task is not reported as successful: the bridge writes a local `STATUS_WRITE_FAILED` record, leaves the task unconsumed or in `FAILED_OWNER_RECOVERY`, and requires OWNER recovery. Bridge status comments are never themselves treated as tasks.
+
+Status comment ownership is verified, not assumed. The bridge resolves its own authenticated numeric GitHub user id once per run and will only reuse or update a marker comment authored by that identity. A marker posted by any other account is ignored: it is never overwritten and never treated as authoritative bridge status, so a foreign comment can neither hijack the bridge's status nor force a spurious write failure. If the identity cannot be resolved the bridge fails closed and performs no status write at all.
 
 ## 7. OWNER Cursor activation check
 
@@ -248,7 +254,7 @@ One invocation handles one selected comment. Repeating the command is enough to 
 
 `state_dir/watch.lock` is held for the duration of a `--watch` loop so two watchers cannot run against one state directory. `watch.lock` and `run.lock` are removed on clean exit, including Ctrl+C.
 
-`state_dir/receipts.sqlite3` records the first claimed task ID/hash and disposition. A committed `STARTED` claim precedes the Cursor call. All subsequent observations of the same comment remain consumed; editing/reapproving it never creates another attempt. This provides **at-most-one attempt**, not guaranteed completion or exactly-once application. State deletion, restoring an old database, separate state directories, and running multiple hosts break that guarantee and are unsupported.
+`state_dir/receipts.sqlite3` records the first claimed task ID/hash and disposition. A committed `STARTED` claim precedes the Cursor call. All subsequent observations of the same comment remain consumed; editing/reapproving it never creates another attempt. This provides **at-most-one attempt**, not guaranteed completion or exactly-once application. The single exception is a `PUBLISHED_WAITING_CI` receipt, which stays eligible for a CI-only resume as described in section 6.1; it never permits a second coding attempt. State deletion, restoring an old database, separate state directories, and running multiple hosts break that guarantee and are unsupported.
 
 `state_dir/run.lock` serializes runs. A hard crash may leave it behind intentionally. Never automatically expire or delete it just because its timestamp/PID looks old: PIDs can be reused, and a child may still be running.
 
@@ -278,6 +284,13 @@ This is a bounded threat/edge matrix, not a claim that every possible Windows, n
 | Status comment content | Fixed marker plus bounded JSON only; no instructions, model output, paths or tokens | Status tests |
 | `test`/`atdd scope`/`semgrep/ci` missing, pending or conflicting | Never `APPROVE` | Required-check tests |
 | Advisory job failure (Ruff/Bandit/pip-audit/Gitleaks) or CircleCI error | Does not block approval | Required-check tests |
+| Published draft PR awaiting CI | Stays resumable; later polls re-evaluate CI only, never re-code | Resume tests |
+| CI pending on a later poll | No approval; task stays resumable | Resume tests |
+| CI terminal on a later poll | Submits exact-SHA review once, then terminal | Resume tests |
+| Permanently malformed `/opip-task` or decision body | `INVALID_TASK_ENVELOPE` / `INVALID_DECISION_ENVELOPE` once; never retried | Envelope tests |
+| Malformed GitHub transport *response* | Still transient and retried | Envelope/discovery tests |
+| Status marker authored by another account | Ignored; never overwritten or treated as bridge status | Status-identity tests |
+| Status-writer identity lookup fails | Fails closed; no POST/PATCH performed | Status-identity tests |
 | Missing/wrong author or OWNER approval | No dispatch | Control-plane tests |
 | Approval copied to another task or modified task body | Exact body hash mismatch stops | Control-plane tests |
 | Edited task/approval, expired/future/overlong approval | Stop; fresh immutable comment required | Control-plane tests |
@@ -418,7 +431,7 @@ Autonomous dry-run returns `AUTONOMOUS_DRY_RUN_VALID` without creating execution
 
 Publication uses an explicit `HEAD:refs/heads/feature/...` destination with **no force option**, verifies staged paths and staged content hashes, checks the resulting parent/branch, and validates both fetch and push URLs. A non-fast-forward remote, concurrent file change or staged extra file stops. A failed/ambiguous push or PR creation never automatically retries.
 
-After publication, `WAITING_CI` is a safe resumable phase. Invoke the same command later (manually or using your existing Windows scheduler). It rechecks policy, clean worktree/HEAD, PR identity and required checks without recoding, retesting, recommitting or repushing. A newer in-progress check run supersedes an earlier green run. Failed required checks yield `REQUEST_CHANGES`; pending/missing checks yield no approval. Passing required checks allow `APPROVE` only for the already reviewed exact SHA. Both remote reviews include `commit_id`. The PR must remain a draft with auto-merge disabled through review submission; a ready-for-review or auto-merge-enabled PR fails closed. The OWNER can mark it ready after reviewing the bridge result.
+After publication, `WAITING_CI` is a safe resumable phase. Invoke the same command later (manually or using your existing Windows scheduler), or let `--watch` revisit it automatically: a `PUBLISHED_WAITING_CI` receipt stays rediscoverable and is re-evaluated only for its exact-SHA CI/review state, never re-coded, re-tested, re-committed or re-pushed. It rechecks policy, clean worktree/HEAD, PR identity and required checks without recoding, retesting, recommitting or repushing. A newer in-progress check run supersedes an earlier green run. Failed required checks yield `REQUEST_CHANGES`; pending/missing checks yield no approval and the task stays resumable. Passing required checks allow `APPROVE` only for the already reviewed exact SHA. After the review is submitted the task is terminal and is no longer rediscovered. Both remote reviews include `commit_id`. The PR must remain a draft with auto-merge disabled through review submission; a ready-for-review or auto-merge-enabled PR fails closed. The OWNER can mark it ready after reviewing the bridge result.
 
 ### 12.4 Autonomous failure and recovery cases
 

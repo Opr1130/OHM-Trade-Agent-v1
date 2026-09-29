@@ -14,6 +14,8 @@ from tools import local_agent_bridge as b
 
 NOW = datetime(2026, 9, 28, 12, tzinfo=timezone.utc)
 PATH = b.PREFIX + "docs/engineering/example.md"
+# The authenticated GitHub identity that owns bridge status comments in tests.
+STATUS_AUTHOR = 1
 
 
 def fixture_task():
@@ -689,7 +691,7 @@ def test_github_status_reporting(tmp_path, monkeypatch):
 
     writer = Writer()
     status = b.GitHubStatus(11, api=SnapAPI((1, {"state": "open"}, [])), writer=writer,
-                            state_dir=tmp_path)
+                            state_dir=tmp_path, identity=lambda: STATUS_AUTHOR)
 
     status.announce(10, "accepted", branch="feature/bridge-example", head_sha="a" * 40,
                     increment="ATDD-EXAMPLE")
@@ -730,7 +732,8 @@ def test_github_status_reporting(tmp_path, monkeypatch):
     existing = [status_comment_for(77, 10)]
     restart_writer = Writer()
     restart = b.GitHubStatus(11, api=SnapAPI((1, {"state": "open"}, existing)),
-                             writer=restart_writer, state_dir=tmp_path)
+                             writer=restart_writer, state_dir=tmp_path,
+                             identity=lambda: STATUS_AUTHOR)
     restart.announce(10, "applied", branch="feature/bridge-example", head_sha="a" * 40,
                      increment="ATDD-EXAMPLE", comments=existing)
     assert [call[0] for call in restart_writer.calls] == ["PATCH"]
@@ -748,7 +751,8 @@ def test_github_status_reporting(tmp_path, monkeypatch):
 
     # A GitHub write failure fails closed.
     failing = b.GitHubStatus(11, api=SnapAPI((1, {"state": "open"}, [])),
-                             writer=Writer("HOST_COMMAND_FAILED"), state_dir=tmp_path)
+                             writer=Writer("HOST_COMMAND_FAILED"), state_dir=tmp_path,
+                             identity=lambda: STATUS_AUTHOR)
     with pytest.raises(b.Stop, match="STATUS_WRITE_FAILED"):
         failing.announce(10, "applied", branch="feature/bridge-example", head_sha="a" * 40,
                          increment="ATDD-EXAMPLE")
@@ -761,16 +765,187 @@ def test_github_status_reporting(tmp_path, monkeypatch):
     scratch.mkdir()
     root, config, api, proposal = run_fixture(scratch, monkeypatch)
     blocked = b.GitHubStatus(1, api=api, writer=Writer("HOST_COMMAND_FAILED"),
-                             state_dir=Path(config["state_dir"]))
+                             state_dir=Path(config["state_dir"]),
+                             identity=lambda: STATUS_AUTHOR)
     with pytest.raises(b.Stop, match="STATUS_WRITE_FAILED"):
         b.run(config, 1, 10, True, api, lambda *a: proposal, status_api=blocked)
     assert (root / PATH).read_bytes() == b"before\n"
 
 
-def status_comment_for(identifier, marker_task):
+def status_comment_for(identifier, marker_task, author=STATUS_AUTHOR):
     payload = b.status_payload(marker_task, "accepted", branch="feature/bridge-example",
                                increment="ATDD-EXAMPLE")
-    return comment(identifier, b.status_marker(marker_task) + "\n" + json.dumps(payload, sort_keys=True))
+    return comment(identifier,
+                   b.status_marker(marker_task) + "\n" + json.dumps(payload, sort_keys=True),
+                   author=author)
+
+
+@pytest.mark.acceptance
+def test_status_comment_identity_is_verified(tmp_path):
+    """ATDD-BRIDGE-v1/AC-012: only the authenticated status writer may own bridge status."""
+    ATTACKER = 999
+
+    class Writer:
+        def __init__(self, failure=None):
+            self.calls = []
+            self.failure = failure
+            self.counter = 700
+
+        def __call__(self, method, path, payload):
+            self.calls.append((method, path, payload))
+            if self.failure:
+                raise b.Stop(self.failure)
+            if method == "POST":
+                self.counter += 1
+                return {"id": self.counter}
+            return {"id": 4242}
+
+    def make(writer, comments=(), identity=lambda: STATUS_AUTHOR):
+        return b.GitHubStatus(11, api=SnapAPI((1, {"state": "open"}, list(comments))),
+                              writer=writer, state_dir=tmp_path, identity=identity)
+
+    # (a) An attacker marker that appears before any bridge comment is ignored.
+    attacker = status_comment_for(50, 10, author=ATTACKER)
+    writer = Writer()
+    make(writer, [attacker]).announce(10, "accepted", branch="feature/bridge-example",
+                                      head_sha="a" * 40, increment="ATDD-EXAMPLE",
+                                      comments=[attacker])
+    # (b) The bridge therefore creates its own comment instead of touching the attacker's.
+    assert [call[0] for call in writer.calls] == ["POST"]
+    assert writer.calls[0][2]["body"].startswith(b.status_marker(10))
+    bridge_id = writer.counter
+    assert bridge_id != attacker["id"]
+
+    # (d)/(e) An attacker marker after the bridge comment is ignored: the bridge still
+    # updates its own comment and never PATCHes the attacker's.
+    after = [status_comment_for(bridge_id, 10), status_comment_for(90, 10, author=ATTACKER)]
+    restart_writer = Writer()
+    make(restart_writer, after).announce(10, "applied", branch="feature/bridge-example",
+                                         head_sha="a" * 40, increment="ATDD-EXAMPLE",
+                                         comments=after)
+    assert [call[0] for call in restart_writer.calls] == ["PATCH"]
+    assert restart_writer.calls[0][1] == f"issues/comments/{bridge_id}"
+    assert all("90" not in call[1] for call in restart_writer.calls)
+
+    # (c) A restart locates only the bridge-authored marker even when the attacker's
+    # marker has a lower id and would otherwise be found first.
+    ordered = [status_comment_for(20, 10, author=ATTACKER), status_comment_for(88, 10)]
+    located_writer = Writer()
+    make(located_writer, ordered).announce(10, "applied", branch="feature/bridge-example",
+                                           head_sha="a" * 40, increment="ATDD-EXAMPLE",
+                                           comments=ordered)
+    assert [call[0] for call in located_writer.calls] == ["PATCH"]
+    assert located_writer.calls[0][1] == "issues/comments/88"
+
+    # A foreign marker for a different task never collides with this task's marker.
+    assert b.status_comment_id([status_comment_for(30, 99, author=ATTACKER)], 10,
+                               STATUS_AUTHOR) is None
+    assert b.status_comment_id([status_comment_for(30, 10, author=ATTACKER)], 10,
+                               STATUS_AUTHOR) is None
+    assert b.status_comment_id([status_comment_for(30, 10)], 10, STATUS_AUTHOR) == 30
+
+    # (f) An authenticated identity lookup failure fails closed: no POST, no PATCH.
+    def broken_identity():
+        raise b.Stop("STATUS_IDENTITY_UNKNOWN")
+
+    with pytest.raises(b.Stop, match="STATUS_IDENTITY_UNKNOWN"):
+        make(Writer(), identity=broken_identity).status_identity()
+    failing_writer = Writer()
+    with pytest.raises(b.Stop, match="STATUS_WRITE_FAILED"):
+        make(failing_writer, identity=broken_identity).announce(
+            10, "applied", branch="feature/bridge-example", head_sha="a" * 40,
+            increment="ATDD-EXAMPLE")
+    assert failing_writer.calls == []
+
+    # An unauthenticated/missing identity is never trusted as ownership.
+    with pytest.raises(b.Stop, match="STATUS_IDENTITY_UNKNOWN"):
+        b.status_comment_id([status_comment_for(30, 10)], 10, None)
+
+
+@pytest.mark.acceptance
+def test_malformed_task_envelope_is_permanent():
+    """ATDD-BRIDGE-v1/AC-001: a malformed task body is a permanent, non-retryable refusal."""
+    # A malformed or oversized task body never becomes valid on a later poll.
+    for bad in ("{ not json", "x" * (b.MAX_BYTES + 1)):
+        snap = (1, {"state": "open"}, [comment(10, "/opip-task\n" + bad)])
+        with pytest.raises(b.Stop, match="^INVALID_TASK_ENVELOPE$"):
+            b.control(snap, 10, [], NOW)
+
+    # A parseable but structurally wrong body is a permanent schema refusal too.
+    for body in ('/opip-task\n"just a string"', "/opip-task\n[1,2,3]",
+                 "/opip-task\n" + json.dumps({"schema": 1})):
+        snap = (1, {"state": "open"}, [comment(10, body)])
+        with pytest.raises(b.Stop) as error:
+            b.control(snap, 10, [], NOW)
+        assert str(error.value) not in b.RETRYABLE_REASONS
+
+    # Malformed OWNER decisions are permanent as well.
+    base = snapshot()
+    base[2][1]["body"] = "/opip-approve\n{ not json"
+    with pytest.raises(b.Stop, match="^INVALID_DECISION_ENVELOPE$"):
+        b.control(base, 10, [], NOW)
+
+    # strict_json keeps its transient code, so GitHub transport parsing stays retryable.
+    with pytest.raises(b.Stop, match="^INVALID_JSON$"):
+        b.strict_json("{ not json")
+    assert "INVALID_JSON" in b.RETRYABLE_REASONS and "OVERSIZED_JSON" in b.RETRYABLE_REASONS
+    assert not (b.PERMANENT_ENVELOPE_REASONS & b.RETRYABLE_REASONS)
+    assert b.INVALID_TASK_ENVELOPE not in b.RETRYABLE_REASONS
+    assert b.INVALID_DECISION_ENVELOPE not in b.RETRYABLE_REASONS
+    # The envelope translation only rewrites parse codes, not other refusals.
+    assert b.envelope(comment(10, "/opip-task\n{}"), "/opip-task") == {}
+
+
+@pytest.mark.acceptance
+def test_permanent_malformed_task_is_not_retried(tmp_path, monkeypatch):
+    """ATDD-BRIDGE-v1/AC-011: a permanently malformed task is rejected once and never retried."""
+    state = tmp_path / "state"
+    config = {"worktree": str(tmp_path / "tree"), "state_dir": str(state),
+              "dispatch_ids": [], "enable_execution": True}
+
+    malformed = comment(10, "/opip-task\n{ not json")
+    valid = comment(20, "/opip-task\n" + json.dumps(fixture_task()), author=1)
+    snap = (1, {"state": "open"}, [malformed, valid])
+    seen = []
+    permanent = {10: b.INVALID_TASK_ENVELOPE, 30: b.INVALID_TASK_ENVELOPE}
+
+    def fake_run(config_, issue, comment_id, execute=False, api=None, agent=None,
+                 status_api=None):
+        seen.append(comment_id)
+        if comment_id in permanent:
+            raise b.Stop(permanent[comment_id])
+
+    monkeypatch.setattr(b, "run", fake_run)
+
+    # (e) The malformed task is refused once; the valid later task is still processed.
+    assert b.poll_once(config, 1, execute=True, api=SnapAPI(snap)) == [20]
+    assert seen == [10, 20]
+
+    # (a)/(c) A later poll does not reconsider the permanently malformed comment.
+    seen.clear()
+    assert b.poll_once(config, 1, execute=True, api=SnapAPI(snap)) == []
+    assert 10 not in seen
+    disposition = b.load_discovery(b.discovery_path(state))["dispositions"]["10"]
+    assert disposition["state"] == "REJECTED"
+    assert disposition["reason"] == b.INVALID_TASK_ENVELOPE
+
+    # (d) Genuine transient GitHub/transport failures remain retryable and consume nothing.
+    transient = tmp_path / "transient"
+    transient_config = dict(config, state_dir=str(transient))
+    with pytest.raises(b.Stop, match="HOST_COMMAND_FAILED"):
+        b.poll_once(transient_config, 1, execute=True,
+                    api=SnapAPI(snap, failure="HOST_COMMAND_FAILED"))
+    assert not b.discovery_path(transient).exists()
+
+    # (b) An oversized task envelope is likewise permanent, not retried.
+    huge = tmp_path / "huge"
+    huge_config = dict(config, state_dir=str(huge))
+    oversized = (1, {"state": "open"},
+                 [comment(30, "/opip-task\n" + "x" * (b.MAX_BYTES + 1))])
+    b.poll_once(huge_config, 1, execute=True, api=SnapAPI(oversized))
+    huge_disposition = b.load_discovery(b.discovery_path(huge))["dispositions"]["30"]
+    assert huge_disposition["state"] == "REJECTED"
+    assert huge_disposition["reason"] == b.INVALID_TASK_ENVELOPE
 
 
 @pytest.mark.acceptance

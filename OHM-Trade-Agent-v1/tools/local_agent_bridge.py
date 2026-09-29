@@ -71,6 +71,21 @@ POLL_MIN_SECONDS, POLL_MAX_SECONDS, POLL_DEFAULT_SECONDS = 10, 300, 20
 DISCOVERY_FILE = "discovery.json"
 MAX_DISPOSITIONS = 5000
 
+# A published draft PR whose checks have not reached a terminal disposition stays
+# resumable. Its receipt proves coding/tests/commit/push already happened, so a
+# later poll may only re-evaluate CI/review state; it must never re-code.
+RESUMABLE_RECEIPT_STATUSES = frozenset({"PUBLISHED_WAITING_CI"})
+
+# Codes raised by strict_json. Inside a GitHub transport response they are transient
+# and retryable; at the task/decision envelope boundary they mean a permanently
+# malformed comment and are translated to the permanent codes below.
+JSON_PARSE_CODES = frozenset({"INVALID_JSON", "OVERSIZED_JSON"})
+INVALID_TASK_ENVELOPE = "INVALID_TASK_ENVELOPE"
+INVALID_DECISION_ENVELOPE = "INVALID_DECISION_ENVELOPE"
+
+# Reasons that are permanent for one comment: recorded once, never retried.
+PERMANENT_ENVELOPE_REASONS = frozenset({INVALID_TASK_ENVELOPE, INVALID_DECISION_ENVELOPE})
+
 # Reasons that describe an unavailable/!yet-decidable read rather than a permanent verdict.
 # They must not consume a task: the next poll retries them.
 RETRYABLE_REASONS = frozenset({
@@ -81,6 +96,9 @@ RETRYABLE_REASONS = frozenset({
     # A GitHub write outage must not consume a task; the next poll retries it.
     "STATUS_WRITE_FAILED",
 })
+
+# A permanent-envelope reason must never be retryable; the two sets are disjoint.
+assert not (PERMANENT_ENVELOPE_REASONS & RETRYABLE_REASONS)
 
 # Reasons that are a refusal/authority state rather than a runtime failure.
 BLOCKED_REASONS = frozenset({
@@ -263,10 +281,21 @@ def immutable(comment):
     timestamp(comment.get("created_at"))
 
 
-def envelope(comment, command):
+def envelope(comment, command, permanent=INVALID_TASK_ENVELOPE):
+    """Parse one command envelope body.
+
+    A malformed or oversized body is permanent for this comment: it will never
+    become valid on a later poll, so it is translated to ``permanent`` instead of
+    the transport-parse codes that GitHub read failures keep as retryable.
+    """
     body = comment.get("body", "")
     require(type(body) is str and body.startswith(command + "\n"), "INVALID_ENVELOPE")
-    return strict_json(body[len(command) + 1:])
+    try:
+        return strict_json(body[len(command) + 1:])
+    except Stop as exc:
+        if str(exc) in JSON_PARSE_CODES:
+            raise Stop(permanent) from exc
+        raise
 
 
 def control(snapshot, comment_id, dispatch_ids, now=None, admit=None):
@@ -316,7 +345,7 @@ def owner_approval(comments, owner, comment_id, task_hash, comment, now):
         body = item.get("body", "") or ""
         for command in ("/opip-approve", "/opip-revoke"):
             if body.startswith(command + "\n"):
-                value = envelope(item, command)
+                value = envelope(item, command, INVALID_DECISION_ENVELOPE)
                 require(type(value) is dict, "INVALID_DECISION")
                 if value.get("task_comment_id") == comment_id:
                     immutable(item)
@@ -619,26 +648,52 @@ def status_comment(payload):
     return body
 
 
-def status_comment_id(comments, comment_id):
+def status_comment_id(comments, comment_id, author_id):
+    """Return the one bridge-authored status comment id for this task, or None.
+
+    Ownership is verified, not assumed: only the authenticated status-writer
+    identity may own the bridge's status comment. A marker posted by any other
+    account is ignored, so a foreign comment can never be overwritten or treated
+    as authoritative bridge status.
+    """
+    require(integer(author_id), "STATUS_IDENTITY_UNKNOWN")
     marker = status_marker(comment_id)
     for item in comments:
+        if item.get("user", {}).get("id") != author_id:
+            continue
         body = item.get("body")
         if type(body) is str and body.startswith(marker):
-            return item.get("id") if integer(item.get("id")) else None
+            found = item.get("id")
+            if integer(found):
+                return found
     return None
 
 
 class GitHubStatus:
     """Create-once, update-in-place status comments on the single control issue."""
 
-    def __init__(self, issue, *, api=None, writer=None, state_dir=None, clock=None):
+    def __init__(self, issue, *, api=None, writer=None, state_dir=None, clock=None,
+                 identity=None):
         require(integer(issue), "INVALID_ID")
         self.issue = issue
         self._api = api or GitHub()
         self._writer = writer or self._gh_write
         self._state_dir = Path(state_dir) if state_dir else Path(tempfile.gettempdir())
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._identity_resolver = identity or self._gh_identity
+        self._identity = None
         self._comment_ids = {}
+
+    def status_identity(self):
+        """Resolve and cache the authenticated status-writer numeric user id.
+
+        Resolved once per run so comment ownership is deterministic. A lookup
+        failure fails closed and never falls back to trusting an arbitrary author.
+        """
+        if self._identity is None:
+            self._identity = self._identity_resolver()
+        require(integer(self._identity), "STATUS_IDENTITY_UNKNOWN")
+        return self._identity
 
     def announce(self, comment_id, state, *, branch="", head_sha="", increment="",
                  reason_code=None, comments=None):
@@ -652,7 +707,7 @@ class GitHubStatus:
                 source = comments
                 if source is None:
                     source = self._api.snapshot(self.issue)[2]
-                existing = status_comment_id(source, comment_id)
+                existing = status_comment_id(source, comment_id, self.status_identity())
                 if existing is not None:
                     self._comment_ids[comment_id] = existing
             if existing is None:
@@ -669,13 +724,26 @@ class GitHubStatus:
                 subprocess.SubprocessError) as exc:
             raise Stop("STATUS_WRITE_FAILED") from exc
 
-    def _gh_write(self, method, path, payload):
-        binary = shutil.which("gh")
-        require(binary is not None, "GH_MISSING")
+    def _write_env(self):
         env = dict(os.environ)
         token = os.environ.get(STATUS_TOKEN_ENV)
         if token:
             env["GH_TOKEN"] = token
+        return env
+
+    def _gh_identity(self):
+        """Resolve the status writer's numeric id through authenticated gh."""
+        binary = shutil.which("gh")
+        require(binary is not None, "GH_MISSING")
+        user = strict_json(host_run([binary, "api", "--hostname", "github.com",
+                                     "--method", "GET", "user"], env=self._write_env()))
+        require(integer(user.get("id")), "STATUS_IDENTITY_UNKNOWN")
+        return user["id"]
+
+    def _gh_write(self, method, path, payload):
+        binary = shutil.which("gh")
+        require(binary is not None, "GH_MISSING")
+        env = self._write_env()
         # Structured file input: the token never reaches argv and no token is written.
         directory = tempfile.mkdtemp(prefix="opip-status-", dir=self._state_dir)
         try:
@@ -790,14 +858,31 @@ def task_candidates(comments, allowed_ids, decided):
     return found
 
 
-def attempted_tasks(state):
-    """Task comment ids already claimed in the durable receipt database."""
+def receipt_states(state):
+    """Return ``{task_comment_id: receipt_status}`` from the durable receipt database."""
     path = Path(state) / "receipts.sqlite3"
     if not path.exists():
-        return set()
+        return {}
     with contextlib.closing(receipt_db(Path(state))) as connection:
-        rows = connection.execute("SELECT task FROM receipts").fetchall()
-    return {row[0] for row in rows}
+        rows = connection.execute("SELECT task, status FROM receipts").fetchall()
+    return {task: status for task, status in rows}
+
+
+def attempted_tasks(state):
+    """Task comment ids already consumed, excluding tasks still awaiting CI.
+
+    A ``PUBLISHED_WAITING_CI`` receipt is durable proof that coding, tests, commit
+    and push already happened. It deliberately stays eligible so a later poll can
+    re-evaluate only the exact-SHA CI/review state; it is never re-coded.
+    """
+    return {task for task, status in receipt_states(state).items()
+            if status not in RESUMABLE_RECEIPT_STATUSES}
+
+
+def resumable_tasks(state):
+    """Task comment ids whose only remaining work is the CI/review disposition."""
+    return {task for task, status in receipt_states(state).items()
+            if status in RESUMABLE_RECEIPT_STATUSES}
 
 
 def poll_once(config, issue, *, execute=False, policy_path=None, status_api=None,
@@ -836,7 +921,9 @@ def poll_once(config, issue, *, execute=False, policy_path=None, status_api=None
                 discovery_decide(discovery, comment_id, "FAILED", "FAILED_OWNER_RECOVERY")
             continue
         handled.append(comment_id)
-        if execute:
+        # A task still awaiting CI is not terminal: leave it rediscoverable so the
+        # next poll can resume the review disposition without re-coding.
+        if execute and comment_id not in resumable_tasks(state):
             discovery_decide(discovery, comment_id, "HANDLED", None)
     if execute:
         highest = max([c.get("id") for c in comments if integer(c.get("id"))] or [0])

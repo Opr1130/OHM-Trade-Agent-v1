@@ -306,3 +306,131 @@ def test_autonomous_pipeline(tmp_path, monkeypatch, case):
         assert model_calls == [False, True]
     if case == "tests_fail":
         assert not posted and model_calls == [False]
+
+
+@pytest.mark.acceptance
+@pytest.mark.parametrize("outcome", ["pending", "green", "failure"])
+def test_waiting_ci_resume_through_watch(tmp_path, monkeypatch, outcome):
+    """ATDD-BRIDGE-v1/AC-011: a published draft PR stays resumable without re-coding."""
+    root, task = make_repo(tmp_path)
+    state = tmp_path / "state"
+    cfg = {"worktree": str(root), "state_dir": str(state), "dispatch_ids": [],
+           "enable_execution": True}
+    value = policy()
+    for key in ("contract_sha256", "authority_sha256"):
+        value[key] = task[key]
+    value["base_head"] = task["head"]
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps(value))
+    hashed = b.digest(path.read_bytes())
+    snap = snapshot(task)
+    snap[2].append(comment(20, "/opip-authorize-increment\n" + json.dumps({
+        "policy_sha256": hashed, "expires_at": "2026-09-29T11:00:00Z",
+        "architecture_clear": True})))
+    snap[2][:] = [c for c in snap[2] if c["id"] != 11]
+    comments = snap[2]
+
+    class API:
+        def snapshot(self, issue):
+            return copy.deepcopy(snap)
+
+        def get(self, route):
+            return {"state": "open", "draft": True, "user": {"id": 2},
+                    "head": {"sha": task["head"], "ref": task["branch"],
+                             "repo": {"full_name": b.REPO}},
+                    "base": {"ref": "main", "repo": {"full_name": b.REPO}},
+                    "number": 42, "html_url": "https://example.invalid/pull/42"}
+
+    monkeypatch.setattr(b, "GitHub", API)
+    original_policy, original_control = a.authorize_policy, b.control
+    monkeypatch.setattr(a, "authorize_policy", lambda s, h: original_policy(s, h, NOW))
+    monkeypatch.setattr(b, "control",
+                        lambda s, cid, ids, admit=None: original_control(s, cid, ids, NOW, admit))
+    monkeypatch.setattr(a, "reviewer_id", lambda: 3)
+
+    model_calls, test_calls, publish_calls, posted = [], [], [], []
+
+    def cursor(config, task, context, contract, review=False):
+        model_calls.append(review)
+        if review:
+            return {"verdict": "APPROVE", "findings": []}
+        return {"conflict": False, "edits": [{"path": PATH, "before_sha256":
+                b.digest(b"before\n"), "content": "after\n"}]}
+
+    monkeypatch.setattr(b, "cursor", cursor)
+
+    def tests(*args):
+        test_calls.append(1)
+        return {"exit_code": 0}
+
+    monkeypatch.setattr(a, "isolated_tests", tests)
+
+    def publish(*args):
+        publish_calls.append(1)
+        (root / PATH).write_bytes(b"before\n")
+        return {"sha": task["head"], "pr": 42, "url": "https://example.invalid/pull/42"}
+
+    monkeypatch.setattr(a, "publish", publish)
+
+    # The pipeline runs for real; CI is pending on the first pass, then varies.
+    ci_ready = [False]
+
+    def pages(api, route, key=None):
+        if not key:
+            return []
+        if not ci_ready[0]:
+            return [{"id": i, "name": name, "status": "in_progress", "conclusion": None}
+                    for i, name in enumerate(b.PROTECTED_REQUIRED_CHECKS)]
+        conclusion = {"pending": None, "green": "success", "failure": "failure"}[outcome]
+        status = "in_progress" if outcome == "pending" else "completed"
+        return [{"id": i, "name": name, "status": status, "conclusion": conclusion}
+                for i, name in enumerate(b.PROTECTED_REQUIRED_CHECKS)]
+
+    monkeypatch.setattr(a, "all_pages", pages)
+
+    def post(route, body, state_, reviewer=False):
+        posted.append(body)
+        return {"commit_id": task["head"], "state":
+                {"APPROVE": "APPROVED", "REQUEST_CHANGES": "CHANGES_REQUESTED"}[body["event"]]}
+
+    monkeypatch.setattr(a, "gh_write", post)
+
+    # (a) First watch pass publishes the draft PR and reaches WAITING_CI.
+    assert b.poll_once(cfg, 1, execute=True, policy_path=path, api=API()) == [10]
+    assert publish_calls == [1]
+    assert model_calls == [False, True]
+    assert test_calls == [1]
+    assert b.receipt_states(state)[10] == "PUBLISHED_WAITING_CI"
+
+    # (b) The task remains eligible for a CI-only resume.
+    assert b.resumable_tasks(state) == {10}
+    assert 10 not in b.attempted_tasks(state)
+    decided = {str(t) for t in b.attempted_tasks(state)}
+    assert b.task_candidates(comments, {1}, decided) == [10]
+
+    if outcome == "pending":
+        # A still-pending CI result neither re-codes nor terminates the task.
+        assert b.poll_once(cfg, 1, execute=True, policy_path=path, api=API()) == [10]
+        assert model_calls == [False, True] and test_calls == [1] and publish_calls == [1]
+        assert posted == []
+        assert b.resumable_tasks(state) == {10}
+        return
+
+    # (c)/(d) A terminal CI result resumes this task and submits the review.
+    ci_ready[0] = True
+    assert b.poll_once(cfg, 1, execute=True, policy_path=path, api=API()) == [10]
+    expected_event = {"green": "APPROVE", "failure": "REQUEST_CHANGES"}[outcome]
+    assert [body["event"] for body in posted] == [expected_event]
+    assert posted[0]["commit_id"] == task["head"]
+    assert b.receipt_states(state)[10] == expected_event
+
+    # (e) Resume did not re-code, re-test, re-commit or re-push.
+    assert model_calls == [False, True]
+    assert test_calls == [1]
+    assert publish_calls == [1]
+
+    # (f) A terminal task is no longer rediscovered.
+    assert b.poll_once(cfg, 1, execute=True, policy_path=path, api=API()) == []
+    assert b.resumable_tasks(state) == set()
+    assert 10 in b.attempted_tasks(state)
+    assert model_calls == [False, True] and publish_calls == [1]

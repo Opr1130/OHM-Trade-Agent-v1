@@ -134,6 +134,7 @@ FROZEN BOUNDARIES:
 
 ACCEPTANCE TEST TRACEABILITY:
 AC-001 -> tests/test_local_agent_bridge.py::test_control_plane
+AC-001 -> tests/test_local_agent_bridge.py::test_malformed_task_envelope_is_permanent
 AC-002 -> tests/test_local_agent_bridge.py::test_repository_and_scope
 AC-003 -> tests/test_local_agent_bridge.py::test_dry_run
 AC-004 -> tests/test_local_agent_bridge.py::test_cursor_boundary
@@ -144,7 +145,10 @@ AC-008 -> tests/test_local_bridge_autonomy.py::test_registered_policy
 AC-009 -> tests/test_local_bridge_autonomy.py::test_isolated_verification
 AC-010 -> tests/test_local_bridge_autonomy.py::test_review_gate
 AC-011 -> tests/test_local_agent_bridge.py::test_continuous_discovery
+AC-011 -> tests/test_local_agent_bridge.py::test_permanent_malformed_task_is_not_retried
+AC-011 -> tests/test_local_bridge_autonomy.py::test_waiting_ci_resume_through_watch
 AC-012 -> tests/test_local_agent_bridge.py::test_github_status_reporting
+AC-012 -> tests/test_local_agent_bridge.py::test_status_comment_identity_is_verified
 AC-013 -> tests/test_local_bridge_autonomy.py::test_protected_required_checks
 
 IMPLEMENTATION MAP:
@@ -179,6 +183,7 @@ AC-010 -> OHM-Trade-Agent-v1/tests/test_local_bridge_autonomy.py
 AC-010 -> OHM-Trade-Agent-v1/docs/engineering/LOCAL_AGENT_BRIDGE_V1.md
 AC-011 -> OHM-Trade-Agent-v1/tools/local_agent_bridge.py
 AC-011 -> OHM-Trade-Agent-v1/tests/test_local_agent_bridge.py
+AC-011 -> OHM-Trade-Agent-v1/tests/test_local_bridge_autonomy.py
 AC-011 -> OHM-Trade-Agent-v1/docs/engineering/LOCAL_AGENT_BRIDGE_V1.md
 AC-012 -> OHM-Trade-Agent-v1/tools/local_agent_bridge.py
 AC-012 -> OHM-Trade-Agent-v1/tools/local_bridge_autonomy.py
