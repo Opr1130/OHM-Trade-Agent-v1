@@ -35,7 +35,7 @@ def test_ac_002_repeated_evaluation_is_deterministic() -> None:
 
 @pytest.mark.acceptance
 def test_ac_003_explicit_evaluation_time_uses_declared_grid() -> None:
-    """ATDD-R3-F3-ignition-detector/AC-003: the 60-second grid sets cadence, not longer features."""
+    """ATDD-R3-F3-ignition-detector/AC-003: grid cadence governs and evaluation_time equals the snapshot cutoff."""
     pytest.skip(_DEFERRED)
 
 
@@ -83,7 +83,7 @@ def test_ac_010_shadow_isolation_grants_no_authority() -> None:
 
 @pytest.mark.acceptance
 def test_ac_011_evaluation_is_bound_to_the_sealed_snapshot_identity() -> None:
-    """ATDD-R3-F3-ignition-detector/AC-011: claims bind to the sealed snapshot identity and content hash."""
+    """ATDD-R3-F3-ignition-detector/AC-011: decision input is detector_replay_input; lineage ids are carried, not decision inputs."""
     pytest.skip(_DEFERRED)
 
 
@@ -101,7 +101,7 @@ def test_ac_013_instrument_identity_must_match_prior_state() -> None:
 
 @pytest.mark.acceptance
 def test_ac_014_evaluation_time_is_explicit_and_valid() -> None:
-    """ATDD-R3-F3-ignition-detector/AC-014: evaluation_time is explicit, grid-valid and never read from a clock."""
+    """ATDD-R3-F3-ignition-detector/AC-014: evaluation_time is explicit, grid-valid and exactly equals the snapshot cutoff."""
     pytest.skip(_DEFERRED)
 
 

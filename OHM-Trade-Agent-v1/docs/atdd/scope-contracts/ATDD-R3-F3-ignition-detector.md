@@ -18,7 +18,7 @@ Frozen F3 semantics that this contract encodes:
 
 1. IGNITION is the sole detector family for v1.
 2. `evaluate()` is pure: no network, disk, database, environment, internal-clock or global-mutable-state access.
-3. `evaluation_time` is explicit.
+3. `evaluation_time` is explicit; it is UTC; it sits on the declared 60-second evaluation grid; and it is exactly equal to `snapshot.evaluation_cutoff`. Detector evaluation uses the declared 60-second grid, and every actual detector-evaluation `FeatureSnapshot` corresponds to its evaluation instant, so a stale snapshot must not be reused as a later detector evaluation. `evaluated_at_utc` is a DIFFERENT boundary and may legitimately be later, because receipt/visibility latency is a separate fact from the evidence cutoff; `evaluation_time` and `evaluated_at_utc` are therefore never equated. No hidden clock is read, and a mismatch between `evaluation_time` and `snapshot.evaluation_cutoff` fails closed.
 4. The detector owns transition semantics, hysteresis, debounce/persistence interpretation, claim generation and the next `DetectorState`.
 5. Runtime persistence is not owned by `evaluate()`; persistence integration is outside this first slice.
 6. Claim idempotency is tied to the actual detector transition and evidence, not to wall-clock invocation identity.
@@ -32,7 +32,20 @@ Frozen F3 semantics that this contract encodes:
 TARGET INTERFACE INPUTS (current repository truth, not a new contract):
 
 - `app/opip/contracts/features.py` owns `FeatureSnapshot`: `instrument_version_id`, `venue_instrument_id`, `feature_version`, `evaluation_cutoff` (grid-aligned), `evaluated_at_utc`, `consumed_input_watermark`, `values`, `availability`, `missingness`, `coverage`, `restart_state`, `evaluation_grid_seconds`, `feature_schema_version`, `feature_calc_version`, `feature_dag_hash`, `snapshot_id`, and `content_hash()`.
-- `app/opip/features/replay.py::detector_replay_input` already defines exactly what a detector may read from a snapshot, and `detector_input_fingerprint` (`DETIN`) is the deterministic input fingerprint. F3 must reuse that surface rather than invent a competing one.
+- `app/opip/features/replay.py::detector_replay_input` already defines exactly what a detector may read from a snapshot, and `detector_input_fingerprint` (`DETIN`) is the deterministic input fingerprint. F3 must reuse that surface rather than invent a competing one, and the frozen evidence/lineage distinction is:
+
+    DETECTOR DECISION INPUT (what `evaluate()` consumes):
+    - `detector_replay_input(snapshot)`;
+    - the prior `DetectorState`;
+    - the explicit `evaluation_time`;
+    - the versioned detector policy.
+
+    LINEAGE / TAMPER EVIDENCE (carried, not what drives the decision):
+    - `snapshot_id`;
+    - `snapshot.content_hash()`;
+    - `detector_input_fingerprint(snapshot)` (`DETIN`).
+
+    The detector may carry the lineage identifiers into `DetectorClaim` / `DetectorState`, but excluded `FeatureSnapshot` metadata (for example `availability`, `evaluated_at_utc`, freshness and notes) must not become favourable transition evidence. `detector_replay_input` is not expanded in this increment and `app/opip/features/replay.py` is not modified.
 - `app/opip/features/state.py` already proves the gap/persistence-reset discipline at the feature layer (`persistence_intervals`, `gap_resets`, `last_gap_epoch`). F3 mirrors that discipline for detector persistence; it does not create a second state framework.
 - `app/services/explosion_state.py` and the other `IGNITION` string uses are the legacy explosion/phase taxonomy. They are not `DetectorState` and are not prior art for this contract.
 
@@ -52,7 +65,9 @@ PROPOSED IMPLEMENTATION MAP FOR THE DEFERRED F3 IMPLEMENTATION INCREMENT (docume
 - `OHM-Trade-Agent-v1/app/opip/detectors/ignition.py` — the pure `evaluate(snapshot, prior_state, evaluation_time)` IGNITION evaluator.
 - `OHM-Trade-Agent-v1/tests/test_opip_r3_f3_ignition_detector.py` — the acceptance and unit tests; the contract-stage skeletons in this increment are completed here rather than replaced by a second test file.
 
-The proposed set adds no second Feature Bus, no second state framework, no duplicate snapshot contract, no parallel opportunity package and no compatibility wrapper. Detector vocabulary belongs with the shared contracts package; the pure evaluator belongs in one detectors package. These paths are proposals for OWNER review and do not authorize any file change under this increment.
+The proposed set adds no second Feature Bus, no second state framework, no duplicate snapshot contract, no parallel opportunity package and no compatibility wrapper. Detector vocabulary belongs with the shared contracts package; the pure evaluator belongs in one detectors package.
+
+This increment remains CONTRACT-FREEZE ONLY. The proposed application paths are advisory for OWNER review only, and they are deliberately NOT added to the active `IMPLEMENTATION MAP`. A separate, OWNER-approved ATDD implementation increment will authorize them, and this contract becomes the normative acceptance source for that implementation increment.
 
 ARCHITECTURE REFERENCES:
 - O'Pip Profit Intelligence Platform Architecture v1.4.3: repository authority copy `docs/architecture/v1.4.3/OPIP_Profit_Intelligence_Architecture_v1_4_3.docx`, SHA256 `ab494a19867831deb43087af2820bbb8eac7e3b310c6b0dab9c3f17d3c93ce83`, and its extraction `docs/architecture/v1.4.3/ARCHITECTURE.md`.
@@ -94,7 +109,7 @@ a detector evaluation on the declared 60-second evaluation grid and a sealed sna
 WHEN:
 evaluate() interprets the snapshot
 THEN:
-evaluation_time is explicit and valid for the 60-second grid, and the longer-cadence feature is consumed only as a value and never redefines detector evaluation cadence
+evaluation_time is explicit, sits on the declared 60-second grid and is exactly equal to the snapshot's evaluation cutoff, and the longer-cadence feature is consumed only as a value and never redefines detector evaluation cadence
 
 AC-004:
 GIVEN:
@@ -158,7 +173,7 @@ a sealed FeatureSnapshot supplied to evaluate()
 WHEN:
 the evaluation binds its claims and next state to that snapshot
 THEN:
-the binding uses the snapshot identity and content hash, the evaluation consumes exactly the snapshot content plus the explicit arguments, and a snapshot whose identity is absent or not bound to the supplied evidence fails closed
+the detector decision input is exactly detector_replay_input(snapshot) plus the prior DetectorState, the explicit evaluation_time and the versioned detector policy; the detector may carry the lineage and tamper-evidence identifiers snapshot_id, snapshot.content_hash() and detector_input_fingerprint(snapshot) into DetectorClaim and DetectorState, but excluded FeatureSnapshot metadata must not become favourable transition evidence; and a snapshot whose identity is absent or not bound to the supplied evidence fails closed
 
 AC-012:
 GIVEN:
@@ -178,11 +193,11 @@ the mismatch fails closed, and the detector never applies one instrument's phase
 
 AC-014:
 GIVEN:
-a sealed FeatureSnapshot and an evaluation_time
+a sealed FeatureSnapshot and an explicit evaluation_time
 WHEN:
 evaluate() validates the evaluation instant
 THEN:
-the instant must be explicit, must sit on the declared 60-second grid and must not precede the snapshot's evaluation cutoff, no hidden clock is read, and a missing or invalid evaluation_time fails closed
+evaluation_time is explicit, UTC, sits on the declared 60-second grid and is exactly equal to the snapshot's evaluation_cutoff; evaluated_at_utc is a separate receipt/visibility boundary and is never equated with evaluation_time; no hidden clock is read; and a missing, off-grid or cutoff-mismatched evaluation_time fails closed
 
 AC-015:
 GIVEN:
@@ -232,7 +247,9 @@ FROZEN BOUNDARIES:
 - Paper execution stays isolated from funded order endpoints.
 - Committee authority is unchanged and remains shadow-only.
 - The v1.4.3 DOCX bytes are unchanged and equal to the recorded SHA256.
-- No merge, deploy, activation, push or PR occurs under this increment.
+- No merge, deploy, activation, or PR occurs under this increment.
+- A normal push of the contract-only review branch is permitted solely for OWNER review.
+- That push grants no implementation or runtime authority.
 
 ACCEPTANCE TEST TRACEABILITY:
 AC-001 -> tests/test_opip_r3_f3_ignition_detector.py::test_ac_001_evaluation_is_pure
