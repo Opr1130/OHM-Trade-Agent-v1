@@ -75,7 +75,17 @@ def test_ac_006_deferred_deadlines_are_bounded() -> None:
 
 @pytest.mark.acceptance
 def test_ac_007_expiry_is_explicit_terminal() -> None:
-    """ATDD-R3-F4-opportunity-lifecycle/AC-007: expiry is explicit terminal with no silent resume."""
+    """ATDD-R3-F4-opportunity-lifecycle/AC-007: TIME-DRIVEN expiry at evaluation_time >= deadline needs no new DetectorClaim; duplicates are not a timer."""
+    # Contract-stage regression guards (no F4 runtime): expiry must not require
+    # a new claim, and duplicates must not act as timer ticks.
+    contract = CONTRACT_PATH.read_text(encoding="utf-8")
+    assert "WITHOUT requiring a new DetectorClaim" in contract
+    assert "TIME-DRIVEN" in contract
+    assert "evaluation_time greater than or equal to that deadline" in contract
+    assert "cannot substitute for the timer" in contract
+    assert "cannot extend the deadline" in contract
+    # Must not regress to claim-required expiry as the sole path.
+    assert "requires a DetectorClaim for every transition" not in contract
     pytest.skip(_DEFERRED)
 
 
@@ -93,7 +103,19 @@ def test_ac_009_terminality_requires_new_lifecycle() -> None:
 
 @pytest.mark.acceptance
 def test_ac_010_transition_core_is_pure() -> None:
-    """ATDD-R3-F4-opportunity-lifecycle/AC-010: pure transition core performs no I/O and reads no hidden state."""
+    """ATDD-R3-F4-opportunity-lifecycle/AC-010: purity covers CLAIM-DRIVEN and TIME-DRIVEN; deterministic/replayable; no I/O or hidden clock."""
+    # Contract-stage regression guards: both stimulus classes must stay pure.
+    contract = CONTRACT_PATH.read_text(encoding="utf-8")
+    assert "CLAIM-DRIVEN" in contract
+    assert "TIME-DRIVEN" in contract
+    assert "prior+evaluation_time+policy" in contract or (
+        "prior episode + explicit `evaluation_time` + versioned lifecycle policy"
+        in contract
+        or "prior OpportunityEpisode, an explicit evaluation_time and a versioned lifecycle policy"
+        in contract
+    )
+    assert "hidden-clock" in contract or "hidden clock" in contract
+    assert "no new DetectorClaim" in contract or "with no new DetectorClaim" in contract
     pytest.skip(_DEFERRED)
 
 

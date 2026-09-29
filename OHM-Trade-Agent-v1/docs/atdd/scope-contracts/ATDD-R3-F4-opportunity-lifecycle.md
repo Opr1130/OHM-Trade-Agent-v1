@@ -2,33 +2,42 @@ INCREMENT:
 ATDD-R3-F4-opportunity-lifecycle
 
 OWNER-APPROVED INTENT:
-Freeze the minimum architecture-faithful contract for the second R3 slice after F3: the F4 Opportunity Lifecycle over detector claims. This increment defines and freezes the acceptance criteria and the authorized path set for a future deterministic, replayable, pure opportunity-lifecycle transition surface that consumes already-produced `DetectorClaim` evidence and manages episode identity, deduplication, deferral, deadline, expiry, and terminal reason:
+Freeze the minimum architecture-faithful contract for the second R3 slice after F3: the F4 Opportunity Lifecycle over detector claims. This increment defines and freezes the acceptance criteria and the authorized path set for a future deterministic, replayable, pure opportunity-lifecycle transition surface that manages episode identity, deduplication, deferral, deadline, expiry, and terminal reason.
+
+Not every lifecycle transition requires a new `DetectorClaim`. F4 recognizes two stimulus classes:
+
+1. **CLAIM-DRIVEN** — a supplied `DetectorClaim` (plus prior episode or explicit absence, explicit `evaluation_time`, and versioned lifecycle policy) advances claim→episode work: create/bind, defer, terminal-for-claim-reasons, and other claim-triggered dispositions. Claim→episode lineage reuses identities already carried by `DetectorClaim` / sealed snapshot evidence.
+2. **TIME-DRIVEN** — a deferred episode is evaluated at an explicit `evaluation_time` against its already-recorded deadline **without** requiring a new `DetectorClaim`. Deadline expiry is a TIME-DRIVEN stimulus: when `evaluation_time >= deadline`, the episode terminates with an explicit F4 expiry terminal reason. `evaluation_time` is a timing input only (not a hidden wall clock inside the pure core).
+
+Duplicate or replayed claim delivery is **not** a timer tick: it must not extend a deadline, create a new episode, duplicate an expiry, or clear terminality (see AC-002 / AC-007). Redelivering the original claim cannot substitute for TIME-DRIVEN deadline evaluation.
+
+Exact callable shape is an OWNER DECISION (Q10) and is **not** frozen by this increment. Illustrative, non-normative sketches of both stimulus classes (not a ratified API):
 
 ```text
-advance(
-    claim: DetectorClaim,
-    prior_episode: OpportunityEpisode | None,
-    evaluation_time: datetime,
-) -> tuple[OpportunityEpisode, list[LifecycleEvent]]
+# CLAIM-DRIVEN (illustrative only — not frozen):
+#   inputs: claim, prior_episode | None, evaluation_time, versioned policy
+# TIME-DRIVEN deadline evaluation (illustrative only — not frozen):
+#   inputs: prior_episode (deferred), evaluation_time, versioned policy
+#           — no new DetectorClaim required
 ```
 
-The three-argument shape above is the **proposed** pure core for OWNER review, mirroring the F3 pattern (versioned lifecycle policy is a deterministic code artifact of the implementation, not a fourth argument and not a hidden input). Architecture v1.4.3 names the `OpportunityEpisode` entity and the deferral/deadline/expiry rules but does **not** yet pin this exact Python signature; freezing the behavioural contract does not invent unratified hash formulas, deadline durations, state-token spellings, or terminal-reason taxonomies (see OWNER DECISIONS REQUIRED).
+Any final OWNER-ratified interface MUST support both CLAIM-DRIVEN and TIME-DRIVEN stimuli. The historical three-argument `advance(claim, prior_episode, evaluation_time)` sketch is demoted: it is neither frozen nor an implied core, and it must not be read as requiring a claim for every transition (including expiry). Versioned lifecycle policy remains a deterministic code artifact of a future implementation (not a hidden input). Architecture v1.4.3 names the `OpportunityEpisode` entity and the deferral/deadline/expiry rules but does **not** pin a Python signature; freezing the behavioural contract does not invent unratified hash formulas, deadline durations, state-token spellings, or terminal-reason taxonomies (see OWNER DECISIONS REQUIRED).
 
 This increment is CONTRACT-FREEZE ONLY / SHADOW / evidence-only. It grants no production authority, no admission authority, no paper authority, no order authority, no risk authority and no Feature Bus activation. It does not wire any lifecycle into `run_cycle`. It authorizes this scope contract, the active-increment pointer and contract-stage acceptance-test skeletons only. Opportunity-lifecycle application code — `OpportunityEpisode` runtime types, the writer, DB migration, consumer migration and cutover — is a later, OWNER-approved implementation increment.
 
 Frozen F4 semantics that this contract encodes:
 
 1. Episode identity is deterministic and must not derive from wall clock, UUID, process identity, invocation order or retry count. Existing ratified identity primitives are inventoried below; inventing a new hash formula is prohibited in this freeze.
-2. Deduplication is at-least-once safe: retries, restarts, deadline-extension attempts and already-terminal episodes must not create duplicate episodes or extra lifecycle work.
-3. Claim→episode lineage reuses claim, snapshot, instrument, detector and policy/cutoff identities already carried by `DetectorClaim` / sealed snapshot evidence. F4 consumes `DetectorClaim`; it MUST NOT reinterpret F3 thresholds, hysteresis, debounce, persistence or transition evidence.
+2. Deduplication is at-least-once safe: retries, restarts, deadline-extension attempts and already-terminal episodes must not create duplicate episodes or extra lifecycle work. Duplicate claim delivery is not a TIME-DRIVEN timer tick and must not extend deadlines.
+3. Claim→episode lineage (CLAIM-DRIVEN) reuses claim, snapshot, instrument, detector and policy/cutoff identities already carried by `DetectorClaim` / sealed snapshot evidence. F4 consumes `DetectorClaim` for claim-driven work; it MUST NOT reinterpret F3 thresholds, hysteresis, debounce, persistence or transition evidence.
 4. Lifecycle state covers at least active/open, deferred and terminal concepts. Exact token spellings that are not architecture-authorized remain provisional (OWNER DECISION REQUIRED).
 5. Deferral is an explicit opportunity-lifecycle disposition. It is NOT detector `DORMANT`, detector reset, missing evidence, F5+ feasibility/forecast/selector, paper/trade lifecycle, or Committee advisory state.
 6. Every deferred episode carries an explicit deadline bounded by validity horizon. No numeric duration is invented here (OWNER DECISION REQUIRED if no authorized duration exists).
-7. Expiry is an explicit terminal disposition. Silent resume from duplicate delivery, replay, restart or stale state is forbidden. A new lifecycle requires a new eligible evaluation under future re-entry policy.
+7. Expiry is an explicit TIME-DRIVEN terminal disposition: evaluating a deferred episode at `evaluation_time >= deadline` terminates with an F4 expiry terminal reason and requires **no** new `DetectorClaim`. Silent resume from duplicate delivery, replay, restart or stale state is forbidden. Duplicates/replays cannot substitute for the timer, extend the deadline, create an episode, duplicate expiry, or clear terminality. A new lifecycle requires a new eligible evaluation under future re-entry policy.
 8. Terminal reasons use a canonical F4 episode vocabulary. Funnel / scan `ReasonCode` values are scan outcomes, not episode deadlines (conformance ledger). Do not blend with forecast TIMEOUT, order/fill, TARGET/STOP, RISK_EXIT, protection or learning vocabularies.
 9. Terminal is terminal. A new lifecycle needs an eligible new claim under a future OWNER-approved re-entry policy; this freeze does not invent that policy.
-10. The pure transition core takes claim + prior episode + explicit evaluation time + versioned lifecycle policy → next episode state and events. No network, disk, database, environment, hidden clock, random or global mutable state inside the pure core.
-11. Replay: identical inputs produce identical results.
+10. Purity applies to **both** stimulus classes. CLAIM-DRIVEN inputs: claim + prior episode (or explicit absence) + explicit `evaluation_time` + versioned lifecycle policy. TIME-DRIVEN inputs: prior episode + explicit `evaluation_time` + versioned lifecycle policy (no new claim). Either class yields next episode state and events with no network, disk, database, environment, hidden clock, random or global mutable state inside the pure core.
+11. Replay: identical inputs produce identical results (for each stimulus class).
 12. F3 boundary: no F3 contract, detector semantics or implementation changes; no reinterpretation of F3 evidence.
 13. F5+ isolation: no feasibility, forecast, selector, paper, funded or Committee authority.
 14. Current vs target authority: CURRENT = legacy fragmented clocks; TARGET = one canonical lifecycle over detector claims; CONTRACT STAGE = no authority transfer; initial implementation remains shadow unless later OWNER cutover.
@@ -93,7 +102,7 @@ OVERLAPPING CLOCKS / TTL EVIDENCE (legacy only; not F4 policy):
 PROPOSED IMPLEMENTATION MAP FOR THE DEFERRED F4 IMPLEMENTATION INCREMENT (documentation only; this contract-freeze increment authorizes no application path and creates no lifecycle runtime):
 
 - `OHM-Trade-Agent-v1/app/opip/contracts/opportunity.py` — typed `OpportunityEpisode`, lifecycle events, provisional state/terminal vocabularies once OWNER-ratified.
-- `OHM-Trade-Agent-v1/app/opip/opportunity/lifecycle.py` — pure `advance(claim, prior_episode, evaluation_time)` core (package name subject to OWNER confirmation that it does not fork Signal Quality v2 into a second spine).
+- `OHM-Trade-Agent-v1/app/opip/opportunity/lifecycle.py` — pure transition surface supporting both CLAIM-DRIVEN and TIME-DRIVEN stimuli (exact callable(s) subject to Q10; package name subject to OWNER confirmation that it does not fork Signal Quality v2 into a second spine).
 - `OHM-Trade-Agent-v1/tests/test_opip_r3_f4_opportunity_lifecycle.py` — acceptance and unit tests; contract-stage skeletons in this increment are completed here rather than replaced by a second test file.
 
 This increment remains CONTRACT-FREEZE ONLY. Proposed application paths are advisory for OWNER review only and are deliberately NOT added to the active `IMPLEMENTATION MAP`. A separate, OWNER-approved ATDD implementation increment will authorize them.
@@ -137,8 +146,8 @@ OWNER DECISIONS REQUIRED (discovery answers 1–12; unresolved items stay open �
    Status: OWNER DECISION REQUIRED. Safest options: (a) bind deadline to an F6-supplied horizon once F6 exists, with F4 only enforcing presence+bound check; (b) OWNER-ratify a temporary shadow constant with explicit expiry of that ratification; (c) fail closed on missing horizon rather than inventing a number. This freeze forbids inventing a number.
 
 7. Expiry / silent-resume prohibition?
-   Evidence: §8 "Expired claims cannot resume without a new evaluation."
-   Status: Answered — expiry is explicit terminal; no silent resume from duplicate/replay/restart/stale; new lifecycle needs new evaluation.
+   Evidence: §8 "Expired claims cannot resume without a new evaluation." Deadline expiry is TIME-DRIVEN and must not require a new DetectorClaim.
+   Status: Answered — expiry is explicit TIME-DRIVEN terminal at evaluation_time >= deadline without a new DetectorClaim; no silent resume from duplicate/replay/restart/stale; duplicates are not a timer; new lifecycle needs new evaluation.
 
 8. Canonical F4 terminal-reason vocabulary?
    Evidence: conformance ledger warns funnel terminals are scan outcomes; architecture requires explicit terminal reason; no F4 enum is checked in.
@@ -148,9 +157,9 @@ OWNER DECISIONS REQUIRED (discovery answers 1–12; unresolved items stay open �
    Evidence: new evaluation required; no ratified re-entry eligibility matrix.
    Status: OWNER DECISION REQUIRED for eligibility rules. This freeze only requires terminality and that a new lifecycle needs an eligible new claim under a future policy.
 
-10. Exact pure `advance(...)` signature and policy-version carriage?
-    Evidence: F3 froze `evaluate(snapshot, prior_state, evaluation_time)`; architecture does not pin an F4 callable.
-    Status: OWNER DECISION REQUIRED to ratify or amend the proposed three-argument surface. Behavioural purity/determinism/replay are frozen regardless.
+10. Exact pure transition API signature(s) and policy-version carriage?
+    Evidence: F3 froze `evaluate(snapshot, prior_state, evaluation_time)`; architecture does not pin an F4 callable. Behaviour requires both CLAIM-DRIVEN and TIME-DRIVEN stimuli (deadline expiry without a new DetectorClaim).
+    Status: OWNER DECISION REQUIRED — exact API unresolved. Any final interface MUST support both CLAIM-DRIVEN (claim + prior + evaluation_time + policy) and TIME-DRIVEN (prior + evaluation_time + policy, no new claim) stimuli. The historical three-argument `advance(claim, prior_episode, evaluation_time)` sketch is demoted and is neither frozen nor an implied core. Behavioural purity/determinism/replay for both stimulus classes are frozen regardless of the eventual signature.
 
 11. Consumer census completeness / migration order?
     Evidence: census table above from whole-repo search at the pinned SHA.
@@ -211,11 +220,11 @@ a deadline is present, the deadline is bounded by the validity horizon once that
 
 AC-007:
 GIVEN:
-a deferred episode whose deadline has been reached under an explicit evaluation time
+a deferred episode with an explicit deadline
 WHEN:
-the lifecycle transition surface evaluates expiry
+the lifecycle transition surface is evaluated at an explicit evaluation_time greater than or equal to that deadline
 THEN:
-the episode terminates with an explicit expiry terminal reason, and it cannot silently resume from duplicate delivery, replay, restart or stale prior state; a new lifecycle requires a new eligible evaluation
+the episode terminates with an explicit F4 expiry terminal reason WITHOUT requiring a new DetectorClaim (TIME-DRIVEN stimulus); evaluation_time is the only timing input for the comparison; duplicate claim delivery or replay cannot substitute for the timer, cannot extend the deadline, cannot create a new episode, cannot duplicate the expiry, and cannot clear terminality; a new lifecycle requires a new eligible evaluation
 
 AC-008:
 GIVEN:
@@ -235,15 +244,15 @@ terminal remains terminal, and opening a new lifecycle requires an eligible new 
 
 AC-010:
 GIVEN:
-a DetectorClaim, a prior OpportunityEpisode or explicit absence, an explicit evaluation_time and a versioned lifecycle policy
+either (a) CLAIM-DRIVEN inputs — a DetectorClaim, a prior OpportunityEpisode or explicit absence, an explicit evaluation_time and a versioned lifecycle policy — or (b) TIME-DRIVEN inputs — a prior OpportunityEpisode, an explicit evaluation_time and a versioned lifecycle policy, with no new DetectorClaim
 WHEN:
-the pure F4 transition core runs
+the pure F4 transition core runs for that stimulus class
 THEN:
-it performs no network, disk, database, environment, hidden-clock, random or global-mutable-state access, and it observes no input outside the supplied claim, prior episode, explicit evaluation_time and the versioned policy bound to the implementation
+it is deterministic and replayable; it performs no network, disk, database, environment, hidden-clock, random or global-mutable-state access; and it observes no input outside the supplied inputs for that stimulus class (claim+prior+evaluation_time+policy for CLAIM-DRIVEN; prior+evaluation_time+policy for TIME-DRIVEN) and the versioned policy bound to the implementation
 
 AC-011:
 GIVEN:
-identical claim, prior episode, evaluation_time and lifecycle policy/version inputs
+identical inputs for a given stimulus class (CLAIM-DRIVEN or TIME-DRIVEN) including evaluation_time and lifecycle policy/version
 WHEN:
 the pure transition core runs more than once, including from a fresh process
 THEN:
@@ -395,7 +404,7 @@ DEFERRED DISCOVERIES:
 - Exact OWNER-ratified lifecycle state tokens and F4 terminal-reason enum (Q4, Q8).
 - Numeric deferred deadline / validity-horizon binding source (Q6); may require F6.
 - Re-entry eligibility matrix after terminal (Q9).
-- Ratification of the proposed `advance(claim, prior_episode, evaluation_time)` signature (Q10).
+- Exact OWNER-ratified transition API supporting both CLAIM-DRIVEN and TIME-DRIVEN stimuli (Q10); historical three-arg `advance(claim, ...)` is demoted/not frozen.
 - Persistence/writer schema for OpportunityEpisode and LifecycleEvent (implementation increment).
 - Consumer migration order and stop-writing timestamps per overlapping clock (cutover increment).
 - Whether package path `app/opip/opportunity/` is acceptable given recovery-roadmap warning against a Signal Quality second spine (OWNER naming decision).
