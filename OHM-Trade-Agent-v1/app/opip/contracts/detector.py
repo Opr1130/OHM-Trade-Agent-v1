@@ -394,6 +394,26 @@ class DetectorClaim:
                 "F3 never creates an opportunity episode; episode_id must be None"
             )
 
+        # Enforce the identity invariant the contract requires: a claim's
+        # identity is a pure function of its evidence, so a directly
+        # constructed claim whose identifiers do not match its own evidence is
+        # refused rather than accepted as a valid-looking claim.
+        expected_id, expected_key = detector_claim_identity(
+            detector_family=self.detector_family,
+            detector_version=self.detector_version,
+            policy_version=self.policy_version,
+            instrument_version_id=self.instrument_version_id,
+            venue_instrument_id=self.venue_instrument_id,
+            transition=self.transition,
+            snapshot_id=self.snapshot_id,
+            detector_input_fingerprint=self.detector_input_fingerprint,
+        )
+        if self.claim_id != expected_id or self.idempotency_key != expected_key:
+            raise DetectorContractError(
+                "claim identity does not match its evidence; build the claim with "
+                "DetectorClaim.create()"
+            )
+
     @classmethod
     def create(
         cls,

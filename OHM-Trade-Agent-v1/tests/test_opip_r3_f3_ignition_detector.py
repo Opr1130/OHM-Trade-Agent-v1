@@ -1294,6 +1294,62 @@ def test_debounce_is_the_persistence_rule_not_an_extra_cooldown() -> None:
     assert next_state.phase is DetectorPhase.IGNITION
 
 
+def test_direct_construction_refuses_identity_that_does_not_match_its_evidence() -> None:
+    """A claim identifier is a pure function of its evidence, so it is enforced."""
+    snapshot = build_snapshot(cutoff=SECOND_CUTOFF)
+    fingerprint = detector_input_fingerprint(snapshot)
+    valid_id, valid_key = detector_claim_identity(
+        detector_family=DetectorFamily.IGNITION,
+        detector_version=IGNITION_DETECTOR_VERSION,
+        policy_version=IGNITION_POLICY_VERSION,
+        instrument_version_id=INSTRUMENT_VERSION_ID,
+        venue_instrument_id=VENUE_INSTRUMENT_ID,
+        transition=DetectorTransition.DORMANT_TO_IGNITION,
+        snapshot_id=snapshot.snapshot_id,
+        detector_input_fingerprint=fingerprint,
+    )
+    evidence = {
+        "detector_family": DetectorFamily.IGNITION,
+        "detector_version": IGNITION_DETECTOR_VERSION,
+        "policy_version": IGNITION_POLICY_VERSION,
+        "instrument_version_id": INSTRUMENT_VERSION_ID,
+        "venue_instrument_id": VENUE_INSTRUMENT_ID,
+        "phase": DetectorPhase.IGNITION,
+        "transition": DetectorTransition.DORMANT_TO_IGNITION,
+        "snapshot_id": snapshot.snapshot_id,
+        "detector_input_fingerprint": fingerprint,
+        "evaluation_cutoff": SECOND_CUTOFF,
+    }
+
+    # The matching identity is accepted.
+    assert DetectorClaim(
+        claim_id=valid_id, idempotency_key=valid_key, **evidence
+    ).claim_id == valid_id
+
+    # Non-empty but incorrect identifiers are refused.
+    for override in (
+        {"claim_id": "DCLM:not-the-evidence", "idempotency_key": valid_key},
+        {"claim_id": valid_id, "idempotency_key": "DCLMKEY:not-the-evidence"},
+        {"claim_id": valid_key, "idempotency_key": valid_id},
+    ):
+        with pytest.raises(DetectorContractError):
+            DetectorClaim(**{**evidence, **override})
+
+    # Identity is bound to the evidence, so different evidence needs a different id.
+    other = build_snapshot(cutoff=THIRD_CUTOFF)
+    with pytest.raises(DetectorContractError):
+        DetectorClaim(
+            claim_id=valid_id,
+            idempotency_key=valid_key,
+            **{
+                **evidence,
+                "snapshot_id": other.snapshot_id,
+                "detector_input_fingerprint": detector_input_fingerprint(other),
+                "evaluation_cutoff": THIRD_CUTOFF,
+            },
+        )
+
+
 def test_all_sixteen_acceptance_tests_execute_and_cite_both_increments() -> None:
     """No F3 acceptance test may be skipped, and each must cite both increments."""
     source = TEST_PATH.read_text(encoding="utf-8")

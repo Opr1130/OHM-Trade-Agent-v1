@@ -91,6 +91,7 @@ These are the resolutions the implementation had to make where the ratified poli
 6. A required feature present with `missingness` absent from the snapshot maps to `INSUFFICIENT_EVIDENCE`, consistent with "absent".
 7. The prior state is used exactly as supplied. The detector does not require, infer or reconstruct grid adjacency from `last_evaluation_cutoff`; the frozen `evaluation_time == snapshot.evaluation_cutoff` rule is what prevents a stale snapshot from being reused as a later evaluation.
 8. `evaluation_time` must be timezone-aware UTC, sub-second-free and on the declared 60-second grid, in addition to equalling `snapshot.evaluation_cutoff`.
+9. Claim identity is enforced at construction. A `DetectorClaim` built directly with identifiers that do not match its own evidence is refused, so an invalid-looking claim cannot be created outside `DetectorClaim.create()`. This enforces the deterministic-identity requirement rather than adding a policy parameter.
 
 ARCHITECTURE REFERENCES:
 - `OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R3-F3-ignition-detector.md`: the normative acceptance source for this increment. Read-only under this increment.
@@ -332,6 +333,7 @@ DEFERRED DISCOVERIES:
 - R3 slices F4 through F7, and the v1.4.3 section 13 platform acceptance scenarios, remain future increments.
 - The observed value ranges of the provisional policy thresholds have not yet been calibrated against recorded shadow evidence; recalibration is a future versioned policy decision.
 - Cross-checks of `feature_version` / `feature_dag_hash` against the prior state are not required by the frozen contract, so they were deliberately not added; introducing one would be a new versioned policy requirement.
+- Raised in review of this implementation PR: because the ratified persistence rule increments unconditionally, a caller that re-feeds the identical snapshot with the returned intermediate state (a redelivery or retry) can accrue 60 -> 120 and complete entry from one distinct interval, and a caller that supplies a non-adjacent complete-window snapshot can bridge a skipped grid step. This implementation applies the ratified rule exactly as specified and adds no adjacency or duplicate guard, because doing so would be a new policy rule requiring a new versioned policy and OWNER approval. A genuine gap is expected to surface from the feature bus as `coverage != COMPLETE` (already implemented as `MATERIAL_GAP`), and duplicate snapshot delivery is deduplicated by `snapshot_id` at the canonical/persistence layer, which is outside F3. Proposed future criterion for OWNER ruling: require `evaluation_time == prior_state.last_evaluation_cutoff + 60s` before accruing persistence, and treat a repeated or non-adjacent evaluation as a reset. Recorded as a proposal only; it is not approved and not implemented.
 
 UNAPPROVED SCOPE CHANGES:
 NONE
