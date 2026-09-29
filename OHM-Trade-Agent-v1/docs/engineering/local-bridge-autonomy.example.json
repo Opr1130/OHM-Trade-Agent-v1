@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "repo": "Opr1130/OHM-Trade-Agent-v1",
+  "increment": "ATDD-YOUR-APPROVED-INCREMENT",
+  "branch": "feature/bridge-example",
+  "base_head": "REPLACE_WITH_FULL_40_CHARACTER_COMMIT",
+  "contract_sha256": "REPLACE_WITH_CONTRACT_SHA256",
+  "authority_sha256": "REPLACE_WITH_AUTHORITY_SHA256",
+  "registered_tasks": [
+    {
+      "instructions": "Correct the spelling in the approved engineering document without changing behavior.",
+      "files": ["OHM-Trade-Agent-v1/docs/engineering/example.md"]
+    }
+  ],
+  "max_tasks": 3,
+  "test_image": "opip-bridge-tests@sha256:REPLACE_WITH_OWNER_VERIFIED_IMAGE_DIGEST",
+  "test_command": ["python", "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider", "--basetemp", "/tmp/pytest", "tests/test_your_increment.py"],
+  "test_timeout_seconds": 300,
+  "required_checks": ["test", "atdd scope"]
+}

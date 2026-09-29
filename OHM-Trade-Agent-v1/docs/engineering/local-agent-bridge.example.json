@@ -1,0 +1,9 @@
+{
+  "worktree": "C:\\OpipBridge\\worktrees\\engineering-task",
+  "state_dir": "C:\\OpipBridge\\state",
+  "dispatch_ids": [],
+  "enable_execution": false,
+  "cursor_executable": "C:\\REPLACE_WITH_VERIFIED_CURSOR_PATH\\agent.exe",
+  "cursor_sha256": "REPLACE_WITH_OWNER_VERIFIED_EXECUTABLE_SHA256",
+  "cursor_timeout_seconds": 300
+}
