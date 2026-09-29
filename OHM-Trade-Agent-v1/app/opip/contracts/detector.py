@@ -8,8 +8,9 @@ versioned detector/policy tokens and the immutable ``DetectorState`` /
 Three boundaries are deliberate:
 
 * The opportunity lifecycle is **not** here. ``episode_id`` exists only so the
-  frozen contract's shape is represented; F3 never mints one, and a claim that
-  carries an episode identity is rejected. F4 owns deadlines and expiry.
+  frozen contract's declared form is represented; F3 never mints one, and a
+  claim that carries an episode identity is rejected. F4 owns deadlines and
+  expiry.
 * The identity of a claim is a pure function of the detector family/version,
   the applied policy version, the instrument, the transition and the sealed
   snapshot evidence identity. No wall clock and no process identity take part.

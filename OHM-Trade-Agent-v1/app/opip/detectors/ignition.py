@@ -148,8 +148,8 @@ def _present_feature_value(
 
     Absence is epistemic: a missing key, a non-``PRESENT`` missingness stamp or
     a ``None`` value yields ``None`` (the caller maps that to
-    ``INSUFFICIENT_EVIDENCE``). A *present* value of the wrong shape is a
-    structural violation and raises instead.
+    ``INSUFFICIENT_EVIDENCE``). A *present* value that is not representable as
+    the declared type is a structural violation and raises instead.
     """
     if name not in values:
         return None
