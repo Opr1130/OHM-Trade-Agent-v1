@@ -78,7 +78,9 @@ RESUMABLE_RECEIPT_STATUSES = frozenset({"PUBLISHED_WAITING_CI"})
 
 # Codes raised by strict_json. Inside a GitHub transport response they are transient
 # and retryable; at the task/decision envelope boundary they mean a permanently
-# malformed comment and are translated to the permanent codes below.
+# malformed comment and are translated to the permanent codes below. A decision
+# envelope code is only permanent once the decision is attributed to a task; an
+# unattributable malformed decision is skipped instead (see owner_approval).
 JSON_PARSE_CODES = frozenset({"INVALID_JSON", "OVERSIZED_JSON"})
 INVALID_TASK_ENVELOPE = "INVALID_TASK_ENVELOPE"
 INVALID_DECISION_ENVELOPE = "INVALID_DECISION_ENVELOPE"
@@ -344,12 +346,22 @@ def owner_approval(comments, owner, comment_id, task_hash, comment, now):
             continue
         body = item.get("body", "") or ""
         for command in ("/opip-approve", "/opip-revoke"):
-            if body.startswith(command + "\n"):
+            if not body.startswith(command + "\n"):
+                continue
+            try:
                 value = envelope(item, command, INVALID_DECISION_ENVELOPE)
-                require(type(value) is dict, "INVALID_DECISION")
-                if value.get("task_comment_id") == comment_id:
-                    immutable(item)
-                    decisions.append((item["id"], command, value, item))
+            except Stop as exc:
+                # An unparseable decision cannot be bound to a task id. It never
+                # authorizes anything and must never permanently poison unrelated
+                # tasks, so it is skipped; the task still requires a valid approval.
+                if str(exc) == INVALID_DECISION_ENVELOPE:
+                    continue
+                raise
+            if type(value) is not dict:
+                continue  # A non-object decision cannot be attributed to a task.
+            if value.get("task_comment_id") == comment_id:
+                immutable(item)
+                decisions.append((item["id"], command, value, item))
     require(bool(decisions), "OWNER_APPROVAL_REQUIRED")
     _, command, approval, approval_comment = max(decisions, key=lambda d: d[0])
     require(command == "/opip-approve", "OWNER_REVOKED")

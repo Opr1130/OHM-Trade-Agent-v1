@@ -70,12 +70,22 @@ def authorize_policy(snapshot, policy_hash, now=None):
             continue
         body = comment.get("body", "") or ""
         for command in ("/opip-authorize-increment", "/opip-revoke-increment"):
-            if body.startswith(command + "\n"):
-                value = b.envelope(comment, command)
-                b.require(type(value) is dict, "INVALID_POLICY_APPROVAL")
-                if value.get("policy_sha256") == policy_hash:
-                    b.immutable(comment)
-                    decisions.append((comment["id"], command, value, comment))
+            if not body.startswith(command + "\n"):
+                continue
+            try:
+                value = b.envelope(comment, command, b.INVALID_DECISION_ENVELOPE)
+            except b.Stop as exc:
+                # An unparseable policy decision cannot be bound to a policy hash.
+                # It never authorizes anything and must never permanently poison an
+                # unrelated task, so it is skipped.
+                if str(exc) == b.INVALID_DECISION_ENVELOPE:
+                    continue
+                raise
+            if type(value) is not dict:
+                continue
+            if value.get("policy_sha256") == policy_hash:
+                b.immutable(comment)
+                decisions.append((comment["id"], command, value, comment))
     b.require(bool(decisions), "OWNER_POLICY_APPROVAL_REQUIRED")
     _, command, value, comment = max(decisions, key=lambda d: d[0])
     b.require(command == "/opip-authorize-increment", "OWNER_POLICY_REVOKED")

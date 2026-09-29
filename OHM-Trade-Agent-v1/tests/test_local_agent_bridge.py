@@ -864,7 +864,7 @@ def test_status_comment_identity_is_verified(tmp_path):
 
 @pytest.mark.acceptance
 def test_malformed_task_envelope_is_permanent():
-    """ATDD-BRIDGE-v1/AC-001: a malformed task body is a permanent, non-retryable refusal."""
+    """ATDD-BRIDGE-v1/AC-001: a malformed task body is permanent; unattributable decisions are skipped."""
     # A malformed or oversized task body never becomes valid on a later poll.
     for bad in ("{ not json", "x" * (b.MAX_BYTES + 1)):
         snap = (1, {"state": "open"}, [comment(10, "/opip-task\n" + bad)])
@@ -879,11 +879,26 @@ def test_malformed_task_envelope_is_permanent():
             b.control(snap, 10, [], NOW)
         assert str(error.value) not in b.RETRYABLE_REASONS
 
-    # Malformed OWNER decisions are permanent as well.
+    # A malformed OWNER decision is unattributable: it never authorizes anything and
+    # must never permanently poison the task under evaluation.
     base = snapshot()
     base[2][1]["body"] = "/opip-approve\n{ not json"
-    with pytest.raises(b.Stop, match="^INVALID_DECISION_ENVELOPE$"):
+    with pytest.raises(b.Stop, match="^OWNER_APPROVAL_REQUIRED$"):
         b.control(base, 10, [], NOW)
+    assert "OWNER_APPROVAL_REQUIRED" in b.RETRYABLE_REASONS
+
+    # A malformed approval for another task (99) leaves valid approved task 10 executable.
+    noise = snapshot()
+    noise[2].insert(0, comment(5, "/opip-approve\n{ not json"))
+    noise[2].insert(1, comment(6, '/opip-approve\n["not", "an", "object"]'))
+    noise[2].insert(2, comment(7, '/opip-approve\n{"task_comment_id": 99, "task_sha256": "%s"}' % ("e" * 64)))
+    assert b.control(noise, 10, [], NOW)[0] == fixture_task()
+
+    # A structurally invalid decision bound to THIS task still fails closed.
+    bound = snapshot()
+    bound[2][1]["body"] = '/opip-approve\n{"task_comment_id": 10}'
+    with pytest.raises(b.Stop):
+        b.control(bound, 10, [], NOW)
 
     # strict_json keeps its transient code, so GitHub transport parsing stays retryable.
     with pytest.raises(b.Stop, match="^INVALID_JSON$"):

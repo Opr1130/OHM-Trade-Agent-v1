@@ -191,7 +191,9 @@ Discovery distinguishes four outcomes, and only the last two are durable decisio
 | Permanently malformed body (bad JSON, oversized, unknown key, edited, unauthorized) | Rejected once with a fixed reason code; never retried, never executed |
 | Eligible | Executed once under the existing lock/receipt rules |
 
-A malformed or oversized `/opip-task` or decision body is translated from the transport parse code to the permanent `INVALID_TASK_ENVELOPE` / `INVALID_DECISION_ENVELOPE` at the envelope boundary, so it is refused once instead of being retried on every cycle. The transport-level parse code is deliberately left transient, so a malformed GitHub *response* is still retried rather than being mistaken for a bad comment.
+A malformed or oversized `/opip-task` body is translated from the transport parse code to the permanent `INVALID_TASK_ENVELOPE` at the envelope boundary, so it is refused once instead of being retried on every cycle. The transport-level parse code is deliberately left transient, so a malformed GitHub *response* is still retried rather than being mistaken for a bad comment.
+
+A malformed OWNER decision (`/opip-approve`, `/opip-revoke`, or a policy decision) cannot be bound to a task or policy id, so it is **skipped** rather than failing the whole issue: it never authorizes anything, and it never permanently rejects an unrelated task. Only a structurally invalid decision that is clearly bound to the task under evaluation fails that task closed.
 
 A comment that fails a temporary GitHub read is never marked "seen and done". An edited comment is never executed, and a comment whose approval is revoked before execution stops before any write. A failed or ambiguous execution still follows the section 9 recovery rules and is never silently retried.
 
@@ -287,7 +289,8 @@ This is a bounded threat/edge matrix, not a claim that every possible Windows, n
 | Published draft PR awaiting CI | Stays resumable; later polls re-evaluate CI only, never re-code | Resume tests |
 | CI pending on a later poll | No approval; task stays resumable | Resume tests |
 | CI terminal on a later poll | Submits exact-SHA review once, then terminal | Resume tests |
-| Permanently malformed `/opip-task` or decision body | `INVALID_TASK_ENVELOPE` / `INVALID_DECISION_ENVELOPE` once; never retried | Envelope tests |
+| Permanently malformed `/opip-task` body | `INVALID_TASK_ENVELOPE` once; never retried | Envelope tests |
+| Malformed OWNER decision not bound to a task | Skipped; never poisons unrelated tasks | Envelope/approval tests |
 | Malformed GitHub transport *response* | Still transient and retried | Envelope/discovery tests |
 | Status marker authored by another account | Ignored; never overwritten or treated as bridge status | Status-identity tests |
 | Status-writer identity lookup fails | Fails closed; no POST/PATCH performed | Status-identity tests |

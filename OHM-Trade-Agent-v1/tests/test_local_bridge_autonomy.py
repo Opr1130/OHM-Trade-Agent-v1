@@ -25,7 +25,8 @@ def policy():
 
 @pytest.mark.acceptance
 @pytest.mark.parametrize("case", ["valid", "wrong_hash", "missing", "revoke", "edited", "expired", "conflict",
-    "instructions", "files", "branch", "contract", "budget", "floating_image", "missing_check", "unknown_key"])
+    "instructions", "files", "branch", "contract", "budget", "floating_image", "missing_check", "unknown_key",
+    "malformed_noise"])
 def test_registered_policy(tmp_path, case):
     """ATDD-BRIDGE-v1/AC-008: only immutable OWNER policy and exact registered work authorize autonomy."""
     value = policy()
@@ -55,11 +56,15 @@ def test_registered_policy(tmp_path, case):
         snap[2].insert(0, comment(21, '/opip-revoke-increment\n' + json.dumps({"policy_sha256": hashed})))
     elif case == "edited":
         snap[2][-1]["updated_at"] = "2026-09-28T11:01:00Z"
+    elif case == "malformed_noise":
+        # Unattributable malformed policy decisions must not poison a valid approval.
+        snap[2].insert(0, comment(22, "/opip-authorize-increment\n{ not json"))
+        snap[2].insert(1, comment(23, '/opip-authorize-increment\n["not", "an", "object"]'))
     task = fixture_task()
     if case in {"instructions", "files", "branch", "contract"}:
         key = "contract_sha256" if case == "contract" else case
         task[key] = [b.PREFIX + "tools/unapproved.py"] if case == "files" else "unapproved change"
-    if case == "valid":
+    if case in {"valid", "malformed_noise"}:
         a.authorize_policy(snap, hashed, NOW)
         a.admit_task(value, task, "unused")
     else:

@@ -153,7 +153,9 @@ AC-013 -> tests/test_local_bridge_autonomy.py::test_protected_required_checks
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/tools/local_agent_bridge.py
+AC-001 -> OHM-Trade-Agent-v1/tools/local_bridge_autonomy.py
 AC-001 -> OHM-Trade-Agent-v1/tests/test_local_agent_bridge.py
+AC-001 -> OHM-Trade-Agent-v1/tests/test_local_bridge_autonomy.py
 AC-002 -> OHM-Trade-Agent-v1/tools/local_agent_bridge.py
 AC-002 -> OHM-Trade-Agent-v1/tests/test_local_agent_bridge.py
 AC-003 -> OHM-Trade-Agent-v1/tools/local_agent_bridge.py
