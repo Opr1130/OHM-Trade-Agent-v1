@@ -530,6 +530,250 @@ def test_receipts_and_failures(tmp_path, monkeypatch, case):
 
 
 @pytest.mark.acceptance
+def test_continuous_discovery(tmp_path, monkeypatch):
+    """ATDD-BRIDGE-v1/AC-011: one control issue, ordered discovery, no replay after restart."""
+    state = tmp_path / "state"
+    config = {"worktree": str(tmp_path / "tree"), "state_dir": str(state),
+              "dispatch_ids": [], "enable_execution": True}
+
+    def task_comment(identifier, author=1, edited=False):
+        item = comment(identifier, "/opip-task\n" + json.dumps(fixture_task()), author=author)
+        if edited:
+            item["updated_at"] = "2026-09-28T11:01:00Z"
+        return item
+
+    def status_comment(identifier, marker_task):
+        return status_comment_for(identifier, marker_task)
+
+    noise = comment(11, "just chatting")
+    ordered = [task_comment(13), noise, task_comment(10), status_comment(12, 10)]
+    snap = (1, {"state": "open"}, ordered)
+
+    # Only exact /opip-task envelopes from allowed authors are candidates, in id order.
+    assert b.task_candidates(ordered, {1}, set()) == [10, 13]
+    assert b.task_candidates([status_comment(12, 10)], {1}, set()) == []
+    assert b.task_candidates([task_comment(10, author=999)], {1}, set()) == []
+    assert b.task_candidates([comment(9, "/opip-task-ish\n{}")], {1}, set()) == []
+
+    calls = []
+    in_flight = []
+
+    def fake_run(config_, issue, comment_id, execute=False, api=None, agent=None, status_api=None):
+        assert not in_flight, "tasks must run one at a time"
+        in_flight.append(comment_id)
+        calls.append(comment_id)
+        try:
+            if comment_id == 13:
+                raise b.Stop("OWNER_REVOKED")
+        finally:
+            in_flight.pop()
+
+    real_run = b.run
+    monkeypatch.setattr(b, "run", fake_run)
+    handled = b.poll_once(config, 1, execute=True, api=SnapAPI(snap))
+    assert calls == [10, 13]
+    assert handled == [10]
+    assert in_flight == []
+    # A restart does not replay the handled task or the rejected one.
+    calls.clear()
+    assert b.poll_once(config, 1, execute=True, api=SnapAPI(snap)) == []
+    assert calls == []
+
+    # A durable receipt alone is enough to prevent replay.
+    receipt_state = tmp_path / "receipts"
+    receipt_state.mkdir()
+    with b.receipt_db(receipt_state) as connection:
+        b.claim(connection, 10, "digest")
+    calls.clear()
+    b.poll_once(dict(config, state_dir=str(receipt_state)), 1, execute=True, api=SnapAPI(snap))
+    assert 10 not in calls
+
+    # A transient GitHub read failure consumes nothing.
+    transient = tmp_path / "transient"
+    with pytest.raises(b.Stop, match="HOST_COMMAND_FAILED"):
+        b.poll_once(dict(config, state_dir=str(transient)), 1, execute=True,
+                    api=SnapAPI(snap, failure="HOST_COMMAND_FAILED"))
+    assert not b.discovery_path(transient).exists()
+
+    # Edited and revoked tasks are refused before Cursor, through the real control path.
+    root, task = make_repo(tmp_path)
+    original = b.control
+    monkeypatch.setattr(b, "control", lambda snap_, cid, ids: original(snap_, cid, ids, NOW))
+    monkeypatch.setattr(b, "run", real_run)
+
+    def forbidden_agent(*_args):
+        pytest.fail("Cursor must not run for an ineligible task")
+
+    base = snapshot(task)
+    edited = copy.deepcopy(base)
+    edited[2][0]["updated_at"] = "2026-09-28T11:01:00Z"
+    edited_config = {"worktree": str(root), "state_dir": str(tmp_path / "edited"),
+                     "dispatch_ids": [], "enable_execution": True}
+    assert b.poll_once(edited_config, 1, execute=True, api=SnapAPI(edited),
+                       agent=forbidden_agent) == []
+
+    revoked = copy.deepcopy(base)
+    revoked[2].insert(0, comment(12, '/opip-revoke\n{"task_comment_id":10}'))
+    revoked_config = {"worktree": str(root), "state_dir": str(tmp_path / "revoked"),
+                      "dispatch_ids": [], "enable_execution": True}
+    assert b.poll_once(revoked_config, 1, execute=True, api=SnapAPI(revoked),
+                       agent=forbidden_agent) == []
+    assert (root / PATH).read_bytes() == b"before\n"
+
+    # Explicit one-shot --task-comment mode still works, and watch rejects it.
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "worktree": str(tmp_path / "wt"), "state_dir": str(tmp_path / "st"),
+        "dispatch_ids": [], "enable_execution": False, "cursor_executable": "none.exe",
+        "cursor_sha256": "none", "cursor_timeout_seconds": 300}))
+    explicit = []
+    monkeypatch.setattr(b, "run", lambda config_, issue, comment_id, execute=False,
+                        status_api=None: explicit.append((issue, comment_id, execute)))
+    assert b.main(["--config", str(config_path), "--issue", "7", "--task-comment", "10",
+                   "--dry-run"]) == 0
+    assert explicit == [(7, 10, False)]
+    assert b.main(["--config", str(config_path), "--issue", "7", "--watch",
+                   "--task-comment", "10"]) == 2
+
+    # Bounded polling interval and clean interruption.
+    with pytest.raises(b.Stop, match="POLL_INTERVAL_OUT_OF_RANGE"):
+        b.watch(config, 1, api=SnapAPI(snap), state=tmp_path / "w0", polls=1,
+                poll_seconds=5, sleep=lambda _s: None)
+    assert b.main(["--config", str(config_path), "--issue", "7", "--watch", "--dry-run",
+                   "--poll-seconds", "5"]) == 2
+
+    monkeypatch.setattr(b, "poll_once", lambda *a, **k: [])
+    watch_state = tmp_path / "w1"
+    assert b.watch(config, 1, state=watch_state, polls=1, poll_seconds=20,
+                   sleep=lambda _s: None) == 1
+    assert not (watch_state / "watch.lock").exists()
+
+    def interrupt(_seconds):
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        b.watch(config, 1, state=tmp_path / "w2", polls=None, poll_seconds=20, sleep=interrupt)
+    assert not (tmp_path / "w2" / "watch.lock").exists()
+
+
+class SnapAPI:
+    def __init__(self, snap, failure=None):
+        self.snap = snap
+        self.failure = failure
+        self.calls = 0
+
+    def snapshot(self, issue):
+        self.calls += 1
+        if self.failure:
+            raise b.Stop(self.failure)
+        return copy.deepcopy(self.snap)
+
+
+@pytest.mark.acceptance
+def test_github_status_reporting(tmp_path, monkeypatch):
+    """ATDD-BRIDGE-v1/AC-012: one bounded, redacted, task-linked status comment."""
+    class Writer:
+        def __init__(self, failure=None):
+            self.calls = []
+            self.failure = failure
+            self.counter = 500
+
+        def __call__(self, method, path, payload):
+            self.calls.append((method, path, payload))
+            if self.failure:
+                raise b.Stop(self.failure)
+            if method == "POST":
+                self.counter += 1
+                return {"id": self.counter}
+            return {"id": 4242}
+
+    writer = Writer()
+    status = b.GitHubStatus(11, api=SnapAPI((1, {"state": "open"}, [])), writer=writer,
+                            state_dir=tmp_path)
+
+    status.announce(10, "accepted", branch="feature/bridge-example", head_sha="a" * 40,
+                    increment="ATDD-EXAMPLE")
+    method, path, payload = writer.calls[-1]
+    assert method == "POST" and path == "issues/11/comments"
+    body = payload["body"]
+    assert body.startswith(b.status_marker(10))
+    assert len(body.encode("utf-8")) <= b.MAX_STATUS_BODY
+    record = json.loads(body.split("\n", 1)[1])
+    assert set(record) == {"schema", "task_comment_id", "state", "branch", "head_sha",
+                           "increment", "reason_code", "updated_at"}
+    assert record["schema"] == "opip-local-agent-status/v1"
+    assert record["task_comment_id"] == 10 and record["state"] == "accepted"
+    assert record["increment"] == "ATDD-EXAMPLE" and record["reason_code"] is None
+    assert fixture_task()["instructions"] not in body
+    assert "C:\\" not in body and "ghp_" not in body and "\n" not in record["state"]
+    created = len(writer.calls)
+
+    # Later states update the same comment instead of adding new ones.
+    status.announce(10, "running", branch="feature/bridge-example", head_sha="a" * 40,
+                    increment="ATDD-EXAMPLE")
+    status.announce(10, "applied", branch="feature/bridge-example", head_sha="a" * 40,
+                    increment="ATDD-EXAMPLE")
+    assert len(writer.calls) == created + 2
+    assert [call[0] for call in writer.calls[created:]] == ["PATCH", "PATCH"]
+    assert writer.calls[-1][1] == f"issues/comments/{writer.counter}"
+    assert sum(1 for call in writer.calls if call[0] == "POST") == 1
+
+    # Status is linked to the exact task, so a second task gets its own comment.
+    status.announce(100, "accepted", branch="feature/bridge-example", head_sha="",
+                    increment="ATDD-EXAMPLE")
+    assert writer.calls[-1][0] == "POST"
+    assert writer.calls[-1][2]["body"].startswith(b.status_marker(100))
+    assert not writer.calls[-1][2]["body"].startswith(b.status_marker(10))
+    assert sum(1 for call in writer.calls if call[0] == "POST") == 2
+
+    # A restart reuses the existing linkage instead of creating a duplicate.
+    existing = [status_comment_for(77, 10)]
+    restart_writer = Writer()
+    restart = b.GitHubStatus(11, api=SnapAPI((1, {"state": "open"}, existing)),
+                             writer=restart_writer, state_dir=tmp_path)
+    restart.announce(10, "applied", branch="feature/bridge-example", head_sha="a" * 40,
+                     increment="ATDD-EXAMPLE", comments=existing)
+    assert [call[0] for call in restart_writer.calls] == ["PATCH"]
+    assert restart_writer.calls[0][1] == "issues/comments/77"
+
+    # Only fixed reason codes and bounded validated fields are accepted.
+    with pytest.raises(b.Stop):
+        b.status_payload(10, "accepted", reason_code="leak C:\\Users\\owner")
+    with pytest.raises(b.Stop):
+        b.status_payload(10, "not-a-real-state")
+    with pytest.raises(b.Stop):
+        b.status_payload(10, "accepted", branch="feature/" + "x" * 200)
+    with pytest.raises(b.Stop):
+        b.status_payload(10, "accepted", head_sha="not-a-sha")
+
+    # A GitHub write failure fails closed.
+    failing = b.GitHubStatus(11, api=SnapAPI((1, {"state": "open"}, [])),
+                             writer=Writer("HOST_COMMAND_FAILED"), state_dir=tmp_path)
+    with pytest.raises(b.Stop, match="STATUS_WRITE_FAILED"):
+        failing.announce(10, "applied", branch="feature/bridge-example", head_sha="a" * 40,
+                         increment="ATDD-EXAMPLE")
+
+    # Bridge status comments are never discovered as tasks.
+    assert b.task_candidates([status_comment_for(10, 10)], {1}, set()) == []
+
+    # In the live path a failed status write never becomes an applied success.
+    scratch = tmp_path / "run"
+    scratch.mkdir()
+    root, config, api, proposal = run_fixture(scratch, monkeypatch)
+    blocked = b.GitHubStatus(1, api=api, writer=Writer("HOST_COMMAND_FAILED"),
+                             state_dir=Path(config["state_dir"]))
+    with pytest.raises(b.Stop, match="STATUS_WRITE_FAILED"):
+        b.run(config, 1, 10, True, api, lambda *a: proposal, status_api=blocked)
+    assert (root / PATH).read_bytes() == b"before\n"
+
+
+def status_comment_for(identifier, marker_task):
+    payload = b.status_payload(marker_task, "accepted", branch="feature/bridge-example",
+                               increment="ATDD-EXAMPLE")
+    return comment(identifier, b.status_marker(marker_task) + "\n" + json.dumps(payload, sort_keys=True))
+
+
+@pytest.mark.acceptance
 def test_contract_and_runbook():
     """ATDD-BRIDGE-v1/AC-007: contract, detailed Windows instructions and frozen architecture remain traceable."""
     contract = b.parse_scope_contract((b.APP / "docs/atdd/scope-contracts/ATDD-BRIDGE-v1.md").read_text())

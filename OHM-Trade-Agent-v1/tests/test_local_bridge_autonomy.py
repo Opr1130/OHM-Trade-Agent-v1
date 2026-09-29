@@ -19,7 +19,8 @@ def policy():
             "registered_tasks": [{"instructions": task["instructions"], "files": task["files"]}],
             "max_tasks": 3, "test_image": "opip-tests@sha256:" + "d" * 64,
             "test_command": ["python", "-B", "-m", "pytest", "-q", "tests/test_example.py"],
-            "test_timeout_seconds": 300, "required_checks": ["test", "atdd scope"]}
+            "test_timeout_seconds": 300,
+            "required_checks": ["test", "atdd scope", "semgrep/ci"]}
 
 
 @pytest.mark.acceptance
@@ -130,6 +131,71 @@ def test_review_gate(case):
         assert a.check_gate(checks, statuses, ["test", "atdd scope"]) == expected
 
 
+@pytest.mark.acceptance
+@pytest.mark.parametrize("case", ["policy_missing_semgrep", "policy_cannot_remove", "missing_semgrep",
+                                  "semgrep_pending", "semgrep_failure", "semgrep_neutral", "all_pass",
+                                  "advisory_failure_ignored", "circleci_error_ignored",
+                                  "conflicting_legacy_status", "unrelated_success"])
+def test_protected_required_checks(tmp_path, case):
+    """ATDD-BRIDGE-v1/AC-013: test, atdd scope and semgrep/ci are structurally required."""
+    value = policy()
+    path = tmp_path / "policy.json"
+
+    if case == "policy_missing_semgrep":
+        value["required_checks"] = ["test", "atdd scope"]
+        path.write_text(json.dumps(value))
+        with pytest.raises(b.Stop, match="REQUIRED_CHECKS_MISSING"):
+            a.policy_file(path, tmp_path / "worktree")
+        return
+
+    if case == "policy_cannot_remove":
+        value["required_checks"] = ["test", "atdd scope", "semgrep/ci", "custom-lint"]
+        path.write_text(json.dumps(value))
+        loaded, _ = a.policy_file(path, tmp_path / "worktree")
+        names = a.required_check_names(loaded)
+        assert set(b.PROTECTED_REQUIRED_CHECKS).issubset(names)
+        assert "custom-lint" in names
+        return
+
+    path.write_text(json.dumps(value))
+    loaded, _ = a.policy_file(path, tmp_path / "worktree")
+    names = a.required_check_names(loaded)
+    assert set(b.PROTECTED_REQUIRED_CHECKS) == {"test", "atdd scope", "semgrep/ci"}
+
+    def check(name, identifier, conclusion="success", status="completed"):
+        return {"id": identifier, "name": name, "status": status, "conclusion": conclusion}
+
+    passing = [check("test", 1), check("atdd scope", 2), check("semgrep/ci", 3)]
+    matrix = {
+        "missing_semgrep": (passing[:2], []),
+        "semgrep_pending": ([check("test", 1), check("atdd scope", 2),
+                             check("semgrep/ci", 3, None, "in_progress")], []),
+        "semgrep_failure": ([check("test", 1), check("atdd scope", 2),
+                             check("semgrep/ci", 3, "failure")], []),
+        "semgrep_neutral": ([check("test", 1), check("atdd scope", 2),
+                             check("semgrep/ci", 3, "neutral")], []),
+        "all_pass": (passing, []),
+        "advisory_failure_ignored": (passing + [check("ruff (advisory)", 4, "failure"),
+                                                check("bandit (advisory)", 5, "failure")], []),
+        "circleci_error_ignored": (passing + [check("CircleCI Pipeline", 6, "failure")], []),
+        "conflicting_legacy_status": (passing, [{"id": 90, "context": "semgrep/ci", "state": "failure"}]),
+        "unrelated_success": ([check("test", 1), check("totally-other", 2)], []),
+    }
+    expected = {
+        "missing_semgrep": "WAITING_CI",
+        "semgrep_pending": "WAITING_CI",
+        "semgrep_failure": "REQUEST_CHANGES",
+        "semgrep_neutral": "WAITING_CI",
+        "all_pass": "APPROVE",
+        "advisory_failure_ignored": "APPROVE",
+        "circleci_error_ignored": "APPROVE",
+        "conflicting_legacy_status": "REQUEST_CHANGES",
+        "unrelated_success": "WAITING_CI",
+    }
+    checks, statuses = matrix[case]
+    assert a.check_gate(checks, statuses, names) == expected[case]
+
+
 def test_publish_ordinary_push_only(tmp_path, monkeypatch):
     root, task = make_repo(tmp_path)
     b.git(root, "config", "user.name", "Bridge Test")
@@ -206,11 +272,14 @@ def test_autonomous_pipeline(tmp_path, monkeypatch, case):
         return {"sha": task["head"], "pr": 42, "url": "https://github.com/Opr1130/OHM-Trade-Agent-v1/pull/42"}
     monkeypatch.setattr(a, "publish", publish)
     waiting = [case in {"wait", "resume"}]
+
     def pages(api, route, key=None):
         if not key:
             return []
         return [{"id": i, "name": name, "status": "in_progress" if waiting[0] else "completed",
-                 "conclusion": "success"} for i, name in enumerate(["test", "atdd scope"])]
+                 "conclusion": "success"}
+                for i, name in enumerate(["test", "atdd scope", "semgrep/ci"])]
+
     monkeypatch.setattr(a, "all_pages", pages)
     posted = []
     def post(route, body, state, reviewer=False):

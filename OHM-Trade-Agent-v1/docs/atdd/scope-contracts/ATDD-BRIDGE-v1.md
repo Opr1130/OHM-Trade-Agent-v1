@@ -93,6 +93,30 @@ required GitHub checks and an independent review are evaluated for its exact cur
 THEN:
 the bridge may submit APPROVE or REQUEST_CHANGES using a reviewer identity different from the PR author; missing/failed/pending checks prevent approval, stale SHA or policy stops, retries resume only the pending-check phase without recoding, and no result permits merge/deploy or changes repository protections
 
+AC-011:
+GIVEN:
+the bridge is started in continuous mode with one configured control issue
+WHEN:
+new immutable /opip-task comments appear
+THEN:
+the bridge discovers eligible unseen tasks automatically, processes them one at a time, preserves durable cursor/idempotency state across restart, does not require the operator to manually supply --task-comment for every task, and never executes comments that fail existing authentication/approval/policy checks
+
+AC-012:
+GIVEN:
+an eligible task is accepted, running, blocked, failed, waiting for CI, pushed, or completed
+WHEN:
+the bridge changes state
+THEN:
+it posts or updates a bounded machine-readable status on the control issue without exposing prompts, model transcripts, credentials, environment values, or untrusted exception bodies; posting failure must not incorrectly report task success and must recover conservatively
+
+AC-013:
+GIVEN:
+autonomous mode evaluates exact-SHA GitHub checks before review approval
+WHEN:
+required checks are configured/evaluated
+THEN:
+the bridge requires at minimum the repository's protected checks test, atdd scope, and semgrep/ci, and cannot approve with any of them missing, pending, failed, cancelled, stale, or represented only by a conflicting legacy status
+
 EXPLICITLY OUT OF SCOPE:
 - Runtime/app, deploy, architecture, CI, agent-governance, risk, strategy, exchange, paper authority and canonical evidence changes.
 - Force-push, merge, deployment, arbitrary shell/test execution or dependency installation. Autonomous ordinary feature commit/push and isolated registered tests are authorized only under AC-008 through AC-010.
@@ -119,6 +143,9 @@ AC-007 -> tests/test_local_agent_bridge.py::test_contract_and_runbook
 AC-008 -> tests/test_local_bridge_autonomy.py::test_registered_policy
 AC-009 -> tests/test_local_bridge_autonomy.py::test_isolated_verification
 AC-010 -> tests/test_local_bridge_autonomy.py::test_review_gate
+AC-011 -> tests/test_local_agent_bridge.py::test_continuous_discovery
+AC-012 -> tests/test_local_agent_bridge.py::test_github_status_reporting
+AC-013 -> tests/test_local_bridge_autonomy.py::test_protected_required_checks
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/tools/local_agent_bridge.py
@@ -150,6 +177,18 @@ AC-009 -> OHM-Trade-Agent-v1/docs/engineering/LOCAL_AGENT_BRIDGE_V1.md
 AC-010 -> OHM-Trade-Agent-v1/tools/local_bridge_autonomy.py
 AC-010 -> OHM-Trade-Agent-v1/tests/test_local_bridge_autonomy.py
 AC-010 -> OHM-Trade-Agent-v1/docs/engineering/LOCAL_AGENT_BRIDGE_V1.md
+AC-011 -> OHM-Trade-Agent-v1/tools/local_agent_bridge.py
+AC-011 -> OHM-Trade-Agent-v1/tests/test_local_agent_bridge.py
+AC-011 -> OHM-Trade-Agent-v1/docs/engineering/LOCAL_AGENT_BRIDGE_V1.md
+AC-012 -> OHM-Trade-Agent-v1/tools/local_agent_bridge.py
+AC-012 -> OHM-Trade-Agent-v1/tools/local_bridge_autonomy.py
+AC-012 -> OHM-Trade-Agent-v1/tests/test_local_agent_bridge.py
+AC-012 -> OHM-Trade-Agent-v1/docs/engineering/LOCAL_AGENT_BRIDGE_V1.md
+AC-013 -> OHM-Trade-Agent-v1/tools/local_agent_bridge.py
+AC-013 -> OHM-Trade-Agent-v1/tools/local_bridge_autonomy.py
+AC-013 -> OHM-Trade-Agent-v1/tests/test_local_bridge_autonomy.py
+AC-013 -> OHM-Trade-Agent-v1/docs/engineering/LOCAL_AGENT_BRIDGE_V1.md
+AC-013 -> OHM-Trade-Agent-v1/docs/engineering/local-bridge-autonomy.example.json
 
 DEFERRED DISCOVERIES:
 - Native Cursor executable availability, verified tool-denial behavior and separate automation-account setup require OWNER machine validation before enablement.

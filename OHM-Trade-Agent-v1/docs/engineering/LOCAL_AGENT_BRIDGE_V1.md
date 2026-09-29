@@ -2,7 +2,7 @@
 
 This is a small, standard-library Python program for **Opr1130/OHM-Trade-Agent-v1 only**. It reads one explicitly selected GitHub issue/PR conversation task, checks its OWNER approval, asks a local Cursor CLI for a bounded proposal, and validates that proposal before writing approved text files in a dedicated linked feature worktree.
 
-**Default: dry-run. Execution requires both `--execute` and `enable_execution: true`.** Basic mode ends at `APPLIED_UNTESTED` and uses read-only GitHub access. Following the OWNER's explicit request for fully autonomous development, optional registered-policy mode additionally runs isolated tests, performs a fresh review, commits/pushes the approved feature branch, creates a draft PR and submits an exact-SHA GitHub review. See section 12. Neither mode merges, deploys, force-pushes, changes protections or activates trading.
+**Default: dry-run. Execution requires both `--execute` and `enable_execution: true`.** Basic mode ends at `APPLIED_UNTESTED`. The bridge reads GitHub through `gh`; the only GitHub write it ever performs is the single bounded status comment per task described in section 6.2, which is created only when execution is enabled. Following the OWNER's explicit request for fully autonomous development, optional registered-policy mode additionally runs isolated tests, performs a fresh review, commits/pushes the approved feature branch, creates a draft PR and submits an exact-SHA GitHub review. See section 12. Neither mode merges, deploys, force-pushes, changes protections or activates trading.
 
 ## 1. Scope and trust boundary
 
@@ -167,6 +167,47 @@ if ($LASTEXITCODE -ne 0) { throw 'Bridge validation stopped; inspect its status 
 
 Replace the issue/PR number and comment ID. `DRY_RUN_VALID` means identity, approval, repository and scope checks passed. Dry-run performs GitHub reads and local validation and appends `status.jsonl`; it does not call Cursor, claim the task, edit source, or write to GitHub. It does not prove Cursor is installed, authenticated or safe. Execution will repeat all checks.
 
+### 6.1 Continuous discovery (`--watch`)
+
+To avoid discovering each comment by hand, poll exactly one control issue:
+
+```powershell
+python -B "$bridgeApp\tools\local_agent_bridge.py" `
+  --config C:\OpipBridge\config.json `
+  --issue 123 `
+  --watch --dry-run
+```
+
+`--watch` polls only the configured `--issue`, recognises only immutable `/opip-task` envelopes from the OWNER or a configured `dispatch_ids` identity, and processes eligible tasks one at a time in ascending comment-id order. It is a bounded poller: no webhook, no server, no listening port, no repository or issue scanning beyond the one configured issue, and no background registration.
+
+Polling interval: `--poll-seconds` (default 20, allowed 10–300). Restarting the bridge never replays a task: a durable local receipt plus a discovery record under `state_dir` prevent re-execution, and a `watch.lock` prevents two watchers.
+
+Discovery distinguishes four outcomes, and only the last two are durable decisions:
+
+| Outcome | Behavior |
+| --- | --- |
+| Transient GitHub/read failure | No task consumed; the same poll retries next cycle |
+| Approval not yet posted, issue closed/locked | No task consumed; retried later |
+| Permanently invalid (malformed, edited, unknown key, unauthorized) | Rejected once with a fixed reason code; never executed |
+| Eligible | Executed once under the existing lock/receipt rules |
+
+A comment that fails a temporary GitHub read is never marked "seen and done". An edited comment is never executed, and a comment whose approval is revoked before execution stops before any write. A failed or ambiguous execution still follows the section 9 recovery rules and is never silently retried.
+
+`--watch` with an explicit `--task-comment` is refused; use one or the other. The explicit one-shot form in section 6 remains the supported way to run one named task.
+
+### 6.2 GitHub-visible status
+
+When execution is enabled (`--execute`), the bridge also maintains **one** bounded status comment on the same control issue, updating it in place as the task changes state. The comment carries a fixed marker plus strict JSON only:
+
+```text
+<!-- opip-local-agent-status:v1 task=1234567890 -->
+{"schema":"opip-local-agent-status/v1","task_comment_id":1234567890,"state":"running", ...}
+```
+
+States are drawn from a fixed set (`accepted`, `running`, `blocked`, `failed`, `applied`, `testing`, `pushed`, `waiting_ci`, `request_changes`, `approved`, `completed`) and the reason code is always one of the bridge's own fixed codes, never free text. The status comment never contains the task instructions, the Cursor prompt or response, file contents, environment values, API responses, exception text, local paths or tokens. Dry-run never writes to GitHub, so a dry-run has no status comment.
+
+Writing status is a bounded GitHub **write** use of the issue conversation. It requires only issue-comment write on this one repository; it grants no merge, deployment, workflow or administration permission. `gh` is authenticated outside the bridge, or `OPIP_BRIDGE_STATUS_TOKEN` may supply a narrower token; the token never appears on the command line, in a file, in a log, or in the Cursor environment. If a status write fails the task is not reported as successful: the bridge writes a local `STATUS_WRITE_FAILED` record, leaves the task unconsumed or in `FAILED_OWNER_RECOVERY`, and requires OWNER recovery. Bridge status comments are never themselves treated as tasks.
+
 ## 7. OWNER Cursor activation check
 
 Before setting `enable_execution: true`, independently verify the selected native `.exe` and vendor version under the dedicated account:
@@ -197,11 +238,15 @@ Possible normal progression: `STARTED` → `APPLYING` → `APPLIED_UNTESTED`. A 
 
 In basic mode, review `git diff` and newly added files before running code. Run the contract's targeted tests in your normal isolated development/test environment with no production credentials. For Python changes, run the repository-required compile check and applicable CI checks. Basic-mode commit/push still require explicit OWNER authorization under `AGENTS.md`. In autonomous mode, the approved policy grants bounded commit/push and engineering-review authority as described in section 12; merge/deploy remain separate OWNER decisions.
 
-One invocation handles one selected comment. Repeating the command is enough to poll it. If you later use Windows Task Scheduler, use the same account/config/state directory, disallow overlapping instances, and prefer dry-run until the activation checks pass. Sleep/offline/logged-out machines do not process tasks; expired approvals remain expired when the machine wakes. There is no auto-discovery of arbitrary comments, background service installation or new scheduler in this increment.
+One invocation handles one selected comment. Repeating the command is enough to poll it. Continuous operation uses `--watch` (section 6.1), which replaces the manual per-task `--task-comment` with automatic discovery on the same control issue. If you later use Windows Task Scheduler, use the same account/config/state directory, disallow overlapping instances, and prefer dry-run until the activation checks pass. Sleep/offline/logged-out machines do not process tasks; expired approvals remain expired when the machine wakes. There is no background service installation or new scheduler in this increment.
 
 ## 9. Status, receipts and recovery
 
-`state_dir/status.jsonl` contains schema version, UTC timestamp, repository, task comment ID and fixed status/reason code. Raw comments, model output, file contents, subprocess stderr and tokens are not logged. Some early configuration/filesystem failures can only emit a generic JSON error to stdout. Capture stdout with appropriate local access controls if needed.
+`state_dir/status.jsonl` contains schema version, UTC timestamp, repository, task comment ID and fixed status/reason code. Raw comments, model output, file contents, subprocess stderr and tokens are not logged. When execution is enabled the same transitions also maintain the bounded GitHub status comment described in section 6.2. Some early configuration/filesystem failures can only emit a generic JSON error to stdout. Capture stdout with appropriate local access controls if needed.
+
+`state_dir/discovery.json` records discovery progress for `--watch`: the highest comment id observed (observability only, never used to skip an earlier task) and a bounded map of comment ids that already reached a permanent disposition. It is written atomically. A task that failed a temporary GitHub read is deliberately absent from it so the next poll retries.
+
+`state_dir/watch.lock` is held for the duration of a `--watch` loop so two watchers cannot run against one state directory. `watch.lock` and `run.lock` are removed on clean exit, including Ctrl+C.
 
 `state_dir/receipts.sqlite3` records the first claimed task ID/hash and disposition. A committed `STARTED` claim precedes the Cursor call. All subsequent observations of the same comment remain consumed; editing/reapproving it never creates another attempt. This provides **at-most-one attempt**, not guaranteed completion or exactly-once application. State deletion, restoring an old database, separate state directories, and running multiple hosts break that guarantee and are unsupported.
 
@@ -222,6 +267,17 @@ This is a bounded threat/edge matrix, not a claim that every possible Windows, n
 
 | Scenario | Required behavior | Evidence |
 | --- | --- | --- |
+| New `/opip-task` comment on the one control issue | Discovered automatically in `--watch`, executed once, in id order | Discovery tests |
+| Unrelated comment, bridge status comment, non-OWNER author | Ignored; never executed | Discovery tests |
+| Transient GitHub read failure during discovery | No task consumed; retried next poll; no discovery record written | Discovery tests |
+| Edited or revoked task before execution | Refused before any Cursor call or source write | Discovery + control-plane tests |
+| Restart after a handled or claimed task | No replay; durable receipts and dispositions hold | Receipt/discovery tests |
+| Two watchers or two runs against one state directory | `watch.lock`/`run.lock` refuse the second process | Discovery/lock tests |
+| Polling interval outside 10–300 seconds, or `--watch` with `--task-comment` | Refused before any GitHub write | Discovery/CLI tests |
+| GitHub status write fails | Task not reported successful; `STATUS_WRITE_FAILED` recorded; OWNER recovery | Status tests |
+| Status comment content | Fixed marker plus bounded JSON only; no instructions, model output, paths or tokens | Status tests |
+| `test`/`atdd scope`/`semgrep/ci` missing, pending or conflicting | Never `APPROVE` | Required-check tests |
+| Advisory job failure (Ruff/Bandit/pip-audit/Gitleaks) or CircleCI error | Does not block approval | Required-check tests |
 | Missing/wrong author or OWNER approval | No dispatch | Control-plane tests |
 | Approval copied to another task or modified task body | Exact body hash mismatch stops | Control-plane tests |
 | Edited task/approval, expired/future/overlong approval | Stop; fresh immutable comment required | Control-plane tests |
@@ -255,9 +311,9 @@ This is a bounded threat/edge matrix, not a claim that every possible Windows, n
 From the application directory, using your existing test environment:
 
 ```powershell
-python -B -m pytest -q tests/test_local_agent_bridge.py tests/test_atdd_scope_control.py tests/test_opip_r0r1_audit_reconciliation.py
+python -B -m pytest -q tests/test_local_agent_bridge.py tests/test_local_bridge_autonomy.py tests/test_atdd_scope_control.py tests/test_opip_r0r1_audit_reconciliation.py
 python -m compileall -q app
-python -m ruff check tools/local_agent_bridge.py tests/test_local_agent_bridge.py
+python -m ruff check tools/local_agent_bridge.py tools/local_bridge_autonomy.py tests/test_local_agent_bridge.py tests/test_local_bridge_autonomy.py
 ```
 
 The existing pytest CI collects these tests automatically. No workflow, requirements or runtime file changes are needed. `--noconftest` can isolate these stdlib-oriented tests from the existing application autouse fixtures for focused diagnostics; it is not a substitute for the normal CI run. Keep pytest temporary directories outside the target checkout; short absolute paths help on Windows.
@@ -313,7 +369,7 @@ Copy `local-bridge-autonomy.example.json` to `C:\OpipBridge\autonomy.json` outsi
 - `registered_tasks`: exact instructions and ordered file lists permitted without per-task human approval. Instructions must match exactly; a “similar” request is rejected.
 - `max_tasks`: 1–10 attempts under this policy, including failed attempts; default example is three.
 - `test_image`: audited preinstalled image digest; `test_command`: one argv array for the registered test entry point; timeout of 1–900 seconds.
-- `required_checks`: exact current CI context names. `test` and `atdd scope` are mandatory; add every other required check for this repository. Success cannot be inferred from an empty/missing check set. Neutral/skipped checks do not count as success.
+- `required_checks`: exact current CI context names. `test`, `atdd scope` and `semgrep/ci` are structurally mandatory in the bridge code and cannot be removed by a policy; a policy may only add names. A missing protected context is treated as pending, never as satisfied, and a same-named legacy commit status that conflicts with a successful check-run fails closed. Success cannot be inferred from an empty/missing check set. Neutral/skipped checks do not count as success. Advisory jobs (`ruff (advisory)`, `bandit (advisory)`, `pip-audit (advisory)`, `gitleaks (advisory)`) and unrelated failures such as `CircleCI Pipeline` are deliberately not required.
 
 Run the local hash command and review the policy's complete bytes before approval:
 
@@ -386,3 +442,26 @@ The same `receipts.sqlite3` holds the unique task claim and extended `runs` phas
 | Need to remediate a failed task | New registered task/comment with clean reviewed base and remaining budget; no hidden scope growth |
 
 Run `tests/test_local_bridge_autonomy.py` with the bridge tests for policy admission, test-container controls, bounded publication, check freshness, separate review identity, pipeline failure and CI-resume coverage. Mocked pipeline tests do not certify a live Docker engine, Cursor build, Git credential setup or GitHub review account; all remain OWNER activation checks.
+
+## 13. First live smoke test (do not run before activation)
+
+This is the smallest end-to-end proof that the loop works. It must not run until section 7 activation checks pass and the OWNER has explicitly enabled execution. It never merges, deploys or touches production.
+
+Aim it at one harmless development-only file inside the already-approved engineering namespace, for example `OHM-Trade-Agent-v1/docs/engineering/bridge-smoke-test.md`, listed in the active contract's implementation map.
+
+| Step | Action | Expected evidence |
+| --- | --- | --- |
+| 1 | Start `--watch --dry-run` on the control issue | Poll loop starts; no Cursor call, no commit, no push |
+| 2 | Post one harmless OWNER `/opip-task` (and `/opip-approve`, or a registered policy) | Comment accepted as immutable and approved |
+| 3 | Wait one poll interval | The task is discovered automatically with no `--task-comment` |
+| 4 | Observe the control issue | A `<!-- opip-local-agent-status:v1 task=... -->` comment appears with `state: accepted` then `running` |
+| 5 | Confirm dry-run side effects | Local `status.jsonl` only: no Cursor process, no source change, no GitHub status comment, no commit, no push |
+| 6 | Enable execution explicitly (`enable_execution: true` plus `--execute`) | OWNER-controlled change in local config only |
+| 7 | Re-run `--watch --execute` for that one task | Exactly one Cursor invocation against the isolated worktree |
+| 8 | Verify isolation | Cursor ran in scratch with deny rules; no GitHub token in its environment; proposal validated before any write |
+| 9 | Verify publication (autonomous mode) | One ordinary feature commit, one non-force push of the feature branch only |
+| 10 | Verify the draft PR | Draft PR created or reused; still draft; auto-merge disabled |
+| 11 | Verify the check gate | `test`, `atdd scope` and `semgrep/ci` all reported for the exact SHA; missing or pending yields `waiting_ci`, not approval |
+| 12 | Verify no authority escalation | No merge, no deployment, no branch-protection change, no production access, no trading change |
+
+If any step fails, stop and follow the section 9 recovery procedure. Do not re-run a claimed task; post a new task with a fresh exact HEAD instead.

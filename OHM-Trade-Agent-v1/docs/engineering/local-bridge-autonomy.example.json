@@ -16,5 +16,5 @@
   "test_image": "opip-bridge-tests@sha256:REPLACE_WITH_OWNER_VERIFIED_IMAGE_DIGEST",
   "test_command": ["python", "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider", "--basetemp", "/tmp/pytest", "tests/test_your_increment.py"],
   "test_timeout_seconds": 300,
-  "required_checks": ["test", "atdd scope"]
+  "required_checks": ["test", "atdd scope", "semgrep/ci"]
 }

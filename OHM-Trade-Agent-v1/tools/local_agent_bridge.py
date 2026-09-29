@@ -50,6 +50,48 @@ TASK_KEYS = {"schema", "repo", "increment", "branch", "head", "contract_sha256",
              "authority_sha256", "files", "instructions"}
 DENY = ["Shell(*)", "Read(*)", "Write(*)", "WebFetch(*)"]
 
+# Protected `main` requires these exact GitHub check contexts. An approved policy may
+# require additional names, but these can never be removed and never count as satisfied
+# through any other name. Advisory quality/security jobs are deliberately not required.
+PROTECTED_REQUIRED_CHECKS = ("test", "atdd scope", "semgrep/ci")
+
+# GitHub-visible bounded status: one comment per task, created once and updated in place.
+STATUS_SCHEMA = "opip-local-agent-status/v1"
+STATUS_MARKER_PREFIX = "<!-- opip-local-agent-status:v1 task="
+STATUS_MARKER_SUFFIX = " -->"
+STATUS_STATES = ("accepted", "running", "blocked", "failed", "applied", "testing",
+                 "pushed", "waiting_ci", "request_changes", "approved", "completed")
+STATUS_REASON = re.compile(r"[A-Z0-9_]{1,64}")
+HEAD_SHA_FIELD = re.compile(r"(?:[0-9a-f]{40})?")
+MAX_STATUS_BODY = 2000
+STATUS_TOKEN_ENV = "OPIP_BRIDGE_STATUS_TOKEN"
+
+# Continuous discovery mode. Polls exactly one configured control issue.
+POLL_MIN_SECONDS, POLL_MAX_SECONDS, POLL_DEFAULT_SECONDS = 10, 300, 20
+DISCOVERY_FILE = "discovery.json"
+MAX_DISPOSITIONS = 5000
+
+# Reasons that describe an unavailable/!yet-decidable read rather than a permanent verdict.
+# They must not consume a task: the next poll retries them.
+RETRYABLE_REASONS = frozenset({
+    "HOST_COMMAND_UNAVAILABLE", "HOST_COMMAND_FAILED", "GH_MISSING", "INVALID_JSON",
+    "OVERSIZED_JSON", "COMMENT_PAGE_LIMIT", "INVALID_COMMENTS", "ISSUE_CLOSED_OR_LOCKED",
+    "TASK_NOT_FOUND", "OWNER_APPROVAL_REQUIRED", "OWNER_POLICY_APPROVAL_REQUIRED",
+    "INVALID_REVIEW", "INVALID_CHECK_RESPONSE", "CHECK_PAGE_LIMIT",
+    # A GitHub write outage must not consume a task; the next poll retries it.
+    "STATUS_WRITE_FAILED",
+})
+
+# Reasons that are a refusal/authority state rather than a runtime failure.
+BLOCKED_REASONS = frozenset({
+    "OWNER_APPROVAL_REQUIRED", "OWNER_REVOKED", "OWNER_POLICY_APPROVAL_REQUIRED",
+    "OWNER_POLICY_REVOKED", "TASK_AUTHOR_DENIED", "ARCHITECTURE_CONFLICT",
+    "SCOPE_CHANGE_REQUIRED", "EXECUTION_DISABLED", "RUN_LOCKED_OWNER_RECOVERY",
+    "TASK_OUTSIDE_REGISTERED_POLICY", "POLICY_BUDGET_EXHAUSTED", "PR_HEAD_MISMATCH",
+    "AUTONOMY_REQUIRES_CONTROL_ISSUE", "ALREADY_ATTEMPTED", "POLICY_EXPIRED_OR_FUTURE",
+    "REVIEWER_CREDENTIAL_REQUIRED", "SELF_APPROVAL_FORBIDDEN", "TASK_CHANGED",
+})
+
 
 class Stop(Exception):
     """A fixed public reason code, never untrusted diagnostic text."""
@@ -488,9 +530,9 @@ def apply_edits(edits):
 
 
 @contextlib.contextmanager
-def run_lock(state):
+def exclusive_lock(state, name):
     state.mkdir(parents=True, exist_ok=True)
-    lock = state / "run.lock"
+    lock = state / name
     try:
         descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError as exc:
@@ -502,6 +544,10 @@ def run_lock(state):
     finally:
         os.close(descriptor)
         lock.unlink()
+
+
+def run_lock(state):
+    return exclusive_lock(state, "run.lock")
 
 
 def receipt_db(state):
@@ -532,21 +578,318 @@ def status(state, comment_id, name):
     print(line, flush=True)
 
 
-def run(config, issue, comment_id, execute=False, api=None, agent=None):
+# ---------------------------------------------------------------------------
+# GitHub-visible bounded status (AC-012)
+#
+# A local status.jsonl line is always written first, so local evidence survives a
+# failed GitHub write. The GitHub comment carries a fixed marker plus strict JSON
+# only: no prompts, model output, file contents, environment values, exception
+# text, local paths or tokens. One comment exists per task and is updated in place.
+# ---------------------------------------------------------------------------
+
+
+def status_marker(comment_id):
+    return STATUS_MARKER_PREFIX + str(comment_id) + STATUS_MARKER_SUFFIX
+
+
+def status_payload(comment_id, state, branch="", head_sha="", increment="",
+                   reason_code=None, now=None):
+    require(state in STATUS_STATES, "INVALID_STATUS_STATE")
+    require(integer(comment_id), "INVALID_ID")
+    require(type(branch) is str and len(branch) <= 120, "INVALID_STATUS_FIELD")
+    require(type(increment) is str and len(increment) <= 120, "INVALID_STATUS_FIELD")
+    require(type(head_sha) is str and HEAD_SHA_FIELD.fullmatch(head_sha) is not None,
+            "INVALID_STATUS_FIELD")
+    if reason_code is None:
+        reason = None
+    else:
+        require(type(reason_code) is str and STATUS_REASON.fullmatch(reason_code),
+                "INVALID_REASON_CODE")
+        reason = reason_code
+    moment = now or datetime.now(timezone.utc)
+    return {"schema": STATUS_SCHEMA, "task_comment_id": comment_id, "state": state,
+            "branch": branch, "head_sha": head_sha, "increment": increment,
+            "reason_code": reason, "updated_at": moment.strftime("%Y-%m-%dT%H:%M:%SZ")}
+
+
+def status_comment(payload):
+    body = status_marker(payload["task_comment_id"]) + "\n" + json.dumps(
+        payload, separators=(",", ":"), sort_keys=True)
+    require(len(body.encode("utf-8")) <= MAX_STATUS_BODY, "STATUS_BODY_LIMIT")
+    return body
+
+
+def status_comment_id(comments, comment_id):
+    marker = status_marker(comment_id)
+    for item in comments:
+        body = item.get("body")
+        if type(body) is str and body.startswith(marker):
+            return item.get("id") if integer(item.get("id")) else None
+    return None
+
+
+class GitHubStatus:
+    """Create-once, update-in-place status comments on the single control issue."""
+
+    def __init__(self, issue, *, api=None, writer=None, state_dir=None, clock=None):
+        require(integer(issue), "INVALID_ID")
+        self.issue = issue
+        self._api = api or GitHub()
+        self._writer = writer or self._gh_write
+        self._state_dir = Path(state_dir) if state_dir else Path(tempfile.gettempdir())
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._comment_ids = {}
+
+    def announce(self, comment_id, state, *, branch="", head_sha="", increment="",
+                 reason_code=None, comments=None):
+        """Post or update the one bounded status comment linked to this task."""
+        payload = status_payload(comment_id, state, branch, head_sha, increment,
+                                 reason_code, now=self._clock())
+        body = status_comment(payload)
+        try:
+            existing = self._comment_ids.get(comment_id)
+            if existing is None:
+                source = comments
+                if source is None:
+                    source = self._api.snapshot(self.issue)[2]
+                existing = status_comment_id(source, comment_id)
+                if existing is not None:
+                    self._comment_ids[comment_id] = existing
+            if existing is None:
+                created = self._writer("POST", f"issues/{self.issue}/comments", {"body": body})
+                new_id = created.get("id") if type(created) is dict else None
+                require(integer(new_id), "STATUS_WRITE_FAILED")
+                self._comment_ids[comment_id] = new_id
+            else:
+                self._writer("PATCH", f"issues/comments/{existing}", {"body": body})
+            return self._comment_ids[comment_id]
+        except Stop as exc:
+            raise Stop("STATUS_WRITE_FAILED") from exc
+        except (OSError, ValueError, TypeError, KeyError,
+                subprocess.SubprocessError) as exc:
+            raise Stop("STATUS_WRITE_FAILED") from exc
+
+    def _gh_write(self, method, path, payload):
+        binary = shutil.which("gh")
+        require(binary is not None, "GH_MISSING")
+        env = dict(os.environ)
+        token = os.environ.get(STATUS_TOKEN_ENV)
+        if token:
+            env["GH_TOKEN"] = token
+        # Structured file input: the token never reaches argv and no token is written.
+        directory = tempfile.mkdtemp(prefix="opip-status-", dir=self._state_dir)
+        try:
+            request = Path(directory) / "status.json"
+            request.write_text(json.dumps(payload), encoding="utf-8")
+            return strict_json(host_run([binary, "api", "--hostname", "github.com",
+                                         "--method", method, f"repos/{REPO}/{path}",
+                                         "--input", str(request)], env=env))
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
+
+
+def announce(status_api, comment_id, state, task=None, *, reason_code=None, comments=None):
+    """Announce a state transition, or do nothing when status is not configured."""
+    if status_api is None:
+        return None
+    task = task or {}
+    return status_api.announce(
+        comment_id, state, branch=task.get("branch", ""),
+        head_sha=task.get("head", "") if HEAD.fullmatch(task.get("head", "")) else "",
+        increment=task.get("increment", ""), reason_code=reason_code, comments=comments)
+
+
+def safe_announce(status_api, comment_id, state, task=None, *, reason_code=None):
+    """Announce a failure without masking the original reason or a write failure."""
+    try:
+        return announce(status_api, comment_id, state, task, reason_code=reason_code)
+    except Stop:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Continuous discovery (AC-011)
+#
+# Polls exactly one configured control issue. Progress is durable and local, and
+# a transient GitHub read failure never consumes a task. Comment scanning is
+# ordered by id and never uses a high-water mark to skip an earlier task.
+# ---------------------------------------------------------------------------
+
+
+def discovery_path(state):
+    return Path(state) / DISCOVERY_FILE
+
+
+def load_discovery(path):
+    try:
+        raw = Path(path).read_bytes()
+    except FileNotFoundError:
+        return {"schema": 1, "last_seen_comment_id": 0, "dispositions": {}}
+    except OSError as exc:
+        raise Stop("DISCOVERY_STATE_CORRUPT") from exc
+    try:
+        value = strict_json(raw.decode("utf-8-sig"))
+    except (Stop, UnicodeError) as exc:
+        raise Stop("DISCOVERY_STATE_CORRUPT") from exc
+    require(type(value) is dict and
+            set(value) == {"schema", "last_seen_comment_id", "dispositions"} and
+            value["schema"] == 1 and type(value["last_seen_comment_id"]) is int and
+            value["last_seen_comment_id"] >= 0 and type(value["dispositions"]) is dict,
+            "DISCOVERY_STATE_CORRUPT")
+    for key, entry in value["dispositions"].items():
+        require(re.fullmatch(r"[1-9][0-9]*", key) is not None and type(entry) is dict,
+                "DISCOVERY_STATE_CORRUPT")
+    return value
+
+
+def save_discovery(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    fd, temporary = tempfile.mkstemp(prefix=".opip-discovery-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, str(path))
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def discovery_decide(value, comment_id, state, reason):
+    entries = value["dispositions"]
+    entries[str(comment_id)] = {"state": state, "reason": reason}
+    if len(entries) > MAX_DISPOSITIONS:
+        excess = len(entries) - MAX_DISPOSITIONS
+        for key in sorted(entries, key=int)[:excess]:
+            entries.pop(key, None)
+    if comment_id > value["last_seen_comment_id"]:
+        value["last_seen_comment_id"] = comment_id
+
+
+def task_candidates(comments, allowed_ids, decided):
+    """Ordered /opip-task comments from allowed authors that are not yet decided.
+
+    Bridge status comments are excluded because their body starts with the status
+    marker, never with the task envelope.
+    """
+    ordered = sorted(comments, key=lambda c: c.get("id") if type(c.get("id")) is int else 0)
+    found = []
+    for item in ordered:
+        comment_id = item.get("id")
+        if not integer(comment_id) or str(comment_id) in decided:
+            continue
+        if item.get("user", {}).get("id") not in allowed_ids:
+            continue
+        body = item.get("body")
+        if type(body) is not str or not body.startswith("/opip-task\n"):
+            continue
+        found.append(comment_id)
+    return found
+
+
+def attempted_tasks(state):
+    """Task comment ids already claimed in the durable receipt database."""
+    path = Path(state) / "receipts.sqlite3"
+    if not path.exists():
+        return set()
+    with contextlib.closing(receipt_db(Path(state))) as connection:
+        rows = connection.execute("SELECT task FROM receipts").fetchall()
+    return {row[0] for row in rows}
+
+
+def poll_once(config, issue, *, execute=False, policy_path=None, status_api=None,
+              api=None, agent=None, state=None):
+    """Discover and handle every currently eligible new task, one at a time."""
+    state = Path(state or config["state_dir"])
+    api = api or GitHub()
+    discovery = load_discovery(discovery_path(state))
+    owner, _, comments = api.snapshot(issue)
+    allowed = {owner, *config["dispatch_ids"]}
+    decided = set(discovery["dispositions"])
+    decided.update(str(task) for task in attempted_tasks(state))
+    handled = []
+    for comment_id in task_candidates(comments, allowed, decided):
+        try:
+            if policy_path is not None:
+                from tools.local_bridge_autonomy import autonomous
+                autonomous(config, policy_path, issue, comment_id, execute,
+                           status_api=status_api)
+            else:
+                run(config, issue, comment_id, execute=execute, api=api, agent=agent,
+                    status_api=status_api)
+        except KeyboardInterrupt:
+            raise
+        except Stop as exc:
+            code = str(exc)
+            if code in RETRYABLE_REASONS:
+                status(state, comment_id, "DEFERRED_" + code)
+                continue
+            if execute:
+                discovery_decide(discovery, comment_id, "REJECTED", code)
+            continue
+        except (OSError, ValueError, TypeError, KeyError, sqlite3.Error,
+                subprocess.SubprocessError):
+            if execute:
+                discovery_decide(discovery, comment_id, "FAILED", "FAILED_OWNER_RECOVERY")
+            continue
+        handled.append(comment_id)
+        if execute:
+            discovery_decide(discovery, comment_id, "HANDLED", None)
+    if execute:
+        highest = max([c.get("id") for c in comments if integer(c.get("id"))] or [0])
+        if highest > discovery["last_seen_comment_id"]:
+            discovery["last_seen_comment_id"] = highest
+        save_discovery(discovery_path(state), discovery)
+    return handled
+
+
+def watch(config, issue, *, execute=False, policy_path=None,
+          poll_seconds=POLL_DEFAULT_SECONDS, status_api=None, api=None, agent=None,
+          state=None, polls=None, sleep=time.sleep):
+    """Poll the single control issue until interrupted. Never a server or webhook."""
+    require(POLL_MIN_SECONDS <= poll_seconds <= POLL_MAX_SECONDS, "POLL_INTERVAL_OUT_OF_RANGE")
+    state = Path(state or config["state_dir"])
+    completed = 0
+    with exclusive_lock(state, "watch.lock"):
+        while True:
+            try:
+                poll_once(config, issue, execute=execute, policy_path=policy_path,
+                          status_api=status_api, api=api, agent=agent, state=state)
+            except KeyboardInterrupt:
+                raise
+            except Stop as exc:
+                code = str(exc)
+                status(state, 0, "POLL_" + code)
+                if code not in RETRYABLE_REASONS:
+                    raise
+            completed += 1
+            if polls is not None and completed >= polls:
+                return completed
+            sleep(poll_seconds)
+
+
+def run(config, issue, comment_id, execute=False, api=None, agent=None, status_api=None):
     root, state = Path(config["worktree"]), Path(config["state_dir"])
     api, agent = api or GitHub(), agent or cursor
+    task = None
     with run_lock(state):
         try:
-            task, task_hash = control(api.snapshot(issue), comment_id, config["dispatch_ids"])
+            snapshot = api.snapshot(issue)
+            task, task_hash = control(snapshot, comment_id, config["dispatch_ids"])
             context, contract = repository(root, task)
             if not execute:
                 status(state, comment_id, "DRY_RUN_VALID")
                 return
             require(config["enable_execution"] is True, "EXECUTION_DISABLED")
+            announce(status_api, comment_id, "accepted", task, comments=snapshot[2])
             with contextlib.closing(receipt_db(state)) as connection:
                 claim(connection, comment_id, task_hash)
                 try:
                     status(state, comment_id, "STARTED")
+                    announce(status_api, comment_id, "running", task, comments=snapshot[2])
                     proposal = agent(config, task, context, contract)
                     fresh_task, fresh_hash = control(api.snapshot(issue), comment_id, config["dispatch_ids"])
                     require(fresh_hash == task_hash and fresh_task == task, "TASK_CHANGED")
@@ -555,6 +898,9 @@ def run(config, issue, comment_id, execute=False, api=None, agent=None):
                     edits = proposal_edits(proposal, root, task, context)
                     status(state, comment_id, "APPLYING")
                     apply_edits(edits)
+                    # The GitHub write precedes the terminal receipt so a failed status
+                    # write can never be reported as an applied success.
+                    announce(status_api, comment_id, "applied", task, comments=snapshot[2])
                     with connection:
                         connection.execute("UPDATE receipts SET status='APPLIED_UNTESTED' WHERE task=?",
                                            (comment_id,))
@@ -565,11 +911,19 @@ def run(config, issue, comment_id, execute=False, api=None, agent=None):
                                            (comment_id,))
                     raise
         except Stop as exc:
-            status(state, comment_id, str(exc))
+            code = str(exc)
+            status(state, comment_id, code)
+            if task is not None:
+                safe_announce(status_api, comment_id,
+                              "blocked" if code in BLOCKED_REASONS else "failed",
+                              task, reason_code=code)
             raise
         except (OSError, ValueError, TypeError, KeyError, sqlite3.Error, subprocess.SubprocessError,
                 KeyboardInterrupt):
             status(state, comment_id, "FAILED_OWNER_RECOVERY")
+            if task is not None:
+                safe_announce(status_api, comment_id, "failed", task,
+                              reason_code="FAILED_OWNER_RECOVERY")
             raise
 
 
@@ -577,21 +931,38 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--issue", type=int, required=True)
-    parser.add_argument("--task-comment", type=int, required=True)
+    parser.add_argument("--task-comment", type=int,
+                        help="explicit one-shot task comment id; not used with --watch")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--execute", action="store_true")
     mode.add_argument("--dry-run", action="store_true", help="default; no Cursor call or source writes")
+    parser.add_argument("--watch", action="store_true",
+                        help="poll the one configured control issue and discover new tasks")
+    parser.add_argument("--poll-seconds", type=int, default=POLL_DEFAULT_SECONDS,
+                        help=f"continuous polling interval, {POLL_MIN_SECONDS}-{POLL_MAX_SECONDS} seconds")
     parser.add_argument("--autonomy-policy", type=Path,
                         help="OWNER-authorized registered-work policy; optional autonomous pipeline")
     args = parser.parse_args(argv)
     try:
-        require(integer(args.issue) and integer(args.task_comment), "INVALID_ID")
+        require(integer(args.issue), "INVALID_ID")
+        require(not (args.watch and args.task_comment is not None), "WATCH_TAKES_NO_TASK_COMMENT")
+        require(args.watch or integer(args.task_comment), "INVALID_ID")
+        require(not args.watch or POLL_MIN_SECONDS <= args.poll_seconds <= POLL_MAX_SECONDS,
+                "POLL_INTERVAL_OUT_OF_RANGE")
         config = config_file(args.config)
-        if args.autonomy_policy:
+        # Status comments are GitHub writes, so dry-run and basic read-only mode never post.
+        status_api = None
+        if args.execute:
+            status_api = GitHubStatus(args.issue, state_dir=Path(config["state_dir"]))
+        if args.watch:
+            watch(config, args.issue, execute=args.execute, policy_path=args.autonomy_policy,
+                  poll_seconds=args.poll_seconds, status_api=status_api)
+        elif args.autonomy_policy:
             from tools.local_bridge_autonomy import autonomous
-            autonomous(config, args.autonomy_policy, args.issue, args.task_comment, args.execute)
+            autonomous(config, args.autonomy_policy, args.issue, args.task_comment, args.execute,
+                       status_api=status_api)
         else:
-            run(config, args.issue, args.task_comment, execute=args.execute)
+            run(config, args.issue, args.task_comment, execute=args.execute, status_api=status_api)
         return 0
     except (Stop, OSError, ValueError, TypeError, KeyError, sqlite3.Error, subprocess.SubprocessError,
             KeyboardInterrupt) as exc:

@@ -44,7 +44,9 @@ def policy_file(path, root):
     checks = policy["required_checks"]
     b.require(type(checks) is list and 2 <= len(checks) <= 30 and
               all(type(c) is str and c and len(c) <= 100 for c in checks) and
-              {"test", "atdd scope"}.issubset(checks) and len(set(checks)) == len(checks),
+              # The protected `main` contexts are structural, not policy-removable.
+              set(b.PROTECTED_REQUIRED_CHECKS).issubset(checks) and
+              len(set(checks)) == len(checks),
               "REQUIRED_CHECKS_MISSING")
     templates = policy["registered_tasks"]
     b.require(type(templates) is list and 1 <= len(templates) <= 20, "TASK_REGISTRY_REQUIRED")
@@ -214,9 +216,19 @@ def check_gate(checks, statuses, required):
             values.append("pending")
         else:
             values.extend(records)
-    if any(v in {"failure", "error", "cancelled", "timed_out", "action_required", "stale"} for v in values):
+    if any(v in {"failure", "error", "cancelled", "timed_out", "action_required", "stale",
+                 "startup_failure"} for v in values):
         return "REQUEST_CHANGES"
     return "APPROVE" if values and all(v == "success" for v in values) else "WAITING_CI"
+
+
+def required_check_names(policy):
+    """Protected contexts plus any additional policy-required names.
+
+    A policy may add checks; it can never remove a protected context, and a
+    missing protected context is always evaluated as pending, never as satisfied.
+    """
+    return tuple(sorted(set(policy["required_checks"]) | set(b.PROTECTED_REQUIRED_CHECKS)))
 
 
 def all_pages(api, path, key=None):
@@ -297,10 +309,22 @@ def publish(config, task, context, api):
     return {"sha": sha, "pr": pr["number"], "url": pr["html_url"]}
 
 
-def autonomous(config, policy_path, issue, comment_id, execute=False):
+def autonomous(config, policy_path, issue, comment_id, execute=False, api=None,
+               status_api=None):
     state, root = Path(config["state_dir"]), Path(config["worktree"])
     policy, policy_hash = policy_file(policy_path, root)
-    api = b.GitHub()
+    api = api or b.GitHub()
+    gate_names = required_check_names(policy)
+
+    def note(status_name, task=None, reason=None):
+        """Success-path announcement: a failed GitHub write stops the task."""
+        return b.announce(status_api, comment_id, status_name, task, reason_code=reason)
+
+    def note_failure(status_name, task=None, reason=None):
+        """Failure-path announcement: never masks the original reason."""
+        return b.safe_announce(status_api, comment_id, status_name, task, reason_code=reason)
+
+    task = None
     with b.run_lock(state):
         connection = b.receipt_db(state) if execute else None
         try:
@@ -309,6 +333,7 @@ def autonomous(config, policy_path, issue, comment_id, execute=False):
                 connection.execute("CREATE TABLE IF NOT EXISTS runs "
                                    "(task INTEGER PRIMARY KEY, policy TEXT, phase TEXT, details TEXT)")
                 connection.commit()
+
             def authorized():
                 snapshot = api.snapshot(issue)
                 # Pipeline uses an issue as the stable control plane while PR HEAD advances.
@@ -316,6 +341,7 @@ def autonomous(config, policy_path, issue, comment_id, execute=False):
                 authorize_policy(snapshot, policy_hash)
                 return b.control(snapshot, comment_id, config["dispatch_ids"],
                                  admit=lambda task, hashed: admit_task(policy, task, hashed))
+
             task, task_hash = authorized()
             b.require(b.git(root, "config", "--type=bool", "--default=false", "--get", "core.autocrlf") == "false",
                       "AUTONOMY_REQUIRES_BYTE_STABLE_CHECKOUT")
@@ -328,6 +354,7 @@ def autonomous(config, policy_path, issue, comment_id, execute=False):
                 resumed = dict(task, head=details["sha"])
                 b.repository(root, resumed)
                 b.require(details["task_sha256"] == task_hash, "TASK_CHANGED")
+                note("pushed", task)
             else:
                 context, contract = b.repository(root, task)
                 if not execute:
@@ -337,16 +364,19 @@ def autonomous(config, policy_path, issue, comment_id, execute=False):
                 b.require(connection.execute("SELECT COUNT(*) FROM runs WHERE policy=?",
                                               (policy_hash,)).fetchone()[0] < policy["max_tasks"], "POLICY_BUDGET_EXHAUSTED")
                 reviewer_id()  # Establish separate review credentials before spending on Cursor.
+                note("accepted", task)
                 b.claim(connection, comment_id, task_hash)
                 details = {"task_sha256": task_hash}
                 phase(connection, comment_id, policy_hash, "STARTED", details)
                 b.status(state, comment_id, "AUTONOMOUS_TASK_APPROVED")
+                note("running", task)
                 proposal = b.cursor(config, task, context, contract)
                 authorized()
                 b.require(b.repository(root, task)[0] == context, "CONTEXT_CHANGED")
                 edits = b.proposal_edits(proposal, root, task, context)
                 phase(connection, comment_id, policy_hash, "APPLYING", details)
                 b.apply_edits(edits)
+                note("testing", task)
                 candidate = {name: (root / name).read_bytes() for name in task["files"]}
                 evidence = isolated_tests(config, policy, task)
                 review_context = {name: {"before": context[name]["content"],
@@ -361,8 +391,10 @@ def autonomous(config, policy_path, issue, comment_id, execute=False):
                 authorized()
                 details["tests"] = evidence
                 phase(connection, comment_id, policy_hash, "PUBLISHING", details)
-                details.update(publish(config, task, candidate, api))
+                published = publish(config, task, candidate, api)
+                details.update(published)
                 phase(connection, comment_id, policy_hash, "PUBLISHED_WAITING_CI", details)
+                note("pushed", dict(task, head=details["sha"]))
             pr = api.get(f"pulls/{details['pr']}")
             pr_identity(pr, task["branch"], details["sha"])
             reviewer = reviewer_id()
@@ -370,8 +402,9 @@ def autonomous(config, policy_path, issue, comment_id, execute=False):
                       reviewer != pr["user"]["id"], "SELF_APPROVAL_FORBIDDEN")
             checks = all_pages(api, f"commits/{details['sha']}/check-runs", "check_runs")
             statuses = all_pages(api, f"commits/{details['sha']}/statuses")
-            verdict = check_gate(checks, statuses, policy["required_checks"])
+            verdict = check_gate(checks, statuses, gate_names)
             if verdict == "WAITING_CI":
+                note("waiting_ci", dict(task, head=details["sha"]))
                 b.status(state, comment_id, verdict)
                 return
             authorized()
@@ -386,15 +419,21 @@ def autonomous(config, policy_path, issue, comment_id, execute=False):
             b.require(result.get("commit_id") == details["sha"] and result.get("state") ==
                       {"APPROVE": "APPROVED", "REQUEST_CHANGES": "CHANGES_REQUESTED"}[verdict], "REVIEW_RESULT_AMBIGUOUS")
             phase(connection, comment_id, policy_hash, verdict, details)
+            note("approved" if verdict == "APPROVE" else "request_changes",
+                 dict(task, head=details["sha"]), reason=verdict)
             b.status(state, comment_id, "GITHUB_" + verdict)
         except BaseException as exc:
             # Never retry an ambiguous push, commit, PR creation, review or partial write.
             # A failed read in the explicit CI-wait phase can safely be retried later.
+            code = str(exc) if isinstance(exc, b.Stop) else "FAILED_OWNER_RECOVERY"
             if connection:
                 row = connection.execute("SELECT phase, details FROM runs WHERE task=?", (comment_id,)).fetchone()
                 if row and row[0] in {"STARTED", "APPLYING", "REVIEWED", "PUBLISHING", "REVIEW_SUBMITTING"}:
                     phase(connection, comment_id, policy_hash, "FAILED_OWNER_RECOVERY", json.loads(row[1]))
-            b.status(state, comment_id, str(exc) if isinstance(exc, b.Stop) else "FAILED_OWNER_RECOVERY")
+            b.status(state, comment_id, code)
+            if task is not None:
+                note_failure("blocked" if code in b.BLOCKED_REASONS else "failed",
+                             task, reason=code)
             raise
         finally:
             if connection:
