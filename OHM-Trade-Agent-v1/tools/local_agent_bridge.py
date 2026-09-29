@@ -38,6 +38,9 @@ PREFIX = "OHM-Trade-Agent-v1/"
 ACTIVE = PREFIX + "docs/atdd/ACTIVE_INCREMENT"
 SELF = PREFIX + "tools/local_agent_bridge.py"
 CHECKER = PREFIX + "tests/atdd_scope.py"
+BRIDGE_TOOL_ROOT = PREFIX + "tools/bridge_tasks/"
+TEST_ROOT = PREFIX + "tests/"
+ENGINEERING_DOC_ROOT = PREFIX + "docs/engineering/"
 MAX_BYTES = 1_000_000
 MAX_FILES = 20
 SHA = re.compile(r"[0-9a-f]{64}")
@@ -106,15 +109,22 @@ def safe_path(value):
         require(stem not in {"CON", "PRN", "AUX", "NUL", "CLOCK$"} and
                 not re.fullmatch(r"(?:COM|LPT)[0-9]+", stem), "UNSAFE_PATH")
         require(not part.startswith("."), "HIDDEN_PATH")
-    require(value.startswith((PREFIX + "tools/", PREFIX + "tests/",
-                              PREFIX + "docs/engineering/")), "FROZEN_PATH")
+    basename = parts[-1].casefold()
+    require(basename not in {"__init__.py", "conftest.py"}, "FROZEN_PATH")
+    suffix = Path(value).suffix
+    test_relative = value.removeprefix(TEST_ROOT)
+    eligible_tool = value.startswith(BRIDGE_TOOL_ROOT) and suffix == ".py"
+    eligible_test = (value.startswith(TEST_ROOT) and "/" not in test_relative and
+                     test_relative.startswith("test_") and suffix == ".py")
+    eligible_doc = value.startswith(ENGINEERING_DOC_ROOT)
+    require(eligible_tool or eligible_test or eligible_doc, "FROZEN_PATH")
     require(value not in {SELF, CHECKER, PREFIX + "tools/local_bridge_autonomy.py",
                          PREFIX + "tests/test_local_bridge_autonomy.py"} and
             not value.startswith(PREFIX + "docs/engineering/local-agent-bridge") and
             not value.startswith(PREFIX + "docs/engineering/local-bridge-autonomy") and
             value != PREFIX + "docs/engineering/LOCAL_AGENT_BRIDGE_V1.md" and
             value != PREFIX + "tests/test_local_agent_bridge.py", "FROZEN_PATH")
-    require(Path(value).suffix in {".py", ".md", ".txt", ".json"}, "UNSUPPORTED_FILE")
+    require(suffix in {".py", ".md", ".txt", ".json"}, "UNSUPPORTED_FILE")
     require(not re.search(r"(?i)(credential|secret|token|private.?key|api.?key|password)",
                           value), "CREDENTIAL_PATH")
     return value

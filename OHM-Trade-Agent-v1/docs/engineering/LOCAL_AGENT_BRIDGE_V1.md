@@ -6,13 +6,13 @@ This is a small, standard-library Python program for **Opr1130/OHM-Trade-Agent-v
 
 ## 1. Scope and trust boundary
 
-V1 accepts exact, case-sensitive file paths under these repository-root directories:
+V1 accepts exact, case-sensitive file paths only in these repository-root namespaces:
 
-- `OHM-Trade-Agent-v1/tools/`
-- `OHM-Trade-Agent-v1/tests/`
-- `OHM-Trade-Agent-v1/docs/engineering/`
+- Python engineering tools under `OHM-Trade-Agent-v1/tools/bridge_tasks/`
+- top-level Python tests named `OHM-Trade-Agent-v1/tests/test_*.py`
+- text documentation under `OHM-Trade-Agent-v1/docs/engineering/`
 
-Only `.py`, `.md`, `.txt`, and `.json` text files may be added/replaced. Each path must also appear in the active approved ATDD implementation map and the exact approved task. The bridge/checker, bridge tests and bridge policy documentation are frozen against self-modification. App/runtime, architecture, ATDD contracts, workflows, deployment files, hidden files and credential-named paths are unavailable to tasks. Deletion, rename, binary edits, wildcards, links and arbitrary commands are unsupported.
+Only `.py`, `.md`, `.txt`, and `.json` text files may be added/replaced; tools and tests are Python-only. Every `__init__.py` and `conftest.py` is frozen at any depth because Python or pytest can execute it during import or collection. Each path must also appear in the active approved ATDD implementation map and the exact approved task. The bridge/checker, bridge tests and bridge policy documentation are frozen against self-modification. Existing gateway, governance, platform backup/restore, app/runtime, architecture, ATDD contracts, workflows, deployment files, hidden files and credential-named paths are unavailable to tasks. Deletion, rename, binary edits, wildcards, links and arbitrary commands are unsupported.
 
 This engineering-only limit deliberately excludes R3 trading-product implementation. Expanding it requires a separately approved bridge increment and review of the execution boundary. An instruction that requests a forbidden behavior must not receive OWNER approval. Filename checks cannot prove the semantic meaning of generated code. OWNER approval includes explicit architecture/frozen-boundary clearance; the model can flag a conflict but cannot grant authority.
 

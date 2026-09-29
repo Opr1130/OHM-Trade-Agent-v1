@@ -51,7 +51,7 @@ Cursor's untrusted structured proposal
 WHEN:
 the bridge validates and applies it after rechecking approval and repository state
 THEN:
-only unique explicitly approved text files may be added or replaced, no deletion/rename/binary/symlink/junction/hardlink/credential/frozen path is allowed, every before-hash must match, all edits validate before any write, and a detected conflict or partial application requires OWNER recovery without automatic rollback
+only unique explicitly approved text files in the dedicated bridge-tool namespace, top-level test-module namespace or engineering-documentation namespace may be added or replaced; all `__init__.py` and `conftest.py` files and existing gateway/governance/platform tools are frozen; no deletion/rename/binary/symlink/junction/hardlink/credential/frozen path is allowed, every before-hash must match, all edits validate before any write, and a detected conflict or partial application requires OWNER recovery without automatic rollback
 
 AC-006:
 GIVEN:

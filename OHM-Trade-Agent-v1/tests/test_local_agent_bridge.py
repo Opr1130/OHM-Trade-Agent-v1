@@ -209,10 +209,25 @@ def test_file_alias_and_reparse(tmp_path, monkeypatch):
     b.PREFIX + "tools/a//b.py", b.PREFIX + "tools/.env", b.PREFIX + "tools/API_KEY.txt",
     b.PREFIX + "app/a.py", b.PREFIX + "deploy/a.py", ".github/workflows/a.yml",
     b.PREFIX + "docs/architecture/a.md", b.PREFIX + "docs/atdd/ACTIVE_INCREMENT",
-    b.SELF, b.CHECKER, b.PREFIX + "tools/tool.exe", b.PREFIX + "tools/a~1.py"])
+    b.SELF, b.CHECKER, b.PREFIX + "tools/tool.exe", b.PREFIX + "tools/a~1.py",
+    b.PREFIX + "tools/__init__.py", b.PREFIX + "tools/ai_gateway/profiles.py",
+    b.PREFIX + "tools/opip_platform_backup.py", b.PREFIX + "tools/opip_platform_restore_verify.py",
+    b.PREFIX + "tools/bridge_tasks/__init__.py", b.PREFIX + "tools/bridge_tasks/conftest.py",
+    b.PREFIX + "tests/__init__.py", b.PREFIX + "tests/conftest.py",
+    b.PREFIX + "tests/nested/conftest.py", b.PREFIX + "tests/nested/test_escape.py",
+    b.PREFIX + "tests/test_escape/helper.py"])
 def test_unsafe_paths(path):
     with pytest.raises(b.Stop):
         b.safe_path(path)
+
+
+@pytest.mark.parametrize("path", [
+    b.PREFIX + "tools/bridge_tasks/format_report.py",
+    b.PREFIX + "tests/test_bridge_task.py",
+    b.PREFIX + "docs/engineering/bridge-task.md",
+])
+def test_explicit_editable_namespaces(path):
+    assert b.safe_path(path) == path
 
 
 def make_repo(tmp_path):
