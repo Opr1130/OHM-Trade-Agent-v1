@@ -46,6 +46,8 @@ TARGET INTERFACE INPUTS (current repository truth, not a new contract):
     - `detector_input_fingerprint(snapshot)` (`DETIN`).
 
     The detector may carry the lineage identifiers into `DetectorClaim` / `DetectorState`, but excluded `FeatureSnapshot` metadata (for example `availability`, `evaluated_at_utc`, freshness and notes) must not become favourable transition evidence. `detector_replay_input` is not expanded in this increment and `app/opip/features/replay.py` is not modified.
+- Where the applied detector policy comes from (it is not a fourth argument): the versioned detector policy named above is a versioned property of the detector implementation itself, not an argument and not a hidden input. v1 IGNITION has one detector family and one versioned policy, and that policy (hysteresis, debounce and persistence parameters together with its version token) is a deterministic, replayable code artifact exactly like any other frozen contract constant. Nothing outside the supplied snapshot, the supplied prior `DetectorState` and the explicit `evaluation_time` is consulted at run time, and no environment, clock, registry or global state selects or substitutes it. The prior `DetectorState` carries the detector/policy version that produced it; `evaluate()` fails closed when that declared version does not match the applied policy version, and every returned claim and the next state carry the applied version. Introducing a further policy version, or moving policy selection to a caller-supplied argument, changes the frozen three-argument interface and therefore requires an OWNER-approved interface change outside this freeze.
+- Point-in-time eligibility of the facts inside a sealed `FeatureSnapshot` is owned by the upstream sealing boundary, not by F3. The snapshot is consumed already sealed: its `consumed_input_watermark` plus the producer's guarantees are what make its `values` cutoff-eligible, and the frozen rule `evaluation_time == evaluation_cutoff` binds an evaluation to that sealed instant. F3 therefore does not re-adjudicate visibility and must not attempt to reconstruct eligibility from excluded metadata. Re-adjudicating visibility upstream, or adding availability facts to the replay-input projection, changes the sealing boundary and `app/opip/features/replay.py`, is outside this increment, and requires its own OWNER-approved change.
 - `app/opip/features/state.py` already proves the gap/persistence-reset discipline at the feature layer (`persistence_intervals`, `gap_resets`, `last_gap_epoch`). F3 mirrors that discipline for detector persistence; it does not create a second state framework.
 - `app/services/explosion_state.py` and the other `IGNITION` string uses are the legacy explosion/phase taxonomy. They are not `DetectorState` and are not prior art for this contract.
 
@@ -173,7 +175,7 @@ a sealed FeatureSnapshot supplied to evaluate()
 WHEN:
 the evaluation binds its claims and next state to that snapshot
 THEN:
-the detector decision input is exactly detector_replay_input(snapshot) plus the prior DetectorState, the explicit evaluation_time and the versioned detector policy; the detector may carry the lineage and tamper-evidence identifiers snapshot_id, snapshot.content_hash() and detector_input_fingerprint(snapshot) into DetectorClaim and DetectorState, but excluded FeatureSnapshot metadata must not become favourable transition evidence; and a snapshot whose identity is absent or not bound to the supplied evidence fails closed
+the detector decision input is exactly detector_replay_input(snapshot) plus the prior DetectorState, the explicit evaluation_time and the versioned detector policy; the detector may carry the lineage and tamper-evidence identifiers snapshot_id, snapshot.content_hash() and detector_input_fingerprint(snapshot) into DetectorClaim and DetectorState, but excluded FeatureSnapshot metadata must not become favourable transition evidence; eligibility of the facts inside that sealed snapshot is taken as guaranteed by the upstream sealing boundary, so F3 adds no visibility re-adjudication and derives no transition evidence from evidence-receipt metadata; and a snapshot whose identity is absent or not bound to the supplied evidence fails closed
 
 AC-012:
 GIVEN:
@@ -181,7 +183,7 @@ a prior DetectorState and an applied detector policy that each declare a detecto
 WHEN:
 evaluate() runs
 THEN:
-every returned claim and the next DetectorState carry that version, and a prior state whose declared version does not match the applied policy fails closed rather than continuing under a silently substituted policy
+every returned claim and the next DetectorState carry that version, the applied policy version is the one bound to the detector implementation rather than a caller-supplied argument (consistent with the frozen three-argument interface), and a prior state whose declared version does not match the applied policy fails closed rather than continuing under a silently substituted policy
 
 AC-013:
 GIVEN:
@@ -247,9 +249,9 @@ FROZEN BOUNDARIES:
 - Paper execution stays isolated from funded order endpoints.
 - Committee authority is unchanged and remains shadow-only.
 - The v1.4.3 DOCX bytes are unchanged and equal to the recorded SHA256.
-- No merge, deploy, activation, or PR occurs under this increment.
-- A normal push of the contract-only review branch is permitted solely for OWNER review.
-- That push grants no implementation or runtime authority.
+- No merge, deploy, activation, or implementation change occurs under this increment.
+- A normal push of the contract-only review branch is permitted solely for OWNER review, and OWNER review and merge of this contract-only governance PR are permitted.
+- Reviewing, pushing or merging this contract grants no implementation or runtime authority, and does not authorize F3 implementation.
 
 ACCEPTANCE TEST TRACEABILITY:
 AC-001 -> tests/test_opip_r3_f3_ignition_detector.py::test_ac_001_evaluation_is_pure
@@ -310,6 +312,7 @@ DEFERRED DISCOVERIES:
 - The exact hysteresis and debounce parameter values are versioned policy and are not frozen numerically here; only the versioning requirement is.
 - Whether a no-claim evaluation is persisted per grid instant is an F2/F3/canonical-writer retention decision already stated by v1.4.3 section 7 and is not redefined by this contract.
 - Cross-sectional cold-start substitution remains a separate shadow-only research hypothesis and is not part of F3.
+- Late-arrival eligibility adjudication (whether evidence received after a cutoff could be distinguished inside the sealed snapshot) was raised in review of this contract. F3 consumes an already-sealed snapshot and adds no eligibility check, because visibility eligibility is owned by the upstream sealing boundary and `consumed_input_watermark`. If that boundary later needs to expose per-fact availability for a stronger check, it is a separate OWNER-approved change to the sealing contract and to `app/opip/features/replay.py`, not an F3 acceptance criterion under this freeze.
 - R3 slices F4 through F7, and v1.4.3 section 13 platform acceptance scenarios, remain future increments.
 
 UNAPPROVED SCOPE CHANGES:
