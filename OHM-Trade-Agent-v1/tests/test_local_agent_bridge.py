@@ -996,6 +996,28 @@ def test_completed_increment_pointer_is_not_pinned():
 
 
 @pytest.mark.acceptance
+def test_bridge_smoke_target_is_authorized():
+    """ATDD-BRIDGE-v1/AC-015: one harmless engineering document is the bounded activation target."""
+    target = b.PREFIX + "docs/engineering/bridge-smoke-test.md"
+
+    # The smoke target is allowed by the bridge's existing engineering-doc boundary.
+    assert b.safe_path(target) == target
+
+    # It is also explicitly authorized by the active ATDD implementation map.
+    contract = b.parse_scope_contract(
+        (b.APP / "docs/atdd/scope-contracts/ATDD-BRIDGE-v1.md").read_text(encoding="utf-8")
+    )
+    assert target in contract.implementation_map["AC-015"]
+
+    # The file is intentionally inert development documentation, not executable authority.
+    smoke = b.APP / "docs/engineering/bridge-smoke-test.md"
+    assert smoke.is_file()
+    text = smoke.read_text(encoding="utf-8")
+    assert "development-only" in text
+    assert "no runtime, trading, deployment, merge, or production authority" in text
+
+
+@pytest.mark.acceptance
 def test_contract_and_runbook():
     """ATDD-BRIDGE-v1/AC-007: contract, detailed Windows instructions and frozen architecture remain traceable."""
     contract = b.parse_scope_contract((b.APP / "docs/atdd/scope-contracts/ATDD-BRIDGE-v1.md").read_text())
