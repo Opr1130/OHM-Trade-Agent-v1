@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Mapping
 
 from app.opip.contracts.detector import (
@@ -389,6 +389,24 @@ def _phase_change(
     return DetectorTransition.IGNITION_TO_DORMANT
 
 
+def _is_consecutive(prior_state: DetectorState, instant: datetime) -> bool:
+    """Whether ``instant`` is the next declared grid step after the prior one.
+
+    The OWNER-ratified policy requires *consecutive* 60-second evaluations. A
+    ``None`` prior cutoff means there is no earlier evaluation to be adjacent to,
+    so this evaluation legitimately starts the first run. Otherwise the instant
+    must advance by exactly one grid interval; a repeated instant (a replay or
+    retry of the same sealed evaluation) or a skipped instant is not a further
+    consecutive evaluation.
+    """
+    prior_cutoff = prior_state.last_evaluation_cutoff
+    if prior_cutoff is None:
+        return True
+    return (instant - prior_cutoff) == timedelta(
+        seconds=PERSISTENCE_INTERVAL_SECONDS
+    )
+
+
 def evaluate(
     snapshot: FeatureSnapshot,
     prior_state: DetectorState,
@@ -402,6 +420,19 @@ def evaluate(
     """
     instant = _validate_structure(snapshot, prior_state, evaluation_time)
     projection = _project(snapshot, instant)
+
+    # Persistence accrues only across CONSECUTIVE evaluations. The OWNER-ratified
+    # policy requires "2 consecutive 60-second evaluations", so a repeated or
+    # non-adjacent evaluation instant must not count as a further consecutive
+    # interval: the prior run is broken and this evaluation starts a new one. No
+    # new policy numbers are introduced, evaluate() stays pure and deterministic,
+    # and the rule is fail-safe because a replayed sealed evaluation can never
+    # fabricate a claim.
+    prior_run = (
+        prior_state.persistence_seconds
+        if _is_consecutive(prior_state, instant)
+        else 0
+    )
 
     if not projection.usable:
         # Fail closed: no claim, safe DORMANT state, persistence reset to 0, and
@@ -428,7 +459,7 @@ def evaluate(
                 snapshot=snapshot,
                 evaluation_time=instant,
             )
-        persistence = prior_state.persistence_seconds + PERSISTENCE_INTERVAL_SECONDS
+        persistence = prior_run + PERSISTENCE_INTERVAL_SECONDS
         if persistence < ENTRY_PERSISTENCE_SECONDS:
             return [], _continued_state(
                 prior_state,
@@ -477,7 +508,7 @@ def evaluate(
             evaluation_time=instant,
         )
 
-    failed_hold = prior_state.persistence_seconds + PERSISTENCE_INTERVAL_SECONDS
+    failed_hold = prior_run + PERSISTENCE_INTERVAL_SECONDS
     if failed_hold < RELEASE_PERSISTENCE_SECONDS:
         return [], _continued_state(
             prior_state,

@@ -1394,3 +1394,73 @@ def test_every_required_feature_is_individually_enforced(feature: str) -> None:
     )
     assert claims == []
     assert_reset(state, DetectorResetReason.INSUFFICIENT_EVIDENCE)
+
+
+# ---------------------------------------------------------------------------
+# Consecutive-evaluation persistence (PR review remediation)
+# ---------------------------------------------------------------------------
+
+
+def test_replayed_evaluation_does_not_double_count_persistence() -> None:
+    """A replay of the same sealed evaluation is not a further consecutive one.
+
+    Review finding: accrual was unconditional, so re-evaluating the identical
+    snapshot at the identical evaluation_time advanced persistence 60 -> 120 and
+    fabricated an IGNITION claim after only one distinct interval.
+    """
+    snapshot = build_snapshot(cutoff=CUTOFF)
+    first_claims, first_state = ignition.evaluate(snapshot, build_state(), CUTOFF)
+    assert first_claims == []
+    assert first_state.phase is DetectorPhase.DORMANT
+    assert first_state.persistence_seconds == PERSISTENCE_INTERVAL_SECONDS
+
+    replay_claims, replay_state = ignition.evaluate(snapshot, first_state, CUTOFF)
+
+    assert replay_claims == []
+    assert replay_state.phase is DetectorPhase.DORMANT
+    assert replay_state.persistence_seconds == PERSISTENCE_INTERVAL_SECONDS
+    assert replay_state.persistence_seconds < ignition.ENTRY_PERSISTENCE_SECONDS
+
+
+def test_consecutive_evaluations_still_complete_entry() -> None:
+    """Positive control: two genuinely consecutive evaluations still ignite."""
+    claims, state = evaluate_entry_sequence()
+
+    assert len(claims) == 1
+    assert claims[0].phase is DetectorPhase.IGNITION
+    assert state.phase is DetectorPhase.IGNITION
+
+
+def test_non_adjacent_evaluation_restarts_the_run() -> None:
+    """A skipped grid instant is not consecutive, so the run restarts at 60."""
+    snapshot_1 = build_snapshot(cutoff=CUTOFF)
+    _, state_1 = ignition.evaluate(snapshot_1, build_state(), CUTOFF)
+    assert state_1.persistence_seconds == PERSISTENCE_INTERVAL_SECONDS
+
+    skipped = build_snapshot(cutoff=THIRD_CUTOFF)
+    claims, state = ignition.evaluate(skipped, state_1, THIRD_CUTOFF)
+
+    assert claims == []
+    assert state.phase is DetectorPhase.DORMANT
+    assert state.persistence_seconds == PERSISTENCE_INTERVAL_SECONDS
+    assert state.persistence_seconds < ignition.ENTRY_PERSISTENCE_SECONDS
+
+
+def test_duplicate_failed_hold_does_not_release_early() -> None:
+    """Duplicate failed-hold input must not complete the release persistence."""
+    igniting = complete_entry()
+    assert igniting.phase is DetectorPhase.IGNITION
+    assert igniting.persistence_seconds == 0
+
+    failing = build_snapshot(values=HOLD_FAILED_VALUES, cutoff=THIRD_CUTOFF)
+    first_claims, first_state = ignition.evaluate(failing, igniting, THIRD_CUTOFF)
+    assert first_claims == []
+    assert first_state.phase is DetectorPhase.IGNITION
+    assert first_state.persistence_seconds == PERSISTENCE_INTERVAL_SECONDS
+
+    replay_claims, replay_state = ignition.evaluate(failing, first_state, THIRD_CUTOFF)
+
+    assert replay_claims == []
+    assert replay_state.phase is DetectorPhase.IGNITION
+    assert replay_state.persistence_seconds == PERSISTENCE_INTERVAL_SECONDS
+    assert replay_state.persistence_seconds < ignition.RELEASE_PERSISTENCE_SECONDS
