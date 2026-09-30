@@ -520,7 +520,7 @@ def config_file(path):
     base_fields = {"worktree", "state_dir", "dispatch_ids", "enable_execution",
                    "cursor_executable", "cursor_sha256", "cursor_timeout_seconds"}
     packaged_fields = base_fields | {"cursor_runtime_root", "cursor_runtime_sha256"}
-    require(set(config) in {frozenset(base_fields), frozenset(packaged_fields)},
+    require(frozenset(config) in {frozenset(base_fields), frozenset(packaged_fields)},
             "INVALID_SCHEMA")
     for key in ("worktree", "state_dir"):
         require(type(config[key]) is str and Path(config[key]).is_absolute(),
