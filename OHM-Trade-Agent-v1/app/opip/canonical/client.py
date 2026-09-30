@@ -23,6 +23,7 @@ from app.opip.contracts.paper_execution_runtime import (
     PaperProtectionActionAck,
     PaperProtectionActionRequest,
 )
+from app.opip.contracts import opportunity_persistence as opportunity_persistence_contract
 from app.opip.canonical.paths import socket_path
 from app.opip.canonical.protocol import recv_json, send_json
 
@@ -52,6 +53,10 @@ class WriterClient(Protocol):
     def get_paper_v2_protection_work(self) -> PaperV2ProtectionWork: ...
 
     def get_paper_v2_ledger(self) -> PaperV2Ledger: ...
+
+    def get_opportunity_episode_projection(
+        self, episode_id: str
+    ) -> opportunity_persistence_contract.OpportunityEpisodeProjection: ...
 
     def confirm_ops_applied(self, event_id: str) -> WriterAck: ...
 
@@ -162,6 +167,19 @@ class CanonicalWriterClient:
     def get_paper_v2_ledger(self) -> PaperV2Ledger:
         response = self._roundtrip({"method": "GET_PAPER_V2_LEDGER"})
         return PaperV2Ledger.from_dict(response)
+
+    def get_opportunity_episode_projection(
+        self, episode_id: str
+    ) -> opportunity_persistence_contract.OpportunityEpisodeProjection:
+        response = self._roundtrip(
+            {
+                "method": "GET_OPPORTUNITY_EPISODE_PROJECTION",
+                "episode_id": episode_id,
+            }
+        )
+        return opportunity_persistence_contract.OpportunityEpisodeProjection.from_dict(
+            response
+        )
 
     def confirm_ops_applied(self, event_id: str) -> WriterAck:
         response = self._roundtrip(
@@ -278,6 +296,18 @@ class InProcessWriterClient:
     def get_paper_v2_ledger(self) -> PaperV2Ledger:
         return PaperV2Ledger.from_dict(
             self._server.dispatch_for_tests({"method": "GET_PAPER_V2_LEDGER"})
+        )
+
+    def get_opportunity_episode_projection(
+        self, episode_id: str
+    ) -> opportunity_persistence_contract.OpportunityEpisodeProjection:
+        return opportunity_persistence_contract.OpportunityEpisodeProjection.from_dict(
+            self._server.dispatch_for_tests(
+                {
+                    "method": "GET_OPPORTUNITY_EPISODE_PROJECTION",
+                    "episode_id": episode_id,
+                }
+            )
         )
 
     def mark_handoff_superseded(self, event_id: str) -> WriterAck:
