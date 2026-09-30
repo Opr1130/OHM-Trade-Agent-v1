@@ -372,44 +372,93 @@ def test_cursor_boundary(tmp_path, monkeypatch, case):
               "cursor_timeout_seconds": 1}
     # AC-004/AC-016 scratch-trust proof: --trust is reachable ONLY for the
     # bridge-created disposable scratch, never the worktree, the state directory
-    # itself, an arbitrary or nested directory, or a borrowed name.
+    # itself, an arbitrary or nested directory, or a borrowed name. Each rejection
+    # uses a fresh independent fixture so no guard can pass for a neighbour's reason.
     if case == "success":
-        (tmp_path / "tree").mkdir(exist_ok=True)
+        worktree = tmp_path / "tree"
+        worktree.mkdir(exist_ok=True)
         base = [str(exe), "--print", "--mode", "ask", "--sandbox", "enabled",
                 "--output-format", "json"]
 
-        def make_scratch(root, name="opip-cursor-proof"):
-            scratch = Path(root) / name
+        def make_scratch(parent, name="opip-cursor-proof"):
+            scratch = Path(parent) / name
             (scratch / "config").mkdir(parents=True, exist_ok=True)
             (scratch / "config" / "cli-config.json").write_text("{}", encoding="utf-8")
             (scratch / ".cursor").mkdir(exist_ok=True)
             (scratch / ".cursor" / "cli.json").write_text("{}", encoding="utf-8")
             return scratch
 
+        def entries_of(path):
+            return {item.name for item in Path(path).iterdir()}
+
         good = make_scratch(tmp_path)
-        trusted = b.scratch_trust_argv(good, [str(exe)], config, base)
-        assert trusted == base + ["--trust"] and trusted.count("--trust") == 1
-        assert trusted[trusted.index("--sandbox") + 1] == "enabled"
+        ok = b.scratch_trust_argv(good, [str(exe)], config, base)
+        assert ok == base + ["--trust"] and ok.count("--trust") == 1
+        assert ok[ok.index("--sandbox") + 1] == "enabled"
         assert b.DENY == ["Shell(*)", "Read(*)", "Write(*)", "WebFetch(*)"]
         for blocked in ("--force", "--yolo", "--approve-mcps"):
-            assert blocked not in trusted
+            assert blocked not in ok
 
-        elsewhere = tmp_path / "elsewhere"
-        elsewhere.mkdir()
-        for bad in (
-            make_scratch(tmp_path / "tree"),          # the configured worktree
-            tmp_path,                                  # the state directory itself
-            make_scratch(elsewhere),                   # outside state_dir
-            tmp_path / "not-bridge-made",              # borrowed name
-            make_scratch(good, "inner"),               # nested under the scratch
-        ):
-            with pytest.raises(b.Stop, match="SCRATCH_TRUST_DENIED"):
-                b.scratch_trust_argv(bad, [str(exe)], config, base)
+        # Double grant refused while the valid scratch is otherwise still valid.
+        assert entries_of(good) == {"config", ".cursor"}
         with pytest.raises(b.Stop, match="SCRATCH_TRUST_DENIED"):
-            b.scratch_trust_argv(good, [str(exe)], config, trusted)  # double grant
+            b.scratch_trust_argv(good, [str(exe)], config, ok)
+        assert entries_of(good) == {"config", ".cursor"}
+
+        # Worktree relationship refused with an otherwise-valid direct-child scratch.
+        # state_dir and worktree are normally disjoint, so the worktree guard is
+        # exercised by pointing config.worktree at the state directory itself.
         with pytest.raises(b.Stop, match="SCRATCH_TRUST_DENIED"):
-            # A scratch that IS the worktree relationship is refused.
             b.scratch_trust_argv(good, [str(exe)], dict(config, worktree=str(tmp_path)), base)
+        # A scratch physically inside the worktree is also refused.
+        with pytest.raises(b.Stop, match="SCRATCH_TRUST_DENIED"):
+            b.scratch_trust_argv(make_scratch(worktree), [str(exe)], config, base)
+
+        # Borrowed name refused even though the directory exists with valid config.
+        borrowed = make_scratch(tmp_path, "not-bridge-made")
+        assert (borrowed / "config" / "cli-config.json").is_file()
+        assert (borrowed / ".cursor" / "cli.json").is_file()
+        with pytest.raises(b.Stop, match="SCRATCH_TRUST_DENIED"):
+            b.scratch_trust_argv(borrowed, [str(exe)], config, base)
+
+        # state_dir itself refused.
+        with pytest.raises(b.Stop, match="SCRATCH_TRUST_DENIED"):
+            b.scratch_trust_argv(tmp_path, [str(exe)], config, base)
+
+        # Outside-state scratch refused.
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        with pytest.raises(b.Stop, match="SCRATCH_TRUST_DENIED"):
+            b.scratch_trust_argv(make_scratch(outside), [str(exe)], config, base)
+
+        # Extra content refused.
+        extra = make_scratch(tmp_path, "opip-cursor-extra")
+        (extra / "prompt.json").write_text("{}", encoding="utf-8")
+        with pytest.raises(b.Stop, match="SCRATCH_TRUST_DENIED"):
+            b.scratch_trust_argv(extra, [str(exe)], config, base)
+
+        # Nested scratch built under a SEPARATE parent; the valid scratch is untouched.
+        separate_parent = make_scratch(tmp_path, "opip-cursor-outer")
+        nested = make_scratch(separate_parent, "inner")
+        assert (nested / "config" / "cli-config.json").is_file()
+        with pytest.raises(b.Stop, match="SCRATCH_TRUST_DENIED"):
+            b.scratch_trust_argv(nested, [str(exe)], config, base)
+        assert entries_of(good) == {"config", ".cursor"}
+
+        # Missing configuration anchor refused.
+        with pytest.raises(b.Stop, match="SCRATCH_TRUST_DENIED"):
+            b.scratch_trust_argv(
+                good, [str(exe)],
+                {k: v for k, v in config.items() if k != "worktree"}, base)
+
+        # Symlink/reparse scratch refused.
+        real_is_symlink = Path.is_symlink
+        monkeypatch.setattr(
+            Path, "is_symlink",
+            lambda self: True if Path(self) == good else real_is_symlink(self))
+        with pytest.raises(b.Stop, match="SCRATCH_TRUST_DENIED"):
+            b.scratch_trust_argv(good, [str(exe)], config, base)
+        monkeypatch.setattr(Path, "is_symlink", real_is_symlink)
     if case == "missing_exe":
         exe.unlink()
     elif case == "batch_wrapper":
@@ -1223,9 +1272,9 @@ def test_scratch_trust_boundary(tmp_path, monkeypatch, case):
         outside.mkdir()
         target = bridge_scratch(outside)
     elif case == "nested":
-        deep = state / "opip-cursor-outer" / "inner"
-        deep.mkdir(parents=True)
-        target = deep
+        # Valid config, valid name, but nested rather than a direct child of state_dir.
+        outer = bridge_scratch(state, "opip-cursor-outer")
+        target = bridge_scratch(outer, "inner")
     elif case == "borrowed_name":
         target = bridge_scratch(state, "not-bridge-made")
     elif case == "extra_content":
