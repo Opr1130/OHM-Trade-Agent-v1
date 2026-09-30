@@ -1422,10 +1422,7 @@ def test_ac_026_f3_f4_semantics_unchanged() -> None:
 
 @pytest.mark.acceptance
 def test_ac_027_f4_pointer_handoff() -> None:
-    """ATDD-R3-F5-feasibility-safety/AC-027: the ATDD pointer names this F5 increment, the F4 test no longer pins the global pointer, and every substantive F4 AC-014 assertion is preserved."""
-    active = ACTIVE_INCREMENT_PATH.read_text(encoding="utf-8").strip()
-    assert active == INCREMENT
-
+    """ATDD-R3-F5-feasibility-safety/AC-027: the completed F5 increment no longer pins the globally movable ATDD pointer, the F4 test no longer pins it either, and every substantive F4 AC-014 assertion is preserved."""
     f4_test = F4_TEST_PATH.read_text(encoding="utf-8")
     # The stale global-pointer ownership assertion is gone.
     assert "ACTIVE_INCREMENT" not in f4_test
