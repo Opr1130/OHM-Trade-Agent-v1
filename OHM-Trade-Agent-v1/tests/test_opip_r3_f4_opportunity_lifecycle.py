@@ -626,7 +626,14 @@ def test_ac_009_terminality_requires_new_lifecycle() -> None:
 
     terminal = lifecycle.evaluate_time(deferred, DEFER_DEADLINE, POLICY).episode
 
-    # Terminal replay (same claim) is unchanged.
+    # Terminal replay (same claim) is unchanged, including a restart redelivery
+    # at the claim's own cutoff, which precedes the terminal instant.
+    cutoff_replay = lifecycle.apply_claim(claim, terminal, claim.evaluation_cutoff, POLICY)
+    assert cutoff_replay.changed is False
+    assert cutoff_replay.events == ()
+    assert cutoff_replay.episode is terminal
+    assert cutoff_replay.episode.lifecycle_state is OpportunityLifecycleState.TERMINAL
+
     replay = lifecycle.apply_claim(
         claim, terminal, AFTER_DEADLINE, POLICY, deferral_request=deferral()
     )
@@ -1002,9 +1009,12 @@ def test_time_regression_fails_closed_on_both_paths() -> None:
     with pytest.raises(OpportunityContractError):
         lifecycle.evaluate_time(created, regressed, POLICY)
 
-    # A duplicate redelivery with a regressing instant also fails closed.
-    with pytest.raises(OpportunityContractError):
-        lifecycle.apply_claim(claim, created, regressed, POLICY)
+    # A duplicate redelivery is idempotent and never rewrites history, even at an
+    # earlier delivery instant: it returns the recorded episode unchanged.
+    duplicate = lifecycle.apply_claim(claim, created, regressed, POLICY)
+    assert duplicate.changed is False
+    assert duplicate.events == ()
+    assert duplicate.episode is created
 
     terminal = lifecycle.evaluate_time(created, DEFER_DEADLINE, POLICY).episode
     newer = build_claim(cutoff=CUTOFF + timedelta(hours=2), snapshot_id=OTHER_SNAPSHOT_ID)
@@ -1012,6 +1022,80 @@ def test_time_regression_fails_closed_on_both_paths() -> None:
         lifecycle.apply_claim(
             newer, terminal, terminal.last_evaluation_time - timedelta(seconds=1), POLICY
         )
+
+
+def test_duplicate_at_claim_cutoff_against_terminal_stays_terminal() -> None:
+    """AC-002/AC-009: a restart redelivery at the claim's own cutoff is idempotent."""
+    claim = build_claim()
+    deferred = create_deferred(claim)
+    terminal = lifecycle.evaluate_time(deferred, DEFER_DEADLINE, POLICY).episode
+    assert terminal.last_evaluation_time == DEFER_DEADLINE
+
+    # The claim cutoff is EARLIER than the terminal instant; a restart redelivery
+    # at that cutoff must still return the recorded terminal outcome unchanged.
+    replay = lifecycle.apply_claim(claim, terminal, claim.evaluation_cutoff, POLICY)
+    assert replay.changed is False
+    assert replay.events == ()
+    assert replay.episode is terminal
+    assert replay.episode.lifecycle_state is OpportunityLifecycleState.TERMINAL
+    assert replay.episode.terminal_reason is OpportunityTerminalReason.EXPIRED
+
+
+def test_deferral_request_on_a_duplicate_never_defers_an_active_episode() -> None:
+    """The ratified v1 policy defers only at creation; a duplicate stays unchanged."""
+    claim = build_claim()
+    active = create_active(claim)
+    result = lifecycle.apply_claim(
+        claim, active, claim.evaluation_cutoff, POLICY, deferral_request=deferral()
+    )
+    assert result.changed is False
+    assert result.events == ()
+    assert result.episode is active
+    assert result.episode.lifecycle_state is OpportunityLifecycleState.ACTIVE
+    assert result.episode.defer_deadline is None
+
+
+def test_episode_version_fields_are_bound_to_the_ratified_policy() -> None:
+    episode = create_active()
+    for override in (
+        {"policy_version": "opportunity-shadow-policy-v2"},
+        {"lifecycle_version": "opportunity-lifecycle-v2"},
+        {"episode_schema_version": "opportunity-episode-v2"},
+    ):
+        with pytest.raises(OpportunityContractError):
+            replace(episode, **override)
+
+
+def test_prior_episode_with_mismatched_versions_fails_closed_on_both_surfaces() -> None:
+    episode = create_active()
+    mutated = replace(episode)
+    object.__setattr__(mutated, "policy_version", "opportunity-shadow-policy-v2")
+    claim = build_claim()
+    with pytest.raises(OpportunityContractError):
+        lifecycle.apply_claim(claim, mutated, claim.evaluation_cutoff, POLICY)
+    with pytest.raises(OpportunityContractError):
+        lifecycle.evaluate_time(mutated, AFTER_DEADLINE, POLICY)
+
+
+def test_episode_lineage_fields_must_reproduce_the_claim_identity() -> None:
+    episode = create_active()
+    for override in (
+        {"snapshot_id": "SNAP:tampered"},
+        {"instrument_version_id": "INSTR:kraken:BTC:USD:1"},
+        {"venue_instrument_id": "BTCUSD"},
+        {"detector_input_fingerprint": "DETIN:tampered"},
+        {"source_claim_idempotency_key": "DCLMKEY:tampered"},
+        {"detector_version": "ignition-detector-v2"},
+        {"detector_policy_version": "ignition-shadow-policy-v2"},
+    ):
+        with pytest.raises(OpportunityContractError):
+            replace(episode, **override)
+
+
+def test_active_episode_rejects_impossible_time_ordering() -> None:
+    episode = create_active()
+    with pytest.raises(OpportunityContractError):
+        replace(episode, last_evaluation_time=episode.claim_evaluation_cutoff - timedelta(seconds=1))
 
 
 def test_naive_and_malformed_evaluation_times_fail_closed() -> None:

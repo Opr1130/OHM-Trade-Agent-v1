@@ -333,6 +333,19 @@ class OpportunityEpisode:
                 self, name, require_opportunity_text(getattr(self, name), field_name=name)
             )
 
+        # The episode's version fields are bound to the ratified code artifacts,
+        # so a reconstituted episode carrying an unratified schema/lifecycle/
+        # policy tag is refused rather than accepted and later advanced.
+        for name, expected in (
+            ("episode_schema_version", OPPORTUNITY_EPISODE_SCHEMA_VERSION),
+            ("lifecycle_version", OPPORTUNITY_LIFECYCLE_VERSION),
+            ("policy_version", OPPORTUNITY_POLICY_VERSION),
+        ):
+            if getattr(self, name) != expected:
+                raise OpportunityContractError(
+                    f"{name} is not the ratified {expected}"
+                )
+
         family = require_opportunity_enum(
             detector_vocab.DetectorFamily, self.detector_family, field_name="detector_family"
         )
@@ -400,6 +413,11 @@ class OpportunityEpisode:
 
     def _validate_state_invariants(self) -> None:
         state = self.lifecycle_state
+        # Applies to every state, including ACTIVE.
+        if self.last_evaluation_time < self.claim_evaluation_cutoff:
+            raise OpportunityContractError(
+                "last_evaluation_time cannot precede the claim evaluation cutoff"
+            )
         if state is OpportunityLifecycleState.ACTIVE:
             if (
                 self.defer_deadline is not None
@@ -419,10 +437,6 @@ class OpportunityEpisode:
         if self.defer_deadline > self.validity_deadline:
             raise OpportunityContractError(
                 "defer_deadline must not exceed validity_deadline"
-            )
-        if self.last_evaluation_time < self.claim_evaluation_cutoff:
-            raise OpportunityContractError(
-                "last_evaluation_time cannot precede the claim evaluation cutoff"
             )
 
         if state is OpportunityLifecycleState.DEFERRED:
@@ -463,6 +477,27 @@ class OpportunityEpisode:
             raise OpportunityContractError(
                 "episode_id does not match its claim lineage; build episodes with "
                 "the lifecycle transition surface"
+            )
+
+        # The episode's copied detector/evidence fields must reproduce the F3
+        # claim identity, so a reconstructed episode cannot carry contradictory
+        # claim provenance.
+        expected_claim_id, expected_key = detector_vocab.detector_claim_identity(
+            detector_family=self.detector_family,
+            detector_version=self.detector_version,
+            policy_version=self.detector_policy_version,
+            instrument_version_id=self.instrument_version_id,
+            venue_instrument_id=self.venue_instrument_id,
+            transition=self.claim_transition,
+            snapshot_id=self.snapshot_id,
+            detector_input_fingerprint=self.detector_input_fingerprint,
+        )
+        if (
+            self.source_claim_id != expected_claim_id
+            or self.source_claim_idempotency_key != expected_key
+        ):
+            raise OpportunityContractError(
+                "episode claim lineage does not match its source claim identity"
             )
 
     def to_dict(self) -> dict[str, Any]:

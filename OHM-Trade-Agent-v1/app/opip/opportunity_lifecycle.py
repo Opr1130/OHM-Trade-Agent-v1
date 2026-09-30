@@ -78,6 +78,26 @@ def _require_episode(episode: object) -> OpportunityEpisode:
     return episode
 
 
+def _require_episode_policy(
+    episode: OpportunityEpisode, policy: OpportunityLifecyclePolicy
+) -> None:
+    """Re-validate an episode's version binding against the applied policy.
+
+    The episode constructor already binds these fields, but the transition
+    surfaces re-check them at the boundary (defense in depth, matching F3) so an
+    episode that bypassed construction cannot be advanced under a mismatched
+    policy or emit an event carrying an unratified version.
+    """
+    if (
+        episode.episode_schema_version != policy.episode_schema_version
+        or episode.lifecycle_version != policy.lifecycle_version
+        or episode.policy_version != policy.policy_version
+    ):
+        raise OpportunityContractError(
+            "prior episode versions do not match the applied policy"
+        )
+
+
 def _require_utc_instant(value: object, *, field_name: str) -> datetime:
     return require_opportunity_utc(value, field_name=field_name)
 
@@ -275,24 +295,27 @@ def apply_claim(
         )
 
     prior = _require_episode(prior_episode)
-
-    # A lifecycle evaluation never rewrites history: an instant earlier than the
-    # episode's previously recorded lifecycle evaluation fails closed on every
-    # claim-driven path, including a duplicate redelivery.
-    if evaluation_time < prior.last_evaluation_time:
-        raise OpportunityContractError(
-            "evaluation_time cannot precede the episode's last lifecycle evaluation"
-        )
+    _require_episode_policy(prior, policy)
 
     if prior.source_claim_id == claim.claim_id:
         # At-least-once delivery of the same claim against its own episode is
-        # idempotent. No new episode, no event, no deadline extension, no expiry
-        # and the recorded evaluation instant is left untouched.
+        # idempotent and never rewrites history, regardless of the delivery
+        # instant supplied: no new episode, no event, no deadline extension, no
+        # expiry, and the recorded evaluation instant is left untouched. This
+        # branch intentionally precedes any time-ordering guard so a restart
+        # redelivery at the claim's own cutoff still returns the recorded
+        # outcome, including against an already-terminal episode.
         return OpportunityLifecycleResult(episode=prior, events=(), changed=False)
 
     if prior.lifecycle_state is not OpportunityLifecycleState.TERMINAL:
         raise OpportunityContractError(
             "a different claim cannot bind while the prior episode is unresolved"
+        )
+
+    # A new lifecycle cannot be opened before the terminal episode it follows.
+    if evaluation_time < prior.last_evaluation_time:
+        raise OpportunityContractError(
+            "evaluation_time cannot precede the prior episode's terminal evaluation"
         )
 
     result = _create_episode(
@@ -326,6 +349,7 @@ def evaluate_time(
     """
     policy = _require_policy(policy)
     episode = _require_episode(prior_episode)
+    _require_episode_policy(episode, policy)
     evaluation_time = _require_utc_instant(evaluation_time, field_name="evaluation_time")
 
     if evaluation_time < episode.last_evaluation_time:
