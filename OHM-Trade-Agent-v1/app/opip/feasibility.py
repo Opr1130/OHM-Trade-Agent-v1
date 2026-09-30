@@ -143,40 +143,72 @@ def _bool_or_none(value: Any, *, field_name: str) -> bool | None:
     return value
 
 
-def _string_list_or_none(value: Any, *, field_name: str) -> tuple[str, ...] | None:
-    if value is None:
+def _lenient_text(value: Any) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _lenient_number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    if not isinstance(value, (list, tuple)):
-        raise FeasibilityContractError(f"{field_name} must be a list of text or None")
-    items: list[str] = []
-    for item in value:
-        if not isinstance(item, str):
-            raise FeasibilityContractError(f"{field_name} must contain only text")
-        items.append(item)
-    return tuple(items)
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _lenient_bool(value: Any) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _lenient_text_tuple(value: Any) -> tuple[str, ...] | None:
+    if isinstance(value, (list, tuple)) and all(
+        isinstance(item, str) for item in value
+    ):
+        return tuple(value)
+    return None
 
 
 def _canonical_evidence_summary(snapshot: MarketSnapshot) -> dict[str, Any]:
     """The normalized F5-required evidence inputs used for the fingerprint.
 
-    Only well-typed primitives and primitive sequences are kept, so the
-    fingerprint can never depend on an object repr and changes whenever a
-    required input changes. A malformed required field fails closed here.
+    This is deliberately lenient: it never raises, so building the fingerprint
+    cannot pre-empt the ordered checks and mask a proven hard veto (a proven veto
+    must short-circuit and be returned). A malformed required structure is
+    detected by the check itself, when - and only when - that component is
+    evaluated. Only well-typed primitives and primitive sequences are kept, so
+    the fingerprint never depends on an object repr; a non-primitive or
+    non-finite value is recorded as ``None`` for identity purposes.
     """
     market = getattr(snapshot, "market_data_validation", None)
     if market is None:
         market_summary: dict[str, Any] | None = None
     else:
         market_summary = {
-            "status": _text_or_none(
-                getattr(market, "status", None), field_name="market.status"
+            "status": _lenient_text(getattr(market, "status", None)),
+            "qualified": _lenient_bool(getattr(market, "qualified", None)),
+            "candle_count": _lenient_number(getattr(market, "candle_count", None)),
+            "latest_candle_timestamp": _lenient_number(
+                getattr(market, "latest_candle_timestamp", None)
             ),
-            "qualified": _bool_or_none(
-                getattr(market, "qualified", None), field_name="market.qualified"
+            "latest_candle_age_seconds": _lenient_number(
+                getattr(market, "latest_candle_age_seconds", None)
             ),
-            "rejection_reasons": _string_list_or_none(
-                getattr(market, "rejection_reasons", None),
-                field_name="market.rejection_reasons",
+            "duplicate_timestamp_count": _lenient_number(
+                getattr(market, "duplicate_timestamp_count", None)
+            ),
+            "gap_count": _lenient_number(getattr(market, "gap_count", None)),
+            "invalid_ohlc_count": _lenient_number(
+                getattr(market, "invalid_ohlc_count", None)
+            ),
+            "non_finite_value_count": _lenient_number(
+                getattr(market, "non_finite_value_count", None)
+            ),
+            "ticker_vs_ohlc_difference_pct": _lenient_number(
+                getattr(market, "ticker_vs_ohlc_difference_pct", None)
+            ),
+            "suspicious_spike_detected": _lenient_bool(
+                getattr(market, "suspicious_spike_detected", None)
+            ),
+            "rejection_reasons": _lenient_text_tuple(
+                getattr(market, "rejection_reasons", None)
             ),
         }
 
@@ -185,67 +217,93 @@ def _canonical_evidence_summary(snapshot: MarketSnapshot) -> dict[str, Any]:
         execution_summary: dict[str, Any] | None = None
     else:
         execution_summary = {
-            "status": _text_or_none(
-                getattr(execution, "status", None), field_name="execution.status"
+            "status": _lenient_text(getattr(execution, "status", None)),
+            "book_coverage_status": _lenient_text(
+                getattr(execution, "book_coverage_status", None)
             ),
-            "book_coverage_status": _text_or_none(
-                getattr(execution, "book_coverage_status", None),
-                field_name="execution.book_coverage_status",
+            "spread_bps": _lenient_number(getattr(execution, "spread_bps", None)),
+            "buy_visible_coverage_pct": _lenient_number(
+                getattr(execution, "buy_visible_coverage_pct", None)
             ),
-            "spread_bps": _number_or_none(
-                getattr(execution, "spread_bps", None),
-                field_name="execution.spread_bps",
+            "sell_visible_coverage_pct": _lenient_number(
+                getattr(execution, "sell_visible_coverage_pct", None)
             ),
-            "buy_visible_coverage_pct": _number_or_none(
-                getattr(execution, "buy_visible_coverage_pct", None),
-                field_name="execution.buy_visible_coverage_pct",
+            "buy_fully_covered": _lenient_bool(
+                getattr(execution, "buy_fully_covered", None)
             ),
-            "sell_visible_coverage_pct": _number_or_none(
-                getattr(execution, "sell_visible_coverage_pct", None),
-                field_name="execution.sell_visible_coverage_pct",
+            "sell_fully_covered": _lenient_bool(
+                getattr(execution, "sell_fully_covered", None)
             ),
-            "buy_fully_covered": _bool_or_none(
-                getattr(execution, "buy_fully_covered", None),
-                field_name="execution.buy_fully_covered",
-            ),
-            "sell_fully_covered": _bool_or_none(
-                getattr(execution, "sell_fully_covered", None),
-                field_name="execution.sell_fully_covered",
-            ),
-            "short_round_trip_drag_pct": _number_or_none(
+            "short_round_trip_drag_pct": _lenient_number(
                 getattr(
                     execution,
                     "estimated_visible_short_round_trip_market_drag_pct",
                     None,
-                ),
-                field_name="execution.short_round_trip_drag_pct",
+                )
             ),
-            "recent_trade_status": _text_or_none(
-                getattr(execution, "recent_trade_status", None),
-                field_name="execution.recent_trade_status",
+            "recent_trade_status": _lenient_text(
+                getattr(execution, "recent_trade_status", None)
             ),
         }
 
     return {
-        "direction": _direction(snapshot),
+        "direction": _lenient_text(getattr(snapshot, "trade_direction", None)),
+        "symbol": _lenient_text(getattr(snapshot, "symbol", None)),
+        "kraken_public_symbol": _lenient_text(
+            getattr(snapshot, "kraken_public_symbol", None)
+        ),
+        "primary_pair": _lenient_text(getattr(snapshot, "primary_pair", None)),
         "market": market_summary,
-        "margin_status": _text_or_none(
-            getattr(snapshot, "margin_validation_status", None),
-            field_name="margin_status",
+        "margin_status": _lenient_text(
+            getattr(snapshot, "margin_validation_status", None)
         ),
-        "margin_eligible": _bool_or_none(
-            getattr(snapshot, "margin_eligible", None), field_name="margin_eligible"
+        "margin_eligible": _lenient_bool(getattr(snapshot, "margin_eligible", None)),
+        "margin_venue_symbol": _lenient_text(
+            getattr(snapshot, "margin_venue_symbol", None)
         ),
-        "margin_venue_symbol": _text_or_none(
-            getattr(snapshot, "margin_venue_symbol", None),
-            field_name="margin_venue_symbol",
-        ),
-        "margin_max_leverage": _number_or_none(
-            getattr(snapshot, "margin_max_leverage", None),
-            field_name="margin_max_leverage",
+        "margin_max_leverage": _lenient_number(
+            getattr(snapshot, "margin_max_leverage", None)
         ),
         "execution": execution_summary,
     }
+
+
+def _instrument_token(value: Any) -> str | None:
+    """Normalize one venue instrument token for identity comparison.
+
+    Uppercase alphanumerics only, so ``SOL/USD`` and ``SOLUSD`` compare equal and
+    a non-text or empty value yields ``None``.
+    """
+    if not isinstance(value, str) or value.strip() == "":
+        return None
+    token = "".join(character for character in value.upper() if character.isalnum())
+    return token or None
+
+
+def _require_instrument_correspondence(
+    episode: OpportunityEpisode, snapshot: MarketSnapshot
+) -> None:
+    """The evidence snapshot must be for the episode's venue instrument.
+
+    This is an identity-consistency guard, not a trading threshold: a
+    foreign-market snapshot with otherwise usable feasibility fields fails closed
+    rather than being stamped with the episode's lineage.
+    """
+    venue = _instrument_token(getattr(episode, "venue_instrument_id", None))
+    if venue is None:
+        raise FeasibilityContractError(
+            "episode venue instrument id is not comparable to a market symbol"
+        )
+    candidates = {
+        _instrument_token(getattr(snapshot, "symbol", None)),
+        _instrument_token(getattr(snapshot, "kraken_public_symbol", None)),
+        _instrument_token(getattr(snapshot, "primary_pair", None)),
+    }
+    candidates.discard(None)
+    if venue not in candidates:
+        raise FeasibilityContractError(
+            "evidence snapshot does not correspond to the episode venue instrument"
+        )
 
 
 def _check(
@@ -333,6 +391,16 @@ def _margin_check(
         }:
             raise FeasibilityContractError(
                 f"SHORT margin_validation_status has an unsupported token: {raw!r}"
+            )
+        # The live filter keeps a SHORT only when margin_eligible is true, so an
+        # ELIGIBLE status with margin_eligible False (or the reverse) is
+        # contradictory evidence and must fail closed rather than pass.
+        eligible_flag = getattr(snapshot, "margin_eligible", None)
+        if not isinstance(eligible_flag, bool):
+            raise FeasibilityContractError("SHORT margin_eligible must be a bool")
+        if eligible_flag is not (raw.upper() == MARGIN_ELIGIBLE):
+            raise FeasibilityContractError(
+                "SHORT margin_validation_status contradicts the margin_eligible flag"
             )
 
     result = evaluate_margin_gate(snapshot, evaluated_at=evaluation_time)
@@ -496,7 +564,10 @@ def evaluate_feasibility(
     )
     episode = _require_episode(episode)
     snapshot = _require_snapshot(evidence)
+    _require_instrument_correspondence(episode, snapshot)
 
+    # The fingerprint is lenient by design: it must never pre-empt the ordered
+    # checks (a proven hard veto must short-circuit and be returned).
     fingerprint = feasibility_evidence_fingerprint(
         _canonical_evidence_summary(snapshot)
     )
@@ -519,8 +590,14 @@ def evaluate_feasibility(
     decision_id = feasibility_decision_identity(
         decision_schema_version=policy.decision_schema_version,
         episode_id=episode.episode_id,
+        source_claim_id=episode.source_claim_id,
+        instrument_version_id=episode.instrument_version_id,
+        venue_instrument_id=episode.venue_instrument_id,
+        detector_snapshot_id=episode.snapshot_id,
         evidence_fingerprint=fingerprint,
         evaluation_time=evaluation_time,
+        disposition=disposition,
+        checks=tuple(evaluated),
         feasibility_version=policy.feasibility_version,
         policy_version=policy.policy_version,
     )

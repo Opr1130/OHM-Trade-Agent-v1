@@ -451,12 +451,37 @@ def test_ac_004_decision_identity_is_deterministic() -> None:
     expected = feasibility_decision_identity(
         decision_schema_version=FEASIBILITY_DECISION_SCHEMA_VERSION,
         episode_id=episode.episode_id,
+        source_claim_id=episode.source_claim_id,
+        instrument_version_id=episode.instrument_version_id,
+        venue_instrument_id=episode.venue_instrument_id,
+        detector_snapshot_id=episode.snapshot_id,
         evidence_fingerprint=first.evidence_fingerprint,
         evaluation_time=CUTOFF,
+        disposition=first.disposition,
+        checks=first.checks,
         feasibility_version=FEASIBILITY_VERSION,
         policy_version=FEASIBILITY_POLICY_VERSION,
     )
     assert first.decision_id == expected
+
+    # The identity binds the outcome and the copied lineage, so tampering with a
+    # durable record (disposition, checks, or lineage) fails closed.
+    tampered_disposition = first.to_dict()
+    tampered_disposition["disposition"] = "VETO"
+    with pytest.raises(FeasibilityContractError):
+        FeasibilityDecision.from_dict(tampered_disposition)
+    dropped_check = first.to_dict()
+    dropped_check["checks"] = list(dropped_check["checks"][:-1])
+    with pytest.raises(FeasibilityContractError):
+        FeasibilityDecision.from_dict(dropped_check)
+    emptied = first.to_dict()
+    emptied["checks"] = []
+    with pytest.raises(FeasibilityContractError):
+        FeasibilityDecision.from_dict(emptied)
+    forged_lineage = first.to_dict()
+    forged_lineage["source_claim_id"] = "DCLM:forged"
+    with pytest.raises(FeasibilityContractError):
+        FeasibilityDecision.from_dict(forged_lineage)
 
     # The identity is identical at any wall-clock value (no clock participates).
     real_time = time.time
@@ -806,6 +831,38 @@ def test_ac_018_malformed_required_evidence_fails_structurally() -> None:
     with pytest.raises(FeasibilityContractError):
         seam.evaluate_feasibility(episode, bad_bool, CUTOFF, POLICY)
 
+    # A SHORT whose status and eligibility flag contradict is refused, so an
+    # ELIGIBLE status can never override the live margin safeguard.
+    contradictory_margin = snapshot(
+        direction="SHORT",
+        market=market_validation(),
+        execution=execution_validation(),
+        margin_status="ELIGIBLE",
+        margin_eligible=False,
+    )
+    with pytest.raises(FeasibilityContractError):
+        seam.evaluate_feasibility(episode, contradictory_margin, CUTOFF, POLICY)
+
+    # Evidence for a different venue instrument is refused rather than stamped
+    # with the episode's lineage.
+    foreign = snapshot(market=market_validation(), execution=execution_validation())
+    foreign.symbol = "BTCUSD"
+    foreign.kraken_public_symbol = "XBTUSD"
+    with pytest.raises(FeasibilityContractError):
+        seam.evaluate_feasibility(episode, foreign, CUTOFF, POLICY)
+
+    # A proven hard veto short-circuits: malformed later evidence does not
+    # pre-empt the veto (the fingerprint is lenient by design).
+    vetoed_with_malformed_later = snapshot(
+        market=market_validation(status=MARKET_REJECT, qualified=False),
+        execution=replace(execution_validation(), spread_bps=float("nan")),
+    )
+    short_circuit = seam.evaluate_feasibility(
+        episode, vetoed_with_malformed_later, CUTOFF, POLICY
+    )
+    assert short_circuit.disposition is FeasibilityDisposition.VETO
+    assert len(short_circuit.checks) == 1
+
     # Wrong evidence type, unsupported version and naive time all fail closed.
     with pytest.raises(FeasibilityContractError):
         seam.evaluate_feasibility(episode, {"market": "PASS"}, CUTOFF, POLICY)
@@ -827,8 +884,9 @@ def test_ac_018_malformed_required_evidence_fails_structurally() -> None:
 def test_ac_019_no_new_threshold_ownership() -> None:
     """ATDD-R3-F5-feasibility-safety/AC-019: the F5 modules add no independent numeric trading threshold and only re-map existing evaluator outcomes."""
     numeric = numeric_constants(FEASIBILITY_SOURCE) + numeric_constants(VOCABULARY_SOURCE)
-    # The seam introduces no numeric policy literal; 0 is the only permitted one.
-    assert all(value in {0, 0.0} for value in numeric), numeric
+    # Only ordinal/index literals (0 and 1) appear: the seam introduces no
+    # numeric trading policy literal and duplicates no threshold.
+    assert set(numeric) <= {0, 1}, numeric
 
     # No service/threshold module is imported; only the recorded evaluators.
     modules = imported_modules(FEASIBILITY_SOURCE)

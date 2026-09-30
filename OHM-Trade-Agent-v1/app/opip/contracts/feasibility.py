@@ -241,29 +241,79 @@ def feasibility_evidence_fingerprint(payload: Mapping[str, Any]) -> str:
     return stable_hash(FEASIBILITY_EVIDENCE_FINGERPRINT_PREFIX, normalized)
 
 
+def canonical_check_sequence(checks: Any) -> tuple[tuple[str, str], ...]:
+    """Return the canonical ``(name, status)`` sequence for an identity payload.
+
+    A non-sequence, a non-``FeasibilityCheck`` member, an unknown token or a
+    non-unique name is refused rather than coerced. The canonical sequence is
+    bound into the decision identity so a tampered disposition, a dropped veto or
+    a reordered/replaced check list changes the identity and fails closed.
+    """
+    if isinstance(checks, (str, bytes)) or not isinstance(checks, (list, tuple)):
+        raise FeasibilityContractError("checks must be a list or tuple of checks")
+    canonical: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for check in checks:
+        if not isinstance(check, FeasibilityCheck):
+            raise FeasibilityContractError("checks must be FeasibilityCheck values")
+        name = check.name.value
+        if name in seen:
+            raise FeasibilityContractError("checks must not repeat a component")
+        seen.add(name)
+        canonical.append((name, check.status.value))
+    return tuple(canonical)
+
+
 def feasibility_decision_identity(
     *,
     decision_schema_version: str = FEASIBILITY_DECISION_SCHEMA_VERSION,
     episode_id: str,
+    source_claim_id: str,
+    instrument_version_id: str,
+    venue_instrument_id: str,
+    detector_snapshot_id: str,
     evidence_fingerprint: str,
     evaluation_time: datetime,
+    disposition: FeasibilityDisposition | str,
+    checks: Any,
     feasibility_version: str = FEASIBILITY_VERSION,
     policy_version: str = FEASIBILITY_POLICY_VERSION,
 ) -> str:
     """The deterministic ``FEAS:<digest>`` identity of one feasibility decision.
 
-    Identity binds the decision schema version, the episode id, the source
-    evidence fingerprint, the explicit evaluation time, the F5 version and the
-    F5 policy version. It contains no UUID, receipt timestamp, retry count,
-    process identity or database sequence, so re-deriving the same decision
-    yields the same id and a forged decision identity fails closed.
+    Identity binds the decision schema version, the preserved F4 lineage
+    (episode id, source claim id, instrument version id, venue instrument id,
+    detector snapshot id), the source evidence fingerprint, the explicit
+    evaluation time, the F5 version, the F5 policy version, the overall
+    disposition and the canonical ordered ``(name, status)`` check sequence.
+
+    Binding the lineage and the disposition/checks makes a durable record
+    tamper-evident: changing any copied lineage field, the disposition, or the
+    recorded checks changes the identity, so a forged decision fails closed. The
+    identity contains no UUID, receipt timestamp, retry count, process identity
+    or database sequence, so re-deriving the same decision yields the same id.
     """
     instant = require_feasibility_utc(evaluation_time, field_name="evaluation_time")
+    disposition_token = require_feasibility_enum(
+        FeasibilityDisposition, disposition, field_name="disposition"
+    )
     payload = {
         "decision_schema_version": require_feasibility_text(
             decision_schema_version, field_name="decision_schema_version"
         ),
         "episode_id": require_feasibility_text(episode_id, field_name="episode_id"),
+        "source_claim_id": require_feasibility_text(
+            source_claim_id, field_name="source_claim_id"
+        ),
+        "instrument_version_id": require_feasibility_text(
+            instrument_version_id, field_name="instrument_version_id"
+        ),
+        "venue_instrument_id": require_feasibility_text(
+            venue_instrument_id, field_name="venue_instrument_id"
+        ),
+        "detector_snapshot_id": require_feasibility_text(
+            detector_snapshot_id, field_name="detector_snapshot_id"
+        ),
         "evidence_fingerprint": require_feasibility_text(
             evidence_fingerprint, field_name="evidence_fingerprint"
         ),
@@ -274,6 +324,8 @@ def feasibility_decision_identity(
         "policy_version": require_feasibility_text(
             policy_version, field_name="policy_version"
         ),
+        "disposition": disposition_token.value,
+        "checks": [list(item) for item in canonical_check_sequence(checks)],
     }
     return stable_hash(FEASIBILITY_DECISION_ID_PREFIX, payload)
 
@@ -452,13 +504,19 @@ class FeasibilityDecision:
                     "checks must be FeasibilityCheck values"
                 )
         object.__setattr__(self, "checks", checks)
-        self._validate_aggregation()
+        self._validate_check_sequence_and_aggregation()
 
         expected = feasibility_decision_identity(
             decision_schema_version=self.decision_schema_version,
             episode_id=self.episode_id,
+            source_claim_id=self.source_claim_id,
+            instrument_version_id=self.instrument_version_id,
+            venue_instrument_id=self.venue_instrument_id,
+            detector_snapshot_id=self.detector_snapshot_id,
             evidence_fingerprint=self.evidence_fingerprint,
             evaluation_time=self.evaluation_time,
+            disposition=self.disposition,
+            checks=self.checks,
             feasibility_version=self.feasibility_version,
             policy_version=self.policy_version,
         )
@@ -468,12 +526,41 @@ class FeasibilityDecision:
                 "feasibility seam"
             )
 
-    def _validate_aggregation(self) -> None:
-        """The recorded disposition must follow the deterministic aggregation rule."""
-        statuses = {check.status for check in self.checks}
-        if FeasibilityCheckStatus.VETO in statuses:
+    def _validate_check_sequence_and_aggregation(self) -> None:
+        """Enforce the canonical ordered check sequence, then the aggregation rule.
+
+        A decision must record a non-empty ordered *prefix* of the required checks
+        with no duplicate component. A ``VETO`` short-circuits, so it may only be
+        the last recorded check; a decision with no ``VETO`` must record every
+        required check. Combined with the identity binding, this refuses a
+        tampered durable record - an emptied, dropped, reordered or replaced check
+        list - instead of letting it claim ``FEASIBLE``.
+        """
+        checks = self.checks
+        names = [check.name for check in checks]
+        if not names or names != list(FEASIBILITY_CHECK_ORDER[: len(names)]):
+            raise FeasibilityContractError(
+                "checks must be a non-empty ordered prefix of the required checks"
+            )
+        veto_positions = [
+            index
+            for index, check in enumerate(checks)
+            if check.status is FeasibilityCheckStatus.VETO
+        ]
+        if veto_positions and veto_positions != [len(checks) - 1]:
+            raise FeasibilityContractError(
+                "a VETO short-circuits, so it must be the last recorded check"
+            )
+        if not veto_positions and len(checks) != len(FEASIBILITY_CHECK_ORDER):
+            raise FeasibilityContractError(
+                "a non-veto decision must carry every required check"
+            )
+        if veto_positions:
             expected = FeasibilityDisposition.VETO
-        elif FeasibilityCheckStatus.INSUFFICIENT_EVIDENCE in statuses:
+        elif any(
+            check.status is FeasibilityCheckStatus.INSUFFICIENT_EVIDENCE
+            for check in checks
+        ):
             expected = FeasibilityDisposition.INSUFFICIENT_EVIDENCE
         else:
             expected = FeasibilityDisposition.FEASIBLE
@@ -550,6 +637,7 @@ __all__ = [
     "FeasibilityDecision",
     "FeasibilityDisposition",
     "FeasibilityPolicy",
+    "canonical_check_sequence",
     "feasibility_decision_identity",
     "feasibility_evidence_fingerprint",
     "require_feasibility_enum",

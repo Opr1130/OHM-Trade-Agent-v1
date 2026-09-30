@@ -24,7 +24,15 @@ AGGREGATION ORDER. Deterministic sequential evaluation in the recorded live hard
 
 AGGREGATION RULE. Sequential; any evaluated check with an explicit hard `VETO` yields overall `VETO` and short-circuits the remaining checks (live-order short-circuit), so a proven hard veto is never downgraded to abstention because a later unneeded check is absent. Otherwise, if any evaluated required check is `INSUFFICIENT_EVIDENCE`, overall is `INSUFFICIENT_EVIDENCE`. Otherwise, when every applicable required check is positively proven `PASS`, overall is `FEASIBLE`. `NOT_APPLICABLE` never blocks.
 
-MISSING-VS-MALFORMED RULE. ABSENT / UNAVAILABLE required evidence yields `INSUFFICIENT_EVIDENCE`. PRESENT-BUT-INVALID-STRUCTURE raises `FeasibilityContractError` (invalid enum/status token, bool where numeric is required, non-finite numeric, wrong object type, contradictory identity, unsupported version, naive timestamp). Operational failure is not a policy veto: explicit INELIGIBLE/INVALID evidence yields `VETO`; discovery/evidence UNAVAILABLE/MISSING yields `INSUFFICIENT_EVIDENCE`. Never turn a malformed structure into zero, default, or pass.
+MISSING-VS-MALFORMED RULE. ABSENT / UNAVAILABLE required evidence yields `INSUFFICIENT_EVIDENCE`. PRESENT-BUT-INVALID-STRUCTURE raises `FeasibilityContractError` (invalid enum/status token, bool where numeric is required, non-finite numeric, wrong object type, contradictory identity, unsupported version, naive timestamp). Operational failure is not a policy veto: explicit INELIGIBLE/INVALID evidence yields `VETO`; discovery/evidence UNAVAILABLE/MISSING yields `INSUFFICIENT_EVIDENCE`. Never turn a malformed structure into zero, default, or pass. A malformed field is detected when, and only when, its component is evaluated: a proven earlier hard veto short-circuits and is returned as `VETO`, so unevaluated later evidence cannot pre-empt or mask the veto, and the evidence fingerprint is deliberately lenient so it never raises before the ordered checks run.
+
+DECISION IDENTITY AND TAMPER RESISTANCE. The deterministic `FEAS:<digest>` decision identity binds the decision schema version, the preserved F4 lineage (episode id, source claim id, instrument version id, venue instrument id, detector snapshot id), the source evidence fingerprint, the explicit evaluation time, the F5 version, the F5 policy version, the overall disposition and the canonical ordered `(name, status)` check sequence, using the existing canonical serialization and `stable_hash` helpers. No UUID, receipt timestamp, retry count, process identity or database sequence participates. Because the identity binds the outcome and lineage, a durable record whose disposition, recorded checks or copied lineage fields are altered fails closed on reconstruction. The recorded checks must be a non-empty ordered prefix of the required checks with no duplicate component; only the last recorded check may be a `VETO` (the short-circuit), and a decision with no `VETO` must carry every required check.
+
+EVIDENCE FINGERPRINT. The `FEASEV:<digest>` evidence fingerprint is a pure function of the normalized F5-required inputs only (direction, the market-validation status/qualification and its key validation measurements, the margin status/flag/venue/leverage, and the execution status/coverage/spread/drag/coverage-completeness fields), so it changes when the evaluated evidence changes and never depends on an object repr.
+
+INSTRUMENT CORRESPONDENCE. Before evaluation, the evidence snapshot must correspond to the episode's venue instrument by normalized instrument-token comparison (uppercase alphanumerics; e.g. `SOL/USD` equals `SOLUSD`). This is an identity-consistency guard, not a trading threshold: foreign-market evidence fails closed rather than being stamped with the episode's lineage. No F5-level instrument-normalization policy beyond this equality is invented.
+
+MARGIN CONSISTENCY. For a SHORT candidate the explicit `margin_validation_status` and the live `margin_eligible` flag must agree (`ELIGIBLE` requires `margin_eligible` true; `INELIGIBLE`/`UNAVAILABLE` require false). Contradictory margin evidence fails closed, so an `ELIGIBLE` status cannot override the live margin safeguard that keeps a SHORT only when `margin_eligible` is true.
 
 SOURCE EVALUATORS (reused; not duplicated). `MARKET_DATA` reads the existing `MarketDataValidation` produced by `app/scanner/market_data_validation.validate_market_data` (status vocabulary `PASS`/`WARN`/`REJECT`, `qualified` flag; live absent-evidence sentinel `UNAVAILABLE`). `MARGIN_ELIGIBILITY` reuses the thin adapter `app/opip/decision/gates.evaluate_margin_gate` (over `app/scanner/margin_eligibility.validate_short_margin_eligibility`, status vocabulary `ELIGIBLE`/`INELIGIBLE`/`UNAVAILABLE`). `EXECUTION_LIQUIDITY` reuses the thin adapter `app/opip/decision/gates.evaluate_execution_gate` (over `app/scanner/execution_validation.evaluate_execution`, status vocabulary `VALID`/`UNAVAILABLE`/`INVALID`, plus the OFFLINE SHORT route `app/scanner/short_execution_quality.short_execution_is_tradeable(..., refresh_margin_book=False)`). No exchange/network refresh occurs in F5. Every adapter call passes the explicit `evaluated_at=evaluation_time` and never relies on a `GateResult` default clock. Only a thin market-data mapping adapter is added, inside the F5 seam itself.
 
@@ -89,7 +97,7 @@ one ACTIVE episode, one evidence snapshot and one explicit evaluation time
 WHEN:
 the F5 decision is produced more than once
 THEN:
-the FEAS: decision identity is a deterministic function of the decision schema version, the episode id, the source evidence fingerprint, the explicit evaluation time, the F5 version and the F5 policy version, it uses no UUID, receipt timestamp, retry, pid or database sequence, and a forged decision identity fails closed
+the FEAS: decision identity is a deterministic function of the decision schema version, the preserved F4 lineage, the source evidence fingerprint, the explicit evaluation time, the F5 version, the F5 policy version, the overall disposition and the canonical ordered check sequence, it uses no UUID, receipt timestamp, retry, pid or database sequence, and a forged decision identity or a durable record whose disposition, recorded checks or copied lineage fields have been altered fails closed
 
 AC-005:
 GIVEN:
@@ -201,7 +209,7 @@ present-but-malformed required evidence structure
 WHEN:
 the F5 seam evaluates it
 THEN:
-it raises FeasibilityContractError for an invalid enum or status token, a bool where a numeric is required, a non-finite numeric, a wrong object type, a contradictory identity, an unsupported version or a naive timestamp, and it never converts malformed evidence into zero, default or pass
+it raises FeasibilityContractError for an invalid enum or status token, a bool where a numeric is required, a non-finite numeric, a wrong object type, a contradictory identity (including contradictory SHORT margin evidence and a snapshot that does not correspond to the episode venue instrument), an unsupported version or a naive timestamp, and it never converts malformed evidence into zero, default or pass; a malformed field is detected only when its component is evaluated, so a proven earlier hard veto short-circuits and returns VETO rather than being pre-empted by malformed later evidence
 
 AC-019:
 GIVEN:
@@ -403,6 +411,7 @@ DEFERRED DISCOVERIES:
 - The F4 numeric validity-horizon source (F6) remains unresolved and is not invented here.
 - Whether a future F5 policy needs an ABSTAIN-adjacent reason taxonomy beyond the three recorded dispositions is not authorized here.
 - Consumer migration order and per-clock stop times for the F4 clocks remain a future cutover increment.
+- Richer venue-instrument normalization beyond uppercase-alphanumeric token equality, and whether a canonical instrument-identity mapping is needed, are not invented by this increment.
 
 UNAPPROVED SCOPE CHANGES:
 NONE
