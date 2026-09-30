@@ -49,6 +49,15 @@ IDENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 TASK_KEYS = {"schema", "repo", "increment", "branch", "head", "contract_sha256",
              "authority_sha256", "files", "instructions"}
 DENY = ["Shell(*)", "Read(*)", "Write(*)", "WebFetch(*)"]
+
+# --trust is permitted ONLY for the bridge-created disposable scratch workspace,
+# to suppress Cursor's workspace-trust prompt for the current directory. It never
+# grants repository, worktree, profile or caller-supplied-directory trust, and it
+# does not weaken sandboxing, deny rules, credential isolation or path limits.
+CURSOR_TRUST_FLAG = "--trust"
+SCRATCH_PREFIX = "opip-cursor-"
+EXPECTED_SCRATCH_ENTRIES = frozenset({"config", ".cursor"})
+EXPECTED_SCRATCH_FILES = frozenset({("config", "cli-config.json"), (".cursor", "cli.json")})
 CURSOR_RUNTIME_VERSION = re.compile(r"^\d{4}\.\d{1,2}\.\d{1,2}(?:-\d{2}-\d{2}-\d{2})?-[0-9a-f]+$")
 MAX_CURSOR_RUNTIME_FILES = 200_000
 MAX_CURSOR_RUNTIME_BYTES = 8 * 1024 * 1024 * 1024
@@ -557,6 +566,78 @@ def cursor_environment(scratch, invoked_as=None):
     return env
 
 
+def scratch_trust_argv(scratch, launch, config, base_argv):
+    """Append --trust ONLY for the bridge-created disposable scratch workspace.
+
+    --trust suppresses Cursor's workspace-trust prompt for the current directory.
+    It is justified only because this invocation created an empty scratch
+    directory under the configured state directory and runs the model there with
+    no repository context, no tools (DENY) and sandboxing enabled.
+
+    The caller cannot aim --trust at an arbitrary directory: every condition is
+    re-derived from the live filesystem here, and the same path is later passed
+    as Popen cwd. There is no config switch for this.
+    """
+    require(config["enable_execution"] is True, "EXECUTION_DISABLED")
+    # Fail closed unless both anchors are present: --trust is granted only when the
+    # scratch relationship can actually be proven from configuration.
+    require("worktree" in config and "state_dir" in config, "SCRATCH_TRUST_DENIED")
+    worktree = Path(config["worktree"]).resolve()
+    state_dir = Path(config["state_dir"]).resolve()
+
+    # An ordinary directory, never a link/junction/reparse point.
+    require(scratch.is_dir() and not scratch.is_symlink(), "SCRATCH_TRUST_DENIED")
+    info = scratch.lstat()
+    require(stat.S_ISDIR(info.st_mode) and
+            not getattr(info, "st_file_attributes", 0) & 0x400, "SCRATCH_TRUST_DENIED")
+
+    resolved = scratch.resolve()
+
+    # Bridge-created direct child of the configured state directory only. The
+    # state directory itself, the worktree, a nested path, a sibling, an
+    # unrelated directory or a borrowed directory are all refused.
+    require(resolved.parent == state_dir, "SCRATCH_TRUST_DENIED")
+    require(resolved != state_dir, "SCRATCH_TRUST_DENIED")
+    require(resolved.is_relative_to(state_dir), "SCRATCH_TRUST_DENIED")
+    require(resolved != worktree, "SCRATCH_TRUST_DENIED")
+    require(not resolved.is_relative_to(worktree) and
+            not worktree.is_relative_to(resolved), "SCRATCH_TRUST_DENIED")
+    require(scratch.name.startswith(SCRATCH_PREFIX), "SCRATCH_TRUST_DENIED")
+
+    # The scratch still holds only the private Cursor config this invocation just
+    # wrote, and nothing else: no prompt, no source, no borrowed directory.
+    require({item.name for item in scratch.iterdir()} == EXPECTED_SCRATCH_ENTRIES,
+            "SCRATCH_TRUST_DENIED")
+    require({(item.parent.name, item.name) for item in scratch.rglob("*") if item.is_file()}
+            == EXPECTED_SCRATCH_FILES, "SCRATCH_TRUST_DENIED")
+    for item in scratch.rglob("*"):
+        item_info = item.lstat()
+        require(not stat.S_ISLNK(item_info.st_mode) and
+                not getattr(item_info, "st_file_attributes", 0) & 0x400,
+                "SCRATCH_TRUST_DENIED")
+
+    # The packaged runtime pin must already have validated. In packaged mode that
+    # means exactly node.exe + sibling index.js; basic mode uses a single pinned
+    # executable. Either way there is no wrapper, link or reparse point.
+    require(bool(launch), "SCRATCH_TRUST_DENIED")
+    for part in launch:
+        entry = Path(part)
+        require(entry.is_absolute() and entry.is_file() and not entry.is_symlink(),
+                "SCRATCH_TRUST_DENIED")
+        require(not Path(part).name.casefold().endswith((".cmd", ".bat", ".ps1")),
+                "SCRATCH_TRUST_DENIED")
+    if "cursor_runtime_root" in config:
+        require(len(launch) == 2, "SCRATCH_TRUST_DENIED")
+        require(Path(launch[0]).name.casefold() == "node.exe" and
+                Path(launch[1]).name.casefold() == "index.js", "SCRATCH_TRUST_DENIED")
+
+    argv = list(base_argv)
+    for flag in ("--force", "--yolo", "--approve-mcps", CURSOR_TRUST_FLAG):
+        require(flag not in argv, "SCRATCH_TRUST_DENIED")
+    argv.append(CURSOR_TRUST_FLAG)
+    return argv
+
+
 def cursor(config, task, context, contract, review=False):
     require(config["enable_execution"] is True, "EXECUTION_DISABLED")
     launch, invoked_as = cursor_launch(config)
@@ -580,7 +661,7 @@ def cursor(config, task, context, contract, review=False):
         "task": task, "atdd_contract": contract, "files": context,
     }, ensure_ascii=True)
     require(len(prompt.encode()) <= 2 * MAX_BYTES, "PROMPT_LIMIT")
-    with tempfile.TemporaryDirectory(prefix="opip-cursor-", dir=config["state_dir"]) as name:
+    with tempfile.TemporaryDirectory(prefix=SCRATCH_PREFIX, dir=config["state_dir"]) as name:
         scratch = Path(name)
         (scratch / "config").mkdir()
         (scratch / "config/cli-config.json").write_text(json.dumps({
@@ -592,13 +673,17 @@ def cursor(config, task, context, contract, review=False):
             "permissions": {"allow": [], "deny": DENY},
         }), encoding="utf-8")
         env = cursor_environment(scratch, invoked_as)
+        # Validate the disposal scratch and add --trust before any temp file is
+        # created here, so the scratch still holds only the private config material.
+        argv = scratch_trust_argv(
+            scratch, launch, config,
+            launch + ["--print", "--mode", "ask",
+                      "--sandbox", "enabled", "--output-format", "json"])
         # Prompt on stdin avoids Windows argv limits, process-list exposure and shell quoting.
         with tempfile.TemporaryFile(dir=scratch) as stdin, tempfile.TemporaryFile(dir=scratch) as stdout:
             stdin.write(prompt.encode("utf-8"))
             stdin.seek(0)
             try:
-                argv = launch + ["--print", "--mode", "ask",
-                                 "--sandbox", "enabled", "--output-format", "json"]
                 with subprocess.Popen(argv, cwd=scratch, env=env, stdin=stdin, stdout=stdout,
                                       stderr=subprocess.DEVNULL, shell=False) as process:
                     try:
