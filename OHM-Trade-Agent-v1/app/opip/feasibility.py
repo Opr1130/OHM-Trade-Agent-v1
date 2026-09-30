@@ -146,17 +146,24 @@ def _int_or_none(
     return value
 
 
-def _finite_or_none(
-    value: Any, *, field_name: str, allow_none: bool = False
+def _measurement_or_none(
+    value: Any, *, field_name: str, require_finite: bool
 ) -> float | None:
+    """Validate one optional raw measurement.
+
+    A ``None`` is allowed, a bool/non-numeric is always malformed, and a
+    non-finite value is malformed only when ``require_finite`` is set. The live
+    market validator stores a raw non-finite ``ticker_last`` on a record it has
+    already rejected, so a non-finite measurement on an explicit invalidity is
+    tolerated (the record still maps to ``VETO``) while the same measurement on a
+    usable ``PASS``/``WARN`` record fails closed.
+    """
     if value is None:
-        if allow_none:
-            return None
-        raise FeasibilityContractError(f"{field_name} must be numeric")
+        return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise FeasibilityContractError(f"{field_name} must be numeric")
+        raise FeasibilityContractError(f"{field_name} must be numeric or None")
     number = float(value)
-    if not math.isfinite(number):
+    if require_finite and not math.isfinite(number):
         raise FeasibilityContractError(f"{field_name} must be finite")
     return number
 
@@ -175,17 +182,18 @@ def _text_list_field(value: Any, *, field_name: str) -> tuple[str, ...]:
     return tuple(value)
 
 
-def _validate_market_fields(validation: Any) -> None:
-    """Validate the concrete market-data evidence structure; malformed fails closed."""
+def _validate_market_fields(validation: Any, *, require_finite: bool) -> None:
+    """Validate the concrete market-data evidence structure; malformed fails closed.
+
+    Structural fields (counts, the timestamp, the boolean flag and the text
+    lists) are always validated. The raw numeric measurements are only required
+    to be finite when ``require_finite`` is set, because the live validator stores
+    a raw non-finite ``ticker_last`` on a record it has already rejected.
+    """
     _int_or_none(getattr(validation, "candle_count", None), field_name="candle_count")
     _int_or_none(
         getattr(validation, "latest_candle_timestamp", None),
         field_name="latest_candle_timestamp",
-        allow_none=True,
-    )
-    _finite_or_none(
-        getattr(validation, "latest_candle_age_seconds", None),
-        field_name="latest_candle_age_seconds",
         allow_none=True,
     )
     _int_or_none(
@@ -201,25 +209,18 @@ def _validate_market_fields(validation: Any) -> None:
         getattr(validation, "non_finite_value_count", None),
         field_name="non_finite_value_count",
     )
-    _finite_or_none(
-        getattr(validation, "largest_gap_seconds", None),
-        field_name="largest_gap_seconds",
-    )
-    _finite_or_none(
-        getattr(validation, "ticker_last", None),
-        field_name="ticker_last",
-        allow_none=True,
-    )
-    _finite_or_none(
-        getattr(validation, "latest_ohlc_close", None),
-        field_name="latest_ohlc_close",
-        allow_none=True,
-    )
-    _finite_or_none(
-        getattr(validation, "ticker_vs_ohlc_difference_pct", None),
-        field_name="ticker_vs_ohlc_difference_pct",
-        allow_none=True,
-    )
+    for name in (
+        "latest_candle_age_seconds",
+        "largest_gap_seconds",
+        "ticker_last",
+        "latest_ohlc_close",
+        "ticker_vs_ohlc_difference_pct",
+    ):
+        _measurement_or_none(
+            getattr(validation, name, None),
+            field_name=name,
+            require_finite=require_finite,
+        )
     _bool_field(
         getattr(validation, "suspicious_spike_detected", None),
         field_name="suspicious_spike_detected",
@@ -436,8 +437,6 @@ def _market_check(snapshot: MarketSnapshot) -> FeasibilityCheck:
         raise FeasibilityContractError(
             "market-data evidence must be a MarketDataValidation"
         )
-    _validate_market_fields(validation)
-
     status = getattr(validation, "status", None)
     qualified = getattr(validation, "qualified", None)
     if isinstance(status, bool) or not isinstance(status, str):
@@ -446,6 +445,7 @@ def _market_check(snapshot: MarketSnapshot) -> FeasibilityCheck:
         raise FeasibilityContractError("market-data qualified must be a bool")
 
     if status == MARKET_DATA_UNAVAILABLE_SENTINEL:
+        _validate_market_fields(validation, require_finite=False)
         return _check(
             FeasibilityCheckName.MARKET_DATA,
             FeasibilityCheckStatus.INSUFFICIENT_EVIDENCE,
@@ -466,6 +466,10 @@ def _market_check(snapshot: MarketSnapshot) -> FeasibilityCheck:
             raise FeasibilityContractError(
                 "contradictory market-data evidence: REJECT with qualified=True"
             )
+        # An explicit invalidity is a VETO. The live validator can store a raw
+        # non-finite ticker_last on a record it already rejected, so finite-ness
+        # is not required here; structural fields are still validated.
+        _validate_market_fields(validation, require_finite=False)
         return _check(
             FeasibilityCheckName.MARKET_DATA,
             FeasibilityCheckStatus.VETO,
@@ -476,6 +480,8 @@ def _market_check(snapshot: MarketSnapshot) -> FeasibilityCheck:
         raise FeasibilityContractError(
             f"contradictory market-data evidence: {status} with qualified=False"
         )
+    # A usable record must carry structurally valid, finite measurements.
+    _validate_market_fields(validation, require_finite=True)
     return _check(
         FeasibilityCheckName.MARKET_DATA,
         FeasibilityCheckStatus.PASS,

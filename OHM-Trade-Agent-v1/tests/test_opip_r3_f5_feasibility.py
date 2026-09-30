@@ -600,6 +600,20 @@ def test_ac_007_market_explicit_invalid_is_veto() -> None:
     # A proven veto short-circuits the remaining checks.
     assert len(decision.checks) == 1
 
+    # A real live REJECT can carry a raw non-finite ticker_last (the validator
+    # records the rejection but stores the raw value); it must still be a VETO,
+    # not a structural error.
+    nonfinite_ticker = snapshot(
+        market=replace(
+            market_validation(status=MARKET_REJECT, qualified=False),
+            ticker_last=float("nan"),
+        ),
+        execution=execution_validation(),
+    )
+    veto = seam.evaluate_feasibility(episode, nonfinite_ticker, CUTOFF, POLICY)
+    assert status_of(veto, FeasibilityCheckName.MARKET_DATA) == "VETO"
+    assert veto.disposition is FeasibilityDisposition.VETO
+
 
 @pytest.mark.acceptance
 def test_ac_008_market_missing_or_unavailable_is_insufficient() -> None:
