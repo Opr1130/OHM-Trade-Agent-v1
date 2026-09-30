@@ -27,12 +27,12 @@ Install or use existing Python 3.12+, Git for Windows, GitHub CLI (`gh`) and a n
 The OWNER must decide:
 
 1. Which dedicated non-administrator Windows account and credential-free workspace will run the bridge.
-2. Which audited Cursor CLI build to use, its absolute `.exe` path and SHA256. `.cmd`, `.bat`, `.ps1`, WSL and arbitrary launcher commands are rejected in v1. If installation provides only a wrapper, keep execution disabled; do not rename the wrapper or remove this check.
+2. Which audited Cursor CLI build to use. The official Windows package observed during OWNER activation on 29 September 2026 installs `agent.cmd` / `cursor-agent.ps1` wrappers that select a versioned runtime and execute `node.exe index.js`. The bridge still rejects every `.cmd`, `.bat`, `.ps1`, WSL and arbitrary launcher command. For this packaged form, configure the absolute versioned `node.exe` path, its SHA256, the exact sibling runtime directory and the bridge-computed deterministic runtime-tree SHA256. The bridge invokes `node.exe index.js` directly with `shell=False`; it never executes the wrappers.
 3. Whether other numeric GitHub user/bot IDs may submit tasks. Default `dispatch_ids: []` permits only the repository OWNER to submit. Only the repository's actual numeric OWNER ID, fetched from GitHub, may approve/revoke; collaborator labels, display names and `author_association` are not authority.
 4. The bounded task, approved ATDD contract and non-secret context. OWNER approval of one comment does not authorize future comments, new HEADs, more paths or changed instructions.
 5. An execution timeout (1–900 seconds), Cursor account spending controls, and operator availability for interrupted-run recovery. Timeout limits duration, not billed dollars.
 
-No live Cursor smoke test was possible in the implementation environment because Cursor CLI was absent. Mocked tests prove the adapter arguments, environment, validation and failure handling, not actual vendor enforcement. Live activation remains disabled until section 7 is completed.
+No live Cursor sandbox smoke test was possible in the implementation environment. OWNER-machine activation established the current Windows packaging shape and that the vendor `agent.cmd --version` path works, but mocked tests still prove only adapter arguments, runtime pinning, environment, validation and failure handling—not actual vendor sandbox enforcement. Live execution remains disabled until section 7 is completed.
 
 Official vendor references checked 28 September 2026:
 
@@ -218,15 +218,31 @@ Status comment ownership is verified, not assumed. The bridge resolves its own a
 
 ## 7. OWNER Cursor activation check
 
-Before setting `enable_execution: true`, independently verify the selected native `.exe` and vendor version under the dedicated account:
+Before setting `enable_execution: true`, independently verify the selected Cursor version under the dedicated account. For the packaged Windows form, **do not execute the `.cmd` or `.ps1` wrapper from the bridge**. Pin and test the exact version directory selected by the vendor launcher.
 
-- `--print --mode ask --sandbox enabled --output-format json` accepts a stdin prompt and returns the documented success envelope.
+Example discovery for the currently installed package:
+
+```powershell
+$runtime = "$env:LOCALAPPDATA\cursor-agent\versions\2026.09.28-64d2043"
+& "$runtime\node.exe" "$runtime\index.js" --version
+(Get-FileHash -Algorithm SHA256 -LiteralPath "$runtime\node.exe").Hash.ToLowerInvariant()
+
+Push-Location $bridgeApp
+python -B -c "import sys; from pathlib import Path; from tools.local_agent_bridge import cursor_runtime_digest; print(cursor_runtime_digest(Path(sys.argv[1])))" $runtime
+Pop-Location
+```
+
+Put the absolute `node.exe` path and lowercase executable hash in `cursor_executable` / `cursor_sha256`, and the same version directory plus the bridge-computed tree hash in `cursor_runtime_root` / `cursor_runtime_sha256`. The tree hash covers every regular file recursively—including `index.js`, numbered JS chunks, native modules, `cursorsandbox.exe`, `crepectl.exe`, and `node_modules`—and excludes only the vendor's transient `.running` marker. Links/reparse points and any other runtime-byte drift fail closed. An auto-update creates or selects a different version directory/hash and therefore requires fresh OWNER verification before changing the pins.
+
+Then verify the exact pinned runtime with the same isolation the bridge will use:
+
+- `--print --mode ask --sandbox enabled --output-format json` accepts a stdin prompt and returns the documented success envelope when launched as `node.exe index.js ...`.
 - A private `CURSOR_CONFIG_DIR` and empty HOME/USERPROFILE load only the specified deny policy, with no personal/global MCP server, browser tool, plugin, startup hook or profile inherited.
 - Adversarial prompts to read a sentinel outside scratch, write a sentinel, execute a harmless shell marker, invoke an MCP or fetch a URL are all denied. Check actual filesystem/process/network evidence, not the model's claim that it complied. Do this in a disposable credential-free environment.
-- Sandbox mode really works on this Windows build; unsupported sandbox/options or missing helpers must fail. No fallback to `--force`, `--yolo`, `--approve-mcps`, `--trust`, an unrestricted SDK, or wrapper scripts is permitted.
+- Sandbox mode really works on this Windows build; unsupported sandbox/options or missing helpers must fail. No fallback to `--force`, `--yolo`, `--approve-mcps`, `--trust`, an unrestricted SDK, or wrapper execution is permitted.
 - Timeout/Ctrl+C clean up the process tree in this build. The implementation attempts descendant cleanup on Windows, but crash/power-loss cases still need operator inspection.
 
-Record the tested version, evidence and hash outside the task worktree. Obtain the hash using `Get-FileHash -Algorithm SHA256 -LiteralPath 'C:\verified\agent.exe'`; put the lowercase value and absolute executable path in local config. If a build auto-updates, the hash gate stops; repeat verification before updating the pin. If these checks cannot pass, leave execution disabled. Do not treat unit tests as substitute evidence.
+Record the tested version, hashes and evidence outside the task worktree. If any check cannot pass, leave execution disabled. Unit tests are not substitute evidence.
 
 Provide only the Cursor model-authentication key to the bridge process through the account's approved secret mechanism. Do not put a key in the JSON configuration, task comments, PowerShell history, source files or command-line arguments. V1 intentionally does not borrow browser login credentials from the user's profile.
 
