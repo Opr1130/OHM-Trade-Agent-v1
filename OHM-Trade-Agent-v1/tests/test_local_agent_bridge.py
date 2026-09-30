@@ -368,7 +368,48 @@ def test_cursor_boundary(tmp_path, monkeypatch, case):
     exe.write_bytes(b"synthetic executable; never run")
     config = {"enable_execution": case != "disabled", "cursor_executable": str(exe),
               "cursor_sha256": b.digest(exe.read_bytes()), "state_dir": str(tmp_path),
+              "worktree": str(tmp_path / "tree"),
               "cursor_timeout_seconds": 1}
+    # AC-004/AC-016 scratch-trust proof: --trust is reachable ONLY for the
+    # bridge-created disposable scratch, never the worktree, the state directory
+    # itself, an arbitrary or nested directory, or a borrowed name.
+    if case == "success":
+        (tmp_path / "tree").mkdir(exist_ok=True)
+        base = [str(exe), "--print", "--mode", "ask", "--sandbox", "enabled",
+                "--output-format", "json"]
+
+        def make_scratch(root, name="opip-cursor-proof"):
+            scratch = Path(root) / name
+            (scratch / "config").mkdir(parents=True, exist_ok=True)
+            (scratch / "config" / "cli-config.json").write_text("{}", encoding="utf-8")
+            (scratch / ".cursor").mkdir(exist_ok=True)
+            (scratch / ".cursor" / "cli.json").write_text("{}", encoding="utf-8")
+            return scratch
+
+        good = make_scratch(tmp_path)
+        trusted = b.scratch_trust_argv(good, [str(exe)], config, base)
+        assert trusted == base + ["--trust"] and trusted.count("--trust") == 1
+        assert trusted[trusted.index("--sandbox") + 1] == "enabled"
+        assert b.DENY == ["Shell(*)", "Read(*)", "Write(*)", "WebFetch(*)"]
+        for blocked in ("--force", "--yolo", "--approve-mcps"):
+            assert blocked not in trusted
+
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        for bad in (
+            make_scratch(tmp_path / "tree"),          # the configured worktree
+            tmp_path,                                  # the state directory itself
+            make_scratch(elsewhere),                   # outside state_dir
+            tmp_path / "not-bridge-made",              # borrowed name
+            make_scratch(good, "inner"),               # nested under the scratch
+        ):
+            with pytest.raises(b.Stop, match="SCRATCH_TRUST_DENIED"):
+                b.scratch_trust_argv(bad, [str(exe)], config, base)
+        with pytest.raises(b.Stop, match="SCRATCH_TRUST_DENIED"):
+            b.scratch_trust_argv(good, [str(exe)], config, trusted)  # double grant
+        with pytest.raises(b.Stop, match="SCRATCH_TRUST_DENIED"):
+            # A scratch that IS the worktree relationship is refused.
+            b.scratch_trust_argv(good, [str(exe)], dict(config, worktree=str(tmp_path)), base)
     if case == "missing_exe":
         exe.unlink()
     elif case == "batch_wrapper":
@@ -384,8 +425,12 @@ def test_cursor_boundary(tmp_path, monkeypatch, case):
         killed = False
         def __init__(self, argv, **kw):
             calls.append(argv)
-            assert "--force" not in argv and "--yolo" not in argv
-            assert argv[1:] == ["--print", "--mode", "ask", "--sandbox", "enabled", "--output-format", "json"]
+            assert argv[1:] == ["--print", "--mode", "ask", "--sandbox", "enabled",
+                                "--output-format", "json", "--trust"]
+            for blocked in ("--force", "--yolo", "--approve-mcps"):
+                assert blocked not in argv, blocked
+            assert argv.count("--trust") == 1
+            # cwd is exactly the verified disposable scratch for this invocation.
             assert kw["shell"] is False and kw["env"] == b.cursor_environment(kw["cwd"])
             policy = json.loads((kw["cwd"] / ".cursor/cli.json").read_text())
             assert policy["permissions"] == {"allow": [], "deny": b.DENY}
@@ -449,6 +494,7 @@ def test_cursor_packaged_windows_runtime(tmp_path, monkeypatch, case):
         "cursor_runtime_root": str(runtime),
         "cursor_runtime_sha256": runtime_hash,
         "state_dir": str(tmp_path),
+        "worktree": str(tmp_path / "tree"),
         "cursor_timeout_seconds": 1,
     }
     if case == "runtime_drift":
@@ -485,7 +531,10 @@ def test_cursor_packaged_windows_runtime(tmp_path, monkeypatch, case):
             calls.append(argv)
             assert argv[:2] == [str(node), str(entrypoint)]
             assert argv[2:] == ["--print", "--mode", "ask", "--sandbox", "enabled",
-                                "--output-format", "json"]
+                                "--output-format", "json", "--trust"]
+            assert argv.count("--trust") == 1
+            for blocked in ("--force", "--yolo", "--approve-mcps"):
+                assert blocked not in argv, blocked
             assert kw["shell"] is False
             assert kw["env"]["CURSOR_INVOKED_AS"] == "agent.cmd"
             assert "PATH" not in kw["env"] and "GH_TOKEN" not in kw["env"]
@@ -1122,6 +1171,149 @@ def test_bridge_smoke_target_is_authorized():
     text = smoke.read_text(encoding="utf-8")
     assert "development-only" in text
     assert "no runtime, trading, deployment, merge, or production authority" in text
+
+
+@pytest.mark.parametrize("case", ["bridge_scratch", "worktree", "arbitrary", "state_dir_itself",
+                                  "symlink_scratch", "outside_state_dir", "nested", "borrowed_name",
+                                  "extra_content", "missing_config_key", "link_in_scratch"])
+def test_scratch_trust_boundary(tmp_path, monkeypatch, case):
+    """Focused coverage: --trust is granted only to the bridge-created scratch.
+
+    AC-004 acceptance proof for the same behaviour lives inside test_cursor_boundary.
+    """
+    monkeypatch.setenv("CURSOR_API_KEY", "synthetic-cursor-auth")
+    state = tmp_path / "state"
+    state.mkdir()
+    worktree = tmp_path / "tree"
+    worktree.mkdir()
+    exe = tmp_path / "agent.exe"
+    exe.write_bytes(b"synthetic executable; never run")
+    config = {"enable_execution": True, "cursor_executable": str(exe),
+              "cursor_sha256": b.digest(exe.read_bytes()),
+              "state_dir": str(state), "worktree": str(worktree),
+              "cursor_timeout_seconds": 1}
+    launch = [str(exe)]
+    base = [str(exe), "--print", "--mode", "ask", "--sandbox", "enabled",
+            "--output-format", "json"]
+
+    # A genuine bridge-shaped scratch: direct child of state_dir, private config only.
+    def bridge_scratch(root, name="opip-cursor-abc123"):
+        scratch = Path(root) / name
+        (scratch / "config").mkdir(parents=True)
+        (scratch / "config" / "cli-config.json").write_text(json.dumps({
+            "version": 1, "editor.vimMode": False,
+            "permissions": {"allow": [], "deny": b.DENY}}), encoding="utf-8")
+        (scratch / ".cursor").mkdir()
+        (scratch / ".cursor" / "cli.json").write_text(json.dumps({
+            "permissions": {"allow": [], "deny": b.DENY}}), encoding="utf-8")
+        return scratch
+
+    scratch = bridge_scratch(state)
+    target = scratch
+    if case == "worktree":
+        target = bridge_scratch(worktree, "opip-cursor-worktree")
+    elif case == "arbitrary":
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        target = bridge_scratch(elsewhere)
+    elif case == "state_dir_itself":
+        target = state
+    elif case == "outside_state_dir":
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        target = bridge_scratch(outside)
+    elif case == "nested":
+        deep = state / "opip-cursor-outer" / "inner"
+        deep.mkdir(parents=True)
+        target = deep
+    elif case == "borrowed_name":
+        target = bridge_scratch(state, "not-bridge-made")
+    elif case == "extra_content":
+        (scratch / "prompt.json").write_text("{}", encoding="utf-8")
+    elif case == "missing_config_key":
+        config.pop("worktree")
+    elif case == "link_in_scratch":
+        real_lstat = Path.lstat
+        victim = scratch / "config" / "cli-config.json"
+
+        def linked(self, *args, **kwargs):
+            info = real_lstat(self, *args, **kwargs)
+            if self == victim:
+                from types import SimpleNamespace
+                return SimpleNamespace(st_mode=info.st_mode, st_size=info.st_size,
+                                       st_file_attributes=0x400, st_nlink=1)
+            return info
+
+        monkeypatch.setattr(Path, "lstat", linked)
+
+    if case == "symlink_scratch":
+        real_is_symlink = Path.is_symlink
+
+        def symlinked(self):
+            return True if self == target else real_is_symlink(self)
+
+        monkeypatch.setattr(Path, "is_symlink", symlinked)
+
+    if case == "bridge_scratch":
+        argv = b.scratch_trust_argv(target, launch, config, base)
+        assert argv == base + ["--trust"]
+        assert argv.count("--trust") == 1
+        # sandbox stays on, DENY unchanged, no prohibited bypasses
+        assert argv[argv.index("--sandbox") + 1] == "enabled"
+        for blocked in ("--force", "--yolo", "--approve-mcps"):
+            assert blocked not in argv
+        assert b.DENY == ["Shell(*)", "Read(*)", "Write(*)", "WebFetch(*)"]
+        # a second application of the flag is refused
+        with pytest.raises(b.Stop, match="SCRATCH_TRUST_DENIED"):
+            b.scratch_trust_argv(target, launch, config, argv)
+    else:
+        with pytest.raises(b.Stop, match="SCRATCH_TRUST_DENIED"):
+            b.scratch_trust_argv(target, launch, config, base)
+
+
+def test_scratch_trust_requires_completed_launch_pin(tmp_path, monkeypatch):
+    """Focused coverage: --trust never precedes a validated packaged runtime pin.
+
+    AC-016 acceptance proof for the same behaviour lives inside
+    test_cursor_packaged_windows_runtime.
+    """
+    monkeypatch.setenv("CURSOR_API_KEY", "synthetic-cursor-auth")
+    state = tmp_path / "state"
+    state.mkdir()
+    runtime = tmp_path / "2026.09.28-64d2043"
+    runtime.mkdir()
+    node = runtime / "node.exe"
+    entry = runtime / "index.js"
+    node.write_bytes(b"synthetic node")
+    entry.write_text("module.exports = {}", encoding="utf-8")
+    (runtime / "cursorsandbox.exe").write_bytes(b"synthetic sandbox")
+    config = {"enable_execution": True, "cursor_executable": str(node),
+              "cursor_sha256": b.digest(node.read_bytes()),
+              "cursor_runtime_root": str(runtime),
+              "cursor_runtime_sha256": b.cursor_runtime_digest(runtime),
+              "state_dir": str(state), "worktree": str(tmp_path / "tree"),
+              "cursor_timeout_seconds": 1}
+    scratch = state / "opip-cursor-pkg"
+    (scratch / "config").mkdir(parents=True)
+    (scratch / "config" / "cli-config.json").write_text("{}", encoding="utf-8")
+    (scratch / ".cursor").mkdir()
+    (scratch / ".cursor" / "cli.json").write_text("{}", encoding="utf-8")
+
+    launch, invoked_as = b.cursor_launch(config)
+    assert launch == [str(node), str(entry)]
+    assert invoked_as == "agent.cmd"
+    base = launch + ["--print", "--mode", "ask", "--sandbox", "enabled", "--output-format", "json"]
+    assert b.scratch_trust_argv(scratch, launch, config, base) == base + ["--trust"]
+
+    # A drifted runtime cannot reach the --trust grant at all.
+    (runtime / "index.js").write_text("module.exports = {changed:true}", encoding="utf-8")
+    with pytest.raises(b.Stop):
+        b.cursor_launch(config)
+
+    # Execution disabled still short-circuits before any trust evaluation.
+    off = dict(config, enable_execution=False)
+    with pytest.raises(b.Stop, match="EXECUTION_DISABLED"):
+        b.scratch_trust_argv(scratch, launch, off, base)
 
 
 @pytest.mark.acceptance
