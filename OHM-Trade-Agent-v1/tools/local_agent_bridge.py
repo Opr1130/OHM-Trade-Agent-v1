@@ -49,7 +49,7 @@ IDENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 TASK_KEYS = {"schema", "repo", "increment", "branch", "head", "contract_sha256",
              "authority_sha256", "files", "instructions"}
 DENY = ["Shell(*)", "Read(*)", "Write(*)", "WebFetch(*)"]
-CURSOR_RUNTIME_VERSION = re.compile(r"^\\d{4}\\.\\d{1,2}\\.\\d{1,2}(?:-\\d{2}-\\d{2}-\\d{2})?-[0-9a-f]+$")
+CURSOR_RUNTIME_VERSION = re.compile(r"^\d{4}\.\d{1,2}\.\d{1,2}(?:-\d{2}-\d{2}-\d{2})?-[0-9a-f]+$")
 MAX_CURSOR_RUNTIME_FILES = 200_000
 MAX_CURSOR_RUNTIME_BYTES = 8 * 1024 * 1024 * 1024
 
