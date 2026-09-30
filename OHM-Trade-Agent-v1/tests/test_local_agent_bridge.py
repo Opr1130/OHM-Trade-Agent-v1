@@ -515,7 +515,8 @@ def test_cursor_packaged_windows_runtime(tmp_path, monkeypatch, case):
 
     if case == "success":
         config_file = tmp_path / "packaged.json"
-        local = dict(config, worktree=str(tmp_path / "tree"), dispatch_ids=[])
+        local = dict(config, worktree=str(tmp_path / "tree"), state_dir=str(tmp_path / "state"),
+                     dispatch_ids=[])
         (tmp_path / "tree").mkdir()
         config_file.write_text(json.dumps(local), encoding="utf-8")
         assert b.config_file(config_file)["cursor_runtime_sha256"] == runtime_hash
