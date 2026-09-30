@@ -49,6 +49,9 @@ IDENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 TASK_KEYS = {"schema", "repo", "increment", "branch", "head", "contract_sha256",
              "authority_sha256", "files", "instructions"}
 DENY = ["Shell(*)", "Read(*)", "Write(*)", "WebFetch(*)"]
+CURSOR_RUNTIME_VERSION = re.compile(r"^\\d{4}\\.\\d{1,2}\\.\\d{1,2}(?:-\\d{2}-\\d{2}-\\d{2})?-[0-9a-f]+$")
+MAX_CURSOR_RUNTIME_FILES = 200_000
+MAX_CURSOR_RUNTIME_BYTES = 8 * 1024 * 1024 * 1024
 
 # Protected `main` requires these exact GitHub check contexts. An approved policy may
 # require additional names, but these can never be removed and never count as satisfied
@@ -417,13 +420,117 @@ def repository(root, task):
     return context, text_content(raw)
 
 
+def cursor_runtime_digest(root: Path) -> str:
+    """Hash one immutable Cursor version directory without following links.
+
+    The official Windows launcher keeps a transient `.running` marker beside the
+    packaged runtime. It is the only excluded path; every executable, JS chunk,
+    native module and other file that the versioned CLI could load is pinned.
+    """
+    require(root.is_absolute() and root.is_dir() and not root.is_symlink(),
+            "CURSOR_RUNTIME_REQUIRED")
+    root_info = root.lstat()
+    require(not getattr(root_info, "st_file_attributes", 0) & 0x400,
+            "CURSOR_RUNTIME_LINK")
+    hasher = hashlib.sha256()
+    count = total = 0
+
+    for current, directories, filenames in os.walk(root, topdown=True, followlinks=False):
+        current_path = Path(current)
+        relative_dir = current_path.relative_to(root).as_posix()
+        kept = []
+        for name in sorted(directories):
+            relative = name if relative_dir == "." else relative_dir + "/" + name
+            if relative == ".running" or relative.startswith(".running/"):
+                continue
+            child = current_path / name
+            info = child.lstat()
+            require(not stat.S_ISLNK(info.st_mode) and
+                    not getattr(info, "st_file_attributes", 0) & 0x400,
+                    "CURSOR_RUNTIME_LINK")
+            require(stat.S_ISDIR(info.st_mode), "CURSOR_RUNTIME_LAYOUT")
+            kept.append(name)
+        directories[:] = kept
+
+        for name in sorted(filenames):
+            relative = name if relative_dir == "." else relative_dir + "/" + name
+            if relative == ".running":
+                continue
+            child = current_path / name
+            info = child.lstat()
+            require(stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode) and
+                    not getattr(info, "st_file_attributes", 0) & 0x400,
+                    "CURSOR_RUNTIME_LINK")
+            count += 1
+            total += info.st_size
+            require(count <= MAX_CURSOR_RUNTIME_FILES and total <= MAX_CURSOR_RUNTIME_BYTES,
+                    "CURSOR_RUNTIME_LIMIT")
+            relative_bytes = relative.encode("utf-8")
+            hasher.update(len(relative_bytes).to_bytes(4, "big"))
+            hasher.update(relative_bytes)
+            hasher.update(info.st_size.to_bytes(8, "big"))
+            with child.open("rb") as stream:
+                while chunk := stream.read(1024 * 1024):
+                    hasher.update(chunk)
+
+    require(count > 0, "CURSOR_RUNTIME_REQUIRED")
+    return hasher.hexdigest()
+
+
+def cursor_launch(config):
+    """Return the exact shell-free Cursor argv prefix after local pin validation."""
+    executable = Path(config["cursor_executable"])
+    require(executable.is_absolute() and executable.is_file() and
+            executable.suffix.lower() == ".exe" and not executable.is_symlink(),
+            "CURSOR_EXE_REQUIRED")
+    executable_info = executable.lstat()
+    require(stat.S_ISREG(executable_info.st_mode) and
+            not getattr(executable_info, "st_file_attributes", 0) & 0x400,
+            "CURSOR_EXE_REQUIRED")
+    require(SHA.fullmatch(config["cursor_sha256"] or "") and
+            digest(executable.read_bytes()) == config["cursor_sha256"],
+            "CURSOR_BINARY_DRIFT")
+
+    runtime_value = config.get("cursor_runtime_root")
+    if runtime_value is None:
+        return [str(executable)], None
+
+    runtime = Path(runtime_value)
+    require(runtime.is_absolute() and runtime.is_dir() and
+            CURSOR_RUNTIME_VERSION.fullmatch(runtime.name) is not None,
+            "CURSOR_RUNTIME_REQUIRED")
+    require(executable.parent == runtime and executable.name.casefold() == "node.exe",
+            "CURSOR_RUNTIME_LAYOUT")
+    entrypoint = runtime / "index.js"
+    require(entrypoint.is_file() and not entrypoint.is_symlink(),
+            "CURSOR_RUNTIME_LAYOUT")
+    entry_info = entrypoint.lstat()
+    require(stat.S_ISREG(entry_info.st_mode) and
+            not getattr(entry_info, "st_file_attributes", 0) & 0x400,
+            "CURSOR_RUNTIME_LINK")
+    require(SHA.fullmatch(config.get("cursor_runtime_sha256") or "") and
+            cursor_runtime_digest(runtime) == config["cursor_runtime_sha256"],
+            "CURSOR_RUNTIME_DRIFT")
+    return [str(executable), str(entrypoint)], "agent.cmd"
+
+
 def config_file(path):
     require(path.is_absolute(), "ABSOLUTE_CONFIG_REQUIRED")
     config = strict_json(path.read_text(encoding="utf-8-sig"))
-    fields(config, {"worktree", "state_dir", "dispatch_ids", "enable_execution",
-                    "cursor_executable", "cursor_sha256", "cursor_timeout_seconds"})
+    base_fields = {"worktree", "state_dir", "dispatch_ids", "enable_execution",
+                   "cursor_executable", "cursor_sha256", "cursor_timeout_seconds"}
+    packaged_fields = base_fields | {"cursor_runtime_root", "cursor_runtime_sha256"}
+    require(set(config) in {frozenset(base_fields), frozenset(packaged_fields)},
+            "INVALID_SCHEMA")
     for key in ("worktree", "state_dir"):
-        require(type(config[key]) is str and Path(config[key]).is_absolute(), "ABSOLUTE_PATH_REQUIRED")
+        require(type(config[key]) is str and Path(config[key]).is_absolute(),
+                "ABSOLUTE_PATH_REQUIRED")
+    if "cursor_runtime_root" in config:
+        require(type(config["cursor_runtime_root"]) is str and
+                Path(config["cursor_runtime_root"]).is_absolute(),
+                "ABSOLUTE_PATH_REQUIRED")
+        require(type(config["cursor_runtime_sha256"]) is str,
+                "INVALID_HASH")
     root, state = Path(config["worktree"]).resolve(), Path(config["state_dir"]).resolve()
     require(not state.is_relative_to(root) and not root.is_relative_to(state) and
             not path.resolve().is_relative_to(root), "STATE_OR_CONFIG_IN_WORKTREE")
@@ -435,13 +542,16 @@ def config_file(path):
     return config
 
 
-def cursor_environment(scratch):
+def cursor_environment(scratch, invoked_as=None):
     env = {k: os.environ[k] for k in ("SystemRoot", "WINDIR", "COMSPEC") if k in os.environ}
     # No PATH, GitHub token, SSH agent, proxy, cloud, exchange or inherited profile.
     env.update({"HOME": str(scratch), "USERPROFILE": str(scratch),
                 "APPDATA": str(scratch), "LOCALAPPDATA": str(scratch),
                 "TEMP": str(scratch), "TMP": str(scratch),
                 "CURSOR_CONFIG_DIR": str(scratch / "config"), "NO_COLOR": "1"})
+    if invoked_as is not None:
+        require(invoked_as == "agent.cmd", "CURSOR_RUNTIME_LAYOUT")
+        env["CURSOR_INVOKED_AS"] = invoked_as
     require(bool(os.environ.get("CURSOR_API_KEY")), "CURSOR_AUTH_MISSING")
     env["CURSOR_API_KEY"] = os.environ["CURSOR_API_KEY"]
     return env
@@ -449,11 +559,7 @@ def cursor_environment(scratch):
 
 def cursor(config, task, context, contract, review=False):
     require(config["enable_execution"] is True, "EXECUTION_DISABLED")
-    executable = Path(config["cursor_executable"])
-    require(executable.is_absolute() and executable.is_file() and
-            executable.suffix.lower() == ".exe" and not executable.is_symlink(), "CURSOR_EXE_REQUIRED")
-    require(SHA.fullmatch(config["cursor_sha256"] or "") and
-            digest(executable.read_bytes()) == config["cursor_sha256"], "CURSOR_BINARY_DRIFT")
+    launch, invoked_as = cursor_launch(config)
     instruction = ("Return only a JSON object with keys conflict (boolean) and edits (array). "
         "Each edit has path, before_sha256, content (complete UTF-8 text). "
         "Propose only requested engineering edits. Do not call any tools. "
@@ -485,15 +591,15 @@ def cursor(config, task, context, contract, review=False):
         (scratch / ".cursor/cli.json").write_text(json.dumps({
             "permissions": {"allow": [], "deny": DENY},
         }), encoding="utf-8")
-        env = cursor_environment(scratch)
+        env = cursor_environment(scratch, invoked_as)
         # Prompt on stdin avoids Windows argv limits, process-list exposure and shell quoting.
         with tempfile.TemporaryFile(dir=scratch) as stdin, tempfile.TemporaryFile(dir=scratch) as stdout:
             stdin.write(prompt.encode("utf-8"))
             stdin.seek(0)
             try:
-                with subprocess.Popen([str(executable), "--print", "--mode", "ask",
-                                       "--sandbox", "enabled", "--output-format", "json"],
-                                      cwd=scratch, env=env, stdin=stdin, stdout=stdout,
+                argv = launch + ["--print", "--mode", "ask",
+                                 "--sandbox", "enabled", "--output-format", "json"]
+                with subprocess.Popen(argv, cwd=scratch, env=env, stdin=stdin, stdout=stdout,
                                       stderr=subprocess.DEVNULL, shell=False) as process:
                     try:
                         deadline = time.monotonic() + config["cursor_timeout_seconds"]
