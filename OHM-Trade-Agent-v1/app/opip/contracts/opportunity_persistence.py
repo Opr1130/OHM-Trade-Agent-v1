@@ -492,8 +492,8 @@ class OpportunityEpisodeProjection:
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "OpportunityEpisodeProjection":
-        # Tolerant of a generic error envelope (for example a WriterAck-shaped
-        # server error reply, which carries only ``status``/``error_code``): the
+        # Tolerant of a generic error envelope (for example a WriterAck
+        # server-error reply, which carries only ``status``/``error_code``): the
         # read model degrades to a typed RETRYABLE projection instead of raising.
         episode = raw.get("episode")
         return cls(
