@@ -58,6 +58,7 @@ from app.opip.contracts.opportunity import (  # noqa: E402
 from app.scanner.execution_validation import (  # noqa: E402
     COMPLETE,
     FRESH,
+    INSUFFICIENT,
     INVALID as EXECUTION_INVALID,
     UNAVAILABLE as EXECUTION_UNAVAILABLE,
     VALID as EXECUTION_VALID,
@@ -284,7 +285,7 @@ def execution_validation(
 ) -> ExecutionValidation:
     return ExecutionValidation(
         status=status,
-        book_coverage_status=COMPLETE,
+        book_coverage_status=COMPLETE if tradeable else INSUFFICIENT,
         warnings=[],
         buy_fully_covered=tradeable,
         sell_fully_covered=tradeable,
@@ -1023,6 +1024,28 @@ def test_ac_018_malformed_required_evidence_fails_structurally() -> None:
     )
     with pytest.raises(FeasibilityContractError):
         seam.evaluate_feasibility(episode, lowercase_margin, CUTOFF, POLICY)
+
+    # A case-folded trade direction is refused.
+    lower_direction = snapshot(
+        market=market_validation(), execution=execution_validation()
+    )
+    lower_direction.trade_direction = "long"
+    with pytest.raises(FeasibilityContractError):
+        seam.evaluate_feasibility(episode, lower_direction, CUTOFF, POLICY)
+
+    # The coverage token and the coverage flags must agree.
+    contradictory_coverage = snapshot(
+        market=market_validation(),
+        execution=replace(execution_validation(), buy_fully_covered=False),
+    )
+    with pytest.raises(FeasibilityContractError):
+        seam.evaluate_feasibility(episode, contradictory_coverage, CUTOFF, POLICY)
+    contradictory_insufficient = snapshot(
+        market=market_validation(),
+        execution=replace(execution_validation(), book_coverage_status="INSUFFICIENT"),
+    )
+    with pytest.raises(FeasibilityContractError):
+        seam.evaluate_feasibility(episode, contradictory_insufficient, CUTOFF, POLICY)
 
     # Wrong evidence type, unsupported version and naive time all fail closed.
     with pytest.raises(FeasibilityContractError):

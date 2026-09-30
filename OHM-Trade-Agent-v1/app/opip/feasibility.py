@@ -113,12 +113,13 @@ def _direction(snapshot: MarketSnapshot) -> str:
         raise FeasibilityContractError(
             "trade_direction must be a non-empty, whitespace-free string"
         )
-    token = raw.upper()
-    if token not in {_LONG, _SHORT}:
+    # The producer emits the exact uppercase tokens; a case-folded or unknown
+    # token is malformed and fails closed rather than being normalized.
+    if raw not in {_LONG, _SHORT}:
         raise FeasibilityContractError(
             f"trade_direction has an unsupported token: {raw!r}"
         )
-    return token
+    return raw
 
 
 def _number_or_none(value: Any, *, field_name: str) -> float | None:
@@ -642,14 +643,28 @@ def _validate_execution_fields(execution: Any) -> None:
         raise FeasibilityContractError(
             f"execution recent_trade_status has an unsupported token: {recent!r}"
         )
-    _bool_field(
+    buy_covered = _bool_field(
         getattr(execution, "buy_fully_covered", None),
         field_name="execution.buy_fully_covered",
     )
-    _bool_field(
+    sell_covered = _bool_field(
         getattr(execution, "sell_fully_covered", None),
         field_name="execution.sell_fully_covered",
     )
+    # The producer assigns COMPLETE/PARTIAL only when both sides are fully
+    # covered and INSUFFICIENT when either side is not; a contradictory flag set
+    # fails closed rather than being accepted by the LONG adapter.
+    if status == execution_evidence.VALID:
+        if coverage in {execution_evidence.COMPLETE, execution_evidence.PARTIAL} and not (
+            buy_covered and sell_covered
+        ):
+            raise FeasibilityContractError(
+                "COMPLETE/PARTIAL coverage requires both sides fully covered"
+            )
+        if coverage == execution_evidence.INSUFFICIENT and buy_covered and sell_covered:
+            raise FeasibilityContractError(
+                "INSUFFICIENT coverage requires an uncovered side"
+            )
     for field_name in (
         "spread_bps",
         "buy_visible_coverage_pct",
