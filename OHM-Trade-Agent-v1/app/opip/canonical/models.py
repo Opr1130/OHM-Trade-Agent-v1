@@ -56,6 +56,12 @@ EventType = Literal[
     "paper_protection.state.recorded",
     "paper_protection.trigger.recorded",
     "paper_execution.reconciliation.recorded",
+    # R3 F4 Opportunity Lifecycle persistence. One durable record per real
+    # lifecycle transition, reusing the existing generic events, idempotency_keys
+    # and watermarks tables. Owned by app.opip.contracts.opportunity_persistence;
+    # the literal is restated here only because the type annotation cannot be
+    # computed from that frozenset. LOW priority, no ops handoff.
+    "opportunity_lifecycle.transition.recorded",
 ]
 OpsOperation = Literal["RECORD", "RELEASE"]
 HandoffStatus = Literal["PENDING", "APPLIED", "SUPERSEDED"]

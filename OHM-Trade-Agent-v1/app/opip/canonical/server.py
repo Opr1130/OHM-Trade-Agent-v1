@@ -24,6 +24,7 @@ from app.opip.canonical.models import (
 )
 from app.opip.canonical.protocol import recv_json, send_json
 from app.opip.canonical.writer import CanonicalWriter
+from app.opip.contracts import opportunity_persistence as opportunity_persistence_contract
 from app.opip.contracts.paper_execution_runtime import (
     PaperAdmissionAck,
     PaperAdmissionRequest,
@@ -299,6 +300,18 @@ class CanonicalWriterServer:
                     error_code="WORKER_UNHEALTHY",
                 ).to_dict()
             return self.writer.paper_v2_ledger().to_dict()
+        if method == "GET_OPPORTUNITY_EPISODE_PROJECTION":
+            # Read-only F4 lifecycle projection, health-gated for the same reason
+            # as the other reads: an unhealthy store must not present apparently
+            # valid lifecycle state, and an unknown episode stays NOT_FOUND.
+            requested = str(request.get("episode_id") or "")
+            if self._health_status() != "OK":
+                return opportunity_persistence_contract.OpportunityEpisodeProjection(
+                    status="RETRYABLE",
+                    episode_id=requested,
+                    error_code="WORKER_UNHEALTHY",
+                ).to_dict()
+            return self.writer.opportunity_episode_projection(requested).to_dict()
 
         # Mutating control RPCs must not write after integrity is uncertain.
         if self._health_status() != "OK":

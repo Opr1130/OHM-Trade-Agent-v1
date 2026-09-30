@@ -32,8 +32,9 @@ canonical evidence.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any
 
@@ -149,6 +150,99 @@ def _require_optional_utc(value: Any, *, field_name: str) -> datetime | None:
     if value is None:
         return None
     return require_opportunity_utc(value, field_name=field_name)
+
+
+#: Exact durable key set of ``OpportunityEpisode.to_dict()``. ``from_dict``
+#: refuses a mapping that omits a mandatory key or carries an unknown one, so a
+#: drifted or tampered durable record cannot be silently reconstituted.
+_EPISODE_DURABLE_KEYS: tuple[str, ...] = (
+    "episode_id",
+    "episode_schema_version",
+    "lifecycle_version",
+    "policy_version",
+    "source_claim_id",
+    "source_claim_idempotency_key",
+    "instrument_version_id",
+    "venue_instrument_id",
+    "detector_family",
+    "detector_version",
+    "detector_policy_version",
+    "claim_transition",
+    "snapshot_id",
+    "detector_input_fingerprint",
+    "claim_evaluation_cutoff",
+    "lifecycle_state",
+    "last_evaluation_time",
+    "defer_deadline",
+    "validity_deadline",
+    "terminal_reason",
+    "terminal_evaluation_time",
+)
+
+#: Exact durable key set of ``OpportunityLifecycleEvent.to_dict()``.
+_EVENT_DURABLE_KEYS: tuple[str, ...] = (
+    "event_id",
+    "event_type",
+    "episode_id",
+    "lifecycle_version",
+    "policy_version",
+    "evaluation_time",
+    "source_claim_id",
+)
+
+
+def _require_durable_mapping(
+    value: Any, *, field_name: str, expected_keys: tuple[str, ...]
+) -> Mapping[str, Any]:
+    """Refuse a non-mapping, or one whose key set is not exactly ``expected_keys``."""
+    if not isinstance(value, Mapping):
+        raise OpportunityContractError(f"{field_name} must be a mapping")
+    present = set(value.keys())
+    expected = set(expected_keys)
+    missing = sorted(expected - present)
+    if missing:
+        raise OpportunityContractError(
+            f"{field_name} is missing mandatory keys: " + ", ".join(missing)
+        )
+    unknown = sorted(str(key) for key in present - expected)
+    if unknown:
+        raise OpportunityContractError(
+            f"{field_name} carries unknown keys: " + ", ".join(unknown)
+        )
+    return value
+
+
+def _parse_persisted_utc(value: Any, *, field_name: str) -> datetime:
+    """Strictly parse one durable UTC instant.
+
+    A non-string, an empty or whitespace-padded string, a naive timestamp, a
+    non-UTC offset, or any value that is not an ISO-8601 instant fails closed.
+    This is deliberately stricter than a loose ``datetime.fromisoformat``: a
+    durability boundary must never accept a timestamp whose zone is ambiguous.
+    """
+    if not isinstance(value, str):
+        raise OpportunityContractError(f"{field_name} must be an ISO-8601 UTC string")
+    if value == "" or value != value.strip():
+        raise OpportunityContractError(
+            f"{field_name} must be a non-empty, whitespace-free ISO-8601 UTC string"
+        )
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise OpportunityContractError(
+            f"{field_name} must be an ISO-8601 UTC instant"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise OpportunityContractError(f"{field_name} must be timezone-aware")
+    if parsed.utcoffset() != timedelta(0):
+        raise OpportunityContractError(f"{field_name} must be a UTC instant")
+    return parsed.astimezone(timezone.utc)
+
+
+def _parse_optional_persisted_utc(value: Any, *, field_name: str) -> datetime | None:
+    if value is None:
+        return None
+    return _parse_persisted_utc(value, field_name=field_name)
 
 
 def opportunity_episode_identity(
@@ -546,6 +640,56 @@ class OpportunityEpisode:
             ),
         }
 
+    @classmethod
+    def from_dict(cls, raw: Any) -> "OpportunityEpisode":
+        """Reconstitute one durable episode, re-running every constructor invariant.
+
+        This is a durability trust boundary, so it is deliberately strict: the
+        mapping must carry exactly the canonical key set, text and enum tokens
+        are never coerced (a bool/number never becomes an enum member), every
+        instant must be an explicit UTC ISO-8601 string, and the reconstructed
+        episode is put back through ``__post_init__`` so its episode identity and
+        claim lineage are re-verified. A malformed, drifted or forged durable
+        record is refused rather than silently repaired.
+        """
+        body = _require_durable_mapping(
+            raw, field_name="episode", expected_keys=_EPISODE_DURABLE_KEYS
+        )
+        return cls(
+            episode_id=body["episode_id"],
+            episode_schema_version=body["episode_schema_version"],
+            lifecycle_version=body["lifecycle_version"],
+            policy_version=body["policy_version"],
+            source_claim_id=body["source_claim_id"],
+            source_claim_idempotency_key=body["source_claim_idempotency_key"],
+            instrument_version_id=body["instrument_version_id"],
+            venue_instrument_id=body["venue_instrument_id"],
+            detector_family=body["detector_family"],
+            detector_version=body["detector_version"],
+            detector_policy_version=body["detector_policy_version"],
+            claim_transition=body["claim_transition"],
+            snapshot_id=body["snapshot_id"],
+            detector_input_fingerprint=body["detector_input_fingerprint"],
+            claim_evaluation_cutoff=_parse_persisted_utc(
+                body["claim_evaluation_cutoff"], field_name="claim_evaluation_cutoff"
+            ),
+            lifecycle_state=body["lifecycle_state"],
+            last_evaluation_time=_parse_persisted_utc(
+                body["last_evaluation_time"], field_name="last_evaluation_time"
+            ),
+            defer_deadline=_parse_optional_persisted_utc(
+                body["defer_deadline"], field_name="defer_deadline"
+            ),
+            validity_deadline=_parse_optional_persisted_utc(
+                body["validity_deadline"], field_name="validity_deadline"
+            ),
+            terminal_reason=body["terminal_reason"],
+            terminal_evaluation_time=_parse_optional_persisted_utc(
+                body["terminal_evaluation_time"],
+                field_name="terminal_evaluation_time",
+            ),
+        )
+
 
 @dataclass(frozen=True)
 class OpportunityLifecycleEvent:
@@ -607,6 +751,30 @@ class OpportunityLifecycleEvent:
             ),
             "source_claim_id": self.source_claim_id,
         }
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> "OpportunityLifecycleEvent":
+        """Reconstitute one durable lifecycle event, re-running constructor invariants.
+
+        Same durability trust boundary as ``OpportunityEpisode.from_dict``: the
+        canonical key set is exact, tokens are never coerced, the evaluation
+        instant must be an explicit UTC ISO-8601 string, and the event identity
+        is re-derived so a forged ``OPEV`` id is refused.
+        """
+        body = _require_durable_mapping(
+            raw, field_name="event", expected_keys=_EVENT_DURABLE_KEYS
+        )
+        return cls(
+            event_id=body["event_id"],
+            event_type=body["event_type"],
+            episode_id=body["episode_id"],
+            lifecycle_version=body["lifecycle_version"],
+            policy_version=body["policy_version"],
+            evaluation_time=_parse_persisted_utc(
+                body["evaluation_time"], field_name="evaluation_time"
+            ),
+            source_claim_id=body["source_claim_id"],
+        )
 
 
 @dataclass(frozen=True)

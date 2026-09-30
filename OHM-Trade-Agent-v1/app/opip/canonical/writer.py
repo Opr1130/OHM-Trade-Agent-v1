@@ -138,6 +138,11 @@ from app.opip.decision_intelligence.events import (
 from app.opip.decision_intelligence.serialization import canonical_serialize
 from app.opip.market.instrument_version_store import instrument_version_from_payload
 
+# The F4 persistence vocabulary (event type, stream, priority, payload
+# validation, durable-history reconstruction and the typed read model). Imported
+# as a module alias so the trust boundary names are used exactly once.
+from app.opip.contracts import opportunity_persistence as opportunity_persistence_contract
+
 MAX_PAYLOAD_BYTES = 16 * 1024
 _UTC_OFFSET = "+00:00"
 _UTC_Z = "Z"
@@ -197,6 +202,12 @@ IDEMPOTENT_PAYLOAD_EVENT_TYPES = frozenset(
     # identical submissions different facts rather than duplicates.
     | PAPER_OUTCOME_EVENT_TYPES
     | PAPER_V2_ALL_EVENT_TYPES
+    # R3 F4 lifecycle transitions join the full-payload conflict set. The
+    # validated payload embeds the whole episode and event and contains no
+    # volatile receipt clock, so an exact replay is byte-identical and an
+    # otherwise-identical resubmission carrying a different deadline/state is an
+    # integrity conflict rather than a duplicate.
+    | opportunity_persistence_contract.OPPORTUNITY_LIFECYCLE_EVENT_TYPES
 )
 
 #: Wall-clock / hash fields that may move on an otherwise identical snapshot.
@@ -270,6 +281,7 @@ ACCEPTED_EVENT_TYPES = (
     | DECISION_INTELLIGENCE_EVENT_TYPES
     | PAPER_OUTCOME_EVENT_TYPES
     | PAPER_V2_WRITER_EVENT_TYPES
+    | opportunity_persistence_contract.OPPORTUNITY_LIFECYCLE_EVENT_TYPES
 )
 
 
@@ -319,8 +331,22 @@ class CanonicalWriter:
             self._request_lifecycle_projection_watermark: tuple[int, int] = (0, -1)
             self._role_result_idempotency_by_id: dict[str, str] = {}
             self._role_result_projection_watermark: tuple[int, int] = (0, -1)
+            # F4 opportunity-lifecycle persistence projection. Mirrors the DI
+            # hydration pattern: the durable rows are the source of truth and the
+            # in-memory projection is rebuilt from them, failing closed on an
+            # impossible history.
+            self._opportunity_transition_projection: dict[
+                str, opportunity_persistence_contract.OpportunityEpisode
+            ] = {}
+            self._opportunity_transition_count: dict[str, int] = {}
+            self._opportunity_transition_last: dict[
+                str, tuple[str, str, int, int]
+            ] = {}
+            self._opportunity_transition_watermark: tuple[int, int] = (0, -1)
+            self._opportunity_transition_hydrated = False
             self._hydrate_request_lifecycle_projection()
             self._hydrate_role_result_identity_projection()
+            self._hydrate_opportunity_transition_projection()
         except BaseException:
             # Cleanup is itself protected: a secondary failure while closing the
             # connection or releasing ownership must never replace the original
@@ -360,6 +386,11 @@ class CanonicalWriter:
         instance._request_lifecycle_projection_watermark = (0, -1)
         instance._role_result_idempotency_by_id = {}
         instance._role_result_projection_watermark = (0, -1)
+        instance._opportunity_transition_projection = {}
+        instance._opportunity_transition_count = {}
+        instance._opportunity_transition_last = {}
+        instance._opportunity_transition_watermark = (0, -1)
+        instance._opportunity_transition_hydrated = False
         return instance
 
     @property
@@ -527,6 +558,167 @@ class CanonicalWriter:
             self._role_result_projection_watermark = (
                 int(row["history_epoch"]),
                 int(row["local_sequence"]),
+            )
+
+    # -- F4 opportunity-lifecycle persistence projection --------------------
+
+    def _apply_persisted_opportunity_transition(
+        self, payload: Mapping[str, object]
+    ) -> None:
+        """Fold one durable F4 record into the in-memory projection.
+
+        The payload is re-validated and folded onto the episode's recorded prior
+        state, so an impossible transition raises and the caller fails closed
+        rather than accepting a corrupt history.
+        """
+        contract = opportunity_persistence_contract
+        episode_id = contract.opportunity_transition_episode_id(payload)
+        episode = contract.apply_opportunity_transition_record(
+            self._opportunity_transition_projection.get(episode_id), payload
+        )
+        self._opportunity_transition_projection[episode.episode_id] = episode
+        self._opportunity_transition_count[episode.episode_id] = (
+            self._opportunity_transition_count.get(episode.episode_id, 0) + 1
+        )
+
+    def _hydrate_opportunity_transition_projection(self) -> None:
+        rows = self._conn.execute(
+            """
+            SELECT event_id, history_epoch, local_sequence, payload_json
+            FROM events
+            WHERE event_type = ?
+            ORDER BY history_epoch ASC, local_sequence ASC
+            """,
+            (
+                opportunity_persistence_contract.OPPORTUNITY_LIFECYCLE_TRANSITION_RECORDED,
+            ),
+        ).fetchall()
+        for row in rows:
+            payload = json.loads(str(row["payload_json"]))
+            self._apply_persisted_opportunity_transition(payload)
+            episode_id = (
+                opportunity_persistence_contract.opportunity_transition_episode_id(
+                    payload
+                )
+            )
+            self._opportunity_transition_last[episode_id] = (
+                opportunity_persistence_contract.opportunity_transition_event_id(
+                    payload
+                ),
+                str(row["event_id"]),
+                int(row["history_epoch"]),
+                int(row["local_sequence"]),
+            )
+            self._opportunity_transition_watermark = (
+                int(row["history_epoch"]),
+                int(row["local_sequence"]),
+            )
+        self._opportunity_transition_hydrated = True
+
+    def _ensure_opportunity_transition_projection(self) -> None:
+        if not self._opportunity_transition_hydrated:
+            self._hydrate_opportunity_transition_projection()
+
+    def _refresh_opportunity_transition_projection(self) -> None:
+        self._ensure_opportunity_transition_projection()
+        history_epoch, local_sequence = self._opportunity_transition_watermark
+        rows = self._conn.execute(
+            """
+            SELECT event_id, history_epoch, local_sequence, payload_json
+            FROM events
+            WHERE event_type = ?
+              AND (
+                    history_epoch > ?
+                    OR (history_epoch = ? AND local_sequence > ?)
+                  )
+            ORDER BY history_epoch ASC, local_sequence ASC
+            """,
+            (
+                opportunity_persistence_contract.OPPORTUNITY_LIFECYCLE_TRANSITION_RECORDED,
+                history_epoch,
+                history_epoch,
+                local_sequence,
+            ),
+        ).fetchall()
+        for row in rows:
+            payload = json.loads(str(row["payload_json"]))
+            self._apply_persisted_opportunity_transition(payload)
+            episode_id = (
+                opportunity_persistence_contract.opportunity_transition_episode_id(
+                    payload
+                )
+            )
+            self._opportunity_transition_last[episode_id] = (
+                opportunity_persistence_contract.opportunity_transition_event_id(
+                    payload
+                ),
+                str(row["event_id"]),
+                int(row["history_epoch"]),
+                int(row["local_sequence"]),
+            )
+            self._opportunity_transition_watermark = (
+                int(row["history_epoch"]),
+                int(row["local_sequence"]),
+            )
+
+    def opportunity_episode_projection(
+        self, episode_id: str
+    ) -> opportunity_persistence_contract.OpportunityEpisodeProjection:
+        """Read-only projection of one episode's latest persisted F4 state.
+
+        Pure read: it validates the persisted history, holds the writer lock and
+        returns the latest committed episode. It performs no lifecycle
+        evaluation, advances no clock, creates no episode and infers nothing. An
+        unknown episode is reported as ``NOT_FOUND`` (ACTIVE is never invented),
+        and a corrupt persisted history is reported as ``REJECTED``.
+        """
+        contract = opportunity_persistence_contract
+        if (
+            not isinstance(episode_id, str)
+            or episode_id == ""
+            or episode_id != episode_id.strip()
+            or not episode_id.startswith(contract.OPPORTUNITY_EPISODE_ID_PREFIX)
+        ):
+            return contract.OpportunityEpisodeProjection(
+                status="REJECTED",
+                episode_id=episode_id if isinstance(episode_id, str) else "",
+                error_code="MALFORMED_EPISODE_ID",
+            )
+        with self._lock:
+            try:
+                self._refresh_opportunity_transition_projection()
+            except (TypeError, ValueError) as exc:
+                return contract.OpportunityEpisodeProjection(
+                    status="REJECTED",
+                    episode_id=episode_id,
+                    error_code="LIFECYCLE_HISTORY_INVALID",
+                    detail=str(exc),
+                )
+            except sqlite3.Error as exc:
+                return contract.OpportunityEpisodeProjection(
+                    status="RETRYABLE",
+                    episode_id=episode_id,
+                    error_code="SQLITE_ERROR",
+                    detail=str(exc),
+                )
+            episode = self._opportunity_transition_projection.get(episode_id)
+            if episode is None:
+                return contract.OpportunityEpisodeProjection(
+                    status="NOT_FOUND", episode_id=episode_id
+                )
+            last = self._opportunity_transition_last.get(
+                episode_id, ("", "", 0, -1)
+            )
+            return contract.OpportunityEpisodeProjection(
+                status="OK",
+                episode_id=episode_id,
+                episode=episode,
+                lifecycle_state=episode.lifecycle_state.value,
+                last_event_id=last[0],
+                canonical_event_id=last[1],
+                history_epoch=last[2],
+                local_sequence=last[3],
+                event_count=self._opportunity_transition_count.get(episode_id, 0),
             )
 
     def close(self) -> None:
@@ -4626,6 +4818,47 @@ class CanonicalWriter:
         return normalized
 
     @staticmethod
+    def _validate_opportunity_transition_intent(intent: WriterIntent) -> dict:
+        """Validate one F4 lifecycle transition intent at the persistence boundary.
+
+        Enforces LOW priority, no ops handoff, an exact canonical payload, and
+        the deterministic durable identity: the idempotency key, ``event_time``,
+        correlation id and causation id must all match what the validated payload
+        itself implies, so a forger cannot decouple the envelope from the record.
+        """
+        contract = opportunity_persistence_contract
+        if intent.priority != contract.OPPORTUNITY_LIFECYCLE_PRIORITY:
+            raise ValueError("opportunity lifecycle events must use LOW priority")
+        if intent.ops_handoff is not None:
+            raise ValueError(
+                "opportunity lifecycle events must not carry ops_handoff"
+            )
+        normalized = contract.validate_opportunity_transition_record(
+            intent.event_type, intent.payload
+        )
+        expected_key = contract.opportunity_transition_idempotency_key(normalized)
+        if intent.idempotency_key != expected_key:
+            raise ValueError(
+                "opportunity lifecycle idempotency_key does not match its record identity"
+            )
+        expected_time = contract.opportunity_transition_event_time(normalized)
+        if intent.event_time != expected_time:
+            raise ValueError(
+                "opportunity lifecycle event_time must equal the transition evaluation time"
+            )
+        if intent.correlation_id != contract.opportunity_transition_correlation_id(
+            normalized
+        ):
+            raise ValueError("opportunity lifecycle correlation_id must be the episode id")
+        if intent.causation_id != contract.opportunity_transition_causation_id(
+            normalized
+        ):
+            raise ValueError(
+                "opportunity lifecycle causation_id must be the source claim id or None"
+            )
+        return normalized
+
+    @staticmethod
     def _validate_alert_ops_intent(intent: WriterIntent) -> None:
         if intent.event_type == _ALERT_CAPTURE_GAP_RECORDED:
             if intent.ops_handoff is not None:
@@ -4681,6 +4914,14 @@ class CanonicalWriter:
             return self._validate_paper_outcome_intent(intent)
         if intent.event_type in PAPER_V2_WRITER_EVENT_TYPES:
             return self._validate_paper_execution_intent(intent)
+        if (
+            intent.event_type
+            in opportunity_persistence_contract.OPPORTUNITY_LIFECYCLE_EVENT_TYPES
+        ):
+            # The F4 persistence trust boundary: a producer payload is not
+            # trusted just because it arrived over IPC, and it must never fall
+            # through to the alert-ops validation branch below.
+            return self._validate_opportunity_transition_intent(intent)
 
         self._validate_alert_ops_intent(intent)
         return intent.payload
@@ -4703,6 +4944,11 @@ class CanonicalWriter:
             return PAPER_OUTCOME_STREAM
         if event_type in PAPER_V2_ALL_EVENT_TYPES:
             return PAPER_EXECUTION_STREAM
+        if (
+            event_type
+            in opportunity_persistence_contract.OPPORTUNITY_LIFECYCLE_EVENT_TYPES
+        ):
+            return opportunity_persistence_contract.OPPORTUNITY_LIFECYCLE_STREAM
         return STREAM_EARLY_WATCH
 
     @staticmethod
@@ -4713,6 +4959,8 @@ class CanonicalWriter:
             and event_type not in DECISION_INTELLIGENCE_EVENT_TYPES
             and event_type not in PAPER_OUTCOME_EVENT_TYPES
             and event_type not in PAPER_V2_ALL_EVENT_TYPES
+            and event_type
+            not in opportunity_persistence_contract.OPPORTUNITY_LIFECYCLE_EVENT_TYPES
         )
 
     def _upsert_alert_identity_projection(
@@ -4829,6 +5077,27 @@ class CanonicalWriter:
         operation = str(handoff.get("operation") or "")
         stream = self._stream_for_event(intent.event_type)
 
+        # The projected F4 state is computed against the current projection
+        # before any write, so an impossible transition is refused before it can
+        # touch the database, and the in-memory projection is only advanced after
+        # the SQLite commit actually succeeds.
+        projected_episode = None
+        if (
+            intent.event_type
+            in opportunity_persistence_contract.OPPORTUNITY_LIFECYCLE_EVENT_TYPES
+        ):
+            self._ensure_opportunity_transition_projection()
+            projected_episode = (
+                opportunity_persistence_contract.apply_opportunity_transition_record(
+                    self._opportunity_transition_projection.get(
+                        opportunity_persistence_contract.opportunity_transition_episode_id(
+                            payload
+                        )
+                    ),
+                    payload,
+                )
+            )
+
         self._conn.execute("BEGIN IMMEDIATE")
         meta = self._conn.execute(_META_SEQUENCE_SQL).fetchone()
         assert meta is not None
@@ -4943,6 +5212,22 @@ class CanonicalWriter:
             (local_sequence + 1, now),
         )
         self._conn.commit()
+        if projected_episode is not None:
+            self._opportunity_transition_projection[projected_episode.episode_id] = (
+                projected_episode
+            )
+            self._opportunity_transition_count[projected_episode.episode_id] = (
+                self._opportunity_transition_count.get(projected_episode.episode_id, 0) + 1
+            )
+            self._opportunity_transition_last[projected_episode.episode_id] = (
+                opportunity_persistence_contract.opportunity_transition_event_id(
+                    payload
+                ),
+                event_id,
+                history_epoch,
+                local_sequence,
+            )
+            self._opportunity_transition_watermark = (history_epoch, local_sequence)
         if intent.event_type == DECISION_INTELLIGENCE_TRANSITION_RECORDED:
             self._request_lifecycle_projection_watermark = (
                 history_epoch,

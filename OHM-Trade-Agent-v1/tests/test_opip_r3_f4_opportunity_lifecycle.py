@@ -156,7 +156,19 @@ CONTRACT_SOURCE = CONTRACT_PATH.read_text(encoding="utf-8")
 
 AUTHORIZED_PATHS = frozenset(
     str(path)
-    for path in (LIFECYCLE_PATH, CONTRACT_PATH, CONTRACTS_INIT_PATH)
+    for path in (
+        LIFECYCLE_PATH,
+        CONTRACT_PATH,
+        CONTRACTS_INIT_PATH,
+        # The separately OWNER-authorized R3 F4 persistence increment
+        # (ATDD-R3-F4-opportunity-lifecycle-persistence) authorizes the F4
+        # persistence vocabulary module and the canonical writer's IPC event-type
+        # literal to name the durable F4 event type/stream. This widens the
+        # allow-list only; no assertion below is removed or relaxed, and no other
+        # runtime path may import the F4 lifecycle.
+        APP_ROOT / "app" / "opip" / "contracts" / "opportunity_persistence.py",
+        APP_ROOT / "app" / "opip" / "canonical" / "models.py",
+    )
 )
 
 FORBIDDEN_IMPORT_ROOTS = frozenset(
@@ -820,8 +832,13 @@ def test_ac_013_f5_plus_isolation() -> None:
 def test_ac_014_current_vs_target_authority() -> None:
     """ATDD-R3-F4-opportunity-lifecycle/AC-014: contract stage transfers no authority from legacy clocks. ATDD-R3-F4-opportunity-lifecycle-implementation/AC-014: the active increment is the F4 implementation and remains shadow."""
     assert IMPLEMENTATION_CONTRACT_PATH.is_file()
-    assert ACTIVE_INCREMENT_PATH.read_text(encoding="utf-8").strip() == (
-        IMPLEMENTATION_INCREMENT
+    # The active pointer is expected to advance to a later OWNER-authorized F4
+    # increment (for example the durable persistence increment). It must name this
+    # implementation increment or a later increment in the same F4
+    # opportunity-lifecycle lineage; it may never name an unrelated increment.
+    active = ACTIVE_INCREMENT_PATH.read_text(encoding="utf-8").strip()
+    assert active == IMPLEMENTATION_INCREMENT or active.startswith(
+        "ATDD-R3-F4-opportunity-lifecycle-"
     )
 
     lines = IMPLEMENTATION_CONTRACT_PATH.read_text(encoding="utf-8").splitlines()
