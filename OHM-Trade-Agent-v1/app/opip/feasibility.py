@@ -289,12 +289,20 @@ def _canonical_evidence_summary(snapshot: MarketSnapshot) -> dict[str, Any]:
             "non_finite_value_count": _lenient_number(
                 getattr(market, "non_finite_value_count", None)
             ),
+            "largest_gap_seconds": _lenient_number(
+                getattr(market, "largest_gap_seconds", None)
+            ),
+            "ticker_last": _lenient_number(getattr(market, "ticker_last", None)),
+            "latest_ohlc_close": _lenient_number(
+                getattr(market, "latest_ohlc_close", None)
+            ),
             "ticker_vs_ohlc_difference_pct": _lenient_number(
                 getattr(market, "ticker_vs_ohlc_difference_pct", None)
             ),
             "suspicious_spike_detected": _lenient_bool(
                 getattr(market, "suspicious_spike_detected", None)
             ),
+            "warnings": _lenient_text_tuple(getattr(market, "warnings", None)),
             "rejection_reasons": _lenient_text_tuple(
                 getattr(market, "rejection_reasons", None)
             ),
@@ -392,13 +400,16 @@ def _require_instrument_correspondence(
         raise FeasibilityContractError(
             "episode venue instrument id is not comparable to a market symbol"
         )
+    # Every populated identifier must agree with the episode venue instrument, so
+    # a snapshot whose symbol matches but whose public/primary pair identifies a
+    # different instrument is refused rather than accepted on one match.
     candidates = {
         _instrument_token(getattr(snapshot, "symbol", None)),
         _instrument_token(getattr(snapshot, "kraken_public_symbol", None)),
         _instrument_token(getattr(snapshot, "primary_pair", None)),
     }
     candidates.discard(None)
-    if venue not in candidates:
+    if not candidates or any(token != venue for token in candidates):
         raise FeasibilityContractError(
             "evidence snapshot does not correspond to the episode venue instrument"
         )

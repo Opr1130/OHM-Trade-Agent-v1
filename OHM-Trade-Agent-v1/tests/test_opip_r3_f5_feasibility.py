@@ -519,6 +519,19 @@ def test_ac_004_decision_identity_is_deterministic() -> None:
         != first.decision_id
     )
 
+    # A changed validated market measurement changes the fingerprint and the id.
+    gap_changed = seam.evaluate_feasibility(
+        episode,
+        snapshot(
+            market=replace(market_validation(), largest_gap_seconds=3600.0),
+            execution=execution_validation(),
+        ),
+        CUTOFF,
+        POLICY,
+    )
+    assert gap_changed.evidence_fingerprint != first.evidence_fingerprint
+    assert gap_changed.decision_id != first.decision_id
+
     # A forged decision identity fails closed.
     with pytest.raises(FeasibilityContractError):
         replace(first, decision_id="FEAS:forged")
@@ -868,6 +881,13 @@ def test_ac_018_malformed_required_evidence_fails_structurally() -> None:
     foreign.kraken_public_symbol = "XBTUSD"
     with pytest.raises(FeasibilityContractError):
         seam.evaluate_feasibility(episode, foreign, CUTOFF, POLICY)
+
+    # If the symbol matches but another populated identifier conflicts, the
+    # snapshot is refused rather than accepted on one matching field.
+    conflicting = snapshot(market=market_validation(), execution=execution_validation())
+    conflicting.kraken_public_symbol = "BTCUSD"
+    with pytest.raises(FeasibilityContractError):
+        seam.evaluate_feasibility(episode, conflicting, CUTOFF, POLICY)
 
     # A proven hard veto short-circuits: malformed later evidence does not
     # pre-empt the veto (the fingerprint is lenient by design).
