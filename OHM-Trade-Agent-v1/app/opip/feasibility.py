@@ -554,6 +554,25 @@ def _margin_check(
             raise FeasibilityContractError(
                 "SHORT margin_validation_status contradicts the margin_eligible flag"
             )
+        # The live producer writes a text venue symbol and a finite numeric
+        # effective ceiling; a malformed eligible record fails closed.
+        venue_symbol = getattr(snapshot, "margin_venue_symbol", None)
+        if venue_symbol is not None and not isinstance(venue_symbol, str):
+            raise FeasibilityContractError(
+                "SHORT margin_venue_symbol must be text or None"
+            )
+        leverage = getattr(snapshot, "margin_max_leverage", None)
+        if leverage is not None:
+            if isinstance(leverage, bool) or not isinstance(leverage, (int, float)):
+                raise FeasibilityContractError(
+                    "SHORT margin_max_leverage must be numeric or None"
+                )
+            if not math.isfinite(float(leverage)):
+                raise FeasibilityContractError("SHORT margin_max_leverage must be finite")
+        if raw == MARGIN_ELIGIBLE and leverage is None:
+            raise FeasibilityContractError(
+                "an ELIGIBLE SHORT margin record requires margin_max_leverage"
+            )
 
     result = evaluate_margin_gate(snapshot, evaluated_at=evaluation_time)
 
@@ -676,6 +695,17 @@ def _validate_execution_fields(execution: Any) -> None:
         )
 
 
+def _has_btnl_venue_provenance(snapshot: MarketSnapshot) -> bool:
+    """True when the snapshot carries the Bitnomial margin venue provenance.
+
+    The live SHORT route refreshes the BTNL margin book onto the snapshot; the
+    offline route must not trust spot evidence (which lacks this provenance) as
+    if it were the BTNL book the SHORT quality thresholds are defined for.
+    """
+    venue = getattr(snapshot, "margin_venue_symbol", None)
+    return isinstance(venue, str) and ":BTNL" in venue.upper()
+
+
 def _execution_check(
     snapshot: MarketSnapshot, evaluation_time: datetime
 ) -> FeasibilityCheck:
@@ -696,6 +726,17 @@ def _execution_check(
             FeasibilityCheckStatus.INSUFFICIENT_EVIDENCE,
             "execution validation evidence is explicitly unavailable",
         )
+    # A SHORT is decided on the BTNL margin book. Without the BTNL provenance
+    # marker the attached execution evidence cannot be trusted to be that book,
+    # so this is missing evidence, not a favorable result. An explicit structural
+    # INVALID is still a VETO below.
+    if status != execution_evidence.INVALID and _direction(snapshot) == _SHORT:
+        if not _has_btnl_venue_provenance(snapshot):
+            return _check(
+                FeasibilityCheckName.EXECUTION_LIQUIDITY,
+                FeasibilityCheckStatus.INSUFFICIENT_EVIDENCE,
+                "SHORT execution evidence lacks BTNL venue provenance",
+            )
 
     result = evaluate_execution_gate(snapshot, evaluated_at=evaluation_time)
 

@@ -320,6 +320,8 @@ def snapshot(
     execution: ExecutionValidation | None = None,
     margin_status: str = "NOT_REQUIRED",
     margin_eligible: bool = False,
+    margin_venue_symbol: str | None = None,
+    margin_max_leverage: float | None = None,
 ) -> MarketSnapshot:
     candidate = MarketSnapshot(
         symbol="SOLUSD",
@@ -342,6 +344,8 @@ def snapshot(
     candidate.execution_validation = execution
     candidate.margin_validation_status = margin_status
     candidate.margin_eligible = margin_eligible
+    candidate.margin_venue_symbol = margin_venue_symbol
+    candidate.margin_max_leverage = margin_max_leverage
     return candidate
 
 
@@ -685,6 +689,8 @@ def test_ac_010_short_margin_eligible_is_pass() -> None:
         execution=execution_validation(),
         margin_status="ELIGIBLE",
         margin_eligible=True,
+        margin_venue_symbol="SOLUSD:BTNL",
+        margin_max_leverage=3.0,
     )
     decision = seam.evaluate_feasibility(episode, candidate, CUTOFF, POLICY)
     assert status_of(decision, FeasibilityCheckName.MARGIN_ELIGIBILITY) == "PASS"
@@ -790,6 +796,8 @@ def test_ac_016_short_execution_quality_reject_is_reproduced() -> None:
         execution=execution_validation(status=EXECUTION_VALID, tradeable=True, spread_bps=50.0),
         margin_status="ELIGIBLE",
         margin_eligible=True,
+        margin_venue_symbol="SOLUSD:BTNL",
+        margin_max_leverage=3.0,
     )
     with ForbiddenIO():
         decision = seam.evaluate_feasibility(episode, candidate, CUTOFF, POLICY)
@@ -802,6 +810,25 @@ def test_ac_016_short_execution_quality_reject_is_reproduced() -> None:
     # The offline route is used: no exchange refresh happens inside the seam.
     assert "refresh_margin_book=False" not in FEASIBILITY_SOURCE
     assert "KrakenClient(" not in FEASIBILITY_SOURCE
+
+    # Without BTNL venue provenance, SHORT execution evidence is treated as
+    # missing (abstain), never accepted on trust.
+    no_provenance = snapshot(
+        direction="SHORT",
+        market=market_validation(),
+        execution=execution_validation(),
+        margin_status="ELIGIBLE",
+        margin_eligible=True,
+        margin_max_leverage=3.0,
+    )
+    provenance_decision = seam.evaluate_feasibility(
+        episode, no_provenance, CUTOFF, POLICY
+    )
+    assert (
+        status_of(provenance_decision, FeasibilityCheckName.EXECUTION_LIQUIDITY)
+        == "INSUFFICIENT_EVIDENCE"
+    )
+    assert provenance_decision.disposition is FeasibilityDisposition.INSUFFICIENT_EVIDENCE
 
 
 @pytest.mark.acceptance
@@ -910,6 +937,30 @@ def test_ac_018_malformed_required_evidence_fails_structurally() -> None:
     )
     with pytest.raises(FeasibilityContractError):
         seam.evaluate_feasibility(episode, contradictory_margin, CUTOFF, POLICY)
+
+    # A malformed ELIGIBLE SHORT margin record fails closed.
+    bad_leverage_bool = snapshot(
+        direction="SHORT",
+        market=market_validation(),
+        execution=execution_validation(),
+        margin_status="ELIGIBLE",
+        margin_eligible=True,
+        margin_venue_symbol="SOLUSD:BTNL",
+        margin_max_leverage=True,
+    )
+    with pytest.raises(FeasibilityContractError):
+        seam.evaluate_feasibility(episode, bad_leverage_bool, CUTOFF, POLICY)
+    bad_leverage_nan = snapshot(
+        direction="SHORT",
+        market=market_validation(),
+        execution=execution_validation(),
+        margin_status="ELIGIBLE",
+        margin_eligible=True,
+        margin_venue_symbol="SOLUSD:BTNL",
+        margin_max_leverage=float("nan"),
+    )
+    with pytest.raises(FeasibilityContractError):
+        seam.evaluate_feasibility(episode, bad_leverage_nan, CUTOFF, POLICY)
 
     # Evidence for a different venue instrument is refused rather than stamped
     # with the episode's lineage.
@@ -1103,6 +1154,8 @@ def test_ac_020_frozen_population_parity() -> None:
             execution=execution_validation(),
             margin_status="ELIGIBLE",
             margin_eligible=True,
+            margin_venue_symbol="SOLUSD:BTNL",
+            margin_max_leverage=3.0,
         )
 
     parity: dict[str, tuple[MarketSnapshot | None, str]] = {
@@ -1161,6 +1214,8 @@ def test_ac_020_frozen_population_parity() -> None:
                 execution=execution_validation(spread_bps=50.0),
                 margin_status="ELIGIBLE",
                 margin_eligible=True,
+                margin_venue_symbol="SOLUSD:BTNL",
+                margin_max_leverage=3.0,
             ),
             "VETO",
         ),
