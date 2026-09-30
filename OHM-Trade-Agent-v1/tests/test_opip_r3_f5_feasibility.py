@@ -811,8 +811,8 @@ def test_ac_016_short_execution_quality_reject_is_reproduced() -> None:
     assert "refresh_margin_book=False" not in FEASIBILITY_SOURCE
     assert "KrakenClient(" not in FEASIBILITY_SOURCE
 
-    # Without BTNL venue provenance, SHORT execution evidence is treated as
-    # missing (abstain), never accepted on trust.
+    # An ELIGIBLE SHORT without the BTNL venue symbol fails closed rather than
+    # trusting untrusted evidence.
     no_provenance = snapshot(
         direction="SHORT",
         market=market_validation(),
@@ -821,14 +821,8 @@ def test_ac_016_short_execution_quality_reject_is_reproduced() -> None:
         margin_eligible=True,
         margin_max_leverage=3.0,
     )
-    provenance_decision = seam.evaluate_feasibility(
-        episode, no_provenance, CUTOFF, POLICY
-    )
-    assert (
-        status_of(provenance_decision, FeasibilityCheckName.EXECUTION_LIQUIDITY)
-        == "INSUFFICIENT_EVIDENCE"
-    )
-    assert provenance_decision.disposition is FeasibilityDisposition.INSUFFICIENT_EVIDENCE
+    with pytest.raises(FeasibilityContractError):
+        seam.evaluate_feasibility(episode, no_provenance, CUTOFF, POLICY)
 
 
 @pytest.mark.acceptance
@@ -961,6 +955,34 @@ def test_ac_018_malformed_required_evidence_fails_structurally() -> None:
     )
     with pytest.raises(FeasibilityContractError):
         seam.evaluate_feasibility(episode, bad_leverage_nan, CUTOFF, POLICY)
+    missing_venue = snapshot(
+        direction="SHORT",
+        market=market_validation(),
+        execution=execution_validation(),
+        margin_status="ELIGIBLE",
+        margin_eligible=True,
+        margin_max_leverage=3.0,
+    )
+    with pytest.raises(FeasibilityContractError):
+        seam.evaluate_feasibility(episode, missing_venue, CUTOFF, POLICY)
+
+    # A huge integer that cannot be represented as a float does not pre-empt an
+    # earlier proven veto (the lenient fingerprint never raises), but is refused
+    # when its component is actually evaluated.
+    overflow_veto = snapshot(
+        market=market_validation(status=MARKET_REJECT, qualified=False),
+        execution=replace(execution_validation(), spread_bps=10**400),
+    )
+    overflow_decision = seam.evaluate_feasibility(
+        episode, overflow_veto, CUTOFF, POLICY
+    )
+    assert overflow_decision.disposition is FeasibilityDisposition.VETO
+    overflow_evaluated = snapshot(
+        market=market_validation(),
+        execution=replace(execution_validation(), spread_bps=10**400),
+    )
+    with pytest.raises(FeasibilityContractError):
+        seam.evaluate_feasibility(episode, overflow_evaluated, CUTOFF, POLICY)
 
     # Evidence for a different venue instrument is refused rather than stamped
     # with the episode's lineage.

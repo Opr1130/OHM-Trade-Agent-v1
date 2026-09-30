@@ -127,7 +127,10 @@ def _number_or_none(value: Any, *, field_name: str) -> float | None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise FeasibilityContractError(f"{field_name} must be numeric or None")
-    number = float(value)
+    try:
+        number = float(value)
+    except OverflowError as exc:
+        raise FeasibilityContractError(f"{field_name} must be finite") from exc
     if not math.isfinite(number):
         raise FeasibilityContractError(f"{field_name} must be finite")
     return number
@@ -155,13 +158,17 @@ def _measurement_or_none(
     A ``None`` is allowed and a bool/non-numeric is always malformed. A
     non-finite value is malformed unless ``require_finite`` is cleared; only the
     live validator's raw non-finite ``ticker_last`` on an already-rejected record
-    clears it, so every other measurement is required to be finite.
+    clears it, so every other measurement is required to be finite. A value that
+    cannot be represented as a float (for example a huge integer) is malformed.
     """
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise FeasibilityContractError(f"{field_name} must be numeric or None")
-    number = float(value)
+    try:
+        number = float(value)
+    except OverflowError as exc:
+        raise FeasibilityContractError(f"{field_name} must be finite") from exc
     if require_finite and not math.isfinite(number):
         raise FeasibilityContractError(f"{field_name} must be finite")
     return number
@@ -173,11 +180,15 @@ def _lenient_float_token(value: Any) -> float | str | None:
     A finite number is returned as-is; non-finite values map to distinct
     canonical tokens (rather than being erased to ``None``), so an accepted
     non-finite ``ticker_last`` changes the fingerprint and the decision id; a
-    non-numeric value maps to ``None``.
+    value that cannot be represented as a float maps to a signed overflow token;
+    a non-numeric value maps to ``None``.
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    number = float(value)
+    try:
+        number = float(value)
+    except OverflowError:
+        return "NON_FINITE_POSITIVE" if value > 0 else "NON_FINITE_NEGATIVE"
     if math.isnan(number):
         return "NON_FINITE_NAN"
     if number == math.inf:
@@ -261,7 +272,10 @@ def _lenient_text(value: Any) -> str | None:
 def _lenient_number(value: Any) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    number = float(value)
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
     return number if math.isfinite(number) else None
 
 
@@ -563,16 +577,16 @@ def _margin_check(
             )
         leverage = getattr(snapshot, "margin_max_leverage", None)
         if leverage is not None:
-            if isinstance(leverage, bool) or not isinstance(leverage, (int, float)):
+            _measurement_or_none(leverage, field_name="margin_max_leverage")
+        if raw == MARGIN_ELIGIBLE:
+            if venue_symbol is None or venue_symbol == "":
                 raise FeasibilityContractError(
-                    "SHORT margin_max_leverage must be numeric or None"
+                    "an ELIGIBLE SHORT margin record requires a margin_venue_symbol"
                 )
-            if not math.isfinite(float(leverage)):
-                raise FeasibilityContractError("SHORT margin_max_leverage must be finite")
-        if raw == MARGIN_ELIGIBLE and leverage is None:
-            raise FeasibilityContractError(
-                "an ELIGIBLE SHORT margin record requires margin_max_leverage"
-            )
+            if leverage is None:
+                raise FeasibilityContractError(
+                    "an ELIGIBLE SHORT margin record requires margin_max_leverage"
+                )
 
     result = evaluate_margin_gate(snapshot, evaluated_at=evaluation_time)
 
