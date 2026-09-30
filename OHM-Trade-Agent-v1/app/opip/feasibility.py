@@ -147,16 +147,14 @@ def _int_or_none(
 
 
 def _measurement_or_none(
-    value: Any, *, field_name: str, require_finite: bool
+    value: Any, *, field_name: str, require_finite: bool = True
 ) -> float | None:
     """Validate one optional raw measurement.
 
-    A ``None`` is allowed, a bool/non-numeric is always malformed, and a
-    non-finite value is malformed only when ``require_finite`` is set. The live
-    market validator stores a raw non-finite ``ticker_last`` on a record it has
-    already rejected, so a non-finite measurement on an explicit invalidity is
-    tolerated (the record still maps to ``VETO``) while the same measurement on a
-    usable ``PASS``/``WARN`` record fails closed.
+    A ``None`` is allowed and a bool/non-numeric is always malformed. A
+    non-finite value is malformed unless ``require_finite`` is cleared; only the
+    live validator's raw non-finite ``ticker_last`` on an already-rejected record
+    clears it, so every other measurement is required to be finite.
     """
     if value is None:
         return None
@@ -165,6 +163,26 @@ def _measurement_or_none(
     number = float(value)
     if require_finite and not math.isfinite(number):
         raise FeasibilityContractError(f"{field_name} must be finite")
+    return number
+
+
+def _lenient_float_token(value: Any) -> float | str | None:
+    """A canonical fingerprint token for one raw float, preserving non-finite state.
+
+    A finite number is returned as-is; non-finite values map to distinct
+    canonical tokens (rather than being erased to ``None``), so an accepted
+    non-finite ``ticker_last`` changes the fingerprint and the decision id; a
+    non-numeric value maps to ``None``.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if math.isnan(number):
+        return "NON_FINITE_NAN"
+    if number == math.inf:
+        return "NON_FINITE_POSITIVE"
+    if number == -math.inf:
+        return "NON_FINITE_NEGATIVE"
     return number
 
 
@@ -182,13 +200,16 @@ def _text_list_field(value: Any, *, field_name: str) -> tuple[str, ...]:
     return tuple(value)
 
 
-def _validate_market_fields(validation: Any, *, require_finite: bool) -> None:
+def _validate_market_fields(
+    validation: Any, *, allow_non_finite_ticker: bool
+) -> None:
     """Validate the concrete market-data evidence structure; malformed fails closed.
 
     Structural fields (counts, the timestamp, the boolean flag and the text
-    lists) are always validated. The raw numeric measurements are only required
-    to be finite when ``require_finite`` is set, because the live validator stores
-    a raw non-finite ``ticker_last`` on a record it has already rejected.
+    lists) are always validated, and every measurement except ``ticker_last`` is
+    always required to be finite. ``ticker_last`` is only excused when
+    ``allow_non_finite_ticker`` is set, because the live validator stores a raw
+    non-finite ``ticker_last`` on a record it has already rejected.
     """
     _int_or_none(getattr(validation, "candle_count", None), field_name="candle_count")
     _int_or_none(
@@ -212,15 +233,15 @@ def _validate_market_fields(validation: Any, *, require_finite: bool) -> None:
     for name in (
         "latest_candle_age_seconds",
         "largest_gap_seconds",
-        "ticker_last",
         "latest_ohlc_close",
         "ticker_vs_ohlc_difference_pct",
     ):
-        _measurement_or_none(
-            getattr(validation, name, None),
-            field_name=name,
-            require_finite=require_finite,
-        )
+        _measurement_or_none(getattr(validation, name, None), field_name=name)
+    _measurement_or_none(
+        getattr(validation, "ticker_last", None),
+        field_name="ticker_last",
+        require_finite=not allow_non_finite_ticker,
+    )
     _bool_field(
         getattr(validation, "suspicious_spike_detected", None),
         field_name="suspicious_spike_detected",
@@ -293,7 +314,7 @@ def _canonical_evidence_summary(snapshot: MarketSnapshot) -> dict[str, Any]:
             "largest_gap_seconds": _lenient_number(
                 getattr(market, "largest_gap_seconds", None)
             ),
-            "ticker_last": _lenient_number(getattr(market, "ticker_last", None)),
+            "ticker_last": _lenient_float_token(getattr(market, "ticker_last", None)),
             "latest_ohlc_close": _lenient_number(
                 getattr(market, "latest_ohlc_close", None)
             ),
@@ -403,14 +424,22 @@ def _require_instrument_correspondence(
         )
     # Every populated identifier must agree with the episode venue instrument, so
     # a snapshot whose symbol matches but whose public/primary pair identifies a
-    # different instrument is refused rather than accepted on one match.
-    candidates = {
-        _instrument_token(getattr(snapshot, "symbol", None)),
-        _instrument_token(getattr(snapshot, "kraken_public_symbol", None)),
-        _instrument_token(getattr(snapshot, "primary_pair", None)),
-    }
-    candidates.discard(None)
-    if not candidates or any(token != venue for token in candidates):
+    # different instrument is refused rather than accepted on one match. A
+    # populated identifier that cannot be normalized (non-string or no
+    # alphanumerics) is itself malformed and fails closed rather than being
+    # discarded.
+    tokens: list[str] = []
+    for attribute in ("symbol", "kraken_public_symbol", "primary_pair"):
+        raw = getattr(snapshot, attribute, None)
+        if raw is None or raw == "":
+            continue
+        token = _instrument_token(raw)
+        if token is None:
+            raise FeasibilityContractError(
+                f"snapshot {attribute} is populated but not a usable instrument token"
+            )
+        tokens.append(token)
+    if not tokens or any(token != venue for token in tokens):
         raise FeasibilityContractError(
             "evidence snapshot does not correspond to the episode venue instrument"
         )
@@ -445,7 +474,7 @@ def _market_check(snapshot: MarketSnapshot) -> FeasibilityCheck:
         raise FeasibilityContractError("market-data qualified must be a bool")
 
     if status == MARKET_DATA_UNAVAILABLE_SENTINEL:
-        _validate_market_fields(validation, require_finite=False)
+        _validate_market_fields(validation, allow_non_finite_ticker=True)
         return _check(
             FeasibilityCheckName.MARKET_DATA,
             FeasibilityCheckStatus.INSUFFICIENT_EVIDENCE,
@@ -469,7 +498,7 @@ def _market_check(snapshot: MarketSnapshot) -> FeasibilityCheck:
         # An explicit invalidity is a VETO. The live validator can store a raw
         # non-finite ticker_last on a record it already rejected, so finite-ness
         # is not required here; structural fields are still validated.
-        _validate_market_fields(validation, require_finite=False)
+        _validate_market_fields(validation, allow_non_finite_ticker=True)
         return _check(
             FeasibilityCheckName.MARKET_DATA,
             FeasibilityCheckStatus.VETO,
@@ -481,7 +510,7 @@ def _market_check(snapshot: MarketSnapshot) -> FeasibilityCheck:
             f"contradictory market-data evidence: {status} with qualified=False"
         )
     # A usable record must carry structurally valid, finite measurements.
-    _validate_market_fields(validation, require_finite=True)
+    _validate_market_fields(validation, allow_non_finite_ticker=False)
     return _check(
         FeasibilityCheckName.MARKET_DATA,
         FeasibilityCheckStatus.PASS,

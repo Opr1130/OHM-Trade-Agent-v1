@@ -532,6 +532,28 @@ def test_ac_004_decision_identity_is_deterministic() -> None:
     assert gap_changed.evidence_fingerprint != first.evidence_fingerprint
     assert gap_changed.decision_id != first.decision_id
 
+    # An accepted non-finite ticker_last is preserved in the fingerprint, so it
+    # is distinct from an absent ticker.
+    reject_nan = snapshot(
+        market=replace(
+            market_validation(status=MARKET_REJECT, qualified=False),
+            ticker_last=float("nan"),
+        ),
+        execution=execution_validation(),
+    )
+    reject_none = snapshot(
+        market=market_validation(status=MARKET_REJECT, qualified=False),
+        execution=execution_validation(),
+    )
+    assert (
+        seam.evaluate_feasibility(
+            episode, reject_nan, CUTOFF, POLICY
+        ).evidence_fingerprint
+        != seam.evaluate_feasibility(
+            episode, reject_none, CUTOFF, POLICY
+        ).evidence_fingerprint
+    )
+
     # A forged decision identity fails closed.
     with pytest.raises(FeasibilityContractError):
         replace(first, decision_id="FEAS:forged")
@@ -902,6 +924,27 @@ def test_ac_018_malformed_required_evidence_fails_structurally() -> None:
     conflicting.kraken_public_symbol = "BTCUSD"
     with pytest.raises(FeasibilityContractError):
         seam.evaluate_feasibility(episode, conflicting, CUTOFF, POLICY)
+
+    # A populated but unnormalizable identifier is refused, not discarded.
+    unusable_id = snapshot(market=market_validation(), execution=execution_validation())
+    unusable_id.kraken_public_symbol = "///"
+    with pytest.raises(FeasibilityContractError):
+        seam.evaluate_feasibility(episode, unusable_id, CUTOFF, POLICY)
+    nonstring_id = snapshot(market=market_validation(), execution=execution_validation())
+    nonstring_id.primary_pair = 123
+    with pytest.raises(FeasibilityContractError):
+        seam.evaluate_feasibility(episode, nonstring_id, CUTOFF, POLICY)
+
+    # A REJECT record with a non-finite non-ticker measurement is still refused.
+    reject_nonfinite_gap = snapshot(
+        market=replace(
+            market_validation(status=MARKET_REJECT, qualified=False),
+            largest_gap_seconds=float("inf"),
+        ),
+        execution=execution_validation(),
+    )
+    with pytest.raises(FeasibilityContractError):
+        seam.evaluate_feasibility(episode, reject_nonfinite_gap, CUTOFF, POLICY)
 
     # A proven hard veto short-circuits: malformed later evidence does not
     # pre-empt the veto (the fingerprint is lenient by design).
