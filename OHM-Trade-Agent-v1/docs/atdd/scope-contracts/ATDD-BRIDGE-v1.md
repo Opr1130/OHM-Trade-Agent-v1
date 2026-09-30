@@ -133,6 +133,14 @@ the OWNER authorizes a smoke task targeting the exact mapped engineering documen
 THEN:
 the bridge may add or replace only `OHM-Trade-Agent-v1/docs/engineering/bridge-smoke-test.md` under the existing bounded proposal, approval, scope and path controls, without granting runtime, trading, deployment, merge, production or broader repository authority
 
+AC-016:
+GIVEN:
+the official Cursor Windows CLI installation observed during OWNER activation uses `agent.cmd` -> `cursor-agent.ps1` -> a versioned `node.exe index.js` runtime rather than a standalone `agent.exe`
+WHEN:
+the bridge is configured for that packaged Windows runtime
+THEN:
+it must never execute the `.cmd` or `.ps1` wrappers; it may invoke only the native versioned `node.exe` with the sibling `index.js`, after verifying the exact executable SHA256 and a deterministic hash of the complete versioned runtime tree (excluding only the vendor's transient `.running` marker), rejecting links/reparse points, runtime drift, wrong layout and wrapper paths before Cursor starts; the existing sandbox, deny policy, credential isolation and no-merge/no-deploy boundaries remain unchanged
+
 EXPLICITLY OUT OF SCOPE:
 - Runtime/app, deploy, architecture, CI, agent-governance, risk, strategy, exchange, paper authority and canonical evidence changes.
 - Force-push, merge, deployment, arbitrary shell/test execution or dependency installation. Autonomous ordinary feature commit/push and isolated registered tests are authorized only under AC-008 through AC-010.
@@ -168,6 +176,7 @@ AC-012 -> tests/test_local_agent_bridge.py::test_status_comment_identity_is_veri
 AC-013 -> tests/test_local_bridge_autonomy.py::test_protected_required_checks
 AC-014 -> tests/test_local_agent_bridge.py::test_completed_increment_pointer_is_not_pinned
 AC-015 -> tests/test_local_agent_bridge.py::test_bridge_smoke_target_is_authorized
+AC-016 -> tests/test_local_agent_bridge.py::test_cursor_packaged_windows_runtime
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/tools/local_agent_bridge.py
@@ -220,9 +229,14 @@ AC-014 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-BRIDGE-v1.md
 AC-015 -> OHM-Trade-Agent-v1/docs/engineering/bridge-smoke-test.md
 AC-015 -> OHM-Trade-Agent-v1/tests/test_local_agent_bridge.py
 AC-015 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-BRIDGE-v1.md
+AC-016 -> OHM-Trade-Agent-v1/tools/local_agent_bridge.py
+AC-016 -> OHM-Trade-Agent-v1/tests/test_local_agent_bridge.py
+AC-016 -> OHM-Trade-Agent-v1/docs/engineering/LOCAL_AGENT_BRIDGE_V1.md
+AC-016 -> OHM-Trade-Agent-v1/docs/engineering/local-agent-bridge.example.json
+AC-016 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-BRIDGE-v1.md
 
 DEFERRED DISCOVERIES:
-- Native Cursor executable availability, verified tool-denial behavior and separate automation-account setup require OWNER machine validation before enablement.
+- Verified Cursor tool-denial behavior and separate automation-account setup require OWNER machine validation before enablement. The 29 September 2026 Windows activation established the official packaged launcher shape; AC-016 authorizes a hash-pinned direct versioned runtime adapter while live sandbox behavior remains an OWNER activation check.
 - Autonomous candidate tests require OWNER provisioning of a pinned local Docker Desktop Linux image; no image is installed/pulled automatically. Until provisioned, autonomous execution fails closed.
 - V1 supports issue/PR conversation comments, not inline review comments; bounded one-shot polling may be invoked manually or by existing Windows scheduling.
 
