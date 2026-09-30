@@ -1201,6 +1201,37 @@ def test_completed_increment_pointer_is_not_pinned():
 
 
 @pytest.mark.acceptance
+def test_f4_completed_increment_pointer_is_not_pinned():
+    """ATDD-BRIDGE-v1/AC-017: a completed F4 increment must not freeze the movable ATDD pointer."""
+    r3_test = b.APP / "tests" / "test_opip_r3_f4_opportunity_lifecycle.py"
+    source = r3_test.read_text(encoding="utf-8")
+
+    # The stale lineage pin is gone: this test no longer reads or asserts the pointer.
+    assert "ACTIVE_INCREMENT" not in source
+
+    # The completed increment stays historically identifiable through its own contracts.
+    for increment in ("ATDD-R3-F4-opportunity-lifecycle-implementation",
+                      "ATDD-R3-F4-opportunity-lifecycle-persistence"):
+        contract = (b.APP / "docs" / "atdd" / "scope-contracts" / f"{increment}.md")
+        assert contract.is_file(), contract
+        lines = contract.read_text(encoding="utf-8").splitlines()
+        assert lines[0].strip() == "INCREMENT:"
+        assert lines[1].strip() == increment
+
+    # No substantive shadow / no-authority assertion was weakened.
+    for required in (
+        "IMPLEMENTATION_CONTRACT_PATH.is_file()",
+        'lines[lines.index("INCREMENT:") + 1].strip() == IMPLEMENTATION_INCREMENT',
+        "shadow",
+        "non-authoritative",
+        "AUTHORITY_TOKENS",
+        "run_cycle.py",
+        "FORBIDDEN_MODULE_PREFIXES",
+    ):
+        assert required in source, required
+
+
+@pytest.mark.acceptance
 def test_bridge_smoke_target_is_authorized():
     """ATDD-BRIDGE-v1/AC-015: one harmless engineering document is the bounded activation target."""
     target = b.PREFIX + "docs/engineering/bridge-smoke-test.md"

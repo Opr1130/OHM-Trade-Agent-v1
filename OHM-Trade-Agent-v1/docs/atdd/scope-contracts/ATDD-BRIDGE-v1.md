@@ -133,6 +133,14 @@ the OWNER authorizes a smoke task targeting the exact mapped engineering documen
 THEN:
 the bridge may add or replace only `OHM-Trade-Agent-v1/docs/engineering/bridge-smoke-test.md` under the existing bounded proposal, approval, scope and path controls, without granting runtime, trading, deployment, merge, production or broader repository authority
 
+AC-017:
+GIVEN:
+a completed F4 increment's acceptance test pins the globally active increment pointer to its own lineage
+WHEN:
+that stale lineage pin would block the OWNER-authorized bridge activation increment from becoming active
+THEN:
+the OWNER may authorize removing only that pointer pin, each completed F4 increment remains identifiable through its own scope contract, and no F4 shadow, no-authority, import or isolation assertion is weakened
+
 AC-016:
 GIVEN:
 the official Cursor Windows CLI installation observed during OWNER activation uses `agent.cmd` -> `cursor-agent.ps1` -> a versioned `node.exe index.js` runtime rather than a standalone `agent.exe`
@@ -175,6 +183,7 @@ AC-012 -> tests/test_local_agent_bridge.py::test_github_status_reporting
 AC-012 -> tests/test_local_agent_bridge.py::test_status_comment_identity_is_verified
 AC-013 -> tests/test_local_bridge_autonomy.py::test_protected_required_checks
 AC-014 -> tests/test_local_agent_bridge.py::test_completed_increment_pointer_is_not_pinned
+AC-017 -> tests/test_local_agent_bridge.py::test_f4_completed_increment_pointer_is_not_pinned
 AC-015 -> tests/test_local_agent_bridge.py::test_bridge_smoke_target_is_authorized
 AC-016 -> tests/test_local_agent_bridge.py::test_cursor_packaged_windows_runtime
 
@@ -226,6 +235,9 @@ AC-013 -> OHM-Trade-Agent-v1/docs/engineering/local-bridge-autonomy.example.json
 AC-014 -> OHM-Trade-Agent-v1/tests/test_opip_r3_f3_ignition_detector.py
 AC-014 -> OHM-Trade-Agent-v1/tests/test_local_agent_bridge.py
 AC-014 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-BRIDGE-v1.md
+AC-017 -> OHM-Trade-Agent-v1/tests/test_opip_r3_f4_opportunity_lifecycle.py
+AC-017 -> OHM-Trade-Agent-v1/tests/test_local_agent_bridge.py
+AC-017 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-BRIDGE-v1.md
 AC-015 -> OHM-Trade-Agent-v1/docs/engineering/bridge-smoke-test.md
 AC-015 -> OHM-Trade-Agent-v1/tests/test_local_agent_bridge.py
 AC-015 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-BRIDGE-v1.md
