@@ -2,7 +2,7 @@ INCREMENT:
 ATDD-BRIDGE-v1
 
 OWNER-APPROVED INTENT:
-Implement the user's 28 September 2026 request for a minimal Windows-local GitHub-to-Cursor engineering bridge in a new feature worktree from current main. This contract records that explicitly requested scope before implementation. The subsequent explicit request to enable all review/approval options and fully autonomous development additionally authorizes bounded autonomous task admission, sandboxed tests, feature-branch commit/non-force-push, draft PR publication and separate-identity GitHub reviews. Future tasks require either exact OWNER approval or an OWNER-approved, hash-pinned registered-work policy. V1 uses a tool-denied Cursor proposal followed by deterministic bounded file writes. No production, runtime, trading, merge or deployment authority is granted.
+Implement the user's 28 September 2026 request for a minimal Windows-local GitHub-to-Cursor engineering bridge in a new feature worktree from current main. This contract records that explicitly requested scope before implementation. The subsequent explicit request to enable all review/approval options and fully autonomous development additionally authorizes bounded autonomous task admission, sandboxed tests, feature-branch commit/non-force-push, draft PR publication and separate-identity GitHub reviews. Future tasks require either exact OWNER approval or an OWNER-approved, hash-pinned registered-work policy. The OWNER's 29 September 2026 activation instruction additionally authorizes exactly one harmless engineering smoke target, `OHM-Trade-Agent-v1/docs/engineering/bridge-smoke-test.md`, solely to prove the local bridge activation path; it grants no broader edit, runtime, trading, deployment or production authority. V1 uses a tool-denied Cursor proposal followed by deterministic bounded file writes. No production, runtime, trading, merge or deployment authority is granted.
 
 ARCHITECTURE REFERENCES:
 - Base main: ca9d6e308e3a2b63c5185e9ae10d5c45fa107628, verified against GitHub on 28 September 2026.
@@ -125,6 +125,14 @@ that stale lifecycle pin prevents every later approved increment from activating
 THEN:
 the OWNER may authorize removing only that pointer pin, the completed increment remains identifiable through its own scope contract, and no runtime, trading, feature-bus, import or isolation assertion is weakened
 
+AC-015:
+GIVEN:
+the merged bridge requires one harmless development-only file to prove first local activation end to end
+WHEN:
+the OWNER authorizes a smoke task targeting the exact mapped engineering document
+THEN:
+the bridge may add or replace only `OHM-Trade-Agent-v1/docs/engineering/bridge-smoke-test.md` under the existing bounded proposal, approval, scope and path controls, without granting runtime, trading, deployment, merge, production or broader repository authority
+
 EXPLICITLY OUT OF SCOPE:
 - Runtime/app, deploy, architecture, CI, agent-governance, risk, strategy, exchange, paper authority and canonical evidence changes.
 - Force-push, merge, deployment, arbitrary shell/test execution or dependency installation. Autonomous ordinary feature commit/push and isolated registered tests are authorized only under AC-008 through AC-010.
@@ -159,6 +167,7 @@ AC-012 -> tests/test_local_agent_bridge.py::test_github_status_reporting
 AC-012 -> tests/test_local_agent_bridge.py::test_status_comment_identity_is_verified
 AC-013 -> tests/test_local_bridge_autonomy.py::test_protected_required_checks
 AC-014 -> tests/test_local_agent_bridge.py::test_completed_increment_pointer_is_not_pinned
+AC-015 -> tests/test_local_agent_bridge.py::test_bridge_smoke_target_is_authorized
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/tools/local_agent_bridge.py
@@ -208,6 +217,9 @@ AC-013 -> OHM-Trade-Agent-v1/docs/engineering/local-bridge-autonomy.example.json
 AC-014 -> OHM-Trade-Agent-v1/tests/test_opip_r3_f3_ignition_detector.py
 AC-014 -> OHM-Trade-Agent-v1/tests/test_local_agent_bridge.py
 AC-014 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-BRIDGE-v1.md
+AC-015 -> OHM-Trade-Agent-v1/docs/engineering/bridge-smoke-test.md
+AC-015 -> OHM-Trade-Agent-v1/tests/test_local_agent_bridge.py
+AC-015 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-BRIDGE-v1.md
 
 DEFERRED DISCOVERIES:
 - Native Cursor executable availability, verified tool-denial behavior and separate automation-account setup require OWNER machine validation before enablement.
