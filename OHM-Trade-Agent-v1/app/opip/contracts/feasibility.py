@@ -542,6 +542,18 @@ class FeasibilityDecision:
             raise FeasibilityContractError(
                 "checks must be a non-empty ordered prefix of the required checks"
             )
+        # MARKET_DATA and EXECUTION_LIQUIDITY are always required; only the
+        # SHORT-only margin applicability can be NOT_APPLICABLE. A tampered
+        # record cannot mark an always-required check inapplicable to reach
+        # FEASIBLE without proving it.
+        for check in checks:
+            if (
+                check.status is FeasibilityCheckStatus.NOT_APPLICABLE
+                and check.name is not FeasibilityCheckName.MARGIN_ELIGIBILITY
+            ):
+                raise FeasibilityContractError(
+                    "NOT_APPLICABLE is only valid for MARGIN_ELIGIBILITY"
+                )
         veto_positions = [
             index
             for index, check in enumerate(checks)

@@ -216,22 +216,24 @@ class ForbiddenIO:
 # ---------------------------------------------------------------------------
 
 
-def build_claim() -> DetectorClaim:
+def build_claim(
+    *, venue_instrument_id: str = "SOLUSD", instrument_version_id: str = "INSTR:kraken:SOL:USD:1"
+) -> DetectorClaim:
     return DetectorClaim.create(
         detector_version=IGNITION_DETECTOR_VERSION,
         policy_version=IGNITION_POLICY_VERSION,
-        instrument_version_id="INSTR:kraken:SOL:USD:1",
-        venue_instrument_id="SOLUSD",
+        instrument_version_id=instrument_version_id,
+        venue_instrument_id=venue_instrument_id,
         snapshot_id="SNAP:r3f5-fixture",
         detector_input_fingerprint="DETIN:r3f5-fixture",
         evaluation_cutoff=CUTOFF,
     )
 
 
-def active_episode():
-    claim = build_claim()
+def active_episode(claim: DetectorClaim | None = None):
+    chosen = claim if claim is not None else build_claim()
     return lifecycle.apply_claim(
-        claim, None, claim.evaluation_cutoff, F4_POLICY
+        chosen, None, chosen.evaluation_cutoff, F4_POLICY
     ).episode
 
 
@@ -419,6 +421,18 @@ def test_ac_002_active_episode_lineage_preserved() -> None:
     assert episode.terminal_reason is None
     assert episode.lifecycle_state is OpportunityLifecycleState.ACTIVE
 
+    # The repository's Kraken base aliases (BASE_ALIASES) are reused, so a
+    # legitimate XBT/USD venue episode matches a canonical BTC/USD snapshot.
+    alias_episode = active_episode(build_claim(venue_instrument_id="XBTUSD"))
+    alias_candidate = snapshot(
+        market=market_validation(), execution=execution_validation()
+    )
+    alias_candidate.symbol = "BTC/USD"
+    alias_decision = seam.evaluate_feasibility(
+        alias_episode, alias_candidate, CUTOFF, POLICY
+    )
+    assert alias_decision.disposition is FeasibilityDisposition.FEASIBLE
+
 
 @pytest.mark.acceptance
 def test_ac_003_non_active_episode_rejected() -> None:
@@ -482,6 +496,10 @@ def test_ac_004_decision_identity_is_deterministic() -> None:
     forged_lineage["source_claim_id"] = "DCLM:forged"
     with pytest.raises(FeasibilityContractError):
         FeasibilityDecision.from_dict(forged_lineage)
+    inapplicable = first.to_dict()
+    inapplicable["checks"][0]["status"] = "NOT_APPLICABLE"
+    with pytest.raises(FeasibilityContractError):
+        FeasibilityDecision.from_dict(inapplicable)
 
     # The identity is identical at any wall-clock value (no clock participates).
     real_time = time.time
@@ -862,6 +880,45 @@ def test_ac_018_malformed_required_evidence_fails_structurally() -> None:
     )
     assert short_circuit.disposition is FeasibilityDisposition.VETO
     assert len(short_circuit.checks) == 1
+
+    # Malformed market-evidence fields are refused even when status/qualified
+    # look valid, so a PASS record with broken evidence cannot become FEASIBLE.
+    for field_name, bad_value in (
+        ("candle_count", True),
+        ("latest_candle_age_seconds", float("nan")),
+        ("gap_count", -1),
+        ("rejection_reasons", [1, 2]),
+    ):
+        bad_market = snapshot(
+            market=replace(market_validation(), **{field_name: bad_value}),
+            execution=execution_validation(),
+        )
+        with pytest.raises(FeasibilityContractError):
+            seam.evaluate_feasibility(episode, bad_market, CUTOFF, POLICY)
+
+    # A duck-typed market object and a wrong execution object are refused.
+    class _Duck:
+        status = "PASS"
+        qualified = True
+
+    duck = snapshot(market=market_validation(), execution=execution_validation())
+    duck.market_data_validation = _Duck()
+    with pytest.raises(FeasibilityContractError):
+        seam.evaluate_feasibility(episode, duck, CUTOFF, POLICY)
+
+    unknown_coverage = snapshot(
+        market=market_validation(),
+        execution=replace(execution_validation(), book_coverage_status="BOGUS"),
+    )
+    with pytest.raises(FeasibilityContractError):
+        seam.evaluate_feasibility(episode, unknown_coverage, CUTOFF, POLICY)
+
+    wrong_execution_type = snapshot(
+        market=market_validation(), execution=execution_validation()
+    )
+    wrong_execution_type.execution_validation = object()
+    with pytest.raises(FeasibilityContractError):
+        seam.evaluate_feasibility(episode, wrong_execution_type, CUTOFF, POLICY)
 
     # Wrong evidence type, unsupported version and naive time all fail closed.
     with pytest.raises(FeasibilityContractError):

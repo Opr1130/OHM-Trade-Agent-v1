@@ -57,6 +57,11 @@ from app.opip.decision.models import GateName, GateStatus, ReasonCode
 from app.scanner import market_data_validation as market_data
 from app.scanner import execution_validation as execution_evidence
 from app.scanner.models import MarketSnapshot
+from app.scanner.universe import BASE_ALIASES
+
+#: Quote suffixes stripped when comparing venue instrument tokens, so
+#: ``SOL/USD`` and ``SOLUSD`` compare equal.
+_QUOTE_SUFFIXES = ("USDT", "USD")
 
 #: The live absent-evidence sentinel the scanner prints when a snapshot carries
 #: no market-data validation object. It is an explicit unavailability marker, not
@@ -116,14 +121,6 @@ def _direction(snapshot: MarketSnapshot) -> str:
     return token
 
 
-def _text_or_none(value: Any, *, field_name: str) -> str | None:
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        raise FeasibilityContractError(f"{field_name} must be text or None")
-    return value
-
-
 def _number_or_none(value: Any, *, field_name: str) -> float | None:
     if value is None:
         return None
@@ -135,12 +132,103 @@ def _number_or_none(value: Any, *, field_name: str) -> float | None:
     return number
 
 
-def _bool_or_none(value: Any, *, field_name: str) -> bool | None:
+def _int_or_none(
+    value: Any, *, field_name: str, allow_none: bool = False
+) -> int | None:
     if value is None:
-        return None
-    if not isinstance(value, bool):
-        raise FeasibilityContractError(f"{field_name} must be a bool or None")
+        if allow_none:
+            return None
+        raise FeasibilityContractError(f"{field_name} must be an integer")
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise FeasibilityContractError(f"{field_name} must be an integer")
+    if value < 0:
+        raise FeasibilityContractError(f"{field_name} must not be negative")
     return value
+
+
+def _finite_or_none(
+    value: Any, *, field_name: str, allow_none: bool = False
+) -> float | None:
+    if value is None:
+        if allow_none:
+            return None
+        raise FeasibilityContractError(f"{field_name} must be numeric")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise FeasibilityContractError(f"{field_name} must be numeric")
+    number = float(value)
+    if not math.isfinite(number):
+        raise FeasibilityContractError(f"{field_name} must be finite")
+    return number
+
+
+def _bool_field(value: Any, *, field_name: str) -> bool:
+    if not isinstance(value, bool):
+        raise FeasibilityContractError(f"{field_name} must be a bool")
+    return value
+
+
+def _text_list_field(value: Any, *, field_name: str) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)) or not all(
+        isinstance(item, str) for item in value
+    ):
+        raise FeasibilityContractError(f"{field_name} must be a list of text")
+    return tuple(value)
+
+
+def _validate_market_fields(validation: Any) -> None:
+    """Validate the concrete market-data evidence structure; malformed fails closed."""
+    _int_or_none(getattr(validation, "candle_count", None), field_name="candle_count")
+    _int_or_none(
+        getattr(validation, "latest_candle_timestamp", None),
+        field_name="latest_candle_timestamp",
+        allow_none=True,
+    )
+    _finite_or_none(
+        getattr(validation, "latest_candle_age_seconds", None),
+        field_name="latest_candle_age_seconds",
+        allow_none=True,
+    )
+    _int_or_none(
+        getattr(validation, "duplicate_timestamp_count", None),
+        field_name="duplicate_timestamp_count",
+    )
+    _int_or_none(getattr(validation, "gap_count", None), field_name="gap_count")
+    _int_or_none(
+        getattr(validation, "invalid_ohlc_count", None),
+        field_name="invalid_ohlc_count",
+    )
+    _int_or_none(
+        getattr(validation, "non_finite_value_count", None),
+        field_name="non_finite_value_count",
+    )
+    _finite_or_none(
+        getattr(validation, "largest_gap_seconds", None),
+        field_name="largest_gap_seconds",
+    )
+    _finite_or_none(
+        getattr(validation, "ticker_last", None),
+        field_name="ticker_last",
+        allow_none=True,
+    )
+    _finite_or_none(
+        getattr(validation, "latest_ohlc_close", None),
+        field_name="latest_ohlc_close",
+        allow_none=True,
+    )
+    _finite_or_none(
+        getattr(validation, "ticker_vs_ohlc_difference_pct", None),
+        field_name="ticker_vs_ohlc_difference_pct",
+        allow_none=True,
+    )
+    _bool_field(
+        getattr(validation, "suspicious_spike_detected", None),
+        field_name="suspicious_spike_detected",
+    )
+    _text_list_field(getattr(validation, "warnings", None), field_name="warnings")
+    _text_list_field(
+        getattr(validation, "rejection_reasons", None),
+        field_name="rejection_reasons",
+    )
 
 
 def _lenient_text(value: Any) -> str | None:
@@ -271,13 +359,23 @@ def _canonical_evidence_summary(snapshot: MarketSnapshot) -> dict[str, Any]:
 def _instrument_token(value: Any) -> str | None:
     """Normalize one venue instrument token for identity comparison.
 
-    Uppercase alphanumerics only, so ``SOL/USD`` and ``SOLUSD`` compare equal and
-    a non-text or empty value yields ``None``.
+    Uppercase alphanumerics only, then the repository's existing Kraken base
+    alias normalization (``BASE_ALIASES``: ``XBT`` -> ``BTC``, ``XDG`` ->
+    ``DOGE``) is applied to the base of a USD/USDT pair, so F4's Kraken
+    ``altname`` (``XBTUSD``/``XDGUSD``) compares equal to the scanner's canonical
+    snapshot symbol (``BTC/USD``/``DOGE/USD``). A non-text or empty value yields
+    ``None``.
     """
     if not isinstance(value, str) or value.strip() == "":
         return None
     token = "".join(character for character in value.upper() if character.isalnum())
-    return token or None
+    if not token:
+        return None
+    for quote in _QUOTE_SUFFIXES:
+        if token.endswith(quote) and len(token) > len(quote):
+            base = token[: -len(quote)]
+            return BASE_ALIASES.get(base, base) + quote
+    return token
 
 
 def _require_instrument_correspondence(
@@ -323,6 +421,11 @@ def _market_check(snapshot: MarketSnapshot) -> FeasibilityCheck:
             FeasibilityCheckStatus.INSUFFICIENT_EVIDENCE,
             "required market-data evidence is absent",
         )
+    if not isinstance(validation, market_data.MarketDataValidation):
+        raise FeasibilityContractError(
+            "market-data evidence must be a MarketDataValidation"
+        )
+    _validate_market_fields(validation)
 
     status = getattr(validation, "status", None)
     qualified = getattr(validation, "qualified", None)
@@ -440,23 +543,45 @@ def _margin_check(
 
 def _validate_execution_fields(execution: Any) -> None:
     """Validate the F5-required execution fields; malformed fails closed."""
-    status = getattr(execution, "status", None)
+    if not isinstance(execution, execution_evidence.ExecutionValidation):
+        raise FeasibilityContractError(
+            "execution evidence must be an ExecutionValidation"
+        )
+    status = execution.status
     if isinstance(status, bool) or not isinstance(status, str):
         raise FeasibilityContractError("execution status must be a text token")
-    if status not in {execution_evidence.VALID, execution_evidence.INVALID,
-                      execution_evidence.UNAVAILABLE}:
+    if status not in {
+        execution_evidence.VALID,
+        execution_evidence.INVALID,
+        execution_evidence.UNAVAILABLE,
+    }:
         raise FeasibilityContractError(
             f"execution status has an unsupported token: {status!r}"
         )
-    _text_or_none(
-        getattr(execution, "book_coverage_status", None),
-        field_name="execution.book_coverage_status",
-    )
-    _bool_or_none(
+    coverage = getattr(execution, "book_coverage_status", None)
+    if coverage not in {
+        execution_evidence.COMPLETE,
+        execution_evidence.PARTIAL,
+        execution_evidence.INSUFFICIENT,
+        execution_evidence.UNAVAILABLE,
+    }:
+        raise FeasibilityContractError(
+            f"execution book_coverage_status has an unsupported token: {coverage!r}"
+        )
+    recent = getattr(execution, "recent_trade_status", None)
+    if recent not in {
+        execution_evidence.FRESH,
+        execution_evidence.WARN,
+        execution_evidence.UNAVAILABLE,
+    }:
+        raise FeasibilityContractError(
+            f"execution recent_trade_status has an unsupported token: {recent!r}"
+        )
+    _bool_field(
         getattr(execution, "buy_fully_covered", None),
         field_name="execution.buy_fully_covered",
     )
-    _bool_or_none(
+    _bool_field(
         getattr(execution, "sell_fully_covered", None),
         field_name="execution.sell_fully_covered",
     )
