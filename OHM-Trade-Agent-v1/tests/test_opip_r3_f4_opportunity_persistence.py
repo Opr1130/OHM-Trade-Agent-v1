@@ -47,14 +47,18 @@ from app.opip.contracts.detector import (  # noqa: E402
     DetectorContractError,
 )
 from app.opip.contracts.opportunity import (  # noqa: E402
+    OPPORTUNITY_LIFECYCLE_VERSION,
+    OPPORTUNITY_POLICY_VERSION,
     OpportunityContractError,
     OpportunityDeferral,
     OpportunityEpisode,
     OpportunityLifecycleEvent,
+    OpportunityLifecycleEventType,
     OpportunityLifecyclePolicy,
     OpportunityLifecycleResult,
     OpportunityLifecycleState,
     OpportunityTerminalReason,
+    opportunity_event_identity,
 )
 
 RECORDED = persistence.OPPORTUNITY_LIFECYCLE_TRANSITION_RECORDED
@@ -1073,7 +1077,9 @@ def test_rejected_write_does_not_advance_watermark(canonical_store) -> None:
                 ops_handoff=None,
             )
         )
-        assert RECORDED not in watermark_streams(canonical_store)
+        assert persistence.OPPORTUNITY_LIFECYCLE_STREAM not in watermark_streams(
+            canonical_store
+        )
     finally:
         writer.close()
 
@@ -1178,3 +1184,113 @@ def test_contract_module_is_pure_of_persistence_io() -> None:
     assert roots.isdisjoint(
         {"sqlite3", "socket", "requests", "urllib", "time", "random", "uuid", "os", "sys"}
     )
+
+
+# ---------------------------------------------------------------------------
+# Review-driven regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_equivalent_timestamp_spellings_are_canonicalized_and_replayable(
+    canonical_store,
+) -> None:
+    """A non-canonical but equivalent UTC spelling must not break exact replay."""
+    writer = open_writer(canonical_store)
+    try:
+        canonical = payload_for(deferred_result())
+        spelled = copy.deepcopy(canonical)
+        plus_zero = CUTOFF.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        spelled["episode"]["claim_evaluation_cutoff"] = plus_zero
+        spelled["episode"]["last_evaluation_time"] = plus_zero
+        spelled["episode"]["defer_deadline"] = DEFER_DEADLINE.strftime(
+            "%Y-%m-%dT%H:%M:%S.000+00:00"
+        )
+        spelled["episode"]["validity_deadline"] = VALIDITY_DEADLINE.strftime(
+            "%Y-%m-%dT%H:%M:%S+00:00"
+        )
+        spelled["event"]["evaluation_time"] = plus_zero
+
+        # The boundary rebuilds the canonical payload rather than storing the
+        # caller's raw spelling.
+        assert (
+            persistence.validate_opportunity_transition_record(RECORDED, spelled)
+            == canonical
+        )
+        assert writer.submit(canonical_intent(spelled)).status == "OK"
+        assert f4_count(canonical_store) == 1
+        # The canonical replay of the same transition is DUPLICATE_OK, not a
+        # payload conflict, because both store the same canonical bytes.
+        replay = writer.submit(canonical_intent(canonical))
+        assert replay.status == "DUPLICATE_OK"
+        assert f4_count(canonical_store) == 1
+    finally:
+        writer.close()
+
+
+def test_creation_instant_must_equal_claim_cutoff() -> None:
+    """A claim-driven record must not fabricate a creation after the cutoff."""
+    active = active_result()
+    later = CUTOFF + timedelta(minutes=5)
+    mutated = replace(active.episode, last_evaluation_time=later)
+    opened = OpportunityLifecycleEvent(
+        event_id=opportunity_event_identity(
+            episode_id=active.episode.episode_id,
+            event_type=OpportunityLifecycleEventType.OPENED,
+            evaluation_time=later,
+            source_claim_id=active.episode.source_claim_id,
+        ),
+        event_type=OpportunityLifecycleEventType.OPENED,
+        episode_id=active.episode.episode_id,
+        lifecycle_version=OPPORTUNITY_LIFECYCLE_VERSION,
+        policy_version=OPPORTUNITY_POLICY_VERSION,
+        evaluation_time=later,
+        source_claim_id=active.episode.source_claim_id,
+    )
+    with pytest.raises(OpportunityContractError):
+        persistence.validate_opportunity_transition_record(
+            RECORDED,
+            {
+                "record_type": persistence.OPPORTUNITY_LIFECYCLE_RECORD_TYPE,
+                "schema_version": persistence.OPPORTUNITY_LIFECYCLE_TRANSITION_SCHEMA_TOKEN,
+                "episode": mutated.to_dict(),
+                "event": opened.to_dict(),
+            },
+        )
+
+    deferred = deferred_result()
+    later2 = CUTOFF + timedelta(minutes=2)
+    mutated2 = replace(deferred.episode, last_evaluation_time=later2)
+    deferred_event = OpportunityLifecycleEvent(
+        event_id=opportunity_event_identity(
+            episode_id=deferred.episode.episode_id,
+            event_type=OpportunityLifecycleEventType.DEFERRED,
+            evaluation_time=later2,
+            source_claim_id=deferred.episode.source_claim_id,
+        ),
+        event_type=OpportunityLifecycleEventType.DEFERRED,
+        episode_id=deferred.episode.episode_id,
+        lifecycle_version=OPPORTUNITY_LIFECYCLE_VERSION,
+        policy_version=OPPORTUNITY_POLICY_VERSION,
+        evaluation_time=later2,
+        source_claim_id=deferred.episode.source_claim_id,
+    )
+    with pytest.raises(OpportunityContractError):
+        persistence.validate_opportunity_transition_record(
+            RECORDED,
+            {
+                "record_type": persistence.OPPORTUNITY_LIFECYCLE_RECORD_TYPE,
+                "schema_version": persistence.OPPORTUNITY_LIFECYCLE_TRANSITION_SCHEMA_TOKEN,
+                "episode": mutated2.to_dict(),
+                "event": deferred_event.to_dict(),
+            },
+        )
+
+
+def test_projection_from_dict_tolerates_error_envelope() -> None:
+    projection = persistence.OpportunityEpisodeProjection.from_dict(
+        {"status": "RETRYABLE", "error_code": "SERVER_ERROR", "detail": "ValueError"}
+    )
+    assert projection.status == "RETRYABLE"
+    assert projection.episode_id == ""
+    assert projection.episode is None
+    assert projection.error_code == "SERVER_ERROR"

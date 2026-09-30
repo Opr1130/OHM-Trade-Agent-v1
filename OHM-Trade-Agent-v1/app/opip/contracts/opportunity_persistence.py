@@ -52,8 +52,11 @@ OPPORTUNITY_LIFECYCLE_STREAM = "opportunity_lifecycle"
 OPPORTUNITY_LIFECYCLE_PRIORITY = "LOW"
 
 #: Payload schema token for the F4 transition record, independent of the
-#: canonical DB physical schema version.
-OPPORTUNITY_LIFECYCLE_TRANSITION_SCHEMA_TOKEN = "opportunity-lifecycle-transition-v1"
+#: canonical DB physical schema version. ``# nosec B105`` - this is a schema
+#: identifier, not a secret.
+OPPORTUNITY_LIFECYCLE_TRANSITION_SCHEMA_TOKEN = (  # nosec B105
+    "opportunity-lifecycle-transition-v1"
+)
 
 #: ``record_type`` discriminator carried inside the payload.
 OPPORTUNITY_LIFECYCLE_RECORD_TYPE = "opportunity_lifecycle_transition"
@@ -115,7 +118,7 @@ def opportunity_lifecycle_transition_idempotency_key(event_id: str) -> str:
         raise OpportunityPersistenceError("event_id must be a string")
     token = event_id
     prefix = f"{EVENT_ID_PREFIX}:"
-    if token == "" or token != token.strip() or not token.startswith(prefix):
+    if not token or token != token.strip() or not token.startswith(prefix):
         raise OpportunityPersistenceError(
             f"event_id must be a canonical {prefix}<digest> identity"
         )
@@ -238,6 +241,10 @@ def _validate_record(episode: OpportunityEpisode, event: OpportunityLifecycleEve
             raise OpportunityPersistenceError(
                 "OPENED evaluation_time must equal the episode's lifecycle instant"
             )
+        if event.evaluation_time != episode.claim_evaluation_cutoff:
+            raise OpportunityPersistenceError(
+                "an OPENED creation must occur at the claim evaluation cutoff"
+            )
         return
 
     if kind is OpportunityLifecycleEventType.DEFERRED:
@@ -252,6 +259,10 @@ def _validate_record(episode: OpportunityEpisode, event: OpportunityLifecycleEve
         if event.evaluation_time != episode.last_evaluation_time:
             raise OpportunityPersistenceError(
                 "DEFERRED evaluation_time must equal the episode's lifecycle instant"
+            )
+        if event.evaluation_time != episode.claim_evaluation_cutoff:
+            raise OpportunityPersistenceError(
+                "a DEFERRED creation must occur at the claim evaluation cutoff"
             )
         return
 
@@ -329,7 +340,17 @@ def validate_opportunity_transition_record(
     episode = OpportunityEpisode.from_dict(body["episode"])
     event = OpportunityLifecycleEvent.from_dict(body["event"])
     _validate_record(episode, event)
-    return dict(body)
+    # Return a payload rebuilt from the reconstituted objects rather than the
+    # caller's raw mapping, so the durable bytes and the idempotency comparison
+    # are canonical. A producer that submits an equivalent instant as
+    # ``+00:00`` or ``.000Z`` is stored in the canonical bare-``Z`` form, so an
+    # exact replay reproduces the same bytes and reaches DUPLICATE_OK.
+    return {
+        "record_type": OPPORTUNITY_LIFECYCLE_RECORD_TYPE,
+        "schema_version": OPPORTUNITY_LIFECYCLE_TRANSITION_SCHEMA_TOKEN,
+        "episode": episode.to_dict(),
+        "event": event.to_dict(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -419,7 +440,9 @@ def reconstruct_opportunity_transition_history(
     latest: OpportunityEpisode | None = None
     for payload in payloads:
         latest = apply_opportunity_transition_record(latest, payload)
-    assert latest is not None
+    if latest is None:
+        # Unreachable: a non-empty sequence always yields an episode.
+        raise OpportunityPersistenceError("no durable records to reconstruct")
     return latest
 
 
@@ -469,10 +492,13 @@ class OpportunityEpisodeProjection:
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "OpportunityEpisodeProjection":
+        # Tolerant of a generic error envelope (for example a WriterAck-shaped
+        # server error reply, which carries only ``status``/``error_code``): the
+        # read model degrades to a typed RETRYABLE projection instead of raising.
         episode = raw.get("episode")
         return cls(
-            status=str(raw["status"]),
-            episode_id=str(raw["episode_id"]),
+            status=str(raw.get("status") or "RETRYABLE"),
+            episode_id=str(raw.get("episode_id") or ""),
             episode=(
                 OpportunityEpisode.from_dict(episode)
                 if isinstance(episode, Mapping)

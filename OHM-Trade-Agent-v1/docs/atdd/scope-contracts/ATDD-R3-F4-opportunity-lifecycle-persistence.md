@@ -72,7 +72,7 @@ a durable F4 payload built from an episode and its event
 WHEN:
 the payload is validated and reconstituted through strict deserialization
 THEN:
-it reconstructs the exact episode and event, re-running the same constructor invariants and identity checks
+it reconstructs the exact episode and event, re-running the same constructor invariants and identity checks, and the persistence boundary returns a canonical re-serialization rebuilt from the reconstituted objects so equivalent UTC timestamp spellings produce identical durable bytes
 
 AC-005:
 GIVEN:
@@ -164,7 +164,7 @@ it is TERMINAL/EXPIRED with identical fields, the replay is DUPLICATE_OK and exa
 
 AC-016:
 GIVEN:
-a durable payload with a forged episode identity, forged event identity, mismatched event/episode identity or tampered claim lineage
+a durable payload with a forged episode identity, forged event identity, mismatched event/episode identity, tampered claim lineage, or a claim-driven creation whose evaluation instant does not equal the claim evaluation cutoff
 WHEN:
 it is validated at the persistence trust boundary
 THEN:
