@@ -48,6 +48,8 @@ SHADOW / NON-AUTHORITATIVE STATUS. This increment grants no production, admissio
 
 F4 GOVERNANCE HANDOFF (OWNER-authorized, narrow). `tests/test_opip_r3_f4_opportunity_lifecycle.py::test_ac_014_current_vs_target_authority` previously pinned the globally movable ATDD pointer to the F4 opportunity-lifecycle lineage. This OWNER increment removes ONLY that permanent global-pointer ownership assertion. Every substantive AC-014 assertion is preserved: the F4 implementation contract exists; the frozen increment identity is recorded; the contract names the correct increment; the lifecycle module is shadow; the contract module is non-authoritative; there is no production F4 authority; no Feature Bus activation; no consumer cutover. No F4 state semantics, identity, persistence, policy, or runtime is changed.
 
+MOVABLE POINTER GOVERNANCE HANDOFF (OWNER-authorized, `ATDD-SCOPE-MOVABLE-ACTIVE-POINTER-v1`). AC-027 previously required the global `docs/atdd/ACTIVE_INCREMENT` pointer to equal this F5 increment. That repeated the obsolete completed-increment pin, which would block every later approved increment because only one increment can be active at a time. AC-027 now proves F5's own identity from this contract and this test module, requires only that the pointer resolve to an existing scope contract (the R0/R1 pattern), keeps the F4 no-ownership and F4 isolation assertions, and leaves exact current-increment enforcement to `tests/atdd_scope.py` and the `atdd scope` job. A structural guard in `tests/test_atdd_scope_control.py` fails closed if a future increment test reintroduces a global-pointer comparison against its own increment.
+
 NO-NEW-THRESHOLD RULE. F5 introduces no new numeric trading policy and duplicates no threshold. No spread, liquidity, volume, depth, leverage, slippage, confidence, expected-return, or profit threshold is introduced; the seam only re-maps existing evaluator outcomes. Fixtures may use representative values solely to exercise the existing policies.
 
 NO AI. No OpenAI/Anthropic/DeepSeek/Committee import or call, and no AI confidence or recommendation authority.
@@ -283,9 +285,9 @@ AC-027:
 GIVEN:
 the completed F4 opportunity-lifecycle increments and the movable ATDD pointer
 WHEN:
-the F5 increment becomes active
+the F5 increment has become active and later completes
 THEN:
-the ATDD pointer names this F5 increment, the F4 lifecycle test no longer owns or pins the global pointer value, and every substantive F4 AC-014 isolation assertion is preserved
+F5's own identity is proven from its own scope contract and test module rather than from the global pointer, the pointer is not pinned to F5 and need only resolve to an existing scope contract, the F4 lifecycle test no longer owns or pins the global pointer value, and every substantive F4 AC-014 isolation assertion is preserved
 
 AC-028:
 GIVEN:
