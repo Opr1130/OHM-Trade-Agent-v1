@@ -420,6 +420,112 @@ def test_cursor_boundary(tmp_path, monkeypatch, case):
 
 
 @pytest.mark.acceptance
+@pytest.mark.parametrize("case", ["success", "runtime_drift", "wrong_layout", "wrapper", "missing_entrypoint", "link"])
+def test_cursor_packaged_windows_runtime(tmp_path, monkeypatch, case):
+    """ATDD-BRIDGE-v1/AC-016: official Windows package runs pinned node+index, never wrappers."""
+    monkeypatch.setenv("CURSOR_API_KEY", "synthetic-cursor-auth")
+    runtime = tmp_path / "2026.09.28-64d2043"
+    runtime.mkdir()
+    node = runtime / "node.exe"
+    entrypoint = runtime / "index.js"
+    chunk = runtime / "1124.index.js"
+    node.write_bytes(b"synthetic node")
+    entrypoint.write_text("require('./1124.index.js')", encoding="utf-8")
+    chunk.write_text("module.exports = {}", encoding="utf-8")
+    (runtime / "cursorsandbox.exe").write_bytes(b"synthetic sandbox")
+    running = runtime / ".running"
+    running.mkdir()
+    (running / "transient").write_text("one", encoding="utf-8")
+
+    runtime_hash = b.cursor_runtime_digest(runtime)
+    # The vendor's transient marker is deliberately the only excluded subtree.
+    (running / "transient").write_text("two", encoding="utf-8")
+    assert b.cursor_runtime_digest(runtime) == runtime_hash
+
+    config = {
+        "enable_execution": True,
+        "cursor_executable": str(node),
+        "cursor_sha256": b.digest(node.read_bytes()),
+        "cursor_runtime_root": str(runtime),
+        "cursor_runtime_sha256": runtime_hash,
+        "state_dir": str(tmp_path),
+        "cursor_timeout_seconds": 1,
+    }
+    if case == "runtime_drift":
+        chunk.write_text("module.exports = {changed:true}", encoding="utf-8")
+    elif case == "wrong_layout":
+        other = tmp_path / "node.exe"
+        other.write_bytes(node.read_bytes())
+        config["cursor_executable"] = str(other)
+        config["cursor_sha256"] = b.digest(other.read_bytes())
+    elif case == "wrapper":
+        wrapper = tmp_path / "agent.cmd"
+        wrapper.write_text("@echo off", encoding="utf-8")
+        config["cursor_executable"] = str(wrapper)
+        config["cursor_sha256"] = b.digest(wrapper.read_bytes())
+    elif case == "missing_entrypoint":
+        entrypoint.unlink()
+
+    if case == "link":
+        real_lstat = Path.lstat
+        def linked_lstat(self, *args, **kwargs):
+            info = real_lstat(self, *args, **kwargs)
+            if self == chunk:
+                from types import SimpleNamespace
+                return SimpleNamespace(st_mode=b.stat.S_IFLNK, st_size=info.st_size,
+                                       st_file_attributes=0)
+            return info
+        monkeypatch.setattr(Path, "lstat", linked_lstat)
+
+    calls = []
+    class Process:
+        returncode = 0
+        pid = 42
+        def __init__(self, argv, **kw):
+            calls.append(argv)
+            assert argv[:2] == [str(node), str(entrypoint)]
+            assert argv[2:] == ["--print", "--mode", "ask", "--sandbox", "enabled",
+                                "--output-format", "json"]
+            assert kw["shell"] is False
+            assert kw["env"]["CURSOR_INVOKED_AS"] == "agent.cmd"
+            assert "PATH" not in kw["env"] and "GH_TOKEN" not in kw["env"]
+            result = {"type": "result", "subtype": "success", "is_error": False,
+                      "result": '{"conflict":false,"edits":[]}' }
+            kw["stdout"].write(json.dumps(result).encode())
+            kw["stdout"].flush()
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def poll(self):
+            return self.returncode
+        def kill(self):
+            self.returncode = -9
+        def wait(self, timeout=None):
+            return self.returncode
+
+    monkeypatch.setattr(b.subprocess, "Popen", Process)
+    monkeypatch.setattr(b.subprocess, "run", lambda *a, **k: None)
+    if case == "success":
+        assert b.cursor(config, fixture_task(), {}, "contract")["conflict"] is False
+    else:
+        with pytest.raises(b.Stop):
+            b.cursor(config, fixture_task(), {}, "contract")
+    assert bool(calls) == (case == "success")
+
+    if case == "success":
+        config_file = tmp_path / "packaged.json"
+        local = dict(config, worktree=str(tmp_path / "tree"), dispatch_ids=[])
+        (tmp_path / "tree").mkdir()
+        config_file.write_text(json.dumps(local), encoding="utf-8")
+        assert b.config_file(config_file)["cursor_runtime_sha256"] == runtime_hash
+        local.pop("cursor_runtime_sha256")
+        config_file.write_text(json.dumps(local), encoding="utf-8")
+        with pytest.raises(b.Stop, match="INVALID_SCHEMA"):
+            b.config_file(config_file)
+
+
+@pytest.mark.acceptance
 @pytest.mark.parametrize("case", ["valid", "conflict", "extra", "duplicate", "delete", "binary", "hash", "changed",
                                   "outside", "secret", "partial", "add"])
 def test_proposal_boundary(tmp_path, case, monkeypatch):
