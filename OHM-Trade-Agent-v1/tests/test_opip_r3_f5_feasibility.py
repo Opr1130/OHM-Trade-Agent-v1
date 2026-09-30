@@ -997,6 +997,33 @@ def test_ac_018_malformed_required_evidence_fails_structurally() -> None:
     with pytest.raises(FeasibilityContractError):
         seam.evaluate_feasibility(episode, wrong_execution_type, CUTOFF, POLICY)
 
+    # A VALID execution with explicitly unavailable coverage, or missing the
+    # fields the quality route reads, is refused.
+    valid_unavailable_book = snapshot(
+        market=market_validation(),
+        execution=replace(execution_validation(), book_coverage_status="UNAVAILABLE"),
+    )
+    with pytest.raises(FeasibilityContractError):
+        seam.evaluate_feasibility(episode, valid_unavailable_book, CUTOFF, POLICY)
+    valid_missing_spread = snapshot(
+        market=market_validation(),
+        execution=replace(execution_validation(), spread_bps=None),
+    )
+    with pytest.raises(FeasibilityContractError):
+        seam.evaluate_feasibility(episode, valid_missing_spread, CUTOFF, POLICY)
+
+    # A case-folded SHORT margin token is refused (the producer emits exact
+    # uppercase tokens only).
+    lowercase_margin = snapshot(
+        direction="SHORT",
+        market=market_validation(),
+        execution=execution_validation(),
+        margin_status="eligible",
+        margin_eligible=True,
+    )
+    with pytest.raises(FeasibilityContractError):
+        seam.evaluate_feasibility(episode, lowercase_margin, CUTOFF, POLICY)
+
     # Wrong evidence type, unsupported version and naive time all fail closed.
     with pytest.raises(FeasibilityContractError):
         seam.evaluate_feasibility(episode, {"market": "PASS"}, CUTOFF, POLICY)

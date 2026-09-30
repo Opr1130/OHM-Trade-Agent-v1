@@ -533,7 +533,9 @@ def _margin_check(
             raise FeasibilityContractError(
                 "SHORT margin_validation_status must be whitespace-free"
             )
-        if raw.upper() not in {
+        # The producer emits exact uppercase tokens; a case-folded or unknown
+        # token is malformed and fails closed rather than being normalized.
+        if raw not in {
             MARGIN_ELIGIBLE,
             MARGIN_INELIGIBLE,
             MARGIN_UNAVAILABLE,
@@ -547,7 +549,7 @@ def _margin_check(
         eligible_flag = getattr(snapshot, "margin_eligible", None)
         if not isinstance(eligible_flag, bool):
             raise FeasibilityContractError("SHORT margin_eligible must be a bool")
-        if eligible_flag is not (raw.upper() == MARGIN_ELIGIBLE):
+        if eligible_flag is not (raw == MARGIN_ELIGIBLE):
             raise FeasibilityContractError(
                 "SHORT margin_validation_status contradicts the margin_eligible flag"
             )
@@ -605,15 +607,32 @@ def _validate_execution_fields(execution: Any) -> None:
             f"execution status has an unsupported token: {status!r}"
         )
     coverage = getattr(execution, "book_coverage_status", None)
-    if coverage not in {
-        execution_evidence.COMPLETE,
-        execution_evidence.PARTIAL,
-        execution_evidence.INSUFFICIENT,
-        execution_evidence.UNAVAILABLE,
-    }:
-        raise FeasibilityContractError(
-            f"execution book_coverage_status has an unsupported token: {coverage!r}"
-        )
+    if status == execution_evidence.VALID:
+        # A usable record must prove liquidity: an explicitly unavailable book
+        # cannot be a VALID record, and the fields the quality route reads must
+        # be present.
+        if coverage not in {
+            execution_evidence.COMPLETE,
+            execution_evidence.PARTIAL,
+            execution_evidence.INSUFFICIENT,
+        }:
+            raise FeasibilityContractError(
+                "a VALID execution record must carry measured book coverage"
+            )
+        for field_name in (
+            "spread_bps",
+            "buy_visible_coverage_pct",
+            "sell_visible_coverage_pct",
+        ):
+            if getattr(execution, field_name, None) is None:
+                raise FeasibilityContractError(
+                    f"a VALID execution record requires {field_name}"
+                )
+    else:
+        if coverage != execution_evidence.UNAVAILABLE:
+            raise FeasibilityContractError(
+                "an UNAVAILABLE/INVALID execution record must carry UNAVAILABLE coverage"
+            )
     recent = getattr(execution, "recent_trade_status", None)
     if recent not in {
         execution_evidence.FRESH,
