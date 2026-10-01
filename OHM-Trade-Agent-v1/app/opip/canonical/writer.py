@@ -1271,6 +1271,13 @@ class CanonicalWriter:
                         ),
                         "execution_attempt": attempt,
                         "quote_evidence": self._load_quote_evidence_by_id(quote_ref),
+                        # R4-B0: the committed ENTRY order intent carries the
+                        # ancestry-bound side, so recovery fills on the correct
+                        # book side (BUY into the ask, simulated SELL into the bid)
+                        # instead of assuming a long entry.
+                        "entry_order_intent": self._optional_paper_event_by_identity(
+                            PAPER_ORDER_INTENT_RECORDED, order_id
+                        ),
                     }
                 )
         entries.sort(key=lambda entry: entry["paper_trade_id"])
