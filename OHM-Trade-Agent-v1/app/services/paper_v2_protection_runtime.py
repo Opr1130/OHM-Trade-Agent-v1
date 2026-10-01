@@ -92,10 +92,54 @@ from app.services.paper_v2_execution import (
 )
 from app.services.paper_v2_pretrade_adapter import system_utc_clock
 
-#: Long-only Paper v2 exits by selling, so the executable price is the book's bid.
-EXIT_SIDE = "SELL"
+#: Paper v2 legs by direction. A LONG opens by buying and closes by selling; a
+#: simulated SHORT opens by selling and covers by buying. Simulation only: no
+#: borrow, margin, leverage or funded/exchange authority is implied.
+EXIT_SIDE_LONG = "SELL"
+EXIT_SIDE_SHORT = "BUY"
 EXIT_INTENT_ROLE = "EXIT"
 EXIT_REASON_CODE = "PROTECTION_ACTION"
+
+
+def _direction_of(item: Any) -> str:
+    """The direction of a protection work item, failing closed if unprovable.
+
+    The direction is a committed-ancestry fact projected by the canonical writer
+    (R4-B0); it is never inferred from current market state.
+    """
+    from app.opip.contracts.paper_execution_runtime import require_paper_direction
+
+    try:
+        return require_paper_direction(str(getattr(item, "direction", "") or "LONG"))
+    except ValueError as exc:
+        raise PaperV2ProtectionError(
+            "protection item direction cannot be established from committed ancestry"
+        ) from exc
+
+
+def _exit_side_for(direction: str) -> str:
+    return EXIT_SIDE_SHORT if direction == "SHORT" else EXIT_SIDE_LONG
+
+
+def _executable_exit_price(quote: Mapping[str, Any], *, exit_side: str) -> float:
+    """The executable price for an EXIT on the committed book.
+
+    A SELL (long close) receives the bid; a BUY (short cover) pays the ask.
+    """
+    if exit_side == EXIT_SIDE_LONG:
+        return float(quote["best_bid"])
+    if exit_side == EXIT_SIDE_SHORT:
+        return float(quote["best_ask"])
+    raise PaperV2ProtectionError(f"unsupported EXIT side: {exit_side!r}")
+
+
+def _executable_exit_quantity(quote: Mapping[str, Any], *, exit_side: str) -> float:
+    """The displayed depth on the side an EXIT would consume."""
+    if exit_side == EXIT_SIDE_LONG:
+        return float(quote["bid_quantity"])
+    if exit_side == EXIT_SIDE_SHORT:
+        return float(quote["ask_quantity"])
+    raise PaperV2ProtectionError(f"unsupported EXIT side: {exit_side!r}")
 
 #: Deterministic trigger precedence when several conditions hold at once.
 #:
@@ -406,7 +450,10 @@ def _evaluate_and_trigger(
         settings=settings,
         clock=clock,
     )
-    decision = _evaluate_trigger(item, plan=plan, quote=quote, now=received_at)
+    direction = _direction_of(item)
+    decision = _evaluate_trigger(
+        item, plan=plan, quote=quote, now=received_at, direction=direction
+    )
     if decision is None:
         return "ARMED"
     trigger_type, exit_quantity, reference_price = decision
@@ -430,6 +477,7 @@ def _evaluate_and_trigger(
         quote=(quote if trigger_type in {"STOP", "TARGET"} else None),
         moment=moment,
         client=client,
+        direction=direction,
     )
     return "TRIGGERED"
 
@@ -440,6 +488,7 @@ def _evaluate_trigger(
     plan: Mapping[str, Any],
     quote: Mapping[str, Any],
     now: datetime,
+    direction: str = "LONG",
 ) -> tuple[str, float, float] | None:
     """The first condition that holds, in frozen conservative precedence order.
 
@@ -447,22 +496,40 @@ def _evaluate_trigger(
     claims the full remaining quantity; TARGET claims only the eligible target's
     configured fraction of the *original* entry, never the remainder; TIME claims
     the full remaining quantity once the committed plan expiry has elapsed.
+
+    R4-B0: the executable price and every comparator follow the direction. A LONG
+    exits by selling into the bid and is stopped when the bid falls to the stop /
+    targeted when the bid rises to the target. A simulated SHORT covers by buying
+    into the ask and is stopped when the ask rises to the stop / targeted when the
+    ask falls to the target.
     """
-    bid = float(quote["best_bid"])
+    exit_side = _exit_side_for(direction)
+    price = _executable_exit_price(quote, exit_side=exit_side)
+    is_long = direction != "SHORT"
     for trigger_type in TRIGGER_PRECEDENCE:
         if trigger_type == "STOP":
-            if bid <= float(plan["stop_price"]) + QUANTITY_TOLERANCE:
-                return "STOP", item.remaining_quantity, bid
+            stop_price = float(plan["stop_price"])
+            if is_long:
+                if price <= stop_price + QUANTITY_TOLERANCE:
+                    return "STOP", item.remaining_quantity, price
+            elif price >= stop_price - QUANTITY_TOLERANCE:
+                return "STOP", item.remaining_quantity, price
         elif trigger_type == "TARGET":
-            eligible = _eligible_target(item, plan)
+            eligible = _eligible_target(item, plan, direction=direction)
             if eligible is None:
                 continue
-            if bid >= float(eligible["price"]) - QUANTITY_TOLERANCE:
+            target_price = float(eligible["price"])
+            reached = (
+                price >= target_price - QUANTITY_TOLERANCE
+                if is_long
+                else price <= target_price + QUANTITY_TOLERANCE
+            )
+            if reached:
                 cap = min(
                     float(eligible["fraction"]) * item.entry_quantity,
                     item.remaining_quantity,
                 )
-                return "TARGET", cap, bid
+                return "TARGET", cap, price
         else:
             if _expiry_reached(plan, now):
                 return "TIME", item.remaining_quantity, float(plan["stop_price"])
@@ -470,18 +537,27 @@ def _evaluate_trigger(
 
 
 def _eligible_target(
-    item: PaperV2ProtectionWorkItem, plan: Mapping[str, Any]
+    item: PaperV2ProtectionWorkItem,
+    plan: Mapping[str, Any],
+    *,
+    direction: str = "LONG",
 ) -> dict[str, Any] | None:
-    """The next unconsumed target, in the frozen ascending-price order.
+    """The next unconsumed target, in the frozen profit order for the direction.
 
     Mirrors the writer's own derivation: each committed TARGET trigger for this plan
-    consumes one target in ascending ``(price, target_id)`` order, so the next one in
-    that order is the only eligible target and no target can exit twice.
+    consumes one target in profit order, so the next one in that order is the only
+    eligible target and no target can exit twice. A LONG profits as price rises
+    (ascending order, unchanged); a simulated SHORT profits as price falls, so the
+    nearest target is the highest price and targets are consumed in descending order.
     """
+    ascending = direction != "SHORT"
     plan_id = str(plan["protection_plan_id"])
     targets = sorted(
         (dict(target) for target in plan["targets"]),
-        key=lambda target: (float(target["price"]), str(target["target_id"])),
+        key=lambda target: (
+            float(target["price"]) * (1 if ascending else -1),
+            str(target["target_id"]),
+        ),
     )
     consumed = sum(
         1
@@ -520,6 +596,7 @@ def _commit_protection_action(
     quote: Mapping[str, Any] | None,
     moment: datetime,
     client: Any,
+    direction: str = "LONG",
 ) -> None:
     """Build and submit the atomic protection action - the only way to trigger.
 
@@ -576,7 +653,7 @@ def _commit_protection_action(
         "decision_context_id": item.decision_context_id,
         "intent_seq": len(item.exit_order_intents),
         "intent_role": EXIT_INTENT_ROLE,
-        "side": EXIT_SIDE,
+        "side": _exit_side_for(direction),
         "order_type": "MARKET",
         "requested_quantity": exit_quantity,
         "requested_notional": exit_quantity * float(reference_price),
@@ -702,6 +779,8 @@ def _execute_exit_order(
     order_id = str(order["order_intent_id"])
     requested = float(order["requested_quantity"])
     target = _quote_target(item)
+    direction = _direction_of(item)
+    exit_side = _exit_side_for(direction)
     quote, received_at = commit_execution_quote(
         target,
         client=client,
@@ -709,9 +788,9 @@ def _execute_exit_order(
         settings=settings,
         clock=clock,
     )
-    if requested > float(quote["bid_quantity"]) + QUANTITY_TOLERANCE:
+    if requested > _executable_exit_quantity(quote, exit_side=exit_side) + QUANTITY_TOLERANCE:
         raise ExecutionRetryRequired(
-            "committed EXIT quantity exceeds displayed bid depth; retry later"
+            "committed EXIT quantity exceeds displayed exit-side depth; retry later"
         )
     # Causal floor: an EXIT attempt cannot be recorded before the trigger and EXIT
     # intent that authorized it. A clock behind that floor must be retried rather
@@ -794,7 +873,9 @@ def _write_exit_fill(
             "committed EXIT quote evidence is unavailable for the attempt"
         )
     quantity = float(attempt["accepted_quantity"])
-    price = float(resolved["best_bid"])
+    direction = _direction_of(item)
+    exit_side = _exit_side_for(direction)
+    price = _executable_exit_price(resolved, exit_side=exit_side)
     economics = paper_economics_for_version(PAPER_ECONOMIC_MODEL_VERSION)
     cost = economics.cost_components(quantity, price)
     attempt_floor = temporal_instant(attempt["attempt_time"], field_name="attempt_time")
@@ -814,7 +895,7 @@ def _write_exit_fill(
         "order_intent_id": order_id,
         "paper_trade_id": item.paper_trade_id,
         "fill_seq": 0,
-        "side": EXIT_SIDE,
+        "side": exit_side,
         "quantity": quantity,
         "price": price,
         "fee_cost": cost["fee_cost"],
@@ -851,6 +932,8 @@ def _commit_residual_plan(
     """
     plan = item.protection_plan or {}
     plan_id = str(plan["protection_plan_id"])
+    direction = _direction_of(item)
+    ascending = direction != "SHORT"
     consumed = sum(
         1
         for trigger in item.triggers
@@ -859,7 +942,10 @@ def _commit_residual_plan(
     )
     targets = sorted(
         (dict(target) for target in plan["targets"]),
-        key=lambda target: (float(target["price"]), str(target["target_id"])),
+        key=lambda target: (
+            float(target["price"]) * (1 if ascending else -1),
+            str(target["target_id"]),
+        ),
     )
     residual_targets = targets[consumed:]
     if not residual_targets:

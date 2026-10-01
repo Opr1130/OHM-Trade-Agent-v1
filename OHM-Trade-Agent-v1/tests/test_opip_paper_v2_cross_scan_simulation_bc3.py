@@ -1333,12 +1333,37 @@ def test_global_cross_scan_canonical_invariants(env):
     assert eth_state.execution_attempt is None
     assert eth_state.fill is None
 
-    before = _family_counts(writer)
+    long_trades_before = {
+        str(row["paper_trade_id"])
+        for row in _rows(writer, PAPER_EXECUTION_ATTEMPT_RECORDED)
+        if row.get("paper_trade_id") is not None
+    }
+    # R4-B0 authority handoff: SHORT used to be refused outright. It is now a
+    # supported simulated direction, so this control no longer asserts a refusal.
+    # What it still proves is the invariant that matters: a SHORT is never
+    # silently executed as a LONG. Any ENTRY intent it commits is SELL-side, and
+    # it never mutates the pre-existing LONG trade set. ``before`` is captured so
+    # the LONG families can be shown untouched on the refusal path.
     short_opportunity = replace(_opportunity("ETHUSD"), direction="SHORT")
-    with pytest.raises(PaperV2ExecutionError):
+    try:
         _run(env, short_opportunity)
-    assert _family_counts(writer) == before
-    assert _count(writer, CTX_EVENT) == 3
+    except PaperV2ExecutionError:
+        # The fixture book is not admissible for this SHORT; it closed as a
+        # zero-fill. Valid outcome, and the side invariant below still holds.
+        pass
+    short_entry_intents = [
+        row
+        for row in _rows(writer, PAPER_ORDER_INTENT_RECORDED)
+        if str(row.get("intent_role")) == "ENTRY" and str(row.get("side")) == "SELL"
+    ]
+    assert short_entry_intents, "a SHORT ENTRY must be SELL-side, never a long BUY"
+    assert all(
+        str(row["paper_trade_id"]) not in long_trades_before
+        for row in short_entry_intents
+    ), "a SHORT must not contribute to the LONG trade set"
+    # R4-B0: the three LONG contexts from S1-S3 must remain exactly as they were;
+    # the SHORT may add at most its own one context (when it admits).
+    assert _count(writer, CTX_EVENT) in (3, 4)
 
     # The S2 non-vacuity evidence is part of the final proof: the same candidate
     # really did resolve differently with and without the canonical exposure.

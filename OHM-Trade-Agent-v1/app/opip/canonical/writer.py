@@ -78,7 +78,7 @@ from app.opip.contracts.paper_v2_identity import (
 )
 from app.opip.contracts.paper_execution_runtime import (
     PAPER_ACTION_ARMED_STATES,
-    PAPER_ACTION_EXIT_SIDE,
+    PAPER_DIRECTION_LONG,
     PAPER_ADMISSION_REQUEST_RECORDED,
     PAPER_DECISION_SNAPSHOT_RECORDED,
     PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES,
@@ -97,6 +97,7 @@ from app.opip.contracts.paper_execution_runtime import (
     decision_snapshot_idempotency_key,
     expected_paper_side,
     paper_trade_direction_contract,
+    require_paper_direction,
     protection_action_idempotency_key,
     protection_transition_allowed,
     protection_transition_requires_trigger,
@@ -285,6 +286,19 @@ ACCEPTED_EVENT_TYPES = (
     | PAPER_V2_WRITER_EVENT_TYPES
     | opportunity_persistence_contract.OPPORTUNITY_LIFECYCLE_EVENT_TYPES
 )
+
+
+def _exit_executable_price(quote: Mapping[str, object], *, exit_side: str) -> float:
+    """The executable price for an EXIT on the committed book.
+
+    A SELL (long close) receives the bid; a BUY (short cover) pays the ask.
+    Reading the wrong side would fabricate a price the book never offered.
+    """
+    if exit_side == "SELL":
+        return float(quote["best_bid"])
+    if exit_side == "BUY":
+        return float(quote["best_ask"])
+    raise ValueError(f"unsupported EXIT side: {exit_side!r}")
 
 
 def _utc_now() -> str:
@@ -1149,9 +1163,11 @@ class CanonicalWriter:
                     disposition_id=disposition_id,
                     symbol=self._decision_symbol_for_trade(paper_trade_id),
                     quote_currency=str(disposition.get("quote_currency") or ""),
-                    # This frozen engine is long-only; the direction is a property
-                    # of the engine rather than of the disposition payload.
-                    direction="LONG",
+                    # R4-B0: direction is a property of the admitted trade's
+                    # committed ancestry, not of the engine. A historical v1
+                    # admission with no direction field reads as LONG under the
+                    # narrow rule; a direction-contract admission must declare it.
+                    direction=paper_trade_direction_contract(disposition),
                     filled_quantity=float(totals["entry_quantity"]),
                     exited_quantity=float(totals["exit_quantity"]),
                     remaining_quantity=float(totals["remaining_quantity"]),
@@ -1834,6 +1850,10 @@ class CanonicalWriter:
                 or str(disposition.get("quote_currency") or "")
                 or None
             ),
+            # R4-B0: direction comes from the committed admission ancestry, so
+            # protection derives the correct exit side and comparators without
+            # ever inferring a direction from current market state.
+            direction=paper_trade_direction_contract(disposition),
             instrument_version=instrument_version,
             native_symbol=native_symbol,
             entry_quantity=float(totals["entry_quantity"]),
@@ -4349,19 +4369,30 @@ class CanonicalWriter:
         plan: Mapping[str, object],
         *,
         plan_id: str,
+        direction: str = PAPER_DIRECTION_LONG,
     ) -> dict:
         """Deterministically derive the uniquely eligible next target.
 
         The frozen trigger contract deliberately carries no target identity, so
         eligibility is derived from canonical evidence rather than invented: every
-        committed TARGET trigger for this plan consumes one target in ascending
-        price order, and the next target in that order is the only eligible one.
-        Taking the lowest *untriggered* target is what stops one target's crossing
+        committed TARGET trigger for this plan consumes one target in *profit
+        order*, and the next target in that order is the only eligible one.
+        Taking the nearest untriggered target is what stops one target's crossing
         from authorising an arbitrary or full-position exit.
+
+        R4-B0: profit order follows the direction. A LONG profits as price rises,
+        so targets are consumed in ascending price order (unchanged from the frozen
+        long-only rule). A simulated SHORT profits as price falls, so the nearest
+        target is the highest price and targets are consumed in descending order.
         """
+        resolved = require_paper_direction(direction)
+        ascending = resolved == PAPER_DIRECTION_LONG
         targets = sorted(
             (dict(target) for target in plan["targets"]),
-            key=lambda target: (float(target["price"]), str(target["target_id"])),
+            key=lambda target: (
+                float(target["price"]) * (1 if ascending else -1),
+                str(target["target_id"]),
+            ),
         )
         consumed = sum(
             1
@@ -4410,31 +4441,50 @@ class CanonicalWriter:
             execution_time_field="trigger_time",
         )
         # A valid lineage quote is necessary but not sufficient: the quote must
-        # itself prove the configured threshold was crossed. This trade is
-        # long-only and exits by selling, so the authoritative executable price is
-        # the quote's best bid, and reference_price must be exactly that price
-        # rather than a caller-chosen level the market never traded.
-        executable_price = float(quote["best_bid"])
+        # itself prove the configured threshold was crossed. The authoritative
+        # executable price and the comparator both follow the *direction* of the
+        # admitted trade (R4-B0): a LONG exits by selling into the bid and is
+        # stopped when the bid falls to the stop; a simulated SHORT covers by
+        # buying into the ask and is stopped when the ask rises to the stop.
+        direction = paper_trade_direction_contract(admission)
+        exit_side = expected_paper_side(direction, "EXIT")
+        executable_price = _exit_executable_price(quote, exit_side=exit_side)
         reference_price = float(payload["reference_price"])
         if abs(reference_price - executable_price) > _QUANTITY_TOLERANCE:
             raise ValueError(
                 "protection trigger reference_price must equal the executable "
                 "quote price for the cited evidence"
             )
+        is_long = direction == PAPER_DIRECTION_LONG
         if trigger_type == "STOP":
-            if executable_price > float(plan["stop_price"]) + _QUANTITY_TOLERANCE:
+            stop_price = float(plan["stop_price"])
+            crossed = (
+                executable_price <= stop_price + _QUANTITY_TOLERANCE
+                if is_long
+                else executable_price >= stop_price - _QUANTITY_TOLERANCE
+            )
+            if not crossed:
                 raise ValueError(
-                    "STOP trigger requires a quote at or below the configured "
-                    "stop_price"
+                    "STOP trigger requires a quote at or "
+                    + ("below" if is_long else "above")
+                    + " the configured stop_price"
                 )
             return None
         eligible = self._eligible_target(
-            plan, plan_id=str(payload["protection_plan_id"])
+            plan,
+            plan_id=str(payload["protection_plan_id"]),
+            direction=direction,
         )
-        if executable_price < float(eligible["price"]) - _QUANTITY_TOLERANCE:
+        target_price = float(eligible["price"])
+        if is_long:
+            reached = executable_price >= target_price - _QUANTITY_TOLERANCE
+        else:
+            reached = executable_price <= target_price + _QUANTITY_TOLERANCE
+        if not reached:
             raise ValueError(
-                "TARGET trigger requires a quote at or above the eligible "
-                "target price"
+                "TARGET trigger requires a quote at or "
+                + ("above" if is_long else "below")
+                + " the eligible target price"
             )
         return eligible
 
@@ -4568,7 +4618,11 @@ class CanonicalWriter:
             raise ValueError("protection action requires positive canonical exposure")
 
         # F. the EXIT intent must reduce exposure without over-closing it.
-        self._validate_action_exit_intent(exit_order_intent, capacity)
+        self._validate_action_exit_intent(
+            exit_order_intent,
+            capacity,
+            direction=paper_trade_direction_contract(admission),
+        )
 
         # E and G. frozen trigger evidence, B/C-1 order-intent ancestry, and
         # trigger sequence monotonicity. The trigger validation returns the
@@ -4591,14 +4645,16 @@ class CanonicalWriter:
         self,
         exit_order_intent: Mapping[str, object],
         capacity: Mapping[str, object],
+        *,
+        direction: str = PAPER_DIRECTION_LONG,
     ) -> None:
-        """An action exit must sell, be positive, and fit the available capacity."""
+        """An action exit must use the direction's exit side, be positive, and fit capacity."""
         if str(exit_order_intent["intent_role"]) != "EXIT":
             raise ValueError("protection action requires an EXIT order intent")
-        if str(exit_order_intent["side"]) != PAPER_ACTION_EXIT_SIDE:
+        expected_side = expected_paper_side(direction, "EXIT")
+        if str(exit_order_intent["side"]) != expected_side:
             raise ValueError(
-                "protection action EXIT intent must use side "
-                f"{PAPER_ACTION_EXIT_SIDE}"
+                f"protection action EXIT intent must use side {expected_side}"
             )
         requested_quantity = float(exit_order_intent["requested_quantity"])
         if requested_quantity <= 0:

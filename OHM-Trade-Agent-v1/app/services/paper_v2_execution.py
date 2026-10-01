@@ -118,16 +118,16 @@ from app.services.paper_v2_quote_evidence import (
 #: placeholder; the build and process identity are obtained by the producer itself.
 PRODUCING_COMPONENT = "paper_v2_execution"
 
-#: R4-B0 Decision 6 defines the simulated LONG/SHORT direction contract, and the
-#: ENTRY/EXIT side matrix plus the writer ancestry enforcement are in place. The
-#: execution boundary is deliberately still LONG-only in this increment: enabling a
-#: SHORT *entry* before the SHORT *protection* semantics (inverse stop/target and
-#: BUY-to-cover on the ask) are implemented and tested would create a position the
-#: protection runtime would manage with LONG logic. SHORT becomes reachable only
-#: when that pair lands together.
+#: R4-B0 Decision 6: Paper v2 models simulated LONG and SHORT exposure. SHORT
+#: became reachable only together with the direction-correct protection runtime
+#: (inverse stop/target and BUY-to-cover on the ask), so no short position can
+#: exist that protection would manage with LONG logic. Simulation only: no borrow,
+#: margin, leverage or funded/exchange authority anywhere on this path.
 OPPORTUNITY_DIRECTION_LONG = "LONG"
 OPPORTUNITY_DIRECTION_SHORT = "SHORT"
-SUPPORTED_OPPORTUNITY_DIRECTIONS = frozenset({OPPORTUNITY_DIRECTION_LONG})
+SUPPORTED_OPPORTUNITY_DIRECTIONS = frozenset(
+    {OPPORTUNITY_DIRECTION_LONG, OPPORTUNITY_DIRECTION_SHORT}
+)
 
 #: Terminal, non-continuing admission outcomes. Each stops this opportunity.
 STOP_DISPOSITIONS = frozenset({"CAPACITY_REJECTED", "CAPITAL_REJECTED"})
