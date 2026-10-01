@@ -240,6 +240,25 @@ def test_ac_001_malformed_state_fails_closed(raw):
     assert evidence.reason_code == readiness.REASON_MODE_UNAVAILABLE
 
 
+def test_ac_001_repository_default_is_not_live_mode_evidence():
+    """ATDD-R4-F8-paper-v2-cutover-readiness/AC-001: a settings field default is not observed live evidence."""
+    from app.core.config import Settings
+
+    defaulted = Settings(_env_file=None, webhook_secret="x" * 20)
+    assert "opip_paper_v2_mode" not in defaulted.model_fields_set
+    assert (
+        readiness.observe_mode_evidence(defaulted).status
+        == readiness.EVIDENCE_UNAVAILABLE
+    )
+
+    explicit = Settings(
+        _env_file=None, webhook_secret="x" * 20, opip_paper_v2_mode="off"
+    )
+    evidence = readiness.observe_mode_evidence(explicit)
+    assert evidence.status == readiness.EVIDENCE_READY
+    assert evidence.mode == "off"
+
+
 def test_ac_001_report_contains_no_environment_or_secrets(monkeypatch):
     """ATDD-R4-F8-paper-v2-cutover-readiness/AC-001: the report never dumps the environment or a secret."""
     sentinel = "SENTINEL_SECRET_VALUE_1234567890"

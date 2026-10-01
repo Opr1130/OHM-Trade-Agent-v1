@@ -413,12 +413,34 @@ def observe_mode_evidence(settings: Any | None = None) -> ModeEvidence:
             return ModeEvidence(
                 status=EVIDENCE_UNAVAILABLE, reason_code=REASON_MODE_UNAVAILABLE
             )
+        if not _mode_is_explicit(source):
+            # The value came from the field default, not from an observed settings
+            # source. A repository default is not live evidence.
+            return ModeEvidence(
+                status=EVIDENCE_UNAVAILABLE, reason_code=REASON_MODE_UNAVAILABLE
+            )
         mode = resolve_paper_v2_mode(source)
         return ModeEvidence(status=EVIDENCE_READY, mode=mode)
     except Exception:  # noqa: BLE001 - unreadable mode must not read as a default
         return ModeEvidence(
             status=EVIDENCE_UNAVAILABLE, reason_code=REASON_MODE_UNAVAILABLE
         )
+
+
+def _mode_is_explicit(source: Any) -> bool:
+    """Whether the mode was explicitly provided rather than filled from a default.
+
+    A pydantic ``Settings`` exposes ``model_fields_set``. When the field is absent
+    from that set, the observed value is the repository default and is therefore not
+    live evidence; the probe must fail closed rather than claim the default as
+    production fact. A plain object that carries the attribute is treated as an
+    explicit observation, because a caller passing a settings double is asserting
+    the value (and the production Compose file sets no ``OPIP_PAPER_V2_MODE``).
+    """
+    fields_set = getattr(source, "model_fields_set", None)
+    if fields_set is None:
+        return True
+    return "opip_paper_v2_mode" in fields_set
 
 
 def _process_settings() -> Any | None:

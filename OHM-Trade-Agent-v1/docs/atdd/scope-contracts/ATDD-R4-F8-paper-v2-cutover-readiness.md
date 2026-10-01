@@ -30,7 +30,7 @@ the bounded live-evidence probe
 WHEN:
 the Paper-v2 mode is observed
 THEN:
-a value is evidence only when read from an explicit settings source, a missing or malformed value fails closed as UNAVAILABLE rather than the default, and the report never dumps the environment or a secret
+a value is evidence only when read from an explicit settings source rather than from a field default, a missing, defaulted or malformed value fails closed as UNAVAILABLE rather than the default, and the report never dumps the environment or a secret
 
 AC-002:
 GIVEN:
@@ -152,6 +152,7 @@ ACCEPTANCE TEST TRACEABILITY:
 AC-001 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_001_default_is_not_live_evidence
 AC-001 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_001_malformed_state_fails_closed
 AC-001 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_001_missing_state_is_unavailable
+AC-001 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_001_repository_default_is_not_live_mode_evidence
 AC-001 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_001_report_contains_no_environment_or_secrets
 AC-002 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_002_drain_draining_while_any_obligation_remains
 AC-002 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_002_drain_ready_when_legacy_empty
