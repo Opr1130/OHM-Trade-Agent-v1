@@ -57,6 +57,7 @@ jobs:
           bash -n deploy/remote/reconcile-stream-worker.sh
           bash -n deploy/remote/export-opip-learning-evidence.sh
           bash -n deploy/remote/opip-learning-read-export.sh
+          bash -n deploy/remote/diagnose-opip-learning.sh
           bash -n deploy/learning/opip-learning-sync.sh
           bash -n deploy/learning/opip-learning-job.sh
           bash -n deploy/analytics/bootstrap-opip-data-platform.sh

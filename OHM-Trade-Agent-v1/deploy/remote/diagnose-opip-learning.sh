@@ -1450,6 +1450,40 @@ fi
 echo "funnel_candidates_source=OPIP_QUALIFICATION_FUNNEL"
 echo "search_mode_source=production_runtime_data.effective_mode"
 
+# ---------------------------------------------------------------------------
+# R4-F8A - Paper-v2 cutover readiness evidence (read-only).
+#
+# The R4-A readiness probe is the sanctioned way to observe whether the
+# technical Paper-v2 cutover gates are satisfied. It observes only bounded typed
+# facts - mode evidence, legacy drain, protection independence, the universe
+# gate, LONG/SHORT coverage, the pending mandate, the frozen F7 handoff
+# contract, canonical writer health and rollback readiness - and it activates
+# nothing and writes nothing.
+#
+# The probe is time-boxed and byte-bounded so a slow or noisy container cannot
+# stall or flood diagnostics. A NOT_READY verdict is expected evidence and never
+# degrades learning diagnostics; only an unavailable probe does, because an
+# unreadable readiness probe is not a proven-clear one.
+# ---------------------------------------------------------------------------
+echo "OPIP_PAPER_V2_CUTOVER_READINESS"
+if docker inspect ohm-trade-agent >/dev/null 2>&1 \
+   && [[ "$(docker inspect --format='{{.State.Running}}' ohm-trade-agent 2>/dev/null || true)" == "true" ]]; then
+  readiness_report="$(
+    timeout --signal=TERM --kill-after=5s 45 docker exec ohm-trade-agent \
+      python -m app.jobs.report_paper_v2_cutover_readiness 2>/dev/null || true
+  )"
+  if [[ -n "$readiness_report" ]]; then
+    printf '%s\n' "$readiness_report" | head -c 8000
+  else
+    echo "readiness=UNAVAILABLE"
+    degrade
+  fi
+else
+  echo "readiness=UNAVAILABLE"
+  degrade
+fi
+echo "OPIP_PAPER_V2_CUTOVER_READINESS_END"
+
 # Export cron alone must not imply healthy learning compute.
 if [[ "$status" == "OK" ]]; then
   if [[ "${release_compatibility_status:-}" == "RELEASE_DRIFT" \
