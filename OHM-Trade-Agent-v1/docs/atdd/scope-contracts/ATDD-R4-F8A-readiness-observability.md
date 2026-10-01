@@ -27,7 +27,7 @@ the sanctioned read-only diagnostics wrapper
 WHEN:
 it runs its production probes
 THEN:
-it invokes the deployed readiness job through the existing core-container exec path exactly once, emits bounded section markers, is time-boxed and byte-bounded, reports UNAVAILABLE when the container is absent or the probe produces no output, and emits no raw argv or environment
+it invokes the deployed readiness job through the existing core-container exec path exactly once, emits bounded section markers, is time-boxed on both the host and container side, bounds the probe's output while it streams, rejects a failed, timed-out or truncated probe as UNAVAILABLE rather than printing a fragment, reports UNAVAILABLE when the container is absent, and emits no raw argv or environment
 
 AC-002:
 GIVEN:
@@ -35,7 +35,7 @@ the readiness section
 WHEN:
 the probe reports a verdict
 THEN:
-a NOT_READY verdict is reported as expected evidence and never degrades diagnostics, only an unavailable probe degrades, the section parses no verdict text, and it precedes the final status line so it survives the bounded output window
+a NOT_READY verdict is reported as expected evidence and never degrades diagnostics, only an unavailable probe degrades, the section parses no verdict text, it precedes the final status line so it survives the bounded output window, and its byte bound stays a minority of the published window so the diagnostics it accompanies are not crowded out
 
 AC-003:
 GIVEN:
@@ -76,9 +76,11 @@ ACCEPTANCE TEST TRACEABILITY:
 AC-001 -> tests/test_opip_r4_f8a_readiness_observability.py::test_ac_001_wrapper_runs_the_deployed_readiness_probe
 AC-001 -> tests/test_opip_r4_f8a_readiness_observability.py::test_ac_001_probe_is_time_boxed_and_byte_bounded
 AC-001 -> tests/test_opip_r4_f8a_readiness_observability.py::test_ac_001_probe_reports_unavailable_when_the_container_is_not_running
+AC-001 -> tests/test_opip_r4_f8a_readiness_observability.py::test_ac_001_incomplete_probe_is_rejected_not_printed
 AC-001 -> tests/test_opip_r4_f8a_readiness_observability.py::test_ac_001_probe_emits_no_raw_argv_or_environment
 AC-002 -> tests/test_opip_r4_f8a_readiness_observability.py::test_ac_002_unavailable_probe_degrades_but_a_verdict_does_not
 AC-002 -> tests/test_opip_r4_f8a_readiness_observability.py::test_ac_002_readiness_section_precedes_the_final_status_line
+AC-002 -> tests/test_opip_r4_f8a_readiness_observability.py::test_ac_002_published_window_leaves_room_for_earlier_diagnostics
 AC-003 -> tests/test_opip_r4_f8a_readiness_observability.py::test_ac_003_section_performs_no_mutation_or_activation
 AC-003 -> tests/test_opip_r4_f8a_readiness_observability.py::test_ac_003_forced_command_gateway_is_unchanged
 AC-003 -> tests/test_opip_r4_f8a_readiness_observability.py::test_ac_003_readiness_job_has_no_activation_or_write_surface
@@ -89,6 +91,7 @@ AC-004 -> tests/test_opip_r4_f8a_readiness_observability.py::test_ac_004_readine
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/deploy/remote/diagnose-opip-learning.sh
 AC-002 -> OHM-Trade-Agent-v1/deploy/remote/diagnose-opip-learning.sh
+AC-002 -> .github/workflows/deploy-production.yml
 AC-003 -> OHM-Trade-Agent-v1/deploy/remote/diagnose-opip-learning.sh
 AC-004 -> OHM-Trade-Agent-v1/deploy/remote/diagnose-opip-learning.sh
 AC-004 -> .github/workflows/pytest.yml

@@ -24,6 +24,7 @@ WRAPPER = APP_ROOT / "deploy" / "remote" / "diagnose-opip-learning.sh"
 GATEWAY = APP_ROOT / "deploy" / "remote" / "ohm-deploy-ssh"
 READINESS_JOB = APP_ROOT / "app" / "jobs" / "report_paper_v2_cutover_readiness.py"
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "pytest.yml"
+DEPLOY_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "deploy-production.yml"
 
 pytestmark = pytest.mark.acceptance
 
@@ -63,10 +64,14 @@ def test_ac_001_wrapper_runs_the_deployed_readiness_probe():
 
 
 def test_ac_001_probe_is_time_boxed_and_byte_bounded():
-    """ATDD-R4-F8A-readiness-observability/AC-001: a slow or noisy probe cannot stall or flood diagnostics."""
+    """ATDD-R4-F8A-readiness-observability/AC-001: a slow or noisy probe cannot stall, persist, or flood."""
     section = _readiness_section()
+    # Host-side deadline for a stuck Docker client.
     assert "timeout --signal=TERM --kill-after=5s 45 docker exec" in section
-    assert "head -c 8000" in section
+    # Container-side deadline so a stalled read does not keep running in the core.
+    assert "timeout --signal=TERM --kill-after=5s 40 \\" in section
+    # The byte ceiling is applied while the probe streams.
+    assert "| head -c 8000" in section
 
 
 def test_ac_001_probe_reports_unavailable_when_the_container_is_not_running():
@@ -74,8 +79,31 @@ def test_ac_001_probe_reports_unavailable_when_the_container_is_not_running():
     section = _readiness_section()
     assert 'docker inspect ohm-trade-agent >/dev/null 2>&1' in section
     assert ".State.Running" in section
-    # Two UNAVAILABLE branches: no container, and no probe output.
+    # Two UNAVAILABLE branches: no container, and an incomplete/failed probe.
     assert section.count('echo "readiness=UNAVAILABLE"') == 2
+
+
+def test_ac_001_incomplete_probe_is_rejected_not_printed():
+    """ATDD-R4-F8A-readiness-observability/AC-001: a failed, timed-out or truncated probe is never accepted as evidence."""
+    section = _readiness_section()
+    code = _code_lines(section)
+    # The probe's own status is never masked with `|| true`.
+    capture_block = section[
+        section.index('readiness_verdict="$(', section.index("State.Running"))
+        : section.index("if printf '%s")
+    ]
+    assert "|| true" not in capture_block, capture_block
+    # Failure is absorbed without aborting the wrapper, and completeness is proven
+    # by the verdict line the job prints last.
+    assert sum(1 for line in code if line.startswith('if ! readiness_verdict="$(')) == 1
+    assert (
+        sum(
+            1
+            for line in code
+            if line.startswith("if printf '%s\\n' \"$readiness_verdict\" | grep -q '^Readiness:'")
+        )
+        == 1
+    )
 
 
 def test_ac_001_probe_emits_no_raw_argv_or_environment():
@@ -121,6 +149,20 @@ def test_ac_002_readiness_section_precedes_the_final_status_line():
     assert text.index(SECTION_START) < text.index('echo "diagnostics_status=$status"')
 
 
+def test_ac_002_published_window_leaves_room_for_earlier_diagnostics():
+    """ATDD-R4-F8A-readiness-observability/AC-002: the readiness section cannot crowd out the diagnostics it accompanies."""
+    workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+    window_match = re.search(r"tail -c (\d+) diagnostics\.log", workflow)
+    assert window_match, "diagnostics publish window not found"
+    window = int(window_match.group(1))
+    cap_match = re.search(r"head -c (\d+)", _readiness_section())
+    assert cap_match, "readiness byte cap not found"
+    cap = int(cap_match.group(1))
+    # The readiness section must stay a minority of the published window so the
+    # export, lock, manifest and funnel diagnostics keep their place.
+    assert cap * 2 <= window, (cap, window)
+
+
 # ---------------------------------------------------------------------------
 # AC-003 - no mutation, no activation, no widened remote authority
 # ---------------------------------------------------------------------------
@@ -128,7 +170,7 @@ def test_ac_002_readiness_section_precedes_the_final_status_line():
 
 def test_ac_003_section_performs_no_mutation_or_activation():
     """ATDD-R4-F8A-readiness-observability/AC-003: the section writes nothing and activates nothing."""
-    section = _readiness_section()
+    code = _code_lines(_readiness_section())
     for forbidden in (
         "OPIP_PAPER_V2_MODE=",
         "export OPIP_PAPER_V2_MODE",
@@ -143,7 +185,8 @@ def test_ac_003_section_performs_no_mutation_or_activation():
         "kill ",
         "pkill ",
     ):
-        assert forbidden not in section, forbidden
+        for line in code:
+            assert forbidden not in line, (forbidden, line)
 
 
 def test_ac_003_forced_command_gateway_is_unchanged():
@@ -204,10 +247,12 @@ def test_ac_004_readiness_section_is_well_formed():
     section = _readiness_section()
     code = _code_lines(section)
     assert sum(1 for line in code if line.startswith("if docker inspect")) == 1
-    assert sum(1 for line in code if line.startswith('if [[ -n "$readiness_report"')) == 1
-    # Outer container guard + inner probe-output guard: two else/fi pairs, balanced.
+    assert sum(1 for line in code if line.startswith('if ! readiness_verdict="$(')) == 1
+    assert sum(1 for line in code if line.startswith("if printf '%s\\n' \"$readiness_verdict\" | grep -q")) == 1
+    # Outer container guard (if/else) + the completeness guard (if/else); the
+    # `if !` capture has no else. Three else/fi closers total.
     assert code.count("else") == 2, code
-    assert code.count("fi") == 2, code
+    assert code.count("fi") == 3, code
     # No nested function definition or heredoc sneaks in.
     assert "<<" not in section
     assert re.search(r"^\w+\(\)", section, re.MULTILINE) is None

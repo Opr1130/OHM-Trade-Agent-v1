@@ -1460,20 +1460,32 @@ echo "search_mode_source=production_runtime_data.effective_mode"
 # contract, canonical writer health and rollback readiness - and it activates
 # nothing and writes nothing.
 #
-# The probe is time-boxed and byte-bounded so a slow or noisy container cannot
-# stall or flood diagnostics. A NOT_READY verdict is expected evidence and never
-# degrades learning diagnostics; only an unavailable probe does, because an
-# unreadable readiness probe is not a proven-clear one.
+# The probe is time-boxed on both sides - a container-side deadline stops a
+# stalled read without leaving work running in the core container, and the host
+# deadline still covers a stuck Docker client - and byte-bounded while its output
+# streams, so a noisy probe cannot buffer without limit. The job prints its
+# verdict lines last, so requiring the verdict is what proves the report is
+# complete: a truncated or failed probe is reported unavailable, never printed as
+# if it were whole. A NOT_READY verdict is expected evidence and never degrades
+# learning diagnostics; only an unavailable probe does, because an unreadable
+# readiness probe is not a proven-clear one.
 # ---------------------------------------------------------------------------
 echo "OPIP_PAPER_V2_CUTOVER_READINESS"
 if docker inspect ohm-trade-agent >/dev/null 2>&1 \
    && [[ "$(docker inspect --format='{{.State.Running}}' ohm-trade-agent 2>/dev/null || true)" == "true" ]]; then
-  readiness_report="$(
-    timeout --signal=TERM --kill-after=5s 45 docker exec ohm-trade-agent \
-      python -m app.jobs.report_paper_v2_cutover_readiness 2>/dev/null || true
-  )"
-  if [[ -n "$readiness_report" ]]; then
-    printf '%s\n' "$readiness_report" | head -c 8000
+  readiness_verdict=""
+  # The enclosing `if !` keeps `set -e` from aborting on a failed or
+  # SIGPIPE-truncated pipeline; the value is simply left empty.
+  if ! readiness_verdict="$(
+       timeout --signal=TERM --kill-after=5s 45 docker exec ohm-trade-agent \
+         timeout --signal=TERM --kill-after=5s 40 \
+         python -m app.jobs.report_paper_v2_cutover_readiness 2>/dev/null \
+         | head -c 8000
+     )"; then
+    readiness_verdict=""
+  fi
+  if printf '%s\n' "$readiness_verdict" | grep -q '^Readiness:'; then
+    printf '%s\n' "$readiness_verdict"
   else
     echo "readiness=UNAVAILABLE"
     degrade

@@ -505,7 +505,7 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -s diagnostics.log ]]; then
-            DIAGNOSTICS="$(tail -c 12000 diagnostics.log)"
+            DIAGNOSTICS="$(tail -c 20000 diagnostics.log)"
           else
             DIAGNOSTICS="Diagnostics command did not produce output."
           fi
