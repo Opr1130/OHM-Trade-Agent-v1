@@ -89,6 +89,9 @@ from app.scanner.market_data_validation import (  # noqa: E402
     MarketDataValidation,
 )
 from app.scanner.models import MarketSnapshot  # noqa: E402
+from tests.test_atdd_scope_control import (  # noqa: E402
+    global_pointer_pin_violations,
+)
 
 INCREMENT = "ATDD-R3-F6-forecast-engine"
 FROZEN_F5_INCREMENT = "ATDD-R3-F5-feasibility-safety"
@@ -1697,29 +1700,49 @@ def test_ac_035_f3_f4_f5_semantics_unchanged() -> None:
 
 @pytest.mark.acceptance
 def test_ac_036_f5_pointer_handoff() -> None:
-    """ATDD-R3-F6-forecast-engine/AC-036: the ATDD pointer names this F6 increment, the completed F5 increment no longer pins the global pointer, and F5 stays shadow with no consumers."""
-    active = ACTIVE_INCREMENT_PATH.read_text(encoding="utf-8").strip()
-    assert active == INCREMENT
+    """ATDD-R3-F6-forecast-engine/AC-036: F6 proves its own identity, the completed F5 and F6 increments do not pin the movable global pointer, and every substantive F6 isolation guarantee is retained."""
+    # F6's own identity comes from its own frozen scope contract, not the pointer.
+    f6_contract_path = (
+        APP_ROOT / "docs" / "atdd" / "scope-contracts" / f"{INCREMENT}.md"
+    )
+    assert f6_contract_path.is_file()
+    f6_contract = f6_contract_path.read_text(encoding="utf-8")
+    f6_lines = f6_contract.splitlines()
+    assert f6_lines[0].strip() == "INCREMENT:"
+    assert f6_lines[1].strip() == INCREMENT
+    assert "F5 ACTIVE_INCREMENT HANDOFF" in f6_contract
+    assert "test_ac_027_f4_pointer_handoff" in f6_contract
 
+    # The global pointer is deliberately movable orchestration state. F6 and F5 are
+    # complete, so neither pins it; the pointer only has to resolve to an existing
+    # scope contract, exactly as the R0/R1 increment does.
+    pointer = ACTIVE_INCREMENT_PATH.read_text(encoding="utf-8").strip()
+    assert (
+        APP_ROOT / "docs" / "atdd" / "scope-contracts" / f"{pointer}.md"
+    ).is_file(), pointer
+
+    # Neither this module nor the completed F5 module reads the global pointer and
+    # compares it to its own increment identity; the structural guard proves it.
+    f6_source = Path(__file__).read_text(encoding="utf-8")
+    assert global_pointer_pin_violations(f6_source) == []
     f5_test = (
         APP_ROOT / "tests" / "test_opip_r3_f5_feasibility.py"
     ).read_text(encoding="utf-8")
-    # The completed F5 increment no longer pins the movable global pointer.
-    assert "assert active == INCREMENT" not in f5_test
-    assert "ACTIVE_INCREMENT_PATH.read_text" not in f5_test
+    assert global_pointer_pin_violations(f5_test) == []
     assert FROZEN_F5_INCREMENT in f5_test
-    # F5 remains shadow / non-authoritative with no runtime consumer.
-    assert 'OPIP_FEATURE_BUS_MODE: "off"' in COMPOSE_PATH.read_text(encoding="utf-8")
 
-    f5_contract = (
-        APP_ROOT / "docs" / "atdd" / "scope-contracts" / f"{FROZEN_F5_INCREMENT}.md"
-    )
-    assert f5_contract.is_file()
-    f6_contract = (
-        APP_ROOT / "docs" / "atdd" / "scope-contracts" / f"{INCREMENT}.md"
-    ).read_text(encoding="utf-8")
-    assert "F5 ACTIVE_INCREMENT HANDOFF" in f6_contract
-    assert "test_ac_027_f4_pointer_handoff" in f6_contract
+    # F5/F6 stay shadow and non-authoritative with the Feature Bus off, and every
+    # substantive F6 isolation criterion stays asserted in this module.
+    assert 'OPIP_FEATURE_BUS_MODE: "off"' in COMPOSE_PATH.read_text(encoding="utf-8")
+    for marker in (
+        "test_ac_030_no_ai_or_committee_authority",
+        "test_ac_031_no_allocation_or_f7",
+        "test_ac_032_no_runtime_integration",
+        "test_ac_033_no_new_writer_db_jsonl",
+        "test_ac_034_feature_bus_off",
+        "test_ac_035_f3_f4_f5_semantics_unchanged",
+    ):
+        assert marker in f6_source, marker
 
 
 # ---------------------------------------------------------------------------

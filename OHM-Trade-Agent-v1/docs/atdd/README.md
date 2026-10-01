@@ -88,6 +88,27 @@ Adjacent bugs, refactors, observability, and future requirements go under `DEFER
 
 `docs/atdd/ACTIVE_INCREMENT` names the one increment allowed to authorize files. An older contract's implementation map does not authorize a later increment. A missing, ambiguous, or unknown active increment fails closed.
 
+### The active increment pointer is movable
+
+`docs/atdd/ACTIVE_INCREMENT` holds a single increment identifier. It is **mutable orchestration state**, not a permanent record: it names the one increment currently authorized to change files and is **deliberately movable**. Exact current-increment enforcement belongs to `tests/atdd_scope.py` and the `atdd scope` CI job, which read the pointer from the pull-request head and compare the diff against that increment only.
+
+Consequences for acceptance tests:
+
+- A completed product increment's acceptance tests must **not** permanently require the global pointer to equal that increment. Pinning it blocks every later approved increment, because only one increment can be active at a time.
+- Increment identity is proven from that increment's **own** contract and test identity — its scope contract exists and declares its increment — not by requiring the global pointer to stay there forever.
+- A historical test may verify that the current pointer **resolves to an existing scope contract**. That is the R0/R1 pattern:
+
+  ```python
+  pointer = _read(ATDD / "ACTIVE_INCREMENT").strip()
+  # The pointer is expected to move later, so it is not pinned here; the scope
+  # checker enforces that the active pointer matches the checked increment.
+  assert (ATDD / "scope-contracts" / f"{pointer}.md").is_file(), pointer
+  ```
+
+- A structural regression test in `tests/test_atdd_scope_control.py` scans every increment acceptance module (including F3, F4, F5 and F6) and fails closed if any increment test reads the global pointer and compares it to its own increment identity. It catches pointer-derived locals (including annotated and walrus bindings), pointer-returning helpers, direct pointer expressions, and `read_increment_pointer()` calls, in assertions or conditional guards, and it deliberately ignores generic checks such as `startswith("ATDD-")`. This prevents a future completed increment from re-introducing a global-pointer ownership pin.
+
+The pointer must always name an existing scope contract, and the checker still fails closed when it is missing, ambiguous, or unknown.
+
 Check the branch diff from `OHM-Trade-Agent-v1/`:
 
 ```bash

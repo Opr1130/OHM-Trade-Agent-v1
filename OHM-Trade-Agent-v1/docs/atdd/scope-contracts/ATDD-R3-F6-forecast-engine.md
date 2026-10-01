@@ -18,6 +18,8 @@ NO-QUALIFIED-MODEL REALITY. The repository proves no ForecastEngine and no regis
 
 F5 ACTIVE_INCREMENT HANDOFF (OWNER-authorized, narrow). `tests/test_opip_r3_f5_feasibility.py::test_ac_027_f4_pointer_handoff` previously pinned the globally movable ATDD pointer to the F5 increment. This OWNER increment removes ONLY that permanent global-pointer ownership assertion. Every substantive F5 acceptance criterion is preserved: the F5 contract exists; the F5 increment identity is recorded; the F4 pointer pin is removed; the F4 substantive AC-014 protections remain; F5 runtime shadow; no consumers; Feature Bus OFF; no persistence; no F6/F7 leakage in F5 implementation. No F5 semantics, identity, or frozen F5 scope contract is changed; this F6 contract is the authorization record.
 
+F6 COMPLETED-INCREMENT MOVABLE-POINTER HANDOFF (OWNER-authorized, `ATDD-SCOPE-MOVABLE-ACTIVE-POINTER-v1`). AC-036 originally required the global `docs/atdd/ACTIVE_INCREMENT` pointer to equal this F6 increment. A completed increment must not permanently own the pointer, because only one increment can be active at a time; that ownership pin blocks every later approved increment. AC-036 now proves F6's own identity from this frozen contract and the F6 test module, records that neither the completed F5 increment nor the completed F6 increment pins the pointer, and requires only that the pointer resolve to an existing scope contract. Every substantive F6 guarantee is unchanged and still asserted: the engine stays pure/deterministic, SHADOW / NON-AUTHORITATIVE, with no runtime consumers, the Feature Bus off, no F7 allocation, no calibrated-model shortcut, no AI/Committee probability, no persistence, and no paper/funded authority. A structural guard in `tests/test_atdd_scope_control.py` fails closed if any increment test reintroduces a global-pointer comparison against its own increment identity. No forecast behavior, contract identity, or frozen F6 semantic is changed.
+
 NO SCORE TO PROBABILITY. This increment does not relabel any existing score as a probability. The technical score, explosion score, opportunity score, tradeability score, ranking score, alert/Chief/AI/Committee confidence, the Committee 0-100 rubric, the economic-quality score, the target-attainability score and the F5 feasibility result stay ordinal. There is no `score/100` probability and no invented logistic mapping.
 
 NO CALIBRATION WITHOUT EVIDENCE. A model is registered only if qualifying evidence proves it: a declared feature schema, a point-in-time training cutoff, a sealed evaluation population, declared entry and path horizons, execution-outcome labels, post-fill path labels, a missingness and fidelity treatment, proper scoring, reliability evidence, no future leakage, an explicit model version and an explicit already-approved calibrated-shadow status. Nothing is inferred. With no such artifact the registry stays empty.
@@ -321,11 +323,11 @@ F3 thresholds, claim identity, state and schemas are unmodified, the F4 pure lif
 
 AC-036:
 GIVEN:
-the completed F5 feasibility increment and the movable ATDD pointer
+the completed F5 feasibility increment, the completed F6 forecast-engine increment and the movable ATDD pointer
 WHEN:
-the F6 increment becomes active
+the F6 increment has completed and a later approved increment owns the pointer
 THEN:
-the ATDD pointer names this F6 increment, the completed F5 increment no longer owns or pins the global pointer value, F5 remains shadow with no runtime consumer, and every substantive F5 acceptance criterion is preserved
+F6 proves its own identity from its own frozen scope contract and test module rather than from the global pointer, neither the completed F5 increment nor the completed F6 increment permanently requires the pointer to equal it, the pointer need only resolve to an existing scope contract, and every substantive F5 and F6 isolation assertion is preserved
 
 EXPLICITLY OUT OF SCOPE:
 - F7 economic/portfolio selector: allocation, net-dollars, ranking, cash/no-trade comparator, reservation, sizing or concentration
