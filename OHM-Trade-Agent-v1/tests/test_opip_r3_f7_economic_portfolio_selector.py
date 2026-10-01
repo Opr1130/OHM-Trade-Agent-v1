@@ -130,6 +130,16 @@ CALIBRATION_REPORT_ID = "FEVAL:r3f7-fixture-report"
 HORIZON = ForecastHorizon(
     entry_deadline_seconds=300, path_horizon_seconds=3600, validity_seconds=3600
 )
+
+
+def horizon(validity_seconds: int = 3600) -> ForecastHorizon:
+    return ForecastHorizon(
+        entry_deadline_seconds=300,
+        path_horizon_seconds=3600,
+        validity_seconds=validity_seconds,
+    )
+
+
 WINDOW = PortfolioEvaluationWindow(
     start=EVAL, end=EVAL + timedelta(days=2)
 )
@@ -353,19 +363,19 @@ def feasible_decision(symbol: str = "SOLUSD"):
     )
 
 
-def input_vector(symbol: str = "SOLUSD") -> ForecastInputVector:
+def input_vector(symbol: str = "SOLUSD", *, validity_seconds: int = 3600) -> ForecastInputVector:
     return ForecastInputVector(
         input_schema_id="forecast-input-schema",
         input_schema_version="1",
         source_snapshot_id=f"SNAP:{symbol}",
         source_cutoff=CUTOFF,
-        horizon=HORIZON,
+        horizon=horizon(validity_seconds),
         features=(ForecastFeatureValue("rsi", 55.0, CUTOFF),),
     )
 
 
-def artifact(symbol: str = "SOLUSD") -> ForecastModelArtifact:
-    inputs = input_vector(symbol)
+def artifact(symbol: str = "SOLUSD", *, validity_seconds: int = 3600) -> ForecastModelArtifact:
+    inputs = input_vector(symbol, validity_seconds=validity_seconds)
     return ForecastModelArtifact.build(
         model_kind=ForecastModelKind.SYNTHETIC_TEST_ONLY,
         model_family="synthetic-deterministic",
@@ -425,16 +435,16 @@ def make_registry(expected_return: float) -> Any:
     )
 
 
-def forecast_for(symbol: str, expected_return: float):
+def forecast_for(symbol: str, expected_return: float, *, validity_seconds: int = 3600):
     episode = active_episode(symbol)
     feasibility = feasible_decision(symbol)
     return fengine.evaluate_forecast(
         episode,
         feasibility,
-        input_vector(symbol),
+        input_vector(symbol, validity_seconds=validity_seconds),
         EVAL,
         FORECAST_POLICY,
-        model_artifact=artifact(symbol),
+        model_artifact=artifact(symbol, validity_seconds=validity_seconds),
         registry=make_registry(expected_return),
     )
 
@@ -474,10 +484,13 @@ def candidate(
     execution_evidence_status: PortfolioEvidenceStatus = PortfolioEvidenceStatus.VALID,
     common_shock_group: str | None = None,
     technical_score: int = 90,
+    validity_seconds: int = 3600,
     forecast: Any = _UNSET,
 ) -> PortfolioCandidate:
     resolved_forecast = (
-        forecast_for(symbol, expected_return) if forecast is _UNSET else forecast
+        forecast_for(symbol, expected_return, validity_seconds=validity_seconds)
+        if forecast is _UNSET
+        else forecast
     )
     return PortfolioCandidate(
         episode_id=resolved_forecast.episode_id,
@@ -496,13 +509,16 @@ def candidate(
 
 
 def capital_state(
-    available: float = 1000.0, *, portfolio_version: str = "PV:r3f7"
+    available: float = 1000.0,
+    *,
+    portfolio_version: str = "PV:r3f7",
+    as_of: datetime = EVAL,
 ) -> PortfolioCapitalState:
     return PortfolioCapitalState(
         portfolio_version=portfolio_version,
         available_capital=available,
         currency="USD",
-        as_of=EVAL,
+        as_of=as_of,
     )
 
 
@@ -511,18 +527,21 @@ def exposure(
     portfolio_version: str = "PV:r3f7",
     gross: float = 0.0,
     open_positions: int = 0,
+    loss_at_stop: float = 0.0,
     same_direction: dict[str, int] | None = None,
     symbol_exposure: dict[str, float] | None = None,
     group_counts: dict[str, int] | None = None,
+    as_of: datetime = EVAL,
 ) -> PortfolioExposureSnapshot:
     return PortfolioExposureSnapshot(
         portfolio_version=portfolio_version,
         gross_exposure=gross,
         open_positions=open_positions,
+        loss_at_stop=loss_at_stop,
         same_direction_counts=same_direction or {},
         symbol_exposure=symbol_exposure or {},
         common_shock_group_counts=group_counts or {},
-        as_of=EVAL,
+        as_of=as_of,
     )
 
 
@@ -1626,3 +1645,202 @@ def test_legacy_active_positions_are_deterministic() -> None:
         ),
     )
     assert blocked.risk_veto_reasons
+
+
+# ---------------------------------------------------------------------------
+# Review-finding regressions
+# ---------------------------------------------------------------------------
+
+
+def test_regression_comparator_same_direction_counts_existing_positions() -> None:
+    """The live veto must see a plain direction token for existing positions."""
+    panel = [
+        candidate("AAAUSD", 0.06),
+        candidate("BBBUSD", 0.05),
+        candidate("CCCUSD", 0.04),
+    ]
+    result = build_frozen_legacy_comparison(
+        panel,
+        capital_state=capital_state(),
+        window=WINDOW,
+        active_positions=(
+            LegacyActivePosition(
+                symbol="ZZZUSD", direction=PortfolioDirection.LONG, capital=50.0
+            ),
+        ),
+    )
+    # One existing LONG plus the live default max_same_direction of 2 admits one more.
+    assert len(result.risk_admitted_candidate_ids) == 1
+    assert any(
+        "same-direction" in reason for reason in result.risk_veto_reasons.values()
+    )
+
+
+def test_regression_each_reservation_uses_its_own_forecast_expiry() -> None:
+    short = candidate("AAAUSD", 0.06, validity_seconds=3600)
+    long = candidate("BBBUSD", 0.05, validity_seconds=7200)
+    decision = select([short, long], configuration=policy(max_portfolio_loss_fraction=1.0))
+    assert decision.reservation_plan is not None
+    by_candidate = {
+        reservation.candidate_id: reservation
+        for reservation in decision.reservation_plan.reservations
+    }
+    assert by_candidate[short.candidate_id].expires_at == short.forecast.valid_until
+    assert by_candidate[long.candidate_id].expires_at == long.forecast.valid_until
+    assert (
+        by_candidate[short.candidate_id].expires_at
+        != by_candidate[long.candidate_id].expires_at
+    )
+
+    late = expire_reservations(
+        decision.reservation_plan, at_time=EVAL + timedelta(hours=1, minutes=1)
+    )
+    states = {reservation.candidate_id: reservation.status for reservation in late.reservations}
+    assert states[short.candidate_id] is ReservationStatus.EXPIRED
+    assert states[long.candidate_id] is ReservationStatus.PLANNED
+
+
+def test_regression_symbol_cap_sums_same_symbol_allocations() -> None:
+    long = candidate(
+        "AAAUSD", 0.06, direction=PortfolioDirection.LONG, requested_capital_fraction=0.3
+    )
+    short = candidate(
+        "AAAUSD", 0.06, direction=PortfolioDirection.SHORT, requested_capital_fraction=0.3
+    )
+    decision = select(
+        [long, short],
+        configuration=policy(
+            max_capital_fraction_per_candidate=0.3,
+            max_symbol_exposure_fraction=0.5,
+            max_portfolio_loss_fraction=1.0,
+        ),
+    )
+    # Each allocation is 300; the 50% symbol cap (500) refuses the 600 pair.
+    assert len(decision.allocations) == 1
+
+
+def test_regression_negative_symbol_exposure_fails_closed() -> None:
+    with pytest.raises(PortfolioContractError):
+        exposure(symbol_exposure={"AAAUSD": -50.0})
+
+
+def test_regression_future_snapshots_fail_closed() -> None:
+    future = EVAL + timedelta(hours=1)
+    with pytest.raises(PortfolioContractError):
+        select([candidate("AAAUSD", 0.05)], capital=capital_state(as_of=future))
+    with pytest.raises(PortfolioContractError):
+        select([candidate("AAAUSD", 0.05)], portfolio_exposure=exposure(as_of=future))
+    assert select([candidate("AAAUSD", 0.05)]).status is PortfolioStatus.SELECTED
+
+
+def test_regression_partial_fill_residual_stays_reserved_and_adjustable() -> None:
+    item = candidate("AAAUSD", 0.05)
+    plan = select(
+        [item], configuration=policy(max_portfolio_loss_fraction=1.0)
+    ).reservation_plan
+    assert plan is not None
+
+    partial = adjust_reservation_for_fill(
+        plan, candidate_id=item.candidate_id, filled_capital=40.0, at_time=EVAL
+    )
+    reservation = partial.reservations[0]
+    assert reservation.status is ReservationStatus.FILL_ADJUSTED
+    assert reservation.is_active is True
+    assert partial.planned_capital == pytest.approx(60.0)
+
+    again = adjust_reservation_for_fill(
+        partial, candidate_id=item.candidate_id, filled_capital=10.0, at_time=EVAL
+    )
+    assert again.reservations[0].reserved_capital == pytest.approx(50.0)
+
+    released = release_reservation(
+        again,
+        candidate_id=item.candidate_id,
+        reason=ReservationReleaseReason.CANCELLED,
+        at_time=EVAL,
+    )
+    assert released.planned_capital == 0.0
+
+    expired = expire_reservations(partial, at_time=EVAL + timedelta(days=1))
+    assert expired.reservations[0].status is ReservationStatus.EXPIRED
+
+    fully_filled = adjust_reservation_for_fill(
+        plan, candidate_id=item.candidate_id, filled_capital=100.0, at_time=EVAL
+    )
+    assert fully_filled.reservations[0].status is ReservationStatus.RELEASED
+    assert fully_filled.planned_capital == 0.0
+
+
+def test_regression_comparison_requires_a_panel_evaluated_decision() -> None:
+    panel = [candidate("AAAUSD", 0.06)]
+    legacy = build_frozen_legacy_comparison(
+        panel, capital_state=capital_state(), window=WINDOW
+    )
+    abstention = select([])
+    assert abstention.status is PortfolioStatus.INSUFFICIENT_EVIDENCE
+    assert abstention.panel_fingerprint is None
+    with pytest.raises(PortfolioContractError):
+        build_portfolio_comparison(
+            abstention, legacy, panel_fingerprint=legacy.panel_fingerprint
+        )
+
+
+def test_regression_decision_identity_binds_aggregate_fields() -> None:
+    decision = select(
+        [candidate("AAAUSD", 0.05)], configuration=policy(max_portfolio_loss_fraction=1.0)
+    )
+    for field, tampered in (
+        ("expected_net_dollars_lower_bound", -999.0),
+        ("expected_net_dollars_upper_bound", 999.0),
+        ("loss_at_stop", 999.0),
+        ("unallocated_capital", 0.0),
+    ):
+        payload = decision.to_dict()
+        payload[field] = tampered
+        with pytest.raises(PortfolioContractError):
+            PortfolioDecision.from_dict(payload)
+
+
+def test_regression_candidate_round_trip_rejects_forecast_id_drift() -> None:
+    payload = candidate("AAAUSD", 0.05).to_dict()
+    payload["forecast_decision_id"] = "FCST:forged"
+    with pytest.raises(PortfolioContractError):
+        PortfolioCandidate.from_dict(payload)
+
+
+def test_regression_comparator_is_permutation_invariant() -> None:
+    panel = [
+        candidate("AAAUSD", 0.06),
+        candidate("BBBUSD", 0.05),
+        candidate("CCCUSD", 0.04),
+    ]
+    first = build_frozen_legacy_comparison(
+        panel, capital_state=capital_state(), window=WINDOW
+    )
+    second = build_frozen_legacy_comparison(
+        list(reversed(panel)), capital_state=capital_state(), window=WINDOW
+    )
+    assert first.to_dict() == second.to_dict()
+
+
+def test_regression_existing_loss_counts_toward_the_loss_cap() -> None:
+    blocked = select(
+        [candidate("AAAUSD", 0.05, stop_loss_fraction=0.01)],
+        portfolio_exposure=exposure(loss_at_stop=9.5, open_positions=1),
+        configuration=policy(max_portfolio_loss_fraction=0.01),
+    )
+    assert blocked.status is PortfolioStatus.CASH_NO_TRADE
+    allowed = select(
+        [candidate("AAAUSD", 0.05, stop_loss_fraction=0.01)],
+        portfolio_exposure=exposure(loss_at_stop=8.0, open_positions=1),
+        configuration=policy(max_portfolio_loss_fraction=0.01),
+    )
+    assert allowed.status is PortfolioStatus.SELECTED
+
+
+def test_regression_comparator_rejects_duplicate_panels() -> None:
+    item = candidate("AAAUSD", 0.05)
+    with pytest.raises(PortfolioContractError):
+        build_frozen_legacy_comparison(
+            [item, item], capital_state=capital_state(), window=WINDOW
+        )

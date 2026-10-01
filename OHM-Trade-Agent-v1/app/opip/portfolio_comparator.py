@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import inspect
 import math
+import types
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -173,7 +174,7 @@ def legacy_unrounded_total(observables: LegacyComparatorObservables) -> float:
 
 
 def _legacy_ranking_key(candidate: PortfolioCandidate) -> tuple[Any, ...]:
-    """Reproduce the live profit-ranking ordering key for one candidate."""
+    """The live profit-ranking ordering key, reproduced without added tie-breaks."""
     observables = candidate.legacy_observables
     unrounded = legacy_unrounded_total(observables)
     drag = observables.execution_drag_pct
@@ -184,7 +185,6 @@ def _legacy_ranking_key(candidate: PortfolioCandidate) -> tuple[Any, ...]:
         drag if drag is not None else float("inf"),
         -float(observables.technical_score),
         candidate.symbol,
-        candidate.candidate_id,
     )
 
 
@@ -347,17 +347,15 @@ def build_frozen_legacy_comparison(
 
     panel_fingerprint = portfolio_panel_fingerprint(window, resolved)
 
+    # The F7 panel is a set: canonicalize the input order once, then reproduce the
+    # live stable sorts exactly, without inventing a tie-break the live code lacks.
+    ordered = tuple(sorted(resolved, key=lambda candidate: candidate.candidate_id))
     qualified = [
         candidate
-        for candidate in resolved
+        for candidate in ordered
         if candidate.legacy_observables.technical_score >= LEGACY_MIN_TECHNICAL_SCORE
     ]
-    qualified.sort(
-        key=lambda candidate: (
-            -candidate.legacy_observables.technical_score,
-            candidate.candidate_id,
-        )
-    )
+    qualified.sort(key=lambda candidate: -candidate.legacy_observables.technical_score)
     population = tuple(qualified[:LEGACY_MAX_CANDIDATES])
     ranked = tuple(sorted(population, key=_legacy_ranking_key))
 
@@ -371,7 +369,16 @@ def build_frozen_legacy_comparison(
     live_positions: list[LegacyActivePosition] = list(positions)
     for candidate in ranked:
         decision = evaluate_portfolio_risk(
-            active_trades=list(live_positions),
+            active_trades=[
+                types.SimpleNamespace(
+                    symbol=position.symbol,
+                    direction=position.direction.value,
+                    capital=position.capital,
+                    margin_leverage=position.margin_leverage,
+                    status=position.status,
+                )
+                for position in live_positions
+            ],
             proposed_symbol=candidate.symbol,
             proposed_direction=candidate.direction.value,
             proposed_capital=proposed_capital,
@@ -552,7 +559,11 @@ def build_portfolio_comparison(
         raise PortfolioContractError(
             "the legacy comparator result was computed on a different panel"
         )
-    if decision.panel_fingerprint is not None and decision.panel_fingerprint != shared:
+    if decision.panel_fingerprint is None:
+        raise PortfolioContractError(
+            "the F7 decision has no panel evaluation and cannot be compared"
+        )
+    if decision.panel_fingerprint != shared:
         raise PortfolioContractError(
             "the F7 decision was computed on a different panel"
         )

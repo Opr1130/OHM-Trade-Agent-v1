@@ -42,7 +42,7 @@ from collections.abc import Sequence
 from datetime import datetime
 from itertools import combinations
 
-from app.opip.contracts.forecast import ForecastStatus
+from app.opip.contracts.forecast import ForecastDecision, ForecastStatus
 from app.opip.contracts.portfolio import (
     PORTFOLIO_DECISION_SCHEMA_VERSION,
     PORTFOLIO_SELECTOR_VERSION,
@@ -119,6 +119,15 @@ def _require_window(window: object) -> PortfolioEvaluationWindow:
     if not isinstance(window, PortfolioEvaluationWindow):
         raise PortfolioContractError("window must be a PortfolioEvaluationWindow")
     return window
+
+
+def _require_valid_until(forecast: ForecastDecision | None) -> datetime:
+    """Each reservation expires at its own candidate's forecast validity."""
+    if forecast is None or forecast.valid_until is None:
+        raise PortfolioContractError(
+            "a selected candidate must carry a FORECAST with an explicit valid_until"
+        )
+    return forecast.valid_until
 
 
 def _require_window_consistent(
@@ -258,13 +267,20 @@ def _subset_is_feasible(
             return False
 
     symbol_cap = policy.max_symbol_exposure_fraction * available
+    symbol_totals: dict[str, float] = {}
     for allocation in selected:
-        existing = float(exposure.symbol_exposure.get(allocation.symbol, 0.0))
-        if existing + allocation.allocated_capital > symbol_cap + 1e-9:
+        symbol_totals[allocation.symbol] = (
+            symbol_totals.get(allocation.symbol, 0.0) + allocation.allocated_capital
+        )
+    for symbol, selected_exposure in symbol_totals.items():
+        existing = float(exposure.symbol_exposure.get(symbol, 0.0))
+        if existing + selected_exposure > symbol_cap + 1e-9:
             return False
 
     loss_cap = policy.max_portfolio_loss_fraction * available
-    total_loss = sum(allocation.loss_at_stop for allocation in selected)
+    total_loss = exposure.loss_at_stop + sum(
+        allocation.loss_at_stop for allocation in selected
+    )
     if total_loss > loss_cap + 1e-9:
         return False
 
@@ -338,6 +354,10 @@ def _abstain(
         reservation_plan_id=None,
         comparator_result_id=None,
         expected_net_dollars=None,
+        expected_net_dollars_lower_bound=None,
+        expected_net_dollars_upper_bound=None,
+        loss_at_stop=None,
+        unallocated_capital=None,
     )
     return PortfolioDecision(
         decision_id=identity,
@@ -380,6 +400,10 @@ def _cash(
         reservation_plan_id=None,
         comparator_result_id=None,
         expected_net_dollars=None,
+        expected_net_dollars_lower_bound=None,
+        expected_net_dollars_upper_bound=None,
+        loss_at_stop=None,
+        unallocated_capital=unallocated_capital,
     )
     return PortfolioDecision(
         decision_id=identity,
@@ -440,6 +464,14 @@ def select_portfolio(
         raise PortfolioContractError(
             "capital state and exposure snapshot must share one portfolio version"
         )
+    if resolved_capital.as_of > instant:
+        raise PortfolioContractError(
+            "the capital state was observed after the evaluation instant"
+        )
+    if resolved_exposure.as_of > instant:
+        raise PortfolioContractError(
+            "the exposure snapshot was observed after the evaluation instant"
+        )
 
     _require_window_consistent(resolved_window, instant, resolved_candidates)
     panel_fingerprint = portfolio_panel_fingerprint(resolved_window, resolved_candidates)
@@ -499,6 +531,9 @@ def select_portfolio(
             key=lambda allocation: allocation.candidate_id,
         )
     )
+    forecast_by_candidate = {
+        candidate.candidate_id: candidate.forecast for candidate in best
+    }
     expected_net_dollars = sum(
         allocation.expected_net_dollars for allocation in selected_allocations
     )
@@ -541,10 +576,8 @@ def select_portfolio(
             reserved_capital=allocation.allocated_capital,
             portfolio_version=resolved_capital.portfolio_version,
             created_at=instant,
-            expires_at=min(
-                candidate.forecast.valid_until
-                for candidate in best
-                if candidate.forecast is not None
+            expires_at=_require_valid_until(
+                forecast_by_candidate[allocation.candidate_id]
             ),
         )
         for allocation in selected_allocations
@@ -590,6 +623,10 @@ def select_portfolio(
         reservation_plan_id=reservation_plan.plan_id,
         comparator_result_id=None,
         expected_net_dollars=expected_net_dollars,
+        expected_net_dollars_lower_bound=lower_bound,
+        expected_net_dollars_upper_bound=upper_bound,
+        loss_at_stop=loss_at_stop,
+        unallocated_capital=unallocated,
     )
     return PortfolioDecision(
         decision_id=identity,

@@ -296,7 +296,7 @@ def _require_durable_mapping(
 
 
 def _freeze_mapping(raw: Any, *, field_name: str, value_kind: str) -> Mapping[str, Any]:
-    """Deep-freeze a text-keyed mapping of text or finite numbers."""
+    """Deep-freeze a text-keyed mapping of text, counts or finite numbers."""
     if not isinstance(raw, Mapping):
         raise PortfolioContractError(f"{field_name} must be a mapping")
     frozen: dict[str, Any] = {}
@@ -306,6 +306,8 @@ def _freeze_mapping(raw: Any, *, field_name: str, value_kind: str) -> Mapping[st
             frozen[token] = require_portfolio_text(item, field_name=f"{field_name}[{token}]")
         elif value_kind == "int":
             frozen[token] = require_non_negative_int(item, field_name=f"{field_name}[{token}]")
+        elif value_kind == "non_negative":
+            frozen[token] = require_non_negative(item, field_name=f"{field_name}[{token}]")
         else:
             frozen[token] = require_finite(item, field_name=f"{field_name}[{token}]")
     return MappingProxyType(dict(sorted(frozen.items())))
@@ -453,6 +455,7 @@ _EXPOSURE_DURABLE_KEYS: tuple[str, ...] = (
     "portfolio_version",
     "gross_exposure",
     "open_positions",
+    "loss_at_stop",
     "same_direction_counts",
     "symbol_exposure",
     "common_shock_group_counts",
@@ -465,14 +468,15 @@ _EXPOSURE_DURABLE_KEYS: tuple[str, ...] = (
 class PortfolioExposureSnapshot:
     """The explicit current-exposure snapshot passed into the pure selector.
 
-    Existing gross exposure, position count, per-direction counts, per-symbol
-    exposure and per-common-shock-group counts are all explicit. The selector
-    never reads a live portfolio.
+    Existing gross exposure, position count, loss already at stop, per-direction
+    counts, per-symbol exposure and per-common-shock-group counts are all explicit.
+    The selector never reads a live portfolio.
     """
 
     portfolio_version: str
     gross_exposure: float
     open_positions: int
+    loss_at_stop: float
     same_direction_counts: Mapping[str, int]
     symbol_exposure: Mapping[str, float]
     common_shock_group_counts: Mapping[str, int]
@@ -497,6 +501,11 @@ class PortfolioExposureSnapshot:
         )
         object.__setattr__(
             self,
+            "loss_at_stop",
+            require_non_negative(self.loss_at_stop, field_name="loss_at_stop"),
+        )
+        object.__setattr__(
+            self,
             "same_direction_counts",
             _freeze_mapping(
                 self.same_direction_counts,
@@ -508,7 +517,9 @@ class PortfolioExposureSnapshot:
             self,
             "symbol_exposure",
             _freeze_mapping(
-                self.symbol_exposure, field_name="symbol_exposure", value_kind="number"
+                self.symbol_exposure,
+                field_name="symbol_exposure",
+                value_kind="non_negative",
             ),
         )
         object.__setattr__(
@@ -539,6 +550,7 @@ class PortfolioExposureSnapshot:
             "portfolio_version": self.portfolio_version,
             "gross_exposure": self.gross_exposure,
             "open_positions": self.open_positions,
+            "loss_at_stop": self.loss_at_stop,
             "same_direction_counts": _mapping_to_dict(self.same_direction_counts),
             "symbol_exposure": _mapping_to_dict(self.symbol_exposure),
             "common_shock_group_counts": _mapping_to_dict(self.common_shock_group_counts),
@@ -560,6 +572,7 @@ class PortfolioExposureSnapshot:
             portfolio_version=body["portfolio_version"],
             gross_exposure=body["gross_exposure"],
             open_positions=body["open_positions"],
+            loss_at_stop=body["loss_at_stop"],
             same_direction_counts=body["same_direction_counts"],
             symbol_exposure=body["symbol_exposure"],
             common_shock_group_counts=body["common_shock_group_counts"],
@@ -947,6 +960,15 @@ class PortfolioCandidate:
         body = _require_durable_mapping(
             raw, field_name="candidate", expected_keys=_CANDIDATE_DURABLE_KEYS
         )
+        forecast = (
+            None if body["forecast"] is None else ForecastDecision.from_dict(body["forecast"])
+        )
+        declared_forecast_id = body["forecast_decision_id"]
+        actual_forecast_id = None if forecast is None else forecast.decision_id
+        if declared_forecast_id != actual_forecast_id:
+            raise PortfolioContractError(
+                "candidate.forecast_decision_id does not match its nested forecast"
+            )
         return cls(
             candidate_id=body["candidate_id"],
             episode_id=body["episode_id"],
@@ -962,9 +984,7 @@ class PortfolioCandidate:
             legacy_observables=LegacyComparatorObservables.from_dict(
                 body["legacy_observables"]
             ),
-            forecast=(
-                None if body["forecast"] is None else ForecastDecision.from_dict(body["forecast"])
-            ),
+            forecast=forecast,
         )
 
 
@@ -975,7 +995,9 @@ def portfolio_panel_fingerprint(
 
     It binds the declared window and the canonical, sorted candidate ids, so both
     F7 and the frozen legacy comparator provably evaluate the same population and
-    an input reordering cannot change the identity.
+    an input reordering cannot change the identity. It also fails closed on a
+    duplicate candidate identity or a duplicate symbol/direction pair, so every
+    consumer of the panel inherits the same population validation.
     """
     if not isinstance(window, PortfolioEvaluationWindow):
         raise PortfolioContractError("window must be a PortfolioEvaluationWindow")
@@ -986,6 +1008,16 @@ def portfolio_panel_fingerprint(
         if not isinstance(candidate, PortfolioCandidate):
             raise PortfolioContractError("candidates must be PortfolioCandidate values")
         identifiers.append(candidate.candidate_id)
+    if len(identifiers) != len(set(identifiers)):
+        raise PortfolioContractError(
+            "the candidate panel carries a duplicate candidate identity; duplicate "
+            "candidates cannot create duplicate capital"
+        )
+    pairs = [(candidate.symbol, candidate.direction.value) for candidate in candidates]
+    if len(pairs) != len(set(pairs)):
+        raise PortfolioContractError(
+            "the candidate panel carries a duplicate symbol/direction pair"
+        )
     return stable_hash(
         PORTFOLIO_PANEL_FINGERPRINT_PREFIX,
         {
@@ -1211,6 +1243,15 @@ class PortfolioReservation:
                 "portfolio selector"
             )
 
+    @property
+    def is_active(self) -> bool:
+        """True while the reservation still holds capital.
+
+        ``FILL_ADJUSTED`` is an *active* state: after a partial fill the residual
+        capital stays reserved and can still be adjusted, released or expired.
+        """
+        return self.status in (ReservationStatus.PLANNED, ReservationStatus.FILL_ADJUSTED)
+
     def _identity_payload(self) -> dict[str, Any]:
         return {
             "candidate_id": self.candidate_id,
@@ -1320,7 +1361,7 @@ class PortfolioReservationPlan:
         return sum(
             reservation.reserved_capital
             for reservation in self.reservations
-            if reservation.status is ReservationStatus.PLANNED
+            if reservation.is_active
         )
 
     def _identity_payload(self) -> dict[str, Any]:
@@ -1411,8 +1452,8 @@ def release_reservation(
             updated.append(reservation)
             continue
         found = True
-        if reservation.status is not ReservationStatus.PLANNED:
-            raise PortfolioContractError("only a PLANNED reservation can be released")
+        if not reservation.is_active:
+            raise PortfolioContractError("only an active reservation can be released")
         updated.append(
             PortfolioReservation(
                 candidate_id=reservation.candidate_id,
@@ -1439,14 +1480,11 @@ def release_reservation(
 def expire_reservations(
     plan: PortfolioReservationPlan, *, at_time: datetime
 ) -> PortfolioReservationPlan:
-    """Expire every planned reservation whose declared expiry has passed."""
+    """Expire every active reservation whose declared expiry has passed."""
     instant = require_portfolio_utc(at_time, field_name="at_time")
     updated: list[PortfolioReservation] = []
     for reservation in plan.reservations:
-        if (
-            reservation.status is ReservationStatus.PLANNED
-            and reservation.expires_at <= instant
-        ):
+        if reservation.is_active and reservation.expires_at <= instant:
             updated.append(
                 PortfolioReservation(
                     candidate_id=reservation.candidate_id,
@@ -1483,12 +1521,13 @@ def adjust_reservation_for_fill(
             updated.append(reservation)
             continue
         found = True
-        if reservation.status is not ReservationStatus.PLANNED:
-            raise PortfolioContractError("only a PLANNED reservation can be adjusted")
+        if not reservation.is_active:
+            raise PortfolioContractError("only an active reservation can be adjusted")
         remaining = reservation.reserved_capital - filled
         if remaining < 0.0:
             raise PortfolioContractError("filled_capital exceeds the reserved capital")
         if remaining == 0.0:
+            # Fully filled: no residual capital remains reserved.
             updated.append(
                 PortfolioReservation(
                     candidate_id=reservation.candidate_id,
@@ -1498,11 +1537,12 @@ def adjust_reservation_for_fill(
                     portfolio_version=reservation.portfolio_version,
                     created_at=reservation.created_at,
                     expires_at=reservation.expires_at,
-                    status=ReservationStatus.FILL_ADJUSTED,
+                    status=ReservationStatus.RELEASED,
                     release_reason=ReservationReleaseReason.FILL_ADJUSTED,
                 )
             )
         else:
+            # Partially filled: the residual stays reserved and remains adjustable.
             updated.append(
                 PortfolioReservation(
                     candidate_id=reservation.candidate_id,
@@ -1573,15 +1613,20 @@ def portfolio_decision_identity(
     reservation_plan_id: str | None,
     comparator_result_id: str | None,
     expected_net_dollars: float | None,
+    expected_net_dollars_lower_bound: float | None,
+    expected_net_dollars_upper_bound: float | None,
+    loss_at_stop: float | None,
+    unallocated_capital: float | None,
 ) -> str:
     """The deterministic ``PSEL:<digest>`` identity of one portfolio decision.
 
     Identity binds the ratified versions, the policy identity, the explicit
     capital/exposure/panel fingerprints, the declared window, the evaluation
-    instant, the status and the decision's own semantic payload (the ordered
-    allocations, the reservation-plan id, the comparator id and the objective).
-    No UUID, clock, retry count, process identity or database sequence takes part,
-    and a forged decision fails closed.
+    instant, the status and the decision's own semantic payload: the ordered
+    allocations, the reservation-plan id, the comparator id, the objective and
+    every derived aggregate (the uncertainty bounds, the loss at stop and the
+    unallocated capital). No UUID, clock, retry count, process identity or
+    database sequence takes part, and a forged decision fails closed.
     """
     status_token = require_portfolio_enum(PortfolioStatus, status, field_name="status")
     cash_token: str | None = None
@@ -1619,6 +1664,10 @@ def portfolio_decision_identity(
         "reservation_plan_id": reservation_plan_id,
         "comparator_result_id": comparator_result_id,
         "expected_net_dollars": expected_net_dollars,
+        "expected_net_dollars_lower_bound": expected_net_dollars_lower_bound,
+        "expected_net_dollars_upper_bound": expected_net_dollars_upper_bound,
+        "loss_at_stop": loss_at_stop,
+        "unallocated_capital": unallocated_capital,
     }
     return stable_hash(PORTFOLIO_DECISION_ID_PREFIX, payload)
 
@@ -1831,6 +1880,10 @@ class PortfolioDecision:
             reservation_plan_id=self.reservation_plan_id,
             comparator_result_id=self.comparator_result_id,
             expected_net_dollars=self.expected_net_dollars,
+            expected_net_dollars_lower_bound=self.expected_net_dollars_lower_bound,
+            expected_net_dollars_upper_bound=self.expected_net_dollars_upper_bound,
+            loss_at_stop=self.loss_at_stop,
+            unallocated_capital=self.unallocated_capital,
         )
         if self.decision_id != expected:
             raise PortfolioContractError(
