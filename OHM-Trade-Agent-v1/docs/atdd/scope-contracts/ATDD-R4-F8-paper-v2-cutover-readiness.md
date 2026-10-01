@@ -46,7 +46,7 @@ the unified cycle protection phase
 WHEN:
 the cycle runs
 THEN:
-Paper-v2 protection is invoked in the protection phase before discovery, it still runs when discovery is skipped, when the scanner throws, and when operator state is unreadable, and a protection failure never aborts the cycle
+Paper-v2 protection is invoked in the protection phase before discovery, it still runs when discovery is skipped, when the scanner throws, when operator state is unreadable, and when the active-position monitor raises, and a protection failure never aborts the cycle
 
 AC-004:
 GIVEN:
@@ -128,6 +128,14 @@ it runs
 THEN:
 it prints one machine-readable readiness report and activates nothing
 
+AC-014:
+GIVEN:
+the protection-work projection
+WHEN:
+readiness assesses protection health
+THEN:
+a positive exposure with no committed protection plan or in a non-armable state is reported UNSAFE and blocks readiness, a terminal or flat exposure is healthy, and no lifecycle work is advanced
+
 EXPLICITLY OUT OF SCOPE:
 - Setting `OPIP_PAPER_V2_MODE=active` or any other activation
 - Wiring F7 as the live admission authority or retiring the legacy selector, Top-8 gate or profit-ranking comparator
@@ -153,6 +161,7 @@ AC-001 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_001_default_is_not
 AC-001 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_001_malformed_state_fails_closed
 AC-001 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_001_missing_state_is_unavailable
 AC-001 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_001_repository_default_is_not_live_mode_evidence
+AC-001 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_001_report_bounds_drain_reason_text
 AC-001 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_001_report_contains_no_environment_or_secrets
 AC-002 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_002_drain_draining_while_any_obligation_remains
 AC-002 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_002_drain_ready_when_legacy_empty
@@ -162,6 +171,7 @@ AC-003 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_003_cycle_runs_pro
 AC-003 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_003_protection_runs_when_discovery_is_skipped
 AC-003 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_003_protection_runs_when_discovery_throws
 AC-003 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_003_protection_runs_when_operator_state_is_unreadable
+AC-003 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_003_protection_runs_when_active_monitor_throws
 AC-004 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_004_protection_sweep_is_idempotent_and_read_only
 AC-004 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_004_scan_protection_precedes_admission
 AC-005 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_005_universe_metadata_gate_fails_closed
@@ -182,6 +192,7 @@ AC-012 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_012_baseline_triag
 AC-012 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_012_mode_inactive_is_a_prerequisite_not_a_blocker
 AC-012 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_012_readiness_never_activates
 AC-013 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_013_readiness_job_is_read_only
+AC-014 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_014_unsafe_exposure_blocks_protection_readiness
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/services/paper_v2_cutover_readiness.py
@@ -203,6 +214,7 @@ AC-013 -> OHM-Trade-Agent-v1/app/jobs/report_paper_v2_cutover_readiness.py
 AC-013 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
 AC-013 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-F8-paper-v2-cutover-readiness.md
 AC-013 -> OHM-Trade-Agent-v1/tests/test_opip_r4_f8_cutover_readiness.py
+AC-014 -> OHM-Trade-Agent-v1/app/services/paper_v2_cutover_readiness.py
 
 DEFERRED DISCOVERIES:
 - A Paper-v2 short engine is required for full cutover unless the owner ratifies a LONG-only paper mandate; this increment reports the gap and implements neither.

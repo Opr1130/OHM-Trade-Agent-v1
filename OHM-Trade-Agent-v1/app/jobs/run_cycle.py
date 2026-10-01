@@ -461,8 +461,12 @@ def _run_cycle_once() -> None:
             _notify_monitor_degraded(settings=get_settings(), reason=reason, identity="UNIFIED_CYCLE_STATE")
         except Exception as notify_exc:
             print("OHM degradation alert failed:", notify_exc)
-        monitor_active_main()
-        _run_paper_v2_protection_fail_open()
+        try:
+            monitor_active_main()
+        finally:
+            # Paper-v2 protection must advance even when the active-position monitor
+            # raises, which is why it is not simply sequenced after it.
+            _run_paper_v2_protection_fail_open()
         print("Discovery/pending workflows skipped until operator state is readable.")
         return
 
@@ -483,9 +487,13 @@ def _run_cycle_once() -> None:
 
     # Active-position protection is the only production workload permitted
     # ahead of a normally due broad discovery pass. Paper-v2 protection rides the
-    # same protection phase so it survives discovery being disabled or failing.
-    monitor_active_main()
-    _run_paper_v2_protection_fail_open()
+    # same protection phase so it survives discovery being disabled or failing; the
+    # ``finally`` guarantees it still advances if the active monitor raises, while
+    # the monitor's own error continues to propagate unchanged.
+    try:
+        monitor_active_main()
+    finally:
+        _run_paper_v2_protection_fail_open()
 
     if decision.effective_mode == "MAINTENANCE":
         _run_external_order_review_fail_open()

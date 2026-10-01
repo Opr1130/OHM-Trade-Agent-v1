@@ -276,6 +276,25 @@ def test_ac_001_report_contains_no_environment_or_secrets(monkeypatch):
     }
 
 
+def test_ac_001_report_bounds_drain_reason_text(monkeypatch):
+    """ATDD-R4-F8-paper-v2-cutover-readiness/AC-001: raw drain exception text is never serialized."""
+    sentinel = "malformed_net_pnl_987654321"
+    monkeypatch.setattr(
+        "app.services.freqtrade_result_ingest.freqtrade_dry_run_status",
+        lambda **kwargs: (_ for _ in ()).throw(ValueError(sentinel)),
+    )
+    drain = readiness.evaluate_legacy_drain(starting_equity=10_000.0)
+    # The evaluator's own reason still carries the detail for the scan's print.
+    assert sentinel in drain.reason
+    report = readiness.evaluate_cutover_readiness(_healthy_evidence(drain=drain))
+    dumped = json.dumps(report.to_dict(), sort_keys=True)
+    assert sentinel not in dumped
+    assert (
+        report.to_dict()["evidence"]["drain"]["reason_code"]
+        == "LEGACY_DRAIN_UNAVAILABLE"
+    )
+
+
 # ===========================================================================
 # AC-002 — legacy drain
 # ===========================================================================
@@ -364,6 +383,20 @@ def test_ac_003_protection_runs_when_operator_state_is_unreadable(monkeypatch):
     """ATDD-R4-F8-paper-v2-cutover-readiness/AC-003: degraded mode still protects existing exposure."""
     recorder = _drive_cycle(monkeypatch, mode="SEARCH", operator_raises=True)
     run_cycle._run_cycle_once()
+    assert "paper_v2_protection" in recorder.order
+
+
+def test_ac_003_protection_runs_when_active_monitor_throws(monkeypatch):
+    """ATDD-R4-F8-paper-v2-cutover-readiness/AC-003: a raising active monitor still lets paper protection advance."""
+    recorder = _drive_cycle(monkeypatch, mode="MAINTENANCE")
+    monkeypatch.setattr(
+        run_cycle,
+        "monitor_active_main",
+        lambda: (_ for _ in ()).throw(RuntimeError("monitor exploded")),
+    )
+    # The monitor's own error still propagates; protection runs first regardless.
+    with pytest.raises(RuntimeError, match="monitor exploded"):
+        run_cycle._run_cycle_once()
     assert "paper_v2_protection" in recorder.order
 
 
@@ -776,3 +809,42 @@ def test_ac_013_readiness_job_is_read_only(capsys):
     assert "CUTOVER READINESS" in out
     assert "Readiness:" in out
     assert "Reason codes:" in out
+
+
+# ===========================================================================
+# AC-014 — protection-readiness safety
+# ===========================================================================
+
+
+class _ProtectionClient:
+    def __init__(self, items):
+        self._items = tuple(items)
+
+    def get_paper_v2_protection_work(self):
+        from app.opip.canonical.models import PaperV2ProtectionWork
+
+        return PaperV2ProtectionWork(status="OK", items=self._items)
+
+
+def test_ac_014_unsafe_exposure_blocks_protection_readiness():
+    """ATDD-R4-F8-paper-v2-cutover-readiness/AC-014: unplanned open exposure is unsafe and blocks readiness, read-only."""
+    from app.opip.canonical.models import PaperV2ProtectionWorkItem
+
+    unsafe = PaperV2ProtectionWorkItem(
+        paper_trade_id="PTV2:unsafe", remaining_quantity=5.0, protection_plan=None
+    )
+    evidence = readiness.observe_protection_evidence(_ProtectionClient([unsafe]))
+    assert evidence.status == readiness.EVIDENCE_BLOCKED
+    assert evidence.reason_code == readiness.REASON_PROTECTION_UNSAFE
+
+    report = readiness.evaluate_cutover_readiness(_healthy_evidence(protection=evidence))
+    assert readiness.REASON_PROTECTION_UNSAFE in report.reason_codes
+
+    # A flat or terminal exposure is healthy.
+    safe = PaperV2ProtectionWorkItem(
+        paper_trade_id="PTV2:safe", remaining_quantity=0.0, final_verified=True
+    )
+    assert (
+        readiness.observe_protection_evidence(_ProtectionClient([safe])).status
+        == readiness.EVIDENCE_READY
+    )

@@ -211,6 +211,7 @@ REASON_MODE_UNAVAILABLE = "PAPER_V2_MODE_EVIDENCE_UNAVAILABLE"
 REASON_LEGACY_DRAIN_DRAINING = "LEGACY_DRAIN_DRAINING"
 REASON_LEGACY_DRAIN_UNAVAILABLE = "LEGACY_DRAIN_UNAVAILABLE"
 REASON_PROTECTION_UNAVAILABLE = "PROTECTION_EVIDENCE_UNAVAILABLE"
+REASON_PROTECTION_UNSAFE = "PROTECTION_UNSAFE"
 REASON_PROTECTION_NOT_INDEPENDENT = "PROTECTION_DEPENDS_ON_DISCOVERY"
 REASON_UNIVERSE_GATE_ABSENT = "UNIVERSE_METADATA_GATE_ABSENT"
 REASON_UNIVERSE_NOT_OBSERVED = "UNIVERSE_METADATA_NOT_OBSERVED"
@@ -348,7 +349,7 @@ class CutoverEvidence:
     def to_dict(self) -> dict:
         return {
             "mode": _as_dict(self.mode),
-            "drain": self.drain.to_dict(),
+            "drain": _drain_evidence(self.drain),
             "protection": _as_dict(self.protection),
             "universe": _as_dict(self.universe),
             "direction": _as_dict(self.direction),
@@ -385,6 +386,31 @@ def _as_dict(record: Any) -> dict:
     return {
         field_name: getattr(record, field_name)
         for field_name in record.__dataclass_fields__
+    }
+
+
+#: Fixed, status-derived drain reason codes for the report. The drain evaluator's own
+#: ``reason`` is deliberately excluded from report serialization because it can embed
+#: raw exception text (for example a failed numeric conversion quoting a persisted
+#: value), and the report job prints its output.
+_DRAIN_REASON_CODES = {
+    DRAIN_READY: "LEGACY_DRAIN_READY",
+    DRAIN_DRAINING: "LEGACY_DRAIN_DRAINING",
+    DRAIN_UNAVAILABLE: "LEGACY_DRAIN_UNAVAILABLE",
+}
+
+
+def _drain_evidence(drain: LegacyDrainStatus) -> dict:
+    """A bounded drain view: status-derived code and counts, never free-form text."""
+    return {
+        "status": drain.status,
+        "reason_code": _DRAIN_REASON_CODES.get(drain.status, "LEGACY_DRAIN_UNKNOWN"),
+        "freqtrade_open_trades": drain.freqtrade_open_trades,
+        "freqtrade_pending_entries": drain.freqtrade_pending_entries,
+        "paper_v1_pending_entries": drain.paper_v1_pending_entries,
+        "paper_v1_open_positions": drain.paper_v1_open_positions,
+        "paper_v1_reserved_capital": drain.paper_v1_reserved_capital,
+        "legacy_control_enabled": drain.legacy_control_enabled,
     }
 
 
@@ -480,12 +506,51 @@ def observe_protection_evidence(client: Any | None) -> ProtectionEvidence:
             reason_code=REASON_PROTECTION_UNAVAILABLE,
         )
     items = tuple(getattr(projection, "items", ()) or ())
+    if any(not _protection_item_is_safe(item) for item in items):
+        # A readable projection is not the same as healthy protection: a positive
+        # exposure with no committed plan, or in a state the runtime would refuse to
+        # arm or trigger, is exactly what withholds new admissions. Readiness must
+        # block it rather than report the store as healthy.
+        return ProtectionEvidence(
+            status=EVIDENCE_BLOCKED,
+            independent_of_discovery=PROTECTION_INDEPENDENT_OF_DISCOVERY,
+            open_exposure_count=len(items),
+            reason_code=REASON_PROTECTION_UNSAFE,
+        )
     open_count = sum(1 for item in items if not bool(getattr(item, "final_verified", False)))
     return ProtectionEvidence(
         status=EVIDENCE_READY,
         independent_of_discovery=PROTECTION_INDEPENDENT_OF_DISCOVERY,
         open_exposure_count=open_count,
     )
+
+
+def _protection_item_is_safe(item: Any) -> bool:
+    """Read-only mirror of the protection runtime's unsafe-exposure rule.
+
+    Mirrors ``paper_v2_protection_runtime._advance_protection_item`` without advancing
+    anything: a terminal or flat item is safe, while a positive exposure with no
+    committed protection plan, or in a state the runtime would not arm or trigger, is
+    unsafe. It never mutates canonical evidence.
+    """
+    try:
+        from app.opip.contracts.paper_execution import ProtectionState
+        from app.services.paper_v2_protection_runtime import QUANTITY_TOLERANCE
+    except Exception:  # noqa: BLE001 - an unprovable rule must fail closed
+        return False
+    if bool(getattr(item, "final_verified", False)):
+        return True
+    remaining = float(getattr(item, "remaining_quantity", 0.0) or 0.0)
+    if remaining <= QUANTITY_TOLERANCE:
+        return True
+    if getattr(item, "protection_plan", None) is None:
+        return False
+    state = str(getattr(item, "protection_state", "") or "")
+    return state in {
+        ProtectionState.PLANNED.value,
+        ProtectionState.ACTIVE.value,
+        ProtectionState.TRIGGERED.value,
+    }
 
 
 def observe_canonical_writer_evidence(client: Any | None) -> CanonicalWriterEvidence:
@@ -696,7 +761,9 @@ def evaluate_cutover_readiness(evidence: CutoverEvidence) -> CutoverReadinessRep
     # --- protection ---------------------------------------------------------
     if not evidence.protection.independent_of_discovery:
         reasons.append(REASON_PROTECTION_NOT_INDEPENDENT)
-    if evidence.protection.status != EVIDENCE_READY:
+    if evidence.protection.status == EVIDENCE_BLOCKED:
+        reasons.append(REASON_PROTECTION_UNSAFE)
+    elif evidence.protection.status != EVIDENCE_READY:
         reasons.append(REASON_PROTECTION_UNAVAILABLE)
 
     # --- universe metadata gate --------------------------------------------
