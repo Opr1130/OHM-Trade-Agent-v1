@@ -52,6 +52,12 @@ from app.opip.contracts import (
     feasibility_evidence_fingerprint,
     require_feasibility_utc,
 )
+from app.opip.contracts.feasibility_evidence import (
+    FeasibilityEvidence,
+    FeasibilityEvidenceError,
+    feasibility_evidence_from_market_snapshot,
+    feasibility_evidence_summary,
+)
 from app.opip.decision.gates import evaluate_execution_gate, evaluate_margin_gate
 from app.opip.decision.models import GateName, GateStatus, ReasonCode
 from app.scanner import market_data_validation as market_data
@@ -98,16 +104,67 @@ def _require_episode(episode: object) -> OpportunityEpisode:
     return episode
 
 
-def _require_snapshot(evidence: object) -> MarketSnapshot:
-    if not isinstance(evidence, MarketSnapshot):
+def _require_feasibility_evidence(evidence: object) -> FeasibilityEvidence:
+    """Require the canonical typed evidence record.
+
+    R4-B0 Decision 2: the target F5 contract no longer *requires*
+    ``isinstance(evidence, MarketSnapshot)``. A typed ``FeasibilityEvidence`` is the
+    canonical input. A legacy ``MarketSnapshot`` is adapted once, in
+    ``evaluate_feasibility``, using the caller's explicit ``evaluation_time`` so no
+    clock or global state is read.
+    """
+    if not isinstance(evidence, FeasibilityEvidence):
         raise FeasibilityContractError(
-            "evidence must be a MarketSnapshot candidate carrying the "
-            "pre-forecast feasibility inputs"
+            "evidence must be a FeasibilityEvidence carrying the pre-forecast "
+            "feasibility inputs"
         )
     return evidence
 
 
-def _direction(snapshot: MarketSnapshot) -> str:
+def adapt_legacy_market_snapshot(
+    snapshot: MarketSnapshot, *, evaluation_time: datetime
+) -> FeasibilityEvidence:
+    """The one transitional ``MarketSnapshot`` -> ``FeasibilityEvidence`` adapter.
+
+    ``evaluation_time`` is the explicit instant the caller already supplies, so the
+    adapted evidence epoch is the caller's fact rather than a hidden read. The
+    legacy snapshot carries no separate observation instant, so the cutoff is the
+    same explicit instant.
+    """
+    return feasibility_evidence_from_market_snapshot(
+        snapshot,
+        source_cutoff=evaluation_time,
+        source_snapshot_id=(
+            f"LEGACY_SNAPSHOT:{getattr(snapshot, 'symbol', '') or 'UNKNOWN'}"
+        ),
+        evaluation_time=evaluation_time,
+    )
+
+
+def _require_evidence_epoch(
+    evidence: FeasibilityEvidence,
+    episode: OpportunityEpisode,
+    evaluation_time: datetime,
+) -> None:
+    """OWNER Decision 8: the evidence must belong to the observed epoch.
+
+    The typed evidence carries its own ``evaluation_time``, which must be the
+    caller's explicit instant; evidence observed after the decision fails closed.
+    Instrument correspondence is enforced separately by
+    ``_require_instrument_correspondence`` using the frozen venue-token rule, so
+    this guard adds epoch discipline without tightening the frozen F5 semantics.
+    """
+    if evidence.evaluation_time != evaluation_time:
+        raise FeasibilityContractError(
+            "feasibility evidence evaluation_time does not match the evaluation instant"
+        )
+    if evidence.source_cutoff > evaluation_time:
+        raise FeasibilityContractError(
+            "feasibility evidence was observed after the evaluation instant"
+        )
+
+
+def _direction(snapshot: Any) -> str:
     raw = getattr(snapshot, "trade_direction", None)
     if not isinstance(raw, str) or raw != raw.strip():
         raise FeasibilityContractError(
@@ -291,114 +348,14 @@ def _lenient_text_tuple(value: Any) -> tuple[str, ...] | None:
     return None
 
 
-def _canonical_evidence_summary(snapshot: MarketSnapshot) -> dict[str, Any]:
-    """The normalized F5-required evidence inputs used for the fingerprint.
+def _canonical_evidence_summary(evidence: Any) -> dict[str, Any]:
+    """R4-B0: the normalized F5-required evidence inputs used for the fingerprint.
 
-    This is deliberately lenient: it never raises, so building the fingerprint
-    cannot pre-empt the ordered checks and mask a proven hard veto (a proven veto
-    must short-circuit and be returned). A malformed required structure is
-    detected by the check itself, when - and only when - that component is
-    evaluated. Only well-typed primitives and primitive sequences are kept, so
-    the fingerprint never depends on an object repr; a non-primitive or
-    non-finite value is recorded as ``None`` for identity purposes.
+    Delegates to the canonical evidence contract so the fingerprint is computed
+    from one definition, and stays lenient so building it cannot pre-empt the
+    ordered checks and mask a proven hard veto.
     """
-    market = getattr(snapshot, "market_data_validation", None)
-    if market is None:
-        market_summary: dict[str, Any] | None = None
-    else:
-        market_summary = {
-            "status": _lenient_text(getattr(market, "status", None)),
-            "qualified": _lenient_bool(getattr(market, "qualified", None)),
-            "candle_count": _lenient_number(getattr(market, "candle_count", None)),
-            "latest_candle_timestamp": _lenient_number(
-                getattr(market, "latest_candle_timestamp", None)
-            ),
-            "latest_candle_age_seconds": _lenient_number(
-                getattr(market, "latest_candle_age_seconds", None)
-            ),
-            "duplicate_timestamp_count": _lenient_number(
-                getattr(market, "duplicate_timestamp_count", None)
-            ),
-            "gap_count": _lenient_number(getattr(market, "gap_count", None)),
-            "invalid_ohlc_count": _lenient_number(
-                getattr(market, "invalid_ohlc_count", None)
-            ),
-            "non_finite_value_count": _lenient_number(
-                getattr(market, "non_finite_value_count", None)
-            ),
-            "largest_gap_seconds": _lenient_number(
-                getattr(market, "largest_gap_seconds", None)
-            ),
-            "ticker_last": _lenient_float_token(getattr(market, "ticker_last", None)),
-            "latest_ohlc_close": _lenient_number(
-                getattr(market, "latest_ohlc_close", None)
-            ),
-            "ticker_vs_ohlc_difference_pct": _lenient_number(
-                getattr(market, "ticker_vs_ohlc_difference_pct", None)
-            ),
-            "suspicious_spike_detected": _lenient_bool(
-                getattr(market, "suspicious_spike_detected", None)
-            ),
-            "warnings": _lenient_text_tuple(getattr(market, "warnings", None)),
-            "rejection_reasons": _lenient_text_tuple(
-                getattr(market, "rejection_reasons", None)
-            ),
-        }
-
-    execution = getattr(snapshot, "execution_validation", None)
-    if execution is None:
-        execution_summary: dict[str, Any] | None = None
-    else:
-        execution_summary = {
-            "status": _lenient_text(getattr(execution, "status", None)),
-            "book_coverage_status": _lenient_text(
-                getattr(execution, "book_coverage_status", None)
-            ),
-            "spread_bps": _lenient_number(getattr(execution, "spread_bps", None)),
-            "buy_visible_coverage_pct": _lenient_number(
-                getattr(execution, "buy_visible_coverage_pct", None)
-            ),
-            "sell_visible_coverage_pct": _lenient_number(
-                getattr(execution, "sell_visible_coverage_pct", None)
-            ),
-            "buy_fully_covered": _lenient_bool(
-                getattr(execution, "buy_fully_covered", None)
-            ),
-            "sell_fully_covered": _lenient_bool(
-                getattr(execution, "sell_fully_covered", None)
-            ),
-            "short_round_trip_drag_pct": _lenient_number(
-                getattr(
-                    execution,
-                    "estimated_visible_short_round_trip_market_drag_pct",
-                    None,
-                )
-            ),
-            "recent_trade_status": _lenient_text(
-                getattr(execution, "recent_trade_status", None)
-            ),
-        }
-
-    return {
-        "direction": _lenient_text(getattr(snapshot, "trade_direction", None)),
-        "symbol": _lenient_text(getattr(snapshot, "symbol", None)),
-        "kraken_public_symbol": _lenient_text(
-            getattr(snapshot, "kraken_public_symbol", None)
-        ),
-        "primary_pair": _lenient_text(getattr(snapshot, "primary_pair", None)),
-        "market": market_summary,
-        "margin_status": _lenient_text(
-            getattr(snapshot, "margin_validation_status", None)
-        ),
-        "margin_eligible": _lenient_bool(getattr(snapshot, "margin_eligible", None)),
-        "margin_venue_symbol": _lenient_text(
-            getattr(snapshot, "margin_venue_symbol", None)
-        ),
-        "margin_max_leverage": _lenient_number(
-            getattr(snapshot, "margin_max_leverage", None)
-        ),
-        "execution": execution_summary,
-    }
+    return feasibility_evidence_summary(evidence)
 
 
 def _instrument_token(value: Any) -> str | None:
@@ -424,7 +381,7 @@ def _instrument_token(value: Any) -> str | None:
 
 
 def _require_instrument_correspondence(
-    episode: OpportunityEpisode, snapshot: MarketSnapshot
+    episode: OpportunityEpisode, snapshot: Any
 ) -> None:
     """The evidence snapshot must be for the episode's venue instrument.
 
@@ -468,7 +425,7 @@ def _check(
     return FeasibilityCheck(name=name, status=status, reason=reason)
 
 
-def _market_check(snapshot: MarketSnapshot) -> FeasibilityCheck:
+def _market_check(snapshot: Any) -> FeasibilityCheck:
     """Map the existing market-data validation evidence (no new threshold)."""
     validation = getattr(snapshot, "market_data_validation", None)
     if validation is None:
@@ -534,7 +491,7 @@ def _market_check(snapshot: MarketSnapshot) -> FeasibilityCheck:
 
 
 def _margin_check(
-    snapshot: MarketSnapshot, evaluation_time: datetime
+    snapshot: Any, evaluation_time: datetime
 ) -> FeasibilityCheck:
     """Reuse the thin margin adapter; LONG is NOT_APPLICABLE, never PASS."""
     direction = _direction(snapshot)
@@ -709,7 +666,7 @@ def _validate_execution_fields(execution: Any) -> None:
         )
 
 
-def _has_btnl_venue_provenance(snapshot: MarketSnapshot) -> bool:
+def _has_btnl_venue_provenance(snapshot: Any) -> bool:
     """True when the snapshot carries the Bitnomial margin venue provenance.
 
     The live SHORT route refreshes the BTNL margin book onto the snapshot; the
@@ -721,7 +678,7 @@ def _has_btnl_venue_provenance(snapshot: MarketSnapshot) -> bool:
 
 
 def _execution_check(
-    snapshot: MarketSnapshot, evaluation_time: datetime
+    snapshot: Any, evaluation_time: datetime
 ) -> FeasibilityCheck:
     """Reuse the thin execution adapter on its OFFLINE route (no refresh)."""
     execution = getattr(snapshot, "execution_validation", None)
@@ -791,7 +748,7 @@ def _execution_check(
 
 def _run_check(
     name: FeasibilityCheckName,
-    snapshot: MarketSnapshot,
+    snapshot: Any,
     evaluation_time: datetime,
 ) -> FeasibilityCheck:
     if name is FeasibilityCheckName.MARKET_DATA:
@@ -805,11 +762,15 @@ def _run_check(
 
 def evaluate_feasibility(
     episode: OpportunityEpisode,
-    evidence: MarketSnapshot,
+    evidence: FeasibilityEvidence | MarketSnapshot,
     evaluation_time: datetime,
     policy: FeasibilityPolicy,
 ) -> FeasibilityDecision:
     """Evaluate one ACTIVE F4 episode against the F5 required checks. Pure.
+
+    R4-B0 Decision 2: ``evidence`` is the canonical ``FeasibilityEvidence``. A
+    legacy ``MarketSnapshot`` is accepted only through the transitional adapter and
+    is stamped with the caller's explicit ``evaluation_time``; no clock is read.
 
     Deterministic sequential aggregation in the recorded live hard-filter order.
     An evaluated hard ``VETO`` yields overall ``VETO`` and short-circuits the
@@ -823,19 +784,31 @@ def evaluate_feasibility(
         evaluation_time, field_name="evaluation_time"
     )
     episode = _require_episode(episode)
-    snapshot = _require_snapshot(evidence)
-    _require_instrument_correspondence(episode, snapshot)
+    if isinstance(evidence, MarketSnapshot):
+        try:
+            evidence = adapt_legacy_market_snapshot(
+                evidence, evaluation_time=evaluation_time
+            )
+        except FeasibilityEvidenceError as exc:
+            # The legacy adapter's structural failures surface as F5's own error,
+            # so the frozen F5 error surface is unchanged for legacy callers.
+            raise FeasibilityContractError(str(exc)) from exc
+    resolved = _require_feasibility_evidence(evidence)
+    # OWNER Decision 8: the evidence must be anchored to the same observed epoch,
+    # and evidence that was not visible by the evaluation instant fails closed.
+    _require_evidence_epoch(resolved, episode, evaluation_time)
+    _require_instrument_correspondence(episode, resolved)
 
     # The fingerprint is lenient by design: it must never pre-empt the ordered
     # checks (a proven hard veto must short-circuit and be returned).
     fingerprint = feasibility_evidence_fingerprint(
-        _canonical_evidence_summary(snapshot)
+        _canonical_evidence_summary(resolved)
     )
 
     evaluated: list[FeasibilityCheck] = []
     disposition = FeasibilityDisposition.FEASIBLE
     for name in FEASIBILITY_CHECK_ORDER:
-        check = _run_check(name, snapshot, evaluation_time)
+        check = _run_check(name, resolved, evaluation_time)
         evaluated.append(check)
         if check.status is FeasibilityCheckStatus.VETO:
             disposition = FeasibilityDisposition.VETO

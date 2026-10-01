@@ -65,6 +65,17 @@ def set_writer_client_for_tests(client: WriterClient | None) -> None:
     _client_override = client
 
 
+#: The Feature Bus runtime modes. ``off`` = no production source; ``shadow`` =
+#: R2 evidence only, no authority; ``active`` = the authoritative FeatureSnapshot
+#: producer for the F3-F7 spine with identical R2-proven math (R4-B0 Decision 7).
+FEATURE_BUS_MODES = frozenset({"off", "shadow", "active"})
+
+#: Modes in which the bus may publish canonical feature evidence. Both are
+#: non-authoritative for trading; only ``active`` is authoritative as the
+#: FeatureSnapshot *source*.
+FEATURE_BUS_CAPTURE_MODES = frozenset({"shadow", "active"})
+
+
 def resolve_feature_bus_mode(settings: Any | None = None) -> str:
     if settings is not None:
         mode = str(getattr(settings, "opip_feature_bus_mode", "off") or "off")
@@ -76,13 +87,22 @@ def resolve_feature_bus_mode(settings: Any | None = None) -> str:
         except Exception:
             mode = "off"
     mode = mode.strip().lower()
-    return mode if mode in {"off", "shadow"} else "off"
+    return mode if mode in FEATURE_BUS_MODES else "off"
+
+
+def feature_bus_production_authoritative(settings: Any | None = None) -> bool:
+    """True only for ``active``: the bus owns the production FeatureSnapshot.
+
+    It still grants no entry, allocation, risk, paper, exchange or Committee
+    authority; it only makes the bus the authoritative snapshot *source*.
+    """
+    return resolve_feature_bus_mode(settings) == "active"
 
 
 def feature_bus_capture_enabled(settings: Any | None = None) -> bool:
-    """Both gates must be shadow. Either being off means no capture."""
+    """Capture requires a publishing bus mode and a shadow writer. Either off means no capture."""
     return (
-        resolve_feature_bus_mode(settings) == "shadow"
+        resolve_feature_bus_mode(settings) in FEATURE_BUS_CAPTURE_MODES
         and resolve_writer_mode(settings) == "shadow"
     )
 
@@ -425,6 +445,8 @@ class FeatureBusPublisher:
 
 __all__ = [
     "FEATURE_BUS_SPOOL_PREFIX",
+    "FEATURE_BUS_CAPTURE_MODES",
+    "FEATURE_BUS_MODES",
     "FeatureBusPublisher",
     "PublishOutcome",
     "SHADOW_CAPTURE_SETTINGS",
@@ -433,6 +455,7 @@ __all__ = [
     "checkpoint_intent",
     "coverage_gap_intent",
     "feature_bus_capture_enabled",
+    "feature_bus_production_authoritative",
     "instrument_version_intent",
     "observation_intent",
     "resolve_feature_bus_mode",
