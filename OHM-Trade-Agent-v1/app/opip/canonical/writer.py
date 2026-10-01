@@ -95,6 +95,8 @@ from app.opip.contracts.paper_execution_runtime import (
     admission_request_idempotency_key,
     admission_result_identities,
     decision_snapshot_idempotency_key,
+    expected_paper_side,
+    paper_trade_direction_contract,
     protection_action_idempotency_key,
     protection_transition_allowed,
     protection_transition_requires_trigger,
@@ -3677,15 +3679,19 @@ class CanonicalWriter:
                 raise ValueError("order intent paper_trade_id does not match reservation")
             if context.get("context_id") != context_id:
                 raise ValueError("order intent decision context ancestry is invalid")
-            # Long-only Paper v2 role/side semantics are frozen here so an
-            # unsupported pair cannot reach conservation, protection eligibility
-            # or the reservation controls with the wrong economic meaning.
+            # R4-B0 Decision 6: the role/side pair is bound to the *admitted
+            # trade's* direction, derived from committed ancestry, never from a
+            # caller-supplied field. A caller therefore cannot claim SHORT merely
+            # to make an ENTRY/SELL pair validate.
             role = str(payload.get("intent_role"))
             side = str(payload.get("side"))
-            if role == "ENTRY" and side != "BUY":
-                raise ValueError("ENTRY order intent must use side BUY")
-            if role == "EXIT" and side != "SELL":
-                raise ValueError("EXIT order intent must use side SELL")
+            admitted_direction = paper_trade_direction_contract(admission)
+            allowed_side = expected_paper_side(admitted_direction, role)
+            if side != allowed_side:
+                raise ValueError(
+                    f"{admitted_direction} {role} order intent must use side "
+                    f"{allowed_side}"
+                )
             trade_id = self._require_string_ref(payload, "paper_trade_id")
             # Terminal FINAL_VERIFIED trade: no new economic mutation. Exact
             # replay never reaches here because idempotency resolves first.
