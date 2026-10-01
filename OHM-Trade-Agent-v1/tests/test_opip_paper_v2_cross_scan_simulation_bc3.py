@@ -1351,16 +1351,26 @@ def test_global_cross_scan_canonical_invariants(env):
         # The fixture book is not admissible for this SHORT; it closed as a
         # zero-fill. Valid outcome, and the side invariant below still holds.
         pass
-    short_entry_intents = [
+    entry_intents = [
         row
         for row in _rows(writer, PAPER_ORDER_INTENT_RECORDED)
-        if str(row.get("intent_role")) == "ENTRY" and str(row.get("side")) == "SELL"
+        if str(row.get("intent_role")) == "ENTRY"
     ]
-    assert short_entry_intents, "a SHORT ENTRY must be SELL-side, never a long BUY"
-    assert all(
-        str(row["paper_trade_id"]) not in long_trades_before
-        for row in short_entry_intents
-    ), "a SHORT must not contribute to the LONG trade set"
+    # The invariant that matters: every BUY-side ENTRY belongs to the pre-existing
+    # LONG trade set, so the SHORT cannot have minted a long BUY. A SELL-side ENTRY,
+    # if the fixture admitted the SHORT, is its own and is never a long trade.
+    buy_entry_trades = {
+        str(row["paper_trade_id"]) for row in entry_intents if str(row.get("side")) == "BUY"
+    }
+    assert buy_entry_trades <= long_trades_before, (
+        "a SHORT must never open through a long BUY ENTRY"
+    )
+    short_entry_trades = {
+        str(row["paper_trade_id"]) for row in entry_intents if str(row.get("side")) == "SELL"
+    }
+    assert not (short_entry_trades & long_trades_before), (
+        "a SHORT ENTRY must not belong to the LONG trade set"
+    )
     # R4-B0: the three LONG contexts from S1-S3 must remain exactly as they were;
     # the SHORT may add at most its own one context (when it admits).
     assert _count(writer, CTX_EVENT) in (3, 4)

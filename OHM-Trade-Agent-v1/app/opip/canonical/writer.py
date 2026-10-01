@@ -4020,7 +4020,18 @@ class CanonicalWriter:
         exit intent or an attempted execution - only from fills that the canonical
         writer actually committed, classified by their parent order's canonical
         role.
+
+        R4-B0: gross P&L is signed by the admitted trade's direction. A LONG pays
+        out on its ENTRY and receives on its EXIT, so gross is exits minus entries;
+        a simulated SHORT receives on its ENTRY (a SELL-to-open) and pays out on
+        its cover, so gross is entries minus exits. Reading the wrong sign would
+        report a profitable short as a loss and would let an unverifiable
+        reconciliation pass.
         """
+        direction = paper_trade_direction_contract(
+            self._admitted_trade(paper_trade_id)
+        )
+        is_long = direction == PAPER_DIRECTION_LONG
         roles = self._order_role_by_id()
         entry_quantity = 0.0
         exit_quantity = 0.0
@@ -4049,10 +4060,12 @@ class CanonicalWriter:
             )
             if role == "ENTRY":
                 entry_quantity += quantity
-                gross_pnl -= notional
+                # A LONG entry is a cash outflow; a SHORT entry is a simulated
+                # inflow of proceeds.
+                gross_pnl += -notional if is_long else notional
             else:
                 exit_quantity += quantity
-                gross_pnl += notional
+                gross_pnl += notional if is_long else -notional
         return {
             "entry_quantity": entry_quantity,
             "exit_quantity": exit_quantity,

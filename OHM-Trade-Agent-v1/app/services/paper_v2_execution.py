@@ -1300,6 +1300,7 @@ def _ensure_protection_plan(
             stop_price=float(opportunity.stop_price),
             target_prices=tuple(float(p) for p in opportunity.target_prices),
             plan_time=moment,
+            direction=str(opportunity.direction),
         ),
         tp1_fraction=float(getattr(settings, "paper_v2_tp1_fraction", 0.5)),
         max_hold_seconds=int(getattr(settings, "paper_v2_max_hold_seconds", 86_400)),

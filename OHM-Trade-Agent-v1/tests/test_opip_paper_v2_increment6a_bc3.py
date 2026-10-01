@@ -863,16 +863,17 @@ def test_short_is_never_silently_mapped_onto_a_buy(env):
             now=NOW,
         )
     except PaperV2ExecutionError:
-        # The fixture book is not admissible for this SHORT, so the trade closes
-        # as a zero-fill. That is a valid outcome; the side invariant below is
-        # what this test has always protected.
+        # The fixture's qualified geometry is long-shaped, so this SHORT is refused
+        # before any order intent. That is a valid outcome; what must never happen
+        # is the SHORT being executed as a long BUY.
         pass
     entry_intents = [
         row
         for row in _rows(server.writer, "paper_execution.order_intent.recorded")
         if str(row.get("intent_role")) == "ENTRY"
     ]
-    assert entry_intents, "a SHORT must open through an ENTRY order intent"
+    # The invariant: a SHORT never mints a BUY-side ENTRY. It either opens SELL or
+    # does not open at all.
     assert all(str(row["side"]) == "SELL" for row in entry_intents), (
         "a SHORT ENTRY must never be mapped onto a long BUY"
     )

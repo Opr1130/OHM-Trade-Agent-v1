@@ -56,6 +56,10 @@ class ProtectionPlanSource:
     stop_price: float
     target_prices: tuple[float, ...]
     plan_time: datetime
+    #: R4-B0: the position direction this geometry protects. A LONG stops below the
+    #: position with targets ascending above it; a simulated SHORT stops above the
+    #: position with targets descending below it.
+    direction: str = "LONG"
 
 
 def build_protection_plan_id(
@@ -91,13 +95,23 @@ def build_protection_plan_payload(
 ) -> dict:
     """Build the canonical B/C-2 protection plan payload.
 
-    Long-only semantics are enforced here: the stop must sit below the position and
-    the targets must ascend above it, matching the qualified geometry. The payload
-    is validated through the frozen contract, so a plan the canonical writer would
-    reject can never be produced.
+    R4-B0: the geometry is direction-bound. A LONG protects a position entered
+    below the market, so the stop sits below it and the targets ascend above it. A
+    simulated SHORT protects a position entered above the market, so the stop sits
+    above it and the targets descend below it. The payload is validated through the
+    frozen contract, so a plan the canonical writer would reject can never be
+    produced.
     """
     if not isinstance(source, ProtectionPlanSource):
         raise ValueError("source must be a ProtectionPlanSource")
+
+    from app.opip.contracts.paper_execution_runtime import (
+        PAPER_DIRECTION_LONG,
+        require_paper_direction,
+    )
+
+    direction = require_paper_direction(source.direction)
+    is_long = direction == PAPER_DIRECTION_LONG
 
     paper_trade_id = str(source.paper_trade_id or "")
     if not paper_trade_id or paper_trade_id != paper_trade_id.strip():
@@ -114,13 +128,21 @@ def build_protection_plan_payload(
         raise ValueError(
             "a staged protection plan requires at least two qualified targets"
         )
-    if list(prices) != sorted(prices):
-        raise ValueError("target prices must ascend")
+    # Profit order follows the direction: a LONG takes profit into rising prices, a
+    # SHORT into falling prices.
+    ordered = list(prices) == sorted(prices) if is_long else list(prices) == sorted(prices, reverse=True)
+    if not ordered:
+        raise ValueError(
+            "target prices must ascend for a LONG and descend for a SHORT"
+        )
     if len(set(prices)) != len(prices):
         raise ValueError("target prices must be distinct")
-    # Long-only geometry: protection sits below the position and targets above it.
-    if stop_price >= prices[0]:
+    # Direction-bound geometry: protection sits beyond the position in the loss
+    # direction and the targets sit in the profit direction.
+    if is_long and stop_price >= prices[0]:
         raise ValueError("stop_price must sit below the first target")
+    if not is_long and stop_price <= prices[0]:
+        raise ValueError("stop_price must sit above the first target")
 
     first_fraction = float(tp1_fraction)
     if not 0.0 < first_fraction < 1.0:
