@@ -7,7 +7,10 @@ from app.core.config import get_settings
 from app.jobs.monitor_active_trades import main as monitor_active_main
 from app.jobs.monitor_pending_setups import main as monitor_pending_main
 from app.jobs.scan_movers import main as scan_movers_main
-from app.jobs.scan_opportunities import main as scan_main
+from app.jobs.scan_opportunities import (
+    main as scan_main,
+    run_scheduled_paper_v2_protection_sweep,
+)
 from app.services.active_trade_monitor_runner import (
     _deliver_system_incident_decision,
     _notify_monitor_degraded,
@@ -35,6 +38,29 @@ from app.services.system_incidents import (
 CYCLE_LOCK_FILE = Path("/app/data/.unified_cycle.lock")
 EARLY_WATCH_STATE_FILE = Path("/app/data/early_watch_scheduler_state.json")
 EARLY_WATCH_LOCK_FILE = EARLY_WATCH_STATE_FILE.parent / ".early_watch_scheduler.lock"
+
+
+def _run_paper_v2_protection_fail_open() -> None:
+    """Advance Paper-v2 protection/EXIT/reconciliation independently of discovery.
+
+    R4-A: Paper-v2 protection must not depend on opportunity discovery. It has to
+    keep running - and keep closing exposure Paper v2 already owns - when discovery
+    is disabled, when the scanner throws, when no candidates exist, or when
+    qualification is unavailable. It therefore rides the unified cycle's protection
+    phase, the same slot the active-position monitor uses, in addition to the scan.
+
+    This reuses the existing ``run_protection_sweep`` runtime through its scheduled
+    seam; it duplicates no protection logic, admits nothing, requalifies nothing, and
+    never falls back to a legacy paper authority. A failure here is reported and never
+    aborts the cycle.
+    """
+    try:
+        run_scheduled_paper_v2_protection_sweep(get_settings(), requested=False)
+    except Exception as exc:  # noqa: BLE001 - protection must not abort the cycle
+        print(
+            "PAPER V2 protection (cycle slot) unavailable; production unaffected:",
+            f"{type(exc).__name__}: {exc}",
+        )
 
 
 def _close_operator_state_incident_if_open() -> bool:
@@ -436,6 +462,7 @@ def _run_cycle_once() -> None:
         except Exception as notify_exc:
             print("OHM degradation alert failed:", notify_exc)
         monitor_active_main()
+        _run_paper_v2_protection_fail_open()
         print("Discovery/pending workflows skipped until operator state is readable.")
         return
 
@@ -455,8 +482,10 @@ def _run_cycle_once() -> None:
     print("Reason:", decision.reason)
 
     # Active-position protection is the only production workload permitted
-    # ahead of a normally due broad discovery pass.
+    # ahead of a normally due broad discovery pass. Paper-v2 protection rides the
+    # same protection phase so it survives discovery being disabled or failing.
     monitor_active_main()
+    _run_paper_v2_protection_fail_open()
 
     if decision.effective_mode == "MAINTENANCE":
         _run_external_order_review_fail_open()

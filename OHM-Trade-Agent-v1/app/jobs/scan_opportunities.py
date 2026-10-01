@@ -705,6 +705,14 @@ def _run_paper_v2_protection_sweep(settings, *, requested: bool):
     return result
 
 
+#: Public, cycle-facing name for the Paper-v2 protection sweep. ``run_cycle``
+#: invokes this from its protection phase (before, and independently of, discovery)
+#: so a committed Paper-v2 obligation stays protected even when discovery is disabled
+#: or fails. It is the same function the scan already calls - one implementation, two
+#: invocation sites - so no protection logic is duplicated.
+run_scheduled_paper_v2_protection_sweep = _run_paper_v2_protection_sweep
+
+
 def _print_paper_v2_summary(summary) -> None:
     """Operator-observable accounting for the active Paper-v2 route."""
     if summary is None:
