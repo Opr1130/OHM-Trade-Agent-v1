@@ -528,16 +528,21 @@ def observe_direction_coverage() -> DirectionCoverage:
         return DirectionCoverage(
             long_covered=False,
             short_covered=False,
-            reason_code=REASON_SHORT_AUTHORITY_MISSING,
+            reason_code=REASON_LONG_AUTHORITY_MISSING,
         )
     # The frozen slice is long-only: there is no short engine, and a SHORT is
     # refused rather than mapped onto a BUY. Full cutover therefore remains blocked
     # on short authority until a future increment supplies it or an owner ratifies a
-    # long-only mandate.
+    # long-only mandate. When even LONG is not covered the gap is larger still, so the
+    # reason names the missing long authority instead of claiming no gap.
     return DirectionCoverage(
         long_covered=long_covered,
         short_covered=False,
-        reason_code=None if not long_covered else REASON_SHORT_AUTHORITY_MISSING,
+        reason_code=(
+            REASON_SHORT_AUTHORITY_MISSING
+            if long_covered
+            else REASON_LONG_AUTHORITY_MISSING
+        ),
     )
 
 
@@ -733,10 +738,22 @@ def cutover_readiness_report(
     if client is None:
         client = _default_writer_client()
     equity = _starting_equity(settings)
+    if equity is None:
+        # Matching the scan's authority resolver: an unprovable starting equity is
+        # not a reason to evaluate legacy drain optimistically. Fail closed.
+        drain = LegacyDrainStatus(
+            status=DRAIN_UNAVAILABLE,
+            reason=(
+                "starting equity is unavailable, so the legacy drain cannot be "
+                "proven; the scan resolver would also block the cutover"
+            ),
+        )
+    else:
+        drain = evaluate_legacy_drain(starting_equity=equity)
     return evaluate_cutover_readiness(
         CutoverEvidence(
             mode=observe_mode_evidence(settings),
-            drain=evaluate_legacy_drain(starting_equity=equity),
+            drain=drain,
             protection=observe_protection_evidence(client),
             universe=observe_universe_gate_evidence(observed_universe_assets),
             direction=observe_direction_coverage(),
@@ -748,10 +765,19 @@ def cutover_readiness_report(
     )
 
 
-def _starting_equity(settings: Any | None) -> float:
-    source = settings if settings is not None else _process_settings()
-    equity = float(getattr(source, "paper_trade_starting_equity", 0.0) or 0.0)
-    return equity if equity > 0 else 1.0
+def _starting_equity(settings: Any | None) -> float | None:
+    """The starting equity the drain evaluator needs, or ``None`` when unprovable.
+
+    Matches ``scan_opportunities._legacy_drain_status``: a missing, zero, negative or
+    malformed equity is not evidence that the legacy subsystems are empty, so it must
+    block rather than be replaced by a default. ``None`` means "unavailable".
+    """
+    try:
+        source = settings if settings is not None else _process_settings()
+        equity = float(getattr(source, "paper_trade_starting_equity", 0.0) or 0.0)
+    except Exception:  # noqa: BLE001 - unreadable equity is not evidence
+        return None
+    return equity if equity > 0 else None
 
 
 def _default_writer_client() -> Any | None:

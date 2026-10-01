@@ -466,6 +466,18 @@ def test_ac_006_short_has_no_authoritative_engine():
     assert report.overall == readiness.READINESS_NOT_READY
 
 
+def test_ac_006_long_coverage_gap_is_reported(monkeypatch):
+    """ATDD-R4-F8-paper-v2-cutover-readiness/AC-006: a missing LONG coverage is named, never reported as no gap."""
+    monkeypatch.setattr(
+        "app.services.paper_v2_scan_router.SUPPORTED_DIRECTION", "SHORT"
+    )
+    coverage = readiness.observe_direction_coverage()
+    assert coverage.long_covered is False
+    assert coverage.reason_code == readiness.REASON_LONG_AUTHORITY_MISSING
+    report = readiness.evaluate_cutover_readiness(_healthy_evidence(direction=coverage))
+    assert readiness.REASON_LONG_AUTHORITY_MISSING in report.reason_codes
+
+
 # ===========================================================================
 # AC-007 — pending-entry mandate / WAIT
 # ===========================================================================
@@ -672,6 +684,17 @@ def test_ac_011_unreadable_evidence_fails_closed():
         readiness.REASON_SELECTOR_HANDOFF_UNAVAILABLE,
     ):
         assert expected in report.reason_codes, expected
+
+
+def test_ac_011_unavailable_equity_fails_closed():
+    """ATDD-R4-F8-paper-v2-cutover-readiness/AC-011: an unprovable starting equity blocks the drain rather than defaulting."""
+    for equity in (None, 0.0, -5.0, "not-a-number"):
+        kwargs = {"opip_paper_v2_mode": "off"}
+        if equity is not None:
+            kwargs["paper_trade_starting_equity"] = equity
+        report = readiness.cutover_readiness_report(SimpleNamespace(**kwargs), client=None)
+        assert report.evidence.drain.status == readiness.DRAIN_UNAVAILABLE, equity
+        assert readiness.REASON_LEGACY_DRAIN_UNAVAILABLE in report.reason_codes
 
 
 # ===========================================================================

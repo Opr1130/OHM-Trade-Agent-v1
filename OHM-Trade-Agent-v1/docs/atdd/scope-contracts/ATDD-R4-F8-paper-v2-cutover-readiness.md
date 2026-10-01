@@ -70,7 +70,7 @@ the Paper-v2 direction coverage
 WHEN:
 coverage is reported
 THEN:
-LONG is covered, SHORT is not, the gap carries the machine-readable reason SHORT_AUTHORITY_MISSING, and the aggregate verdict is NOT_READY
+LONG is covered, SHORT is not, the gap carries the machine-readable reason SHORT_AUTHORITY_MISSING, a missing LONG coverage is reported as LONG_AUTHORITY_MISSING rather than as no gap, and the aggregate verdict is NOT_READY
 
 AC-007:
 GIVEN:
@@ -110,7 +110,7 @@ typed cutover evidence
 WHEN:
 the aggregate verdict is derived
 THEN:
-healthy technical evidence resolves to READY, a missing short authority resolves to NOT_READY with SHORT_AUTHORITY_MISSING, and unreadable evidence fails closed to NOT_READY with the exact reason codes
+healthy technical evidence resolves to READY, a missing short authority resolves to NOT_READY with SHORT_AUTHORITY_MISSING, an unprovable starting equity blocks the drain rather than being defaulted, and unreadable evidence fails closed to NOT_READY with the exact reason codes
 
 AC-012:
 GIVEN:
@@ -165,6 +165,7 @@ AC-004 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_004_protection_swe
 AC-004 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_004_scan_protection_precedes_admission
 AC-005 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_005_universe_metadata_gate_fails_closed
 AC-006 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_006_short_has_no_authoritative_engine
+AC-006 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_006_long_coverage_gap_is_reported
 AC-007 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_007_pending_mandate_is_documented_immediate_only
 AC-007 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_007_unsupported_pending_mandate_fails_closed
 AC-008 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_008_f7_is_not_the_admission_authority
@@ -175,6 +176,7 @@ AC-010 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_010_rollback_path_
 AC-011 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_011_unreadable_evidence_fails_closed
 AC-011 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_011_verdict_not_ready_when_short_authority_missing
 AC-011 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_011_verdict_ready_when_all_technical_gates_pass
+AC-011 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_011_unavailable_equity_fails_closed
 AC-012 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_012_baseline_triage_recorded
 AC-012 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_012_mode_inactive_is_a_prerequisite_not_a_blocker
 AC-012 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_012_readiness_never_activates
