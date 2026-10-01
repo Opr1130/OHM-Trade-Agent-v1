@@ -1450,6 +1450,52 @@ fi
 echo "funnel_candidates_source=OPIP_QUALIFICATION_FUNNEL"
 echo "search_mode_source=production_runtime_data.effective_mode"
 
+# ---------------------------------------------------------------------------
+# R4-F8A - Paper-v2 cutover readiness evidence (read-only).
+#
+# The R4-A readiness probe is the sanctioned way to observe whether the
+# technical Paper-v2 cutover gates are satisfied. It observes only bounded typed
+# facts - mode evidence, legacy drain, protection independence, the universe
+# gate, LONG/SHORT coverage, the pending mandate, the frozen F7 handoff
+# contract, canonical writer health and rollback readiness - and it activates
+# nothing and writes nothing.
+#
+# The probe is time-boxed on both sides - a container-side deadline stops a
+# stalled read without leaving work running in the core container, and the host
+# deadline still covers a stuck Docker client - and byte-bounded while its output
+# streams, so a noisy probe cannot buffer without limit. The job prints its
+# verdict lines last, so requiring the verdict is what proves the report is
+# complete: a truncated or failed probe is reported unavailable, never printed as
+# if it were whole. A NOT_READY verdict is expected evidence and never degrades
+# learning diagnostics; only an unavailable probe does, because an unreadable
+# readiness probe is not a proven-clear one.
+# ---------------------------------------------------------------------------
+echo "OPIP_PAPER_V2_CUTOVER_READINESS"
+if docker inspect ohm-trade-agent >/dev/null 2>&1 \
+   && [[ "$(docker inspect --format='{{.State.Running}}' ohm-trade-agent 2>/dev/null || true)" == "true" ]]; then
+  readiness_verdict=""
+  # The enclosing `if !` keeps `set -e` from aborting on a failed or
+  # SIGPIPE-truncated pipeline; the value is simply left empty.
+  if ! readiness_verdict="$(
+       timeout --signal=TERM --kill-after=5s 45 docker exec ohm-trade-agent \
+         timeout --signal=TERM --kill-after=5s 40 \
+         python -m app.jobs.report_paper_v2_cutover_readiness 2>/dev/null \
+         | head -c 8000
+     )"; then
+    readiness_verdict=""
+  fi
+  if printf '%s\n' "$readiness_verdict" | grep -q '^Readiness:'; then
+    printf '%s\n' "$readiness_verdict"
+  else
+    echo "readiness=UNAVAILABLE"
+    degrade
+  fi
+else
+  echo "readiness=UNAVAILABLE"
+  degrade
+fi
+echo "OPIP_PAPER_V2_CUTOVER_READINESS_END"
+
 # Export cron alone must not imply healthy learning compute.
 if [[ "$status" == "OK" ]]; then
   if [[ "${release_compatibility_status:-}" == "RELEASE_DRIFT" \
