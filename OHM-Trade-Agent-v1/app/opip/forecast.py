@@ -254,6 +254,27 @@ def _require_input_point_in_time(
             )
 
 
+def _require_upstream_point_in_time(
+    episode: OpportunityEpisode,
+    feasibility: FeasibilityDecision,
+    evaluation_time: datetime,
+) -> None:
+    """Reject an upstream F4/F5 input that was not available at the forecast instant.
+
+    The F5 decision and the F4 episode must have existed no later than the
+    forecast evaluation time; otherwise stamping their lineage into a forecast
+    would introduce future leakage into the forecast identity.
+    """
+    if feasibility.evaluation_time > evaluation_time:
+        raise ForecastContractError(
+            "the F5 decision was not available at the forecast evaluation time"
+        )
+    if episode.claim_evaluation_cutoff > evaluation_time:
+        raise ForecastContractError(
+            "the F4 episode was not available at the forecast evaluation time"
+        )
+
+
 def _require_artifact_compatible(
     artifact: ForecastModelArtifact,
     inputs: ForecastInputVector,
@@ -357,6 +378,7 @@ def evaluate_forecast(
     feasibility = _require_feasible_decision(feasibility, episode)
     inputs = _require_inputs(inputs)
     _require_input_point_in_time(inputs, evaluation_time)
+    _require_upstream_point_in_time(episode, feasibility, evaluation_time)
 
     request = ForecastRequest(
         episode_id=episode.episode_id,

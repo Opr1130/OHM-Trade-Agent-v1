@@ -37,6 +37,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
+from types import MappingProxyType
 from typing import Any
 
 from app.opip.contracts import (
@@ -759,15 +760,20 @@ def expected_return_diagnostics(
             continue
         if example.realized_return_label_state is not ForecastLabelState.RESOLVED:
             continue
-        if example.expected_return_unconditional is None or example.realized_net_return is None:
+        realized = example.realized_net_return
+        if realized is None:
             continue
-        error = example.expected_return_unconditional - example.realized_net_return
-        squared += error * error
-        absolute += abs(error)
-        count += 1
+        # Point-forecast error requires a point forecast; interval coverage only
+        # requires an interval, so an interval is never dropped just because the
+        # point forecast is absent.
+        if example.expected_return_unconditional is not None:
+            error = example.expected_return_unconditional - realized
+            squared += error * error
+            absolute += abs(error)
+            count += 1
         if example.uncertainty is not None:
             interval_total += 1
-            if example.uncertainty.contains(example.realized_net_return):
+            if example.uncertainty.contains(realized):
                 covered += 1
     return ForecastExpectedReturnDiagnostics(
         count=count,
@@ -889,6 +895,7 @@ _REPORT_DURABLE_KEYS: tuple[str, ...] = (
     "missingness",
     "leakage_violations",
     "sealed_evaluation",
+    "primary_fidelity",
     "reliability",
 )
 
@@ -925,6 +932,7 @@ def _report_identity_payload(
     missingness: Mapping[str, int],
     leakage_violations: int,
     sealed_evaluation: bool,
+    primary_fidelity: Sequence[str],
     reliability: Sequence[ForecastReliabilityBin],
 ) -> dict[str, Any]:
     return {
@@ -952,6 +960,7 @@ def _report_identity_payload(
         "missingness": dict(missingness),
         "leakage_violations": leakage_violations,
         "sealed_evaluation": sealed_evaluation,
+        "primary_fidelity": list(primary_fidelity),
         "reliability": [bin_.to_dict() for bin_ in reliability],
     }
 
@@ -992,6 +1001,7 @@ class ForecastEvaluationReport:
     missingness: Mapping[str, int]
     leakage_violations: int
     sealed_evaluation: bool
+    primary_fidelity: tuple[str, ...] = ()
     reliability: tuple[ForecastReliabilityBin, ...] = ()
 
     def __post_init__(self) -> None:
@@ -1072,11 +1082,22 @@ class ForecastEvaluationReport:
             if not isinstance(bin_, ForecastReliabilityBin):
                 raise ForecastContractError("reliability must contain reliability bins")
         object.__setattr__(self, "reliability", bins)
+        primary = tuple(
+            require_forecast_text(grade, field_name="primary_fidelity")
+            for grade in self.primary_fidelity
+        )
+        object.__setattr__(self, "primary_fidelity", primary)
         object.__setattr__(
-            self, "fidelity_breakdown", {str(k): int(v) for k, v in self.fidelity_breakdown.items()}
+            self,
+            "fidelity_breakdown",
+            MappingProxyType(
+                {str(k): int(v) for k, v in self.fidelity_breakdown.items()}
+            ),
         )
         object.__setattr__(
-            self, "missingness", {str(k): int(v) for k, v in self.missingness.items()}
+            self,
+            "missingness",
+            MappingProxyType({str(k): int(v) for k, v in self.missingness.items()}),
         )
         expected = stable_hash(
             FORECAST_EVALUATION_REPORT_ID_PREFIX,
@@ -1109,6 +1130,7 @@ class ForecastEvaluationReport:
                 missingness=self.missingness,
                 leakage_violations=self.leakage_violations,
                 sealed_evaluation=self.sealed_evaluation,
+                primary_fidelity=self.primary_fidelity,
                 reliability=self.reliability,
             ),
         )
@@ -1147,6 +1169,7 @@ class ForecastEvaluationReport:
             "missingness": dict(self.missingness),
             "leakage_violations": self.leakage_violations,
             "sealed_evaluation": self.sealed_evaluation,
+            "primary_fidelity": list(self.primary_fidelity),
             "reliability": [bin_.to_dict() for bin_ in self.reliability],
         }
 
@@ -1159,6 +1182,9 @@ class ForecastEvaluationReport:
         raw_bins = body["reliability"]
         if not isinstance(raw_bins, (list, tuple)):
             raise ForecastContractError("report.reliability must be a list")
+        raw_primary = body["primary_fidelity"]
+        if not isinstance(raw_primary, (list, tuple)):
+            raise ForecastContractError("report.primary_fidelity must be a list")
         bins: list[ForecastReliabilityBin] = []
         for item in raw_bins:
             bin_body = _require_mapping(
@@ -1227,6 +1253,7 @@ class ForecastEvaluationReport:
             missingness=dict(body["missingness"]),
             leakage_violations=body["leakage_violations"],
             sealed_evaluation=body["sealed_evaluation"],
+            primary_fidelity=tuple(raw_primary),
             reliability=tuple(bins),
         )
 
@@ -1263,6 +1290,24 @@ def build_evaluation_report(
     sealed = seal_forecast_population(examples)
     start = require_forecast_utc(evaluation_start, field_name="evaluation_start")
     end = require_forecast_utc(evaluation_end, field_name="evaluation_end")
+    if end < start:
+        raise ForecastContractError("evaluation_end cannot precede evaluation_start")
+    # A report must not credit a model it did not score, nor score a prediction
+    # outside the window it claims. Both are refused rather than silently
+    # filtered, so supplied evidence can never be concealed.
+    for example in sealed:
+        if not (start <= example.prediction_cutoff <= end):
+            raise ForecastContractError(
+                "an example prediction falls outside the evaluation window"
+            )
+        if (
+            example.status is ForecastStatus.FORECAST
+            and example.model_artifact_id != model_artifact_id
+        ):
+            raise ForecastContractError(
+                "an example belongs to a different model artifact"
+            )
+    primary_grades = tuple(sorted(grade.value for grade in grades))
 
     primary = tuple(
         example
@@ -1361,6 +1406,7 @@ def build_evaluation_report(
             missingness=missingness,
             leakage_violations=count_leakage_violations(sealed),
             sealed_evaluation=True,
+            primary_fidelity=primary_grades,
             reliability=reliability,
         ),
     )
@@ -1394,6 +1440,7 @@ def build_evaluation_report(
         missingness=missingness,
         leakage_violations=count_leakage_violations(sealed),
         sealed_evaluation=True,
+        primary_fidelity=primary_grades,
         reliability=reliability,
     )
 

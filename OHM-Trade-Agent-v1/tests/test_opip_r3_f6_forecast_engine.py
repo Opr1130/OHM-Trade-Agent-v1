@@ -705,6 +705,13 @@ def test_ac_006_model_artifact_identity_deterministic() -> None:
     )
     assert restamped.artifact_id == first.artifact_id
 
+    # The declared expiry is bound into the identity because it changes the
+    # artifact's eligibility, unlike the informational created/released metadata.
+    assert (
+        artifact(expires_at=RELEASED + timedelta(days=30)).artifact_id
+        != first.artifact_id
+    )
+
     with pytest.raises(ForecastContractError):
         replace(first, artifact_id="FMOD:forged")
     with pytest.raises(ForecastContractError):
@@ -981,6 +988,11 @@ def test_ac_015_expected_return_finite_and_units() -> None:
     for source in F6_SOURCES:
         assert scales_by_hundred(source) is False
 
+    # A conditional-on-fill return is validated exactly like the unconditional one.
+    for bad_conditional in (float("inf"), float("nan"), True, "0.01"):
+        with pytest.raises(ForecastContractError):
+            replace(decision, expected_return_conditional_on_fill=bad_conditional)
+
 
 @pytest.mark.acceptance
 def test_ac_016_uncertainty_required_and_valid() -> None:
@@ -1100,6 +1112,13 @@ def test_ac_019_validity_expiry_explicit() -> None:
         replace(decision, valid_until=EVAL)
     with pytest.raises(ForecastContractError):
         replace(decision, valid_until=EVAL - timedelta(seconds=1))
+    # valid_until must equal the horizon-derived instant exactly, not merely be
+    # later than the evaluation time.
+    with pytest.raises(ForecastContractError):
+        replace(
+            decision,
+            valid_until=EVAL + timedelta(seconds=HORIZON.validity_seconds + 1),
+        )
     # No hidden default: an abstention carries no valid_until.
     abstain = engine.evaluate_forecast(
         active_episode(), feasible_decision(), input_vector(), EVAL, FORECAST_POLICY
@@ -1185,21 +1204,41 @@ def test_ac_021_future_feature_rejected() -> None:
     episode = active_episode()
     feasibility = feasible_decision(episode)
 
-    future_feature = input_vector(
-        features=(
-            ForecastFeatureValue("rsi", 55.0, CUTOFF),
-            ForecastFeatureValue("atr_pct", 2.0, EVAL + timedelta(seconds=1)),
-        )
-    )
+    # A feature that became available after the vector's declared source cutoff is
+    # leakage with respect to that snapshot and is refused at construction, whether
+    # or not it also post-dates the evaluation time.
     with pytest.raises(ForecastContractError):
-        engine.evaluate_forecast(
-            episode, feasibility, future_feature, EVAL, FORECAST_POLICY
+        input_vector(
+            features=(
+                ForecastFeatureValue("rsi", 55.0, CUTOFF),
+                ForecastFeatureValue("atr_pct", 2.0, CUTOFF + timedelta(seconds=1)),
+            )
+        )
+    with pytest.raises(ForecastContractError):
+        input_vector(
+            features=(
+                ForecastFeatureValue("rsi", 55.0, CUTOFF),
+                ForecastFeatureValue("atr_pct", 2.0, EVAL + timedelta(seconds=1)),
+            )
         )
 
+    # A source cutoff after the evaluation time is future leakage and fails closed.
     future_cutoff = input_vector(source_cutoff=EVAL + timedelta(seconds=1))
     with pytest.raises(ForecastContractError):
         engine.evaluate_forecast(
             episode, feasibility, future_cutoff, EVAL, FORECAST_POLICY
+        )
+
+    # An upstream F5 decision that post-dates the forecast instant is refused.
+    late_feasibility = fseam.evaluate_feasibility(
+        episode,
+        snapshot(market=market_validation(), execution=execution_validation()),
+        EVAL + timedelta(hours=1),
+        FEASIBILITY_POLICY,
+    )
+    with pytest.raises(ForecastContractError):
+        engine.evaluate_forecast(
+            episode, late_feasibility, input_vector(), EVAL, FORECAST_POLICY
         )
 
     # A point-in-time input is accepted.
@@ -1454,6 +1493,31 @@ def test_ac_027_families_scored_separately() -> None:
     assert changed_report.path_brier == pytest.approx(report.path_brier)
     assert changed_report.entry_brier != report.entry_brier
 
+    # A report refuses a population that names another model, or a prediction
+    # outside the declared window, rather than crediting a model it did not score.
+    other_model = replace(example, model_artifact_id="FMOD:other")
+    with pytest.raises(ForecastContractError):
+        analysis.build_evaluation_report(
+            [other_model],
+            model_artifact_id=decision.model_artifact_id or "FMOD:x",
+            population_id="POP:mismatch",
+            evaluation_start=EVAL,
+            evaluation_end=EVAL + timedelta(hours=3),
+            bin_edges=(0.0, 0.5, 1.0),
+            primary_fidelity={"A", "B"},
+        )
+    outside_window = replace(example, prediction_cutoff=EVAL - timedelta(hours=1))
+    with pytest.raises(ForecastContractError):
+        analysis.build_evaluation_report(
+            [outside_window],
+            model_artifact_id=decision.model_artifact_id or "FMOD:x",
+            population_id="POP:outside",
+            evaluation_start=EVAL,
+            evaluation_end=EVAL + timedelta(hours=3),
+            bin_edges=(0.0, 0.5, 1.0),
+            primary_fidelity={"A", "B"},
+        )
+
 
 @pytest.mark.acceptance
 def test_ac_028_reliability_report_deterministic() -> None:
@@ -1488,7 +1552,14 @@ def test_ac_028_reliability_report_deterministic() -> None:
     )
     assert not hasattr(report, "calibration_passed")
     assert report.sealed_evaluation is True
+    assert report.primary_fidelity == ("A", "B")
     assert analysis.ForecastEvaluationReport.from_dict(report.to_dict()) == report
+    # The report's mappings are frozen so evaluation evidence cannot change after
+    # construction and silently disagree with its identity.
+    with pytest.raises(TypeError):
+        report.missingness["tampered"] = 1
+    with pytest.raises(TypeError):
+        report.fidelity_breakdown["A"] = 99
 
 
 @pytest.mark.acceptance
@@ -1662,6 +1733,27 @@ def test_adversarial_executable_or_pickle_artifact_rejected() -> None:
             artifact(parameters={"payload": bad})
     with pytest.raises(ForecastContractError):
         artifact(parameters={"payload": float("inf")})
+
+
+def test_adversarial_artifact_parameters_must_be_a_mapping() -> None:
+    for bad in (None, [], "not-a-mapping", 5):
+        with pytest.raises(ForecastContractError):
+            artifact(parameters=bad)
+
+
+def test_adversarial_missing_feature_does_not_discard_value() -> None:
+    with pytest.raises(ForecastContractError):
+        ForecastFeatureValue("rsi", 5.0, CUTOFF, missing=True)
+    assert ForecastFeatureValue("rsi", None, CUTOFF, missing=True).missing is True
+
+
+def test_interval_coverage_counts_without_point_forecast() -> None:
+    decision = forecast_decision()
+    example = replace(example_from(decision), expected_return_unconditional=None)
+    diagnostics = analysis.expected_return_diagnostics([example])
+    assert diagnostics.count == 0
+    assert diagnostics.interval_total == 1
+    assert diagnostics.interval_coverage == pytest.approx(1.0)
 
 
 def test_adversarial_forecast_is_pure_over_declared_inputs() -> None:

@@ -660,20 +660,23 @@ class ForecastFeatureValue:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", require_forecast_text(self.name, field_name="name"))
-        object.__setattr__(
-            self,
-            "value",
-            None if self.missing else _freeze_json_safe(self.value, field_name=self.name),
-        )
+        if not isinstance(self.missing, bool):
+            raise ForecastContractError("missing must be a bool")
+        if self.missing:
+            if self.value is not None:
+                raise ForecastContractError("a missing feature value must be None")
+            object.__setattr__(self, "value", None)
+        else:
+            object.__setattr__(
+                self,
+                "value",
+                _freeze_json_safe(self.value, field_name=self.name),
+            )
         object.__setattr__(
             self,
             "available_at_utc",
             require_forecast_utc(self.available_at_utc, field_name="available_at_utc"),
         )
-        if not isinstance(self.missing, bool):
-            raise ForecastContractError("missing must be a bool")
-        if self.missing and self.value is not None:
-            raise ForecastContractError("a missing feature value must be None")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -778,6 +781,15 @@ class ForecastInputVector:
         if len(names) != len(set(names)):
             raise ForecastContractError("feature names must be unique")
         object.__setattr__(self, "features", features)
+
+        # A feature must be point-in-time with respect to the declared source
+        # snapshot cutoff, not merely older than the evaluation time: a value that
+        # became available after the snapshot it claims to belong to is leakage.
+        for feature in features:
+            if feature.available_at_utc > self.source_cutoff:
+                raise ForecastContractError(
+                    f"feature {feature.name!r} was not available at the source cutoff"
+                )
 
         expected = stable_hash(
             FORECAST_INPUT_FINGERPRINT_PREFIX,
@@ -895,6 +907,7 @@ def _artifact_identity_payload(
     calibration_report_id: str,
     model_payload_ref: str,
     parameters: Mapping[str, Any],
+    expires_at: datetime | None,
 ) -> dict[str, Any]:
     return {
         "artifact_schema_version": artifact_schema_version,
@@ -913,6 +926,9 @@ def _artifact_identity_payload(
         "calibration_report_id": calibration_report_id,
         "model_payload_ref": model_payload_ref,
         "parameters": _require_json_safe(parameters, field_name="parameters"),
+        "expires_at": (
+            None if expires_at is None else iso_z(expires_at, field_name="expires_at")
+        ),
     }
 
 
@@ -1014,6 +1030,8 @@ class ForecastModelArtifact:
             )
         if not isinstance(self.horizon_contract, ForecastHorizon):
             raise ForecastContractError("horizon_contract must be a ForecastHorizon")
+        if not isinstance(self.parameters, Mapping):
+            raise ForecastContractError("parameters must be a JSON-safe mapping")
         object.__setattr__(
             self,
             "parameters",
@@ -1080,6 +1098,7 @@ class ForecastModelArtifact:
             calibration_report_id=self.calibration_report_id,
             model_payload_ref=self.model_payload_ref,
             parameters=self.parameters,
+            expires_at=self.expires_at,
         )
 
     @classmethod
@@ -1091,7 +1110,7 @@ class ForecastModelArtifact:
         )
         payload.setdefault("expires_at", None)
         payload["input_feature_names"] = tuple(payload.get("input_feature_names") or ())
-        payload["parameters"] = payload.get("parameters") or {}
+        payload.setdefault("parameters", {})
         required = (
             "model_kind",
             "model_family",
@@ -1159,6 +1178,7 @@ class ForecastModelArtifact:
                 calibration_report_id=payload["calibration_report_id"],
                 model_payload_ref=payload["model_payload_ref"],
                 parameters=payload["parameters"],
+                expires_at=payload["expires_at"],
             ),
         )
         return cls(**payload)
@@ -1618,9 +1638,12 @@ class ForecastDecision:
                 raise ForecastContractError(
                     "a FORECAST decision requires an explicit horizon and valid_until"
                 )
-            if self.valid_until <= self.evaluation_time:
+            derived_validity = self.evaluation_time + timedelta(
+                seconds=self.horizon.validity_seconds
+            )
+            if self.valid_until != derived_validity:
                 raise ForecastContractError(
-                    "valid_until must be after evaluation_time"
+                    "valid_until must equal evaluation_time plus the horizon validity"
                 )
             if self.entry_distribution is None or (
                 self.entry_distribution.kind is not DistributionKind.ENTRY_EXECUTION
@@ -1643,6 +1666,15 @@ class ForecastDecision:
                 field_name="expected_return_unconditional",
             )
             object.__setattr__(self, "expected_return_unconditional", expected_return)
+            if self.expected_return_conditional_on_fill is not None:
+                object.__setattr__(
+                    self,
+                    "expected_return_conditional_on_fill",
+                    require_finite_number(
+                        self.expected_return_conditional_on_fill,
+                        field_name="expected_return_conditional_on_fill",
+                    ),
+                )
             if self.uncertainty is None:
                 raise ForecastContractError(
                     "a FORECAST decision requires an explicit uncertainty"
