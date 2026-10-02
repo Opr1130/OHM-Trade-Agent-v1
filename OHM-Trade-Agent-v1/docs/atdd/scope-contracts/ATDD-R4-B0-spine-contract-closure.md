@@ -183,8 +183,16 @@ AC-011 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b0_short_direction_matrix.py
 AC-012 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-F8-paper-v2-cutover-readiness.md
 AC-012 -> OHM-Trade-Agent-v1/tests/test_opip_paper_v2_increment6a_bc3.py
 AC-012 -> OHM-Trade-Agent-v1/tests/test_opip_paper_v2_cross_scan_simulation_bc3.py
+AC-012 -> OHM-Trade-Agent-v1/tests/test_opip_paper_execution_bc1.py
+AC-012 -> OHM-Trade-Agent-v1/tests/test_opip_paper_execution_bc2.py
+AC-012 -> OHM-Trade-Agent-v1/tests/test_opip_paper_v2_execution_bc3.py
+AC-012 -> OHM-Trade-Agent-v1/tests/test_opip_paper_v2_remediation_bc3.py
+AC-012 -> OHM-Trade-Agent-v1/tests/test_opip_paper_v2_portfolio_read_bc3.py
+AC-012 -> OHM-Trade-Agent-v1/tests/test_opip_paper_v2_decision_context_v2_bc3a.py
+AC-012 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b0_review_remediation.py
 
 DEFERRED DISCOVERIES:
+- The R4-B0 review loop raised ten correctness findings against these contracts; all were fixed and regression-proven in `tests/test_opip_r4_b0_review_remediation.py`: a tautological handoff causality guard, quantity sized off an unbound reference, a non-actionable geometry bridging, an un-cross-checked instrument symbol, an under-validated handoff, opposite directions sharing a disposition identity, a format marker breaking idempotent legacy admission retries, admission direction defaulting to LONG, the F5 adapter pre-empting its own ordered checks, and the geometry reason being excluded from its identity.
 - R4-B1 runtime wiring of the F3-F7 spine into the live cycle is a separate OWNER increment; this contract neither starts nor authorizes it.
 - The Feature Bus `active` mode is defined but remains off; the owner decision that activates it is a later increment.
 - Paper-v2 SHORT is simulation-only and inactive; activating the mode is a later owner action, so the earlier `SHORT_AUTHORITY_MISSING` cutover blocker is now an activation blocker rather than a missing-capability blocker.
