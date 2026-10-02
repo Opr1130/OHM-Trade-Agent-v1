@@ -270,6 +270,77 @@ def test_long_disposition_identity_is_stable_across_the_direction_contract():
     )
 
 
+def test_a_long_also_resolves_the_interim_direction_qualified_identity():
+    """Regression: a LONG admitted by the interim direction-aware release is found.
+
+    The legacy LONG payload keeps every pre-direction admission reachable, but a
+    brief interim release hashed the direction for LONG too. Both forms are
+    therefore probed, so a retry under either history resolves to the committed
+    trade instead of creating a second admission.
+    """
+    from app.opip.contracts.serialization import stable_hash
+    from app.services.paper_v2_execution import (
+        ENGINE_OPIP_PAPER_V2,
+        build_disposition_id,
+        disposition_id_candidates,
+    )
+
+    candidates = disposition_id_candidates(
+        episode_id="EP:1", native_symbol="SOLUSD", direction="LONG"
+    )
+    legacy = build_disposition_id(
+        episode_id="EP:1", native_symbol="SOLUSD", direction="LONG"
+    )
+    interim = stable_hash(
+        "PDISP",
+        {
+            "episode_id": "EP:1",
+            "native_symbol": "SOLUSD",
+            "direction": "LONG",
+            "engine": ENGINE_OPIP_PAPER_V2,
+        },
+    )
+    assert candidates == (legacy, interim)
+    # A SHORT has exactly one identity form.
+    assert len(
+        disposition_id_candidates(
+            episode_id="EP:1", native_symbol="SOLUSD", direction="SHORT"
+        )
+    ) == 1
+
+
+def test_committed_disposition_is_resolved_before_admitting():
+    """Regression: the lookup must find whichever identity already owns state."""
+    from app.services.paper_v2_execution import resolve_committed_disposition
+
+    class _State:
+        def __init__(self, admitted):
+            self.status = "OK"
+            self.admitted = admitted
+
+    class _Client:
+        def __init__(self, admitted_ids):
+            self._admitted = set(admitted_ids)
+
+        def get_paper_v2_execution_state(self, disposition_id):
+            return _State(disposition_id in self._admitted)
+
+    primary, alternate = "PDISP:primary", "PDISP:alternate"
+    # Nothing committed: the primary identity is used.
+    assert (
+        resolve_committed_disposition(_Client([]), candidates=(primary, alternate))
+        == primary
+    )
+    # A record exists only under the alternate form: it is resolved, so no second
+    # admission can be created.
+    assert (
+        resolve_committed_disposition(
+            _Client([alternate]), candidates=(primary, alternate)
+        )
+        == alternate
+    )
+
+
 # ---------------------------------------------------------------------------
 # 7. A legacy admission retry still resolves idempotently
 # ---------------------------------------------------------------------------
