@@ -241,6 +241,35 @@ def test_opposite_directions_do_not_share_a_disposition_identity():
         build_disposition_id(episode_id="EP:1", native_symbol="SOLUSD", direction="FLAT")
 
 
+def test_long_disposition_identity_is_stable_across_the_direction_contract():
+    """Regression: adding direction for LONG re-keyed every pre-upgrade admission.
+
+    A LONG must keep the exact historical payload, or an already-admitted LONG
+    trade would be missed on a retry and a second admission, trade and reservation
+    would be created for the same episode and symbol. A SHORT is distinct.
+    """
+    from app.opip.contracts.serialization import stable_hash
+    from app.services.paper_v2_execution import (
+        ENGINE_OPIP_PAPER_V2,
+        build_disposition_id,
+    )
+
+    legacy_payload = {
+        "episode_id": "EP:1",
+        "native_symbol": "SOLUSD",
+        "engine": ENGINE_OPIP_PAPER_V2,
+    }
+    legacy_id = stable_hash("PDISP", legacy_payload)
+    assert (
+        build_disposition_id(episode_id="EP:1", native_symbol="SOLUSD", direction="LONG")
+        == legacy_id
+    )
+    assert (
+        build_disposition_id(episode_id="EP:1", native_symbol="SOLUSD", direction="SHORT")
+        != legacy_id
+    )
+
+
 # ---------------------------------------------------------------------------
 # 7. A legacy admission retry still resolves idempotently
 # ---------------------------------------------------------------------------

@@ -77,6 +77,7 @@ from app.opip.contracts.paper_execution_events import (
     paper_evidence_idempotency_key,
 )
 from app.opip.contracts.paper_execution_runtime import (
+    PAPER_DIRECTION_LONG,
     PAPER_QUOTE_EVIDENCE_RECORDED,
     PaperAdmissionRequest,
     expected_paper_side,
@@ -215,21 +216,26 @@ def build_disposition_id(*, episode_id: str, native_symbol: str, direction: str)
     minting a new one - which is what keeps admission, its reservation and every
     downstream event idempotent.
 
-    R4-B0: the direction is part of the identity. A LONG and a SHORT on the same
-    episode and symbol are different trades with different economics, so they must
-    not share a disposition, trade or reservation identity. Restart still
-    reproduces the same identity because the direction is itself committed
-    ancestry, not ambient state.
+    R4-B0: a LONG and a SHORT on the same episode and symbol are different trades
+    with different economics, so they must not share a disposition, trade or
+    reservation identity. The direction is therefore added to the payload **only
+    for a non-LONG trade**: a LONG keeps the exact historical payload, so every
+    LONG identity derived before the direction contract stays stable across the
+    upgrade and an already-admitted LONG trade is still found on a retry. A SHORT
+    gets its own distinct identity. Restart still reproduces either identity,
+    because the direction is committed ancestry rather than ambient state.
     """
-    return stable_hash(
-        "PDISP",
-        {
-            "episode_id": str(episode_id),
-            "native_symbol": str(native_symbol).upper(),
-            "direction": require_paper_direction(str(direction)),
-            "engine": ENGINE_OPIP_PAPER_V2,
-        },
-    )
+    resolved = require_paper_direction(str(direction))
+    payload: dict[str, str] = {
+        "episode_id": str(episode_id),
+        "native_symbol": str(native_symbol).upper(),
+        "engine": ENGINE_OPIP_PAPER_V2,
+    }
+    if resolved != PAPER_DIRECTION_LONG:
+        # Only a non-LONG trade needs to be distinguished from the historical
+        # long-only identity, so the LONG payload is left byte-identical.
+        payload["direction"] = resolved
+    return stable_hash("PDISP", payload)
 
 
 def _require(condition: bool, message: str) -> None:
