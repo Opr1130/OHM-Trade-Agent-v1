@@ -270,105 +270,78 @@ def test_long_disposition_identity_is_stable_across_the_direction_contract():
     )
 
 
-def test_a_long_also_resolves_the_interim_direction_qualified_identity():
-    """Regression: a LONG admitted by the interim direction-aware release is found.
+# ---------------------------------------------------------------------------
+# 6b. The stable single-identity contract
+#
+# R4-B0 briefly carried an alternate-identity lookup for a LONG admitted under a
+# temporary direction-qualified release. Bounded historical proof established that
+# such a record could not exist: the temporary identity was live in production
+# only while `fb1b8a57` was deployed, and Paper-v2 was off for that entire window
+# (the mode was never explicitly provided, and the producer refuses at the
+# activation gate before deriving an identity or writing anything). The
+# compatibility layer was therefore removed. These tests pin the invariant that
+# replaced it, so it cannot be reintroduced on an unreachable premise.
+# ---------------------------------------------------------------------------
 
-    The legacy LONG payload keeps every pre-direction admission reachable, but a
-    brief interim release hashed the direction for LONG too. Both forms are
-    therefore probed, so a retry under either history resolves to the committed
-    trade instead of creating a second admission.
+
+def test_only_one_disposition_identity_derivation_exists():
+    """Invariant: exactly one identity derivation, with no alternate-identity lookup.
+
+    A second lookup form only made sense for a migration state that authoritative
+    evidence proves never existed, so the module must expose the single frozen
+    derivation and nothing else.
     """
-    from app.opip.contracts.serialization import stable_hash
-    from app.services.paper_v2_execution import (
-        ENGINE_OPIP_PAPER_V2,
-        build_disposition_id,
-        disposition_id_candidates,
-    )
+    import inspect
 
-    candidates = disposition_id_candidates(
-        episode_id="EP:1", native_symbol="SOLUSD", direction="LONG"
-    )
-    legacy = build_disposition_id(
-        episode_id="EP:1", native_symbol="SOLUSD", direction="LONG"
-    )
-    interim = stable_hash(
-        "PDISP",
-        {
-            "episode_id": "EP:1",
-            "native_symbol": "SOLUSD",
-            "direction": "LONG",
-            "engine": ENGINE_OPIP_PAPER_V2,
-        },
-    )
-    assert candidates == (legacy, interim)
-    # A SHORT has exactly one identity form.
-    assert len(
-        disposition_id_candidates(
-            episode_id="EP:1", native_symbol="SOLUSD", direction="SHORT"
-        )
-    ) == 1
+    from app.services import paper_v2_execution as module
+
+    source = inspect.getsource(module)
+    assert "disposition_id_candidates" not in source
+    assert "resolve_committed_disposition" not in source
+    # Exactly one paper-v2 disposition identity is derived in the module.
+    assert source.count('"PDISP"') == 1
 
 
-def test_committed_disposition_is_resolved_before_admitting():
-    """Regression: the lookup must find whichever identity already owns evidence.
+def test_paper_v2_inactive_blocks_execution_before_any_canonical_write():
+    """Invariant: an inactive Paper-v2 cannot commit canonical execution evidence.
 
-    A candidate whose state cannot be read authoritatively must fail closed rather
-    than be treated as absent, and any committed admission evidence - including a
-    terminal rejection - counts as ownership so a later retry cannot bypass it.
+    This is the historical impossibility that makes the interim identity
+    unreachable. The activation gate sits after the argument check but before the
+    disposition identity is derived and before any canonical interaction, so no
+    disposition or admission record of any identity can exist while Paper-v2 is
+    off - which it was for the entire interim window, because production never set
+    ``OPIP_PAPER_V2_MODE``.
     """
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
     from app.services.paper_v2_execution import (
         PaperV2ExecutionError,
-        resolve_committed_disposition,
+        run_paper_v2_opportunity,
     )
+    from tests.test_opip_paper_v2_execution_bc3 import _opportunity
 
-    class _State:
-        def __init__(self, status="OK", admitted=False, disposition=None, ctx=None):
-            self.status = status
-            self.admitted = admitted
-            self.disposition = disposition
-            self.decision_context_id = ctx
+    touched: list[str] = []
 
-    class _Client:
-        def __init__(self, states, fail=()):
-            self._states = states
-            self._fail = set(fail)
+    class _Trap:
+        def __getattr__(self, name: str) -> object:
+            touched.append(name)
+            raise AssertionError(f"canonical surface was touched: {name}")
 
-        def get_paper_v2_execution_state(self, disposition_id):
-            if disposition_id in self._fail:
-                raise RuntimeError("transport error")
-            return self._states.get(disposition_id, _State())
+    with pytest.raises(PaperV2ExecutionError, match="not active"):
+        run_paper_v2_opportunity(
+            _opportunity(),
+            client=_Trap(),
+            kraken_client=_Trap(),
+            settings=SimpleNamespace(opip_paper_v2_mode="off"),
+            now=datetime(2026, 10, 2, 2, 30, tzinfo=timezone.utc),
+        )
+    assert touched == []
+    # And the default resolves to off, so an unset environment cannot activate it.
+    from app.services.paper_v2_activation import paper_v2_active
 
-    primary, alternate = "PDISP:primary", "PDISP:alternate"
-
-    # Nothing committed: the primary identity is used.
-    assert resolve_committed_disposition(
-        _Client({}), candidates=(primary, alternate)
-    ) == (primary, None)
-
-    # A record exists only under the alternate admitted form: it is resolved, with
-    # its committed state, so no second admission can be created.
-    state = _State(admitted=True, ctx="DCTX:committed")
-    resolved_id, resolved_state = resolve_committed_disposition(
-        _Client({alternate: state}), candidates=(primary, alternate)
-    )
-    assert resolved_id == alternate
-    assert resolved_state is state
-
-    # A committed terminal rejection is ownership too, so a later retry cannot
-    # bypass the earlier stop decision.
-    rejected = _State(disposition="CAPACITY_REJECTED", ctx="DCTX:rejected")
-    assert resolve_committed_disposition(
-        _Client({alternate: rejected}), candidates=(primary, alternate)
-    )[0] == alternate
-
-    # A probe that cannot be read authoritatively must fail closed.
-    for client in (
-        _Client({}, fail=(alternate,)),
-        _Client({alternate: _State(status="UNAVAILABLE")}),
-        _Client({alternate: _State(status="RETRYABLE")}),
-    ):
-        with pytest.raises(PaperV2ExecutionError):
-            resolve_committed_disposition(client, candidates=(primary, alternate))
+    assert paper_v2_active(SimpleNamespace(opip_paper_v2_mode="")) is False
+    assert paper_v2_active(None) is False
 
 
 # ---------------------------------------------------------------------------
