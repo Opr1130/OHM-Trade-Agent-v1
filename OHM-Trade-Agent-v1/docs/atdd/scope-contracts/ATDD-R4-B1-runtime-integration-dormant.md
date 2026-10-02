@@ -6,7 +6,7 @@ This is the OWNER-authorized R4-B1 runtime-integration increment. R4-B0 proved t
 
 THIS INCREMENT IS DORMANT. It does not activate the Feature Bus, Paper-v2, F7 admission, the Committee or any funded/exchange authority. Its completion posture is: runtime wiring PRESENT; target F3-F7 path NON-AUTHORITATIVE; Feature Bus `off`; Paper-v2 unset; F7 not the admission authority; legacy Top-8 plus profit-ranking and Freqtrade dry-run plus Paper-v1 remain the authoritative paper engines. The target composition terminates at the Paper-v2 admission seam and holds no writer, reservation or execution authority.
 
-THIS PR IS THE CONTRACT FREEZE FOR THE INCREMENT. It writes the scope contract, its freeze-provable acceptance criteria and the movable pointer. It writes no production runtime behavior. The runtime wiring itself (the composition module, the gate setting, the `run_cycle` hook and their behavioral acceptance criteria) is implemented in a later commit of this same increment, at which point this contract's acceptance criteria and implementation map are extended. No runtime behavior is authorized by this freeze.
+THIS INCREMENT WIRES THE SPINE, DORMANTLY. The freeze commit established the boundary; the wiring commit (this PR) adds the off-by-default gate setting, the dormant composition runner and the unified-cycle hook, and reconciles the R4-B0 posture assertion if the wiring changes it. The wiring changes no mode: the completion posture remains Feature Bus `off`, Paper-v2 unset, target path NON-AUTHORITATIVE and legacy authoritative.
 
 AUTHORIZATION PROVENANCE. Authorized by the owner's standing master-orchestrator directive to create and freeze `ATDD-R4-B1-runtime-integration-dormant` before implementing its production wiring.
 
@@ -66,6 +66,41 @@ WHEN:
 the freeze posture is audited
 THEN:
 the contract records the B1 completion posture (Feature Bus off and Paper-v2 unset at completion), exactly one active scheduler command invokes the unified cycle, this increment's contract and acceptance module introduce no funded, exchange, order-placement or Committee authority import, and the contract names the R4-B1 retry freeze as the identity/idempotency authority it preserves
+AC-007:
+GIVEN:
+the target-spine activation gate
+WHEN:
+it is resolved
+THEN:
+it defaults to off, accepts only off and shadow, an invalid value fails Settings parsing rather than silently enabling the path, and a missing or unknown resolved value fails closed to off
+AC-008:
+GIVEN:
+the unified cycle and the dormant target-spine hook
+WHEN:
+the cycle runs
+THEN:
+the hook runs after the active-position and Paper-v2 protection phase, the composition is invoked only when the gate is shadow, it is not invoked at all when the gate is off, and a hook failure never aborts the cycle
+AC-009:
+GIVEN:
+the dormant composition runner
+WHEN:
+the gate is shadow and no snapshot source is available
+THEN:
+the run is a recorded inert no-op with an explicit reason, it composes nothing, it writes no canonical evidence, and it imports no funded, exchange, order, protection or Committee authority
+AC-010:
+GIVEN:
+the dormant composition runner, explicitly test-enabled, and a snapshot source driven by the real R4-B0 production spine
+WHEN:
+the runner composes
+THEN:
+it reports the composed disposition distinctly (SELECTED, INSUFFICIENT_EVIDENCE, VETO and CASH_NO_TRADE are never collapsed), counts the built handoff, and creates no admission, reservation, order intent, fill or protection record
+AC-011:
+GIVEN:
+the R4-B0 dormant-posture assertion and the wiring
+WHEN:
+the posture is audited
+THEN:
+the unified cycle still references no target-spine internal module, the Feature Bus remains off and Paper-v2 unset in the repository configuration, and the wiring introduces no new authority
 
 EXPLICITLY OUT OF SCOPE:
 - Activating the Feature Bus, Paper-v2, F7 runtime admission, or the Committee
@@ -119,6 +154,11 @@ AC-003 -> tests/test_opip_r4_b1_runtime_integration_freeze.py::test_ac_003_gate_
 AC-004 -> tests/test_opip_r4_b1_runtime_integration_freeze.py::test_ac_004_authority_boundary
 AC-005 -> tests/test_opip_r4_b1_runtime_integration_freeze.py::test_ac_005_rollback_and_exclusions
 AC-006 -> tests/test_opip_r4_b1_runtime_integration_freeze.py::test_ac_006_current_posture_and_no_authority_import
+AC-007 -> tests/test_opip_r4_b1_runtime_wiring.py::test_ac_007_gate_defaults_and_fails_closed
+AC-008 -> tests/test_opip_r4_b1_runtime_wiring.py::test_ac_008_hook_runs_after_protection_and_only_when_enabled
+AC-009 -> tests/test_opip_r4_b1_runtime_wiring.py::test_ac_009_inert_without_source_and_writes_nothing
+AC-010 -> tests/test_opip_r4_b1_runtime_wiring.py::test_ac_010_reachable_when_test_enabled_with_real_spine
+AC-011 -> tests/test_opip_r4_b1_runtime_wiring.py::test_ac_011_posture_reconciled_and_no_new_authority
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B1-runtime-integration-dormant.md
@@ -134,13 +174,30 @@ AC-005 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B1-runtime-integr
 AC-005 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b1_runtime_integration_freeze.py
 AC-006 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B1-runtime-integration-dormant.md
 AC-006 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b1_runtime_integration_freeze.py
+AC-007 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B1-runtime-integration-dormant.md
+AC-007 -> OHM-Trade-Agent-v1/app/core/config.py
+AC-007 -> OHM-Trade-Agent-v1/app/services/target_spine_cycle.py
+AC-007 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b1_runtime_wiring.py
+AC-008 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B1-runtime-integration-dormant.md
+AC-008 -> OHM-Trade-Agent-v1/app/jobs/run_cycle.py
+AC-008 -> OHM-Trade-Agent-v1/app/services/target_spine_cycle.py
+AC-008 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b1_runtime_wiring.py
+AC-009 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B1-runtime-integration-dormant.md
+AC-009 -> OHM-Trade-Agent-v1/app/services/target_spine_cycle.py
+AC-009 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b1_runtime_wiring.py
+AC-010 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B1-runtime-integration-dormant.md
+AC-010 -> OHM-Trade-Agent-v1/app/services/target_spine_cycle.py
+AC-010 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b1_runtime_wiring.py
+AC-011 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B1-runtime-integration-dormant.md
+AC-011 -> OHM-Trade-Agent-v1/app/core/config.py
+AC-011 -> OHM-Trade-Agent-v1/app/jobs/run_cycle.py
+AC-011 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b1_runtime_wiring.py
 
 DEFERRED DISCOVERIES:
-- The runtime wiring itself (the composition module, the gate setting, the `run_cycle` hook and their behavioral acceptance criteria and implementation map) is the next commit of this same increment and is not authorized by this freeze PR.
-- The R4-B0 assertion `test_composition_authority_targets_are_unchanged_on_disk` (in `tests/test_opip_r4_b0_spine_composition.py`) asserts that `run_cycle` and `scan_opportunities` do not mention the target spine. Wiring will necessarily trip it. It must be reconciled as an explicitly recorded posture change (wiring present, authority unchanged) in the wiring commit, not deleted or weakened.
-- Whether the real production snapshot source becomes a scheduled feature-bus capture or a read-only committed-snapshot provider is an owner decision; this increment forbids activating a capture source.
-- F11 protection ordering is a prerequisite for R4-B2 activation, not for this dormant wiring. This increment must not bypass it.
-- The exact provider that reads committed feature snapshots does not exist as a public read seam today; the wiring commit must define a read-only seam that creates no second evidence history.
+- The production composition callable and the read-only snapshot source are not wired: production passes no snapshots and no composition callable, so the target path is inert. Activating a real source (a scheduled feature-bus capture or a committed-snapshot read seam) is an owner decision and is out of scope. The wiring proves reachability by driving the real R4-B0 spine through the injected composition callable in tests.
+- The R4-B0 assertion `test_composition_authority_targets_are_unchanged_on_disk` (in `tests/test_opip_r4_b0_spine_composition.py`) still holds, because the wiring delegates composition to `app/services/target_spine_cycle` and the unified cycle references no target-spine internal module. It is not weakened or deleted.
+- A committed-feature-snapshot read seam does not exist as a public API today; defining one that creates no second evidence history is required before a real production source is enabled.
+- F11 protection ordering is a prerequisite for R4-B2 activation, not for this dormant wiring. This increment does not bypass it.
 
 UNAPPROVED SCOPE CHANGES:
 NONE
