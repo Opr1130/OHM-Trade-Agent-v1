@@ -3,7 +3,13 @@ import math
 from datetime import datetime, timezone
 from pathlib import Path
 
-from app.services.registry_io import load_json, registry_lock, save_json_atomic
+from app.services.registry_io import (
+    RegistryIOError,
+    load_json,
+    read_json_without_quarantine,
+    registry_lock,
+    save_json_atomic,
+)
 
 
 TRADE_FILE = Path("/app/data/active_trades.json")
@@ -94,6 +100,28 @@ def get_active_trades() -> list[ActiveTrade]:
     with registry_lock(registry_lock_file()):
         data = _load_raw()
     return [_from_item(item) for item in data.values() if item.get("status") == "active"]
+
+
+def read_active_trades_without_mutation() -> list[ActiveTrade]:
+    """Read active trades without locking, quarantining or writing anything.
+
+    On a malformed registry the underlying read raises (``RegistryIOError``)
+    instead of quarantining the file, so a read-only observer cannot mutate the
+    registry. A non-object row is likewise treated as corruption rather than being
+    silently skipped, so a malformed entry can never be dropped and reported as
+    "no holdings". A caller that needs a safe snapshot must fail closed on the
+    exception.
+    """
+    data = read_json_without_quarantine(TRADE_FILE)
+    trades: list[ActiveTrade] = []
+    for item in data.values():
+        if not isinstance(item, dict):
+            raise RegistryIOError(
+                f"active trade registry {TRADE_FILE} contains a non-object row"
+            )
+        if item.get("status") == "active":
+            trades.append(_from_item(item))
+    return trades
 
 
 def update_trade_remaining_quantity(

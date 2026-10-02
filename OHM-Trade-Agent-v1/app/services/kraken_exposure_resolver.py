@@ -200,11 +200,38 @@ class KrakenExposureResolver:
         public_client: KrakenClient | None = None,
         trade_loader: TradeLoader = get_active_trades,
         managed_verifier_factory: VerifierFactory | None = None,
+        minimum_unmanaged_notional_usd: float | None = None,
     ) -> None:
         self.private_client = private_client or KrakenPrivateClient()
         self.public_client = public_client or KrakenClient()
         self.trade_loader = trade_loader
         self.managed_verifier_factory = managed_verifier_factory
+        #: When set, overrides the materiality floor below which a positive
+        #: unmanaged balance is suppressed. ``None`` keeps the production default
+        #: (env-driven). A read-only safety observer passes ``0.0`` so no positive
+        #: holding is hidden from its health decision.
+        self.minimum_unmanaged_notional_usd = minimum_unmanaged_notional_usd
+
+    def _resolve_minimum_notional(self) -> float:
+        """The materiality floor, honoring an explicit non-mutating override.
+
+        An override may only *lower* the floor, never raise it: the result is the
+        minimum of the production default and the override, so a read-only observer
+        can surface more exposure but can never hide more than production already
+        does. A non-finite, negative or oversized override resolves to zero without
+        raising.
+        """
+        default = _minimum_unmanaged_notional_usd()
+        override = self.minimum_unmanaged_notional_usd
+        if override is None:
+            return default
+        try:
+            candidate = float(override)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        if not math.isfinite(candidate):
+            return 0.0
+        return min(default, max(0.0, candidate))
 
     def resolve(self) -> ExposureResolution:
         try:
@@ -410,7 +437,7 @@ class KrakenExposureResolver:
             pairs_by_asset = {}
             notionals = {}
 
-        minimum_notional = _minimum_unmanaged_notional_usd()
+        minimum_notional = self._resolve_minimum_notional()
         unpriced_assets: list[str] = []
         for asset, quantity in sorted(canonical_balances.items()):
             pair = pairs_by_asset.get(asset)
