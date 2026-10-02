@@ -87,6 +87,7 @@ class LegacyDrainStatus:
     freqtrade_pending_entries: int = 0
     paper_v1_pending_entries: int = 0
     paper_v1_open_positions: int = 0
+    paper_v1_unresolved_trades: int = 0
     paper_v1_reserved_capital: float = 0.0
     legacy_control_enabled: bool = False
 
@@ -102,6 +103,7 @@ class LegacyDrainStatus:
             "freqtrade_pending_entries": self.freqtrade_pending_entries,
             "paper_v1_pending_entries": self.paper_v1_pending_entries,
             "paper_v1_open_positions": self.paper_v1_open_positions,
+            "paper_v1_unresolved_trades": self.paper_v1_unresolved_trades,
             "paper_v1_reserved_capital": self.paper_v1_reserved_capital,
             "legacy_control_enabled": self.legacy_control_enabled,
         }
@@ -139,6 +141,9 @@ def evaluate_legacy_drain(*, starting_equity: float) -> LegacyDrainStatus:
         summary = account_summary(float(starting_equity))
         v1_pending = int(summary.pending_entries)
         v1_open = int(summary.open_positions)
+        # An UNRESOLVED lifecycle is a legacy obligation: its outcome is not proven,
+        # so the drain cannot be READY while one exists.
+        v1_unresolved = int(getattr(summary, "unresolved_trades", 0) or 0)
         v1_reserved = float(summary.reserved_capital)
     except Exception as exc:  # noqa: BLE001 - unreadable state must block cutover
         return LegacyDrainStatus(
@@ -146,26 +151,34 @@ def evaluate_legacy_drain(*, starting_equity: float) -> LegacyDrainStatus:
             reason=f"legacy paper state is unreadable: {type(exc).__name__}: {exc}",
         )
 
-    outstanding_total = open_trades + pending_entries + v1_pending + v1_open
-    if outstanding_total > 0:
+    outstanding_total = (
+        open_trades + pending_entries + v1_pending + v1_open + v1_unresolved
+    )
+    # A READY drain proves every legacy obligation cleared *and* no legacy capital
+    # remains reserved. Retained reserved capital with no counted obligation (for
+    # example an unresolved or quarantined lifecycle) is not drained.
+    if outstanding_total > 0 or v1_reserved > 1e-9:
         return LegacyDrainStatus(
             status=DRAIN_DRAINING,
             reason=(
                 "legacy paper obligations remain: "
                 f"freqtrade open={open_trades} pending={pending_entries}, "
-                f"paper v1 pending={v1_pending} open={v1_open}"
+                f"paper v1 pending={v1_pending} open={v1_open} "
+                f"unresolved={v1_unresolved} reserved_capital={v1_reserved:.8f}"
             ),
             freqtrade_open_trades=open_trades,
             freqtrade_pending_entries=pending_entries,
             paper_v1_pending_entries=v1_pending,
             paper_v1_open_positions=v1_open,
+            paper_v1_unresolved_trades=v1_unresolved,
             paper_v1_reserved_capital=v1_reserved,
             legacy_control_enabled=control_enabled,
         )
 
     return LegacyDrainStatus(
         status=DRAIN_READY,
-        reason="no outstanding legacy paper obligation in either subsystem",
+        reason="no outstanding legacy paper obligation and no reserved legacy capital",
+        paper_v1_unresolved_trades=v1_unresolved,
         paper_v1_reserved_capital=v1_reserved,
         legacy_control_enabled=control_enabled,
     )
@@ -409,6 +422,7 @@ def _drain_evidence(drain: LegacyDrainStatus) -> dict:
         "freqtrade_pending_entries": drain.freqtrade_pending_entries,
         "paper_v1_pending_entries": drain.paper_v1_pending_entries,
         "paper_v1_open_positions": drain.paper_v1_open_positions,
+        "paper_v1_unresolved_trades": drain.paper_v1_unresolved_trades,
         "paper_v1_reserved_capital": drain.paper_v1_reserved_capital,
         "legacy_control_enabled": drain.legacy_control_enabled,
     }

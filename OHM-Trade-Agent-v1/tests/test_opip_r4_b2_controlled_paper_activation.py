@@ -14,8 +14,11 @@ from __future__ import annotations
 import ast
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+
+import app.services.paper_v2_cutover_readiness as cutover
 
 pytestmark = pytest.mark.acceptance
 
@@ -35,10 +38,14 @@ FORBIDDEN_AUTHORITY_TOKENS = (
     "order",
 )
 
-#: The R4-B2 acceptance module may import only the frozen contract surface.
+#: The R4-B2 acceptance module may import only the frozen contract surface and
+#: the read-only seams it anchors to.
 ALLOWED_APP_IMPORT_PREFIXES = (
     "app.opip.contracts.",
-    "app.services.paper_v2_activation",
+    "app.jobs.scan_opportunities",
+    "app.services.paper_v2_",
+    "app.services.protection_health",
+    "app.services.system_incidents",
 )
 
 
@@ -91,6 +98,32 @@ def test_ac_003_single_new_entry_authority():
     assert "the target F7 selector as the admission source being papered" in text
     assert "one reservation authority: the canonical writer" in text
     assert "may not create new entries while the target authority is active" in text
+
+    # Code-anchored: the resolved paper authority is mutually exclusive. For every
+    # grantable value, at most one of the target-route and legacy flags is true, so
+    # the runtime can never grant two new-entry authorities at once.
+    import app.jobs.scan_opportunities as scan
+
+    granted_values = (
+        scan.AUTHORITY_LEGACY,
+        scan.AUTHORITY_PAPER_V2_READY,
+        scan.AUTHORITY_PAPER_V2_DRAINING,
+        scan.AUTHORITY_PAPER_V2_UNAVAILABLE,
+    )
+    seen_granted: set[str] = set()
+    for granted in granted_values:
+        authority = scan.PaperAuthority(requested=True, granted=granted, reason="test")
+        flags = (authority.paper_v2_routing, authority.legacy_new_entry_allowed)
+        assert sum(flags) <= 1, (granted, flags)
+        if any(flags):
+            seen_granted.add(granted)
+    # Exactly the two single-authority grants may ever authorize a new entry.
+    assert seen_granted == {scan.AUTHORITY_LEGACY, scan.AUTHORITY_PAPER_V2_READY}
+    # The draining/unavailable states grant no new-entry authority at all.
+    for granted in (scan.AUTHORITY_PAPER_V2_DRAINING, scan.AUTHORITY_PAPER_V2_UNAVAILABLE):
+        authority = scan.PaperAuthority(requested=True, granted=granted, reason="test")
+        assert not authority.paper_v2_routing
+        assert not authority.legacy_new_entry_allowed
 
 
 def test_ac_004_cutover_preconditions_fail_closed():
@@ -146,9 +179,10 @@ def test_ac_007_retry_semantics_preserved():
 
 
 def test_ac_008_rollback_restores_one_authority():
-    """ATDD-R4-B2-controlled-paper-activation/AC-008: rollback restores exactly one authority via the mode switch, never two, with no canonical-data migration."""
+    """ATDD-R4-B2-controlled-paper-activation/AC-008: rollback stops new target admissions immediately, withholds legacy new-entry authority until the rollback-ready gate, never runs two authorities, and needs no canonical-data migration."""
     text = _contract_text()
-    assert "set the mode back to `off`" in text
+    assert "setting the mode back to `off`" in text
+    assert "does not resume new entries until the rollback-ready gate" in text
     assert "must never leave two allocation authorities running" in text
     assert "no canonical-data migration" in text
     assert "obsolete code is not deleted by this increment" in text
@@ -210,3 +244,108 @@ def test_ac_011_comparator_evidence_required():
     assert "cash/no-trade" in text
     assert "full intent population" in text
     assert "before the legacy admission source is replaced" in text
+
+
+def test_ac_004_drain_requires_no_unresolved_or_reserved_legacy(monkeypatch):
+    """ATDD-R4-B2-controlled-paper-activation/AC-004: a READY legacy drain proves zero unresolved legacy lifecycle AND zero retained legacy reserved capital, not only zero counted obligations."""
+    def _sources(*, unresolved, reserved, v1_pending=0, v1_open=0):
+        monkeypatch.setattr(
+            "app.services.freqtrade_result_ingest.freqtrade_dry_run_status",
+            lambda **kwargs: {"status": "OK", "open_trades": 0},
+        )
+        monkeypatch.setattr(
+            "app.services.freqtrade_signal_bridge.outstanding_admitted_signals",
+            lambda **kwargs: [],
+        )
+        monkeypatch.setattr(
+            "app.services.paper_trade_control.paper_trade_enabled", lambda *a, **k: False
+        )
+        monkeypatch.setattr(
+            "app.services.paper_trade_registry.account_summary",
+            lambda equity, **kwargs: SimpleNamespace(
+                pending_entries=v1_pending,
+                open_positions=v1_open,
+                unresolved_trades=unresolved,
+                reserved_capital=reserved,
+            ),
+        )
+
+    # Unresolved legacy lifecycle with retained reserved capital is NOT drained,
+    # even though no pending/open obligation is counted.
+    _sources(unresolved=2, reserved=500.0)
+    draining = cutover.evaluate_legacy_drain(starting_equity=10_000.0)
+    assert draining.status == cutover.DRAIN_DRAINING
+    assert draining.ready is False
+    assert draining.to_dict()["paper_v1_unresolved_trades"] == 2
+
+    # An unresolved lifecycle ALONE (no reserved capital, no pending/open) still
+    # blocks the drain: the outcome is not proven.
+    _sources(unresolved=1, reserved=0.0)
+    unresolved_only = cutover.evaluate_legacy_drain(starting_equity=10_000.0)
+    assert unresolved_only.status == cutover.DRAIN_DRAINING
+    assert unresolved_only.ready is False
+
+    # Retained reserved capital alone (no counted obligation) is NOT drained.
+    _sources(unresolved=0, reserved=250.0)
+    reserved_only = cutover.evaluate_legacy_drain(starting_equity=10_000.0)
+    assert reserved_only.status == cutover.DRAIN_DRAINING
+
+    # Fully cleared: zero obligations, zero unresolved, zero reserved -> READY.
+    _sources(unresolved=0, reserved=0.0)
+    ready = cutover.evaluate_legacy_drain(starting_equity=10_000.0)
+    assert ready.status == cutover.DRAIN_READY
+    assert ready.ready is True
+
+
+def test_ac_008_rollback_holds_legacy_until_drained():
+    """ATDD-R4-B2-controlled-paper-activation/AC-008: rollback stops new target admissions immediately but withholds legacy new-entry authority until the rollback-ready gate proves no collision."""
+    text = _contract_text()
+    assert "Stopping new Paper-v2 admissions is immediate" in text
+    assert "Restoring legacy new-entry authority is NOT immediate" in text
+    assert "rollback-ready gate proves that no cross-authority collision can occur" in text
+    # The rollback paragraph is fail-closed and keeps the mode-off mechanics.
+    assert "setting the mode back to `off`" in text
+
+
+def test_ac_012_rollback_transition_scenarios():
+    """ATDD-R4-B2-controlled-paper-activation/AC-012: the contract enumerates the rollback scenarios and the one-authority invariant, and the P&L/auth no-authority guarantee holds for the draining states."""
+    text = _contract_text()
+    for scenario in (
+        "an open target position during rollback",
+        "a pending target reservation during rollback",
+        "a target terminal/reconciliation not yet complete during rollback",
+        "a clean fully-drained rollback",
+        "exactly one new-entry authority exists throughout the transition",
+    ):
+        assert scenario in text, scenario
+
+    # Code-anchored: during a draining/unavailable rollback transition the runtime
+    # grants no new-entry authority at all (neither target nor legacy), so it can
+    # never run two authorities.
+    import app.jobs.scan_opportunities as scan
+
+    for granted in (scan.AUTHORITY_PAPER_V2_DRAINING, scan.AUTHORITY_PAPER_V2_UNAVAILABLE):
+        authority = scan.PaperAuthority(requested=True, granted=granted, reason="rollback")
+        assert not authority.paper_v2_routing
+        assert not authority.legacy_new_entry_allowed
+
+
+def test_ac_013_resume_requires_authorized_gate():
+    """ATDD-R4-B2-controlled-paper-activation/AC-013: a healthy observation alone does not resume admissions; resumption requires an authorized gate, and F11 owns no resume authority."""
+    text = _contract_text()
+    assert "A suspended safety state is not cleared by an instantaneous healthy observation" in text
+    assert "a later healthy result alone does NOT resume new admissions" in text
+    assert "Resumption requires an explicit, authorized resume gate" in text
+    assert "F11 owns no such authority" in text
+    assert "requires_owner_recovery_cycles" in text
+
+    # Code-anchored: the resume authority lives in the incident lifecycle, and the
+    # F11 protection-health module exposes no resume/latch API.
+    import app.services.protection_health as ph
+
+    assert not hasattr(ph, "resume")
+    assert not hasattr(ph, "clear_suspension")
+    assert not hasattr(ph, "reset_suspension")
+    from app.services.system_incidents import requires_owner_recovery_cycles  # owner exists
+
+    assert callable(requires_owner_recovery_cycles)
