@@ -86,6 +86,20 @@ class Settings(BaseSettings):
         default="off",
         pattern=_FEATURE_BUS_MODE_PATTERN,
     )
+    # R4-B2 shadow evidence path. When the Feature Bus is in ``shadow`` mode and the
+    # canonical writer is ``shadow``, the dedicated cron entry
+    # (``deploy/cron.d/opip-feature-bus-capture``) runs a bounded Feature Bus SHADOW
+    # capture, publishing canonical feature snapshots for the non-authoritative
+    # target spine. Evidence only: no ranking, admission, allocation, order or
+    # exchange authority. Cadence lives in the cron schedule (the one scheduler),
+    # not in a runtime hook, so it is not duplicated here.
+    opip_feature_bus_capture_limit: int = Field(default=8, ge=1, le=32)
+    # Total wall-clock budget for one capture pass. The loop stops requesting more
+    # instruments once the remaining budget cannot fit one bounded request; the cron
+    # ``timeout`` is only final containment. Capped below the 240s cron timeout so
+    # the internal budget always stops the pass first, keeping the containment
+    # invariant (internal budget = graceful stop, timeout = last resort).
+    opip_feature_bus_capture_budget_seconds: int = Field(default=180, ge=20, le=220)
     # B/C-3 Paper v2 execution. Default off, and "active" is the only value that
     # enables it: activation is an explicit operator decision, so an unknown or
     # malformed value must fail Settings parsing rather than silently enabling a

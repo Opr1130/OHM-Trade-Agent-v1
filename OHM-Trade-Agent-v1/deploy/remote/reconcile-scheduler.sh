@@ -7,6 +7,9 @@ CANONICAL_DST="/etc/cron.d/ohm-unified-cycle"
 LEARNING_EXPORT_SRC="$APP_ROOT/deploy/cron.d/opip-learning-export"
 LEARNING_EXPORT_DST="/etc/cron.d/opip-learning-export"
 ML_EVIDENCE_DST="/etc/cron.d/opip-ml-evidence"
+# R4-B2 bounded Feature Bus SHADOW evidence capture (dedicated, non-overlapping).
+CAPTURE_SRC="$APP_ROOT/deploy/cron.d/opip-feature-bus-capture"
+CAPTURE_DST="/etc/cron.d/opip-feature-bus-capture"
 LEGACY_MOVEMENT="/etc/cron.d/ohm-movement-discovery"
 STREAM_RECONCILE="$APP_ROOT/deploy/remote/reconcile-stream-worker.sh"
 LEARNING_EXPORTER="$APP_ROOT/deploy/remote/export-opip-learning-evidence.sh"
@@ -34,6 +37,7 @@ done
 
 for required in \
   "$CANONICAL_SRC" \
+  "$CAPTURE_SRC" \
   "$LEARNING_EXPORT_SRC" \
   "$STREAM_RECONCILE" \
   "$LEARNING_EXPORTER" \
@@ -52,6 +56,7 @@ had_canonical=0
 had_learning_export=0
 had_ml_evidence=0
 had_legacy=0
+had_capture=0
 had_root_crontab=0
 
 snapshot_file() {
@@ -74,6 +79,10 @@ fi
 if [[ -e "$ML_EVIDENCE_DST" ]]; then
   cp -a "$ML_EVIDENCE_DST" "$tmpdir/ml-evidence.before"
   had_ml_evidence=1
+fi
+if [[ -e "$CAPTURE_DST" ]]; then
+  cp -a "$CAPTURE_DST" "$tmpdir/capture.before"
+  had_capture=1
 fi
 if [[ -e "$LEGACY_MOVEMENT" ]]; then
   cp -a "$LEGACY_MOVEMENT" "$tmpdir/legacy.before"
@@ -114,6 +123,11 @@ rollback() {
   else
     rm -f "$ML_EVIDENCE_DST"
   fi
+  if [[ "$had_capture" == "1" ]]; then
+    cp -a "$tmpdir/capture.before" "$CAPTURE_DST"
+  else
+    rm -f "$CAPTURE_DST"
+  fi
   if [[ "$had_legacy" == "1" ]]; then
     cp -a "$tmpdir/legacy.before" "$LEGACY_MOVEMENT"
   else
@@ -133,6 +147,7 @@ trap rollback ERR
 
 install -o root -g root -m 0644 "$CANONICAL_SRC" "$CANONICAL_DST"
 install -o root -g root -m 0644 "$LEARNING_EXPORT_SRC" "$LEARNING_EXPORT_DST"
+install -o root -g root -m 0644 "$CAPTURE_SRC" "$CAPTURE_DST"
 
 # Refresh forced-command remote operations from the exact deployed SHA. This
 # keeps the production deploy gateway and read-only learning observability in

@@ -73,7 +73,7 @@ the completed R2 increment
 WHEN:
 repository and runtime activation surfaces are inspected
 THEN:
-OPIP_FEATURE_BUS_MODE remains off, production run_cycle does not activate the Feature Bus, no trading, risk, or strategy authority changes, no deploy occurs, and R3 has not started
+OPIP_FEATURE_BUS_MODE remains off, production run_cycle does not activate the Feature Bus (it never schedules the manual pilot, never runs the R4-B2 SHADOW capture, and never constructs a publisher), no trading, risk, or strategy authority changes, no deploy occurs, and R3 has not started. R4-B2 later placed its bounded SHADOW capture on its own cron entry, precisely so the protected cycle never runs it.
 
 EXPLICITLY OUT OF SCOPE:
 - F3 IGNITION detector implementation
@@ -128,7 +128,7 @@ AC-006 -> tests/test_opip_feature_bus_r2_shadow_parity.py::test_reference_metada
 AC-006 -> tests/test_opip_feature_bus_r2_shadow_parity.py::test_future_reference_metadata_is_refused
 AC-006 -> tests/test_opip_feature_bus_r2_shadow_parity.py::test_missing_reference_binding_fails_closed
 AC-007 -> tests/test_opip_feature_bus_r2_shadow_parity.py::test_unsupported_nested_rolling_state_is_refused
-AC-008 -> tests/test_opip_feature_bus_r2_shadow_parity.py::test_feature_bus_mode_stays_off_and_cycle_does_not_call_it
+AC-008 -> tests/test_opip_feature_bus_r2_shadow_parity.py::test_feature_bus_mode_stays_off_and_cycle_does_not_run_capture
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/opip/features/r2_shadow_parity.py

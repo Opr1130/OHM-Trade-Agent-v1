@@ -550,8 +550,10 @@ def test_fields_without_a_legacy_emitter_stay_unavailable():
 
 
 @pytest.mark.acceptance
-def test_feature_bus_mode_stays_off_and_cycle_does_not_call_it():
-    """Feature Bus stays off and the production cycle does not call it.
+def test_feature_bus_mode_stays_off_and_cycle_does_not_run_capture():
+    """Feature Bus stays off by default and the production cycle never runs Feature
+    Bus capture. R4-B2 moved the bounded SHADOW capture onto its own cron entry so
+    it can never hold the protected cycle.
     ATDD-R2-feature-bus-shadow-parity/AC-008
     """
     assert resolve_feature_bus_mode(type("S", (), {"opip_feature_bus_mode": "off"})()) == "off"
@@ -559,8 +561,12 @@ def test_feature_bus_mode_stays_off_and_cycle_does_not_call_it():
     compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
     assert 'OPIP_FEATURE_BUS_MODE: "off"' in compose
     cycle = (root / "app" / "jobs" / "run_cycle.py").read_text(encoding="utf-8")
+    # The manual measurement pilot is never scheduled from the production cycle, and
+    # neither is the R4-B2 SHADOW capture: it runs from its own cron entry.
     assert "run_feature_bus_pilot" not in cycle
-    assert "opip.features" not in cycle
+    assert "capture_feature_bus_shadow" not in cycle
+    assert "feature_bus" not in cycle.lower()
+    assert "FeatureBusPublisher(" not in cycle
 
 
 # --------------------------------------------------------------------------- #
