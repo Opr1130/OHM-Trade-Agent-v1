@@ -1733,6 +1733,50 @@ class CanonicalWriter:
         items.sort(key=lambda item: item.paper_trade_id)
         return PaperV2ProtectionWork(status="OK", items=items)
 
+    def read_feature_snapshots(
+        self,
+        *,
+        after: tuple[int, int] | None = None,
+        limit: int = 200,
+    ) -> tuple[list[dict], tuple[int, int] | None]:
+        """Committed ``FEATURE_SNAPSHOT_RECORDED`` payloads, in canonical order.
+
+        Read-only: it only SELECTs committed rows and never mutates, quarantines or
+        rewrites canonical state. ``after`` is an exclusive ``(history_epoch,
+        local_sequence)`` cursor, so a caller advances deterministically through
+        canonical history and never re-reads or skips a record. Returns up to
+        ``limit`` payloads and the cursor of the last returned row (or ``after``
+        when there is nothing new).
+        """
+        if int(limit) <= 0:
+            raise ValueError("limit must be positive")
+        where = "event_type = ?"
+        params: list[object] = [FEATURE_SNAPSHOT_RECORDED]
+        if after is not None:
+            where += (
+                " AND (history_epoch > ? OR "
+                "(history_epoch = ? AND local_sequence > ?))"
+            )
+            params.extend([int(after[0]), int(after[0]), int(after[1])])
+        params.append(int(limit))
+        # Take the instance lock so repeated reads on the same live writer serialize
+        # with that writer's own operations on the shared connection (``for_reads``
+        # readers use a separate instance and connection; cross-connection safety is
+        # SQLite WAL, not this lock).
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT history_epoch, local_sequence, payload_json FROM events "
+                f"WHERE {where} ORDER BY history_epoch ASC, local_sequence ASC LIMIT ?",
+                tuple(params),
+            ).fetchall()
+        payloads = [json.loads(str(row["payload_json"])) for row in rows]
+        cursor = (
+            (int(rows[-1]["history_epoch"]), int(rows[-1]["local_sequence"]))
+            if rows
+            else after
+        )
+        return payloads, cursor
+
     def _paper_trade_events(self, event_type: str, paper_trade_id: str) -> list[dict]:
         """Committed records of one event type for one trade, in commit order."""
         rows = self._conn.execute(
