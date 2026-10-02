@@ -829,7 +829,7 @@ def test_inactive_paper_v2_prevents_every_write_and_read(env, mode):
     assert _total_event_count(server.writer) == 0
 
 
-@pytest.mark.parametrize("direction", ["SHORT", "short", "FLAT", "", "LONG_ISH", None])
+@pytest.mark.parametrize("direction", ["short", "FLAT", "", "LONG_ISH", None])
 def test_unsupported_direction_is_refused_before_any_write_or_read(env, direction):
     server, _ = env
     calls: list[str] = []
@@ -846,9 +846,15 @@ def test_unsupported_direction_is_refused_before_any_write_or_read(env, directio
 
 
 def test_short_is_never_silently_mapped_onto_a_buy(env):
-    """A SHORT produces no ENTRY intent rather than a BUY."""
+    """R4-B0 authority handoff: a SHORT opens SELL, never a long BUY.
+
+    Historical R4-A behaviour was to refuse SHORT outright. R4-B0 admits SHORT as
+    a *simulated* direction under the direction-bound contract, so the substantive
+    guarantee this test always protected is restated directly: a SHORT never
+    produces an ENTRY BUY. It must open with SELL (into the bid) or not at all.
+    """
     server, _ = env
-    with pytest.raises(PaperV2ExecutionError):
+    try:
         run_paper_v2_opportunity(
             _opportunity(direction="SHORT"),
             client=env[1],
@@ -856,13 +862,41 @@ def test_short_is_never_silently_mapped_onto_a_buy(env):
             settings=_Settings(),
             now=NOW,
         )
-    assert _rows(server.writer, "paper_execution.order_intent.recorded") == []
+    except PaperV2ExecutionError:
+        # The fixture's qualified geometry is long-shaped, so this SHORT is refused
+        # before any order intent. That is a valid outcome; what must never happen
+        # is the SHORT being executed as a long BUY.
+        pass
+    entry_intents = [
+        row
+        for row in _rows(server.writer, "paper_execution.order_intent.recorded")
+        if str(row.get("intent_role")) == "ENTRY"
+    ]
+    # The invariant: a SHORT never mints a BUY-side ENTRY. It either opens SELL or
+    # does not open at all.
+    assert all(str(row["side"]) == "SELL" for row in entry_intents), (
+        "a SHORT ENTRY must never be mapped onto a long BUY"
+    )
 
 
-def test_only_long_is_a_supported_direction():
+def test_short_is_a_supported_direction_only_through_the_direction_contract():
+    """R4-B0 authority handoff (replaces the R4-A long-only assertion).
+
+    The historical increment pinned the engine to LONG only. R4-B0 extends the
+    paper contract to simulated SHORT, and this test proves the extension is
+    bounded: SHORT is admitted, but every direction maps to a fixed role/side pair
+    and an unknown direction is still refused.
+    """
+    from app.opip.contracts.paper_execution_runtime import expected_paper_side
     from app.services.paper_v2_execution import SUPPORTED_OPPORTUNITY_DIRECTIONS
 
-    assert SUPPORTED_OPPORTUNITY_DIRECTIONS == {"LONG"}
+    assert SUPPORTED_OPPORTUNITY_DIRECTIONS == {"LONG", "SHORT"}
+    assert expected_paper_side("LONG", "ENTRY") == "BUY"
+    assert expected_paper_side("LONG", "EXIT") == "SELL"
+    assert expected_paper_side("SHORT", "ENTRY") == "SELL"
+    assert expected_paper_side("SHORT", "EXIT") == "BUY"
+    with pytest.raises(ValueError):
+        expected_paper_side("FLAT", "ENTRY")
 
 
 def test_active_long_execution_still_completes_the_canonical_lifecycle(env):

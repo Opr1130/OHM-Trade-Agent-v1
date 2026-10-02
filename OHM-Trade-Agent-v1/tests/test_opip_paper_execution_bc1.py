@@ -211,6 +211,7 @@ def _admission(
         portfolio_equity_limit=equity_limit,
         portfolio_position_limit=position_limit,
         requested_reservation_amount=reservation_amount,
+        direction="LONG",
     )
 
 

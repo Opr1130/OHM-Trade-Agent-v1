@@ -15,6 +15,11 @@ _MIN_TRADINGVIEW_BEARER_LENGTH = 43
 #: Mode pattern for features that may only be off or shadow. Shared so the
 #: shadow-capable switches cannot drift apart.
 _OFF_SHADOW_MODE_PATTERN = r"^(off|shadow)$"
+#: R4-B0 Decision 7: the Feature Bus gains an explicit production-authoritative
+#: mode. ``active`` uses the identical R2-proven feature math and grants no entry,
+#: allocation, risk, paper, exchange or Committee authority. Production remains
+#: ``off`` in the R4-B0 increment.
+_FEATURE_BUS_MODE_PATTERN = r"^(off|shadow|active)$"
 
 
 class Settings(BaseSettings):
@@ -79,7 +84,7 @@ class Settings(BaseSettings):
     # Invalid env values must fail Settings parsing (never silently become off).
     opip_feature_bus_mode: str = Field(
         default="off",
-        pattern=_OFF_SHADOW_MODE_PATTERN,
+        pattern=_FEATURE_BUS_MODE_PATTERN,
     )
     # B/C-3 Paper v2 execution. Default off, and "active" is the only value that
     # enables it: activation is an explicit operator decision, so an unknown or

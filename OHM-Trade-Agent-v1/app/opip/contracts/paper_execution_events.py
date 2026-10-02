@@ -114,6 +114,12 @@ _EVENT_CONTRACTS = {
                 "portfolio_equity_limit",
                 "portfolio_position_limit",
                 "requested_reservation_amount",
+                # R4-B0 Decision 6: the admitted direction and the marker that
+                # makes it required. Optional on the event so a historical
+                # long-only disposition stays readable; the writer requires it on
+                # every new admission.
+                "direction",
+                "direction_contract_version",
             }
         ),
         parent_refs=("decision_context_id",),

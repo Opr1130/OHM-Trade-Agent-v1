@@ -343,6 +343,12 @@ class PaperV2ProtectionWorkItem:
     #: state exactly (the writer binds it to the canonical admission).
     reserved_capital: float = 0.0
 
+    #: R4-B0: the admitted trade's direction, from committed admission ancestry.
+    #: It is the sole authority for the protection exit side, the executable quote
+    #: side and the stop/target comparators, so protection never guesses a
+    #: direction from current market state.
+    direction: str = "LONG"
+
     #: Effective (highest-sequenced, activated) protection plan and its state.
     protection_plan: dict[str, Any] | None = None
     protection_state: str | None = None
@@ -406,6 +412,7 @@ class PaperV2ProtectionWorkItem:
             gross_pnl=float(raw.get("gross_pnl") or 0.0),
             execution_costs=float(raw.get("execution_costs") or 0.0),
             reserved_capital=float(raw.get("reserved_capital") or 0.0),
+            direction=str(raw.get("direction") or "LONG"),
             protection_plan=(
                 dict(raw["protection_plan"])
                 if isinstance(raw.get("protection_plan"), dict)

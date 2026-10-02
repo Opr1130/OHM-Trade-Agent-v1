@@ -79,7 +79,9 @@ from app.opip.contracts.paper_execution_events import (
 from app.opip.contracts.paper_execution_runtime import (
     PAPER_QUOTE_EVIDENCE_RECORDED,
     PaperAdmissionRequest,
+    expected_paper_side,
     quote_evidence_idempotency_key,
+    require_paper_direction,
 )
 from app.opip.contracts.serialization import iso_z, stable_hash
 from app.opip.contracts.temporal import require_utc
@@ -117,11 +119,16 @@ from app.services.paper_v2_quote_evidence import (
 #: placeholder; the build and process identity are obtained by the producer itself.
 PRODUCING_COMPONENT = "paper_v2_execution"
 
-#: The only opportunity direction this slice can execute. Paper v2 models long-only
-#: exposure, so an ENTRY is a BUY. A short needs a separately frozen contract, so
-#: any other direction is refused rather than silently mapped onto a BUY.
+#: R4-B0 Decision 6: Paper v2 models simulated LONG and SHORT exposure. SHORT
+#: became reachable only together with the direction-correct protection runtime
+#: (inverse stop/target and BUY-to-cover on the ask), so no short position can
+#: exist that protection would manage with LONG logic. Simulation only: no borrow,
+#: margin, leverage or funded/exchange authority anywhere on this path.
 OPPORTUNITY_DIRECTION_LONG = "LONG"
-SUPPORTED_OPPORTUNITY_DIRECTIONS = frozenset({OPPORTUNITY_DIRECTION_LONG})
+OPPORTUNITY_DIRECTION_SHORT = "SHORT"
+SUPPORTED_OPPORTUNITY_DIRECTIONS = frozenset(
+    {OPPORTUNITY_DIRECTION_LONG, OPPORTUNITY_DIRECTION_SHORT}
+)
 
 #: Terminal, non-continuing admission outcomes. Each stops this opportunity.
 STOP_DISPOSITIONS = frozenset({"CAPACITY_REJECTED", "CAPITAL_REJECTED"})
@@ -200,19 +207,26 @@ class PaperV2ExecutionResult:
     detail: str | None = None
 
 
-def build_disposition_id(*, episode_id: str, native_symbol: str) -> str:
+def build_disposition_id(*, episode_id: str, native_symbol: str, direction: str) -> str:
     """Deterministic disposition identity for one qualified opportunity.
 
     Derived from canonical ancestry with the repository's existing ``stable_hash``
     convention, so a retry after restart reproduces the same identity rather than
     minting a new one - which is what keeps admission, its reservation and every
     downstream event idempotent.
+
+    R4-B0: the direction is part of the identity. A LONG and a SHORT on the same
+    episode and symbol are different trades with different economics, so they must
+    not share a disposition, trade or reservation identity. Restart still
+    reproduces the same identity because the direction is itself committed
+    ancestry, not ambient state.
     """
     return stable_hash(
         "PDISP",
         {
             "episode_id": str(episode_id),
             "native_symbol": str(native_symbol).upper(),
+            "direction": require_paper_direction(str(direction)),
             "engine": ENGINE_OPIP_PAPER_V2,
         },
     )
@@ -279,8 +293,9 @@ def run_paper_v2_opportunity(
         raise PaperV2ExecutionError(
             "Paper v2 is not active, so no paper execution may run"
         )
-    # Long-only: an ENTRY is a BUY. A short requires a separately frozen contract,
-    # so an unknown or unsupported direction is refused rather than reinterpreted.
+    # The direction is bound to the ENTRY/EXIT side matrix. An unknown or
+    # unsupported direction is refused rather than reinterpreted, and a caller
+    # can never choose a side independently of the direction.
     if opportunity.direction not in SUPPORTED_OPPORTUNITY_DIRECTIONS:
         raise PaperV2ExecutionError(
             f"unsupported opportunity direction: {opportunity.direction!r}"
@@ -289,7 +304,9 @@ def run_paper_v2_opportunity(
     moment = require_utc(now, field_name="now")
 
     disposition_id = build_disposition_id(
-        episode_id=opportunity.episode_id, native_symbol=opportunity.native_symbol
+        episode_id=opportunity.episode_id,
+        native_symbol=opportunity.native_symbol,
+        direction=str(opportunity.direction),
     )
 
     # --- 0b. validate the snapshot before any canonical write --------------
@@ -529,6 +546,9 @@ def _advance_admitted_trade(
     entry_order_id = paper_v2_entry_order_intent_id(paper_trade_id)
     attempt_id = paper_v2_entry_attempt_id(entry_order_id)
     fill_id = paper_v2_entry_fill_id(entry_order_id)
+    # R4-B0: the ENTRY side is derived from the opportunity's direction (which the
+    # admission committed). It is never taken from a free caller field.
+    entry_side = expected_paper_side(opportunity.direction, "ENTRY")
 
     # --- 3b. an already-terminal trade is returned, never reopened ---------
     # A zero-fill terminal record is a closed outcome. Advancing past it would try
@@ -591,7 +611,7 @@ def _advance_admitted_trade(
             "decision_context_id": context_id,
             "intent_seq": 0,
             "intent_role": "ENTRY",
-            "side": "BUY",
+            "side": entry_side,
             "order_type": "MARKET",
             "requested_quantity": float(opportunity.requested_quantity),
             "requested_notional": float(opportunity.requested_notional),
@@ -699,8 +719,14 @@ def _advance_admitted_trade(
             raise PaperV2ExecutionError(
                 "committed attempt quantity does not match the approved request"
             )
-        # A long ENTRY executes against the ask side of the committed book.
-        executable_price = float(quote["best_ask"])
+        # The ENTRY side decides which side of the committed book is executable:
+        # a BUY opens long into the ask, a simulated SELL opens short into the bid.
+        # The side comes from the committed ENTRY order intent (ancestry), never
+        # from a fresh caller claim.
+        entry_side_committed = str(entry_payload.get("side") or "BUY")
+        executable_price = _entry_executable_price(
+            quote, entry_side=entry_side_committed
+        )
         economics = paper_economics_for_version(PAPER_ECONOMIC_MODEL_VERSION)
         cost = economics.cost_components(fill_quantity, executable_price)
         fill_moment = next_execution_moment(
@@ -719,7 +745,7 @@ def _advance_admitted_trade(
             "order_intent_id": entry_order_id,
             "paper_trade_id": paper_trade_id,
             "fill_seq": 0,
-            "side": "BUY",
+            "side": entry_side_committed,
             "quantity": fill_quantity,
             "price": executable_price,
             "fee_cost": cost["fee_cost"],
@@ -771,57 +797,94 @@ _NOTIONAL_TOLERANCE_USD = 0.01
 QUANTITY_TOLERANCE = 1e-9
 
 
+def _entry_executable_price(quote: Mapping[str, Any], *, entry_side: str) -> float:
+    """The executable price for an ENTRY on the committed book.
+
+    A BUY (long open) pays the ask; a simulated SELL (short open) receives the
+    bid. Reading the wrong side would fabricate a price the book never offered.
+    """
+    if entry_side == "BUY":
+        return float(quote["best_ask"])
+    if entry_side == "SELL":
+        return float(quote["best_bid"])
+    raise PaperV2ExecutionError(f"unsupported ENTRY side: {entry_side!r}")
+
+
 def _require_executable_entry(opportunity: PaperV2Opportunity, *, quote: Mapping[str, Any]) -> None:
-    """Validate the fresh committed ask before it may become exposure.
+    """Validate the fresh committed book before it may become exposure.
 
-    Three independent refusals, all fail-closed:
+    Three independent refusals, all fail-closed and direction-aware:
 
-    * **Qualified geometry.** The ask must still sit inside the entry band the plan
-      qualified, above the qualified stop and below the first qualified target. A
-      quote outside that geometry is a different trade from the one that was
-      qualified, so it must not fill.
-    * **Reserved capital.** The actual notional at the committed ask must not exceed
-      the approved reservation. Silently resizing the trade would change approved
-      economics, so this refuses rather than rescaling.
+    * **Qualified geometry.** The executable price must still sit inside the entry
+      band the plan qualified, on the correct side of the qualified stop and the
+      first qualified target. A quote outside that geometry is a different trade
+      from the one that was qualified, so it must not fill.
+    * **Reserved capital.** The actual notional at the committed price must not
+      exceed the approved reservation. Silently resizing the trade would change
+      approved economics, so this refuses rather than rescaling.
     * **Displayed depth.** There is no approved depth model and no approved
-      partial-fill model, so a top-of-book ask that cannot support the full
+      partial-fill model, so top-of-book size that cannot support the full
       requested quantity cannot be filled. Extrapolating deeper liquidity or
       fabricating a full fill is not permitted.
-    """
-    ask = float(quote["best_ask"])
-    quantity = float(opportunity.requested_quantity)
 
-    if ask > float(opportunity.chase_limit):
-        raise PaperV2ExecutionError(
-            "best ask is above the qualified chase limit for this opportunity"
-        )
-    if ask < float(opportunity.entry_low):
-        raise PaperV2ExecutionError(
-            "best ask is below the qualified entry band for this opportunity"
-        )
-    if ask <= float(opportunity.stop_price):
-        raise PaperV2ExecutionError(
-            "best ask is at or below the qualified stop for this opportunity"
-        )
-    if opportunity.target_prices:
-        first_target = float(opportunity.target_prices[0])
-        if ask >= first_target:
+    LONG buys into the ask; a simulated SHORT sells into the bid.
+    """
+    entry_side = expected_paper_side(opportunity.direction, "ENTRY")
+    is_long = opportunity.direction == OPPORTUNITY_DIRECTION_LONG
+    price = _entry_executable_price(quote, entry_side=entry_side)
+    quantity = float(opportunity.requested_quantity)
+    side_word = "ask" if is_long else "bid"
+
+    if is_long:
+        if price > float(opportunity.chase_limit):
+            raise PaperV2ExecutionError(
+                "best ask is above the qualified chase limit for this opportunity"
+            )
+        if price < float(opportunity.entry_low):
+            raise PaperV2ExecutionError(
+                "best ask is below the qualified entry band for this opportunity"
+            )
+        if price <= float(opportunity.stop_price):
+            raise PaperV2ExecutionError(
+                "best ask is at or below the qualified stop for this opportunity"
+            )
+        if opportunity.target_prices and price >= float(opportunity.target_prices[0]):
             raise PaperV2ExecutionError(
                 "best ask is at or above the first qualified target for this opportunity"
             )
+    else:
+        # Mirrored: a short sells into the bid, which must sit inside the
+        # qualified band, above the (lower) first target and below the (higher)
+        # stop, and must not be better than the qualified chase limit.
+        if price < float(opportunity.chase_limit):
+            raise PaperV2ExecutionError(
+                "best bid is below the qualified chase limit for this opportunity"
+            )
+        if price > float(opportunity.entry_high):
+            raise PaperV2ExecutionError(
+                "best bid is above the qualified entry band for this opportunity"
+            )
+        if price >= float(opportunity.stop_price):
+            raise PaperV2ExecutionError(
+                "best bid is at or above the qualified stop for this opportunity"
+            )
+        if opportunity.target_prices and price <= float(opportunity.target_prices[0]):
+            raise PaperV2ExecutionError(
+                "best bid is at or below the first qualified target for this opportunity"
+            )
 
-    actual_notional = quantity * ask
+    actual_notional = quantity * price
     reserved = float(opportunity.requested_reservation_amount)
     if actual_notional > reserved + _NOTIONAL_TOLERANCE_USD:
         raise PaperV2ExecutionError(
-            "actual execution notional at the committed ask exceeds the approved "
-            "reservation; refusing rather than resizing the trade"
+            f"actual execution notional at the committed {side_word} exceeds the "
+            "approved reservation; refusing rather than resizing the trade"
         )
 
-    ask_quantity = float(quote["ask_quantity"])
-    if quantity > ask_quantity + QUANTITY_TOLERANCE:
+    displayed = float(quote["ask_quantity"] if is_long else quote["bid_quantity"])
+    if quantity > displayed + QUANTITY_TOLERANCE:
         raise PaperV2ExecutionError(
-            "requested quantity exceeds the displayed Level-1 ask quantity; "
+            f"requested quantity exceeds the displayed Level-1 {side_word} quantity; "
             "no approved depth or partial-fill model exists"
         )
 
@@ -959,7 +1022,14 @@ def _complete_committed_fill(
 
     entry_order_id = str(attempt["order_intent_id"])
     fill_quantity = float(attempt["accepted_quantity"])
-    executable_price = float(quote["best_ask"])
+    # R4-B0: the committed ENTRY order intent's side is the ancestry-bound book
+    # side. A recovery fill must not assume a long entry, or a short recovery
+    # would price a BUY-to-open off the ask instead of the bid.
+    committed_entry_intent = entry.get("entry_order_intent")
+    entry_side = "BUY"
+    if isinstance(committed_entry_intent, Mapping):
+        entry_side = str(committed_entry_intent.get("side") or "BUY")
+    executable_price = _entry_executable_price(quote, entry_side=entry_side)
     economics = paper_economics_for_version(PAPER_ECONOMIC_MODEL_VERSION)
     cost = economics.cost_components(fill_quantity, executable_price)
     attempt_floor = temporal_instant(
@@ -979,7 +1049,7 @@ def _complete_committed_fill(
         "order_intent_id": entry_order_id,
         "paper_trade_id": str(attempt["paper_trade_id"]),
         "fill_seq": 0,
-        "side": "BUY",
+        "side": entry_side,
         "quantity": fill_quantity,
         "price": executable_price,
         "fee_cost": cost["fee_cost"],
@@ -1129,6 +1199,10 @@ def _admit(
         portfolio_equity_limit=policy.portfolio_equity_limit,
         portfolio_position_limit=policy.portfolio_position_limit,
         requested_reservation_amount=float(opportunity.requested_reservation_amount),
+        # R4-B0 Decision 6: the direction is committed with the admission, so it
+        # becomes the trade's canonical ancestry and the only authority for the
+        # order-intent role/side matrix downstream.
+        direction=str(opportunity.direction),
     )
     ack = client.admit_paper_opportunity(request)
     status = str(getattr(ack, "status", "") or "")
@@ -1236,6 +1310,7 @@ def _ensure_protection_plan(
             stop_price=float(opportunity.stop_price),
             target_prices=tuple(float(p) for p in opportunity.target_prices),
             plan_time=moment,
+            direction=str(opportunity.direction),
         ),
         tp1_fraction=float(getattr(settings, "paper_v2_tp1_fraction", 0.5)),
         max_hold_seconds=int(getattr(settings, "paper_v2_max_hold_seconds", 86_400)),

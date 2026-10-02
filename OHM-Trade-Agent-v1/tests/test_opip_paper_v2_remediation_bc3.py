@@ -273,7 +273,11 @@ def test_execution_state_does_not_scan_history(env, monkeypatch):
 def _disposition_id(client) -> str:
     from app.services.paper_v2_execution import build_disposition_id
 
-    return build_disposition_id(episode_id=_snapshot_payload()["episode_id"], native_symbol="SOLUSD")
+    return build_disposition_id(
+        episode_id=_snapshot_payload()["episode_id"],
+        native_symbol="SOLUSD",
+        direction="LONG",
+    )
 
 
 def test_execution_state_returns_committed_stage_payloads(env):
@@ -751,6 +755,7 @@ def test_admitted_reservation_with_no_fill_is_not_active_exposure(env):
             portfolio_equity_limit=10_000.0,
             portfolio_position_limit=3,
             requested_reservation_amount=500.0,
+            direction="LONG",
         )
     )
     assert ack.status in {"OK", "DUPLICATE_OK"}, ack.detail
@@ -1112,6 +1117,7 @@ def _seed_reserved_trade(env) -> str:
             portfolio_equity_limit=10_000.0,
             portfolio_position_limit=3,
             requested_reservation_amount=500.0,
+            direction="LONG",
         )
     )
     assert ack.status in {"OK", "DUPLICATE_OK"}, ack.detail

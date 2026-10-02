@@ -174,6 +174,7 @@ def _admit(writer, context, *, disposition_id, quote_currency="USD", expected_ve
             portfolio_equity_limit=10_000.0,
             portfolio_position_limit=3,
             requested_reservation_amount=500.0,
+            direction="LONG",
         )
     )
 

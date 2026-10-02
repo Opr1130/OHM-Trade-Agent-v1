@@ -400,6 +400,86 @@ def resolve_capital_policy(policy_version: str) -> PaperCapitalPolicy:
         raise ValueError(f"unsupported capital policy version: {key!r}") from exc
 
 
+#: R4-B0 Decision 6: the canonical Paper-v2 direction contract. A direction is a
+#: property of the *admitted trade's ancestry*, never a free caller-controlled
+#: field on an order intent: a caller must not be able to claim SHORT merely to
+#: make an ENTRY/SELL pair validate.
+PAPER_DIRECTION_LONG = "LONG"
+PAPER_DIRECTION_SHORT = "SHORT"
+PAPER_DIRECTIONS = frozenset({PAPER_DIRECTION_LONG, PAPER_DIRECTION_SHORT})
+
+#: The direction-bound role/side matrix. A LONG opens by buying and closes by
+#: selling; a simulated SHORT opens by selling and covers by buying. Simulation
+#: only: no borrow, margin, leverage or funded/exchange authority is implied.
+_ROLE_SIDE_MATRIX: dict[tuple[str, str], str] = {
+    (PAPER_DIRECTION_LONG, "ENTRY"): "BUY",
+    (PAPER_DIRECTION_LONG, "EXIT"): "SELL",
+    (PAPER_DIRECTION_SHORT, "ENTRY"): "SELL",
+    (PAPER_DIRECTION_SHORT, "EXIT"): "BUY",
+}
+
+
+def require_paper_direction(value: Any) -> str:
+    """Coerce one direction token strictly. Fails closed on anything else."""
+    if not isinstance(value, str) or value not in PAPER_DIRECTIONS:
+        raise ValueError("direction must be the exact token LONG or SHORT")
+    return value
+
+
+def expected_paper_side(direction: str, role: str) -> str:
+    """The only side permitted for one direction/role pair. Fails closed."""
+    resolved = require_paper_direction(direction)
+    try:
+        return _ROLE_SIDE_MATRIX[(resolved, role)]
+    except KeyError as exc:
+        raise ValueError(
+            f"unsupported direction/role pair: {(resolved, role)!r}"
+        ) from exc
+
+
+def paper_trade_direction_contract(payload: Mapping[str, Any]) -> str:
+    """The direction implied by a canonical admission/order payload.
+
+    Prefers the explicit committed ``direction``. When it is absent, this is a
+    record written before the direction contract existed: the historical engine
+    was long-only *by construction* (the writer hard-coded ENTRY->BUY), so the
+    only sound reading is LONG. A record that declares a contract version at or
+    above the direction contract is never granted that fallback, so a new record
+    cannot omit direction and be silently treated as LONG.
+    """
+    raw = payload.get("direction")
+    if raw is not None:
+        return require_paper_direction(raw)
+    declared = payload.get("direction_contract_version")
+    if declared is not None and int(declared) >= PAPER_DIRECTION_CONTRACT_VERSION:
+        raise ValueError(
+            "a direction-contract record must declare an explicit direction"
+        )
+    if int(payload.get("schema_version") or 0) != PAPER_EXECUTION_CONTRACT_SCHEMA_VERSION:
+        raise ValueError(
+            "a record with an unknown schema and no direction cannot be read as LONG"
+        )
+    return PAPER_DIRECTION_LONG
+
+
+#: The version at which ``direction`` became a required admission fact. Bumping
+#: the *event* schema is avoided so every historical event stays readable: this
+#: dedicated marker discriminates a new direction-aware record from a historical
+#: long-only one without reinterpreting old data.
+PAPER_DIRECTION_CONTRACT_VERSION = 2
+
+
+#: The "direction not supplied" sentinel. It is deliberately not a valid direction
+#: token, so a newly constructed admission that omits its direction fails closed in
+#: validation rather than silently becoming a LONG admission.
+_DIRECTION_UNSET = ""
+
+
+def _admission_request_fields() -> frozenset[str]:
+    """The exact field set a new admission request must carry."""
+    return _ADMISSION_REQUEST_FIELDS
+
+
 _ADMISSION_REQUEST_FIELDS = frozenset(
     {
         "schema_version",
@@ -416,12 +496,26 @@ _ADMISSION_REQUEST_FIELDS = frozenset(
         "portfolio_equity_limit",
         "portfolio_position_limit",
         "requested_reservation_amount",
+        "direction",
+        "direction_contract_version",
     }
+)
+
+#: Historical admission records predate the direction contract and carry exactly
+#: the original field set. They are readable, and are read as LONG under the
+#: narrow rule above; nothing is migrated or rewritten.
+_LEGACY_ADMISSION_REQUEST_FIELDS = frozenset(
+    _ADMISSION_REQUEST_FIELDS - {"direction", "direction_contract_version"}
 )
 
 _ADMISSION_RECORD_FIELDS = _ADMISSION_REQUEST_FIELDS | frozenset(
     {"guard_result", "observed_portfolio_version"}
 )
+
+_LEGACY_ADMISSION_RECORD_FIELDS = _ADMISSION_RECORD_FIELDS - {
+    "direction",
+    "direction_contract_version",
+}
 
 _QUOTE_EVIDENCE_FIELDS = frozenset(
     {
@@ -522,6 +616,14 @@ class PaperAdmissionRequest:
     portfolio_equity_limit: float
     portfolio_position_limit: int
     requested_reservation_amount: float
+    #: R4-B0 Decision 6: the admitted trade's direction. REQUIRED for every new
+    #: admission - it is the only authority for the ENTRY/EXIT side matrix, so an
+    #: omitted direction must fail closed rather than defaulting to LONG. The empty
+    #: sentinel is not a valid direction and is refused by validation; only
+    #: deserializing a historical pre-direction record supplies LONG, and it does so
+    #: explicitly.
+    direction: str = _DIRECTION_UNSET
+    direction_contract_version: int = PAPER_DIRECTION_CONTRACT_VERSION
     evaluation_population: str = EvaluationPopulation.QUALIFIED_INTENT.value
     engine: str = ENGINE_OPIP_PAPER_V2
     schema_version: int = PAPER_EXECUTION_CONTRACT_SCHEMA_VERSION
@@ -542,13 +644,16 @@ class PaperAdmissionRequest:
             "portfolio_equity_limit": self.portfolio_equity_limit,
             "portfolio_position_limit": self.portfolio_position_limit,
             "requested_reservation_amount": self.requested_reservation_amount,
+            "direction": self.direction,
+            "direction_contract_version": self.direction_contract_version,
         }
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "PaperAdmissionRequest":
-        if set(raw) != _ADMISSION_REQUEST_FIELDS:
-            missing = sorted(_ADMISSION_REQUEST_FIELDS - set(raw))
-            extra = sorted(set(raw) - _ADMISSION_REQUEST_FIELDS)
+        keys = set(raw)
+        if keys not in (_ADMISSION_REQUEST_FIELDS, _LEGACY_ADMISSION_REQUEST_FIELDS):
+            missing = sorted(_ADMISSION_REQUEST_FIELDS - keys)
+            extra = sorted(keys - _ADMISSION_REQUEST_FIELDS)
             details = []
             if missing:
                 details.append(_FIELD_MISSING_PREFIX + ",".join(missing))
@@ -570,6 +675,12 @@ class PaperAdmissionRequest:
             portfolio_equity_limit=raw["portfolio_equity_limit"],
             portfolio_position_limit=raw["portfolio_position_limit"],
             requested_reservation_amount=raw["requested_reservation_amount"],
+            # A historical record has no direction fields at all; the narrow rule
+            # reads it as LONG. A record that carries the marker must be explicit.
+            direction=paper_trade_direction_contract(raw),
+            direction_contract_version=int(
+                raw.get("direction_contract_version") or 1
+            ),
         )
         validate_admission_request(request)
         return request
@@ -658,6 +769,11 @@ def validate_admission_request(request: PaperAdmissionRequest) -> dict[str, Any]
             "portfolio_position_limit does not match the authoritative capital policy "
             f"{policy.policy_version} ({policy.portfolio_position_limit})"
         )
+    # R4-B0 Decision 6: direction is validated on every new admission. An omitted
+    # direction is the unset sentinel, which is not a valid token, so it fails
+    # closed here rather than being defaulted to LONG. Only deserializing a
+    # historical pre-direction record supplies LONG, and it does so explicitly.
+    require_paper_direction(request.direction)
 
     payload = request.as_dict()
     paper_trade_id, reservation_id = admission_result_identities(request.disposition_id)
@@ -675,12 +791,17 @@ def validate_admission_request(request: PaperAdmissionRequest) -> dict[str, Any]
 def validate_admission_request_record_payload(
     payload: Mapping[str, Any],
 ) -> dict[str, Any]:
-    if not isinstance(payload, Mapping) or set(payload) != _ADMISSION_RECORD_FIELDS:
+    keys = set(payload)
+    if not isinstance(payload, Mapping) or keys not in (
+        _ADMISSION_RECORD_FIELDS,
+        _LEGACY_ADMISSION_RECORD_FIELDS,
+    ):
         raise ValueError("invalid canonical admission request record fields")
 
     request_payload = {
         field_name: payload[field_name]
-        for field_name in _ADMISSION_REQUEST_FIELDS
+        for field_name in keys
+        if field_name not in {"guard_result", "observed_portfolio_version"}
     }
     request = PaperAdmissionRequest.from_dict(request_payload)
     guard_result = payload.get("guard_result")

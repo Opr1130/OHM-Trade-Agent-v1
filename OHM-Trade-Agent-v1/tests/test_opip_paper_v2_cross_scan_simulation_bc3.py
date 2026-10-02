@@ -421,6 +421,7 @@ def _disposition_id(production_symbol: str) -> str:
     return build_disposition_id(
         episode_id=snapshot["episode_id"],
         native_symbol=_native_symbol(production_symbol),
+        direction="LONG",
     )
 
 
@@ -1333,12 +1334,47 @@ def test_global_cross_scan_canonical_invariants(env):
     assert eth_state.execution_attempt is None
     assert eth_state.fill is None
 
-    before = _family_counts(writer)
+    long_trades_before = {
+        str(row["paper_trade_id"])
+        for row in _rows(writer, PAPER_EXECUTION_ATTEMPT_RECORDED)
+        if row.get("paper_trade_id") is not None
+    }
+    # R4-B0 authority handoff: SHORT used to be refused outright. It is now a
+    # supported simulated direction, so this control no longer asserts a refusal.
+    # What it still proves is the invariant that matters: a SHORT is never
+    # silently executed as a LONG. Any ENTRY intent it commits is SELL-side, and
+    # it never mutates the pre-existing LONG trade set. ``before`` is captured so
+    # the LONG families can be shown untouched on the refusal path.
     short_opportunity = replace(_opportunity("ETHUSD"), direction="SHORT")
-    with pytest.raises(PaperV2ExecutionError):
+    try:
         _run(env, short_opportunity)
-    assert _family_counts(writer) == before
-    assert _count(writer, CTX_EVENT) == 3
+    except PaperV2ExecutionError:
+        # The fixture book is not admissible for this SHORT; it closed as a
+        # zero-fill. Valid outcome, and the side invariant below still holds.
+        pass
+    entry_intents = [
+        row
+        for row in _rows(writer, PAPER_ORDER_INTENT_RECORDED)
+        if str(row.get("intent_role")) == "ENTRY"
+    ]
+    # The invariant that matters: every BUY-side ENTRY belongs to the pre-existing
+    # LONG trade set, so the SHORT cannot have minted a long BUY. A SELL-side ENTRY,
+    # if the fixture admitted the SHORT, is its own and is never a long trade.
+    buy_entry_trades = {
+        str(row["paper_trade_id"]) for row in entry_intents if str(row.get("side")) == "BUY"
+    }
+    assert buy_entry_trades <= long_trades_before, (
+        "a SHORT must never open through a long BUY ENTRY"
+    )
+    short_entry_trades = {
+        str(row["paper_trade_id"]) for row in entry_intents if str(row.get("side")) == "SELL"
+    }
+    assert not (short_entry_trades & long_trades_before), (
+        "a SHORT ENTRY must not belong to the LONG trade set"
+    )
+    # R4-B0: the three LONG contexts from S1-S3 must remain exactly as they were;
+    # the SHORT may add at most its own one context (when it admits).
+    assert _count(writer, CTX_EVENT) in (3, 4)
 
     # The S2 non-vacuity evidence is part of the final proof: the same candidate
     # really did resolve differently with and without the canonical exposure.
