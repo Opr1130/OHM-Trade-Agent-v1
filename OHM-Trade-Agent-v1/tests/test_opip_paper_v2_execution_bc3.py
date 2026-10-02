@@ -354,10 +354,31 @@ def test_protection_plan_uses_the_opportunity_geometry_and_policy(env):
 
 
 def test_disposition_identity_is_deterministic():
-    first = build_disposition_id(episode_id="e1", native_symbol="SOL/USD")
-    second = build_disposition_id(episode_id="e1", native_symbol="SOL/USD")
+    first = build_disposition_id(episode_id="e1", native_symbol="SOL/USD", direction="LONG")
+    second = build_disposition_id(episode_id="e1", native_symbol="SOL/USD", direction="LONG")
     assert first == second
-    assert first != build_disposition_id(episode_id="e2", native_symbol="SOL/USD")
+    assert first != build_disposition_id(
+        episode_id="e2", native_symbol="SOL/USD", direction="LONG"
+    )
+
+
+def test_disposition_identity_separates_opposite_directions():
+    """R4-B0: a LONG and a SHORT are different trades, so they cannot share an identity.
+
+    Regression: the identity previously omitted direction, so opposite-direction
+    opportunities for one episode and symbol collided and the second could not be
+    admitted independently.
+    """
+    long_id = build_disposition_id(
+        episode_id="e1", native_symbol="SOL/USD", direction="LONG"
+    )
+    short_id = build_disposition_id(
+        episode_id="e1", native_symbol="SOL/USD", direction="SHORT"
+    )
+    assert long_id != short_id
+    # An unknown direction is refused rather than silently folded into one identity.
+    with pytest.raises(ValueError):
+        build_disposition_id(episode_id="e1", native_symbol="SOL/USD", direction="FLAT")
 
 
 # ---------------------------------------------------------------------------

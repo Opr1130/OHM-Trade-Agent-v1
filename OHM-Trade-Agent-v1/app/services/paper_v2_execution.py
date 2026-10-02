@@ -81,6 +81,7 @@ from app.opip.contracts.paper_execution_runtime import (
     PaperAdmissionRequest,
     expected_paper_side,
     quote_evidence_idempotency_key,
+    require_paper_direction,
 )
 from app.opip.contracts.serialization import iso_z, stable_hash
 from app.opip.contracts.temporal import require_utc
@@ -206,19 +207,26 @@ class PaperV2ExecutionResult:
     detail: str | None = None
 
 
-def build_disposition_id(*, episode_id: str, native_symbol: str) -> str:
+def build_disposition_id(*, episode_id: str, native_symbol: str, direction: str) -> str:
     """Deterministic disposition identity for one qualified opportunity.
 
     Derived from canonical ancestry with the repository's existing ``stable_hash``
     convention, so a retry after restart reproduces the same identity rather than
     minting a new one - which is what keeps admission, its reservation and every
     downstream event idempotent.
+
+    R4-B0: the direction is part of the identity. A LONG and a SHORT on the same
+    episode and symbol are different trades with different economics, so they must
+    not share a disposition, trade or reservation identity. Restart still
+    reproduces the same identity because the direction is itself committed
+    ancestry, not ambient state.
     """
     return stable_hash(
         "PDISP",
         {
             "episode_id": str(episode_id),
             "native_symbol": str(native_symbol).upper(),
+            "direction": require_paper_direction(str(direction)),
             "engine": ENGINE_OPIP_PAPER_V2,
         },
     )
@@ -296,7 +304,9 @@ def run_paper_v2_opportunity(
     moment = require_utc(now, field_name="now")
 
     disposition_id = build_disposition_id(
-        episode_id=opportunity.episode_id, native_symbol=opportunity.native_symbol
+        episode_id=opportunity.episode_id,
+        native_symbol=opportunity.native_symbol,
+        direction=str(opportunity.direction),
     )
 
     # --- 0b. validate the snapshot before any canonical write --------------

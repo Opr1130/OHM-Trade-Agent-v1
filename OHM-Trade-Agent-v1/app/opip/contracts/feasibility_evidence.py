@@ -159,14 +159,13 @@ class FeasibilityEvidence:
             object.__setattr__(
                 self, name, _require_text(getattr(self, name), field_name=name)
             )
-        if not isinstance(self.direction, str) or self.direction not in (
-            SUPPORTED_EVIDENCE_DIRECTIONS
-        ):
-            # The producer emits exact uppercase tokens; a case-folded or unknown
-            # token is malformed and fails closed rather than being normalized.
-            raise FeasibilityEvidenceError(
-                "direction must be the exact token LONG or SHORT"
-            )
+        if not isinstance(self.direction, str):
+            raise FeasibilityEvidenceError("direction must be text")
+        # The exact LONG/SHORT token rule is enforced by F5 itself, at the frozen
+        # ordered position where it has always been applied. Validating it here
+        # would pre-empt the ordered checks and could turn a proven earlier VETO
+        # (for example a rejected market-data record) into a contract error. This
+        # record is a carrier; F5 remains the validating authority.
         object.__setattr__(
             self,
             "evaluation_time",
@@ -369,6 +368,11 @@ def feasibility_evidence_from_market_snapshot(
     supply typed evidence directly should not use this.
     """
     direction = getattr(snapshot, "trade_direction", None)
+    # The direction is carried verbatim when it is text; a non-text value becomes
+    # the empty token so F5's own ordered check rejects it in its original
+    # position rather than this adapter pre-empting a proven earlier veto.
+    if not isinstance(direction, str):
+        direction = ""
     venue = str(getattr(snapshot, "symbol", "") or "")
     resolved_venue = venue or str(getattr(snapshot, "primary_pair", "") or "")
     if not resolved_venue:

@@ -39,6 +39,7 @@ from app.opip.contracts.portfolio_paper_handoff import (
     build_execution_candidate_bridge,
     build_portfolio_paper_handoffs,
     derive_quantity,
+    geometry_entry_reference,
     require_reservation_covers_allocation,
 )
 from app.opip.execution_geometry import build_execution_geometry
@@ -83,7 +84,10 @@ def _geometry(*, direction: str = "LONG"):
     )
 
 
-def _lineage(**overrides) -> PaperExecutionLineage:
+def _lineage(geometry=None, **overrides) -> PaperExecutionLineage:
+    reference = (
+        geometry_entry_reference(geometry) if geometry is not None else 100.0
+    )
     payload = dict(
         snapshot_id="SNAP:" + "e" * 32,
         snapshot_cutoff=CUTOFF,
@@ -92,7 +96,8 @@ def _lineage(**overrides) -> PaperExecutionLineage:
         cohort_id="COHORT:1",
         native_symbol="SOL/USD",
         quote_currency="USD",
-        entry_reference=100.0,
+        # Bound to the exact geometry, so sizing cannot be moved by a caller.
+        entry_reference=reference,
         detector_claim_id="CLAIM:" + "f" * 32,
         decision_context_id="DCTX:" + "0" * 32,
     )
@@ -119,7 +124,7 @@ def _handoffs(decision, candidate, geometry, *, portfolio_version=None):
         decision,
         candidates={candidate.candidate_id: candidate},
         geometries={candidate.candidate_id: geometry},
-        lineages={candidate.episode_id: _lineage()},
+        lineages={candidate.episode_id: _lineage(geometry=geometry)},
         portfolio_version=(
             portfolio_version
             if portfolio_version is not None
@@ -217,9 +222,10 @@ def test_05_bridge_is_deterministic_and_preserves_lineage():
         candidate=candidate,
         allocation=decision.allocations[0],
         geometry=geometry,
-        lineage=_lineage(),
+        lineage=_lineage(geometry=geometry),
         portfolio_decision_id=str(decision.decision_id),
         portfolio_version=str(decision.reservation_plan.portfolio_version),
+        evaluation_time=decision.evaluation_time,
     )
     first = build_execution_candidate_bridge(**args)
     second = build_execution_candidate_bridge(**args)
@@ -247,17 +253,19 @@ def test_07_different_allocation_changes_the_identity():
         candidate=candidate,
         allocation=allocation,
         geometry=geometry,
-        lineage=_lineage(),
+        lineage=_lineage(geometry=geometry),
         portfolio_decision_id=str(decision.decision_id),
         portfolio_version="PV:r3f7",
+        evaluation_time=decision.evaluation_time,
     )
     changed = build_execution_candidate_bridge(
         candidate=candidate,
         allocation=other,
         geometry=geometry,
-        lineage=_lineage(),
+        lineage=_lineage(geometry=geometry),
         portfolio_decision_id=str(decision.decision_id),
         portfolio_version="PV:r3f7",
+        evaluation_time=decision.evaluation_time,
     )
     assert base.execution_candidate_id != changed.execution_candidate_id
 
@@ -272,9 +280,10 @@ def _bridge_args(decision, candidate, geometry):
         candidate=candidate,
         allocation=decision.allocations[0],
         geometry=geometry,
-        lineage=_lineage(),
+        lineage=_lineage(geometry=geometry),
         portfolio_decision_id=str(decision.decision_id),
         portfolio_version=str(decision.reservation_plan.portfolio_version),
+        evaluation_time=decision.evaluation_time,
     )
 
 
@@ -296,7 +305,7 @@ def test_08_episode_mismatch_fails_closed():
 def test_09_instrument_mismatch_fails_closed():
     decision, candidate, geometry = _selected_panel()
     args = _bridge_args(decision, candidate, geometry)
-    args["lineage"] = _lineage(instrument_version_id="INSTR:kraken:OTHER:USD:9")
+    args["lineage"] = _lineage(geometry=geometry, instrument_version_id="INSTR:kraken:OTHER:USD:9")
     with pytest.raises(PortfolioPaperHandoffError, match="instrument_version_id"):
         build_execution_candidate_bridge(**args)
 
@@ -304,7 +313,7 @@ def test_09_instrument_mismatch_fails_closed():
 def test_09b_venue_mismatch_fails_closed():
     decision, candidate, geometry = _selected_panel()
     args = _bridge_args(decision, candidate, geometry)
-    args["lineage"] = _lineage(venue_instrument_id="OTHERUSD")
+    args["lineage"] = _lineage(geometry=geometry, venue_instrument_id="OTHERUSD")
     with pytest.raises(PortfolioPaperHandoffError, match="venue_instrument_id"):
         build_execution_candidate_bridge(**args)
 
@@ -320,7 +329,7 @@ def test_10_direction_mismatch_fails_closed():
 def test_11_cutoff_mismatch_fails_closed():
     decision, candidate, geometry = _selected_panel()
     args = _bridge_args(decision, candidate, geometry)
-    args["lineage"] = _lineage(snapshot_cutoff=CUTOFF - timedelta(seconds=1))
+    args["lineage"] = _lineage(geometry=geometry, snapshot_cutoff=CUTOFF - timedelta(seconds=1))
     with pytest.raises(PortfolioPaperHandoffError, match="cutoff"):
         build_execution_candidate_bridge(**args)
 
@@ -369,7 +378,7 @@ def test_16_allocation_missing_from_candidates_fails_closed():
             decision,
             candidates={},
             geometries={candidate.candidate_id: geometry},
-            lineages={candidate.episode_id: _lineage()},
+            lineages={candidate.episode_id: _lineage(geometry=geometry)},
             portfolio_version=str(decision.reservation_plan.portfolio_version),
         )
 
@@ -381,7 +390,7 @@ def test_16b_allocation_missing_its_geometry_fails_closed():
             decision,
             candidates={candidate.candidate_id: candidate},
             geometries={},
-            lineages={candidate.episode_id: _lineage()},
+            lineages={candidate.episode_id: _lineage(geometry=geometry)},
             portfolio_version=str(decision.reservation_plan.portfolio_version),
         )
 
@@ -567,7 +576,7 @@ def test_short_allocation_bridges_with_short_direction():
             decision,
             candidates={candidate.candidate_id: candidate},
             geometries={candidate.candidate_id: geometry},
-            lineages={candidate.episode_id: _lineage()},
+            lineages={candidate.episode_id: _lineage(geometry=geometry)},
             portfolio_version="PV:r3f7",
         ) == ()
         return

@@ -368,6 +368,33 @@ class PortfolioPaperHandoff:
             raise PortfolioPaperHandoffError(
                 "quantity_derivation is not the declared rule"
             )
+        # Capital and quantity are internally consistent by construction, so a
+        # directly constructed handoff cannot carry zero capital, a fabricated
+        # quantity or an unbacked notional.
+        if self.allocated_capital <= 0 or self.entry_reference <= 0:
+            raise PortfolioPaperHandoffError(
+                "an actionable handoff requires positive capital and entry reference"
+            )
+        if abs(self.requested_reservation_amount - self.allocated_capital) > 1e-9:
+            raise PortfolioPaperHandoffError(
+                "requested_reservation_amount must equal the allocated capital"
+            )
+        expected_quantity = derive_quantity(
+            allocated_capital=self.allocated_capital,
+            entry_reference=self.entry_reference,
+        )
+        if abs(self.requested_quantity - expected_quantity) > 1e-9:
+            raise PortfolioPaperHandoffError(
+                "requested_quantity is not the declared derivation of the allocation"
+            )
+        if abs(self.requested_notional - self.requested_quantity * self.entry_reference) > 1e-9:
+            raise PortfolioPaperHandoffError(
+                "requested_notional must equal quantity times the entry reference"
+            )
+        if self.requested_notional > self.allocated_capital + 1e-9:
+            raise PortfolioPaperHandoffError(
+                "requested_notional exceeds the allocated capital"
+            )
         # The bridged execution candidate must be the one this handoff names, and
         # the bridge must describe this handoff's own lineage.
         if self.bridge.execution_candidate_id != self.execution_candidate_id:
@@ -511,6 +538,23 @@ def derive_quantity(*, allocated_capital: float, entry_reference: float) -> floa
     return math.floor((capital / reference) * factor) / factor
 
 
+def _normalize_symbol(value: Any) -> str:
+    """Comparable instrument token: uppercase alphanumerics only."""
+    return "".join(ch for ch in str(value or "").upper() if ch.isalnum())
+
+
+def geometry_entry_reference(geometry: Any) -> float:
+    """The geometry's own entry reference: the midpoint of its entry band.
+
+    This is the one authoritative sizing price. Quantity is derived from it, never
+    from a caller-supplied number, so a substituted reference cannot inflate the
+    paper exposure a handoff describes.
+    """
+    low = float(geometry.entry_low)
+    high = float(geometry.entry_high)
+    return (low + high) / 2
+
+
 def build_execution_candidate_bridge(
     *,
     candidate: Any,
@@ -519,13 +563,20 @@ def build_execution_candidate_bridge(
     lineage: PaperExecutionLineage,
     portfolio_decision_id: str,
     portfolio_version: str,
+    evaluation_time: datetime,
 ) -> ExecutionCandidateBridge:
     """Build the deterministic bridge for one selected allocation.
 
     Every cross-link is validated before the bridge is minted, so a mismatch in
-    episode, instrument, direction, cutoff, feasibility, forecast, geometry or
-    portfolio version fails closed rather than being bridged.
+    episode, instrument, venue, symbol, direction, cutoff, feasibility, forecast,
+    geometry or portfolio version fails closed rather than being bridged.
+
+    ``evaluation_time`` is the F7 decision's own instant. The lineage cutoff, the
+    geometry cutoff and the geometry's evidence fingerprint must all belong to that
+    observed epoch: evidence dated after the decision is look-ahead and is refused
+    (OWNER Decision 8).
     """
+    instant = _require_utc(evaluation_time, field_name="evaluation_time")
     if candidate.episode_id != allocation.episode_id:
         raise PortfolioPaperHandoffError(
             "allocation episode does not match the candidate episode"
@@ -534,9 +585,18 @@ def build_execution_candidate_bridge(
         raise PortfolioPaperHandoffError(
             "allocation direction does not match the candidate direction"
         )
-    if lineage.snapshot_cutoff > allocation_decision_time(allocation, lineage):
+    # Causality: evidence must not post-date the F7 decision that selected it.
+    if lineage.snapshot_cutoff > instant:
         raise PortfolioPaperHandoffError(
-            "lineage snapshot_cutoff is later than the evaluation instant"
+            "lineage snapshot_cutoff is later than the F7 evaluation instant"
+        )
+    if geometry.source_cutoff > instant:
+        raise PortfolioPaperHandoffError(
+            "geometry source_cutoff is later than the F7 evaluation instant"
+        )
+    if geometry.source_cutoff != lineage.snapshot_cutoff:
+        raise PortfolioPaperHandoffError(
+            "geometry source_cutoff does not match the declared snapshot cutoff"
         )
     if geometry.instrument_version_id != lineage.instrument_version_id:
         raise PortfolioPaperHandoffError(
@@ -550,13 +610,31 @@ def build_execution_candidate_bridge(
         raise PortfolioPaperHandoffError(
             "geometry direction does not match the candidate direction"
         )
-    if geometry.source_cutoff != lineage.snapshot_cutoff:
+    # Instrument binding: the geometry, the candidate and the declared lineage must
+    # all name the same instrument, so another market's geometry cannot bridge here.
+    if _normalize_symbol(geometry.symbol) != _normalize_symbol(lineage.native_symbol):
         raise PortfolioPaperHandoffError(
-            "geometry source_cutoff does not match the declared snapshot cutoff"
+            "geometry symbol does not match the declared lineage native symbol"
+        )
+    if _normalize_symbol(candidate.symbol) != _normalize_symbol(lineage.native_symbol):
+        raise PortfolioPaperHandoffError(
+            "candidate symbol does not match the declared lineage native symbol"
+        )
+    # A geometry that is not actionable (an explicit WAIT, or the invalid sentinel)
+    # must never become an execution candidate.
+    if not bool(getattr(geometry, "is_actionable", False)):
+        raise PortfolioPaperHandoffError(
+            "the execution geometry is not actionable; a wait is not an entry"
         )
     if candidate.forecast is None:
         raise PortfolioPaperHandoffError(
             "a selected candidate must carry a forecast before it can be bridged"
+        )
+    # Sizing is bound to the exact geometry, not to a caller-supplied number.
+    reference = geometry_entry_reference(geometry)
+    if abs(float(lineage.entry_reference) - reference) > 1e-9:
+        raise PortfolioPaperHandoffError(
+            "lineage entry_reference does not match the geometry entry reference"
         )
     # The F7 candidate's own stop risk must correspond to the exact geometry.
     _require_stop_fraction_matches_geometry(candidate, geometry)
@@ -594,15 +672,6 @@ def build_execution_candidate_bridge(
         allocation_id=str(allocation.allocation_id),
         portfolio_version=portfolio_version,
     )
-
-
-def allocation_decision_time(allocation: Any, lineage: PaperExecutionLineage) -> datetime:
-    """The evaluation instant a handoff is stamped with, taken from the lineage.
-
-    Kept as a named function so the causality check above and the handoff builder
-    agree on one definition rather than reading two clocks.
-    """
-    return lineage.snapshot_cutoff
 
 
 def _require_stop_fraction_matches_geometry(candidate: Any, geometry: Any) -> None:
@@ -714,11 +783,14 @@ def build_portfolio_paper_handoffs(
             lineage=lineage,
             portfolio_decision_id=str(decision.decision_id),
             portfolio_version=portfolio_version,
+            evaluation_time=decision.evaluation_time,
         )
+        # Sizing is bound to the geometry, not to a caller-supplied number.
+        entry_reference = geometry_entry_reference(geometry)
         quantity = derive_quantity(
-            allocated_capital=allocated, entry_reference=lineage.entry_reference
+            allocated_capital=allocated, entry_reference=entry_reference
         )
-        notional = quantity * lineage.entry_reference
+        notional = quantity * entry_reference
         if notional > allocated + 1e-9:
             raise PortfolioPaperHandoffError(
                 "derived notional exceeds the selected allocation"
@@ -748,7 +820,7 @@ def build_portfolio_paper_handoffs(
                 requested_notional=notional,
                 requested_quantity=quantity,
                 quantity_derivation=QUANTITY_DERIVATION_ALLOCATED_CAPITAL_OVER_ENTRY_REFERENCE,
-                entry_reference=lineage.entry_reference,
+                entry_reference=entry_reference,
                 portfolio_version=portfolio_version,
                 panel_fingerprint=str(decision.panel_fingerprint or ""),
                 capital_state_fingerprint=str(decision.capital_state_fingerprint or ""),

@@ -469,6 +469,12 @@ def paper_trade_direction_contract(payload: Mapping[str, Any]) -> str:
 PAPER_DIRECTION_CONTRACT_VERSION = 2
 
 
+#: The "direction not supplied" sentinel. It is deliberately not a valid direction
+#: token, so a newly constructed admission that omits its direction fails closed in
+#: validation rather than silently becoming a LONG admission.
+_DIRECTION_UNSET = ""
+
+
 def _admission_request_fields() -> frozenset[str]:
     """The exact field set a new admission request must carry."""
     return _ADMISSION_REQUEST_FIELDS
@@ -610,9 +616,13 @@ class PaperAdmissionRequest:
     portfolio_equity_limit: float
     portfolio_position_limit: int
     requested_reservation_amount: float
-    #: R4-B0 Decision 6: the admitted trade's direction. Required for every new
-    #: admission; it is the only authority for the ENTRY/EXIT side matrix.
-    direction: str = PAPER_DIRECTION_LONG
+    #: R4-B0 Decision 6: the admitted trade's direction. REQUIRED for every new
+    #: admission - it is the only authority for the ENTRY/EXIT side matrix, so an
+    #: omitted direction must fail closed rather than defaulting to LONG. The empty
+    #: sentinel is not a valid direction and is refused by validation; only
+    #: deserializing a historical pre-direction record supplies LONG, and it does so
+    #: explicitly.
+    direction: str = _DIRECTION_UNSET
     direction_contract_version: int = PAPER_DIRECTION_CONTRACT_VERSION
     evaluation_population: str = EvaluationPopulation.QUALIFIED_INTENT.value
     engine: str = ENGINE_OPIP_PAPER_V2
@@ -759,15 +769,11 @@ def validate_admission_request(request: PaperAdmissionRequest) -> dict[str, Any]
             "portfolio_position_limit does not match the authoritative capital policy "
             f"{policy.policy_version} ({policy.portfolio_position_limit})"
         )
-    # R4-B0 Decision 6: direction is validated on every new admission, so a record
-    # missing it can only be historical (the writer refuses to persist one).
+    # R4-B0 Decision 6: direction is validated on every new admission. An omitted
+    # direction is the unset sentinel, which is not a valid token, so it fails
+    # closed here rather than being defaulted to LONG. Only deserializing a
+    # historical pre-direction record supplies LONG, and it does so explicitly.
     require_paper_direction(request.direction)
-    if (
-        int(request.direction_contract_version)
-        >= PAPER_DIRECTION_CONTRACT_VERSION
-        and not isinstance(request.direction, str)
-    ):
-        raise ValueError("a direction-contract admission must declare its direction")
 
     payload = request.as_dict()
     paper_trade_id, reservation_id = admission_result_identities(request.disposition_id)

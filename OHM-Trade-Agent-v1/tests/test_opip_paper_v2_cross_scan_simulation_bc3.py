@@ -421,6 +421,7 @@ def _disposition_id(production_symbol: str) -> str:
     return build_disposition_id(
         episode_id=snapshot["episode_id"],
         native_symbol=_native_symbol(production_symbol),
+        direction="LONG",
     )
 
 

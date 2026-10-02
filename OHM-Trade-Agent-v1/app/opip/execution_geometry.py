@@ -410,6 +410,7 @@ def build_execution_geometry(
             "reward_to_risk_2": kernel.reward_to_risk_2,
             "risk_level": kernel.risk_level,
             "stop_loss_fraction": kernel.stop_loss_fraction,
+            "reason": kernel.reason,
         },
     )
     return ExecutionGeometry(

@@ -288,6 +288,10 @@ ACCEPTED_EVENT_TYPES = (
 )
 
 
+#: The admission format marker excluded from idempotency payload comparison.
+_DIRECTION_CONTRACT_VERSION_FIELD = "direction_contract_version"
+
+
 def _exit_executable_price(quote: Mapping[str, object], *, exit_side: str) -> float:
     """The executable price for an EXIT on the committed book.
 
@@ -889,13 +893,29 @@ class CanonicalWriter:
             )
 
         stored_request = {key: stored.get(key) for key in request_payload}
+        # R4-B0: ``direction_contract_version`` is a format marker, not a semantic
+        # fact. A historical admission persisted before the direction contract
+        # deserializes with version 1, while the retried request carries version 2;
+        # comparing the marker would reject an exact replay and strand an admitted
+        # trade. The semantic fact - ``direction`` - is still compared, and for a
+        # legacy record it is LONG, which equals a new LONG request.
+        expected_payload = {
+            key: value
+            for key, value in dict(request_payload).items()
+            if key != _DIRECTION_CONTRACT_VERSION_FIELD
+        }
+        stored_payload = {
+            key: value
+            for key, value in stored_request.items()
+            if key != _DIRECTION_CONTRACT_VERSION_FIELD
+        }
         expected_json = json.dumps(
-            dict(request_payload),
+            expected_payload,
             separators=(",", ":"),
             sort_keys=True,
         )
         stored_json = json.dumps(
-            stored_request,
+            stored_payload,
             separators=(",", ":"),
             sort_keys=True,
         )

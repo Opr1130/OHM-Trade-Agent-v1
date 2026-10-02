@@ -323,6 +323,10 @@ def execution_geometry_identity(geometry: ExecutionGeometry) -> str:
         "reward_to_risk_2": geometry.reward_to_risk_2,
         "risk_level": geometry.risk_level,
         "stop_loss_fraction": geometry.stop_loss_fraction,
+        # ``reason`` is a required, serialized field, so it participates in the
+        # identity: otherwise a record could change its stated reason while keeping
+        # the original geometry_id, and a tampered record would validate.
+        "reason": geometry.reason,
     }
     return stable_hash(EXECUTION_GEOMETRY_ID_PREFIX, payload)
 

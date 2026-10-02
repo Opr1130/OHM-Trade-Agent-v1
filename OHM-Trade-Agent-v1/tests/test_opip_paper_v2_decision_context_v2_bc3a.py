@@ -472,6 +472,7 @@ def _admission(*, disposition_id: str, context_id: str):
         portfolio_equity_limit=10_000.0,
         portfolio_position_limit=3,
         requested_reservation_amount=500.0,
+        direction="LONG",
     )
 
 
