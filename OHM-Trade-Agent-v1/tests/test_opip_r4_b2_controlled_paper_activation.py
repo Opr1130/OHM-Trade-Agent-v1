@@ -349,3 +349,48 @@ def test_ac_013_resume_requires_authorized_gate():
     from app.services.system_incidents import requires_owner_recovery_cycles  # owner exists
 
     assert callable(requires_owner_recovery_cycles)
+
+
+def test_ac_014_target_route_supports_long_and_short():
+    """ATDD-R4-B2-controlled-paper-activation/AC-014: the target route supports LONG and SHORT and the readiness probe reports both covered with no SHORT_AUTHORITY_MISSING, resolving the blocker by implemented authority."""
+    import app.services.paper_v2_scan_router as router
+    import app.services.paper_v2_cutover_readiness as readiness
+
+    assert router.SUPPORTED_DIRECTIONS == frozenset({"LONG", "SHORT"})
+    coverage = readiness.observe_direction_coverage()
+    assert coverage.long_covered is True
+    assert coverage.short_covered is True
+    assert coverage.reason_code is None
+
+    # The historical R4-F8 fact is preserved, not deleted.
+    r4f8 = (SCOPE_CONTRACTS / "ATDD-R4-F8-paper-v2-cutover-readiness.md").read_text(
+        encoding="utf-8"
+    )
+    assert "SHORT_AUTHORITY_MISSING" in r4f8
+
+
+def test_ac_014_short_direction_mechanics_and_identity():
+    """ATDD-R4-B2-controlled-paper-activation/AC-014: SHORT uses SELL entry / BUY cover, a direction-distinct disposition identity, and the reused R4-B0 PCAND -> OPIPC bridge (not duplicated)."""
+    from app.opip.contracts.paper_execution_runtime import expected_paper_side
+    from app.opip.contracts.portfolio_paper_handoff import (
+        build_portfolio_paper_handoffs,
+        derive_execution_candidate_id,
+    )
+    import app.services.paper_v2_execution as producer
+
+    assert expected_paper_side("SHORT", "ENTRY") == "SELL"
+    assert expected_paper_side("SHORT", "EXIT") == "BUY"
+    assert expected_paper_side("LONG", "ENTRY") == "BUY"
+    assert expected_paper_side("LONG", "EXIT") == "SELL"
+
+    long_id = producer.build_disposition_id(
+        episode_id="EP:1", native_symbol="SOLUSD", direction="LONG"
+    )
+    short_id = producer.build_disposition_id(
+        episode_id="EP:1", native_symbol="SOLUSD", direction="SHORT"
+    )
+    assert long_id != short_id
+
+    # The existing R4-B0 bridge is reused, not reimplemented.
+    assert callable(derive_execution_candidate_id)
+    assert callable(build_portfolio_paper_handoffs)

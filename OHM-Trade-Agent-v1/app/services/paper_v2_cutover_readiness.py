@@ -622,28 +622,32 @@ def observe_universe_gate_evidence(
 def observe_direction_coverage() -> DirectionCoverage:
     """Report the authoritative direction coverage from the frozen router contract."""
     try:
-        from app.services.paper_v2_scan_router import SUPPORTED_DIRECTION
+        from app.services.paper_v2_scan_router import SUPPORTED_DIRECTIONS
 
-        long_covered = str(SUPPORTED_DIRECTION).upper() == "LONG"
+        supported = {str(item).upper() for item in SUPPORTED_DIRECTIONS}
     except Exception:  # noqa: BLE001 - an unreadable contract is not coverage
         return DirectionCoverage(
             long_covered=False,
             short_covered=False,
             reason_code=REASON_LONG_AUTHORITY_MISSING,
         )
-    # The frozen slice is long-only: there is no short engine, and a SHORT is
-    # refused rather than mapped onto a BUY. Full cutover therefore remains blocked
-    # on short authority until a future increment supplies it or an owner ratifies a
-    # long-only mandate. When even LONG is not covered the gap is larger still, so the
-    # reason names the missing long authority instead of claiming no gap.
+    # R4-B2 (owner SHORT mandate): the target route supports simulated SHORT as
+    # well as LONG. Coverage is derived from the router's supported set, so the
+    # gap closes only when the authority is genuinely implemented - never by
+    # suppressing the blocker. When even LONG is not covered the gap is larger, so
+    # the reason names the missing long authority instead of claiming no gap.
+    long_covered = "LONG" in supported
+    short_covered = "SHORT" in supported
+    if long_covered and short_covered:
+        reason_code = None
+    elif long_covered:
+        reason_code = REASON_SHORT_AUTHORITY_MISSING
+    else:
+        reason_code = REASON_LONG_AUTHORITY_MISSING
     return DirectionCoverage(
         long_covered=long_covered,
-        short_covered=False,
-        reason_code=(
-            REASON_SHORT_AUTHORITY_MISSING
-            if long_covered
-            else REASON_LONG_AUTHORITY_MISSING
-        ),
+        short_covered=short_covered,
+        reason_code=reason_code,
     )
 
 

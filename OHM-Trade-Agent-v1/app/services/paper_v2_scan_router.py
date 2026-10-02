@@ -36,9 +36,11 @@ What this router derives, and from where
   snapshot's own reference price, not from an earlier economic envelope and not
   from a later quote.
 
-Out of scope by construction: no pending-entry state machine, so a LONG that is
-not immediately actionable is a WAIT rather than an immediate BUY; and no short
-engine, so a SHORT is refused rather than mapped onto a BUY.
+Out of scope by construction: no pending-entry state machine, so an opportunity that
+is not immediately actionable is a WAIT rather than an immediate entry. Simulated
+SHORT is supported (R4-B2 owner mandate) using the direction-aware producer: a
+LONG opens a BUY and a SHORT opens a SELL, and an unsupported direction is refused
+rather than mapped onto another direction.
 """
 
 from __future__ import annotations
@@ -58,6 +60,7 @@ from app.services.canonical_episode_capture import build_canonical_episode_snaps
 from app.services.paper_v2_pretrade_adapter import system_utc_clock
 from app.services.paper_v2_execution import (
     OPPORTUNITY_DIRECTION_LONG,
+    OPPORTUNITY_DIRECTION_SHORT,
     PaperV2ExecutionError,
     PaperV2Opportunity,
     run_paper_v2_opportunity,
@@ -67,15 +70,20 @@ from app.services.paper_v2_execution import (
 #: decision snapshot semantics identical to the existing native capture.
 PAPER_V2_SCAN_SOURCE = "LIVE_OPPORTUNITY_SCAN"
 
-#: The only direction this slice can execute. Kept as its own name so the
-#: router's boundary is legible without importing producer internals.
-SUPPORTED_DIRECTION = OPPORTUNITY_DIRECTION_LONG
+#: The directions this slice can authoritatively paper. R4-B2 (owner SHORT
+#: mandate) extends the original long-only slice to include simulated SHORT, which
+#: the producer, protection runtime and canonical writer already support
+#: direction-aware. A direction outside this set is refused rather than mapped
+#: onto another direction.
+SUPPORTED_DIRECTIONS = frozenset(
+    {OPPORTUNITY_DIRECTION_LONG, OPPORTUNITY_DIRECTION_SHORT}
+)
 
 #: The candidate domain the funnel mints. A candidate id outside it is not the
 #: qualified candidate identity.
 CANDIDATE_ID_PREFIX = "OPIPC:"
 
-#: Tolerance for the long-spot leverage-consistency check. The action gate rounds
+#: Tolerance for the 1x leverage-consistency check. The action gate rounds
 #: the notional to cents, so a matched 1x position may differ by less than a cent.
 _NOTIONAL_CONSISTENCY_TOLERANCE = 0.011
 
@@ -136,7 +144,7 @@ class PaperV2RouterSummary:
     executed: int = 0
     capital_rejected: int = 0
     capacity_rejected: int = 0
-    short_unsupported: int = 0
+    unsupported_direction: int = 0
     wait_not_executable: int = 0
     handoff_failures: int = 0
     operational_failures: int = 0
@@ -270,11 +278,11 @@ def _route_one(
     symbol = str(snapshot.symbol)
     direction = str(getattr(snapshot, "trade_direction", "") or "LONG").upper()
 
-    if direction != SUPPORTED_DIRECTION:
-        # No short engine exists in this slice. Recorded explicitly; never mapped
-        # onto a BUY, and never routed to a legacy paper authority.
-        summary.short_unsupported += 1
-        summary.record(f"SHORT_UNSUPPORTED {symbol}")
+    if direction not in SUPPORTED_DIRECTIONS:
+        # Only LONG and SHORT are modelled. Any other direction is refused rather
+        # than mapped onto a side, and never routed to a legacy paper authority.
+        summary.unsupported_direction += 1
+        summary.record(f"UNSUPPORTED_DIRECTION {symbol} {direction}")
         return
 
     if not bool(plan.valid_now):
@@ -319,17 +327,39 @@ def _route_one(
     requested_capital = _positive_finite(
         alert.get("recommended_capital"), field_name="recommended_capital"
     )
-    requested_notional = _positive_finite(
+    # The target Paper-v2 route is a 1x simulated execution and must NOT import the
+    # legacy margin leverage the upstream alert carries. The action gate sizes the
+    # position as ``recommended_position_notional = recommended_capital * leverage``,
+    # and a simulated SHORT carries a leverage of 2.0, so a real SHORT alert reports
+    # a notional of twice the approved capital. Applying that here would (a) import
+    # leverage the paper route forbids and (b) exceed the capital the canonical
+    # writer bounds the entry intent against. The approved capital IS the 1x notional
+    # and the quantity basis; the route defines its own unleveraged sizing.
+    upstream_notional = _positive_finite(
         alert.get("recommended_position_notional"),
         field_name="recommended_position_notional",
     )
-    if abs(requested_notional - requested_capital) > _NOTIONAL_CONSISTENCY_TOLERANCE:
-        # Long spot is 1x. A disagreement means leverage would be implied, which
-        # this slice must not silently apply.
-        raise PaperV2HandoffError(
-            "recommended position notional and recommended capital disagree for a "
-            "long spot trade"
-        )
+    if direction == OPPORTUNITY_DIRECTION_SHORT:
+        # A simulated SHORT carries a 2x margin notional upstream: the action gate
+        # sizes ``notional = capital * leverage`` and SHORT validation leverage is
+        # 2.0. The target route is 1x, so a leverage multiple is normalized away,
+        # never applied; only a notional *below* the approved capital is inconsistent
+        # and fails closed.
+        if upstream_notional < requested_capital - _NOTIONAL_CONSISTENCY_TOLERANCE:
+            raise PaperV2HandoffError(
+                "recommended position notional is below the approved capital for a "
+                "1x simulated trade"
+            )
+    else:
+        # A LONG is unleveraged: the upstream notional must equal the approved
+        # capital. Any disagreement would imply leverage this route forbids, so it
+        # fails closed rather than being silently normalized.
+        if abs(upstream_notional - requested_capital) > _NOTIONAL_CONSISTENCY_TOLERANCE:
+            raise PaperV2HandoffError(
+                "recommended position notional and recommended capital disagree for a "
+                "1x simulated trade"
+            )
+    requested_notional = requested_capital
     reference_price = _positive_finite(
         snapshot_payload.get("reference_price"),
         field_name="canonical snapshot reference_price",

@@ -130,7 +130,8 @@ PAPER_ACTION_ARMED_STATES = frozenset(
     {ProtectionState.ACTIVE, ProtectionState.DEGRADED}
 )
 
-#: The only side that reduces the long-only exposure modelled by this slice.
+#: The side that reduces a LONG target exposure. (Direction-aware EXIT sides are
+#: derived by ``expected_paper_side``; this constant is retained for compatibility.)
 PAPER_ACTION_EXIT_SIDE = "SELL"
 
 #: Permitted protection-state transitions. Any transition not listed here is

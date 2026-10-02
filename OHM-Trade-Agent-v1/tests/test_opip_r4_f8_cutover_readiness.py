@@ -506,22 +506,22 @@ def test_ac_005_universe_metadata_gate_fails_closed():
 # ===========================================================================
 
 
-def test_ac_006_short_has_no_authoritative_engine():
-    """ATDD-R4-F8-paper-v2-cutover-readiness/AC-006: SHORT coverage is absent and blocks full cutover."""
+def test_ac_006_direction_coverage_reflects_router_authority():
+    """ATDD-R4-F8-paper-v2-cutover-readiness/AC-006: direction coverage is derived from the target route's supported directions. At R4-F8 the route was long-only; R4-B2 supplied genuine SHORT authority (owner mandate), so both directions now report covered with no gap."""
     coverage = readiness.observe_direction_coverage()
     assert coverage.long_covered is True
-    assert coverage.short_covered is False
-    assert coverage.reason_code == readiness.REASON_SHORT_AUTHORITY_MISSING
+    assert coverage.short_covered is True
+    assert coverage.reason_code is None
 
     report = readiness.evaluate_cutover_readiness(_healthy_evidence(direction=coverage))
-    assert readiness.REASON_SHORT_AUTHORITY_MISSING in report.reason_codes
-    assert report.overall == readiness.READINESS_NOT_READY
+    assert readiness.REASON_SHORT_AUTHORITY_MISSING not in report.reason_codes
+    assert report.overall == readiness.READINESS_READY
 
 
 def test_ac_006_long_coverage_gap_is_reported(monkeypatch):
     """ATDD-R4-F8-paper-v2-cutover-readiness/AC-006: a missing LONG coverage is named, never reported as no gap."""
     monkeypatch.setattr(
-        "app.services.paper_v2_scan_router.SUPPORTED_DIRECTION", "SHORT"
+        "app.services.paper_v2_scan_router.SUPPORTED_DIRECTIONS", frozenset({"SHORT"})
     )
     coverage = readiness.observe_direction_coverage()
     assert coverage.long_covered is False
@@ -689,13 +689,24 @@ def test_ac_011_verdict_ready_when_all_technical_gates_pass():
     assert report.ready is True
 
 
-def test_ac_011_verdict_not_ready_when_short_authority_missing():
-    """ATDD-R4-F8-paper-v2-cutover-readiness/AC-011: the SHORT gap is the explicit blocker."""
+def test_ac_011_verdict_reflects_direction_coverage(monkeypatch):
+    """ATDD-R4-F8-paper-v2-cutover-readiness/AC-011: complete direction coverage permits READY, and a route missing a direction is NOT_READY with the named reason."""
+    # The target route now supports LONG and SHORT: coverage complete, READY.
     report = readiness.evaluate_cutover_readiness(
         _healthy_evidence(direction=readiness.observe_direction_coverage())
     )
-    assert report.overall == readiness.READINESS_NOT_READY
-    assert report.reason_codes == (readiness.REASON_SHORT_AUTHORITY_MISSING,)
+    assert report.overall == readiness.READINESS_READY
+    assert report.reason_codes == ()
+
+    # A route missing LONG is NOT_READY with the named missing-authority reason.
+    monkeypatch.setattr(
+        "app.services.paper_v2_scan_router.SUPPORTED_DIRECTIONS", frozenset({"SHORT"})
+    )
+    blocked = readiness.evaluate_cutover_readiness(
+        _healthy_evidence(direction=readiness.observe_direction_coverage())
+    )
+    assert blocked.overall == readiness.READINESS_NOT_READY
+    assert readiness.REASON_LONG_AUTHORITY_MISSING in blocked.reason_codes
 
 
 def test_ac_011_unreadable_evidence_fails_closed():

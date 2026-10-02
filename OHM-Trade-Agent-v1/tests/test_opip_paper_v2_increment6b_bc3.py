@@ -141,7 +141,25 @@ def _universe_asset(
     )
 
 
-def _plan(*, valid_now: bool = True, stop: float = 90.0) -> EntryExitPlan:
+def _plan(*, valid_now: bool = True, stop: float = 90.0, direction: str = "LONG") -> EntryExitPlan:
+    if str(direction).upper() == "SHORT":
+        # R4-B2: a SHORT plan stops ABOVE the entry and targets DESCEND below it.
+        return EntryExitPlan(
+            symbol="SOLUSD",
+            valid_now=valid_now,
+            entry_style="MARKET",
+            entry_low=99.0,
+            entry_high=101.0,
+            chase_limit=98.0,
+            stop_price=110.0,
+            target_1=90.0,
+            target_2=80.0,
+            reward_to_risk_1=1.0,
+            reward_to_risk_2=2.0,
+            risk_level="MEDIUM",
+            reason="qualified",
+            direction="SHORT",
+        )
     return EntryExitPlan(
         symbol="SOLUSD",
         valid_now=valid_now,
@@ -210,7 +228,9 @@ def _ranked(
         "recommended_position_notional": notional,
         "signal_id": "OHM:signal-should-not-be-used",
     }
-    opportunity = SimpleNamespace(alert=alert, snapshot=snapshot, plan=_plan(valid_now=valid_now))
+    opportunity = SimpleNamespace(
+        alert=alert, snapshot=snapshot, plan=_plan(valid_now=valid_now, direction=direction)
+    )
     state = SimpleNamespace(
         candidate_id=candidate_id
         or f"OPIPC:{symbol_pseudo_hash(symbol)}",
@@ -493,8 +513,37 @@ def test_requested_quantity_derives_from_the_snapshot_reference_price(writer_env
     assert order["requested_quantity"] == pytest.approx(2.5)
 
 
-def test_leverage_inconsistency_fails_closed(writer_env):
-    """A notional that disagrees with capital would imply leverage."""
+def test_short_notional_below_capital_fails_closed(writer_env):
+    """A SHORT notional below the approved capital cannot be explained by leverage
+    and fails closed rather than upsizing a position."""
+    server, client = writer_env
+    observations = [_observation()]
+    ranked, state = _ranked(
+        observations=observations,
+        decision_at=NOW,
+        direction="SHORT",
+        capital=500.0,
+        notional=100.0,
+    )
+    opip = SimpleNamespace(funnel=_Funnel({("SOLUSD", "SHORT"): state}))
+
+    summary = _route(
+        [ranked],
+        observations=observations,
+        client=client,
+        kraken=KrakenClient(transport=_EchoTransport(requests=[])),
+        registry=_registry(),
+        opip=opip,
+    )
+
+    assert summary.executed == 0
+    assert summary.handoff_failures == 1
+    assert _rows(server.writer, CTX_EVENT) == []
+
+
+def test_leveraged_long_fails_closed(writer_env):
+    """A LONG is unleveraged on the target route: an upstream leverage-scaled (2x)
+    long notional fails closed rather than being silently normalized."""
     server, client = writer_env
     observations = [_observation()]
     ranked, state = _ranked(
@@ -514,6 +563,45 @@ def test_leverage_inconsistency_fails_closed(writer_env):
     assert summary.executed == 0
     assert summary.handoff_failures == 1
     assert _rows(server.writer, CTX_EVENT) == []
+
+
+@pytest.mark.acceptance
+def test_short_2x_alert_executes_at_1x_with_sell_entry(writer_env):
+    """ATDD-R4-B2-controlled-paper-activation/AC-014: a real SHORT alert carries a
+    2x margin notional (SHORT_VALIDATION_LEVERAGE); the target route sizes it at 1x
+    and opens a SELL entry, so SHORT is genuinely executable end to end."""
+    server, client = writer_env
+    observations = [_observation()]
+    ranked, state = _ranked(
+        observations=observations,
+        decision_at=NOW,
+        direction="SHORT",
+        capital=500.0,
+        notional=1_000.0,
+    )
+    opip = SimpleNamespace(funnel=_Funnel({("SOLUSD", "SHORT"): state}))
+
+    summary = _route(
+        [ranked],
+        observations=observations,
+        client=client,
+        kraken=KrakenClient(transport=_EchoTransport(requests=[])),
+        registry=_registry(),
+        opip=opip,
+    )
+
+    assert summary.executed == 1
+    assert summary.handoff_failures == 0
+    assert summary.unsupported_direction == 0
+    entry = [
+        row
+        for row in _rows(server.writer, "paper_execution.order_intent.recorded")
+        if row.get("intent_role") == "ENTRY"
+    ]
+    assert entry, "a SHORT must open an ENTRY order intent"
+    assert entry[0]["side"] == "SELL"
+    # 1x: the approved capital, not the 2x upstream margin notional.
+    assert entry[0]["requested_notional"] == pytest.approx(500.0)
 
 
 @pytest.mark.parametrize("capital", [0.0, -1.0, float("nan"), "500", None])
@@ -862,7 +950,10 @@ def test_snapshot_episode_must_match_the_funnel_episode(writer_env):
 # ---------------------------------------------------------------------------
 
 
-def test_short_is_never_routed_and_is_counted_explicitly(writer_env):
+def test_short_is_routed_to_paper_v2(writer_env):
+    """R4-B2 authority handoff (replaces the R4-A long-only refusal): SHORT is now
+    a supported target-route direction and is routed to the Paper-v2 producer with
+    a SELL entry, exactly like a LONG is routed with a BUY entry."""
     server, client = writer_env
     observations = [_observation()]
     ranked, state = _ranked(
@@ -880,14 +971,11 @@ def test_short_is_never_routed_and_is_counted_explicitly(writer_env):
         opip=opip,
     )
 
-    assert summary.short_unsupported == 1
-    assert summary.executed == 0
+    assert summary.unsupported_direction == 0
+    assert summary.executed == 1
     assert summary.legacy_calls == 0
-    # No producer call at all: not even a read.
-    assert requests == []
-    assert _rows(server.writer, SNAPSHOT_EVENT) == []
-    assert _rows(server.writer, CTX_EVENT) == []
-    assert _rows(server.writer, "paper_execution.order_intent.recorded") == []
+    # The producer reached canonical commit for the SHORT episode.
+    assert _rows(server.writer, CTX_EVENT)
 
 
 def test_long_wait_is_not_converted_into_an_immediate_buy(writer_env):

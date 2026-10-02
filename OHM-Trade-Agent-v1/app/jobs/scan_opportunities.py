@@ -545,17 +545,20 @@ def _paper_lineage_attribution(
     """The (paper_requested, paper_engine) lineage pair for one opportunity.
 
     Mode-aware without changing the inactive path: under LEGACY this returns exactly
-    the historical values. Under READY only a LONG that is immediately actionable is
-    a Paper-v2 request - a WAIT or a SHORT is recorded as not requested rather than
-    being relabelled as one. Under DRAINING and UNAVAILABLE neither authority may
-    create an entry, so the label says so instead of claiming an engine acted.
+    the historical values (the legacy path is long-only, so a SHORT is recorded as
+    having no authoritative short engine). Under READY both a LONG and a SHORT that
+    is immediately actionable is a Paper-v2 request - a WAIT is recorded as not
+    requested rather than being relabelled as one. Under DRAINING and UNAVAILABLE
+    neither authority may create an entry, so the label says so instead of claiming
+    an engine acted.
     """
-    if direction != "LONG":
-        return False, PAPER_ENGINE_NO_AUTHORITATIVE_SHORT
     if authority.legacy_new_entry_allowed:
+        if direction != "LONG":
+            # The legacy paper authorities are long-only.
+            return False, PAPER_ENGINE_NO_AUTHORITATIVE_SHORT
         return bool(paper_enabled and direction == "LONG"), PAPER_ENGINE_FREQTRADE_DRY_RUN
     if authority.paper_v2_routing:
-        if valid_now:
+        if direction in {"LONG", "SHORT"} and valid_now:
             return True, PAPER_ENGINE_OPIP_PAPER_V2
         return False, PAPER_ENGINE_PAPER_V2_WAIT
     if authority.granted == AUTHORITY_PAPER_V2_DRAINING:
@@ -722,7 +725,7 @@ def _print_paper_v2_summary(summary) -> None:
     print("Paper v2 executed:", summary.executed)
     print("Paper v2 capital rejected:", summary.capital_rejected)
     print("Paper v2 capacity rejected:", summary.capacity_rejected)
-    print("Paper v2 SHORT unsupported:", summary.short_unsupported)
+    print("Paper v2 unsupported direction:", summary.unsupported_direction)
     print("Paper v2 WAIT not executable:", summary.wait_not_executable)
     print("Paper v2 no-fill terminal (released):", summary.no_fill_terminal)
     print("Paper v2 handoff failures:", summary.handoff_failures)

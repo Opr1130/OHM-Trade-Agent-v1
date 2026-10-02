@@ -82,20 +82,6 @@ WHEN:
 rollback is inspected
 THEN:
 rollback restores exactly one authority, stops new target admissions immediately but withholds legacy new-entry authority until the rollback-ready gate proves no cross-authority collision, never runs two allocation authorities, needs no canonical-data migration, and retains the former comparator artifacts without deleting obsolete code
-AC-012:
-GIVEN:
-the fail-closed rollback transition
-WHEN:
-the rollback scenarios are enumerated
-THEN:
-the contract enumerates an open target position during rollback, a pending target reservation during rollback, a target terminal/reconciliation not complete during rollback, a clean fully-drained rollback, and proof that exactly one new-entry authority exists throughout the transition, and states that legacy new-entry authority resumes only after the rollback-ready gate proves the target exposure has drained or a proven collision mechanism makes it safe
-AC-013:
-GIVEN:
-the human-approved resumption requirement after a safety suspension
-WHEN:
-the resumption authority is inspected
-THEN:
-the contract states that stopping target admissions on UNSAFE/UNAVAILABLE is immediate while resumption is not, that protection continues during suspension, that a later healthy result alone does not resume new admissions, that resumption requires an explicit authorized resume gate, and that the owning authority is the incident lifecycle's owner-recovery-cycle policy rather than F11
 AC-009:
 GIVEN:
 the authority boundary and exclusions
@@ -117,6 +103,27 @@ WHEN:
 the evidence gate is inspected
 THEN:
 the contract requires matched-window comparison evidence of the target selector against cash/no-trade and the frozen profit-ranking comparator, under matched capital, timing, execution model and fee policy over the full intent population, recorded before the legacy admission source is replaced rather than assumed
+AC-012:
+GIVEN:
+the fail-closed rollback transition
+WHEN:
+the rollback scenarios are enumerated
+THEN:
+the contract enumerates an open target position during rollback, a pending target reservation during rollback, a target terminal/reconciliation not complete during rollback, a clean fully-drained rollback, and proof that exactly one new-entry authority exists throughout the transition, and states that legacy new-entry authority resumes only after the rollback-ready gate proves the target exposure has drained or a proven collision mechanism makes it safe
+AC-013:
+GIVEN:
+the human-approved resumption requirement after a safety suspension
+WHEN:
+the resumption authority is inspected
+THEN:
+the contract states that stopping target admissions on UNSAFE/UNAVAILABLE is immediate while resumption is not, that protection continues during suspension, that a later healthy result alone does not resume new admissions, that resumption requires an explicit authorized resume gate, and that the owning authority is the incident lifecycle's owner-recovery-cycle policy rather than F11
+AC-014:
+GIVEN:
+the owner SHORT mandate for the target paper route and the frozen R4-B0 SHORT machinery
+WHEN:
+direction authority is inspected
+THEN:
+the target route supports LONG and SHORT, the readiness probe reports both directions covered with no SHORT_AUTHORITY_MISSING, the SHORT_AUTHORITY_MISSING blocker is resolved by implemented and tested authority rather than by suppression or relabelling, the historical long-only assertions are converted to direction-coverage assertions rather than deleted, and the existing R4-B0 PCAND to OPIPC bridge is reused rather than duplicated
 
 EXPLICITLY OUT OF SCOPE:
 - Setting `OPIP_PAPER_V2_MODE=active` in production, or any activation, in this freeze PR
@@ -140,7 +147,7 @@ Single authority and collision safety.
 Exactly one authority may create a new paper entry: the target Paper-v2 route, with the target F7 selector as the admission source being papered. The target F7 selector and the target Paper-v2 engine are ONE authority (source and sink), not two. Legacy Top-8/profit-ranking and Freqtrade dry-run/Paper-v1 remain as comparator and rollback only and may not create new entries while the target authority is active. There is one reservation authority: the canonical writer. It must be impossible for the legacy admission path (Top-8/profit-ranking) and the target admission path (F7 -> Paper-v2), or for the two paper engines, to create two independent executions for one economic opportunity.
 
 Direction coverage (no silent LONG-only).
-The activated route must have an explicit direction disposition. The current router is LONG-only (`paper_v2_scan_router.py` `SUPPORTED_DIRECTION`) and the readiness probe reports the missing SHORT authority as a hard blocker (`SHORT_AUTHORITY_MISSING`). R4-B2 therefore requires that direction coverage be resolved, not assumed: either SHORT is supported on the activated route with equivalent proofs, or an explicit owner LONG-only paper mandate is recorded. A silently LONG-only activated route is not acceptable, and the `SHORT_AUTHORITY_MISSING` readiness blocker must be resolved or explicitly dispositioned before activation.
+The activated route must have an explicit direction disposition. At R4-F8 the router was LONG-only (`paper_v2_scan_router.py` `SUPPORTED_DIRECTION`) and the readiness probe reported the missing SHORT authority as a hard blocker (`SHORT_AUTHORITY_MISSING`). R4-B2 resolved this under an explicit owner SHORT mandate: the router now supports both directions (`SUPPORTED_DIRECTIONS = {LONG, SHORT}`), the readiness probe reports both covered, and the historical `SHORT_AUTHORITY_MISSING` fact is preserved as history (see AC-014). A silently LONG-only activated route remains unacceptable; a route that lacks a direction is still refused rather than mapped onto another.
 
 Rollback (fail-closed transition).
 Stopping new Paper-v2 admissions is immediate: setting the mode to `off` (or an unreadable mode) stops new target entries at once. Restoring legacy new-entry authority is NOT immediate. While the target authority still owns any exposure - an open target position, a pending target admission or order, a committed target reservation, or an in-progress terminal reconciliation - legacy new-entry authority must remain withheld and the target path must keep managing, protecting and reconciling what it owns. Legacy new-entry authority may resume only after a deterministic rollback-ready gate proves that no cross-authority collision can occur: the target exposure has safely drained (no open position, no pending admission/order, no committed reservation, no in-progress terminal reconciliation), or a proven shared exposure/collision mechanism makes concurrent legacy admission safe. At every instant of the transition exactly one new-entry authority exists (none, or the draining target, or legacy) - never two. Rollback is completed by this switch and a code revert; it needs no canonical-data migration and does not delete the former comparator artifacts.
@@ -186,6 +193,9 @@ AC-010 -> tests/test_opip_r4_b2_controlled_paper_activation.py::test_ac_010_free
 AC-011 -> tests/test_opip_r4_b2_controlled_paper_activation.py::test_ac_011_comparator_evidence_required
 AC-012 -> tests/test_opip_r4_b2_controlled_paper_activation.py::test_ac_012_rollback_transition_scenarios
 AC-013 -> tests/test_opip_r4_b2_controlled_paper_activation.py::test_ac_013_resume_requires_authorized_gate
+AC-014 -> tests/test_opip_r4_b2_controlled_paper_activation.py::test_ac_014_target_route_supports_long_and_short
+AC-014 -> tests/test_opip_r4_b2_controlled_paper_activation.py::test_ac_014_short_direction_mechanics_and_identity
+AC-014 -> tests/test_opip_paper_v2_increment6b_bc3.py::test_short_2x_alert_executes_at_1x_with_sell_entry
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-paper-activation.md
@@ -216,11 +226,22 @@ AC-012 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-pap
 AC-012 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_controlled_paper_activation.py
 AC-013 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-paper-activation.md
 AC-013 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_controlled_paper_activation.py
+AC-014 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-paper-activation.md
+AC-014 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-F8-paper-v2-cutover-readiness.md
+AC-014 -> OHM-Trade-Agent-v1/app/services/paper_v2_scan_router.py
+AC-014 -> OHM-Trade-Agent-v1/app/services/paper_v2_cutover_readiness.py
+AC-014 -> OHM-Trade-Agent-v1/app/jobs/scan_opportunities.py
+AC-014 -> OHM-Trade-Agent-v1/app/opip/contracts/paper_execution_runtime.py
+AC-014 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_controlled_paper_activation.py
+AC-014 -> OHM-Trade-Agent-v1/tests/test_opip_r4_f8_cutover_readiness.py
+AC-014 -> OHM-Trade-Agent-v1/tests/test_opip_paper_v2_increment6b_bc3.py
+AC-014 -> OHM-Trade-Agent-v1/tests/test_opip_paper_v2_cutover_bc3.py
+AC-014 -> OHM-Trade-Agent-v1/tests/test_opip_paper_v2_cross_scan_simulation_bc3.py
 
 DEFERRED DISCOVERIES:
 - The activation implementation (wiring the target F7 selector as the admission source, the mode/cutover sequence and their behavioral acceptance criteria and implementation map) is a later commit of this same increment and is not authorized by this freeze.
 - The current router papers the legacy-ranked cohort; making the target F7 selector the admission source is the substantive R4-B2 change and must be reconciled against the frozen R4-B0 handoff and R4-B1 retry semantics.
-- SHORT coverage is now a frozen precondition, not an assumption: the activation route's direction coverage must be resolved (SHORT supported with equivalent proofs, or an explicit owner LONG-only mandate). The current router is LONG-only (`paper_v2_scan_router.py` `SUPPORTED_DIRECTION`) and the readiness probe reports `SHORT_AUTHORITY_MISSING`; R4-B0 made SHORT reachable in the canonical engine, so supporting it is a router change that must be scoped, not silently skipped.
+- Direction coverage is frozen as a precondition and now resolved: R4-B2 implemented SHORT on the target route under an explicit owner mandate (AC-014). The historical fact that the router was LONG-only (`SUPPORTED_DIRECTION`) and the probe reported `SHORT_AUTHORITY_MISSING` is preserved as history, not deleted.
 - The comparator and direction-coverage evidence are frozen as pre-cutover requirements (AC-011 and AC-004). Producing them is part of the activation implementation, not this freeze. The comparator evidence is recorded as a durable artifact under the repository's `docs/atdd/evidence/` convention with an explicit consumption disposition, in the activation implementation commit.
 - The PCAND -> OPIPC candidate-identity bridge between the F7 selection and the Paper-v2 handoff (named in `ATDD-R4-F8-paper-v2-cutover-readiness.md` as required for R4-B wiring) is reconciled explicitly in the activation implementation commit; this freeze references it only through the frozen R4-B0 handoff contract.
 - A dual-run comparison of the activated target authority against the legacy comparator for the same opportunity is separate evidence and is not required by this freeze; the freeze requires the collision proof (at most one execution per opportunity), not a dual-writing comparator.
