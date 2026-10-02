@@ -145,6 +145,40 @@ def load_json(path: Path) -> dict:
     return payload
 
 
+def read_json_without_quarantine(path: Path) -> dict:
+    """Parse a JSON object without ever moving or rewriting the source file.
+
+    Unlike :func:`load_json`, a malformed or non-finite file raises
+    ``RegistryCorruptionError`` (``quarantine_path=None``) instead of being
+    quarantined via ``os.replace``. It also never creates a lock file. This is the
+    read seam for read-only observers, which must be able to inspect durable state
+    without mutating it.
+    """
+    if not path.exists():
+        return {}
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RegistryIOError(f"Registry read failed at {path}: {exc}") from exc
+
+    try:
+        payload = json.loads(raw, parse_constant=_reject_json_constant)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise RegistryCorruptionError(path, None, str(exc)) from exc
+
+    if not isinstance(payload, dict):
+        raise RegistryCorruptionError(
+            path, None, f"expected JSON object, got {type(payload).__name__}"
+        )
+
+    nonfinite_path = _first_nonfinite_path(payload)
+    if nonfinite_path is not None:
+        raise RegistryCorruptionError(
+            path, None, f"non-finite numeric value at {nonfinite_path}"
+        )
+    return payload
+
+
 def save_json_atomic(path: Path, data: dict, *, mode: int | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temp_name = tempfile.mkstemp(
