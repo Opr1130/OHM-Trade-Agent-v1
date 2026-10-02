@@ -268,6 +268,54 @@ def submit_canonical_event(
     )
 
 
+def disposition_id_candidates(
+    *, episode_id: str, native_symbol: str, direction: str
+) -> tuple[str, ...]:
+    """Every disposition identity this opportunity may already have been admitted under.
+
+    Primary first. A LONG keeps the legacy payload - stable across the direction
+    contract - and also considers the direction-qualified form that a brief interim
+    direction-aware release used, so a record committed under either form is still
+    found on a retry. A SHORT has exactly one form.
+    """
+    primary = build_disposition_id(
+        episode_id=episode_id, native_symbol=native_symbol, direction=direction
+    )
+    resolved = require_paper_direction(str(direction))
+    if resolved == PAPER_DIRECTION_LONG:
+        interim = stable_hash(
+            "PDISP",
+            {
+                "episode_id": str(episode_id),
+                "native_symbol": str(native_symbol).upper(),
+                "direction": resolved,
+                "engine": ENGINE_OPIP_PAPER_V2,
+            },
+        )
+        if interim != primary:
+            return (primary, interim)
+    return (primary,)
+
+
+def resolve_committed_disposition(client: Any, *, candidates: tuple[str, ...]) -> str:
+    """The identity that already owns committed state, else the primary identity.
+
+    Resolving before admitting is what stops a retry from creating a second
+    admission, trade and reservation for one opportunity simply because the
+    identity derivation changed between releases.
+    """
+    for candidate in candidates:
+        try:
+            state = client.get_paper_v2_execution_state(candidate)
+        except Exception:  # noqa: BLE001 - an unreadable probe must not invent state
+            continue
+        if str(getattr(state, "status", "")) == "OK" and bool(
+            getattr(state, "admitted", False)
+        ):
+            return candidate
+    return candidates[0]
+
+
 def run_paper_v2_opportunity(
     opportunity: PaperV2Opportunity,
     *,
@@ -396,6 +444,17 @@ def run_paper_v2_opportunity(
         raise PaperV2ExecutionError(f"decision context failed: {exc}") from exc
 
     # --- 3. restart check before admitting ---------------------------------
+    # Resolve against every identity form this opportunity may already own, so a
+    # retry cannot create a second admission just because the identity derivation
+    # changed between releases.
+    disposition_id = resolve_committed_disposition(
+        client,
+        candidates=disposition_id_candidates(
+            episode_id=opportunity.episode_id,
+            native_symbol=opportunity.native_symbol,
+            direction=str(opportunity.direction),
+        ),
+    )
     progress = client.get_paper_v2_execution_state(disposition_id)
     _require(
         progress.status == "OK",
