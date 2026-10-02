@@ -97,7 +97,10 @@ EXPECTED_CLASSIFICATION = {
     "targets change": ("protection plan", "NOT_AN_ADMISSION_RETRY"),
     "execution geometry changes": ("protection plan", "NOT_AN_ADMISSION_RETRY"),
     "an earlier terminal stop already exists": ("execution", "EXACT_RETRY"),
-    "a committed reservation exists": ("admission", "EXACT_RETRY"),
+    "a committed reservation exists and the retry request is identical": (
+        "admission",
+        "EXACT_RETRY",
+    ),
     "direction changes": ("disposition identity", "DISTINCT_OPPORTUNITY"),
     "canonical progress is temporarily unreadable": ("retry", "FAIL_CLOSED"),
 }
@@ -164,6 +167,7 @@ def _classification_rows(text: str) -> dict[str, tuple[str, str]]:
             continue
         if len(cells) < 3 or set(cells[0]) <= {"-", " "}:
             continue
+        assert cells[0] not in rows, f"duplicate trigger row: {cells[0]}"
         rows[cells[0]] = (cells[1], cells[2])
     return rows
 
@@ -203,6 +207,32 @@ def test_ac_002_retry_and_requalification_semantics_are_frozen():
         "REQUALIFIED_NEW_DECISION",
         "CONFLICTING_ATTEMPT",
     } <= classifications
+
+    # The precedence rule enumerates the full decision-context identity input set,
+    # so a retry changing any context input is unambiguously REQUALIFIED.
+    assert "context_identity_v2" in text
+    for context_input in (
+        "schema_version",
+        "candidate_id",
+        "episode_id",
+        "instrument_version",
+        "snapshot_id",
+        "snapshot_hash",
+        "evaluation_time",
+        "evidence_cutoff",
+        "policy_version",
+        "policy_fingerprint",
+        "environment",
+        "eligibility",
+        "supersedes_id",
+        "supersession_reason",
+    ):
+        assert context_input in text, context_input
+
+    # The classifications are scoped to re-submitting the admission RPC, and the
+    # already-admitted path is stated rather than over-generalized.
+    assert "does not re-submit that RPC" in text
+    assert "order intent decision context does not match reservation" in text
 
     assert "admission ancestry is immutable" in text
     assert "Ambiguity fails closed" in text
