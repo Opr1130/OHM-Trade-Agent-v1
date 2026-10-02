@@ -337,11 +337,24 @@ def test_paper_v2_inactive_blocks_execution_before_any_canonical_write():
             now=datetime(2026, 10, 2, 2, 30, tzinfo=timezone.utc),
         )
     assert touched == []
-    # And the default resolves to off, so an unset environment cannot activate it.
-    from app.services.paper_v2_activation import paper_v2_active
+    # Only the exact canonical value activates. These use explicit sources, so the
+    # assertion does not depend on the ambient process environment: an absent
+    # field, an empty string, a case-variant, a malformed value and a non-string
+    # all resolve to off.
+    from types import SimpleNamespace as _NS
 
-    assert paper_v2_active(SimpleNamespace(opip_paper_v2_mode="")) is False
-    assert paper_v2_active(None) is False
+    from app.services.paper_v2_activation import (
+        paper_v2_active,
+        resolve_paper_v2_mode,
+    )
+
+    assert resolve_paper_v2_mode(_NS(opip_paper_v2_mode="off")) == "off"
+    assert resolve_paper_v2_mode(_NS()) == "off"
+    assert resolve_paper_v2_mode(_NS(opip_paper_v2_mode="")) == "off"
+    assert resolve_paper_v2_mode(_NS(opip_paper_v2_mode="ACTIVE")) == "off"
+    assert resolve_paper_v2_mode(_NS(opip_paper_v2_mode=" active ")) == "off"
+    assert resolve_paper_v2_mode(_NS(opip_paper_v2_mode=1)) == "off"
+    assert paper_v2_active(_NS(opip_paper_v2_mode="off")) is False
 
 
 # ---------------------------------------------------------------------------
