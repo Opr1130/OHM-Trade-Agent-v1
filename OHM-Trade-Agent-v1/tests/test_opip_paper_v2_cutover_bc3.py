@@ -171,7 +171,24 @@ def _universe(*, display_pair: str = "SOLUSD", pair_id: str = "SOLUSD") -> Unive
     )
 
 
-def _plan(*, valid_now: bool = True) -> EntryExitPlan:
+def _plan(*, valid_now: bool = True, direction: str = "LONG") -> EntryExitPlan:
+    if str(direction).upper() == "SHORT":
+        return EntryExitPlan(
+            symbol="SOLUSD",
+            valid_now=valid_now,
+            entry_style="MARKET",
+            entry_low=99.0,
+            entry_high=101.0,
+            chase_limit=98.0,
+            stop_price=110.0,
+            target_1=90.0,
+            target_2=80.0,
+            reward_to_risk_1=1.0,
+            reward_to_risk_2=2.0,
+            risk_level="MEDIUM",
+            reason="qualified",
+            direction="SHORT",
+        )
     return EntryExitPlan(
         symbol="SOLUSD",
         valid_now=valid_now,
@@ -459,7 +476,9 @@ def _install_scan(
             SimpleNamespace(
                 rank=1,
                 opportunity=SimpleNamespace(
-                    alert=alert, snapshot=snapshot, plan=_plan(valid_now=valid_now)
+                    alert=alert,
+                    snapshot=snapshot,
+                    plan=_plan(valid_now=valid_now, direction=direction),
                 ),
                 profit_ranking=SimpleNamespace(total_score=1.0),
             )
@@ -644,7 +663,10 @@ def test_active_mode_never_falls_back_after_a_paper_v2_failure(monkeypatch, writ
     assert calls.paper_v1 == 0
 
 
-def test_active_mode_short_is_not_routed_and_not_fallen_back(monkeypatch, writer_env):
+def test_active_mode_short_is_routed_to_target_authority(monkeypatch, writer_env):
+    """R4-B2 authority handoff: in active mode a SHORT reaches the routing seam and
+    is routed to the target Paper-v2 authority (owner SHORT mandate) rather than
+    being refused or falling back to a legacy paper path."""
     server, client = writer_env
     set_writer_client_for_tests(client)
     requests: list = []
@@ -657,15 +679,18 @@ def test_active_mode_short_is_not_routed_and_not_fallen_back(monkeypatch, writer
 
     assert calls.freqtrade == 0
     assert calls.paper_v1 == 0
-    assert requests == []
-    count = server.writer._conn.execute(  # noqa: SLF001
-        "SELECT COUNT(*) FROM events"
-    ).fetchone()[0]
-    assert count == 0
-    # Non-vacuous: the SHORT really did reach the routing seam and was refused
-    # there, rather than being filtered out earlier.
+    # Non-vacuous: the SHORT reached the routing seam and was actually executed by
+    # the target authority - a canonical ENTRY order intent with a SELL side - not
+    # merely recorded as routed and then refused inside the router.
     assert len(calls.routed) == 1
     assert len(calls.routed[0]) == 1
+    entry = [
+        row
+        for row in _rows(server.writer, "paper_execution.order_intent.recorded")
+        if row.get("intent_role") == "ENTRY"
+    ]
+    assert entry, "a routed SHORT must open an ENTRY order intent"
+    assert entry[0]["side"] == "SELL"
 
 
 def test_active_mode_wait_is_not_routed_and_not_fallen_back(monkeypatch, writer_env):
@@ -737,7 +762,10 @@ def test_active_mode_wait_lineage_is_not_a_paper_v2_request(monkeypatch, writer_
     assert engine != "OPIP_PAPER_V2"
 
 
-def test_active_mode_short_lineage_keeps_the_no_short_engine_meaning(monkeypatch, writer_env):
+def test_active_mode_short_lineage_is_the_target_authority(monkeypatch, writer_env):
+    """R4-B2 authority handoff (replaces the R4-A no-short-engine lineage): under the
+    READY target authority an immediately actionable SHORT is a Paper-v2 request, not
+    labelled as having no authoritative short engine."""
     server, client = writer_env
     set_writer_client_for_tests(client)
     set_kraken_client_for_tests(KrakenClient(transport=_EchoTransport(requests=[])))
@@ -745,7 +773,7 @@ def test_active_mode_short_lineage_keeps_the_no_short_engine_meaning(monkeypatch
         monkeypatch, mode="active", direction="SHORT"
     )
     scan_opportunities.main()
-    assert _lineage_pairs(calls) == [(False, "NO_AUTHORITATIVE_SHORT_ENGINE_V1")]
+    assert _lineage_pairs(calls) == [(True, "OPIP_PAPER_V2")]
 
 
 def test_active_mode_admission_telemetry_names_the_paper_v2_engine(monkeypatch, writer_env):

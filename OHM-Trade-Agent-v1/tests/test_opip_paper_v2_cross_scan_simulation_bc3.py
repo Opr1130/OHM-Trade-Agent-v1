@@ -1205,7 +1205,8 @@ def test_s7_draining_becomes_ready_across_scans_without_config_change(env, monke
     assert authority_b.paper_v2_routing is True
     assert authority_b.legacy_new_entry_allowed is False
 
-    # A WAIT and a SHORT are never Paper-v2 entry requests, even when granted.
+    # A WAIT is never a Paper-v2 entry request. A SHORT, under the R4-B2 owner
+    # mandate, IS a Paper-v2 request when it is immediately actionable.
     wait = scan_opportunities._paper_lineage_attribution(
         paper_enabled=False, direction="LONG", valid_now=False, authority=authority_b
     )
@@ -1213,7 +1214,7 @@ def test_s7_draining_becomes_ready_across_scans_without_config_change(env, monke
     short = scan_opportunities._paper_lineage_attribution(
         paper_enabled=False, direction="SHORT", valid_now=True, authority=authority_b
     )
-    assert short == (False, scan_opportunities.PAPER_ENGINE_NO_AUTHORITATIVE_SHORT)
+    assert short == (True, scan_opportunities.PAPER_ENGINE_OPIP_PAPER_V2)
 
     # --- Paper v2 may admit now ---------------------------------------------
     result = _run(env, _opportunity("ADAUSD"))

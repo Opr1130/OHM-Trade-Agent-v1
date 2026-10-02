@@ -18,7 +18,7 @@ ARCHITECTURE REFERENCES:
 - `docs/architecture/OPIP_RECOVERY_ROADMAP.md` R4: cutover stays blocked until the R3 selector is the admission source being papered, `OPIP_PAPER_V2_MODE=active`, legacy drain is READY, the protection sweep is healthy before new admissions, and universe metadata is present; "Paper v2 protection today runs inside the scan, not on the one-minute protection slot. R4 must show protection still runs when discovery is down."
 - `docs/architecture/OPIP_CONFORMANCE_LEDGER.md` F8 row: "Paper v2 has no pending-limit state machine and no short engine."; F11 row: "Paper v2 protection sweep runs only inside the opportunity scan." and BLOCKERS "Paper v2 sweep is not on the one-minute slot."
 - `docs/architecture/v1.2/A_PAPER_MANDATE.md` and `docs/architecture/v1.2/F_ECONOMIC_PORTFOLIO_CONTRACT.md`: paper is simulated cash P&L after fees; realistic paper execution is the F8 authority.
-- Reused rather than duplicated: `app/services/freqtrade_result_ingest.py`, `app/services/freqtrade_signal_bridge.py`, `app/services/paper_trade_control.py`, `app/services/paper_trade_registry.py` (drain sources); `app/services/paper_v2_protection_runtime.py` (`run_protection_sweep`); `app/services/paper_v2_scan_router.py` (`SUPPORTED_DIRECTION`, the fail-closed universe gate); `app/opip/contracts/portfolio.py` (the frozen F7 handoff contract).
+- Reused rather than duplicated: `app/services/freqtrade_result_ingest.py`, `app/services/freqtrade_signal_bridge.py`, `app/services/paper_trade_control.py`, `app/services/paper_trade_registry.py` (drain sources); `app/services/paper_v2_protection_runtime.py` (`run_protection_sweep`); `app/services/paper_v2_scan_router.py` (`SUPPORTED_DIRECTIONS`, the fail-closed universe gate); `app/opip/contracts/portfolio.py` (the frozen F7 handoff contract).
 - `docs/atdd/scope-contracts/ATDD-R3-F7-economic-portfolio-selector.md`: F7 is frozen and is not modified by this increment.
 - `docs/atdd/scope-contracts/ATDD-SCOPE-MOVABLE-ACTIVE-POINTER-v1.md`: a completed increment must not permanently own the global pointer.
 - `docs/atdd/scope-contracts/ATDD-000-scope-control.md`: `UNAPPROVED SCOPE CHANGES` must be exactly `NONE`.
@@ -70,7 +70,7 @@ the Paper-v2 direction coverage
 WHEN:
 coverage is reported
 THEN:
-LONG is covered, SHORT is not, the gap carries the machine-readable reason SHORT_AUTHORITY_MISSING, a missing LONG coverage is reported as LONG_AUTHORITY_MISSING rather than as no gap, and the aggregate verdict is NOT_READY
+coverage is derived from the target route's supported directions; at R4-F8 LONG was covered and SHORT was not, the gap carried the machine-readable reason SHORT_AUTHORITY_MISSING, and a missing LONG coverage was reported as LONG_AUTHORITY_MISSING rather than as no gap; R4-B2 later supplied genuine SHORT authority under an owner mandate, so both directions now report covered with no gap and the verdict is no longer blocked on SHORT
 
 AC-007:
 GIVEN:
@@ -110,7 +110,7 @@ typed cutover evidence
 WHEN:
 the aggregate verdict is derived
 THEN:
-healthy technical evidence resolves to READY, a missing short authority resolves to NOT_READY with SHORT_AUTHORITY_MISSING, an unprovable starting equity blocks the drain rather than being defaulted, and unreadable evidence fails closed to NOT_READY with the exact reason codes
+healthy technical evidence resolves to READY when direction coverage is complete, a route missing a direction resolves to NOT_READY with the corresponding missing-authority reason (LONG_AUTHORITY_MISSING or SHORT_AUTHORITY_MISSING), an unprovable starting equity blocks the drain rather than being defaulted, and unreadable evidence fails closed to NOT_READY with the exact reason codes
 
 AC-012:
 GIVEN:
@@ -175,7 +175,7 @@ AC-003 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_003_protection_run
 AC-004 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_004_protection_sweep_is_idempotent_and_read_only
 AC-004 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_004_scan_protection_precedes_admission
 AC-005 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_005_universe_metadata_gate_fails_closed
-AC-006 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_006_short_has_no_authoritative_engine
+AC-006 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_006_direction_coverage_reflects_router_authority
 AC-006 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_006_long_coverage_gap_is_reported
 AC-007 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_007_pending_mandate_is_documented_immediate_only
 AC-007 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_007_unsupported_pending_mandate_fails_closed
@@ -185,7 +185,7 @@ AC-009 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_009_new_code_activ
 AC-009 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_009_no_funded_or_exchange_credentials_added
 AC-010 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_010_rollback_path_remains
 AC-011 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_011_unreadable_evidence_fails_closed
-AC-011 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_011_verdict_not_ready_when_short_authority_missing
+AC-011 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_011_verdict_reflects_direction_coverage
 AC-011 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_011_verdict_ready_when_all_technical_gates_pass
 AC-011 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_011_unavailable_equity_fails_closed
 AC-012 -> tests/test_opip_r4_f8_cutover_readiness.py::test_ac_012_baseline_triage_recorded
