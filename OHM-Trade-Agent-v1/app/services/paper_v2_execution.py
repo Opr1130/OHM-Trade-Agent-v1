@@ -297,23 +297,48 @@ def disposition_id_candidates(
     return (primary,)
 
 
-def resolve_committed_disposition(client: Any, *, candidates: tuple[str, ...]) -> str:
-    """The identity that already owns committed state, else the primary identity.
+def resolve_committed_disposition(
+    client: Any, *, candidates: tuple[str, ...]
+) -> tuple[str, Any | None]:
+    """The identity that already owns committed evidence, and its committed state.
 
-    Resolving before admitting is what stops a retry from creating a second
-    admission, trade and reservation for one opportunity simply because the
-    identity derivation changed between releases.
+    Resolution happens *before* any new canonical write, so a resumed trade
+    continues under the context it was admitted with instead of a freshly derived
+    one, and a retry cannot create a second admission, trade or reservation for one
+    opportunity merely because the identity derivation changed between releases.
+
+    Fails closed: a candidate whose state cannot be authoritatively read (a raised
+    transport error, or any non-``OK`` projection status) stops admission rather
+    than being treated as absent, because an unreadable candidate may already own
+    an admission. Ownership is any committed admission evidence - an admitted
+    trade, or a committed terminal disposition such as a capacity or capital
+    rejection - so a later retry cannot bypass an earlier stop decision.
     """
+    first: str | None = None
     for candidate in candidates:
+        if first is None:
+            first = candidate
         try:
             state = client.get_paper_v2_execution_state(candidate)
-        except Exception:  # noqa: BLE001 - an unreadable probe must not invent state
-            continue
-        if str(getattr(state, "status", "")) == "OK" and bool(
-            getattr(state, "admitted", False)
-        ):
-            return candidate
-    return candidates[0]
+        except Exception as exc:  # noqa: BLE001 - any read failure must fail closed
+            raise PaperV2ExecutionError(
+                f"disposition state could not be read for {candidate}: {exc}"
+            ) from exc
+        status = str(getattr(state, "status", ""))
+        if status != "OK":
+            raise PaperV2ExecutionError(
+                "disposition state is not authoritative "
+                f"for {candidate}: {status or 'UNKNOWN'}"
+            )
+        owns_evidence = (
+            bool(getattr(state, "admitted", False))
+            or getattr(state, "disposition", None) is not None
+            or getattr(state, "decision_context_id", None) is not None
+        )
+        if owns_evidence:
+            return candidate, state
+    assert first is not None
+    return first, None
 
 
 def run_paper_v2_opportunity(
@@ -361,6 +386,19 @@ def run_paper_v2_opportunity(
         episode_id=opportunity.episode_id,
         native_symbol=opportunity.native_symbol,
         direction=str(opportunity.direction),
+    )
+
+    # --- 0a. resolve against every identity form this opportunity may own ---
+    # Done before any canonical write so a resumed trade continues under the
+    # context it was admitted with, and an unreadable candidate fails closed
+    # rather than being assumed absent.
+    disposition_id, committed_state = resolve_committed_disposition(
+        client,
+        candidates=disposition_id_candidates(
+            episode_id=opportunity.episode_id,
+            native_symbol=opportunity.native_symbol,
+            direction=str(opportunity.direction),
+        ),
     )
 
     # --- 0b. validate the snapshot before any canonical write --------------
@@ -418,43 +456,45 @@ def run_paper_v2_opportunity(
     # from the snapshot record committed above, not from the caller. The instrument
     # registration proves the instrument exists; its coordinate is deliberately NOT
     # reused as a consumed-input watermark.
-    facts = DecisionContextFacts(
-        candidate_id=opportunity.candidate_id,
-        episode_id=opportunity.episode_id,
-        instrument_version_id=opportunity.instrument_version_id,
-        instrument_registration_event_id=registered.event_id,
-        snapshot_record_event_id=snapshot_proof.event_id,
-        snapshot_id=decision_snapshot.snapshot_id,
-        snapshot_hash=decision_snapshot.snapshot_hash,
-        evaluation_time=opportunity.evaluation_time,
-        evidence_cutoff=opportunity.evidence_cutoff,
-        policy_version=opportunity.qualification_policy_version,
-        policy_fingerprint=opportunity.qualification_policy_fingerprint,
-        producing_component=PRODUCING_COMPONENT,
-        artifact_or_build_id=app_code_fingerprint(),
-        process_instance_id=process_instance_id(),
-        emitted_at=moment,
-        source_record_refs=opportunity.source_record_refs,
+    #
+    # R4-B0: if this opportunity already owns committed admission evidence, the
+    # trade must continue under the context it was admitted with. A freshly derived
+    # context carries a different process instance, so reusing it here would be
+    # rejected by the writer's ancestry check and terminalize a resumable trade.
+    committed_context_id = (
+        getattr(committed_state, "decision_context_id", None)
+        if committed_state is not None
+        else None
     )
-    try:
-        context_id, _context_proof = commit_decision_context(facts, client=client)
-    except ValueError as exc:
-        raise PaperV2ExecutionError(f"decision context failed: {exc}") from exc
-    except RuntimeError as exc:
-        raise PaperV2ExecutionError(f"decision context failed: {exc}") from exc
+    if committed_context_id:
+        context_id = str(committed_context_id)
+    else:
+        facts = DecisionContextFacts(
+            candidate_id=opportunity.candidate_id,
+            episode_id=opportunity.episode_id,
+            instrument_version_id=opportunity.instrument_version_id,
+            instrument_registration_event_id=registered.event_id,
+            snapshot_record_event_id=snapshot_proof.event_id,
+            snapshot_id=decision_snapshot.snapshot_id,
+            snapshot_hash=decision_snapshot.snapshot_hash,
+            evaluation_time=opportunity.evaluation_time,
+            evidence_cutoff=opportunity.evidence_cutoff,
+            policy_version=opportunity.qualification_policy_version,
+            policy_fingerprint=opportunity.qualification_policy_fingerprint,
+            producing_component=PRODUCING_COMPONENT,
+            artifact_or_build_id=app_code_fingerprint(),
+            process_instance_id=process_instance_id(),
+            emitted_at=moment,
+            source_record_refs=opportunity.source_record_refs,
+        )
+        try:
+            context_id, _context_proof = commit_decision_context(facts, client=client)
+        except ValueError as exc:
+            raise PaperV2ExecutionError(f"decision context failed: {exc}") from exc
+        except RuntimeError as exc:
+            raise PaperV2ExecutionError(f"decision context failed: {exc}") from exc
 
     # --- 3. restart check before admitting ---------------------------------
-    # Resolve against every identity form this opportunity may already own, so a
-    # retry cannot create a second admission just because the identity derivation
-    # changed between releases.
-    disposition_id = resolve_committed_disposition(
-        client,
-        candidates=disposition_id_candidates(
-            episode_id=opportunity.episode_id,
-            native_symbol=opportunity.native_symbol,
-            direction=str(opportunity.direction),
-        ),
-    )
     progress = client.get_paper_v2_execution_state(disposition_id)
     _require(
         progress.status == "OK",

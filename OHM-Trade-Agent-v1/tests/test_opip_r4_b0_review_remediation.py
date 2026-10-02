@@ -310,35 +310,65 @@ def test_a_long_also_resolves_the_interim_direction_qualified_identity():
 
 
 def test_committed_disposition_is_resolved_before_admitting():
-    """Regression: the lookup must find whichever identity already owns state."""
-    from app.services.paper_v2_execution import resolve_committed_disposition
+    """Regression: the lookup must find whichever identity already owns evidence.
+
+    A candidate whose state cannot be read authoritatively must fail closed rather
+    than be treated as absent, and any committed admission evidence - including a
+    terminal rejection - counts as ownership so a later retry cannot bypass it.
+    """
+    from app.services.paper_v2_execution import (
+        PaperV2ExecutionError,
+        resolve_committed_disposition,
+    )
 
     class _State:
-        def __init__(self, admitted):
-            self.status = "OK"
+        def __init__(self, status="OK", admitted=False, disposition=None, ctx=None):
+            self.status = status
             self.admitted = admitted
+            self.disposition = disposition
+            self.decision_context_id = ctx
 
     class _Client:
-        def __init__(self, admitted_ids):
-            self._admitted = set(admitted_ids)
+        def __init__(self, states, fail=()):
+            self._states = states
+            self._fail = set(fail)
 
         def get_paper_v2_execution_state(self, disposition_id):
-            return _State(disposition_id in self._admitted)
+            if disposition_id in self._fail:
+                raise RuntimeError("transport error")
+            return self._states.get(disposition_id, _State())
 
     primary, alternate = "PDISP:primary", "PDISP:alternate"
+
     # Nothing committed: the primary identity is used.
-    assert (
-        resolve_committed_disposition(_Client([]), candidates=(primary, alternate))
-        == primary
+    assert resolve_committed_disposition(
+        _Client({}), candidates=(primary, alternate)
+    ) == (primary, None)
+
+    # A record exists only under the alternate admitted form: it is resolved, with
+    # its committed state, so no second admission can be created.
+    state = _State(admitted=True, ctx="DCTX:committed")
+    resolved_id, resolved_state = resolve_committed_disposition(
+        _Client({alternate: state}), candidates=(primary, alternate)
     )
-    # A record exists only under the alternate form: it is resolved, so no second
-    # admission can be created.
-    assert (
-        resolve_committed_disposition(
-            _Client([alternate]), candidates=(primary, alternate)
-        )
-        == alternate
-    )
+    assert resolved_id == alternate
+    assert resolved_state is state
+
+    # A committed terminal rejection is ownership too, so a later retry cannot
+    # bypass the earlier stop decision.
+    rejected = _State(disposition="CAPACITY_REJECTED", ctx="DCTX:rejected")
+    assert resolve_committed_disposition(
+        _Client({alternate: rejected}), candidates=(primary, alternate)
+    )[0] == alternate
+
+    # A probe that cannot be read authoritatively must fail closed.
+    for client in (
+        _Client({}, fail=(alternate,)),
+        _Client({alternate: _State(status="UNAVAILABLE")}),
+        _Client({alternate: _State(status="RETRYABLE")}),
+    ):
+        with pytest.raises(PaperV2ExecutionError):
+            resolve_committed_disposition(client, candidates=(primary, alternate))
 
 
 # ---------------------------------------------------------------------------
