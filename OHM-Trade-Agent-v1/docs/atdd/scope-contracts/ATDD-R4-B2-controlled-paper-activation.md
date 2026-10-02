@@ -124,6 +124,13 @@ WHEN:
 direction authority is inspected
 THEN:
 the target route supports LONG and SHORT, the readiness probe reports both directions covered with no SHORT_AUTHORITY_MISSING, the SHORT_AUTHORITY_MISSING blocker is resolved by implemented and tested authority rather than by suppression or relabelling, the historical long-only assertions are converted to direction-coverage assertions rather than deleted, and the existing R4-B0 PCAND to OPIPC bridge is reused rather than duplicated
+AC-015:
+GIVEN:
+the read-only committed-snapshot seam that feeds the non-authoritative target spine
+WHEN:
+the reader is inspected and exercised
+THEN:
+it reads only committed FEATURE_SNAPSHOT_RECORDED records through a read-only canonical surface, reconstructs the canonical FeatureSnapshot contract, re-derives and validates snapshot_id and content_hash, rejects malformed or identity-inconsistent payloads (including a malformed watermark and unknown enum values) as SnapshotRecordError rather than repairing them or escaping a raw error, returns records in canonical commit order (history_epoch, local_sequence) with the exclusive cursor advancing deterministically across bounded batches, dedupes deterministically by identity, exposes the cursor so a consumer owns resume persistence across restart, and never mutates or quarantines canonical production state
 
 EXPLICITLY OUT OF SCOPE:
 - Setting `OPIP_PAPER_V2_MODE=active` in production, or any activation, in this freeze PR
@@ -196,6 +203,12 @@ AC-013 -> tests/test_opip_r4_b2_controlled_paper_activation.py::test_ac_013_resu
 AC-014 -> tests/test_opip_r4_b2_controlled_paper_activation.py::test_ac_014_target_route_supports_long_and_short
 AC-014 -> tests/test_opip_r4_b2_controlled_paper_activation.py::test_ac_014_short_direction_mechanics_and_identity
 AC-014 -> tests/test_opip_paper_v2_increment6b_bc3.py::test_short_2x_alert_executes_at_1x_with_sell_entry
+AC-015 -> tests/test_opip_r4_b2_committed_snapshot_reader.py::test_ac_015_roundtrip_identity_and_ordering
+AC-015 -> tests/test_opip_r4_b2_committed_snapshot_reader.py::test_ac_015_cursor_is_commit_order_across_batches
+AC-015 -> tests/test_opip_r4_b2_committed_snapshot_reader.py::test_ac_015_bounded_cursor_and_dedupe
+AC-015 -> tests/test_opip_r4_b2_committed_snapshot_reader.py::test_ac_015_rejects_malformed_and_tampered_payloads
+AC-015 -> tests/test_opip_r4_b2_committed_snapshot_reader.py::test_ac_015_reader_never_mutates_or_quarantines
+AC-015 -> tests/test_opip_r4_b2_committed_snapshot_reader.py::test_ac_015_batch_survives_a_corrupt_stored_record
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-paper-activation.md
@@ -237,6 +250,10 @@ AC-014 -> OHM-Trade-Agent-v1/tests/test_opip_r4_f8_cutover_readiness.py
 AC-014 -> OHM-Trade-Agent-v1/tests/test_opip_paper_v2_increment6b_bc3.py
 AC-014 -> OHM-Trade-Agent-v1/tests/test_opip_paper_v2_cutover_bc3.py
 AC-014 -> OHM-Trade-Agent-v1/tests/test_opip_paper_v2_cross_scan_simulation_bc3.py
+AC-015 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-paper-activation.md
+AC-015 -> OHM-Trade-Agent-v1/app/opip/canonical/writer.py
+AC-015 -> OHM-Trade-Agent-v1/app/opip/features/committed_snapshot_reader.py
+AC-015 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_committed_snapshot_reader.py
 
 DEFERRED DISCOVERIES:
 - The activation implementation (wiring the target F7 selector as the admission source, the mode/cutover sequence and their behavioral acceptance criteria and implementation map) is a later commit of this same increment and is not authorized by this freeze.
