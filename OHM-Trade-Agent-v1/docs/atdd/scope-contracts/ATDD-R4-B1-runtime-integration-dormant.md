@@ -19,7 +19,7 @@ ARCHITECTURE REFERENCES:
 - `docs/architecture/v1.4.3/ARCHITECTURE.md` section 5: "A single canonical writer process is the only authority that commits operational domain events and projections." The composition in this increment writes nothing canonical.
 - `docs/atdd/scope-contracts/ATDD-R4-B1-contract-freeze.md`: the frozen contract this increment implements - single orchestration boundary, dormant posture, authority boundary, exact rollback, exclusions and the retry/requalification classification.
 - `docs/atdd/scope-contracts/ATDD-R4-B0-spine-contract-closure.md`: the proven spine and the closed increment this builds on.
-- `deploy/cron.d/ohm-unified-cycle`: the single host scheduler entry that owns the unified cycle; the only orchestration path this increment may modify.
+- `deploy/cron.d/ohm-unified-cycle`: the host entry point of the single orchestration boundary this increment extends. The boundary this increment wires into is `app.jobs.run_cycle`; the cron unit file itself is not modified.
 - `docs/atdd/scope-contracts/ATDD-SCOPE-MOVABLE-ACTIVE-POINTER-v1.md`: the active-increment pointer is deliberately movable; a completed increment must not permanently own it.
 - `docs/atdd/scope-contracts/ATDD-000-scope-control.md`: ATDD is subordinate to approved architecture; `UNAPPROVED SCOPE CHANGES` must be exactly `NONE`.
 
@@ -51,7 +51,7 @@ the authority boundary
 WHEN:
 it is inspected
 THEN:
-the contract enumerates each authority that must remain unchanged and each authority class this increment may not create, including funded trading, funded exchange order authority, Kraken order authority, Committee runtime authority, a second scheduler, a second allocation or reservation authority, and a second outcome or evidence truth system
+the FROZEN BOUNDARIES section enumerates each authority that must remain unchanged and each authority class this increment may not create, including funded trading, funded exchange order authority, Kraken order authority, Committee runtime authority, dashboard and Telegram trading authority, a second scheduler, and a second reservation, allocation, execution, outcome or evidence authority
 AC-005:
 GIVEN:
 the rollback and exclusion requirements
@@ -61,11 +61,11 @@ THEN:
 the contract names an exact rollback to the pre-integration orchestration (remove the hook and the composition module; no canonical-data migration) and lists explicit exclusions including no Feature Bus activation, no Paper-v2 activation, no F7 admission authority, no Committee runtime authority, no legacy retirement, no F11 bypass and no funded/exchange authority
 AC-006:
 GIVEN:
-the repository-controlled production configuration, the scheduler set and this increment's frozen artifact
+this increment's frozen artifact and the scheduler set
 WHEN:
 the freeze posture is audited
 THEN:
-the Feature Bus remains off and Paper-v2 remains unset in the repository compose configuration, exactly one active scheduler command invokes the unified cycle, this increment's contract and acceptance module introduce no funded, exchange, order-placement or Committee authority import, and the contract names the R4-B1 retry freeze as the identity/idempotency authority it preserves
+the contract records the B1 completion posture (Feature Bus off and Paper-v2 unset at completion), exactly one active scheduler command invokes the unified cycle, this increment's contract and acceptance module introduce no funded, exchange, order-placement or Committee authority import, and the contract names the R4-B1 retry freeze as the identity/idempotency authority it preserves
 
 EXPLICITLY OUT OF SCOPE:
 - Activating the Feature Bus, Paper-v2, F7 runtime admission, or the Committee
@@ -103,6 +103,9 @@ A missing or unreadable snapshot source, invalid lineage, F5 `VETO`, zero-model 
 Observability.
 The hook reports machine-readable evidence that the target composition is reachable when explicitly test-enabled and inert when off, so the difference between wired, test-enabled and authoritative is visible and cannot be inferred from the mere existence of a module.
 
+Authority boundary.
+R4-B1 runtime integration must not create, widen or imply: funded trading; funded exchange order authority; Kraken order placement, modification, cancellation or confirmation; margin, asset borrow or leverage; Committee runtime authority; dashboard trading authority; Telegram trading authority; or a second reservation, allocation, execution, outcome or evidence authority. Risk, strategy, execution, protection and admission authority are unchanged, and legacy remains the sole live admission and paper authority.
+
 Rollback.
 Rollback is exact: remove the `run_cycle` hook and the composition module, restoring the pre-integration `app.jobs.run_cycle` sequence with the gate still off and no canonical-data migration. Because the target path is non-authoritative and writes nothing canonical, rollback is a code revert and restores exactly one authority (the legacy path).
 
@@ -134,7 +137,7 @@ AC-006 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b1_runtime_integration_freeze.py
 
 DEFERRED DISCOVERIES:
 - The runtime wiring itself (the composition module, the gate setting, the `run_cycle` hook and their behavioral acceptance criteria and implementation map) is the next commit of this same increment and is not authorized by this freeze PR.
-- The R4-B0 assertion `test_composition_authority_targets_are_unchanged_on_disk` (in `tests/test_opip_r4_b0_spine_contract_closure.py`) asserts that `run_cycle` and `scan_opportunities` do not mention the target spine. Wiring will necessarily trip it. It must be reconciled as an explicitly recorded posture change (wiring present, authority unchanged) in the wiring commit, not deleted or weakened.
+- The R4-B0 assertion `test_composition_authority_targets_are_unchanged_on_disk` (in `tests/test_opip_r4_b0_spine_composition.py`) asserts that `run_cycle` and `scan_opportunities` do not mention the target spine. Wiring will necessarily trip it. It must be reconciled as an explicitly recorded posture change (wiring present, authority unchanged) in the wiring commit, not deleted or weakened.
 - Whether the real production snapshot source becomes a scheduled feature-bus capture or a read-only committed-snapshot provider is an owner decision; this increment forbids activating a capture source.
 - F11 protection ordering is a prerequisite for R4-B2 activation, not for this dormant wiring. This increment must not bypass it.
 - The exact provider that reads committed feature snapshots does not exist as a public read seam today; the wiring commit must define a read-only seam that creates no second evidence history.

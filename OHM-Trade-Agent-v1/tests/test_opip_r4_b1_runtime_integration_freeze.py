@@ -52,6 +52,16 @@ def _contract_text() -> str:
     return CONTRACT.read_text(encoding="utf-8")
 
 
+def _frozen_boundaries() -> str:
+    """The FROZEN BOUNDARIES section only, so authority assertions cannot pass
+    on the AC criterion text itself."""
+    text = _contract_text()
+    start = text.index("FROZEN BOUNDARIES:")
+    end = text.index("ACCEPTANCE TEST TRACEABILITY:")
+    assert start < end
+    return text[start:end]
+
+
 def _active_cron_commands(path: Path) -> list[str]:
     commands: list[str] = []
     for raw in path.read_text(encoding="utf-8").splitlines():
@@ -110,18 +120,18 @@ def test_ac_003_gate_posture_and_composition_seam():
 
 
 def test_ac_004_authority_boundary():
-    """ATDD-R4-B1-runtime-integration-dormant/AC-004: the contract enumerates each authority that must remain unchanged and each authority class this increment may not create."""
-    text = _contract_text()
+    """ATDD-R4-B1-runtime-integration-dormant/AC-004: the FROZEN BOUNDARIES section enumerates each authority that must remain unchanged and each authority class this increment may not create."""
+    frozen = _frozen_boundaries()
     for authority in (
         "funded trading",
         "funded exchange order authority",
-        "Kraken order authority",
         "Committee runtime authority",
-        "a second scheduler",
-        "a second allocation or reservation authority",
-        "a second outcome or evidence truth system",
+        "dashboard trading authority",
+        "Telegram trading authority",
+        "second scheduler",
+        "a second reservation, allocation, execution, outcome or evidence authority",
     ):
-        assert authority in text, authority
+        assert authority in frozen, authority
 
 
 def test_ac_005_rollback_and_exclusions():
@@ -130,7 +140,8 @@ def test_ac_005_rollback_and_exclusions():
     assert "Rollback." in text
     assert "remove the `run_cycle` hook and the composition module" in text
     assert "no canonical-data migration" in text
-    assert "Exclusions." in text
+    frozen = _frozen_boundaries()
+    assert "Exclusions." in frozen
     for exclusion in (
         "Feature Bus activation",
         "Paper-v2 activation",
@@ -142,7 +153,7 @@ def test_ac_005_rollback_and_exclusions():
         "F11 bypass",
         "hidden mode activation",
     ):
-        assert exclusion in text, exclusion
+        assert exclusion in frozen, exclusion
 
 
 def test_ac_006_current_posture_and_no_authority_import():
