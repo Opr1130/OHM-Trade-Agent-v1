@@ -95,6 +95,17 @@ class Settings(BaseSettings):
         default="off",
         pattern=r"^(off|active)$",
     )
+    # R4-B1 dormant target-spine integration. Default off, and "shadow" is the
+    # only value that lets the unified cycle compose the F3-F7 target spine at
+    # all. This is NON-AUTHORITATIVE: it composes and reports a disposition per
+    # snapshot and builds the deterministic F7 -> Paper-v2 handoff, but it never
+    # admits, reserves, orders, fills or protects, and it grants no ranking,
+    # alert, paper or exchange authority. An invalid value must fail Settings
+    # parsing rather than silently enabling the path.
+    opip_target_spine_mode: str = Field(
+        default="off",
+        pattern=r"^(off|shadow)$",
+    )
     # Module 2 Intelligence Committee. Default off; "shadow" is the only value
     # that permits committee work, and it is research-only: it collects and
     # evaluates independent model opinions and grants no ranking influence, no

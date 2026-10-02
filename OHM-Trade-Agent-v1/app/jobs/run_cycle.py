@@ -386,6 +386,49 @@ def _run_learning_fail_open() -> None:
         print("Learning reason:", learning.get("reason"))
 
 
+def _run_target_spine_fail_open() -> None:
+    """Compose the dormant F3-F7 target spine after real protection.
+
+    R4-B1: NON-AUTHORITATIVE and off by default. This rides the existing cycle
+    after the active-position and Paper-v2 protection phase - it never runs
+    before protection - and it writes nothing canonical. When the gate is off it
+    returns without composing at all. It grants no admission, reservation, order,
+    fill, protection, ranking or alert authority, and a failure here is reported
+    and never aborts the cycle.
+    """
+    try:
+        from app.services.target_spine_cycle import (
+            run_target_spine_cycle,
+            target_spine_enabled,
+        )
+
+        settings = get_settings()
+        if not target_spine_enabled(settings):
+            return
+        summary = run_target_spine_cycle(settings=settings)
+        # Reporting is inside the guard too: a malformed summary must not be able
+        # to abort the cycle, exactly like a composition failure.
+        print("O'Pip Target Spine (DORMANT, non-authoritative)")
+        print("Mode:", summary.mode)
+        print("Inert:", summary.inert)
+        if summary.reason:
+            print("Reason:", summary.reason)
+        print("Snapshot considerations:", summary.considered)
+        print("Selected:", summary.selected)
+        print("Abstained:", summary.abstained)
+        print("Vetoed:", summary.vetoed)
+        print("Cash/no-trade:", summary.cash_no_trade)
+        print("Handoffs built (not executed):", summary.handoffs_built)
+        print("Errors:", summary.errors)
+        for detail in summary.details:
+            print("  TARGET SPINE:", detail)
+    except Exception as exc:  # noqa: BLE001 - the dormant spine must not abort the cycle
+        print(
+            "O'Pip target spine (dormant) unavailable; production unaffected:",
+            f"{type(exc).__name__}: {exc}",
+        )
+
+
 def _run_broad_discovery_if_due(*, decision, entry_watch_ready: bool, settings) -> bool:
     """Run the authoritative broad discovery pass before optional workloads."""
     if decision.effective_mode != "SEARCH":
@@ -547,6 +590,9 @@ def _run_cycle_once() -> None:
     _run_event_intelligence_fail_open(settings=settings)
     _run_external_order_review_fail_open()
     _run_learning_fail_open()
+    # R4-B1 dormant target spine: last, and only after every protection and
+    # non-authoritative workload above. It is inert when the gate is off.
+    _run_target_spine_fail_open()
 
 
 def main() -> None:
