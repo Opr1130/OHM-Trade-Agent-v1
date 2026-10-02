@@ -53,7 +53,7 @@ the cutover preconditions
 WHEN:
 activation is evaluated
 THEN:
-activation is gated on F11 protection health proven, legacy drain READY (zero Freqtrade and Paper-v1 exposure), universe metadata present, direction coverage resolved (SHORT supported with equivalent proofs or an explicit owner LONG-only mandate), and the target spine reachable; a missing, unreadable or unproven gate withholds activation rather than defaulting favourable
+activation is gated on F11 protection health proven, legacy drain READY (zero Freqtrade exposure, zero Paper-v1 pending/open exposure, zero unresolved or quarantined Paper-v1 lifecycle, and zero retained legacy reserved capital), universe metadata present, direction coverage resolved (SHORT supported with equivalent proofs or an explicit owner LONG-only mandate), and the target spine reachable; a missing, unreadable or unproven gate withholds activation rather than defaulting favourable
 AC-005:
 GIVEN:
 the authority-collision requirement
@@ -81,7 +81,21 @@ the rollback requirement
 WHEN:
 rollback is inspected
 THEN:
-rollback restores exactly one authority (restore the mode to `off` so the legacy path resumes), never runs two allocation authorities, needs no canonical-data migration, and retains the former comparator artifacts without deleting obsolete code
+rollback restores exactly one authority, stops new target admissions immediately but withholds legacy new-entry authority until the rollback-ready gate proves no cross-authority collision, never runs two allocation authorities, needs no canonical-data migration, and retains the former comparator artifacts without deleting obsolete code
+AC-012:
+GIVEN:
+the fail-closed rollback transition
+WHEN:
+the rollback scenarios are enumerated
+THEN:
+the contract enumerates an open target position during rollback, a pending target reservation during rollback, a target terminal/reconciliation not complete during rollback, a clean fully-drained rollback, and proof that exactly one new-entry authority exists throughout the transition, and states that legacy new-entry authority resumes only after the rollback-ready gate proves the target exposure has drained or a proven collision mechanism makes it safe
+AC-013:
+GIVEN:
+the human-approved resumption requirement after a safety suspension
+WHEN:
+the resumption authority is inspected
+THEN:
+the contract states that stopping target admissions on UNSAFE/UNAVAILABLE is immediate while resumption is not, that protection continues during suspension, that a later healthy result alone does not resume new admissions, that resumption requires an explicit authorized resume gate, and that the owning authority is the incident lifecycle's owner-recovery-cycle policy rather than F11
 AC-009:
 GIVEN:
 the authority boundary and exclusions
@@ -128,8 +142,18 @@ Exactly one authority may create a new paper entry: the target Paper-v2 route, w
 Direction coverage (no silent LONG-only).
 The activated route must have an explicit direction disposition. The current router is LONG-only (`paper_v2_scan_router.py` `SUPPORTED_DIRECTION`) and the readiness probe reports the missing SHORT authority as a hard blocker (`SHORT_AUTHORITY_MISSING`). R4-B2 therefore requires that direction coverage be resolved, not assumed: either SHORT is supported on the activated route with equivalent proofs, or an explicit owner LONG-only paper mandate is recorded. A silently LONG-only activated route is not acceptable, and the `SHORT_AUTHORITY_MISSING` readiness blocker must be resolved or explicitly dispositioned before activation.
 
+Rollback (fail-closed transition).
+Stopping new Paper-v2 admissions is immediate: setting the mode to `off` (or an unreadable mode) stops new target entries at once. Restoring legacy new-entry authority is NOT immediate. While the target authority still owns any exposure - an open target position, a pending target admission or order, a committed target reservation, or an in-progress terminal reconciliation - legacy new-entry authority must remain withheld and the target path must keep managing, protecting and reconciling what it owns. Legacy new-entry authority may resume only after a deterministic rollback-ready gate proves that no cross-authority collision can occur: the target exposure has safely drained (no open position, no pending admission/order, no committed reservation, no in-progress terminal reconciliation), or a proven shared exposure/collision mechanism makes concurrent legacy admission safe. At every instant of the transition exactly one new-entry authority exists (none, or the draining target, or legacy) - never two. Rollback is completed by this switch and a code revert; it needs no canonical-data migration and does not delete the former comparator artifacts.
+
+Required rollback acceptance scenarios: an open target position during rollback; a pending target reservation during rollback; a target terminal/reconciliation not yet complete during rollback; a clean fully-drained rollback; and proof that exactly one new-entry authority exists throughout the transition.
+
 Cutover preconditions (fail closed).
-Activation requires, all objectively observed and failing closed when absent, unreadable or unproven: F11 protection health proven (no silent or unmanaged holding, coverage complete, protection-incident health proven, target protection not withholding); legacy drain READY (zero Freqtrade open trades and outstanding signals, zero Paper-v1 pending entries and open positions); universe metadata present; direction coverage resolved per the rule above; and the target spine reachable. A missing or unreadable gate withholds activation.
+Activation requires, all objectively observed and failing closed when absent, unreadable or unproven: F11 protection health proven (no silent or unmanaged holding, coverage complete, protection-incident health proven, target protection not withholding); legacy drain READY (zero Freqtrade open trades and outstanding signals, zero Paper-v1 pending entries and open positions, zero unresolved or quarantined Paper-v1 lifecycle, and zero retained legacy reserved capital); universe metadata present; direction coverage resolved per the rule above; and the target spine reachable. A missing or unreadable gate withholds activation. The drain is proven only when every legacy obligation class is cleared AND no legacy capital remains reserved: a retained legacy reservation with no counted obligation (for example an unresolved or quarantined lifecycle) is not drained.
+
+Human-approved resumption after a safety suspension.
+A suspended safety state is not cleared by an instantaneous healthy observation. When an already-active target route becomes suspended because protection is UNSAFE or UNAVAILABLE, target admissions are withheld, existing exposure keeps being protected, and a later healthy result alone does NOT resume new admissions. Resumption requires an explicit, authorized resume gate. F11 owns no such authority: the durable suspension and human-resumption authority is the incident lifecycle's owner-recovery-cycle policy (`app/services/system_incidents`, `requires_owner_recovery_cycles`).
+
+Required resumption acceptance scenario: unsafe/unavailable -> target admissions suspended -> protection continues -> subsequent health recovery alone does NOT resume new admissions -> explicit authorized resume gate -> admissions may resume only when all other gates are also healthy.
 
 Pre-cutover comparison evidence.
 Before the target authority replaces the legacy admission source, the increment must produce matched-window comparison evidence of the target selector against cash/no-trade and the frozen profit-ranking comparator, under matched capital, timing, execution model and fee policy, over the full intent population including no-fills and rejects. This is the evidence the recovery roadmap and retirement ledger name as the gate to flip admission; it is recorded before the legacy admission source is replaced, not assumed.
@@ -141,7 +165,7 @@ Retry and requalification.
 The activated path preserves the R4-B1 freeze in full: an exact retry is idempotent; a materially changed requalification is refused as a conflicting decision; no duplicate trade, reservation or disposition is created; committed ancestry and economics are immutable; ambiguity fails closed.
 
 Rollback.
-Rollback is exact and is a switch plus code revert: set the mode back to `off`, so the legacy path resumes as the single authority with no canonical-data migration. Rollback must never leave two allocation authorities running and must preserve the former comparator artifacts; obsolete code is not deleted by this increment.
+Rollback is fail-closed and is a switch plus code revert: setting the mode back to `off` stops new target admissions immediately, but the legacy path does not resume new entries until the rollback-ready gate proves no cross-authority collision can occur (see the fail-closed rollback transition above). Rollback must never leave two allocation authorities running and must preserve the former comparator artifacts; obsolete code is not deleted by this increment.
 
 Authority boundary.
 R4-B2 must not create, widen or imply: funded trading; funded exchange order authority; Kraken order placement, modification, cancellation or confirmation; margin, asset borrow or leverage; Committee runtime authority; dashboard or Telegram trading authority; a second scheduler; or a second paper/admission/reservation authority. Risk, strategy, execution and protection authority beyond the target paper path are unchanged.
@@ -151,13 +175,17 @@ AC-001 -> tests/test_opip_r4_b2_controlled_paper_activation.py::test_ac_001_cont
 AC-002 -> tests/test_opip_r4_b2_controlled_paper_activation.py::test_ac_002_activation_sequence_and_vocabulary
 AC-003 -> tests/test_opip_r4_b2_controlled_paper_activation.py::test_ac_003_single_new_entry_authority
 AC-004 -> tests/test_opip_r4_b2_controlled_paper_activation.py::test_ac_004_cutover_preconditions_fail_closed
+AC-004 -> tests/test_opip_r4_b2_controlled_paper_activation.py::test_ac_004_drain_requires_no_unresolved_or_reserved_legacy
 AC-005 -> tests/test_opip_r4_b2_controlled_paper_activation.py::test_ac_005_authority_collision_test_defined
 AC-006 -> tests/test_opip_r4_b2_controlled_paper_activation.py::test_ac_006_execution_proofs_enumerated
 AC-007 -> tests/test_opip_r4_b2_controlled_paper_activation.py::test_ac_007_retry_semantics_preserved
 AC-008 -> tests/test_opip_r4_b2_controlled_paper_activation.py::test_ac_008_rollback_restores_one_authority
+AC-008 -> tests/test_opip_r4_b2_controlled_paper_activation.py::test_ac_008_rollback_holds_legacy_until_drained
 AC-009 -> tests/test_opip_r4_b2_controlled_paper_activation.py::test_ac_009_authority_boundary_and_exclusions
 AC-010 -> tests/test_opip_r4_b2_controlled_paper_activation.py::test_ac_010_freeze_sets_no_mode_and_no_authority_import
 AC-011 -> tests/test_opip_r4_b2_controlled_paper_activation.py::test_ac_011_comparator_evidence_required
+AC-012 -> tests/test_opip_r4_b2_controlled_paper_activation.py::test_ac_012_rollback_transition_scenarios
+AC-013 -> tests/test_opip_r4_b2_controlled_paper_activation.py::test_ac_013_resume_requires_authorized_gate
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-paper-activation.md
@@ -168,6 +196,7 @@ AC-002 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_controlled_paper_activation.p
 AC-003 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-paper-activation.md
 AC-003 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_controlled_paper_activation.py
 AC-004 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-paper-activation.md
+AC-004 -> OHM-Trade-Agent-v1/app/services/paper_v2_cutover_readiness.py
 AC-004 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_controlled_paper_activation.py
 AC-005 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-paper-activation.md
 AC-005 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_controlled_paper_activation.py
@@ -183,6 +212,10 @@ AC-010 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-pap
 AC-010 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_controlled_paper_activation.py
 AC-011 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-paper-activation.md
 AC-011 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_controlled_paper_activation.py
+AC-012 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-paper-activation.md
+AC-012 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_controlled_paper_activation.py
+AC-013 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-paper-activation.md
+AC-013 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_controlled_paper_activation.py
 
 DEFERRED DISCOVERIES:
 - The activation implementation (wiring the target F7 selector as the admission source, the mode/cutover sequence and their behavioral acceptance criteria and implementation map) is a later commit of this same increment and is not authorized by this freeze.
