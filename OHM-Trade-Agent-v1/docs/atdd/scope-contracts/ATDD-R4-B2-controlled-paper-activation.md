@@ -145,6 +145,13 @@ WHEN:
 the durable wire record is built, validated and reconstructed
 THEN:
 the durable schema is explicit and frozen (not derived from the dataclass), persisting every substantive top-level field and every field of the nested MarketDataValidation and ExecutionValidation records so the exact typed F5 evidence can be reconstructed; the record carries the frozen F5 semantic `evidence_fingerprint` (FEV, unchanged, covering only the F5-normalized subset) AND an independent exact-content `payload_hash` (FEVH) computed over the complete canonical durable body excluding the hash itself, mirroring the Paper-v2 semantic-identity plus content-hash precedent; building requires a real FeasibilityEvidence, serializes all ratified fields and both nested typed records, and emits one deterministic wrapper; validation requires exact field sets (wrapper and body and both nested records), rejecting unknown fields, missing fields, wrong types, invalid enum/status tokens, malformed or naive datetimes, non-canonical nested structures, non-finite numbers and an invalid fingerprint or payload_hash, with no favorable defaults; reconstruction strictly rebuilds MarketDataValidation, ExecutionValidation and FeasibilityEvidence and performs three independent checks - the reconstructed F5 fingerprint, the rebuilt exact payload_hash, and canonical wrapper equality - where the third does not replace the second; a mutation of a field outside the F5 summary (for example ExecutionValidation.best_bid, mid_price, a depth field, a `*_complete` boolean or buy_vwap) leaves the F5 fingerprint unchanged yet changes payload_hash and is rejected; and the codec grants no trading, admission, reservation, execution or exchange authority, performs no market read and holds no clock
+AC-018:
+GIVEN:
+the canonical `feasibility.evidence.recorded` event and its single canonical writer
+WHEN:
+one committed F5 feasibility-evidence record is persisted and replayed
+THEN:
+it is a separate LOW-priority canonical evidence class with its own event vocabulary, watermark stream and idempotency prefix, owned by one canonical writer, deliberately NOT part of FEATURE_BUS_EVENT_TYPES, and grants no trading, admission, reservation, execution or exchange authority; it carries no ops handoff; the event is registered in the writer's EventType vocabulary and admitted into ACCEPTED_EVENT_TYPES and the full-payload conflict set; the writer validates the record at the persistence boundary (exact payload keys and discriminator, the frozen codec validator recomputing both identities, LOW priority, no ops handoff, and an idempotency key, event_time, correlation id and causation id that must match what the validated record itself implies, so a forger cannot decouple the envelope from the record); the idempotency key binds the record's evaluation identity (instrument version, venue instrument, direction, evaluation and cutoff instants, source snapshot id) together with its exact payload_hash and contains no recorded-at wall clock, receipt time, random envelope id, process id, retry count or database sequence, while the F5 evidence_fingerprint is retained separately for F5 lineage; a byte/content-equivalent retry reaches DUPLICATE_OK leaving exactly one canonical row, an equivalent non-canonical instant normalizes to the same durable bytes and key, materially different durable evidence yields a different key and a distinct record that never silently collapses into the first, a key from one record presented with a different record's payload fails closed, and a restarted writer over the same store treats an exact replay as DUPLICATE_OK
 
 EXPLICITLY OUT OF SCOPE:
 - Setting `OPIP_PAPER_V2_MODE=active` in production, or any activation, in this freeze PR
@@ -248,6 +255,17 @@ AC-017 -> tests/test_opip_r4_b2_feasibility_evidence_codec.py::test_ac_017_bad_f
 AC-017 -> tests/test_opip_r4_b2_feasibility_evidence_codec.py::test_ac_017_bad_datetime_rejected
 AC-017 -> tests/test_opip_r4_b2_feasibility_evidence_codec.py::test_ac_017_non_canonical_timestamp_rejected_consistently
 AC-017 -> tests/test_opip_r4_b2_feasibility_evidence_codec.py::test_ac_017_reconstruction_fails_closed_on_hash_mismatch
+AC-018 -> tests/test_opip_r4_b2_feasibility_evidence_event.py::test_ac_018_event_is_separate_low_priority_accepted_class
+AC-018 -> tests/test_opip_r4_b2_feasibility_evidence_event.py::test_ac_018_payload_round_trips_exact_evidence
+AC-018 -> tests/test_opip_r4_b2_feasibility_evidence_event.py::test_ac_018_idempotency_binds_evaluation_and_exact_content
+AC-018 -> tests/test_opip_r4_b2_feasibility_evidence_event.py::test_ac_018_malformed_or_naive_instant_is_rejected
+AC-018 -> tests/test_opip_r4_b2_feasibility_evidence_event.py::test_ac_018_equivalent_instant_normalizes_to_same_identity
+AC-018 -> tests/test_opip_r4_b2_feasibility_evidence_event.py::test_ac_018_exact_replay_is_duplicate_ok_with_one_row
+AC-018 -> tests/test_opip_r4_b2_feasibility_evidence_event.py::test_ac_018_materially_different_evidence_is_not_collapsed
+AC-018 -> tests/test_opip_r4_b2_feasibility_evidence_event.py::test_ac_018_envelope_cannot_decouple_from_record
+AC-018 -> tests/test_opip_r4_b2_feasibility_evidence_event.py::test_ac_018_writer_rejects_wrong_priority_and_ops_handoff
+AC-018 -> tests/test_opip_r4_b2_feasibility_evidence_event.py::test_ac_018_validator_rejects_forged_or_tampered_payload
+AC-018 -> tests/test_opip_r4_b2_feasibility_evidence_event.py::test_ac_018_restart_rehydrates_and_replays_as_duplicate
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-paper-activation.md
 AC-001 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
@@ -305,6 +323,10 @@ AC-016 -> OHM-Trade-Agent-v1/tests/test_opip_canonical_shadow_activation_v1.py
 AC-017 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-paper-activation.md
 AC-017 -> OHM-Trade-Agent-v1/app/opip/feasibility_evidence_record.py
 AC-017 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_feasibility_evidence_codec.py
+AC-018 -> OHM-Trade-Agent-v1/app/opip/fev_evidence_event.py
+AC-018 -> OHM-Trade-Agent-v1/app/opip/canonical/models.py
+AC-018 -> OHM-Trade-Agent-v1/app/opip/canonical/writer.py
+AC-018 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_feasibility_evidence_event.py
 
 DEFERRED DISCOVERIES:
 - The activation implementation (wiring the target F7 selector as the admission source, the mode/cutover sequence and their behavioral acceptance criteria and implementation map) is a later commit of this same increment and is not authorized by this freeze.
