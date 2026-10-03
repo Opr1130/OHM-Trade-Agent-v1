@@ -1,8 +1,8 @@
 # O'Pip Agent Guardrails
 
-Repository-level instructions for all coding agents (Cursor, Claude Code, and similar).
+Canonical repository engineering governance for Claude, DeepSeek, Gemini, OpenAI/Codex, Cursor, and VS Code agents.
 
-These rules **complement** and do **not** replace:
+These rules define shared engineering governance. Preserve the specialized controls in:
 
 - [`CLAUDE.md`](CLAUDE.md) — Claude Code contract (layout, engineering model, trading safety, quality, AI cost)
 - Existing deployment, CI, paper/Freqtrade, analytics, and promotion contracts under `OHM-Trade-Agent-v1/` and `.github/workflows/`
@@ -63,3 +63,33 @@ When principle 20 applies, state before implementing:
 3. Whether durable evidence/stores are written, migrated, or deleted.
 4. Which tests/CI contracts will prove the change is safe.
 5. What remains explicitly out of scope.
+
+## Shared authority and architecture
+
+- This file is the canonical shared engineering policy. Agent/editor adapters reference it; they do not create a second policy authority. Specialized contracts add detail and must not weaken these boundaries. Surface conflicts and stop affected work rather than silently selecting a weaker rule.
+- Architecture **v1.4.2 is authoritative when present** as a human-approved repository contract. Record its exact path and source revision before applying it. Do not invent missing content or substitute chat summaries for the contract. When absent, use the checked-in architecture baseline and record the gap; stop work that depends on missing v1.4.2 requirements.
+- Architecture authority does not authorize implementation scope. **PR #237 (`feature/pr3-feature-bus`) remains isolated from v1.4.2 scope injection.** Do not import v1.4.2 features, refactors, migrations, or acceptance requirements into it. Propose separate human-scoped work when needed. Governance documentation does not change PR #237's behavior or expand its scope.
+- This mandate is **paper-only; no funded trading authority**. Neither engineering AI nor runtime AI may place, confirm, modify, cancel, or authorize funded orders, mutate trading authority, or bypass deterministic controls. Earlier permission-expansion language in agent contracts is not authorization under this mandate. A different mandate requires a separate explicit human governance decision, outside this task.
+- AI is advisory/offline evidence only and has **no runtime trading authority**. Risk, admission, sizing, execution safety, and rejection are deterministic. Missing, stale, invalid, or unavailable inputs must never grant permission by default.
+- Promotion of models, parameters, policies, evidence, or releases into operational influence is human-controlled through existing gates. Evidence acceptance or passing tests is not promotion approval.
+
+## Point-in-time and canonical evidence
+
+- Use only facts available at the decision time, including publication/ingestion availability, revisions, and late arrivals. Future outcomes/labels must not enter features, policy selection, or historical replay decisions. Preserve chronological evaluation and the existing sealed-evaluation boundaries.
+- Maintain **one canonical history per fact**, with a stable identity, owner/writer, provenance, and explicit correction/supersession history. Derived views reference canonical facts; retries, overlapping windows, exports, and multiple agent reviews must not multiply evidence or create competing authority. Do not erase history to achieve deduplication.
+
+## Shared workspace discipline
+
+- Before edits, record the absolute repository root, branch, HEAD, and existing tracked/untracked changes. Inspect applicable agent and architecture files. Recheck the affected files before writing; pause on concurrent changes instead of overwriting them.
+- Preserve user changes. Never clean/reset the dirty tree, discard files, auto-stash, switch the shared branch, or include unrelated changes in a commit.
+- **DeepSeek stays read-only on the current shared branch.** It may edit only after isolation in a dedicated worktree with its own branch and explicit implementation scope. Do not relax existing review-only GitHub prompts. Other agents must coordinate file ownership or use separate worktrees for concurrent edits.
+- Editor settings or instruction files are guidance, not a security sandbox. If a client does not load repository instructions automatically, explicitly supply this file before work; never assume a filename alone enforces permissions.
+
+## Validation and release gates
+
+- Behavioral changes require focused regression tests and applicable contract/CI checks. Documentation-only changes require structural, link, and diff validation; do not change runtime files or generate runtime caches merely to validate documentation.
+- For stateful changes, explicitly assess and test **idempotency, replay determinism, duplicate/out-of-order delivery, concurrency/transaction ownership, crash recovery/partial writes, and fail-open/fail-closed behavior**. Record evidence for each applicable check; explain any not-applicable result. Safety/authority paths fail closed; any diagnostic fail-open path must remain non-authoritative and observable.
+- No destructive migrations, evidence deletion, or irreversible deployments without explicit human approval of the concrete plan, backup/restore implications, and recovery limits. Existing deployment approval requirements also apply to reversible deployments.
+- Immediately before merge, verify the current remote PR head equals the exact tested and reviewed full SHA, confirm required checks and resolved findings for that SHA, verify the target branch/base and integration result, and obtain human merge authorization. A stale local HEAD, historical SHA, or previous green run is insufficient. If head/base changes, repeat affected tests and final review; use an expected-head merge guard where supported and stop on mismatch.
+- Deploy only through the existing human-approved control plane for the exact approved and tested main SHA. Require a known rollback release, rollback procedure/triggers, migration compatibility, pre-deploy health baseline, and post-deploy health checks. Verify the actual running SHA and required core/learning release alignment. Failed health checks trigger the approved rollback or halt/escalation procedure, never a success claim.
+- The passive template at `docs/engineering/workflow.template.json` records work and evidence references; it executes nothing and grants no commit, merge, promotion, or deployment permission. See `docs/engineering/README.md` for transition gates.
