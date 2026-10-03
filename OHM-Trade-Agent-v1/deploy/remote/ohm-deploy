@@ -419,9 +419,8 @@ validate_release_scheduler_contract() {
   }
   echo "OPIP_FEATURE_BUS_LOCK_IDENTITY=$fb_identity"
   echo "OPIP_FEASIBILITY_LOCK_IDENTITY=$feas_identity"
-  # --- release-scheduler lock verification (end) ----------------------------
-
   echo "OPIP_RELEASE_SCHEDULER=UNIQUE_BOUNDED"
+  # --- release-scheduler lock verification (end) ----------------------------
 }
 
 wait_unified_cycle_success() {
