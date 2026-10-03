@@ -152,6 +152,13 @@ WHEN:
 one committed F5 feasibility-evidence record is persisted and replayed
 THEN:
 it is a separate LOW-priority canonical evidence class with its own event vocabulary, watermark stream and idempotency prefix, owned by one canonical writer, deliberately NOT part of FEATURE_BUS_EVENT_TYPES, and grants no trading, admission, reservation, execution or exchange authority; it carries no ops handoff; the event is registered in the writer's EventType vocabulary and admitted into ACCEPTED_EVENT_TYPES and the full-payload conflict set; the writer validates the record at the persistence boundary (exact payload keys and discriminator, the frozen codec validator recomputing both identities, LOW priority, no ops handoff, and an idempotency key, event_time, correlation id and causation id that must match what the validated record itself implies, so a forger cannot decouple the envelope from the record); the idempotency key binds the record's evaluation identity (instrument version, venue instrument, direction, evaluation and cutoff instants, source snapshot id) together with its exact payload_hash and contains no recorded-at wall clock, receipt time, random envelope id, process id, retry count or database sequence, while the F5 evidence_fingerprint is retained separately for F5 lineage; a byte/content-equivalent retry reaches DUPLICATE_OK leaving exactly one canonical row, an equivalent non-canonical instant normalizes to the same durable bytes and key, materially different durable evidence yields a different key and a distinct record that never silently collapses into the first, a key from one record presented with a different record's payload fails closed, and a restarted writer over the same store treats an exact replay as DUPLICATE_OK
+AC-019:
+GIVEN:
+the read seam over committed F5 feasibility evidence
+WHEN:
+a consumer reads committed feasibility.evidence.recorded records
+THEN:
+it opens the canonical store read-only through the existing read-only connection (no store lock, no schema initialization) and can never mutate, quarantine or rewrite canonical evidence; it reads only committed feasibility.evidence.recorded records in canonical (history_epoch, local_sequence) order and exposes a bounded, exclusive cursor so a consumer processes each record once, deterministically, and resumes after a restart without reclassifying old records as new; it validates each durable payload through the frozen event trust boundary and reconstructs the exact typed FeasibilityEvidence, recomputing both the F5 evidence_fingerprint and the exact-content payload_hash, so a payload whose declared identities do not match its content is rejected; it fails closed per record without aborting the batch (a malformed, tampered or corrupt record is counted and reported as rejected while unaffected valid records are still returned, and no error escapes as an unhandled exception); it dedupes deterministically by exact payload_hash; it fabricates nothing (an empty store yields an empty batch); and it holds no trading, admission, reservation, execution or exchange authority and performs no market read
 
 EXPLICITLY OUT OF SCOPE:
 - Setting `OPIP_PAPER_V2_MODE=active` in production, or any activation, in this freeze PR
@@ -266,6 +273,13 @@ AC-018 -> tests/test_opip_r4_b2_feasibility_evidence_event.py::test_ac_018_envel
 AC-018 -> tests/test_opip_r4_b2_feasibility_evidence_event.py::test_ac_018_writer_rejects_wrong_priority_and_ops_handoff
 AC-018 -> tests/test_opip_r4_b2_feasibility_evidence_event.py::test_ac_018_validator_rejects_forged_or_tampered_payload
 AC-018 -> tests/test_opip_r4_b2_feasibility_evidence_event.py::test_ac_018_restart_rehydrates_and_replays_as_duplicate
+AC-019 -> tests/test_opip_r4_b2_feasibility_evidence_reader.py::test_ac_019_reader_is_read_only_and_reconstructs_exact_evidence
+AC-019 -> tests/test_opip_r4_b2_feasibility_evidence_reader.py::test_ac_019_bounded_cursor_dedupes_and_preserves_order
+AC-019 -> tests/test_opip_r4_b2_feasibility_evidence_reader.py::test_ac_019_malformed_record_is_rejected_without_aborting_batch
+AC-019 -> tests/test_opip_r4_b2_feasibility_evidence_reader.py::test_ac_019_tampered_record_is_rejected
+AC-019 -> tests/test_opip_r4_b2_feasibility_evidence_reader.py::test_ac_019_non_json_committed_row_is_rejected_without_aborting_batch
+AC-019 -> tests/test_opip_r4_b2_feasibility_evidence_reader.py::test_ac_019_reader_holds_no_authority_and_never_mutates
+AC-019 -> tests/test_opip_r4_b2_feasibility_evidence_reader.py::test_ac_019_empty_store_yields_empty_batch
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-paper-activation.md
 AC-001 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
@@ -327,6 +341,9 @@ AC-018 -> OHM-Trade-Agent-v1/app/opip/fev_evidence_event.py
 AC-018 -> OHM-Trade-Agent-v1/app/opip/canonical/models.py
 AC-018 -> OHM-Trade-Agent-v1/app/opip/canonical/writer.py
 AC-018 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_feasibility_evidence_event.py
+AC-019 -> OHM-Trade-Agent-v1/app/opip/fev_evidence_reader.py
+AC-019 -> OHM-Trade-Agent-v1/app/opip/canonical/writer.py
+AC-019 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_feasibility_evidence_reader.py
 
 DEFERRED DISCOVERIES:
 - The activation implementation (wiring the target F7 selector as the admission source, the mode/cutover sequence and their behavioral acceptance criteria and implementation map) is a later commit of this same increment and is not authorized by this freeze.

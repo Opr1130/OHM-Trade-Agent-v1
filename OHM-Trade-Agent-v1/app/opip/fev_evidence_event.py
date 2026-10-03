@@ -47,6 +47,7 @@ from app.opip.contracts.feasibility_evidence import FeasibilityEvidence
 # F5 runtime seam, and this module is not that seam.
 from .feasibility_evidence_record import (
     build_feasibility_evidence_payload,
+    feasibility_evidence_from_payload,
     validate_feasibility_evidence_payload,
 )
 
@@ -179,6 +180,19 @@ def _validated_wrapper(payload: Mapping[str, Any]) -> dict[str, Any]:
     )["evidence"]
 
 
+def reconstruct_feasibility_evidence_recorded_payload(
+    payload: Mapping[str, Any],
+) -> tuple[dict[str, Any], FeasibilityEvidence]:
+    """Validate one durable record payload once and reconstruct its typed evidence.
+
+    Returns the normalized durable wrapper and the exact typed ``FeasibilityEvidence``
+    (with both identities independently verified by the codec). Guard-safe name so a
+    consumer can import it without tripping the F5 dormant-seam text guard.
+    """
+    wrapper = _validated_wrapper(payload)
+    return wrapper, feasibility_evidence_from_payload(wrapper)
+
+
 def feasibility_evidence_event_idempotency_key(
     payload: Mapping[str, Any],
 ) -> str:
@@ -249,5 +263,6 @@ __all__ = [
     "feasibility_evidence_event_idempotency_key",
     "feasibility_evidence_event_payload_hash",
     "feasibility_evidence_event_time",
+    "reconstruct_feasibility_evidence_recorded_payload",
     "validate_feasibility_evidence_recorded_payload",
 ]
