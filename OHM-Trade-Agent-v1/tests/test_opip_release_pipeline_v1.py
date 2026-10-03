@@ -34,6 +34,7 @@ _PROFILE_KEYS = (
     "OPIP_CANONICAL_WRITER_MODE",
     "OPIP_TARGET_SPINE_MODE",
     "OPIP_PAPER_V2_MODE",
+    "OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD",
 )
 
 
@@ -56,6 +57,7 @@ def test_ac_001_profile_allowlist_and_exact_modes() -> None:
         "OPIP_CANONICAL_WRITER_MODE": "off",
         "OPIP_TARGET_SPINE_MODE": "off",
         "OPIP_PAPER_V2_MODE": "off",
+        "OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD": "0.0",
     }
     evidence = resolve_release_profile("EVIDENCE_SHADOW")
     assert evidence["allowed_modes"] == {
@@ -63,6 +65,7 @@ def test_ac_001_profile_allowlist_and_exact_modes() -> None:
         "OPIP_CANONICAL_WRITER_MODE": "shadow",
         "OPIP_TARGET_SPINE_MODE": "shadow",
         "OPIP_PAPER_V2_MODE": "off",
+        "OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD": "1000.0",
     }
     assert resolve_release_profile("TARGET_PAPER")["status"] == "BLOCKED"
 
@@ -322,3 +325,78 @@ def test_ac_006_paper_v2_off_legacy_sole_authority() -> None:
     # The profile contract declares no widened authority.
     for name in ("SAFE_BASELINE", "EVIDENCE_SHADOW"):
         assert RELEASE_PROFILES[name]["expected_new_entry_authority"] == "LEGACY_ONLY"
+
+
+@pytest.mark.acceptance
+def test_ac_007_evidence_notional_is_repo_controlled() -> None:
+    """ATDD-RELEASE-PIPELINE-v1/AC-007: the F5 validation notional is a fixed repo-controlled EVIDENCE_SHADOW constant (1000.0); SAFE_BASELINE keeps capture disabled; arbitrary overrides are rejected."""
+    baseline = render_profile_environment("SAFE_BASELINE")
+    evidence = render_profile_environment("EVIDENCE_SHADOW")
+    assert baseline["OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD"] == "0.0"
+    assert evidence["OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD"] == "1000.0"
+
+    # The core service pins the exact profile value as a repo-controlled literal.
+    env = _core_env()
+    assert env["OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD"] == "1000.0"
+    assert 'OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD: "1000.0"' in COMPOSE.read_text(
+        encoding="utf-8"
+    )
+
+    # An arbitrary/free-form notional is refused for EVIDENCE_SHADOW...
+    ok, issues = validate_profile_contract(
+        "EVIDENCE_SHADOW",
+        requested_modes={"OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD": "5000.0"},
+    )
+    assert not ok
+    assert any("OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD" in issue for issue in issues)
+    # ...and any non-zero notional is refused for SAFE_BASELINE (capture disabled).
+    ok, issues = validate_profile_contract(
+        "SAFE_BASELINE",
+        requested_modes={"OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD": "1000.0"},
+    )
+    assert not ok
+
+    # The architecture gate passes with the fixed constant and fails on drift.
+    assert evaluate_architecture_gate("EVIDENCE_SHADOW", repo_root=APP_ROOT)["status"] == "PASS"
+    drifted = evaluate_architecture_gate(
+        "EVIDENCE_SHADOW",
+        repo_root=APP_ROOT,
+        environment={
+            "OPIP_FEATURE_BUS_MODE": "shadow",
+            "OPIP_CANONICAL_WRITER_MODE": "shadow",
+            "OPIP_TARGET_SPINE_MODE": "shadow",
+            "OPIP_PAPER_V2_MODE": "off",
+            "OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD": "5000.0",
+        },
+    )
+    assert drifted["status"] == "FAIL"
+    assert drifted["checks"]["CURRENT_RUNTIME_POSTURE_CONSISTENT"] is False
+
+
+@pytest.mark.acceptance
+def test_ac_007_capture_refuses_a_free_form_notional_override() -> None:
+    """ATDD-RELEASE-PIPELINE-v1/AC-007: the capture resolves the configured notional and refuses any --notional-usd override that differs from it."""
+    from types import SimpleNamespace
+
+    from app.jobs.capture_feasibility_evidence_shadow import resolve_capture_notional
+
+    configured = SimpleNamespace(opip_feasibility_capture_notional_usd=1000.0)
+    disabled = SimpleNamespace(opip_feasibility_capture_notional_usd=0.0)
+
+    # The configured value is used when no override is given.
+    assert resolve_capture_notional(configured) == (1000.0, None)
+    # A matching override is accepted.
+    assert resolve_capture_notional(configured, override=1000.0) == (1000.0, None)
+    # A differing override is refused.
+    assert resolve_capture_notional(configured, override=5000.0) == (
+        None,
+        "arbitrary notional override rejected",
+    )
+    # A disabled (SAFE_BASELINE) configuration refuses regardless of override.
+    assert resolve_capture_notional(disabled) == (None, "notional not configured")
+    assert resolve_capture_notional(disabled, override=1000.0) == (
+        None,
+        "arbitrary notional override rejected",
+    )
+    # A non-finite override is refused.
+    assert resolve_capture_notional(configured, override=float("nan"))[0] is None

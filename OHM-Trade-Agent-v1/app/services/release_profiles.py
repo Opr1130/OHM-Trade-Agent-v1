@@ -30,6 +30,8 @@ RELEASE_PROFILES: dict[str, dict[str, Any]] = {    "SAFE_BASELINE": {
             "OPIP_CANONICAL_WRITER_MODE": "off",
             "OPIP_TARGET_SPINE_MODE": "off",
             "OPIP_PAPER_V2_MODE": "off",
+            # SAFE_BASELINE keeps F5 feasibility evidence capture disabled.
+            "OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD": "0.0",
         },
         "prerequisites": [
             "Exact main SHA is known.",
@@ -58,6 +60,11 @@ RELEASE_PROFILES: dict[str, dict[str, Any]] = {    "SAFE_BASELINE": {
             "OPIP_CANONICAL_WRITER_MODE": "shadow",
             "OPIP_TARGET_SPINE_MODE": "shadow",
             "OPIP_PAPER_V2_MODE": "off",
+            # Fixed evidence constant for the first prospective epoch: the F5
+            # validation notional, measured at the intended paper trade size
+            # (1,000 USD of a 10,000 USD starting equity). Never derived from live
+            # equity and never varied within an epoch.
+            "OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD": "1000.0",
         },
         "prerequisites": [
             "Exact main SHA must be approved.",
@@ -92,6 +99,7 @@ RELEASE_PROFILES: dict[str, dict[str, Any]] = {    "SAFE_BASELINE": {
             "OPIP_CANONICAL_WRITER_MODE": "shadow",
             "OPIP_TARGET_SPINE_MODE": "shadow",
             "OPIP_PAPER_V2_MODE": "active",
+            "OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD": "1000.0",
         },
         "prerequisites": [
             "F6 artifact evidence is complete.",
@@ -232,6 +240,9 @@ def _runtime_posture_from_environment(env: Mapping[str, Any] | None = None) -> d
         "OPIP_TARGET_SPINE_MODE": str(environment.get("OPIP_TARGET_SPINE_MODE", "off")),
         "OPIP_PAPER_V2_MODE": environment.get("OPIP_PAPER_V2_MODE", "off"),
         "OPIP_COMMITTEE_MODE": str(environment.get("OPIP_COMMITTEE_MODE", "off")),
+        "OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD": str(
+            environment.get("OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD", "0.0")
+        ),
     }
 
 
@@ -276,11 +287,11 @@ def evaluate_architecture_gate(
         "PAPER_V2_REMAINS_OFF": runtime["OPIP_PAPER_V2_MODE"] == "off",
         "RELEASE_PROFILE_ALLOWLIST_VALID": profile["status"] == "ACTIVE",
         "STALE_ENV_CANNOT_ACTIVATE_DORMANT_AUTHORITY": runtime["OPIP_FEATURE_BUS_MODE"] != "active",
-        "CURRENT_RUNTIME_POSTURE_CONSISTENT": (
-            runtime["OPIP_FEATURE_BUS_MODE"] == profile["allowed_modes"]["OPIP_FEATURE_BUS_MODE"]
-            and runtime["OPIP_CANONICAL_WRITER_MODE"] == profile["allowed_modes"]["OPIP_CANONICAL_WRITER_MODE"]
-            and runtime["OPIP_TARGET_SPINE_MODE"] == profile["allowed_modes"]["OPIP_TARGET_SPINE_MODE"]
-            and runtime["OPIP_PAPER_V2_MODE"] == profile["allowed_modes"]["OPIP_PAPER_V2_MODE"]
+        # Compare EVERY allowlisted mode key (including the fixed notional) so the
+        # configured evidence constants cannot silently drift from the profile.
+        "CURRENT_RUNTIME_POSTURE_CONSISTENT": all(
+            str(runtime.get(key, "")) == str(expected)
+            for key, expected in profile["allowed_modes"].items()
         ),
         "ATDD_SCOPE_PASS": True,
     }

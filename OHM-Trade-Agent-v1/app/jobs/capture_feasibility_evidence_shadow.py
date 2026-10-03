@@ -213,6 +213,28 @@ def feasibility_capture_authorized(settings: Any) -> bool:
     )
 
 
+def resolve_capture_notional(
+    settings: Any, *, override: float | None = None
+) -> tuple[float | None, str | None]:
+    """Resolve the F5 validation notional. The configured value is the sole authority.
+
+    The notional is a repo-controlled evidence constant (the release profile sets
+    it; `SAFE_BASELINE` sets it to zero, which disables capture). A free-form
+    `--notional-usd` override that differs from the configured value is refused,
+    so an arbitrary notional can never influence an evidence epoch. Returns
+    ``(notional, None)`` on success or ``(None, reason)`` when refused.
+    """
+    configured = float(getattr(settings, "opip_feasibility_capture_notional_usd", 0.0) or 0.0)
+    if override is not None:
+        if not (float(override) == float(override)):  # NaN guard
+            return (None, "notional override is not finite")
+        if float(override) != configured:
+            return (None, "arbitrary notional override rejected")
+    if not (configured == configured and configured > 0):
+        return (None, "notional not configured")
+    return (configured, None)
+
+
 def _inert_summary(mode: str, reason: str) -> FeasibilityCaptureSummary:
     return FeasibilityCaptureSummary(mode=mode, enabled=False, inert=True, reason=reason)
 
@@ -819,15 +841,11 @@ def main() -> None:
         )
         return
 
-    notional = (
-        float(args.notional_usd)
-        if args.notional_usd is not None
-        else float(
-            getattr(settings, "opip_feasibility_capture_notional_usd", 0.0) or 0.0
-        )
+    notional, reason = resolve_capture_notional(
+        settings, override=args.notional_usd
     )
-    if not (notional == notional and notional > 0):
-        print(json.dumps({"status": "REFUSED", "reason": "notional not configured"}))
+    if reason is not None:
+        print(json.dumps({"status": "REFUSED", "reason": reason}))
         return
 
     from app.exchanges.kraken import KrakenClient
@@ -893,4 +911,5 @@ __all__ = [
     "discover_short_margin",
     "feasibility_capture_authorized",
     "main",
+    "resolve_capture_notional",
 ]
