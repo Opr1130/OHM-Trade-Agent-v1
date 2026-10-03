@@ -363,8 +363,57 @@ validate_release_scheduler_contract() {
     return 1
   fi
 
-  grep -Fq 'FEATURE_BUS_CAPTURE_LOCK_PATH' "$APP_ROOT/app/jobs/capture_feature_bus_shadow.py"
-  grep -Fq 'FEASIBILITY_CAPTURE_LOCK_PATH' "$APP_ROOT/app/jobs/capture_feasibility_evidence_shadow.py"
+  # --- release-scheduler lock verification (begin) --------------------------
+  # Each evidence producer holds its OWN in-container process-level advisory
+  # lock with a DISTINCT identity, so neither can suppress the other while each
+  # still guarantees at most one of its own runs. A host `flock` alone cannot
+  # prove this: killing the host Docker client does not reliably terminate the
+  # process created inside the already-running container. The guard is therefore
+  # verified against the producer SOURCES explicitly and diagnostically (a bare
+  # `grep -Fq` under `set -e` fails silently and caused a release abort).
+  local fb_producer feas_producer fb_identity feas_identity lock_assignment
+  fb_producer="$APP_ROOT/app/jobs/capture_feature_bus_shadow.py"
+  feas_producer="$APP_ROOT/app/jobs/capture_feasibility_evidence_shadow.py"
+
+  [[ -s "$fb_producer" ]] || {
+    echo "Feature Bus producer source is missing: $fb_producer" >&2
+    return 1
+  }
+  [[ -s "$feas_producer" ]] || {
+    echo "feasibility producer source is missing: $feas_producer" >&2
+    return 1
+  }
+
+  # 1. Each producer defines a process-level lock and a locked capture entrypoint.
+  for required in 'class CaptureProcessLock' 'run_capture_locked'; do
+    grep -Fq "$required" "$fb_producer" || {
+      echo "Feature Bus process-level lock guard is missing: $required" >&2
+      return 1
+    }
+  done
+
+  # 2. Each producer's lock identity is a real path assignment, not a mention.
+  lock_assignment='^[A-Z_]*LOCK_PATH[[:space:]]*=[[:space:]]*"[^"]+"'
+  fb_identity="$(grep -oE "$lock_assignment" "$fb_producer" | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')"
+  feas_identity="$(grep -oE "$lock_assignment" "$feas_producer" | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')"
+  [[ -n "$fb_identity" ]] || {
+    echo "Feature Bus lock identity path is not defined in $fb_producer" >&2
+    return 1
+  }
+  [[ -n "$feas_identity" ]] || {
+    echo "feasibility lock identity path is not defined in $feas_producer" >&2
+    return 1
+  }
+
+  # 3. The two producers' lock identities must be DISTINCT.
+  [[ "$fb_identity" != "$feas_identity" ]] || {
+    echo "Feature Bus and feasibility producers share a lock identity: $fb_identity" >&2
+    return 1
+  }
+  echo "OPIP_FEATURE_BUS_LOCK_IDENTITY=$fb_identity"
+  echo "OPIP_FEASIBILITY_LOCK_IDENTITY=$feas_identity"
+  # --- release-scheduler lock verification (end) ----------------------------
+
   echo "OPIP_RELEASE_SCHEDULER=UNIQUE_BOUNDED"
 }
 

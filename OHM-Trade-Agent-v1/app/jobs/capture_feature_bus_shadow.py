@@ -383,7 +383,16 @@ def capture_feature_bus_shadow(
 #: This file is therefore locked by the capture process itself, which guarantees
 #: the invariant directly: at most one ``capture_feature_bus_shadow`` process
 #: executes inside the container at any instant. Overridable for tests.
-DEFAULT_PROCESS_LOCK_PATH = "/tmp/opip-feature-bus-capture.lock"
+#: The Feature Bus producer's process-level lock IDENTITY (path). Named for its
+#: producer so the two evidence producers' lock identities are explicit and
+#: provably distinct, mirroring ``FEASIBILITY_CAPTURE_LOCK_PATH`` in the
+#: feasibility producer. Overridable for tests.
+FEATURE_BUS_CAPTURE_LOCK_PATH = "/tmp/opip-feature-bus-capture.lock"
+
+#: Backwards-compatible alias for the Feature Bus lock identity. The canonical
+#: name is :data:`FEATURE_BUS_CAPTURE_LOCK_PATH`; this alias remains so existing
+#: importers keep working. Do not introduce a second identity here.
+DEFAULT_PROCESS_LOCK_PATH = FEATURE_BUS_CAPTURE_LOCK_PATH
 
 
 def _try_lock_fd(fd: int) -> bool:
@@ -479,7 +488,7 @@ def run_capture_locked(
     lock_path: str | None = None,
     capture_fn: Callable[[], FeatureBusCaptureSummary] | None = None,
     lock_env: str = "OPIP_FEATURE_BUS_CAPTURE_LOCK",
-    lock_default: str = DEFAULT_PROCESS_LOCK_PATH,
+    lock_default: str = FEATURE_BUS_CAPTURE_LOCK_PATH,
 ) -> dict[str, Any]:
     """Run one capture pass guarded by the process-level non-overlap lock.
 
@@ -522,6 +531,7 @@ __all__ = [
     "DEFAULT_CAPTURE_LIMIT",
     "DEFAULT_CONCURRENCY",
     "DEFAULT_PROCESS_LOCK_PATH",
+    "FEATURE_BUS_CAPTURE_LOCK_PATH",
     "FeatureBusCaptureSummary",
     "MAX_BUDGET_SECONDS",
     "MAX_CAPTURE_LIMIT",

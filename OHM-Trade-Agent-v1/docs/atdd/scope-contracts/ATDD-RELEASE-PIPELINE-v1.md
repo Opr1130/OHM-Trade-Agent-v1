@@ -106,6 +106,14 @@ the existing `ohm-deploy` rollback runs
 THEN:
 it restores the previous code SHA but overlays explicit SAFE_BASELINE literals for Feature Bus, writer, target spine, Paper-v2 and Committee and sets feasibility-capture notional to `0.0`; core, writer and paper topology health must pass and the running core's effective mode literals must be re-read before the host emits `OPIP_SAFE_BASELINE_ROLLBACK=SUCCESS`; otherwise rollback remains unproven and the workflow fails closed; the deployment receipt cannot report runtime success without the exact approved SHA, runtime marker, capture, protection, scheduler and rollback dispositions
 
+AC-012:
+GIVEN:
+the deploy-time release-scheduler contract verification and the two bounded evidence producers
+WHEN:
+the scheduler lock invariant is verified
+THEN:
+the verification checks the REAL invariant rather than a stale symbol name: each producer defines an in-container process-level advisory lock (`class CaptureProcessLock`) and a locked capture entrypoint (`run_capture_locked`); each producer's lock identity is a genuine path assignment; the Feature Bus identity (`FEATURE_BUS_CAPTURE_LOCK_PATH`, with `DEFAULT_PROCESS_LOCK_PATH` retained as a same-value backwards-compatible alias) is DISTINCT from the feasibility identity (`FEASIBILITY_CAPTURE_LOCK_PATH`); and the host cron locks remain unique and bounded (one `flock -n` entry per producer on its own `/var/run` lock, no duplicate command in root crontab); the check is explicit and diagnostic (each failure names the missing guard or the shared identity on stderr and returns non-zero) rather than a silent `grep -Fq` that aborts the release; it emits `OPIP_RELEASE_SCHEDULER=UNIQUE_BOUNDED` on success; an adversarial test runs the actual verification logic against the real producer sources and proves it fails closed when the process-lock guard is removed, when the lock identity is undefined, and when the two producers share an identity; and the change alters no release profile, mode, capture authorization, notional, or trading/paper/funded/Committee authority
+
 EXPLICITLY OUT OF SCOPE:
 - Activating TARGET_PAPER, Paper-v2, the Committee, or any funded/live/exchange/order authority
 - Deleting, rewriting or rescoping the historical ATDD increments that recorded the Feature Bus `off`
@@ -136,6 +144,9 @@ AC-006 -> tests/test_opip_release_pipeline_v1.py::test_ac_006_paper_v2_off_legac
 AC-007 -> tests/test_opip_release_pipeline_v1.py::test_ac_007_evidence_notional_is_repo_controlled
 AC-007 -> tests/test_opip_release_pipeline_v1.py::test_ac_007_capture_refuses_a_free_form_notional_override
 AC-007 -> tests/test_opip_release_pipeline_v1.py::test_ac_007_read_only_canonical_evidence_verifier
+AC-012 -> tests/test_release_scheduler_lock_verifier.py::test_ac_012_verifier_checks_the_real_lock_invariant
+AC-012 -> tests/test_release_scheduler_lock_verifier.py::test_ac_012_feature_bus_lock_identity_is_present_and_distinct
+AC-012 -> tests/test_release_scheduler_lock_verifier.py::test_ac_012_verifier_accepts_the_real_producers_and_fails_on_weakening
 AC-008 -> tests/test_opip_release_pipeline_v1.py::test_ac_008_ci_gate_and_main_candidate_are_non_deploying
 AC-009 -> tests/test_opip_release_pipeline_v1.py::test_ac_009_profile_approval_is_owner_only_exact_sha_and_gated
 AC-009 -> tests/test_release_runtime_verifier.py::test_safe_baseline_is_not_a_deploy_candidate
@@ -214,6 +225,10 @@ AC-010 -> OHM-Trade-Agent-v1/tests/test_opip_streaming_safety_v1.py
 AC-010 -> OHM-Trade-Agent-v1/tests/test_opip_canonical_writer_pr2.py
 AC-011 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
 AC-011 -> .github/workflows/deploy-production.yml
+AC-012 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
+AC-012 -> OHM-Trade-Agent-v1/app/jobs/capture_feature_bus_shadow.py
+AC-012 -> OHM-Trade-Agent-v1/tests/test_release_scheduler_lock_verifier.py
+AC-012 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
 
 DEFERRED DISCOVERIES:
 - `TARGET_PAPER` remains BLOCKED. Activating it (Paper-v2) requires the ATDD-R4-B2 AC-011 comparator evidence, F11 protection READY, legacy drain READY and explicit OWNER approval, and is a separate OWNER increment; this contract does not authorize it.
