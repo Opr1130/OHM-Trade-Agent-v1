@@ -120,7 +120,7 @@ def test_ac_015_cursor_is_commit_order_across_batches(canonical_env, writer_serv
 
 
 def test_ac_015_bounded_cursor_and_dedupe(canonical_env, writer_server):
-    """ATDD-R4-B2-controlled-paper-activation/AC-015: the cursor bounds each batch and advances deterministically; a re-read never reclassifies a committed snapshot as new."""
+    """ATDD-R4-B2-controlled-paper-activation/AC-015: the cursor bounds each batch and advances deterministically; the reader is stateless so dedupe is owned by the caller's exclusive cursor."""
     client = InProcessWriterClient(writer_server)
     originals = [_snapshot(minute=m) for m in (0, 1, 2, 3, 4)]
     _publish(client, originals)
@@ -134,9 +134,14 @@ def test_ac_015_bounded_cursor_and_dedupe(canonical_env, writer_server):
     read_ids = [s.snapshot_id for s in first.snapshots + second.snapshots]
     assert read_ids == [s.snapshot_id for s in originals[:4]]
 
-    # Re-reading an earlier range surfaces nothing new: dedupe is by identity.
+    # The reader is stateless: dedupe is owned by the caller's exclusive cursor.
+    # Re-reading from an earlier cursor deterministically re-surfaces the same
+    # committed rows again, and the reader holds no unbounded dedupe set.
     replayed = reader.read_batch(after=None, limit=2)
-    assert replayed.snapshots == ()
+    assert [s.snapshot_id for s in replayed.snapshots] == [
+        s.snapshot_id for s in originals[:2]
+    ]
+    assert replayed.cursor == first.cursor
     reader.close()
 
 
