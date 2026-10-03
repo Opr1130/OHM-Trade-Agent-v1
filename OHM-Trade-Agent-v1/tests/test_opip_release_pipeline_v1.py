@@ -400,3 +400,13 @@ def test_ac_007_capture_refuses_a_free_form_notional_override() -> None:
     )
     # A non-finite override is refused.
     assert resolve_capture_notional(configured, override=float("nan"))[0] is None
+    assert resolve_capture_notional(configured, override=float("inf"))[0] is None
+    # A non-numeric override is refused, not raised.
+    assert resolve_capture_notional(configured, override="not-a-number")[0] is None
+    # A non-finite or non-numeric *configured* value is refused (fail closed).
+    assert resolve_capture_notional(
+        SimpleNamespace(opip_feasibility_capture_notional_usd=float("inf"))
+    ) == (None, "notional not configured")
+    assert resolve_capture_notional(
+        SimpleNamespace(opip_feasibility_capture_notional_usd="bogus")
+    )[0] is None

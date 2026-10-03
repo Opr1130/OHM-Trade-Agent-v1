@@ -51,6 +51,7 @@ exchange authority.
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -224,13 +225,21 @@ def resolve_capture_notional(
     so an arbitrary notional can never influence an evidence epoch. Returns
     ``(notional, None)`` on success or ``(None, reason)`` when refused.
     """
-    configured = float(getattr(settings, "opip_feasibility_capture_notional_usd", 0.0) or 0.0)
+    configured_raw = getattr(settings, "opip_feasibility_capture_notional_usd", 0.0) or 0.0
+    try:
+        configured = float(configured_raw)
+    except (TypeError, ValueError):
+        return (None, "configured notional is not a number")
     if override is not None:
-        if not (float(override) == float(override)):  # NaN guard
+        try:
+            override_value = float(override)
+        except (TypeError, ValueError):
+            return (None, "notional override is not a number")
+        if not math.isfinite(override_value):
             return (None, "notional override is not finite")
-        if float(override) != configured:
+        if override_value != configured:
             return (None, "arbitrary notional override rejected")
-    if not (configured == configured and configured > 0):
+    if not math.isfinite(configured) or configured <= 0:
         return (None, "notional not configured")
     return (configured, None)
 
