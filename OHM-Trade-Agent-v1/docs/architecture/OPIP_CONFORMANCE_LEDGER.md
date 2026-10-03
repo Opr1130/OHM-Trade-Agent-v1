@@ -4,6 +4,10 @@ Historical audit base: `a416be0a068dc58543a4b6cd254d5c42fcaf4c96`
 
 Current reconciled code/production baseline: `facf8e369e1251697bf9799bc9b1c575a9cdc3ec`
 
+Reconciled code baseline (R4-B2 status reconciliation, 2026-10-03): `a808e84ffc2fea4912cfa5592927d1afe2956568`
+
+The superseded status values recorded at the earlier baseline `facf8e36` are preserved as history in each row below; a corrected value never erases what was previously recorded.
+
 Architecture source: v1.4.3 DOCX pinned in `docs/architecture/v1.4.3/SOURCE.md`.
 
 Runtime observations are summarized here and detailed in `OPIP_RUNTIME_TRUTH_2026-09-28.md`, with `OPIP_RUNTIME_TRUTH_2026-09-27.md` preserved as the preceding historical observation. Code status is from the current reconciled baseline unless a row says otherwise. A green test is not production proof. The reconciliation updates status only where evidence changed; it does not convert absence of evidence into completion.
@@ -56,13 +60,13 @@ Status values: `IMPLEMENTED_VERIFIED`, `IMPLEMENTED_NOT_ACTIVE`, `IMPLEMENTED_AW
 | Field | Evidence |
 | --- | --- |
 | ARCHITECTURE_REQUIREMENT | IGNITION is the sole detector family. `evaluate` is a pure function of FeatureSnapshot, prior DetectorState, and evaluation_time. No I/O, hidden clock, or global mutable state. |
-| CURRENT_IMPLEMENTATION | Contract and fixture only: `docs/architecture/v1.2/D_DETECTOR_CONTRACT.md`, `fixtures/detector_evaluate.example.json`. No `class DetectorState` under `app/`. |
+| CURRENT_IMPLEMENTATION | Target detector implemented as the pure module `app/opip/detectors/ignition.py` (shadow / dormant: no runtime authority, not wired into `run_cycle`). Historical at baseline `facf8e36`: contract and fixture only, no `class DetectorState` under `app/`, recorded status `MISSING`. |
 | CURRENT_OWNER | None for the target runtime |
 | CURRENT_WRITER | None |
 | CURRENT_CONSUMERS | None |
 | CURRENT_RUNTIME_AUTHORITY | None |
-| TEST_EVIDENCE | Contract fixture tests only |
-| IMPLEMENTATION_STATUS | `MISSING` |
+| TEST_EVIDENCE | F3 detector tests in `tests/test_opip_r3_f3_ignition_detector.py` and `tests/test_opip_r3_f3_ignition_implementation.py`; contract fixture tests |
+| IMPLEMENTATION_STATUS | `SHADOW` |
 | DUPLICATE_OR_OVERLAPPING_PATHS | `app/services/explosion_state.py` uses the string `IGNITION` as a phase label. That is not DetectorState. |
 | TARGET_AUTHORITY | IGNITION detector runtime |
 | CUTOVER_GATE | Deterministic replay of snapshot + prior state + evaluation_time, shadow only, after Feature Bus evidence exists |
@@ -76,7 +80,7 @@ Status values: `IMPLEMENTED_VERIFIED`, `IMPLEMENTED_NOT_ACTIVE`, `IMPLEMENTED_AW
 | Field | Evidence |
 | --- | --- |
 | ARCHITECTURE_REQUIREMENT | One episode lifecycle: dedup, deferral, deadline, expiry, terminal reason. |
-| CURRENT_IMPLEMENTATION | Fragmented. Live walk is `app/jobs/scan_opportunities.py`. Shadow funnel is `app/opip/decision/funnel.py` and `store.py`. Other clocks: `entry_watch_queue.py`, `price_movement_radar.py`, `monitor_pending_setups.py`, `signal_quality_phase2.py` `MoveEpisode`, `app/opip/early/timing_ledger.py`. |
+| CURRENT_IMPLEMENTATION | Fragmented. Live walk is `app/jobs/scan_opportunities.py`. Shadow funnel is `app/opip/decision/funnel.py` and `store.py`. Other clocks: `entry_watch_queue.py`, `price_movement_radar.py`, `monitor_pending_setups.py`, `signal_quality_phase2.py` `MoveEpisode`, `app/opip/early/timing_ledger.py`. The target lifecycle now exists as `app/opip/opportunity_lifecycle.py` (+ `opportunity_persistence.py`), shadow / dormant. |
 | CURRENT_OWNER | `scan_opportunities` for live admission. Decision engine docstring says it is not authoritative. |
 | CURRENT_WRITER | Scan plus JSONL funnel store |
 | CURRENT_CONSUMERS | Alerts, paper routing, dashboard funnel |
@@ -96,7 +100,7 @@ Status values: `IMPLEMENTED_VERIFIED`, `IMPLEMENTED_NOT_ACTIVE`, `IMPLEMENTED_AW
 | Field | Evidence |
 | --- | --- |
 | ARCHITECTURE_REQUIREMENT | Market, data, liquidity, and execution constraints. Veto or abstain. Missing evidence is never favorable. `INSUFFICIENT_EVIDENCE` is an allowed abstention. |
-| CURRENT_IMPLEMENTATION | Spread across `market_data_validation.py`, margin and short tradeability checks, `execution_validation.py`, `target_attainability.py`, `economic_quality_gate.py`, `portfolio_risk.py`, `trade_action_gate.py`, `app/services/risk.py`. `app/opip/decision/gates.py` adapts the same evaluators in shadow. Chase risk is advisory and is not on the scan admission path. |
+| CURRENT_IMPLEMENTATION | Spread across `market_data_validation.py`, margin and short tradeability checks, `execution_validation.py`, `target_attainability.py`, `economic_quality_gate.py`, `portfolio_risk.py`, `trade_action_gate.py`, `app/services/risk.py`. `app/opip/decision/gates.py` adapts the same evaluators in shadow. Chase risk is advisory and is not on the scan admission path. The target seam now exists as `app/opip/feasibility.py` (+ `app/opip/feasibility_evidence_record.py`, `fev_evidence_event.py`, `fev_evidence_reader.py`), shadow / non-authoritative. |
 | CURRENT_OWNER | Scanner and service gates |
 | CURRENT_WRITER | Scan decisions and funnel telemetry |
 | CURRENT_CONSUMERS | Alert and paper admission |
@@ -116,19 +120,19 @@ Status values: `IMPLEMENTED_VERIFIED`, `IMPLEMENTED_NOT_ACTIVE`, `IMPLEMENTED_AW
 | Field | Evidence |
 | --- | --- |
 | ARCHITECTURE_REQUIREMENT | Execution-aware probability, expected return, uncertainty, and validity horizon. No allocation. LLM confidence is not a probability. |
-| CURRENT_IMPLEMENTATION | No `ForecastEngine`. Decision records set `calibrated_probability: False`. Economic gate is pass/fail on move, net profit, and reward-to-risk. Committee confidence is an ordinal 0–100. |
+| CURRENT_IMPLEMENTATION | No `ForecastEngine` in the live runtime. Decision records set `calibrated_probability: False`. Economic gate is pass/fail on move, net profit, and reward-to-risk. Committee confidence is an ordinal 0–100. The target engine now exists as `app/opip/forecast.py` (+ `app/opip/forecast_evaluation.py`, `app/opip/forecast_labels.py`), shadow / non-authoritative: the production model registry ships empty and returns `INSUFFICIENT_EVIDENCE` / `NO_CALIBRATED_MODEL`. Historical at baseline `facf8e36` this row recorded status `MISSING`. |
 | CURRENT_OWNER | None |
 | CURRENT_WRITER | None |
 | CURRENT_CONSUMERS | None |
 | CURRENT_RUNTIME_AUTHORITY | None |
-| TEST_EVIDENCE | Decision records assert probability is not calibrated |
-| IMPLEMENTATION_STATUS | `MISSING` |
+| TEST_EVIDENCE | F6 forecast-engine and forecast-evaluation tests; decision records assert probability is not calibrated |
+| IMPLEMENTATION_STATUS | `SHADOW` |
 | DUPLICATE_OR_OVERLAPPING_PATHS | Ranking score, alert confidence, Committee rubric score |
 | TARGET_AUTHORITY | Forecast engine |
 | CUTOVER_GATE | Proper scores and a declared horizon, sealed from future labels |
 | RETIREMENT_CANDIDATE | Any display that presents a score as a win probability, after the forecast exists |
 | DELETE_GATE | Not applicable until a forecast owner exists |
-| BLOCKERS | No probability model and no execution-aware path model |
+| BLOCKERS | The production model registry is empty (`NO_CALIBRATED_MODEL`); no qualifying sealed prospective population is proven, and SHORT capture is LONG-only. |
 | NOTES | Do not promote an ordinal score into this feature. |
 
 ## F7 — Economic / Portfolio Selector
@@ -136,7 +140,7 @@ Status values: `IMPLEMENTED_VERIFIED`, `IMPLEMENTED_NOT_ACTIVE`, `IMPLEMENTED_AW
 | Field | Evidence |
 | --- | --- |
 | ARCHITECTURE_REQUIREMENT | Constrained paper capital toward portfolio net dollars. Atomic reservation. No Kelly, leverage, or covariance optimizer. |
-| CURRENT_IMPLEMENTATION | `profit_ranking.py` sorts a weighted score. `candidates.py` keeps Top-8 at technical score ≥ 80. `economic_quality_gate.py` is pass/fail. `portfolio_risk.py` vetoes count and exposure. Paper v2 reservation exists only on the inactive Paper v2 path. |
+| CURRENT_IMPLEMENTATION | `profit_ranking.py` sorts a weighted score. `candidates.py` keeps Top-8 at technical score ≥ 80. `economic_quality_gate.py` is pass/fail. `portfolio_risk.py` vetoes count and exposure. Paper v2 reservation exists only on the inactive Paper v2 path. The target constrained selector now exists as `app/opip/portfolio_selector.py` (+ `app/opip/portfolio_comparator.py`), shadow / dormant and NOT the live admission source. |
 | CURRENT_OWNER | Profit ranking plus portfolio-risk veto |
 | CURRENT_WRITER | Scan ranking |
 | CURRENT_CONSUMERS | Alerts and paper routing |
@@ -148,7 +152,7 @@ Status values: `IMPLEMENTED_VERIFIED`, `IMPLEMENTED_NOT_ACTIVE`, `IMPLEMENTED_AW
 | CUTOVER_GATE | Matched comparison against cash and the frozen ranking comparator, on the same candidate panel |
 | RETIREMENT_CANDIDATE | Top-8 technical gate and profit-ranking comparator, after that comparison |
 | DELETE_GATE | Technical cutover recorded, consumers moved, rollback to the ranking path available |
-| BLOCKERS | F6 is missing. The live path does not maximize portfolio net dollars globally. |
+| BLOCKERS | F6 is shadow-only with no calibrated model, and the target selector is not yet the live admission source. The live path does not maximize portfolio net dollars globally. |
 | NOTES | `OPIP_GLOBAL_CAPITAL_RANKING_ENABLED` default true is a ranking flag, not the target selector. |
 
 ## F8 — Realistic Paper Execution
