@@ -1,6 +1,6 @@
 # Current architecture status
 
-Audit date: 2026-09-27. Reconciliation date: 2026-09-28. This file is the repository hierarchy for architecture, implementation, and production truth. It does not activate, cut over, or retire any runtime.
+Audit date: 2026-09-27. Reconciliation date: 2026-09-28; R4-B2 status reconciliation 2026-10-03. This file is the repository hierarchy for architecture, implementation, and production truth. It does not activate, cut over, or retire any runtime.
 
 ## Architecture authority
 
@@ -23,9 +23,11 @@ Two exact Git commits matter, and they are different:
 | Role | Commit | What it is |
 | --- | --- | --- |
 | Historical audit base | `a416be0a068dc58543a4b6cd254d5c42fcaf4c96` | The commit the R0/R1 audit recorded. Subject `Profit Intelligence: read-only semantic and economic analytics foundation (#282)`. It is history, not current implementation truth. |
-| Current reconciled code/production baseline | `facf8e369e1251697bf9799bc9b1c575a9cdc3ec` | The current `origin/main` and the deployed production core. Subject `R2: Feature Bus shadow parity and deterministic replay (#284)`. This is the implementation truth this reconciliation carries forward. |
+| Current reconciled code baseline | `a808e84ffc2fea4912cfa5592927d1afe2956568` | The current `origin/main` after the R3 F3-F7 spine (#287-#300), R4-B1 dormant wiring (#308-#311), R4-B2 Slice 3A (#317-#324) and R4-B2 Slice 3B (#325-#326). The earlier reconciliation baseline `facf8e369e1251697bf9799bc9b1c575a9cdc3ec` (R2, #284) is preserved as history. |
+| Deployed production core | `facf8e369e1251697bf9799bc9b1c575a9cdc3ec` (last observed) | The last deploy-time observation recorded below. No later production re-probe has been performed; the deployed SHA is not re-observed by this reconciliation. |
+| Superseded status header (historical, baseline `facf8e36`) | `facf8e369e1251697bf9799bc9b1c575a9cdc3ec` | The earlier reconciliation recorded this commit under the header "Current reconciled code/production baseline". That header and value are preserved as history rather than erased. |
 
-`origin/main` matched `facf8e369e1251697bf9799bc9b1c575a9cdc3ec` when this document was reconciled, and it was rechecked immediately before writing. The audit tree is the isolated worktree for `chore/opip-r0-r1-architecture-recovery`. The shared checkout on `feature/p1a-decision-intelligence-foundation` was not used as implementation truth.
+`origin/main` matched `a808e84ffc2fea4912cfa5592927d1afe2956568` when this document was reconciled (2026-10-03). At the earlier 2026-09-28 reconciliation it matched `facf8e369e1251697bf9799bc9b1c575a9cdc3ec`; that earlier statement is preserved as history. The audit tree is the isolated worktree for `chore/opip-r0-r1-architecture-recovery`. The shared checkout on `feature/p1a-decision-intelligence-foundation` was not used as implementation truth.
 
 ## Production truth
 
@@ -39,7 +41,8 @@ The strongest current observation is the owner-gated production deploy run `3647
 | --- | --- | --- |
 | R0/R1 audit | completed | This architecture/audit package, recorded at the historical audit base `a416be0a`. |
 | R2 — Feature Bus shadow parity and deterministic replay | completed, merged, deployed | PR #284 merged to `main` as `facf8e369e1251697bf9799bc9b1c575a9cdc3ec`; exact pre-merge head `b26dab8d58116c5560e5bbed73ce95f0c814fbeb`; exact-head `test` and `atdd scope` PASS; 0 valid unresolved non-outdated review blockers at merge; production deploy run `36473910247` SUCCESS. |
-| R3 — F3 through F7 on the R2 evidence | not started | `R3 has not started`. No IGNITION detector, opportunity lifecycle, feasibility seam, forecast owner, or selector module exists yet. |
+| R3 — F3 through F7 on the R2 evidence | implemented (shadow / dormant, no runtime authority) | The R3 target modules now exist and are merged (#287-#300): F3 `app/opip/detectors/ignition.py`; F4 `app/opip/opportunity_lifecycle.py` + `opportunity_persistence.py`; F5 `app/opip/feasibility.py`; F6 `app/opip/forecast.py` + `forecast_evaluation.py`; F7 `app/opip/portfolio_selector.py` + `portfolio_comparator.py`. They carry **no production runtime authority**: the Feature Bus is pinned `off`, the target spine is a recorded no-op without a snapshot source, and the F6 production model registry ships empty (`NO_CALIBRATED_MODEL`). The earlier statement "R3 has not started" is preserved as history at baseline `facf8e36`. |
+| R4-B2 Slice 3A/3B — controlled paper activation prerequisites | implemented (shadow / dormant) | Durable FeasibilityEvidence codec/event/reader (#318-#320), 60-second cadence bridge (#321), prospective feasibility-evidence producer (#322), SHORT/BTNL integration (#323-#324), bounded reader memory with cursor-owned dedupe (#325), and the prospective F6 evidence contract plus canonical label projection (#326). Paper-v2 is not activated and the target spine is not yet the admission source. |
 
 `FEATURE BUS ACTIVATED = NO`. The compose pin `OPIP_FEATURE_BUS_MODE` remains `off` and `run_cycle` does not call the Feature Bus. Paper v2 was not activated by this reconciliation. The Committee remains advisory/shadow only, with zero runtime trading authority. Funded trading remains disabled.
 

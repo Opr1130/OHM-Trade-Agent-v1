@@ -2,7 +2,9 @@
 
 Historical audit base: `a416be0a068dc58543a4b6cd254d5c42fcaf4c96`
 
-Current reconciled code/production baseline: `facf8e369e1251697bf9799bc9b1c575a9cdc3ec`
+Historical reconciled baseline (superseded 2026-10-03): `facf8e369e1251697bf9799bc9b1c575a9cdc3ec`
+
+Reconciled code baseline (R4-B2 status reconciliation, 2026-10-03): `a808e84ffc2fea4912cfa5592927d1afe2956568`
 
 Architecture: v1.4.3, 22 September 2026. See `docs/architecture/v1.4.3/SOURCE.md`.
 
@@ -14,7 +16,7 @@ The live cycle is `app.jobs.run_cycle` → protection → `scan_opportunities` �
 
 The identity of the *live* paper authority is not fully observed. The Freqtrade dry-run containers are healthy and the code routes to them when Paper v2 is not requested, but the live `OPIP_PAPER_V2_MODE` value and Paper v1 `control.json` are unobserved. Treat the live paper authority as `UNKNOWN_NEEDS_EVIDENCE` until those values are actually observed; do not select an engine from defaults and container health.
 
-The v1.4.3 spine is FeatureSnapshot → IGNITION detector → opportunity lifecycle → feasibility → forecast → constrained portfolio selection → realistic paper. F3 and F6 are missing. F4 is fragmented. F5 and F7 are legacy gates and a ranking score. The Feature Bus that F3 requires is implemented and pinned off, and its R2 shadow parity/replay evidence is now accepted.
+The v1.4.3 spine is FeatureSnapshot → IGNITION detector → opportunity lifecycle → feasibility → forecast → constrained portfolio selection → realistic paper. Status update (R4-B2 status reconciliation, 2026-10-03): the F3-F7 spine is now implemented as shadow / dormant modules (#287-#300) with no production runtime authority; the earlier statement "F3 and F6 are missing" is preserved as history at baseline `facf8e36`. The Feature Bus that F3 requires is implemented and pinned off, and its R2 shadow parity/replay evidence is accepted.
 
 Paper v2 is implemented and inactive. Turning it on now would paper the legacy selector. The Committee package is present, shadow-only, and has no path into `run_cycle`. Its last activation proof had an inactive timer and zero role results, on a SHA older than this core. Dashboard surfaces do not share one semantic model and cannot show detector, forecast, or Committee facts that the runtime does not emit.
 
@@ -37,7 +39,9 @@ Actual completed exit evidence:
 - `OPIP_FEATURE_BUS_MODE` remained `off` throughout, and `run_cycle` still does not call the Feature Bus. The Feature Bus has **no production runtime authority**.
 - Production deploy run `36473910247` for `facf8e369e1251697bf9799bc9b1c575a9cdc3ec` SUCCESS.
 
-### R3 — F3 through F7 on that evidence (NEXT, not started)
+### R3 — F3 through F7 on that evidence (implemented; shadow / dormant)
+
+Status update (R4-B2 status reconciliation, 2026-10-03): the R3 chain is implemented and merged (#287-#300) as shadow / evidence-first modules with **no production runtime authority** — F3 `app/opip/detectors/ignition.py`, F4 `app/opip/opportunity_lifecycle.py`, F5 `app/opip/feasibility.py`, F6 `app/opip/forecast.py`, F7 `app/opip/portfolio_selector.py` / `portfolio_comparator.py`. The earlier "(NEXT, not started)" heading is preserved as history at baseline `facf8e36`.
 
 One chain, in this order, each naming the legacy path it will replace. R3 is shadow/evidence-first: it adds no production runtime authority, activates no Paper v2 cutover, and deletes no legacy path.
 
@@ -92,11 +96,11 @@ Core `facf8e36` was deployed on 2026-09-28 (run `36473910247`). The last success
 
 A matching `/deploy-learning` for `facf8e36` is an owner control-plane action. It is required before learning capture is expected to be healthy. It does not replace R3.
 
-## Single next implementation increment
+## Current implementation focus (updated 2026-10-03)
 
-R3 only: F3 IGNITION pure detector runtime first, then the opportunity lifecycle, then the feasibility seam, then the calibrated forecast owner, then the constrained economic/portfolio selector — shadow/evidence-first.
+R3 is implemented as shadow / dormant modules (see above). The active increment is `ATDD-R4-B2-controlled-paper-activation`; Slice 3B adds the prospective F6 evidence contract and its canonical label projection. The R4 Paper-v2 cutover stays OWNER-gated and evidence-blocked: the disposition is `REAL_EVIDENCE_MATURATION_REQUIRED` for the calibrated forecast, and `SAFETY_OR_AUTHORITY_BLOCK` for the SHADOW enablement and the cutover switch.
 
-Do not start a later phase, enable Paper v2, enable the Committee timer, activate the Feature Bus, or redesign the dashboard in that increment.
+Do not start a later phase, enable Paper v2, enable the Committee timer, activate the Feature Bus, or redesign the dashboard without an explicit owner decision.
 
 ## Signal Quality v2 disposition
 

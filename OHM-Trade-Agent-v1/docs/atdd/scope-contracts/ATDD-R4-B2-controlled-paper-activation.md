@@ -229,6 +229,14 @@ the prepared owner packets are inspected
 THEN:
 both packets exist as repository artifacts and are PREPARED ONLY (they execute no authority change); each names the exact SHA, the exact modes to change, the exact protected-environment/control-plane mechanism, the prerequisites, the preflight commands, the rollback, the post-deploy verification, the authority-collision proof, the protection-health proof, the legacy-drain requirements and the current blockers; the SHADOW packet states that SHADOW runtime creates no new-entry authority, and the cutover packet states that activation is a distinct owner-controlled switch that is not set by any artifact here and that exactly one new-entry paper authority must exist throughout; and neither packet claims activation, changes a production mode, or grants funded/exchange/Committee authority
 
+AC-029:
+GIVEN:
+the stale architecture status/recovery documents and the current accepted code
+WHEN:
+the status reconciliation is inspected
+THEN:
+the conformance ledger, the recovery roadmap and the current-architecture-status document are reconciled to the current accepted code baseline **without modifying architecture authority** (the v1.4.3 DOCX and `ARCHITECTURE.md` are untouched); each preserves its superseded statements identifiably as history (the prior wording and its baseline SHA remain present and are labelled historical); each uses the repository's existing status vocabulary consistently (`SHADOW` for an implemented non-authoritative module, `LEGACY_ACTIVE` for a live legacy authority, `PARTIAL` for a split implementation) rather than inventing new tokens; no document claims a runtime activation, a production mode change, a paper cutover or any funded/trading authority from code implementation alone; and the reconciliation records both the reconciled code baseline and the separately observed (not re-probed) production deploy baseline
+
 EXPLICITLY OUT OF SCOPE:
 - Setting `OPIP_PAPER_V2_MODE=active` in production, or any activation, in this freeze PR
 - Funded or live trading, exchange order placement, modification, cancellation or confirmation, margin, asset borrow or leverage
@@ -427,6 +435,8 @@ AC-026 -> tests/test_opip_r4_b2_f6_label_projection.py::test_ac_026_projection_i
 AC-026 -> tests/test_opip_r4_b2_f6_label_projection.py::test_ac_026_malformed_token_fails_closed_per_record
 AC-027 -> tests/test_opip_r4_b2_f6_prospective_contract.py::test_ac_027_contract_freezes_population_and_policies
 AC-028 -> tests/test_opip_r4_b2_f6_prospective_contract.py::test_ac_028_owner_packets_are_prepared_only
+AC-029 -> tests/test_opip_r4_b2_status_reconciliation.py::test_ac_029_status_docs_are_reconciled_without_activation
+AC-029 -> tests/test_opip_r4_b2_status_reconciliation.py::test_ac_029_architecture_authority_is_untouched
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-paper-activation.md
 AC-001 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
@@ -524,6 +534,11 @@ AC-027 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-pap
 AC-028 -> OHM-Trade-Agent-v1/docs/architecture/OPIP_F6_OWNER_ENABLEMENT_PACKETS.md
 AC-028 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_f6_prospective_contract.py
 AC-028 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-paper-activation.md
+AC-029 -> OHM-Trade-Agent-v1/docs/architecture/OPIP_CONFORMANCE_LEDGER.md
+AC-029 -> OHM-Trade-Agent-v1/docs/architecture/OPIP_RECOVERY_ROADMAP.md
+AC-029 -> OHM-Trade-Agent-v1/docs/architecture/CURRENT_ARCHITECTURE_STATUS.md
+AC-029 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_status_reconciliation.py
+AC-029 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-paper-activation.md
 
 DEFERRED DISCOVERIES:
 - The activation implementation (wiring the target F7 selector as the admission source, the mode/cutover sequence and their behavioral acceptance criteria and implementation map) is a later commit of this same increment and is not authorized by this freeze.
