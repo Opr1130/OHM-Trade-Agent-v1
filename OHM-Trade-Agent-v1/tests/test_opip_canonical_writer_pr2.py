@@ -792,7 +792,11 @@ def test_ohm_deploy_rollback_handles_missing_writer_service():
     deploy = (_repo_root() / "deploy" / "remote" / "ohm-deploy").read_text(encoding="utf-8")
     assert "grep -qx 'opip-canonical-writer'" in deploy
     rollback = deploy.split("rollback() {", 1)[1].split("trap rollback ERR", 1)[0]
-    assert "if docker compose config --services" in rollback
+    normalized_rollback = " ".join(rollback.replace("\\\n", " ").split())
+    assert (
+        'if docker compose -f docker-compose.yml -f "$SAFE_BASELINE_OVERRIDE" '
+        "config --services"
+    ) in normalized_rollback
     assert "opip-canonical-writer" in rollback
     assert "--remove-orphans ohm-trade-agent" in rollback
 

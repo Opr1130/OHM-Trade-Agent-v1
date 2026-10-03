@@ -190,6 +190,7 @@ AC-009 -> OHM-Trade-Agent-v1/tests/test_release_runtime_verifier.py
 AC-009 -> OHM-Trade-Agent-v1/tests/test_opip_deployment_transaction_boundary_v1.py
 AC-009 -> OHM-Trade-Agent-v1/tests/test_opip_ml_scheduler_isolation_v1.py
 AC-009 -> OHM-Trade-Agent-v1/tests/test_opip_streaming_safety_v1.py
+AC-009 -> OHM-Trade-Agent-v1/tests/test_opip_canonical_writer_pr2.py
 AC-010 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
 AC-010 -> .github/workflows/deploy-production.yml
 

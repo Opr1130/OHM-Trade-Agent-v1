@@ -475,11 +475,31 @@ LEGACY_RC0_TRANSITION_LOG = "\n".join(
 
 @requires_bash
 def test_case_a_core_failure_before_commit_still_reports_rollback(tmp_path):
-    """A: a genuine core failure keeps the existing failure/rollback semantics."""
-    log = "deployment failed; rolling back to " + OTHER_SHA + "\nrollback health check passed\n"
+    """A failed core is classified as rolled back only with a verified receipt."""
+    log = "\n".join(
+        [
+            "deployment failed; rolling back to " + OTHER_SHA,
+            "OPIP_SAFE_BASELINE_ROLLBACK=SUCCESS",
+            "rollback health and paper checks passed",
+        ]
+    )
     fields = _classify(tmp_path, log, rc=1)
     assert fields["RESULT"] == "ROLLED BACK"
     assert fields["ROLLBACK"] == "YES"
+    assert fields["GATE"] == "FAIL"
+
+
+@requires_bash
+def test_rollback_without_safe_baseline_receipt_is_unproven(tmp_path):
+    log = "\n".join(
+        [
+            "deployment failed; rolling back to " + OTHER_SHA,
+            "rollback health check passed",
+        ]
+    )
+    fields = _classify(tmp_path, log, rc=1)
+    assert fields["RESULT"] == "SERVER DEPLOY FAILED"
+    assert fields["ROLLBACK"] == "UNKNOWN OR FAILED"
     assert fields["GATE"] == "FAIL"
 
 
@@ -734,7 +754,8 @@ def test_genuine_precommit_core_failure_is_never_retried(tmp_path):
             [
                 "production core health check failed",
                 "deployment failed; rolling back to " + OTHER_SHA,
-                "rollback health check passed",
+                "OPIP_SAFE_BASELINE_ROLLBACK=SUCCESS",
+                "rollback health and paper checks passed",
             ]
         ),
         "writer-health": "\n".join(
@@ -742,7 +763,8 @@ def test_genuine_precommit_core_failure_is_never_retried(tmp_path):
                 "O'Pip scheduler reconciliation: OK",
                 "production writer health check failed",
                 "deployment failed; rolling back to " + OTHER_SHA,
-                "rollback health check passed",
+                "OPIP_SAFE_BASELINE_ROLLBACK=SUCCESS",
+                "rollback health and paper checks passed",
             ]
         ),
         "paper-topology": "\n".join(
@@ -751,7 +773,8 @@ def test_genuine_precommit_core_failure_is_never_retried(tmp_path):
                 "O'Pip scheduler reconciliation: OK",
                 "Freqtrade paper topology failed health/authority validation",
                 "deployment failed; rolling back to " + OTHER_SHA,
-                "rollback health check passed",
+                "OPIP_SAFE_BASELINE_ROLLBACK=SUCCESS",
+                "rollback health and paper checks passed",
             ]
         ),
         "resource-budget": "\n".join(
@@ -760,7 +783,8 @@ def test_genuine_precommit_core_failure_is_never_retried(tmp_path):
                 "O'Pip scheduler reconciliation: OK",
                 "insufficient host memory headroom after paper startup: available_kb=1000",
                 "deployment failed; rolling back to " + OTHER_SHA,
-                "rollback health check passed",
+                "OPIP_SAFE_BASELINE_ROLLBACK=SUCCESS",
+                "rollback health and paper checks passed",
             ]
         ),
     }
