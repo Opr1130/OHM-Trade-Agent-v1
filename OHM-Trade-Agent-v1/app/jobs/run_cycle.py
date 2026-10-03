@@ -472,7 +472,7 @@ def _run_broad_discovery_if_due(*, decision, entry_watch_ready: bool, settings) 
     return True
 
 
-def _run_cycle_once() -> None:
+def _run_cycle_once() -> bool:
     try:
         reconciliation = reconcile_kraken_account()
     except Exception as exc:
@@ -511,7 +511,7 @@ def _run_cycle_once() -> None:
             # raises, which is why it is not simply sequenced after it.
             _run_paper_v2_protection_fail_open()
         print("Discovery/pending workflows skipped until operator state is readable.")
-        return
+        return False
 
     # Producer-owned recovery: this module is the component that can prove the
     # operator/capacity state readable, so it -- and not the active-trade monitor
@@ -545,7 +545,7 @@ def _run_cycle_once() -> None:
             "Maintenance mode: discovery/tracking workflows skipped; "
             "verified-position protection completed."
         )
-        return
+        return True
 
     settings = get_settings()
     normal_search_due = (
@@ -593,6 +593,7 @@ def _run_cycle_once() -> None:
     # R4-B1 dormant target spine: last, and only after every protection and
     # non-authoritative workload above. It is inert when the gate is off.
     _run_target_spine_fail_open()
+    return True
 
 
 def main() -> None:
@@ -607,7 +608,10 @@ def main() -> None:
     try:
         if recover_interrupted_search():
             print("O'Pip recovered interrupted broad-search lifecycle as FAILED.")
-        _run_cycle_once()
+        completed = _run_cycle_once()
+        completed_at = datetime.now(timezone.utc).isoformat()
+        print(f"OPIP_UNIFIED_CYCLE_STATUS={'SUCCESS' if completed else 'DEGRADED'}")
+        print(f"OPIP_UNIFIED_CYCLE_COMPLETED_AT={completed_at}")
     finally:
         cycle_lock.__exit__(None, None, None)
 

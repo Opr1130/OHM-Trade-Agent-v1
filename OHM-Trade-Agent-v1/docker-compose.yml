@@ -57,7 +57,12 @@ services:
       # Evidence-only: does not grant ranking, trading, sizing, alert
       # qualification, or funded execution authority.
       # Core must start independently of writer health (no hard depends_on).
+      OPIP_RELEASE_PROFILE: "EVIDENCE_SHADOW"
+      OPIP_COMMITTEE_MODE: "off"
       OPIP_CANONICAL_WRITER_MODE: "shadow"
+      # Pin Paper-v2 off at the Compose service level so a stale .env cannot
+      # activate the otherwise opt-in execution path.
+      OPIP_PAPER_V2_MODE: "off"
       # Owner-authorized EVIDENCE_SHADOW release profile (ATDD-RELEASE-PIPELINE-v1).
       # The Feature Bus is deliberately activated to SHADOW. This is the approved
       # evidence-plane release profile, NOT a stale-`.env` activation: the value is

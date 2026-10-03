@@ -5,7 +5,7 @@ repository-controlled production posture, which an owner-authorized activation
 increment is expected to change. The owner-authorized Release Pipeline v1
 increment (ATDD-RELEASE-PIPELINE-v1) selects the EVIDENCE_SHADOW release profile,
 which sets the production posture to canonical writer `shadow`, Feature Bus
-`shadow`, target spine `shadow`, and Paper-v2 unset.
+`shadow`, target spine `shadow`, and Paper-v2 `off`.
 
 The immutable freeze contract `ATDD-R4-B1-contract-freeze` records the B1
 completion invariant - Feature Bus `off` and Paper-v2 unset *at B1 completion* -
@@ -52,6 +52,11 @@ def test_target_spine_is_shadow_and_non_authoritative_in_the_core_service():
     assert _core_environment()["OPIP_TARGET_SPINE_MODE"] == "shadow"
 
 
-def test_paper_v2_mode_is_unset_in_the_core_service():
-    """Paper-v2 activation is an owner decision, so the core service must not set it."""
-    assert "OPIP_PAPER_V2_MODE" not in _core_environment()
+def test_paper_v2_mode_is_explicitly_off_in_the_core_service():
+    """The release profile pins Paper-v2 off so a stale `.env` cannot activate it."""
+    assert _core_environment()["OPIP_PAPER_V2_MODE"] == "off"
+
+
+def test_committee_mode_is_explicitly_off_in_the_core_service():
+    """The release profile pins Committee authority off against stale `.env` values."""
+    assert _core_environment()["OPIP_COMMITTEE_MODE"] == "off"

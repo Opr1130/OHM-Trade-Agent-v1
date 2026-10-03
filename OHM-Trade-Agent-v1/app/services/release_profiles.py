@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Mapping
 import os
@@ -21,7 +22,8 @@ FUNDED_CREDENTIAL_KEYS: tuple[str, ...] = (
     "LIVE_TRADING_KEY",
 )
 
-RELEASE_PROFILES: dict[str, dict[str, Any]] = {    "SAFE_BASELINE": {
+RELEASE_PROFILES: dict[str, dict[str, Any]] = {
+    "SAFE_BASELINE": {
         "profile_version": "1",
         "authority_level": "LEGACY_ONLY",
         "owner_approval_required": False,
@@ -30,6 +32,7 @@ RELEASE_PROFILES: dict[str, dict[str, Any]] = {    "SAFE_BASELINE": {
             "OPIP_CANONICAL_WRITER_MODE": "off",
             "OPIP_TARGET_SPINE_MODE": "off",
             "OPIP_PAPER_V2_MODE": "off",
+            "OPIP_COMMITTEE_MODE": "off",
         },
         "prerequisites": [
             "Exact main SHA is known.",
@@ -58,6 +61,7 @@ RELEASE_PROFILES: dict[str, dict[str, Any]] = {    "SAFE_BASELINE": {
             "OPIP_CANONICAL_WRITER_MODE": "shadow",
             "OPIP_TARGET_SPINE_MODE": "shadow",
             "OPIP_PAPER_V2_MODE": "off",
+            "OPIP_COMMITTEE_MODE": "off",
         },
         "prerequisites": [
             "Exact main SHA must be approved.",
@@ -92,6 +96,7 @@ RELEASE_PROFILES: dict[str, dict[str, Any]] = {    "SAFE_BASELINE": {
             "OPIP_CANONICAL_WRITER_MODE": "shadow",
             "OPIP_TARGET_SPINE_MODE": "shadow",
             "OPIP_PAPER_V2_MODE": "active",
+            "OPIP_COMMITTEE_MODE": "off",
         },
         "prerequisites": [
             "F6 artifact evidence is complete.",
@@ -119,7 +124,7 @@ RELEASE_PROFILES: dict[str, dict[str, Any]] = {    "SAFE_BASELINE": {
 
 def get_release_profiles() -> dict[str, dict[str, Any]]:
     """Return the allowlisted release profiles as a deterministic mapping."""
-    return {name: dict(value) for name, value in RELEASE_PROFILES.items()}
+    return deepcopy(RELEASE_PROFILES)
 
 
 def resolve_release_profile(profile_name: str) -> dict[str, Any]:
@@ -134,7 +139,7 @@ def resolve_release_profile(profile_name: str) -> dict[str, Any]:
     if profile is None:
         allowed = ", ".join(sorted(RELEASE_PROFILES))
         raise ValueError(f"unsupported release profile '{profile_name}'. Allowed: {allowed}")
-    return dict(profile)
+    return deepcopy(profile)
 
 
 def render_profile_environment(profile_name: str) -> dict[str, str]:
@@ -153,7 +158,15 @@ def render_profile_environment(profile_name: str) -> dict[str, str]:
     modes = profile.get("allowed_modes")
     if not isinstance(modes, dict) or not modes:
         raise ValueError(f"release profile {profile_name} declares no modes")
-    return {str(key): str(value) for key, value in modes.items()}
+    if set(modes) != {
+        "OPIP_FEATURE_BUS_MODE",
+        "OPIP_CANONICAL_WRITER_MODE",
+        "OPIP_TARGET_SPINE_MODE",
+        "OPIP_PAPER_V2_MODE",
+        "OPIP_COMMITTEE_MODE",
+    } or any(not isinstance(key, str) or not isinstance(value, str) for key, value in modes.items()):
+        raise ValueError(f"release profile {profile_name} has an invalid mode contract")
+    return dict(modes)
 
 
 def validate_profile_contract(
@@ -212,16 +225,16 @@ def _load_compose_environment(repo_root: str | os.PathLike[str] | None = None) -
     if not compose_path.exists() and (root / "OHM-Trade-Agent-v1").exists():
         compose_path = root / "OHM-Trade-Agent-v1" / "docker-compose.yml"
     if not compose_path.exists():
-        return {}
+        raise FileNotFoundError(f"production Compose file not found: {compose_path}")
     if yaml is None:
-        return {}
+        raise RuntimeError("PyYAML is required to evaluate the release architecture gate")
     loaded = yaml.safe_load(compose_path.read_text(encoding="utf-8")) or {}
     services = loaded.get("services") or {}
     service = services.get("ohm-trade-agent") or {}
     env = service.get("environment") or {}
     if isinstance(env, dict):
         return {str(key): str(value) for key, value in env.items()}
-    return {}
+    raise ValueError("ohm-trade-agent environment must be a Compose mapping")
 
 
 def _runtime_posture_from_environment(env: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -252,13 +265,26 @@ def evaluate_architecture_gate(
     compose_env = _load_compose_environment(repo_root)
     source_env = environment if environment is not None else compose_env
     runtime = _runtime_posture_from_environment(source_env)
+    required_compose_keys = {
+        "OPIP_RELEASE_PROFILE",
+        "OPIP_FEATURE_BUS_MODE",
+        "OPIP_CANONICAL_WRITER_MODE",
+        "OPIP_TARGET_SPINE_MODE",
+        "OPIP_PAPER_V2_MODE",
+        "OPIP_COMMITTEE_MODE",
+    }
+    compose_keys_present = required_compose_keys.issubset(source_env)
+    expected_modes = profile.get("allowed_modes", {})
 
     # Funded credential *names* (never values) must be absent from the reviewed
     # paper environment. Derived from the same mapping as every other check.
     funded_keys_present = any(key in dict(source_env) for key in FUNDED_CREDENTIAL_KEYS)
 
     checks: dict[str, bool] = {
-        "ONE_CANONICAL_WRITER": runtime["OPIP_CANONICAL_WRITER_MODE"] == "shadow",
+        "COMPOSE_PROFILE_EXPLICIT": compose_keys_present
+        and source_env.get("OPIP_RELEASE_PROFILE") == profile_name,
+        "ONE_CANONICAL_WRITER": runtime["OPIP_CANONICAL_WRITER_MODE"]
+        == expected_modes.get("OPIP_CANONICAL_WRITER_MODE"),
         "ONE_AUTHORITATIVE_HISTORY": True,
         "NO_SECOND_SELECTOR": True,
         "NO_SECOND_SCHEDULER": True,
@@ -268,21 +294,25 @@ def evaluate_architecture_gate(
         "FUNDED_AUTHORITY_ABSENT": (not funded_keys_present)
         and runtime["OPIP_PAPER_V2_MODE"] == "off",
         "FUNDED_CREDENTIAL_PATH_ABSENT_FROM_PAPER": runtime["OPIP_PAPER_V2_MODE"] == "off",
-        "COMMITTEE_RUNTIME_AUTHORITY_ABSENT": str(runtime["OPIP_COMMITTEE_MODE"]).lower()
-        == "off",
+        "COMMITTEE_RUNTIME_AUTHORITY_ABSENT": compose_keys_present
+        and runtime["OPIP_COMMITTEE_MODE"] == "off",
         "PROTECTION_INDEPENDENT": True,
         "MISSING_EVIDENCE_FAILS_CLOSED": True,
         "POINT_IN_TIME_GUARDS_PRESENT": True,
         "PAPER_V2_REMAINS_OFF": runtime["OPIP_PAPER_V2_MODE"] == "off",
         "RELEASE_PROFILE_ALLOWLIST_VALID": profile["status"] == "ACTIVE",
         "STALE_ENV_CANNOT_ACTIVATE_DORMANT_AUTHORITY": runtime["OPIP_FEATURE_BUS_MODE"] != "active",
-        "CURRENT_RUNTIME_POSTURE_CONSISTENT": (
-            runtime["OPIP_FEATURE_BUS_MODE"] == profile["allowed_modes"]["OPIP_FEATURE_BUS_MODE"]
-            and runtime["OPIP_CANONICAL_WRITER_MODE"] == profile["allowed_modes"]["OPIP_CANONICAL_WRITER_MODE"]
-            and runtime["OPIP_TARGET_SPINE_MODE"] == profile["allowed_modes"]["OPIP_TARGET_SPINE_MODE"]
-            and runtime["OPIP_PAPER_V2_MODE"] == profile["allowed_modes"]["OPIP_PAPER_V2_MODE"]
+        "CURRENT_RUNTIME_POSTURE_CONSISTENT": compose_keys_present
+        and all(
+            runtime[key] == expected_modes[key]
+            for key in (
+                "OPIP_FEATURE_BUS_MODE",
+                "OPIP_CANONICAL_WRITER_MODE",
+                "OPIP_TARGET_SPINE_MODE",
+                "OPIP_PAPER_V2_MODE",
+                "OPIP_COMMITTEE_MODE",
+            )
         ),
-        "ATDD_SCOPE_PASS": True,
     }
 
     passed = all(checks.values())
@@ -301,12 +331,18 @@ def evaluate_architecture_gate(
 
 
 def render_release_verdict(verdict: Mapping[str, Any]) -> str:
+    runtime = verdict.get("runtime")
+    runtime = runtime if isinstance(runtime, Mapping) else {}
     lines = [
         f"ARCHITECTURE_GATE={verdict.get('status', 'FAIL')}",
         f"PROFILE={verdict.get('profile', 'UNKNOWN')}",
+        f"FEATURE_BUS={runtime.get('OPIP_FEATURE_BUS_MODE', 'UNKNOWN')}",
+        f"CANONICAL_WRITER={runtime.get('OPIP_CANONICAL_WRITER_MODE', 'UNKNOWN')}",
+        f"TARGET_SPINE={runtime.get('OPIP_TARGET_SPINE_MODE', 'UNKNOWN')}",
         f"NEW_ENTRY_AUTHORITY={verdict.get('new_entry_authority', 'LEGACY_ONLY')}",
         f"FUNDED_AUTHORITY={verdict.get('funded_authority', 'ABSENT')}",
         f"PAPER_V2={verdict.get('paper_v2', 'OFF')}",
+        f"COMMITTEE_MODE={runtime.get('OPIP_COMMITTEE_MODE', 'UNKNOWN')}",
         f"PROTECTION={verdict.get('protection', 'INDEPENDENT')}",
     ]
     return "\n".join(lines)
@@ -314,10 +350,27 @@ def render_release_verdict(verdict: Mapping[str, Any]) -> str:
 
 if __name__ == "__main__":  # pragma: no cover
     import argparse
+    import sys
 
     parser = argparse.ArgumentParser(description="Evaluate O'Pip release architecture gate")
     parser.add_argument("--profile", default="EVIDENCE_SHADOW")
     parser.add_argument("--repo-root", default=None)
     args = parser.parse_args()
-    verdict = evaluate_architecture_gate(args.profile, repo_root=args.repo_root)
+    try:
+        verdict = evaluate_architecture_gate(args.profile, repo_root=args.repo_root)
+    except (FileNotFoundError, RuntimeError, TypeError, ValueError) as exc:
+        print("ARCHITECTURE_GATE=FAIL")
+        print("PROFILE=INVALID")
+        print("FEATURE_BUS=UNKNOWN")
+        print("CANONICAL_WRITER=UNKNOWN")
+        print("TARGET_SPINE=UNKNOWN")
+        print("NEW_ENTRY_AUTHORITY=UNKNOWN")
+        print("FUNDED_AUTHORITY=UNKNOWN")
+        print("PAPER_V2=UNKNOWN")
+        print("COMMITTEE_MODE=UNKNOWN")
+        print("PROTECTION=UNKNOWN")
+        print(f"GATE_ERROR={type(exc).__name__}")
+        sys.exit(1)
     print(render_release_verdict(verdict))
+    if verdict["status"] != "PASS":
+        sys.exit(1)

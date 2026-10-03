@@ -24,6 +24,7 @@ fi
 LOCK_FILE="/var/lock/ohm-deploy.lock"
 STATE_DIR="/var/lib/ohm-deploy"
 LAST_GOOD_FILE="$STATE_DIR/last-good-sha"
+SAFE_BASELINE_OVERRIDE="$STATE_DIR/safe-baseline-rollback.override.yml"
 # Durable paper-registry initialization provenance. Lives in host operational
 # state so it outlives the registry it protects and never becomes evidence a
 # reader could be handed. See app/services/paper_registry_genesis.py.
@@ -192,6 +193,32 @@ replace_file_atomically() {
   mv -f "$tmp" "$target"
 }
 
+capture_release_evidence_baseline() {
+  # Cursor values are metadata only. Query through the running core container
+  # with SQLite read-only mode, before stopping it or changing the checked-out SHA.
+  docker compose exec -T ohm-trade-agent python -c '
+import json, sqlite3
+from app.opip.canonical.paths import db_path
+path = db_path().resolve()
+conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+try:
+    result = {}
+    for name, event_type in (
+        ("feature_snapshot_cursor", "feature.snapshot.recorded"),
+        ("feasibility_evidence_cursor", "feasibility.evidence.recorded"),
+    ):
+        row = conn.execute(
+            "SELECT history_epoch, local_sequence FROM events WHERE event_type = ? "
+            "ORDER BY history_epoch DESC, local_sequence DESC LIMIT 1",
+            (event_type,),
+        ).fetchone()
+        result[name] = [int(row[0]), int(row[1])] if row else None
+    print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+finally:
+    conn.close()
+'
+}
+
 snapshot_scheduler_state() {
   SCHEDULER_SNAPSHOT="$(mktemp -d "$STATE_DIR/scheduler-before.XXXXXX")"
   for name in ohm-unified-cycle opip-learning-export opip-ml-evidence ohm-movement-discovery; do
@@ -255,6 +282,154 @@ cleanup_snapshot() {
   if [[ -n "$SCHEDULER_SNAPSHOT" && -d "$SCHEDULER_SNAPSHOT" ]]; then
     rm -rf "$SCHEDULER_SNAPSHOT"
   fi
+  rm -f "$SAFE_BASELINE_OVERRIDE"
+}
+
+write_safe_baseline_override() {
+  [[ "$PREVIOUS_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+    echo "SAFE_BASELINE rollback SHA is malformed" >&2
+    return 1
+  }
+  umask 077
+  cat > "$SAFE_BASELINE_OVERRIDE" <<PROFILE
+services:
+  ohm-trade-agent:
+    environment:
+      OPIP_RELEASE_PROFILE: "SAFE_BASELINE"
+      OPIP_FEATURE_BUS_MODE: "off"
+      OPIP_CANONICAL_WRITER_MODE: "off"
+      OPIP_TARGET_SPINE_MODE: "off"
+      OPIP_PAPER_V2_MODE: "off"
+      OPIP_COMMITTEE_MODE: "off"
+    labels:
+      org.opencontainers.image.revision: "$PREVIOUS_SHA"
+PROFILE
+}
+
+validate_safe_baseline_modes() {
+  local actual image_sha
+  image_sha="$(docker inspect --format='{{ index .Config.Labels "org.opencontainers.image.revision" }}' ohm-trade-agent)"
+  [[ "$image_sha" == "$PREVIOUS_SHA" ]] || {
+    echo "SAFE_BASELINE rollback image SHA is unproven" >&2
+    return 1
+  }
+  actual="$(docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' ohm-trade-agent \
+    | grep -E '^OPIP_(RELEASE_PROFILE|FEATURE_BUS_MODE|CANONICAL_WRITER_MODE|TARGET_SPINE_MODE|PAPER_V2_MODE|COMMITTEE_MODE)=')"
+  for expected in \
+    'OPIP_RELEASE_PROFILE=SAFE_BASELINE' \
+    'OPIP_FEATURE_BUS_MODE=off' \
+    'OPIP_CANONICAL_WRITER_MODE=off' \
+    'OPIP_TARGET_SPINE_MODE=off' \
+    'OPIP_PAPER_V2_MODE=off' \
+    'OPIP_COMMITTEE_MODE=off'; do
+    grep -Fxq "$expected" <<< "$actual" || {
+      echo "SAFE_BASELINE rollback mode is unproven: $expected" >&2
+      return 1
+    }
+  done
+}
+
+validate_release_scheduler_contract() {
+  local matches
+  local -a contracts=(
+    'ohm-unified-cycle|python -m app.jobs.run_cycle|/var/run/ohm-unified-cycle.lock|timeout --signal=TERM'
+    'opip-feature-bus-capture|python -m app.jobs.capture_feature_bus_shadow|/var/run/opip-feature-bus-capture.lock|timeout --signal=TERM'
+    'opip-feasibility-evidence-capture|python -m app.jobs.capture_feasibility_evidence_shadow|/var/run/opip-feasibility-capture.lock|timeout --signal=TERM'
+  )
+  local item name command lock bound cron
+  for item in "${contracts[@]}"; do
+    IFS='|' read -r name command lock bound <<< "$item"
+    cron="/etc/cron.d/$name"
+    [[ -s "$cron" ]] || {
+      echo "required release scheduler is missing: $name" >&2
+      return 1
+    }
+    grep -Fq "$command" "$cron"
+    grep -Fq "$lock" "$cron"
+    grep -Fq "$bound" "$cron"
+    grep -Fq 'flock -n' "$cron"
+    matches="$(grep -RhE "^[*0-9/, -]+[[:space:]]+root .*${command//./\\.}" /etc/cron.d 2>/dev/null | wc -l)"
+    [[ "$matches" -eq 1 ]] || {
+      echo "release scheduler command is duplicated or missing: $name count=$matches" >&2
+      return 1
+    }
+  done
+
+  if crontab -l 2>/dev/null \
+    | grep -Eq 'app\.jobs\.(run_cycle|capture_feature_bus_shadow|capture_feasibility_evidence_shadow)'; then
+    echo "duplicate release scheduler command remains in root crontab" >&2
+    return 1
+  fi
+
+  grep -Fq 'FEATURE_BUS_CAPTURE_LOCK_PATH' "$APP_ROOT/app/jobs/capture_feature_bus_shadow.py"
+  grep -Fq 'FEASIBILITY_CAPTURE_LOCK_PATH' "$APP_ROOT/app/jobs/capture_feasibility_evidence_shadow.py"
+  echo "OPIP_RELEASE_SCHEDULER=UNIQUE_BOUNDED"
+}
+
+wait_unified_cycle_success() {
+  local ready_after="$1" deadline="$2"
+  local status completed_at completed_epoch ready_epoch
+  ready_epoch="$(date -u -d "$ready_after" +%s)"
+  while (( SECONDS < deadline )); do
+    status="$(grep -oE 'OPIP_UNIFIED_CYCLE_STATUS=(SUCCESS|DEGRADED)' \
+      /var/log/ohm-unified-cycle.log 2>/dev/null | tail -n 1 | cut -d= -f2 || true)"
+    completed_at="$(grep -oE 'OPIP_UNIFIED_CYCLE_COMPLETED_AT=[^[:space:]]+' \
+      /var/log/ohm-unified-cycle.log 2>/dev/null | tail -n 1 | cut -d= -f2 || true)"
+    if [[ -n "$status" && -n "$completed_at" ]]; then
+      completed_epoch="$(date -u -d "$completed_at" +%s 2>/dev/null || true)"
+      if [[ "$completed_epoch" =~ ^[0-9]+$ ]] && (( completed_epoch >= ready_epoch )); then
+        [[ "$status" == "SUCCESS" ]] || {
+          echo "unified cycle reported DEGRADED after candidate readiness" >&2
+          return 1
+        }
+        echo "OPIP_UNIFIED_CYCLE=HEALTHY"
+        echo "OPIP_UNIFIED_CYCLE_COMPLETED_AT=$completed_at"
+        return 0
+      fi
+    fi
+    sleep 5
+  done
+  echo "no successful unified cycle was observed within the bounded release window" >&2
+  return 1
+}
+
+validate_candidate_container_identity() {
+  local image_sha actual profile expected
+  local -a expected_modes
+  image_sha="$(docker inspect --format='{{ index .Config.Labels "org.opencontainers.image.revision" }}' ohm-trade-agent)"
+  [[ "$image_sha" == "$TARGET_SHA" ]] || {
+    echo "candidate container image SHA does not match the approved SHA" >&2
+    return 1
+  }
+  actual="$(docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' ohm-trade-agent \
+    | grep -E '^OPIP_(RELEASE_PROFILE|FEATURE_BUS_MODE|CANONICAL_WRITER_MODE|TARGET_SPINE_MODE|PAPER_V2_MODE|COMMITTEE_MODE)=')"
+  profile="$(grep -E '^OPIP_RELEASE_PROFILE=' <<< "$actual" | cut -d= -f2)"
+  case "$profile" in
+    EVIDENCE_SHADOW)
+      expected_modes=(
+        'OPIP_FEATURE_BUS_MODE=shadow'
+        'OPIP_CANONICAL_WRITER_MODE=shadow'
+        'OPIP_TARGET_SPINE_MODE=shadow'
+        'OPIP_PAPER_V2_MODE=off'
+        'OPIP_COMMITTEE_MODE=off'
+      )
+      ;;
+    *)
+      echo "candidate container release profile is not deployable: ${profile:-missing}; SAFE_BASELINE is rollback-only" >&2
+      return 1
+      ;;
+  esac
+  grep -Fxq "OPIP_RELEASE_PROFILE=$profile" <<< "$actual" || {
+    echo "candidate container release profile is missing or ambiguous" >&2
+    return 1
+  }
+  for expected in "${expected_modes[@]}"; do
+    grep -Fxq "$expected" <<< "$actual" || {
+      echo "candidate container mode does not match $profile: $expected" >&2
+      return 1
+    }
+  done
+  echo "OPIP_RELEASE_PROFILE=$profile"
 }
 
 "${GIT[@]}" fetch --prune origin main
@@ -270,6 +445,13 @@ if [[ -n "$("${GIT[@]}" status --porcelain --untracked-files=no)" ]]; then
   "${GIT[@]}" status --short >&2
   exit 66
 fi
+UNTRACKED_APP_FILES="$("${GIT[@]}" ls-files --others --exclude-standard -- OHM-Trade-Agent-v1/app)"
+IGNORED_APP_FILES="$("${GIT[@]}" ls-files --others --ignored --exclude-standard -- OHM-Trade-Agent-v1/app \
+  | grep -Ev '\.py[cod]$' || true)"
+if [[ -n "$UNTRACKED_APP_FILES" || -n "$IGNORED_APP_FILES" ]]; then
+  echo "refusing deploy: untracked files in the application Docker build context" >&2
+  exit 66
+fi
 
 PREVIOUS_SHA="$("${GIT[@]}" rev-parse main)"
 if [[ -s "$LAST_GOOD_FILE" ]]; then
@@ -279,6 +461,13 @@ if [[ -s "$LAST_GOOD_FILE" ]]; then
     PREVIOUS_SHA="$RECORDED_SHA"
   fi
 fi
+
+cd "$APP_ROOT"
+RELEASE_EVIDENCE_BASELINE="$(capture_release_evidence_baseline)"
+[[ "$RELEASE_EVIDENCE_BASELINE" == \{*\} ]] || {
+  echo "release evidence baseline is malformed; refusing deployment" >&2
+  exit 69
+}
 
 snapshot_scheduler_state
 
@@ -296,13 +485,23 @@ rollback() {
   "${GIT[@]}" checkout -f main
   "${GIT[@]}" reset --hard "$PREVIOUS_SHA"
   cd "$APP_ROOT"
+  [[ "$("${GIT[@]}" rev-parse HEAD)" == "$PREVIOUS_SHA" ]] || {
+    echo "rollback code SHA does not match the selected previous SHA" >&2
+    false
+  }
+  write_safe_baseline_override
 
   # First PR 2 deploy may roll back to a SHA that does not declare the writer.
   # Detect Compose services after reset; never require a missing service.
-  if docker compose config --services 2>/dev/null | grep -qx 'opip-canonical-writer'; then
-    docker compose build opip-canonical-writer ohm-trade-agent
-    docker compose up -d --remove-orphans opip-canonical-writer
-    docker compose up -d --remove-orphans ohm-trade-agent
+  if docker compose -f docker-compose.yml -f "$SAFE_BASELINE_OVERRIDE" \
+    config --services 2>/dev/null | grep -qx 'opip-canonical-writer'; then
+    docker compose -f docker-compose.yml -f "$SAFE_BASELINE_OVERRIDE" \
+      build --build-arg "OPIP_RELEASE_SHA=$PREVIOUS_SHA" \
+      opip-canonical-writer ohm-trade-agent
+    docker compose -f docker-compose.yml -f "$SAFE_BASELINE_OVERRIDE" \
+      up -d --remove-orphans opip-canonical-writer
+    docker compose -f docker-compose.yml -f "$SAFE_BASELINE_OVERRIDE" \
+      up -d --remove-orphans ohm-trade-agent
     if ! wait_core_health; then
       echo "rollback core health check failed" >&2
       restore_scheduler_state
@@ -316,15 +515,24 @@ rollback() {
       exit "$rc"
     fi
   else
-    docker compose build ohm-trade-agent
+    docker compose -f docker-compose.yml -f "$SAFE_BASELINE_OVERRIDE" \
+      build --build-arg "OPIP_RELEASE_SHA=$PREVIOUS_SHA" ohm-trade-agent
     # --remove-orphans drops a writer left from the failed PR 2 attempt.
-    docker compose up -d --remove-orphans ohm-trade-agent
+    docker compose -f docker-compose.yml -f "$SAFE_BASELINE_OVERRIDE" \
+      up -d --remove-orphans ohm-trade-agent
     if ! wait_core_health; then
       echo "rollback core health check failed" >&2
       restore_scheduler_state
       cleanup_snapshot
       exit "$rc"
     fi
+  fi
+
+  if ! validate_safe_baseline_modes; then
+    echo "SAFE_BASELINE rollback mode validation failed" >&2
+    restore_scheduler_state
+    cleanup_snapshot
+    exit "$rc"
   fi
 
   # Restore the exact scheduler state that was installed before this deploy.
@@ -340,6 +548,7 @@ rollback() {
 
   printf '%s\n' "$PREVIOUS_SHA" > "$LAST_GOOD_FILE"
   cleanup_snapshot
+  echo "OPIP_SAFE_BASELINE_ROLLBACK=SUCCESS"
   echo "rollback health and paper checks passed" >&2
   exit "$rc"
 }
@@ -354,7 +563,12 @@ stop_paper_stack
 "${GIT[@]}" reset --hard "$TARGET_SHA"
 
 cd "$APP_ROOT"
-docker compose build opip-canonical-writer ohm-trade-agent
+[[ "$("${GIT[@]}" rev-parse HEAD)" == "$TARGET_SHA" ]] || {
+  echo "checked-out repository SHA changed before build" >&2
+  false
+}
+docker compose build --build-arg "OPIP_RELEASE_SHA=$TARGET_SHA" \
+  opip-canonical-writer ohm-trade-agent
 # Writer and core are independent services. Build/start both; validate each
 # separately. Never introduce Compose depends_on: condition=service_healthy
 # from ohm-trade-agent onto opip-canonical-writer.
@@ -385,6 +599,27 @@ bash "$SCHEDULER_RECONCILE"
 start_paper_stack
 wait_paper_health
 validate_target_resource_budget
+validate_candidate_container_identity
+validate_release_scheduler_contract
+
+READY_AFTER="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+RELEASE_PROFILE="$(docker compose exec -T ohm-trade-agent \
+  python -c 'import os; print(os.environ.get("OPIP_RELEASE_PROFILE", ""))')"
+echo "O'Pip bounded $RELEASE_PROFILE runtime verification started at $READY_AFTER"
+DEPLOY_VERIFY_DEADLINE=$((SECONDS + 360))
+wait_unified_cycle_success "$READY_AFTER" "$DEPLOY_VERIFY_DEADLINE"
+REMAINING_VERIFY_SECONDS=$((DEPLOY_VERIFY_DEADLINE - SECONDS))
+(( REMAINING_VERIFY_SECONDS > 0 )) || {
+  echo "release verifier exhausted its shared 360-second deadline" >&2
+  false
+}
+timeout --signal=TERM --kill-after=5s "$((REMAINING_VERIFY_SECONDS + 10))" \
+  docker compose exec -T ohm-trade-agent \
+  python -m app.services.release_runtime_verifier \
+    --expected-sha "$TARGET_SHA" \
+    --baseline-json "$RELEASE_EVIDENCE_BASELINE" \
+    --ready-after "$READY_AFTER" \
+    --timeout-seconds "$REMAINING_VERIFY_SECONDS"
 
 # All rollback-sensitive validation is complete. Make the exact SHA
 # authoritative before the owner-authorized irreversible P1 retirement so a

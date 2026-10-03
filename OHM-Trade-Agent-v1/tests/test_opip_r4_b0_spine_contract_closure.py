@@ -321,10 +321,13 @@ def test_ac_009_zero_model_yields_no_trade_with_distinct_states():
 
 @pytest.mark.acceptance
 def test_ac_010_dormant_posture_unchanged_by_closure():
-    """ATDD-R4-B0-spine-contract-closure/AC-010: the closure keeps the Feature Bus off and Paper-v2 unset in repository-controlled configuration, and neither run_cycle nor the scan imports the target spine."""
+    """ATDD-R4-B0-spine-contract-closure/AC-010: the closure preserves its historical dormant contract while the later release profile keeps the spine non-authoritative and Paper-v2 off."""
     compose = COMPOSE.read_text(encoding="utf-8")
+    historical_contract = CONTRACT_PATH.read_text(encoding="utf-8")
+    assert "OPIP_PAPER_V2_MODE` remains unset in production configuration" in historical_contract
+    assert 'OPIP_RELEASE_PROFILE: "EVIDENCE_SHADOW"' in compose
     assert 'OPIP_FEATURE_BUS_MODE: "shadow"' in compose
-    assert "OPIP_PAPER_V2_MODE" not in compose
+    assert 'OPIP_PAPER_V2_MODE: "off"' in compose
 
     run_cycle = RUN_CYCLE.read_text(encoding="utf-8")
     scan = SCAN.read_text(encoding="utf-8")
