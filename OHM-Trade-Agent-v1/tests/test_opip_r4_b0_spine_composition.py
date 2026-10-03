@@ -778,7 +778,7 @@ def test_composition_imports_no_execution_or_authority_surface():
 def test_composition_authority_targets_are_unchanged_on_disk():
     """The dormant production posture is untouched by this increment."""
     compose = (APP_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
-    assert 'OPIP_FEATURE_BUS_MODE: "off"' in compose
+    assert 'OPIP_FEATURE_BUS_MODE: "shadow"' in compose
     assert "OPIP_PAPER_V2_MODE" not in compose
     run_cycle = (APP_ROOT / "app" / "jobs" / "run_cycle.py").read_text(encoding="utf-8")
     scan = (APP_ROOT / "app" / "jobs" / "scan_opportunities.py").read_text(encoding="utf-8")

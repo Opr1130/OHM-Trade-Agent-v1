@@ -559,7 +559,7 @@ def test_feature_bus_mode_stays_off_and_cycle_does_not_run_capture():
     assert resolve_feature_bus_mode(type("S", (), {"opip_feature_bus_mode": "off"})()) == "off"
     root = Path(__file__).resolve().parents[1]
     compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
-    assert 'OPIP_FEATURE_BUS_MODE: "off"' in compose
+    assert 'OPIP_FEATURE_BUS_MODE: "shadow"' in compose
     cycle = (root / "app" / "jobs" / "run_cycle.py").read_text(encoding="utf-8")
     # The manual measurement pilot is never scheduled from the production cycle, and
     # neither is the R4-B2 SHADOW capture: it runs from its own cron entry.

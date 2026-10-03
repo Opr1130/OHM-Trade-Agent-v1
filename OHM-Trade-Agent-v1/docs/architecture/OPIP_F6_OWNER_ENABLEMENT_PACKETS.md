@@ -12,9 +12,16 @@ executed against a moving or unverified SHA.
 
 The one control-plane mechanism is the existing owner-gated production deploy
 (`.github/workflows/deploy-production.yml`, triggered by an owner `/deploy
-<40-char-sha>` command on issue #64 with the exact approved `main` SHA). Mode
-values are set by the owner in the production environment; there is no alternate
-deploy or mode path.
+<40-char-sha>` command on issue #64 with the exact approved `main` SHA). This
+increment adds no alternate deploy path.
+
+**Activation authority (Release Pipeline v1).** The production evidence-plane
+modes are expressed as repo-controlled literals in the core service
+`environment` block of `OHM-Trade-Agent-v1/docker-compose.yml`, selected by the
+allowlisted release profile resolved in `OHM-Trade-Agent-v1/app/services/release_profiles.py`
+(`SAFE_BASELINE`, `EVIDENCE_SHADOW`; `TARGET_PAPER` remains BLOCKED). Packet A
+corresponds to the `EVIDENCE_SHADOW` profile. The `.env` file is never the
+activation authority; see `ATDD-RELEASE-PIPELINE-v1`.
 
 ---
 

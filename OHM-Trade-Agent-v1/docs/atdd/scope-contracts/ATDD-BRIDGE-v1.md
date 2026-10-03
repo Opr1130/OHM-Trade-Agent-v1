@@ -125,6 +125,8 @@ that stale lifecycle pin prevents every later approved increment from activating
 THEN:
 the OWNER may authorize removing only that pointer pin, the completed increment remains identifiable through its own scope contract, and no runtime, trading, feature-bus, import or isolation assertion is weakened
 
+A completed increment's historical scope is immutable evidence unless explicitly amended under owner authority. The no-weakening check must therefore prove that the completed increment's substantive isolation and authority assertions remain present, and must NOT convert a historical runtime literal (for example a past `OPIP_FEATURE_BUS_MODE: "off"` value) into a permanent current-runtime prohibition: a later OWNER-approved increment may supersede an old runtime posture only when it carries explicit owner provenance and its own acceptance tests, and such a supersession is authorized, not a weakening. A mutation/adversarial check proves that an unapproved deletion or weakening of those isolation assertions still fails.
+
 AC-015:
 GIVEN:
 the merged bridge requires one harmless development-only file to prove first local activation end to end
@@ -175,6 +177,7 @@ AC-012 -> tests/test_local_agent_bridge.py::test_github_status_reporting
 AC-012 -> tests/test_local_agent_bridge.py::test_status_comment_identity_is_verified
 AC-013 -> tests/test_local_bridge_autonomy.py::test_protected_required_checks
 AC-014 -> tests/test_local_agent_bridge.py::test_completed_increment_pointer_is_not_pinned
+AC-014 -> tests/test_local_agent_bridge.py::test_bridge_guard_still_fails_unapproved_weakening
 AC-015 -> tests/test_local_agent_bridge.py::test_bridge_smoke_target_is_authorized
 AC-016 -> tests/test_local_agent_bridge.py::test_cursor_packaged_windows_runtime
 

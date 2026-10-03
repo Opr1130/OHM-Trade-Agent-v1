@@ -796,7 +796,7 @@ def test_ac_012_f3_boundary_unchanged() -> None:
 def test_ac_013_f5_plus_isolation() -> None:
     """ATDD-R3-F4-opportunity-lifecycle/AC-013: F5+/Paper/Committee/Feature Bus authorities are unchanged. ATDD-R3-F4-opportunity-lifecycle-implementation/AC-013: the implementation activates nothing and wires no consumer."""
     compose = COMPOSE_PATH.read_text(encoding="utf-8")
-    assert 'OPIP_FEATURE_BUS_MODE: "off"' in compose
+    assert 'OPIP_FEATURE_BUS_MODE: "shadow"' in compose
 
     for source in (LIFECYCLE_SOURCE, CONTRACT_SOURCE):
         modules = imported_modules(source)

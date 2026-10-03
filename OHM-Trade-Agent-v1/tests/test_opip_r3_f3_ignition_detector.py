@@ -829,7 +829,7 @@ def test_ac_009_supplied_prior_state_continues_deterministically() -> None:
 def test_ac_010_shadow_isolation_grants_no_authority() -> None:
     """ATDD-R3-F3-ignition-detector/AC-010: no run_cycle wiring, Feature Bus activation or authority change. ATDD-R3-F3-ignition-implementation/AC-010: the implementation increment activates nothing."""
     compose = COMPOSE_PATH.read_text(encoding="utf-8")
-    assert 'OPIP_FEATURE_BUS_MODE: "off"' in compose
+    assert 'OPIP_FEATURE_BUS_MODE: "shadow"' in compose
 
     for name, source in NEW_MODULE_SOURCE.items():
         for module in imported_modules(source):

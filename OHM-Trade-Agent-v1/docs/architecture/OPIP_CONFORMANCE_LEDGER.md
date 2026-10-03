@@ -43,7 +43,7 @@ Status values: `IMPLEMENTED_VERIFIED`, `IMPLEMENTED_NOT_ACTIVE`, `IMPLEMENTED_AW
 | CURRENT_OWNER | Feature-bus package |
 | CURRENT_WRITER | Publisher, only when feature-bus mode and canonical-writer mode are both `shadow` |
 | CURRENT_CONSUMERS | Pilot and tests. `app/jobs/run_cycle.py` does not call it. |
-| CURRENT_RUNTIME_AUTHORITY | **None.** Compose pins `OPIP_FEATURE_BUS_MODE=off` on the core service and `run_cycle` does not call the Feature Bus. The R2 shadow proof produced evidence only; it did not act as an authority. |
+| CURRENT_RUNTIME_AUTHORITY | **None.** The core-service `OPIP_FEATURE_BUS_MODE` is `shadow` under the owner-authorized `EVIDENCE_SHADOW` release profile (`ATDD-RELEASE-PIPELINE-v1`), superseding the earlier composed pin `OPIP_FEATURE_BUS_MODE=off`; `run_cycle` does not call the Feature Bus. The R2 shadow proof produced evidence only; it did not act as an authority. |
 | TEST_EVIDENCE | `tests/test_opip_feature_bus_pr3.py`, `tests/test_opip_feature_bus_pr3_integrity.py`, `tests/test_opip_feature_bus_r2_shadow_parity.py` |
 | IMPLEMENTATION_STATUS | `IMPLEMENTED_NOT_ACTIVE` in runtime. R2 shadow parity/replay evidence is accepted (see below); runtime authority is unchanged. |
 | VERIFIED_SHADOW_EVIDENCE | R2 `ATDD-R2-feature-bus-shadow-parity` passed and merged via PR #284 (`facf8e369e1251697bf9799bc9b1c575a9cdc3ec`). Deterministic point-in-time replay/parity is proven: sealed snapshots replay byte-identically, invalid or out-of-time inputs fail closed, retained state and restart state are reproduced, and the parity report describes sealed `FeatureSnapshot` values rather than recomputing a competing value. 0 valid unresolved non-outdated review blockers at merge. |
