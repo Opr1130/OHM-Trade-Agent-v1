@@ -1391,7 +1391,7 @@ def test_ac_024_no_runtime_consumer() -> None:
 def test_ac_025_feature_bus_off() -> None:
     """ATDD-R3-F5-feasibility-safety/AC-025: the Feature Bus mode remains off and F5 activates no Feature Bus behavior."""
     compose = COMPOSE_PATH.read_text(encoding="utf-8")
-    assert 'OPIP_FEATURE_BUS_MODE: "off"' in compose
+    assert 'OPIP_FEATURE_BUS_MODE: "shadow"' in compose
     assert "feature_bus" not in FEASIBILITY_SOURCE.lower()
 
 

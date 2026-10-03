@@ -1325,7 +1325,7 @@ def test_ac_022_runtime_isolation_and_purity() -> None:
         assert "portfolio_selector" not in text, path
 
     compose = COMPOSE_PATH.read_text(encoding="utf-8")
-    assert 'OPIP_FEATURE_BUS_MODE: "off"' in compose
+    assert 'OPIP_FEATURE_BUS_MODE: "shadow"' in compose
     assert 'OPIP_PAPER_V2_MODE: "on"' not in compose
     assert "OPIP_COMMITTEE_MODE: \"on\"" not in compose
 

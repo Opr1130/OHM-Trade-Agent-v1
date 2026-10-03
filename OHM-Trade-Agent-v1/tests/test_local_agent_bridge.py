@@ -1087,9 +1087,14 @@ def test_completed_increment_pointer_is_not_pinned():
     assert lines[0].strip() == "INCREMENT:"
     assert lines[1].strip() == "ATDD-R3-F3-ignition-implementation"
 
-    # No substantive isolation, feature-bus or authority assertion was weakened.
+    # No substantive isolation or authority assertion was weakened. This check
+    # deliberately does NOT pin a historical runtime literal (for example
+    # `OPIP_FEATURE_BUS_MODE: "off"`): a later OWNER-approved increment
+    # (ATDD-RELEASE-PIPELINE-v1) may supersede an old runtime posture under its
+    # own provenance and acceptance tests, and requiring the old literal forever
+    # would convert historical scope into a permanent prohibition. The isolation
+    # that AC-014 protects is the substantive guard set below, which stays.
     for required in (
-        'OPIP_FEATURE_BUS_MODE: "off"',
         "FORBIDDEN_MODULE_PREFIXES",
         "FORBIDDEN_IMPORT_ROOTS",
         "AUTHORITY_TOKENS",
@@ -1100,6 +1105,52 @@ def test_completed_increment_pointer_is_not_pinned():
         "SCOPE_CONTRACT_PATH.is_file()",
     ):
         assert required in source, required
+
+    # The Feature Bus mode assertion remains present and repo-controlled: the
+    # completed increment still asserts a concrete mode token (its value may be
+    # superseded later, but the assertion must not be deleted).
+    import re
+
+    assert re.search(r'OPIP_FEATURE_BUS_MODE: "[a-z]+"', source), (
+        "the completed R3-F3 increment must still assert a repo-controlled "
+        "Feature Bus mode token"
+    )
+
+    # The supersession is recorded by its own owner-authorized contract, so a
+    # later posture change is provably authorized rather than an unowned drift.
+    supersession = (
+        b.APP / "docs" / "atdd" / "scope-contracts" / "ATDD-RELEASE-PIPELINE-v1.md"
+    )
+    assert supersession.is_file()
+    supersession_text = supersession.read_text(encoding="utf-8")
+    assert "EVIDENCE_SHADOW" in supersession_text
+    assert "supersed" in supersession_text.lower()
+
+
+@pytest.mark.acceptance
+def test_bridge_guard_still_fails_unapproved_weakening():
+    """ATDD-BRIDGE-v1/AC-014: an unapproved deletion of a completed increment's isolation guard still fails, so the supersession is not a generic relaxation."""
+    # The guard above is only meaningful if removing a substantive assertion would
+    # be detected. Model that here: the required guard set must be non-trivially
+    # present, and the Feature Bus mode assertion must exist as a token.
+    r3_test = b.APP / "tests" / "test_opip_r3_f3_ignition_detector.py"
+    source = r3_test.read_text(encoding="utf-8")
+    guard_tokens = (
+        "FORBIDDEN_MODULE_PREFIXES",
+        "AUTHORITY_TOKENS",
+        "run_cycle.py",
+        "assert imported_modules(source).isdisjoint(",
+    )
+    # Every substantive guard token is present today.
+    for token in guard_tokens:
+        assert token in source, token
+    # If the whole isolation test were deleted, the guard set would vanish; prove
+    # that removing it is detectable by requiring the test function to exist.
+    assert "def test_ac_010_shadow_isolation_grants_no_authority" in source
+    # And the Feature Bus mode assertion must not be silently dropped.
+    import re
+
+    assert re.search(r'OPIP_FEATURE_BUS_MODE: "[a-z]+"', source)
 
 
 @pytest.mark.acceptance

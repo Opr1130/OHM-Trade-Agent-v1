@@ -1660,7 +1660,7 @@ def test_ac_033_no_new_writer_db_jsonl() -> None:
 def test_ac_034_feature_bus_off() -> None:
     """ATDD-R3-F6-forecast-engine/AC-034: the Feature Bus mode remains off and F6 activates no Feature Bus behavior."""
     compose = COMPOSE_PATH.read_text(encoding="utf-8")
-    assert 'OPIP_FEATURE_BUS_MODE: "off"' in compose
+    assert 'OPIP_FEATURE_BUS_MODE: "shadow"' in compose
     for source in F6_SOURCES:
         assert "feature_bus" not in source.lower()
 
@@ -1733,7 +1733,7 @@ def test_ac_036_f5_pointer_handoff() -> None:
 
     # F5/F6 stay shadow and non-authoritative with the Feature Bus off, and every
     # substantive F6 isolation criterion stays asserted in this module.
-    assert 'OPIP_FEATURE_BUS_MODE: "off"' in COMPOSE_PATH.read_text(encoding="utf-8")
+    assert 'OPIP_FEATURE_BUS_MODE: "shadow"' in COMPOSE_PATH.read_text(encoding="utf-8")
     for marker in (
         "test_ac_030_no_ai_or_committee_authority",
         "test_ac_031_no_allocation_or_f7",

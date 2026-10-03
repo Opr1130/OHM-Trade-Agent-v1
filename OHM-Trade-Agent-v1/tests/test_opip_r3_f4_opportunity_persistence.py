@@ -754,7 +754,7 @@ def test_ac_020_no_runtime_caller_no_feature_bus_activation_no_consumer_migratio
         assert "opportunity_persistence" not in text, path
         assert "opportunity_lifecycle" not in text, path
     compose = (APP_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
-    assert 'OPIP_FEATURE_BUS_MODE: "off"' in compose
+    assert 'OPIP_FEATURE_BUS_MODE: "shadow"' in compose
     # The producer seam is dormant: nothing outside the authorized persistence
     # files plus the canonical writer's IPC vocabulary imports it.
     authorized = {

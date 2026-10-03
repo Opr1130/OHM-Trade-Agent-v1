@@ -58,12 +58,21 @@ services:
       # qualification, or funded execution authority.
       # Core must start independently of writer health (no hard depends_on).
       OPIP_CANONICAL_WRITER_MODE: "shadow"
-      # Feature Bus capture must NOT be activated by the writer activation.
-      # It is dual-gated (feature bus mode AND writer mode), so a stale .env
-      # carrying OPIP_FEATURE_BUS_MODE=shadow would widen the blast radius the
-      # moment the writer is enabled. This explicit override wins over .env,
-      # the same way P1_SHADOW_OUTBOX_ENABLED pins its retired path off.
-      OPIP_FEATURE_BUS_MODE: "off"
+      # Owner-authorized EVIDENCE_SHADOW release profile (ATDD-RELEASE-PIPELINE-v1).
+      # The Feature Bus is deliberately activated to SHADOW. This is the approved
+      # evidence-plane release profile, NOT a stale-`.env` activation: the value is
+      # a literal in this `environment` block, which overrides `env_file: .env`, so
+      # a stale `.env` cannot activate, widen, or silently disable capture. The
+      # activation authority is the selected release profile resolved by
+      # `app/services/release_profiles.py`, and reverting to the SAFE_BASELINE
+      # profile ("off" here) is the deterministic rollback. Capture stays
+      # dual-gated (Feature Bus shadow AND writer shadow) and never runs inside the
+      # protected unified cycle.
+      OPIP_FEATURE_BUS_MODE: "shadow"
+      # EVIDENCE_SHADOW composes the F3-F7 target spine as a recorded,
+      # NON-AUTHORITATIVE shadow path (no snapshot source, so it is a recorded
+      # no-op that can never admit, reserve, order or protect).
+      OPIP_TARGET_SPINE_MODE: "shadow"
     ports:
       - "127.0.0.1:8000:8000"
     volumes:

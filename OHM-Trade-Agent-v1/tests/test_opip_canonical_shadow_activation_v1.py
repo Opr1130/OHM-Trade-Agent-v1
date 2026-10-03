@@ -8,8 +8,10 @@ hand-written settings object, so these tests fail if someone later changes the
 compose in a way that silently widens or narrows the blast radius.
 
 Activation is evidence capture only. It grants no ranking, trading, sizing,
-alert-qualification, or funded execution authority, and it must not activate
-the separately-gated Feature Bus.
+alert-qualification, or funded execution authority. The Feature Bus is separately
+gated and is now owner-authorized to `shadow` under the EVIDENCE_SHADOW release
+profile (ATDD-RELEASE-PIPELINE-v1); this module proves capture is enabled only by
+the reviewed, repo-controlled dual gate, never by a stale `.env`.
 """
 from __future__ import annotations
 
@@ -196,29 +198,43 @@ def test_paper_outcome_gate_fails_closed_on_settings_error(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_production_compose_pins_the_feature_bus_gate_off():
-    """Feature Bus isolation must be declarative, not dependent on the .env.
+def test_production_compose_pins_the_owner_activated_feature_bus_gate():
+    """Owner EVIDENCE_SHADOW release profile (ATDD-RELEASE-PIPELINE-v1).
 
-    The core service loads ``env_file: .env``, so a stale deployment ``.env``
-    carrying ``OPIP_FEATURE_BUS_MODE=shadow`` would activate Feature Bus capture
-    the moment the writer is shadow, because that gate is dual-keyed. Pinning
-    the value here makes the blast radius reviewable in the repository instead
-    of resting on a file that is invisible to review. This forbids activation;
-    it does not perform it.
+    The core service loads ``env_file: .env``. Before the OWNER-authorized
+    EVIDENCE_SHADOW activation the value was pinned ``off`` so a stale ``.env``
+    could not activate capture. The OWNER has since authorized the bounded
+    Feature Bus ``shadow`` activation under the EVIDENCE_SHADOW release profile;
+    the value stays a literal in the service ``environment`` block so it
+    overrides ``env_file``. The posture remains repo-controlled and reviewable in
+    the exact-SHA release diff, and the activation authority is the selected
+    release profile, not ``.env``. Reverting to SAFE_BASELINE (``off``) is the
+    deterministic rollback.
     """
-    assert _core_feature_bus_mode() == "off"
+    assert _core_feature_bus_mode() == "shadow"
 
 
-def test_feature_bus_is_not_activated_by_the_activation_itself():
-    """The compose feature-bus pin comes from this change, and it is off."""
+def test_feature_bus_gate_is_a_repo_controlled_literal():
+    """The compose Feature Bus pin is a literal, so it is not ``.env``-derived."""
     core = _service_block("ohm-trade-agent")
-    assert 'OPIP_FEATURE_BUS_MODE: "off"' in core
+    assert 'OPIP_FEATURE_BUS_MODE: "shadow"' in core
+    pinned = [
+        line.split(":", 1)[1].strip()
+        for line in core.splitlines()
+        if line.strip().startswith("OPIP_FEATURE_BUS_MODE:")
+    ][0]
+    # A literal carries no variable expansion, so a stale `.env` cannot drive it.
+    assert pinned == '"shadow"'
+    assert "${" not in pinned
 
 
-def test_feature_bus_stays_disabled_under_production_activation():
-    """Writer=shadow plus pinned-off feature bus must not activate capture.
+def test_activated_capture_requires_both_gates_in_production():
+    """Production capture is enabled by the owner-authorized profile and stays dual-gated.
 
-    This is the single most important isolation property of the activation.
+    With the writer and the Feature Bus both pinned to ``shadow`` by the
+    repository, capture is enabled - but only because BOTH gates are satisfied by
+    reviewed, repo-controlled values, never by a stale ``.env``. The writer is
+    still a required gate: the Feature Bus alone cannot enable capture.
     """
     from app.opip.features.publisher import (
         feature_bus_capture_enabled,
@@ -226,29 +242,35 @@ def test_feature_bus_stays_disabled_under_production_activation():
     )
 
     settings = _production_settings()
-    assert resolve_feature_bus_mode(settings) == "off"
-    assert feature_bus_capture_enabled(settings) is False
-
-
-def test_stale_env_cannot_activate_feature_bus():
-    """A stale .env value is overridden by the compose pin.
-
-    ``env_file`` values are overridden by the service ``environment`` block, so
-    the pinned ``off`` wins. This test asserts the compose declares the pin,
-    which is what makes that override effective.
-    """
-    core = _service_block("ohm-trade-agent")
-    assert 'OPIP_FEATURE_BUS_MODE: "off"' in core
-    # The hazard this defends against: shadow writer + shadow feature bus.
-    from app.opip.features.publisher import feature_bus_capture_enabled
-
-    stale = Settings(
+    assert resolve_feature_bus_mode(settings) == "shadow"
+    assert feature_bus_capture_enabled(settings) is True
+    bus_only = Settings(
         webhook_secret="test-webhook-secret",
         opip_feature_bus_mode="shadow",
+        opip_canonical_writer_mode="off",
+    )
+    assert feature_bus_capture_enabled(bus_only) is False
+
+
+def test_stale_env_cannot_change_the_activated_feature_bus_posture():
+    """A stale `.env` value is overridden by the compose pin.
+
+    ``env_file`` values are overridden by the service ``environment`` block, so
+    the pinned literal wins. This is what keeps the EVIDENCE_SHADOW activation
+    repo-controlled: a stale ``.env`` carrying ``off`` or ``active`` cannot
+    disable or widen it.
+    """
+    core = _service_block("ohm-trade-agent")
+    assert 'OPIP_FEATURE_BUS_MODE: "shadow"' in core
+    from app.opip.features.publisher import feature_bus_capture_enabled
+
+    stale_off = Settings(
+        webhook_secret="test-webhook-secret",
+        opip_feature_bus_mode="off",
         opip_canonical_writer_mode="shadow",
     )
-    assert feature_bus_capture_enabled(stale) is True  # the hazard is real
-    assert feature_bus_capture_enabled(_production_settings()) is False  # pinned off
+    assert feature_bus_capture_enabled(stale_off) is False  # a `.env` off does not change the pin
+    assert feature_bus_capture_enabled(_production_settings()) is True  # the pin wins
 
 
 def test_feature_bus_requires_both_gates_explicitly():

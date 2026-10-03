@@ -63,3 +63,16 @@ When principle 20 applies, state before implementing:
 3. Whether durable evidence/stores are written, migrated, or deleted.
 4. Which tests/CI contracts will prove the change is safe.
 5. What remains explicitly out of scope.
+
+## Release profile and Copilot review contract
+
+The repository uses an allowlisted release-profile contract. The valid profiles are `SAFE_BASELINE`, `EVIDENCE_SHADOW`, and the future `TARGET_PAPER` profile, which remains blocked unless every prerequisite is proven.
+
+The profile mechanism is deterministic and exact: it does not allow arbitrary mode strings, stale `.env` activation, or implicit authority transitions. The `EVIDENCE_SHADOW` profile resolves to:
+
+- `OPIP_FEATURE_BUS_MODE=shadow`
+- `OPIP_CANONICAL_WRITER_MODE=shadow`
+- `OPIP_TARGET_SPINE_MODE=shadow`
+- `OPIP_PAPER_V2_MODE=off`
+
+Copilot review must specifically inspect for duplicate authority, second source of truth, hidden config activation, stale `.env` activation, authority widening, Paper-v2 activation, funded/exchange leakage, point-in-time leakage, missing fail-closed behavior, missing rollback, duplicate deployments, and missing provenance. Copilot approval is advisory only and can never replace deterministic architecture, release-profile, or production deploy gates.
