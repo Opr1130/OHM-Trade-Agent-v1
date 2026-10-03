@@ -201,7 +201,7 @@ def test_ac_004_bridge_guard_still_fails_unapproved_weakening() -> None:
         "run_cycle.py",
         "assert imported_modules(source).isdisjoint(",
     )
-    mode_re = re.compile(r'OPIP_FEATURE_BUS_MODE: "[a-z]+"')
+    mode_re = re.compile(r'OPIP_FEATURE_BUS_MODE: "(?:off|shadow)"')
 
     def guard_ok(source: str) -> bool:
         return all(token in source for token in guards) and bool(mode_re.search(source))
@@ -214,7 +214,9 @@ def test_ac_004_bridge_guard_still_fails_unapproved_weakening() -> None:
     for token in guards:
         assert guard_ok(real.replace(token, "")) is False, token
     # Removing the Feature Bus mode assertion entirely is detected.
-    assert guard_ok(re.sub(r'OPIP_FEATURE_BUS_MODE: "[a-z]+"', "", real)) is False
+    assert guard_ok(re.sub(r'OPIP_FEATURE_BUS_MODE: "(?:off|shadow)"', "", real)) is False
+    # An unapproved widening to a non-allowlisted mode (`active`) is also detected.
+    assert guard_ok(real.replace('OPIP_FEATURE_BUS_MODE: "shadow"', 'OPIP_FEATURE_BUS_MODE: "active"')) is False
 
 
 @pytest.mark.acceptance
@@ -253,6 +255,51 @@ def test_ac_005_gate_fails_closed_and_receipt() -> None:
     assert "PROFILE=EVIDENCE_SHADOW" in receipt
     assert "NEW_ENTRY_AUTHORITY=LEGACY_ONLY" in receipt
     assert "PAPER_V2=OFF" in receipt
+
+    # The gate is hermetic: it derives every check from the supplied mapping, so a
+    # funded credential name in the ambient process environment cannot change the
+    # verdict (and no secret value is ever read).
+    import os
+
+    saved = os.environ.get("KRAKEN_API_KEY")
+    os.environ["KRAKEN_API_KEY"] = "not-a-real-secret"
+    try:
+        assert evaluate_architecture_gate("EVIDENCE_SHADOW", repo_root=APP_ROOT)["status"] == "PASS"
+    finally:
+        if saved is None:
+            os.environ.pop("KRAKEN_API_KEY", None)
+        else:
+            os.environ["KRAKEN_API_KEY"] = saved
+
+    # A declared funded credential name in the reviewed environment fails the gate.
+    funded = evaluate_architecture_gate(
+        "EVIDENCE_SHADOW",
+        repo_root=APP_ROOT,
+        environment={
+            "OPIP_FEATURE_BUS_MODE": "shadow",
+            "OPIP_CANONICAL_WRITER_MODE": "shadow",
+            "OPIP_TARGET_SPINE_MODE": "shadow",
+            "OPIP_PAPER_V2_MODE": "off",
+            "KRAKEN_API_KEY": "x",
+        },
+    )
+    assert funded["status"] == "FAIL"
+    assert funded["checks"]["FUNDED_AUTHORITY_ABSENT"] is False
+
+    # The Committee check is not vacuous: a non-off committee mode fails closed.
+    committee = evaluate_architecture_gate(
+        "EVIDENCE_SHADOW",
+        repo_root=APP_ROOT,
+        environment={
+            "OPIP_FEATURE_BUS_MODE": "shadow",
+            "OPIP_CANONICAL_WRITER_MODE": "shadow",
+            "OPIP_TARGET_SPINE_MODE": "shadow",
+            "OPIP_PAPER_V2_MODE": "off",
+            "OPIP_COMMITTEE_MODE": "on",
+        },
+    )
+    assert committee["checks"]["COMMITTEE_RUNTIME_AUTHORITY_ABSENT"] is False
+    assert committee["status"] == "FAIL"
 
 
 @pytest.mark.acceptance

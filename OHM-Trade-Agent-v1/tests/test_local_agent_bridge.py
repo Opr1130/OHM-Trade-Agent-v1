@@ -1111,7 +1111,7 @@ def test_completed_increment_pointer_is_not_pinned():
     # superseded later, but the assertion must not be deleted).
     import re
 
-    assert re.search(r'OPIP_FEATURE_BUS_MODE: "[a-z]+"', source), (
+    assert re.search(r'OPIP_FEATURE_BUS_MODE: "(?:off|shadow)"', source), (
         "the completed R3-F3 increment must still assert a repo-controlled "
         "Feature Bus mode token"
     )
@@ -1150,7 +1150,7 @@ def test_bridge_guard_still_fails_unapproved_weakening():
     # And the Feature Bus mode assertion must not be silently dropped.
     import re
 
-    assert re.search(r'OPIP_FEATURE_BUS_MODE: "[a-z]+"', source)
+    assert re.search(r'OPIP_FEATURE_BUS_MODE: "(?:off|shadow)"', source)
 
 
 @pytest.mark.acceptance

@@ -1413,7 +1413,7 @@ def test_f6_pointer_handoff_is_lifecycle_safe() -> None:
     # value as a permanent current-runtime prohibition.
     import re
 
-    assert re.search(r'OPIP_FEATURE_BUS_MODE: "[a-z]+"', source)
+    assert re.search(r'OPIP_FEATURE_BUS_MODE: "(?:off|shadow)"', source)
 
     # The F6 acceptance criteria remain traced in the F6 contract.
     for ac in ("AC-030", "AC-031", "AC-032", "AC-033", "AC-034", "AC-035"):

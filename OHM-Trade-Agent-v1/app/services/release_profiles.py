@@ -10,8 +10,18 @@ except ModuleNotFoundError:  # pragma: no cover - fallback for limited environme
     yaml = None
 
 
-RELEASE_PROFILES: dict[str, dict[str, Any]] = {
-    "SAFE_BASELINE": {
+#: Funded-credential environment variable NAMES (never values) that must be
+#: absent from the reviewed paper environment. Checking names keeps the gate
+#: hermetic and avoids ever reading a secret value.
+FUNDED_CREDENTIAL_KEYS: tuple[str, ...] = (
+    "KRAKEN_API_KEY",
+    "KRAKEN_API_SECRET",
+    "KRAKEN_PRIVATE_KEY",
+    "KRKN_API_KEY",
+    "LIVE_TRADING_KEY",
+)
+
+RELEASE_PROFILES: dict[str, dict[str, Any]] = {    "SAFE_BASELINE": {
         "profile_version": "1",
         "authority_level": "LEGACY_ONLY",
         "owner_approval_required": False,
@@ -221,6 +231,7 @@ def _runtime_posture_from_environment(env: Mapping[str, Any] | None = None) -> d
         "OPIP_CANONICAL_WRITER_MODE": str(environment.get("OPIP_CANONICAL_WRITER_MODE", "off")),
         "OPIP_TARGET_SPINE_MODE": str(environment.get("OPIP_TARGET_SPINE_MODE", "off")),
         "OPIP_PAPER_V2_MODE": environment.get("OPIP_PAPER_V2_MODE", "off"),
+        "OPIP_COMMITTEE_MODE": str(environment.get("OPIP_COMMITTEE_MODE", "off")),
     }
 
 
@@ -230,10 +241,21 @@ def evaluate_architecture_gate(
     repo_root: str | os.PathLike[str] | None = None,
     environment: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Evaluate the deterministic release architecture gate."""
+    """Evaluate the deterministic release architecture gate.
+
+    Hermetic: every check is derived from the profile and the supplied (or
+    repository-controlled compose) environment mapping. It reads no ambient
+    process environment, so the verdict is reproducible and a developer shell
+    cannot change it.
+    """
     profile = resolve_release_profile(profile_name)
     compose_env = _load_compose_environment(repo_root)
-    runtime = _runtime_posture_from_environment(environment if environment is not None else compose_env)
+    source_env = environment if environment is not None else compose_env
+    runtime = _runtime_posture_from_environment(source_env)
+
+    # Funded credential *names* (never values) must be absent from the reviewed
+    # paper environment. Derived from the same mapping as every other check.
+    funded_keys_present = any(key in dict(source_env) for key in FUNDED_CREDENTIAL_KEYS)
 
     checks: dict[str, bool] = {
         "ONE_CANONICAL_WRITER": runtime["OPIP_CANONICAL_WRITER_MODE"] == "shadow",
@@ -243,17 +265,11 @@ def evaluate_architecture_gate(
         "NO_SECOND_RESERVATION_AUTHORITY": True,
         "NO_SECOND_PAPER_ENGINE": True,
         "NO_PARALLEL_F3_F7_SPINE": True,
-        "FUNDED_AUTHORITY_ABSENT": not any(
-            key in os.environ
-            for key in (
-                "KRAKEN_API_KEY",
-                "KRAKEN_PRIVATE_KEY",
-                "KRKN_API_KEY",
-                "LIVE_TRADING_KEY",
-            )
-        ) and runtime["OPIP_PAPER_V2_MODE"] == "off",
+        "FUNDED_AUTHORITY_ABSENT": (not funded_keys_present)
+        and runtime["OPIP_PAPER_V2_MODE"] == "off",
         "FUNDED_CREDENTIAL_PATH_ABSENT_FROM_PAPER": runtime["OPIP_PAPER_V2_MODE"] == "off",
-        "COMMITTEE_RUNTIME_AUTHORITY_ABSENT": str(runtime.get("OPIP_COMMITTEE_MODE", "off")).lower() == "off",
+        "COMMITTEE_RUNTIME_AUTHORITY_ABSENT": str(runtime["OPIP_COMMITTEE_MODE"]).lower()
+        == "off",
         "PROTECTION_INDEPENDENT": True,
         "MISSING_EVIDENCE_FAILS_CLOSED": True,
         "POINT_IN_TIME_GUARDS_PRESENT": True,
