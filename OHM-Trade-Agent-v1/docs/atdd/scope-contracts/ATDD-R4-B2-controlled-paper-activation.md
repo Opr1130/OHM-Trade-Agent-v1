@@ -433,6 +433,7 @@ AC-025 -> tests/test_opip_r4_b2_f6_label_projection.py::test_ac_025_realized_ret
 AC-025 -> tests/test_opip_r4_b2_f6_label_projection.py::test_ac_025_timeout_scores_its_recorded_return
 AC-026 -> tests/test_opip_r4_b2_f6_label_projection.py::test_ac_026_projection_is_pure_and_deterministic
 AC-026 -> tests/test_opip_r4_b2_f6_label_projection.py::test_ac_026_malformed_token_fails_closed_per_record
+AC-026 -> tests/test_opip_r4_b2_f6_label_projection.py::test_ac_026_no_favorable_label_without_supporting_evidence
 AC-027 -> tests/test_opip_r4_b2_f6_prospective_contract.py::test_ac_027_contract_freezes_population_and_policies
 AC-028 -> tests/test_opip_r4_b2_f6_prospective_contract.py::test_ac_028_owner_packets_are_prepared_only
 AC-029 -> tests/test_opip_r4_b2_status_reconciliation.py::test_ac_029_status_docs_are_reconciled_without_activation

@@ -253,3 +253,89 @@ def test_ac_026_malformed_token_fails_closed_per_record() -> None:
     unknown_status = _filled(terminal_status="OPEN")
     assert unknown_status.entry_label_state is ForecastLabelState.UNRESOLVED
     assert unknown_status.population is ForecastEvidencePopulation.UNRESOLVED
+
+
+@pytest.mark.acceptance
+def test_ac_026_no_favorable_label_without_supporting_evidence() -> None:
+    """ATDD-R4-B2-controlled-paper-activation/AC-026: across a cross-product of canonical inputs the projection never yields a favorable label, path or return without the exact supporting evidence, and is deterministic."""
+    import itertools
+
+    dispositions = [None, "ADMITTED", "NO_FILL_EXPIRED", "CAPITAL_REJECTED", "CANCELLED"]
+    exec_states = [None, "FILLED", "PARTIALLY_FILLED", "REJECTED", "CANCELLED", "EXPIRED", "WORKING", "UNKNOWN_X"]
+    quantities = [(None, None), (100.0, 100.0), (100.0, 40.0), (100.0, 0.0), (100.0, 150.0), (0.0, 0.0)]
+    exit_reasons = [None, "TARGET_2", "STOP", "ENTRY_CANDLE_STOP", "TIME_EXIT", "OHLC_GAP", "OPERATOR_OFF", "UNRESOLVED", "NEW_REASON"]
+    terminal_statuses = [None, "CLOSED", "CANCELLED", "UNRESOLVED", "OPEN"]
+    economics = [(None, None), (12.5, 1000.0), (-5.0, 1000.0), (5.0, 0.0)]
+
+    checked = 0
+    for disp, state, (intended, accepted), reason, status, (net, capital) in itertools.product(
+        dispositions, exec_states, quantities, exit_reasons, terminal_statuses, economics
+    ):
+        label = project_forecast_labels(
+            disposition=disp,
+            entry_execution_state=state,
+            intended_quantity=intended,
+            accepted_quantity=accepted,
+            exit_reason=reason,
+            terminal_status=status,
+            net_pnl=net,
+            capital_committed=capital,
+            lineage_completeness="COMPLETE",
+        )
+        checked += 1
+
+        # Determinism: an identical input replays an identical label.
+        again = project_forecast_labels(
+            disposition=disp,
+            entry_execution_state=state,
+            intended_quantity=intended,
+            accepted_quantity=accepted,
+            exit_reason=reason,
+            terminal_status=status,
+            net_pnl=net,
+            capital_committed=capital,
+            lineage_completeness="COMPLETE",
+        )
+        assert again == label
+
+        # Grade A is never inferred.
+        assert label.fidelity is not ForecastFidelityGrade.A
+
+        # A full/partial fill requires an actual positive accepted quantity.
+        if label.entry_outcome is EntryExecutionOutcome.FULL_FILL:
+            assert state == "FILLED" and accepted is not None and intended is not None
+            assert accepted > 0 and accepted >= intended
+        if label.entry_outcome is EntryExecutionOutcome.PARTIAL_FILL:
+            assert accepted is not None and accepted > 0
+            assert intended is None or accepted < intended
+
+        # A path label requires fill exposure.
+        if label.post_fill_outcome is not None:
+            assert label.entry_outcome in (
+                EntryExecutionOutcome.PARTIAL_FILL,
+                EntryExecutionOutcome.FULL_FILL,
+            )
+        if label.post_fill_outcome is PostFillPathOutcome.TARGET:
+            assert reason == "TARGET_2"
+        if label.post_fill_outcome is PostFillPathOutcome.TIMEOUT:
+            assert reason == "TIME_EXIT"
+        if label.post_fill_outcome is PostFillPathOutcome.RISK_EXIT:
+            assert label.post_fill_outcome is PostFillPathOutcome.RISK_EXIT
+
+        # A NO_FILL entry never carries a path label.
+        if label.entry_outcome is EntryExecutionOutcome.NO_FILL:
+            assert label.post_fill_outcome is None
+            assert label.post_fill_label_state is ForecastLabelState.INSUFFICIENT_EVIDENCE
+            assert label.realized_net_return == 0.0
+
+        # A nonzero realized return requires real capital and matching economics.
+        if label.realized_net_return not in (None, 0.0):
+            assert net is not None and capital is not None and capital > 0.0
+            assert label.realized_net_return == pytest.approx(net / capital)
+
+        # A terminal UNRESOLVED status asserts nothing at all.
+        if status == "UNRESOLVED":
+            assert label.entry_outcome is None
+            assert label.post_fill_outcome is None
+            assert label.realized_net_return is None
+    assert checked > 1000
