@@ -120,6 +120,32 @@ def test_ac_022_margin_discovery_uses_bitnomial_venue_and_marks_btnl():
     assert margin["margin_max_leverage"] == 3.0  # min(account ceiling 3, venue max 3)
 
 
+def test_ac_022_leverage_is_bounded_by_account_ceiling():
+    """ATDD-R4-B2-controlled-paper-activation/AC-022: the SHORT leverage tier is bounded by the account ceiling, never the raw venue maximum."""
+    snapshot = _Snapshot()
+
+    class _HighLeverageClient(_ShortClient):
+        def get_asset_pairs(self, execution_venue=None):
+            if execution_venue != producer.BITNOMIAL_EXECUTION_VENUE:
+                return {}
+            return {
+                "SOLUSD": {
+                    "altname": "SOLUSD",
+                    "wsname": "SOL/USD",
+                    "leverage_sell": [10],
+                }
+            }
+
+    # Venue advertises 10x; the default account ceiling (3x) bounds the effective tier.
+    bounded = producer.discover_short_margin(snapshot, client=_HighLeverageClient())
+    assert bounded["margin_max_leverage"] == 3.0
+    # An explicit tighter ceiling is honored.
+    tighter = producer.discover_short_margin(
+        snapshot, client=_HighLeverageClient(), account_leverage_ceiling=2.0
+    )
+    assert tighter["margin_max_leverage"] == 2.0
+
+
 def test_ac_022_pair_absent_from_venue_is_ineligible_not_fabricated():
     """ATDD-R4-B2-controlled-paper-activation/AC-022: a pair absent from the margin venue is INELIGIBLE (present negative evidence), never fabricated eligible."""
     snapshot = _Snapshot()
