@@ -21,7 +21,10 @@ Properties this reader guarantees:
 * exposes a bounded cursor so a consumer processes each committed record once,
   deterministically, and resumes after a restart without reclassifying old records
   as new;
-* dedupes deterministically by the exact ``payload_hash``.
+* owns no process-lifetime dedupe state: dedupe is the exclusive canonical
+  ``(history_epoch, local_sequence)`` cursor's job, so the reader's memory stays
+  bounded however long the process lives. A caller that re-reads from an earlier
+  cursor deterministically sees the same committed rows again.
 
 It holds no trading, admission, reservation, execution or exchange authority, and
 performs no market read.
@@ -110,12 +113,13 @@ class CommittedFeasibilityEvidenceReader:
 
     Cursor persistence across a process restart is the caller's responsibility: the
     reader surfaces each batch's cursor so a consumer can persist it and resume
-    deterministically. The in-memory dedupe set is a within-process guard only.
+    deterministically. The reader keeps no dedupe set of its own - the exclusive
+    canonical cursor is the dedupe authority - so its memory never grows with the
+    committed history.
     """
 
     def __init__(self, *, db_path: Path) -> None:
         self._reader = CanonicalWriter.for_reads(db_path)
-        self._seen: set[str] = set()
 
     @property
     def is_read_only(self) -> bool:
@@ -163,11 +167,6 @@ class CommittedFeasibilityEvidenceReader:
                 if len(reasons) < 8:
                     reasons.append(f"committed payload is not decodable JSON: {exc}")
                 continue
-            # Deterministic dedupe across reads by exact content identity: a record
-            # already surfaced is never reclassified as new evidence.
-            if record.payload_hash in self._seen:
-                continue
-            self._seen.add(record.payload_hash)
             records.append(record)
         # Canonical commit order (history_epoch, local_sequence) is the cursor's
         # guarantee and is preserved as returned.

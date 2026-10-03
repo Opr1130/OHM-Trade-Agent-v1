@@ -215,7 +215,7 @@ def test_ac_019_reader_is_read_only_and_reconstructs_exact_evidence(canonical_st
 
 @pytest.mark.acceptance
 def test_ac_019_bounded_cursor_dedupes_and_preserves_order(canonical_store) -> None:
-    """ATDD-R4-B2-controlled-paper-activation/AC-019: reads are bounded, advance by cursor, dedupe by content, and preserve canonical order."""
+    """ATDD-R4-B2-controlled-paper-activation/AC-019: reads are bounded, advance by cursor, are stateless, and preserve canonical order."""
     write_record(canonical_store, payload(snapshot="EPSNAP:1", best_bid=99.9))
     write_record(canonical_store, payload(snapshot="EPSNAP:2", best_bid=98.0))
     write_record(canonical_store, payload(snapshot="EPSNAP:3", best_bid=97.0))
@@ -225,9 +225,15 @@ def test_ac_019_bounded_cursor_dedupes_and_preserves_order(canonical_store) -> N
         assert len(first.records) == 2
         assert first.cursor is not None
         assert [r.evidence.source_snapshot_id for r in first.records] == ["EPSNAP:1", "EPSNAP:2"]
-        # Re-reading from the start re-surfaces the same rows but dedupe by exact
-        # content identity returns nothing new.
-        assert reader.read_batch(limit=2).records == ()
+        # The reader is stateless: dedupe is owned by the caller's exclusive
+        # cursor. Re-reading from an earlier cursor deterministically re-surfaces
+        # the same committed rows again (and holds no unbounded dedupe set).
+        replay = reader.read_batch(limit=2)
+        assert [r.evidence.source_snapshot_id for r in replay.records] == [
+            "EPSNAP:1",
+            "EPSNAP:2",
+        ]
+        assert replay.cursor == first.cursor
         second = reader.read_batch(after=first.cursor, limit=2)
         assert [r.evidence.source_snapshot_id for r in second.records] == ["EPSNAP:3"]
         assert reader.read_batch(after=second.cursor, limit=2).records == ()
