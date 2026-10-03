@@ -371,7 +371,7 @@ validate_release_scheduler_contract() {
   # process created inside the already-running container. The guard is therefore
   # verified against the producer SOURCES explicitly and diagnostically (a bare
   # `grep -Fq` under `set -e` fails silently and caused a release abort).
-  local fb_producer feas_producer fb_identity feas_identity lock_assignment
+  local fb_producer feas_producer fb_identity feas_identity
   fb_producer="$APP_ROOT/app/jobs/capture_feature_bus_shadow.py"
   feas_producer="$APP_ROOT/app/jobs/capture_feasibility_evidence_shadow.py"
 
@@ -384,24 +384,31 @@ validate_release_scheduler_contract() {
     return 1
   }
 
-  # 1. Each producer defines a process-level lock and a locked capture entrypoint.
+  # 1. The shared process-level lock implementation is present, and BOTH
+  #    producers use the locked capture entrypoint.
   for required in 'class CaptureProcessLock' 'run_capture_locked'; do
     grep -Fq "$required" "$fb_producer" || {
-      echo "Feature Bus process-level lock guard is missing: $required" >&2
+      echo "process-level lock implementation is missing: $required" >&2
       return 1
     }
   done
+  grep -Fq 'run_capture_locked(' "$feas_producer" || {
+    echo "feasibility producer does not use the locked capture entrypoint" >&2
+    return 1
+  }
 
   # 2. Each producer's lock identity is a real path assignment, not a mention.
-  lock_assignment='^[A-Z_]*LOCK_PATH[[:space:]]*=[[:space:]]*"[^"]+"'
-  fb_identity="$(grep -oE "$lock_assignment" "$fb_producer" | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')"
-  feas_identity="$(grep -oE "$lock_assignment" "$feas_producer" | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')"
+  #    `grep -m1` avoids a SIGPIPE under `pipefail`, and `|| true` keeps a
+  #    no-match from aborting the release silently: the explicit diagnostics on
+  #    the next lines must be the thing that fires.
+  fb_identity="$(grep -m1 -oE '^FEATURE_BUS_CAPTURE_LOCK_PATH[[:space:]]*=[[:space:]]*"[^"]+"' "$fb_producer" 2>/dev/null | sed -E 's/.*"([^"]+)".*/\1/' || true)"
+  feas_identity="$(grep -m1 -oE '^FEASIBILITY_CAPTURE_LOCK_PATH[[:space:]]*=[[:space:]]*"[^"]+"' "$feas_producer" 2>/dev/null | sed -E 's/.*"([^"]+)".*/\1/' || true)"
   [[ -n "$fb_identity" ]] || {
-    echo "Feature Bus lock identity path is not defined in $fb_producer" >&2
+    echo "Feature Bus lock identity path is not defined (FEATURE_BUS_CAPTURE_LOCK_PATH) in $fb_producer" >&2
     return 1
   }
   [[ -n "$feas_identity" ]] || {
-    echo "feasibility lock identity path is not defined in $feas_producer" >&2
+    echo "feasibility lock identity path is not defined (FEASIBILITY_CAPTURE_LOCK_PATH) in $feas_producer" >&2
     return 1
   }
 

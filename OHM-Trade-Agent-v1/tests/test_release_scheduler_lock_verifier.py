@@ -79,10 +79,13 @@ def test_ac_012_verifier_checks_the_real_lock_invariant() -> None:
     # The real invariant is asserted, explicitly and diagnostically.
     assert "class CaptureProcessLock" in text
     assert "run_capture_locked" in text
+    assert "does not use the locked capture entrypoint" in text
     assert "share a lock identity" in text
     assert "OPIP_RELEASE_SCHEDULER=UNIQUE_BOUNDED" in text
     assert "OPIP_FEATURE_BUS_LOCK_IDENTITY=" in text
     assert "OPIP_FEASIBILITY_LOCK_IDENTITY=" in text
+    # The identity extraction cannot silently abort (no bare grep|head under pipefail).
+    assert "grep -oE \"$lock_assignment\" \"$fb_producer\" | head" not in text
 
 
 @pytest.mark.acceptance
@@ -101,7 +104,7 @@ def test_ac_012_feature_bus_lock_identity_is_present_and_distinct() -> None:
 
 @pytest.mark.acceptance
 def test_ac_012_verifier_accepts_the_real_producers_and_fails_on_weakening() -> None:
-    """ATDD-RELEASE-PIPELINE-v1/AC-012: the actual verifier block accepts the real producer sources and fails closed when the process-lock guard is removed or identities collapse."""
+    """ATDD-RELEASE-PIPELINE-v1/AC-012: the actual verifier block accepts the real producer sources and fails closed when the process-lock guard is removed, when a lock identity is undefined, and when the two producers share an identity."""
     bash = _bash()
     if bash is None:
         pytest.skip("bash is not available in this environment")
@@ -114,29 +117,61 @@ def test_ac_012_verifier_accepts_the_real_producers_and_fails_on_weakening() -> 
     assert "OPIP_RELEASE_SCHEDULER=UNIQUE_BOUNDED" in ok.stdout
     assert "OPIP_FEATURE_BUS_LOCK_IDENTITY=/tmp/opip-feature-bus-capture.lock" in ok.stdout
 
-    # 2. Adversarial: removing the Feature Bus process-lock guard must fail.
     tmp = APP_ROOT / ".tmp-lock-verify-fixture"
-    if tmp.exists():
-        shutil.rmtree(tmp)
-    try:
-        for rel in (
-            "app/jobs/capture_feature_bus_shadow.py",
-            "app/jobs/capture_feasibility_evidence_shadow.py",
-        ):
+    fb_rel = "app/jobs/capture_feature_bus_shadow.py"
+    feas_rel = "app/jobs/capture_feasibility_evidence_shadow.py"
+
+    def _fixture() -> None:
+        if tmp.exists():
+            shutil.rmtree(tmp)
+        for rel in (fb_rel, feas_rel):
             dest = tmp / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text((APP_ROOT / rel).read_text(encoding="utf-8"), encoding="utf-8")
 
-        weakened = (tmp / "app/jobs/capture_feature_bus_shadow.py").read_text(
-            encoding="utf-8"
+    def _mutate(rel: str, old: str, new: str) -> None:
+        path = tmp / rel
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(old, new), encoding="utf-8"
         )
-        (tmp / "app/jobs/capture_feature_bus_shadow.py").write_text(
-            weakened.replace("class CaptureProcessLock", "class _RemovedLock"),
-            encoding="utf-8",
-        )
+
+    try:
+        # 2. Adversarial: removing the process-lock guard must fail.
+        _fixture()
+        _mutate(fb_rel, "class CaptureProcessLock", "class _RemovedLock")
         bad = _run_verifier(tmp, bash)
         assert bad.returncode != 0
-        assert "process-level lock guard is missing" in bad.stderr
+        assert "process-level lock implementation is missing" in bad.stderr
+
+        # 3. Adversarial: an undefined lock identity must fail (and must report
+        #    the explicit diagnostic, not abort silently).
+        _fixture()
+        _mutate(
+            fb_rel,
+            'FEATURE_BUS_CAPTURE_LOCK_PATH = "/tmp/opip-feature-bus-capture.lock"',
+            "FEATURE_BUS_CAPTURE_LOCK_PATH = None",
+        )
+        undefined = _run_verifier(tmp, bash)
+        assert undefined.returncode != 0
+        assert "Feature Bus lock identity path is not defined" in undefined.stderr
+
+        # 4. Adversarial: a shared identity must fail.
+        _fixture()
+        _mutate(
+            fb_rel,
+            'FEATURE_BUS_CAPTURE_LOCK_PATH = "/tmp/opip-feature-bus-capture.lock"',
+            'FEATURE_BUS_CAPTURE_LOCK_PATH = "/tmp/opip-feasibility-evidence-capture.lock"',
+        )
+        shared = _run_verifier(tmp, bash)
+        assert shared.returncode != 0
+        assert "share a lock identity" in shared.stderr
+
+        # 5. Adversarial: removing the feasibility producer's lock wiring must fail.
+        _fixture()
+        _mutate(feas_rel, "run_capture_locked(", "_no_lock(")
+        unwired = _run_verifier(tmp, bash)
+        assert unwired.returncode != 0
+        assert "does not use the locked capture entrypoint" in unwired.stderr
     finally:
         if tmp.exists():
             shutil.rmtree(tmp)
