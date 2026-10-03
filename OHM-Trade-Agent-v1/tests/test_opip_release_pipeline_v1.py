@@ -551,3 +551,26 @@ def test_ac_007_capture_refuses_a_free_form_notional_override() -> None:
     assert resolve_capture_notional(
         SimpleNamespace(opip_feasibility_capture_notional_usd="bogus")
     )[0] is None
+
+
+@pytest.mark.acceptance
+def test_ac_007_read_only_canonical_evidence_verifier() -> None:
+    """ATDD-RELEASE-PIPELINE-v1/AC-007: the diagnostics probe reports canonical evidence counters read-only, without touching the live store."""
+    script = (
+        APP_ROOT / "deploy" / "remote" / "diagnose-opip-learning.sh"
+    ).read_text(encoding="utf-8")
+    # The verifier reports the two prospective evidence families and the notional.
+    assert "OPIP_CANONICAL_EVIDENCE_COUNTS" in script
+    assert "feature_snapshot_recorded_count=" in script
+    assert "feasibility_evidence_recorded_count=" in script
+    assert "canonical_max_local_sequence=" in script
+    assert "latest_feasibility_validation_notional_usd=" in script
+    # It reads the exported replica read-only and never the live store.
+    assert "mode=ro" in script
+    assert "canonical_evidence_counts=UNAVAILABLE" in script
+    # It never mutates: no SQLite write verbs appear in the counter block.
+    block = script.split("OPIP_CANONICAL_EVIDENCE_COUNTS", 1)[1].split(
+        "OPIP_CANONICAL_EVIDENCE_COUNTS_END", 1
+    )[0]
+    for forbidden in ("INSERT", "UPDATE ", "DELETE", "DROP ", "ATTACH"):
+        assert forbidden not in block, forbidden
