@@ -1790,6 +1790,55 @@ class CanonicalWriter:
         )
         return payloads, cursor
 
+    def read_feasibility_evidence_records(
+        self,
+        *,
+        after: tuple[int, int] | None = None,
+        limit: int = 200,
+    ) -> tuple[list[str], tuple[int, int] | None]:
+        """Committed ``feasibility.evidence.recorded`` payloads, in canonical order.
+
+        Read-only: it only SELECTs committed rows and never mutates, quarantines or
+        rewrites canonical state. ``after`` is an exclusive ``(history_epoch,
+        local_sequence)`` cursor, so a caller advances deterministically through
+        canonical history and never re-reads or skips a record. Returns up to
+        ``limit`` committed payload JSON texts and the cursor of the last returned
+        row (or ``after`` when there is nothing new).
+
+        Payloads are returned as committed JSON text so the caller performs
+        guarded, fail-closed decoding per record: a row whose payload is not
+        decodable JSON is the caller's to count as a rejected record rather than
+        aborting the whole batch.
+        """
+        if int(limit) <= 0:
+            raise ValueError("limit must be positive")
+        where = "event_type = ?"
+        params: list[object] = [fev_evidence_event_contract.FEASIBILITY_EVIDENCE_RECORDED]
+        if after is not None:
+            where += (
+                " AND (history_epoch > ? OR "
+                "(history_epoch = ? AND local_sequence > ?))"
+            )
+            params.extend([int(after[0]), int(after[0]), int(after[1])])
+        params.append(int(limit))
+        # Take the instance lock so repeated reads on the same live writer serialize
+        # with that writer's own operations on the shared connection (``for_reads``
+        # readers use a separate instance and connection; cross-connection safety is
+        # SQLite WAL, not this lock).
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT history_epoch, local_sequence, payload_json FROM events "
+                f"WHERE {where} ORDER BY history_epoch ASC, local_sequence ASC LIMIT ?",
+                tuple(params),
+            ).fetchall()
+        payload_texts = [str(row["payload_json"]) for row in rows]
+        cursor = (
+            (int(rows[-1]["history_epoch"]), int(rows[-1]["local_sequence"]))
+            if rows
+            else after
+        )
+        return payload_texts, cursor
+
     def _paper_trade_events(self, event_type: str, paper_trade_id: str) -> list[dict]:
         """Committed records of one event type for one trade, in commit order."""
         rows = self._conn.execute(
