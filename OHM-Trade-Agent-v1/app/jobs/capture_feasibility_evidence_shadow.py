@@ -72,6 +72,14 @@ from app.opip.fev_evidence_event import (
 from app.opip.features.committed_snapshot_reader import CommittedSnapshotReader
 from app.opip.features.publisher import resolve_feature_bus_mode
 
+#: Kraken's US-retail margin execution venue (Bitnomial). Reused, not re-invented.
+BITNOMIAL_EXECUTION_VENUE = "bitnomial_exchange"
+MIN_SHORT_LEVERAGE = 2.0
+DEFAULT_UNKNOWN_PAIR_LEVERAGE = 2.0
+
+#: Default account leverage ceiling for the shadow SHORT margin discovery.
+DEFAULT_ACCOUNT_LEVERAGE_CEILING = 3.0
+
 #: Default bound: how many committed snapshots one batch may convert.
 DEFAULT_CAPTURE_LIMIT = 8
 MAX_CAPTURE_LIMIT = 32
@@ -609,6 +617,185 @@ def build_long_feasibility_evidence(
     )
 
 
+def _normalize_margin_pair(value: str) -> str:
+    """Normalize a pair token exactly as the margin discovery does."""
+    normalized = str(value).upper().replace("XBT", "BTC")
+    normalized = normalized.replace(":BTNL", "")
+    return normalized.replace("/", "")
+
+
+def _reported_max_leverage(details: Any) -> float | None:
+    """The maximum leverage tier the venue advertises for a pair, or None."""
+    values: list[float] = []
+    for key in ("leverage_sell", "leverage_buy", "leverage"):
+        raw = details.get(key)
+        if isinstance(raw, (list, tuple)):
+            for item in raw:
+                try:
+                    values.append(float(item))
+                except (TypeError, ValueError):
+                    pass
+        elif raw is not None:
+            try:
+                values.append(float(raw))
+            except (TypeError, ValueError):
+                pass
+    return max(values) if values else None
+
+
+def discover_short_margin(
+    snapshot: Any,
+    *,
+    client: Any,
+    account_leverage_ceiling: float = DEFAULT_ACCOUNT_LEVERAGE_CEILING,
+) -> dict[str, Any]:
+    """Discover genuine BTNL margin evidence for one instrument.
+
+    Reuses Kraken's Bitnomial execution-venue discovery (the same authority the
+    live scanner uses): pair presence is tradability, and the resolved
+    ``margin_venue_symbol`` carries the ``:BTNL`` provenance F5 requires for SHORT.
+    Returns the margin fields; a pair absent from the venue is INELIGIBLE, and an
+    unavailable discovery is UNAVAILABLE (never fabricated).
+    """
+    from app.exchanges.kraken import KrakenAPIError
+
+    primary = str(snapshot.venue_instrument_id)
+    try:
+        pairs = client.get_asset_pairs(execution_venue=BITNOMIAL_EXECUTION_VENUE)
+    except KrakenAPIError:
+        return {
+            "margin_validation_status": "UNAVAILABLE",
+            "margin_eligible": False,
+            "margin_venue_symbol": None,
+            "margin_max_leverage": None,
+        }
+    lookup: dict[str, Any] = {}
+    for pair_id, details in pairs.items():
+        for identifier in (
+            pair_id,
+            str(details.get("altname") or ""),
+            str(details.get("wsname") or ""),
+        ):
+            if identifier:
+                lookup[_normalize_margin_pair(identifier)] = details
+    details = lookup.get(_normalize_margin_pair(primary))
+    if details is None:
+        return {
+            "margin_validation_status": "INELIGIBLE",
+            "margin_eligible": False,
+            "margin_venue_symbol": None,
+            "margin_max_leverage": None,
+        }
+    reported = _reported_max_leverage(details)
+    venue_max = reported if reported is not None else DEFAULT_UNKNOWN_PAIR_LEVERAGE
+    effective_max = min(float(account_leverage_ceiling), venue_max)
+    venue_symbol = str(details.get("wsname") or details.get("altname") or primary)
+    if ":BTNL" not in venue_symbol.upper():
+        venue_symbol = f"{primary}:BTNL"
+    eligible = effective_max >= MIN_SHORT_LEVERAGE
+    return {
+        "margin_validation_status": "ELIGIBLE" if eligible else "INELIGIBLE",
+        "margin_eligible": eligible,
+        "margin_venue_symbol": venue_symbol,
+        "margin_max_leverage": effective_max,
+    }
+
+
+def build_short_feasibility_evidence(
+    snapshot: Any,
+    *,
+    client: Any,
+    notional_usd: float,
+    acquisition_instant: datetime,
+    interval_minutes: int = 60,
+    interval_seconds: int = 3600,
+    account_leverage_ceiling: float = DEFAULT_ACCOUNT_LEVERAGE_CEILING,
+) -> FeasibilityEvidence:
+    """Assemble genuine SHORT feasibility evidence for one committed snapshot.
+
+    Market data is direction-agnostic (validated on the spot candles), margin
+    eligibility is genuine BTNL discovery, and execution liquidity is the BTNL
+    margin book (``get_pre_trade``/``get_post_trade`` with ``margin_venue_symbol``).
+    Spot execution evidence is NEVER attached as BTNL: without genuine BTNL
+    provenance the SHORT execution record is explicitly UNAVAILABLE (missing
+    evidence), never spot-as-BTNL. The same honest ``evaluation_time``/``source_cutoff``
+    contract as the LONG builder applies.
+    """
+    from app.scanner.execution_validation import evaluate_execution, unavailable_execution
+    from app.scanner.market_data_validation import validate_market_data
+
+    symbol = str(snapshot.venue_instrument_id)
+    moment = acquisition_instant
+    candles = list(client.get_ohlc(symbol, interval=interval_minutes))
+    if not candles:
+        raise FeasibilityCaptureError("no source candles returned")
+    ticker_last = float(client.get_ticker(symbol)["last"])
+    market = validate_market_data(
+        candles, ticker_last, interval_minutes=interval_minutes, now=moment
+    )
+
+    margin = discover_short_margin(
+        snapshot, client=client, account_leverage_ceiling=account_leverage_ceiling
+    )
+    if margin["margin_eligible"] and margin["margin_venue_symbol"]:
+        # Genuine BTNL margin book (the SHORT quality thresholds are defined for it).
+        venue_symbol = margin["margin_venue_symbol"]
+        try:
+            book = client.get_pre_trade(venue_symbol)
+            try:
+                trades = client.get_post_trade(venue_symbol, count=100)
+            except Exception:  # noqa: BLE001 - absent recent trades are still present
+                trades = None
+            execution = evaluate_execution(
+                book=book,
+                validation_notional_usd=float(notional_usd),
+                ticker_last=ticker_last,
+                quote_to_usd_rate=1.0,
+                trades=trades,
+                now=moment,
+            )
+        except Exception as exc:  # noqa: BLE001 - BTNL book unavailable -> explicit absence
+            execution = unavailable_execution(f"BTNL PreTrade unavailable: {exc}")
+    else:
+        # No genuine BTNL provenance: the SHORT execution record is explicitly
+        # UNAVAILABLE (missing evidence). Spot evidence is never used as BTNL.
+        execution = unavailable_execution(
+            "BTNL margin not eligible for this pair; SHORT execution evidence unavailable"
+        )
+
+    evaluation_time = snapshot.evaluation_cutoff
+    completed = candles[:-1] if len(candles) > 1 else candles
+    latest_close = int(completed[-1].timestamp) + int(interval_seconds)
+    source_cutoff = datetime.fromtimestamp(latest_close, tz=timezone.utc)
+    if source_cutoff > evaluation_time:
+        raise FeasibilityEvidenceStaleError(
+            f"source cutoff {source_cutoff.isoformat()} is after the evaluation "
+            f"epoch {evaluation_time.isoformat()}"
+        )
+
+    return FeasibilityEvidence(
+        instrument_version_id=snapshot.instrument_version_id,
+        venue_instrument_id=symbol,
+        direction="SHORT",
+        evaluation_time=evaluation_time,
+        source_cutoff=source_cutoff,
+        source_snapshot_id=snapshot.snapshot_id,
+        source_evidence_refs=(snapshot.snapshot_id,),
+        market_data_validation=market,
+        margin_validation_status=margin["margin_validation_status"],
+        margin_eligible=margin["margin_eligible"],
+        margin_venue_symbol=margin["margin_venue_symbol"],
+        margin_max_leverage=margin["margin_max_leverage"],
+        execution_validation=execution,
+        # Present typed records are present evidence (a negative margin/execution
+        # record leads F5 to its existing hard VETO, never missingness).
+        availability=EVIDENCE_AVAILABLE,
+        missingness=(),
+        kraken_public_symbol=symbol,
+        primary_pair=symbol,
+    )
+
+
 def _make_canonical_submit(writer: Any) -> Callable[[dict], str]:
     """Build the live canonical-writer submit callable for one evidence payload.
 
@@ -686,18 +873,29 @@ def main() -> None:
     writer = CanonicalWriter(db_path())
     try:
         submit = _make_canonical_submit(writer)
+
+        def _build(snapshot, direction):
+            if direction == "SHORT":
+                return build_short_feasibility_evidence(
+                    snapshot,
+                    client=client,
+                    notional_usd=notional,
+                    acquisition_instant=datetime.now(timezone.utc),
+                )
+            return build_long_feasibility_evidence(
+                snapshot,
+                client=client,
+                notional_usd=notional,
+                acquisition_instant=datetime.now(timezone.utc),
+            )
+
         result = run_capture_locked(
             lock_path=args.lock_path or None,
             lock_env=FEASIBILITY_CAPTURE_LOCK_ENV,
             lock_default=FEASIBILITY_CAPTURE_LOCK_PATH,
             capture_fn=lambda: capture_feasibility_evidence_shadow(
                 settings=settings,
-                evidence_builder=lambda snapshot, direction: build_long_feasibility_evidence(
-                    snapshot,
-                    client=client,
-                    notional_usd=notional,
-                    acquisition_instant=datetime.now(timezone.utc),
-                ),
+                evidence_builder=_build,
                 submit_payload=submit,
                 cursor_path=args.cursor_path or None,
             ),
@@ -714,6 +912,8 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "BITNOMIAL_EXECUTION_VENUE",
+    "DEFAULT_ACCOUNT_LEVERAGE_CEILING",
     "DEFAULT_CAPTURE_LIMIT",
     "DEFAULT_DIRECTION",
     "FEASIBILITY_CAPTURE_LOCK_ENV",
@@ -723,7 +923,9 @@ __all__ = [
     "FeasibilityEvidenceStaleError",
     "MAX_CONTEMPORANEOUS_AGE_SECONDS",
     "build_long_feasibility_evidence",
+    "build_short_feasibility_evidence",
     "capture_feasibility_evidence_shadow",
+    "discover_short_margin",
     "feasibility_capture_authorized",
     "main",
 ]
