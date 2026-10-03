@@ -40,6 +40,9 @@ This creates **no new-entry authority** and **no trading authority**.
 - `OPIP_CANONICAL_WRITER_MODE`: `off`/`shadow` → `shadow`
 - `OPIP_TARGET_SPINE_MODE`: `off` → `shadow` (composes the F3-F7 target spine as a
   recorded, non-authoritative no-op until a snapshot source is supplied)
+- `OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD`: fixed evidence constant `1000.0` (the
+  intended paper trade size; never derived from live equity and not varied within
+  the epoch). `SAFE_BASELINE` keeps it `0.0` so F5 feasibility capture is disabled.
 
 The two existing, bounded, non-overlapping cron entries
 (`deploy/cron.d/opip-feature-bus-capture` and

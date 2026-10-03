@@ -51,6 +51,7 @@ exchange authority.
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -211,6 +212,36 @@ def feasibility_capture_authorized(settings: Any) -> bool:
         resolve_feature_bus_mode(settings) == "shadow"
         and resolve_writer_mode(settings) == "shadow"
     )
+
+
+def resolve_capture_notional(
+    settings: Any, *, override: float | None = None
+) -> tuple[float | None, str | None]:
+    """Resolve the F5 validation notional. The configured value is the sole authority.
+
+    The notional is a repo-controlled evidence constant (the release profile sets
+    it; `SAFE_BASELINE` sets it to zero, which disables capture). A free-form
+    `--notional-usd` override that differs from the configured value is refused,
+    so an arbitrary notional can never influence an evidence epoch. Returns
+    ``(notional, None)`` on success or ``(None, reason)`` when refused.
+    """
+    configured_raw = getattr(settings, "opip_feasibility_capture_notional_usd", 0.0) or 0.0
+    try:
+        configured = float(configured_raw)
+    except (TypeError, ValueError):
+        return (None, "configured notional is not a number")
+    if override is not None:
+        try:
+            override_value = float(override)
+        except (TypeError, ValueError):
+            return (None, "notional override is not a number")
+        if not math.isfinite(override_value):
+            return (None, "notional override is not finite")
+        if override_value != configured:
+            return (None, "arbitrary notional override rejected")
+    if not math.isfinite(configured) or configured <= 0:
+        return (None, "notional not configured")
+    return (configured, None)
 
 
 def _inert_summary(mode: str, reason: str) -> FeasibilityCaptureSummary:
@@ -819,15 +850,11 @@ def main() -> None:
         )
         return
 
-    notional = (
-        float(args.notional_usd)
-        if args.notional_usd is not None
-        else float(
-            getattr(settings, "opip_feasibility_capture_notional_usd", 0.0) or 0.0
-        )
+    notional, reason = resolve_capture_notional(
+        settings, override=args.notional_usd
     )
-    if not (notional == notional and notional > 0):
-        print(json.dumps({"status": "REFUSED", "reason": "notional not configured"}))
+    if reason is not None:
+        print(json.dumps({"status": "REFUSED", "reason": reason}))
         return
 
     from app.exchanges.kraken import KrakenClient
@@ -893,4 +920,5 @@ __all__ = [
     "discover_short_margin",
     "feasibility_capture_authorized",
     "main",
+    "resolve_capture_notional",
 ]

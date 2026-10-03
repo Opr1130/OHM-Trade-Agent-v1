@@ -66,6 +66,14 @@ the runtime posture is inspected
 THEN:
 `OPIP_PAPER_V2_MODE` is unset in the core service, the legacy path remains the sole new-entry paper authority, the target spine is shadow and non-authoritative, the bounded capture cron entries remain the scheduler mechanism and are never invoked from inside the protected unified cycle, the rollback posture is `SAFE_BASELINE` (reverting to the baseline modes deterministically disables capture), and no funded/live, exchange, order, margin or Committee authority is introduced
 
+AC-007:
+GIVEN:
+the F5 feasibility-validation notional for the first prospective evidence epoch
+WHEN:
+the profile, the production compose and the capture are inspected and exercised
+THEN:
+the notional is a fixed repo-controlled evidence constant: `EVIDENCE_SHADOW` resolves `OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD=1000.0` and the core service pins exactly `"1000.0"` as a literal (never derived from live account equity, and not varied within the epoch), while `SAFE_BASELINE` resolves `0.0` so capture stays disabled; `validate_profile_contract` rejects an arbitrary or free-form notional (a non-`1000.0` value for `EVIDENCE_SHADOW`, any non-zero value for `SAFE_BASELINE`); the architecture gate passes only when the configured notional equals the profile value and fails closed on drift; the capture resolves the notional from the configured value and refuses a `--notional-usd` override that differs from it (so an arbitrary notional can never influence an epoch); and the change grants no new-entry, reservation, order, exchange, funded or Committee authority
+
 EXPLICITLY OUT OF SCOPE:
 - Activating TARGET_PAPER, Paper-v2, the Committee, or any funded/live/exchange/order authority
 - Deleting, rewriting or rescoping the historical ATDD increments that recorded the Feature Bus `off`
@@ -92,6 +100,8 @@ AC-004 -> tests/test_opip_release_pipeline_v1.py::test_ac_004_bridge_guard_allow
 AC-004 -> tests/test_opip_release_pipeline_v1.py::test_ac_004_bridge_guard_still_fails_unapproved_weakening
 AC-005 -> tests/test_opip_release_pipeline_v1.py::test_ac_005_gate_fails_closed_and_receipt
 AC-006 -> tests/test_opip_release_pipeline_v1.py::test_ac_006_paper_v2_off_legacy_sole_authority
+AC-007 -> tests/test_opip_release_pipeline_v1.py::test_ac_007_evidence_notional_is_repo_controlled
+AC-007 -> tests/test_opip_release_pipeline_v1.py::test_ac_007_capture_refuses_a_free_form_notional_override
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/services/release_profiles.py
@@ -132,6 +142,13 @@ AC-006 -> .github/copilot-instructions.md
 AC-006 -> AGENTS.md
 AC-006 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
 AC-006 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
+AC-007 -> OHM-Trade-Agent-v1/app/services/release_profiles.py
+AC-007 -> OHM-Trade-Agent-v1/app/jobs/capture_feasibility_evidence_shadow.py
+AC-007 -> OHM-Trade-Agent-v1/docker-compose.yml
+AC-007 -> OHM-Trade-Agent-v1/tests/test_opip_release_pipeline_v1.py
+AC-007 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
+AC-007 -> OHM-Trade-Agent-v1/docs/release/README.md
+AC-007 -> OHM-Trade-Agent-v1/docs/architecture/OPIP_F6_OWNER_ENABLEMENT_PACKETS.md
 
 DEFERRED DISCOVERIES:
 - `TARGET_PAPER` remains BLOCKED. Activating it (Paper-v2) requires the AC-011 comparator evidence, F11 protection READY, legacy drain READY and explicit OWNER approval, and is a separate OWNER increment; this contract does not authorize it.
