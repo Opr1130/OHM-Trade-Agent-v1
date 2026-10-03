@@ -1543,36 +1543,40 @@ def _find_notional(node):
 
 
 path = sys.argv[1]
-connection = sqlite3.connect("file:%s?mode=ro" % path, uri=True)
 try:
-    def _count(event_type):
+    connection = sqlite3.connect("file:%s?mode=ro" % path, uri=True)
+    try:
+        def _count(event_type):
+            row = connection.execute(
+                "SELECT COUNT(*) FROM events WHERE event_type = ?", (event_type,)
+            ).fetchone()
+            return row[0] if row else None
+
+        snapshots = _count("feature.snapshot.recorded")
+        feasibility = _count("feasibility.evidence.recorded")
+        latest = connection.execute("SELECT MAX(local_sequence) FROM events").fetchone()
+        latest_seq = latest[0] if latest else None
+        notional = None
         row = connection.execute(
-            "SELECT COUNT(*) FROM events WHERE event_type = ?", (event_type,)
+            "SELECT payload_json FROM events WHERE event_type = ? "
+            "ORDER BY history_epoch DESC, local_sequence DESC LIMIT 1",
+            ("feasibility.evidence.recorded",),
         ).fetchone()
-        return row[0] if row else None
-
-    snapshots = _count("feature.snapshot.recorded")
-    feasibility = _count("feasibility.evidence.recorded")
-    latest = connection.execute("SELECT MAX(local_sequence) FROM events").fetchone()
-    latest_seq = latest[0] if latest else None
-    notional = None
-    row = connection.execute(
-        "SELECT payload_json FROM events WHERE event_type = ? "
-        "ORDER BY history_epoch DESC, local_sequence DESC LIMIT 1",
-        ("feasibility.evidence.recorded",),
-    ).fetchone()
-    if row is not None and row[0]:
-        try:
-            notional = _find_notional(json.loads(row[0]))
-        except (TypeError, ValueError):
-            notional = None
-finally:
-    connection.close()
-
-print("feature_snapshot_recorded_count=%s" % snapshots)
-print("feasibility_evidence_recorded_count=%s" % feasibility)
-print("canonical_max_local_sequence=%s" % latest_seq)
-print("latest_feasibility_validation_notional_usd=%s" % notional)
+        if row is not None and row[0]:
+            try:
+                notional = _find_notional(json.loads(row[0]))
+            except (TypeError, ValueError):
+                notional = None
+    finally:
+        connection.close()
+    print("feature_snapshot_recorded_count=%s" % snapshots)
+    print("feasibility_evidence_recorded_count=%s" % feasibility)
+    print("canonical_max_local_sequence=%s" % latest_seq)
+    print("latest_feasibility_validation_notional_usd=%s" % notional)
+except Exception:
+    # Any store error (missing table/column, unreadable file) fails soft to a
+    # single UNAVAILABLE line rather than aborting the diagnostics run.
+    print("canonical_evidence_counts=UNAVAILABLE")
 PY
 else
   echo "canonical_evidence_counts=UNAVAILABLE"
