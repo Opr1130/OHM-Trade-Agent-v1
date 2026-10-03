@@ -72,13 +72,13 @@ from app.opip.fev_evidence_event import (
 from app.opip.features.committed_snapshot_reader import CommittedSnapshotReader
 from app.opip.features.publisher import resolve_feature_bus_mode
 
-#: Kraken's US-retail margin execution venue (Bitnomial). Reused, not re-invented.
-BITNOMIAL_EXECUTION_VENUE = "bitnomial_exchange"
-MIN_SHORT_LEVERAGE = 2.0
-DEFAULT_UNKNOWN_PAIR_LEVERAGE = 2.0
-
-#: Default account leverage ceiling for the shadow SHORT margin discovery.
-DEFAULT_ACCOUNT_LEVERAGE_CEILING = 3.0
+# Reuse the live scanner's Bitnomial margin authority (single authority, no
+# re-implementation): the execution-venue token and the eligibility/leverage
+# resolution live in app.scanner.margin_eligibility and are consumed here.
+from app.scanner.margin_eligibility import (
+    BITNOMIAL_EXECUTION_VENUE,
+    validate_short_margin_eligibility,
+)
 
 #: Default bound: how many committed snapshots one batch may convert.
 DEFAULT_CAPTURE_LIMIT = 8
@@ -617,87 +617,53 @@ def build_long_feasibility_evidence(
     )
 
 
-def _normalize_margin_pair(value: str) -> str:
-    """Normalize a pair token exactly as the margin discovery does."""
-    normalized = str(value).upper().replace("XBT", "BTC")
-    normalized = normalized.replace(":BTNL", "")
-    return normalized.replace("/", "")
-
-
-def _reported_max_leverage(details: Any) -> float | None:
-    """The maximum leverage tier the venue advertises for a pair, or None."""
-    values: list[float] = []
-    for key in ("leverage_sell", "leverage_buy", "leverage"):
-        raw = details.get(key)
-        if isinstance(raw, (list, tuple)):
-            for item in raw:
-                try:
-                    values.append(float(item))
-                except (TypeError, ValueError):
-                    pass
-        elif raw is not None:
-            try:
-                values.append(float(raw))
-            except (TypeError, ValueError):
-                pass
-    return max(values) if values else None
-
-
 def discover_short_margin(
     snapshot: Any,
     *,
     client: Any,
-    account_leverage_ceiling: float = DEFAULT_ACCOUNT_LEVERAGE_CEILING,
+    account_leverage_ceiling: float | None = None,
 ) -> dict[str, Any]:
     """Discover genuine BTNL margin evidence for one instrument.
 
-    Reuses Kraken's Bitnomial execution-venue discovery (the same authority the
-    live scanner uses): pair presence is tradability, and the resolved
-    ``margin_venue_symbol`` carries the ``:BTNL`` provenance F5 requires for SHORT.
-    Returns the margin fields; a pair absent from the venue is INELIGIBLE, and an
-    unavailable discovery is UNAVAILABLE (never fabricated).
+    Delegates to the live scanner's ``validate_short_margin_eligibility`` -- the
+    SAME authority the live SHORT route uses -- so there is exactly one Bitnomial
+    venue/leverage policy and no drift. That function queries Kraken's Bitnomial
+    execution-venue discovery (pair presence is tradability), resolves the
+    ``:BTNL`` ``margin_venue_symbol`` F5 requires, and bounds the leverage tier by
+    the account ceiling: an absent pair is INELIGIBLE and an unavailable discovery
+    is UNAVAILABLE (never fabricated).
     """
-    from app.exchanges.kraken import KrakenAPIError
+    from app.scanner.models import MarketSnapshot
 
     primary = str(snapshot.venue_instrument_id)
-    try:
-        pairs = client.get_asset_pairs(execution_venue=BITNOMIAL_EXECUTION_VENUE)
-    except KrakenAPIError:
-        return {
-            "margin_validation_status": "UNAVAILABLE",
-            "margin_eligible": False,
-            "margin_venue_symbol": None,
-            "margin_max_leverage": None,
-        }
-    lookup: dict[str, Any] = {}
-    for pair_id, details in pairs.items():
-        for identifier in (
-            pair_id,
-            str(details.get("altname") or ""),
-            str(details.get("wsname") or ""),
-        ):
-            if identifier:
-                lookup[_normalize_margin_pair(identifier)] = details
-    details = lookup.get(_normalize_margin_pair(primary))
-    if details is None:
-        return {
-            "margin_validation_status": "INELIGIBLE",
-            "margin_eligible": False,
-            "margin_venue_symbol": None,
-            "margin_max_leverage": None,
-        }
-    reported = _reported_max_leverage(details)
-    venue_max = reported if reported is not None else DEFAULT_UNKNOWN_PAIR_LEVERAGE
-    effective_max = min(float(account_leverage_ceiling), venue_max)
-    venue_symbol = str(details.get("wsname") or details.get("altname") or primary)
-    if ":BTNL" not in venue_symbol.upper():
-        venue_symbol = f"{primary}:BTNL"
-    eligible = effective_max >= MIN_SHORT_LEVERAGE
+    # A minimal candidate: only the fields margin discovery reads are meaningful.
+    candidate = MarketSnapshot(
+        symbol=primary,
+        last_price=0.0,
+        ema20=0.0,
+        ema50=0.0,
+        ema200=0.0,
+        rsi=0.0,
+        macd_line=0.0,
+        macd_signal=0.0,
+        macd_histogram=0.0,
+        atr=0.0,
+        atr_pct=0.0,
+        volume_ratio=0.0,
+        technical_score=0,
+        trend="neutral",
+        trade_direction="SHORT",
+        primary_pair=primary,
+    )
+    kwargs: dict[str, Any] = {"client": client}
+    if account_leverage_ceiling is not None:
+        kwargs["account_leverage_ceiling"] = float(account_leverage_ceiling)
+    validate_short_margin_eligibility([candidate], **kwargs)
     return {
-        "margin_validation_status": "ELIGIBLE" if eligible else "INELIGIBLE",
-        "margin_eligible": eligible,
-        "margin_venue_symbol": venue_symbol,
-        "margin_max_leverage": effective_max,
+        "margin_validation_status": candidate.margin_validation_status,
+        "margin_eligible": candidate.margin_eligible,
+        "margin_venue_symbol": candidate.margin_venue_symbol,
+        "margin_max_leverage": candidate.margin_max_leverage,
     }
 
 
@@ -709,7 +675,7 @@ def build_short_feasibility_evidence(
     acquisition_instant: datetime,
     interval_minutes: int = 60,
     interval_seconds: int = 3600,
-    account_leverage_ceiling: float = DEFAULT_ACCOUNT_LEVERAGE_CEILING,
+    account_leverage_ceiling: float | None = None,
 ) -> FeasibilityEvidence:
     """Assemble genuine SHORT feasibility evidence for one committed snapshot.
 
@@ -913,7 +879,6 @@ if __name__ == "__main__":
 
 __all__ = [
     "BITNOMIAL_EXECUTION_VENUE",
-    "DEFAULT_ACCOUNT_LEVERAGE_CEILING",
     "DEFAULT_CAPTURE_LIMIT",
     "DEFAULT_DIRECTION",
     "FEASIBILITY_CAPTURE_LOCK_ENV",
