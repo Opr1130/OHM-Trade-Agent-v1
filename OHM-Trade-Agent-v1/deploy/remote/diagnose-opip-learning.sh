@@ -1504,5 +1504,84 @@ if [[ "$status" == "OK" ]]; then
   fi
 fi
 
+# ---------------------------------------------------------------------------
+# Read-only canonical evidence counters (Release Pipeline v1 / EVIDENCE_SHADOW).
+#
+# Verifies the prospective evidence clock: the number of committed
+# FeatureSnapshot and FeasibilityEvidence events, the canonical high-water
+# sequence, and the latest F5 validation notional. It reads the EXPORTED
+# canonical replica read-only (`mode=ro`): it never opens the live store, takes
+# no lock, and mutates nothing. Absent or unreadable evidence reports
+# UNAVAILABLE rather than a fabricated zero.
+# ---------------------------------------------------------------------------
+echo "OPIP_CANONICAL_EVIDENCE_COUNTS"
+canonical_evidence_db=""
+if [[ "${replica_dir_name_valid:-NO}" == "YES" && -n "${replica_dir_path:-}" ]]; then
+  canonical_evidence_db="$replica_dir_path/opip/canonical/opip_canonical_v1.sqlite3"
+fi
+if [[ -n "$canonical_evidence_db" && -f "$canonical_evidence_db" ]] && command -v python3 >/dev/null 2>&1; then
+  python3 - "$canonical_evidence_db" <<'PY' || echo "canonical_evidence_counts=UNAVAILABLE"
+import json
+import sqlite3
+import sys
+
+
+def _find_notional(node):
+    if isinstance(node, dict):
+        if "validation_notional_usd" in node:
+            return node["validation_notional_usd"]
+        for value in node.values():
+            found = _find_notional(value)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for item in node:
+            found = _find_notional(item)
+            if found is not None:
+                return found
+    return None
+
+
+path = sys.argv[1]
+try:
+    connection = sqlite3.connect("file:%s?mode=ro" % path, uri=True)
+    try:
+        def _count(event_type):
+            row = connection.execute(
+                "SELECT COUNT(*) FROM events WHERE event_type = ?", (event_type,)
+            ).fetchone()
+            return row[0] if row else None
+
+        snapshots = _count("feature.snapshot.recorded")
+        feasibility = _count("feasibility.evidence.recorded")
+        latest = connection.execute("SELECT MAX(local_sequence) FROM events").fetchone()
+        latest_seq = latest[0] if latest else None
+        notional = None
+        row = connection.execute(
+            "SELECT payload_json FROM events WHERE event_type = ? "
+            "ORDER BY history_epoch DESC, local_sequence DESC LIMIT 1",
+            ("feasibility.evidence.recorded",),
+        ).fetchone()
+        if row is not None and row[0]:
+            try:
+                notional = _find_notional(json.loads(row[0]))
+            except (TypeError, ValueError):
+                notional = None
+    finally:
+        connection.close()
+    print("feature_snapshot_recorded_count=%s" % snapshots)
+    print("feasibility_evidence_recorded_count=%s" % feasibility)
+    print("canonical_max_local_sequence=%s" % latest_seq)
+    print("latest_feasibility_validation_notional_usd=%s" % notional)
+except Exception:
+    # Any store error (missing table/column, unreadable file) fails soft to a
+    # single UNAVAILABLE line rather than aborting the diagnostics run.
+    print("canonical_evidence_counts=UNAVAILABLE")
+PY
+else
+  echo "canonical_evidence_counts=UNAVAILABLE"
+fi
+echo "OPIP_CANONICAL_EVIDENCE_COUNTS_END"
+
 echo "diagnostics_status=$status"
 [[ "$status" != "FAIL" ]]
