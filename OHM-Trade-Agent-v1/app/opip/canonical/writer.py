@@ -1790,6 +1790,71 @@ class CanonicalWriter:
         )
         return payloads, cursor
 
+    def read_feature_snapshot_rows(
+        self,
+        *,
+        after: tuple[int, int] | None = None,
+        limit: int = 200,
+    ) -> tuple[list[dict], tuple[int, int] | None]:
+        """Committed snapshot rows WITH per-row canonical provenance, in canonical order.
+
+        Read-only. Returns up to ``limit`` rows, each a mapping with
+        ``{"event_id", "history_epoch", "local_sequence", "payload_json"}``, so a
+        consumer can apply contiguous-prefix cursor semantics using each row's OWN
+        canonical position rather than only a batch tail. ``after`` is an exclusive
+        ``(history_epoch, local_sequence)`` cursor; returns the tail cursor (or
+        ``after`` when there is nothing new).
+        """
+        if int(limit) <= 0:
+            raise ValueError("limit must be positive")
+        where = "event_type = ?"
+        params: list[object] = [FEATURE_SNAPSHOT_RECORDED]
+        if after is not None:
+            where += (
+                " AND (history_epoch > ? OR "
+                "(history_epoch = ? AND local_sequence > ?))"
+            )
+            params.extend([int(after[0]), int(after[0]), int(after[1])])
+        params.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT event_id, history_epoch, local_sequence, payload_json FROM events "
+                f"WHERE {where} ORDER BY history_epoch ASC, local_sequence ASC LIMIT ?",
+                tuple(params),
+            ).fetchall()
+        envelopes = [
+            {
+                "event_id": str(row["event_id"]),
+                "history_epoch": int(row["history_epoch"]),
+                "local_sequence": int(row["local_sequence"]),
+                "payload_json": str(row["payload_json"]),
+            }
+            for row in rows
+        ]
+        cursor = (
+            (int(rows[-1]["history_epoch"]), int(rows[-1]["local_sequence"]))
+            if rows
+            else after
+        )
+        return envelopes, cursor
+
+    def latest_feature_snapshot_cursor(self) -> tuple[int, int] | None:
+        """The ``(history_epoch, local_sequence)`` of the newest committed snapshot.
+
+        Read-only. Used as the prospective cold-start boundary so a NEW consumer
+        begins after the current head rather than replaying committed history.
+        Returns ``None`` when no FeatureSnapshot has been committed yet.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT history_epoch, local_sequence FROM events WHERE event_type = ? "
+                "ORDER BY history_epoch DESC, local_sequence DESC LIMIT 1",
+                (FEATURE_SNAPSHOT_RECORDED,),
+            ).fetchone()
+        if row is None:
+            return None
+        return (int(row["history_epoch"]), int(row["local_sequence"]))
+
     def read_feasibility_evidence_records(
         self,
         *,

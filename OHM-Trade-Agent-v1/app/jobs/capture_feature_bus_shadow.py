@@ -478,17 +478,22 @@ def run_capture_locked(
     *,
     lock_path: str | None = None,
     capture_fn: Callable[[], FeatureBusCaptureSummary] | None = None,
+    lock_env: str = "OPIP_FEATURE_BUS_CAPTURE_LOCK",
+    lock_default: str = DEFAULT_PROCESS_LOCK_PATH,
 ) -> dict[str, Any]:
     """Run one capture pass guarded by the process-level non-overlap lock.
 
     If the lock is already held the invocation does NOT run capture; it returns an
     explicit ``SKIPPED_LOCK_HELD`` disposition so a busy skip is always observable
     rather than a silent exit.
+
+    ``lock_env``/``lock_default`` select the lock IDENTITY. Different producers must
+    pass a distinct identity (for example the feasibility producer passes
+    ``OPIP_FEASIBILITY_CAPTURE_LOCK`` and its own default path) so one producer's
+    lock can never suppress another's: the locking IMPLEMENTATION is shared, the
+    identity is not.
     """
-    path = (
-        lock_path
-        or os.getenv("OPIP_FEATURE_BUS_CAPTURE_LOCK", DEFAULT_PROCESS_LOCK_PATH)
-    )
+    path = lock_path or os.getenv(lock_env, lock_default)
     lock = CaptureProcessLock(path)
     if not lock.acquire():
         return {"status": "SKIPPED_LOCK_HELD", "lock_path": path}

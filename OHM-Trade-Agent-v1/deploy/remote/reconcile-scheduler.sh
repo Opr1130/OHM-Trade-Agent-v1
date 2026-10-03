@@ -10,6 +10,9 @@ ML_EVIDENCE_DST="/etc/cron.d/opip-ml-evidence"
 # R4-B2 bounded Feature Bus SHADOW evidence capture (dedicated, non-overlapping).
 CAPTURE_SRC="$APP_ROOT/deploy/cron.d/opip-feature-bus-capture"
 CAPTURE_DST="/etc/cron.d/opip-feature-bus-capture"
+# R4-B2 bounded SHADOW feasibility-evidence capture (dedicated, non-overlapping).
+FEV_CAPTURE_SRC="$APP_ROOT/deploy/cron.d/opip-feasibility-evidence-capture"
+FEV_CAPTURE_DST="/etc/cron.d/opip-feasibility-evidence-capture"
 LEGACY_MOVEMENT="/etc/cron.d/ohm-movement-discovery"
 STREAM_RECONCILE="$APP_ROOT/deploy/remote/reconcile-stream-worker.sh"
 LEARNING_EXPORTER="$APP_ROOT/deploy/remote/export-opip-learning-evidence.sh"
@@ -38,6 +41,7 @@ done
 for required in \
   "$CANONICAL_SRC" \
   "$CAPTURE_SRC" \
+  "$FEV_CAPTURE_SRC" \
   "$LEARNING_EXPORT_SRC" \
   "$STREAM_RECONCILE" \
   "$LEARNING_EXPORTER" \
@@ -57,6 +61,7 @@ had_learning_export=0
 had_ml_evidence=0
 had_legacy=0
 had_capture=0
+had_fev_capture=0
 had_root_crontab=0
 
 snapshot_file() {
@@ -83,6 +88,10 @@ fi
 if [[ -e "$CAPTURE_DST" ]]; then
   cp -a "$CAPTURE_DST" "$tmpdir/capture.before"
   had_capture=1
+fi
+if [[ -e "$FEV_CAPTURE_DST" ]]; then
+  cp -a "$FEV_CAPTURE_DST" "$tmpdir/fev-capture.before"
+  had_fev_capture=1
 fi
 if [[ -e "$LEGACY_MOVEMENT" ]]; then
   cp -a "$LEGACY_MOVEMENT" "$tmpdir/legacy.before"
@@ -128,6 +137,11 @@ rollback() {
   else
     rm -f "$CAPTURE_DST"
   fi
+  if [[ "$had_fev_capture" == "1" ]]; then
+    cp -a "$tmpdir/fev-capture.before" "$FEV_CAPTURE_DST"
+  else
+    rm -f "$FEV_CAPTURE_DST"
+  fi
   if [[ "$had_legacy" == "1" ]]; then
     cp -a "$tmpdir/legacy.before" "$LEGACY_MOVEMENT"
   else
@@ -148,6 +162,7 @@ trap rollback ERR
 install -o root -g root -m 0644 "$CANONICAL_SRC" "$CANONICAL_DST"
 install -o root -g root -m 0644 "$LEARNING_EXPORT_SRC" "$LEARNING_EXPORT_DST"
 install -o root -g root -m 0644 "$CAPTURE_SRC" "$CAPTURE_DST"
+install -o root -g root -m 0644 "$FEV_CAPTURE_SRC" "$FEV_CAPTURE_DST"
 
 # Refresh forced-command remote operations from the exact deployed SHA. This
 # keeps the production deploy gateway and read-only learning observability in
@@ -171,6 +186,7 @@ crontab "$tmpdir/root.after"
 
 grep -q 'app.jobs.run_cycle' "$CANONICAL_DST"
 grep -q 'export-opip-learning-evidence.sh' "$LEARNING_EXPORT_DST"
+grep -q 'capture_feasibility_evidence_shadow' "$FEV_CAPTURE_DST"
 
 if [[ -e "$ML_EVIDENCE_DST" ]]; then
   echo "production ML evidence cron still exists" >&2
@@ -204,3 +220,5 @@ echo "local_ml_evidence_cron=ABSENT"
 echo "learning_export=$LEARNING_EXPORT_DST"
 echo "learning_export_cadence=2 minutes + 40s offset"
 echo "learning_reader_observability=ENABLED"
+echo "fev_capture=$FEV_CAPTURE_DST"
+echo "fev_capture_cadence=1 minute (dual-gated SHADOW; inert unless Feature Bus AND writer are shadow)"

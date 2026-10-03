@@ -1,0 +1,32 @@
+# O'Pip SHADOW feasibility-evidence capture (R4-B2 Slice 3A)
+# Dedicated, bounded, non-overlapping evidence producer that converts committed
+# FeatureSnapshots (the 60-second grid) into genuine feasibility.evidence.recorded
+# records for the non-authoritative target spine. This is NOT the protected unified
+# cycle: it runs as its own process on the one scheduler (cron) and never takes the
+# unified-cycle lock, so it cannot delay or skip a protection cycle.
+#
+# Cadence: every minute, aligned to the F3 60-second evaluation grid. Capture is
+# authorized only when OPIP_FEATURE_BUS_MODE=shadow AND
+# OPIP_CANONICAL_WRITER_MODE=shadow; otherwise it is an explicit recorded no-op that
+# opens nothing (no canonical store, no Kraken).
+#
+# Non-overlap is guaranteed INSIDE the container: the producer holds a process-level
+# advisory lock (OPIP_FEASIBILITY_CAPTURE_LOCK) for the whole pass, so at most one
+# capture process executes inside the container at any instant even if the host
+# Docker client dies independently. The host flock is a cheap first-line guard only.
+#
+# Bounds (derived, not arbitrary; the whole pass must finish inside its minute):
+#   * the producer reads one bounded batch of committed snapshots after its persisted
+#     cursor, materializes the whole batch, then persists the advanced cursor, so
+#     successive passes progress instead of re-reading the oldest batch.
+#   * internal wall-clock budget: OPIP_FEASIBILITY_CAPTURE_BUDGET_SECONDS (default 45,
+#     capped at 50) bounds how many batches one pass attempts.
+#   * enforceable termination: in-container `timeout ... 50` with kill-after 5s, so
+#     the Python process is dead by ~55s < the 60s slot. NO host-side timeout wraps
+#     the docker exec call (that would release the only host lock while the
+#     in-container process could continue).
+#   * protection (the 60s unified cycle) is a separate process and is never contended.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+* * * * * root flock -n /var/run/opip-feasibility-capture.lock -c 'cd /opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1 && /usr/bin/docker compose exec -T ohm-trade-agent timeout --signal=TERM --kill-after=5s 50 python -m app.jobs.capture_feasibility_evidence_shadow >> /var/log/opip-feasibility-capture.log 2>&1'
