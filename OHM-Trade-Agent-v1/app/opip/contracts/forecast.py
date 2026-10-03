@@ -113,6 +113,29 @@ class PostFillPathOutcome(str, Enum):
     RISK_EXIT = "RISK_EXIT"
 
 
+class ForecastLabelState(str, Enum):
+    """The label resolution state for one outcome family.
+
+    Only ``RESOLVED`` is a clean label. ``UNRESOLVED`` and
+    ``INCOMPLETE_COVERAGE`` are never turned into negatives, and
+    ``INSUFFICIENT_EVIDENCE`` covers the absent path evidence of a ``NO_FILL``
+    entry.
+    """
+
+    RESOLVED = "RESOLVED"
+    UNRESOLVED = "UNRESOLVED"
+    INCOMPLETE_COVERAGE = "INCOMPLETE_COVERAGE"
+    INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
+
+
+class ForecastFidelityGrade(str, Enum):
+    """The simulation-fidelity grade of one example (A exact, C material gap)."""
+
+    A = "A"
+    B = "B"
+    C = "C"
+
+
 class ForecastModelStatus(str, Enum):
     """The R3 model status. There is no production or funded status."""
 
@@ -1855,7 +1878,9 @@ __all__ = [
     "ForecastFeatureValue",
     "ForecastHorizon",
     "ForecastHorizonAnchor",
+    "ForecastFidelityGrade",
     "ForecastInputVector",
+    "ForecastLabelState",
     "ForecastModelArtifact",
     "ForecastModelKind",
     "ForecastModelOutput",

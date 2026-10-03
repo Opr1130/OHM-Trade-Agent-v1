@@ -36,7 +36,6 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from enum import Enum
 from types import MappingProxyType
 from typing import Any
 
@@ -47,7 +46,9 @@ from app.opip.contracts import (
     DistributionKind,
     EntryExecutionOutcome,
     ForecastContractError,
+    ForecastFidelityGrade,
     ForecastHorizon,
+    ForecastLabelState,
     ForecastStatus,
     ForecastUncertainty,
     PostFillPathOutcome,
@@ -69,28 +70,10 @@ FORECAST_EVALUATION_REPORT_ID_PREFIX = "FEVAL"
 #: deliberately small and is never a trading, calibration or promotion threshold.
 EVALUATION_LOG_EPSILON = 1e-12
 
-
-class ForecastLabelState(str, Enum):
-    """The label resolution state for one outcome family.
-
-    Only ``RESOLVED`` is a clean label. ``UNRESOLVED`` and ``INCOMPLETE_COVERAGE``
-    are never turned into negatives, and ``INSUFFICIENT_EVIDENCE`` covers the
-    absent path evidence of a ``NO_FILL`` entry.
-    """
-
-    RESOLVED = "RESOLVED"
-    UNRESOLVED = "UNRESOLVED"
-    INCOMPLETE_COVERAGE = "INCOMPLETE_COVERAGE"
-    INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
-
-
-class ForecastFidelityGrade(str, Enum):
-    """The simulation-fidelity grade of one example (A exact, C material gap)."""
-
-    A = "A"
-    B = "B"
-    C = "C"
-
+#: The label-resolution and fidelity vocabulary now lives in the F6 vocabulary
+#: module (``app.opip.contracts.forecast``) so any consumer can import it without
+#: importing the F6 engine or this evaluation module. ``ForecastLabelState`` and
+#: ``ForecastFidelityGrade`` are imported above and remain re-exported here.
 
 _EXAMPLE_DURABLE_KEYS: tuple[str, ...] = (
     "example_id",
