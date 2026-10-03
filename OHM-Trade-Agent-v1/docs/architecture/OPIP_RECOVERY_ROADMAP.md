@@ -2,7 +2,9 @@
 
 Historical audit base: `a416be0a068dc58543a4b6cd254d5c42fcaf4c96`
 
-Current reconciled code/production baseline: `facf8e369e1251697bf9799bc9b1c575a9cdc3ec`
+Historical reconciled baseline (superseded 2026-10-03): `facf8e369e1251697bf9799bc9b1c575a9cdc3ec`
+
+Reconciled code baseline (R4-B2 status reconciliation, 2026-10-03): `a808e84ffc2fea4912cfa5592927d1afe2956568`
 
 Architecture: v1.4.3, 22 September 2026. See `docs/architecture/v1.4.3/SOURCE.md`.
 

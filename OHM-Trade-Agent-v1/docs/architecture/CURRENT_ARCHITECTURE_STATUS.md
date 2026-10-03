@@ -27,7 +27,7 @@ Two exact Git commits matter, and they are different:
 | Deployed production core | `facf8e369e1251697bf9799bc9b1c575a9cdc3ec` (last observed) | The last deploy-time observation recorded below. No later production re-probe has been performed; the deployed SHA is not re-observed by this reconciliation. |
 | Superseded status header (historical, baseline `facf8e36`) | `facf8e369e1251697bf9799bc9b1c575a9cdc3ec` | The earlier reconciliation recorded this commit under the header "Current reconciled code/production baseline". That header and value are preserved as history rather than erased. |
 
-`origin/main` matched `facf8e369e1251697bf9799bc9b1c575a9cdc3ec` when this document was reconciled, and it was rechecked immediately before writing. The audit tree is the isolated worktree for `chore/opip-r0-r1-architecture-recovery`. The shared checkout on `feature/p1a-decision-intelligence-foundation` was not used as implementation truth.
+`origin/main` matched `a808e84ffc2fea4912cfa5592927d1afe2956568` when this document was reconciled (2026-10-03). At the earlier 2026-09-28 reconciliation it matched `facf8e369e1251697bf9799bc9b1c575a9cdc3ec`; that earlier statement is preserved as history. The audit tree is the isolated worktree for `chore/opip-r0-r1-architecture-recovery`. The shared checkout on `feature/p1a-decision-intelligence-foundation` was not used as implementation truth.
 
 ## Production truth
 

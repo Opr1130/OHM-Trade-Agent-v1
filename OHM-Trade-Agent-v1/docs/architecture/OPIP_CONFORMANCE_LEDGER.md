@@ -2,7 +2,7 @@
 
 Historical audit base: `a416be0a068dc58543a4b6cd254d5c42fcaf4c96`
 
-Current reconciled code/production baseline: `facf8e369e1251697bf9799bc9b1c575a9cdc3ec`
+Historical reconciled baseline (superseded 2026-10-03): `facf8e369e1251697bf9799bc9b1c575a9cdc3ec`
 
 Reconciled code baseline (R4-B2 status reconciliation, 2026-10-03): `a808e84ffc2fea4912cfa5592927d1afe2956568`
 
@@ -65,14 +65,14 @@ Status values: `IMPLEMENTED_VERIFIED`, `IMPLEMENTED_NOT_ACTIVE`, `IMPLEMENTED_AW
 | CURRENT_WRITER | None |
 | CURRENT_CONSUMERS | None |
 | CURRENT_RUNTIME_AUTHORITY | None |
-| TEST_EVIDENCE | F3 detector tests in `tests/test_opip_r3_f3_ignition_detector.py` and `tests/test_opip_r3_f3_ignition_implementation.py`; contract fixture tests |
+| TEST_EVIDENCE | F3 detector tests in `tests/test_opip_r3_f3_ignition_detector.py`; contract fixture tests |
 | IMPLEMENTATION_STATUS | `SHADOW` |
 | DUPLICATE_OR_OVERLAPPING_PATHS | `app/services/explosion_state.py` uses the string `IGNITION` as a phase label. That is not DetectorState. |
 | TARGET_AUTHORITY | IGNITION detector runtime |
 | CUTOVER_GATE | Deterministic replay of snapshot + prior state + evaluation_time, shadow only, after Feature Bus evidence exists |
 | RETIREMENT_CANDIDATE | Explosion phase classifier, after the detector owns transitions |
 | DELETE_GATE | No deletion until the detector is the live claim source and consumers have moved |
-| BLOCKERS | Feature Bus is off. No detector module. |
+| BLOCKERS | Feature Bus is off, and the detector module (`app/opip/detectors/ignition.py`) is shadow-only with no runtime authority and no Feature Bus snapshot source. The earlier "Feature Bus is off. No detector module." is preserved as history at baseline `facf8e36`. |
 | NOTES | Do not treat the phase string as the v1.4.3 detector. |
 
 ## F4 — Opportunity Lifecycle
@@ -92,7 +92,7 @@ Status values: `IMPLEMENTED_VERIFIED`, `IMPLEMENTED_NOT_ACTIVE`, `IMPLEMENTED_AW
 | CUTOVER_GATE | One identity, one terminal-reason vocabulary, consumer census of watch/radar/pending |
 | RETIREMENT_CANDIDATE | Parallel episode clocks after that owner exists |
 | DELETE_GATE | Each clock names its replacement and a stop time |
-| BLOCKERS | F3 is missing, so there is no detector claim to lifecycle |
+| BLOCKERS | F3 is shadow-only (no runtime claim source), so no detector claim reaches the live path, and the target lifecycle is not the live admission authority. The earlier "F3 is missing, so there is no detector claim to lifecycle" is preserved as history at baseline `facf8e36`. |
 | NOTES | Funnel terminal reasons are scan outcomes, not episode deadlines. |
 
 ## F5 — Feasibility and Safety
@@ -112,7 +112,7 @@ Status values: `IMPLEMENTED_VERIFIED`, `IMPLEMENTED_NOT_ACTIVE`, `IMPLEMENTED_AW
 | CUTOVER_GATE | Same veto results as the live gates on a frozen candidate set, including abstention |
 | RETIREMENT_CANDIDATE | Duplicate gate adapters only after the seam is the admission path |
 | DELETE_GATE | Do not delete the live vetoes first |
-| BLOCKERS | No target seam module |
+| BLOCKERS | The target seam (`app/opip/feasibility.py`) is shadow-only and is not the live admission path; the live vetoes remain the authority. The earlier "No target seam module" is preserved as history at baseline `facf8e36`. |
 | NOTES | v1.4.3 does not add a new risk veto for the Committee. |
 
 ## F6 — Forecast Engine

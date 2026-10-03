@@ -41,6 +41,12 @@ def test_ac_029_status_docs_are_reconciled_without_activation() -> None:
     assert "| R3 — F3 through F7 on the R2 evidence | implemented (shadow / dormant" in status
     assert "### R3 — F3 through F7 on that evidence (implemented; shadow / dormant)" in roadmap
     assert "| IMPLEMENTATION_STATUS | `SHADOW` |" in ledger
+    # The reconciled code baseline is recorded in every reconciled document.
+    for text in (ledger, roadmap):
+        assert "Reconciled code baseline (R4-B2 status reconciliation, 2026-10-03)" in text
+    assert "a808e84ffc2fea4912cfa5592927d1afe2956568" in status
+    # Superseded blockers are corrected, not left as contradicting current status.
+    assert "is preserved as history at baseline `facf8e36`" in ledger
 
     # Historical statements remain identifiable as history.
     for text in (ledger, roadmap, status):
@@ -58,7 +64,12 @@ def test_ac_029_status_docs_are_reconciled_without_activation() -> None:
 
 @pytest.mark.acceptance
 def test_ac_029_architecture_authority_is_untouched() -> None:
-    """ATDD-R4-B2-controlled-paper-activation/AC-029: the reconciliation modifies no architecture authority; the v1.4.3 DOCX bytes still hash to the recorded value."""
+    """ATDD-R4-B2-controlled-paper-activation/AC-029: the reconciliation modifies no architecture authority; the v1.4.3 DOCX bytes still hash to the recorded value and ARCHITECTURE.md is present."""
     assert _DOCX.is_file()
     digest = hashlib.sha256(_DOCX.read_bytes()).hexdigest()
     assert digest == _AUTHORITY_SHA256
+    architecture_md = _ARCH / "v1.4.3" / "ARCHITECTURE.md"
+    assert architecture_md.is_file()
+    assert "Feasibility and calibrated statistical forecasts" in architecture_md.read_text(
+        encoding="utf-8"
+    )
