@@ -106,6 +106,8 @@ AC-002 -> OHM-Trade-Agent-v1/docs/release/README.md
 AC-003 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
 AC-003 -> OHM-Trade-Agent-v1/tests/test_opip_release_pipeline_v1.py
 AC-003 -> OHM-Trade-Agent-v1/docs/architecture/OPIP_F6_OWNER_ENABLEMENT_PACKETS.md
+AC-003 -> OHM-Trade-Agent-v1/docs/architecture/CURRENT_ARCHITECTURE_STATUS.md
+AC-003 -> OHM-Trade-Agent-v1/docs/architecture/OPIP_CONFORMANCE_LEDGER.md
 AC-004 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-BRIDGE-v1.md
 AC-004 -> OHM-Trade-Agent-v1/tests/test_local_agent_bridge.py
 AC-004 -> OHM-Trade-Agent-v1/tests/test_atdd_scope_control.py
