@@ -532,6 +532,10 @@ jobs:
           # healthy committed core with a blocked learning export is never
           # described as a failed or rolled-back deployment.
           BODY=$(cat <<EOF
+          **Core health:** $HEALTH
+          **Learning export:** ${LEARNING_EXPORT_STATUS:-UNKNOWN}
+          **Learning readiness:** ${LEARNING_READINESS:-UNKNOWN}
+
           SHA=$TARGET_SHA
           PROFILE=$RELEASE_PROFILE
           DEPLOYED_PROFILE=${DEPLOYED_PROFILE:-UNPROVEN}

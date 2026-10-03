@@ -385,6 +385,7 @@ def _classify(
     harness.write_text(
         "set +e\n"
         f"GITHUB_OUTPUT={_shell_quote(str(tmp_path / 'github_output'))}\n"
+        f"APPROVED_PROFILE=EVIDENCE_SHADOW\nTARGET_SHA={_shell_quote(RELEASE_SHA)}\n"
         ': > "$GITHUB_OUTPUT"\n'
         + _classification_block()
         + "\n"
@@ -414,11 +415,25 @@ def _classify(
     return fields
 
 
+RELEASE_RUNTIME_OK_LOG = "\n".join(
+    [
+        "OPIP_RELEASE_RUNTIME_VERIFICATION=PASS",
+        f"OPIP_RELEASE_RUNTIME_SHA={RELEASE_SHA}",
+        "OPIP_RELEASE_EVIDENCE_CAPTURE=PASS",
+        "OPIP_RELEASE_PROFILE=EVIDENCE_SHADOW",
+        "OPIP_RELEASE_PROTECTION=HEALTHY",
+        "OPIP_RELEASE_TARGET_AUTHORITY=ABSENT",
+        "OPIP_RELEASE_SCHEDULER=UNIQUE_BOUNDED",
+        "OPIP_UNIFIED_CYCLE=HEALTHY",
+    ]
+)
+
 CORE_OK_LOG = "\n".join(
     [
         '"status":"ok"',
         "O'Pip scheduler reconciliation: OK",
         "OPIP_CORE_DEPLOY_STATUS=SUCCESS",
+        RELEASE_RUNTIME_OK_LOG,
         "OPIP_PAPER_REGISTRY_GENESIS_STATUS=OK",
         "OPIP_CORE_POSTCOMMIT_HEALTH=OK",
     ]
@@ -644,6 +659,7 @@ def test_contradictory_learning_markers_are_blocked(tmp_path):
             "O'Pip scheduler reconciliation: OK",
             # Genesis is proven here so this fixture isolates the LEARNING
             # contradiction it is about; genesis gating is covered separately.
+            RELEASE_RUNTIME_OK_LOG,
             "OPIP_PAPER_REGISTRY_GENESIS_STATUS=OK",
             "OPIP_LEARNING_EXPORT_STATUS=FAILED",
             'OPIP_LEARNING_READINESS=READY',
@@ -667,6 +683,7 @@ def test_ready_readiness_without_export_success_is_blocked(tmp_path):
             "OPIP_CORE_DEPLOY_STATUS=SUCCESS",
             '"status":"ok"',
             "O'Pip scheduler reconciliation: OK",
+            RELEASE_RUNTIME_OK_LOG,
             "OPIP_LEARNING_READINESS=READY",
             "O'Pip deployment succeeded",
         ]
@@ -921,6 +938,7 @@ def test_postcommit_degraded_health_is_reported_but_not_as_a_core_failure(tmp_pa
             "OPIP_LEARNING_EXPORT_STATUS=SUCCESS",
             "OPIP_LEARNING_READINESS=READY",
             "OPIP_CORE_POSTCOMMIT_HEALTH=DEGRADED",
+            RELEASE_RUNTIME_OK_LOG,
             "O'Pip deployment succeeded",
         ]
     )
@@ -996,6 +1014,7 @@ def test_absent_genesis_marker_blocks_the_deployment(tmp_path):
         [
             "OPIP_CORE_DEPLOY_STATUS=SUCCESS",
             "O'Pip scheduler reconciliation: OK",
+            RELEASE_RUNTIME_OK_LOG,
             "OPIP_LEARNING_EXPORT_STATUS=SUCCESS",
             "OPIP_LEARNING_READINESS=READY",
             "OPIP_CORE_POSTCOMMIT_HEALTH=OK",
