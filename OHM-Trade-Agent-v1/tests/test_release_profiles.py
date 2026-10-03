@@ -22,6 +22,14 @@ def test_release_profiles_include_safe_and_evidence_shadow():
     assert profiles["EVIDENCE_SHADOW"]["allowed_modes"]["OPIP_TARGET_SPINE_MODE"] == "shadow"
     assert profiles["EVIDENCE_SHADOW"]["allowed_modes"]["OPIP_PAPER_V2_MODE"] == "off"
     assert profiles["EVIDENCE_SHADOW"]["allowed_modes"]["OPIP_COMMITTEE_MODE"] == "off"
+    assert (
+        profiles["SAFE_BASELINE"]["allowed_modes"]["OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD"]
+        == "0.0"
+    )
+    assert (
+        profiles["EVIDENCE_SHADOW"]["allowed_modes"]["OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD"]
+        == "1000.0"
+    )
 
 
 def test_release_profile_results_are_deeply_isolated():
@@ -85,6 +93,7 @@ def test_architecture_gate_accepts_only_exact_profile_compose_modes():
             "OPIP_TARGET_SPINE_MODE": "off",
             "OPIP_PAPER_V2_MODE": "off",
             "OPIP_COMMITTEE_MODE": "off",
+            "OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD": "0.0",
         },
     )
     assert baseline["status"] == "PASS"
@@ -98,6 +107,7 @@ def test_architecture_gate_accepts_only_exact_profile_compose_modes():
             "OPIP_TARGET_SPINE_MODE": "off",
             "OPIP_PAPER_V2_MODE": "off",
             "OPIP_COMMITTEE_MODE": "off",
+            "OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD": "0.0",
         },
     )
     assert mismatch["status"] == "FAIL"

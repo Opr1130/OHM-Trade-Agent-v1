@@ -24,7 +24,7 @@ the allowlisted release-profile contract
 WHEN:
 the profiles are enumerated and resolved
 THEN:
-the profiles are exactly the allowlist `SAFE_BASELINE`, `EVIDENCE_SHADOW` and `TARGET_PAPER`; `SAFE_BASELINE` resolves to the non-authoritative baseline modes (Feature Bus `off`, canonical writer `off`, target spine `off`, Paper-v2 `off`, Committee `off`); `EVIDENCE_SHADOW` resolves to exactly Feature Bus `shadow`, canonical writer `shadow`, target spine `shadow`, Paper-v2 `off` and Committee `off`; `TARGET_PAPER` is present but BLOCKED (it may not be selected or validated as ready); an unknown, malformed, differently-cased or whitespace-padded profile name fails closed; and the contract grants no funded, exchange, order, Committee or Telegram authority
+the profiles are exactly the allowlist `SAFE_BASELINE`, `EVIDENCE_SHADOW` and `TARGET_PAPER`; `SAFE_BASELINE` resolves to the non-authoritative baseline modes (Feature Bus `off`, canonical writer `off`, target spine `off`, Paper-v2 `off`, Committee `off`, and feasibility-capture notional `0.0`); `EVIDENCE_SHADOW` resolves to exactly Feature Bus `shadow`, canonical writer `shadow`, target spine `shadow`, Paper-v2 `off`, Committee `off`, and feasibility-capture notional `1000.0`; `TARGET_PAPER` is present but BLOCKED (it may not be selected or validated as ready); an unknown, malformed, differently-cased or whitespace-padded profile name fails closed; and the contract grants no funded, exchange, order, Committee or Telegram authority
 
 AC-002:
 GIVEN:
@@ -32,7 +32,7 @@ the selected release profile and the repository-controlled production compose
 WHEN:
 the profile is applied and the architecture gate is evaluated
 THEN:
-the deploy resolves the selected profile into the exact fixed modes of its allowlist entry (a profile-to-environment resolver returning only the profile's declared keys), the core service `environment` block carries those exact literal modes including `OPIP_PAPER_V2_MODE=off` and `OPIP_COMMITTEE_MODE=off` so `env_file: .env` cannot override them, the gate PASSES only when the observed runtime posture equals the selected profile's allowed modes and FAILS CLOSED otherwise, and a stale or free-form `.env` value cannot elevate `SAFE_BASELINE` to `EVIDENCE_SHADOW`, inject an unexpected `OPIP_*` mode key, or change any mode
+the deploy resolves the selected profile into the exact fixed modes of its allowlist entry (a profile-to-environment resolver returning only the profile's declared keys), the core service `environment` block carries those exact literal modes including `OPIP_PAPER_V2_MODE=off`, `OPIP_COMMITTEE_MODE=off` and `OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD=1000.0` for EVIDENCE_SHADOW so `env_file: .env` cannot override them, the gate PASSES only when the observed runtime posture equals the selected profile's allowed modes and FAILS CLOSED otherwise, and a stale or free-form `.env` value cannot elevate `SAFE_BASELINE` to `EVIDENCE_SHADOW`, inject an unexpected `OPIP_*` mode key, or change any mode
 
 AC-003:
 GIVEN:
@@ -56,7 +56,7 @@ the release architecture gate and its receipt
 WHEN:
 a release posture is evaluated for a profile
 THEN:
-the gate fails closed on any missing, malformed or inconsistent profile or runtime posture, reports a deterministic verdict and a concise receipt (profile, new-entry authority, funded authority, Paper-v2 and Committee state, protection posture, and each named check), asserts `PAPER_V2_REMAINS_OFF`, `COMMITTEE_RUNTIME_AUTHORITY_ABSENT`, `FUNDED_AUTHORITY_ABSENT`, `FUNDED_CREDENTIAL_PATH_ABSENT_FROM_PAPER` and `PROTECTION_INDEPENDENT`, keeps `NEW_ENTRY_AUTHORITY=LEGACY_ONLY` for `SAFE_BASELINE` and `EVIDENCE_SHADOW`, and grants no authority and performs no write
+the gate fails closed on any missing, malformed or inconsistent profile or runtime posture, including drift in any fixed feasibility-capture notional, reports a deterministic verdict and a concise receipt (profile, new-entry authority, funded authority, Paper-v2 and Committee state, protection posture, and each named check), asserts `PAPER_V2_REMAINS_OFF`, `COMMITTEE_RUNTIME_AUTHORITY_ABSENT`, `FUNDED_AUTHORITY_ABSENT`, `FUNDED_CREDENTIAL_PATH_ABSENT_FROM_PAPER` and `PROTECTION_INDEPENDENT`, keeps `NEW_ENTRY_AUTHORITY=LEGACY_ONLY` for `SAFE_BASELINE` and `EVIDENCE_SHADOW`, and grants no authority and performs no write
 
 AC-006:
 GIVEN:
@@ -64,9 +64,17 @@ the activated evidence plane
 WHEN:
 the runtime posture is inspected
 THEN:
-`OPIP_PAPER_V2_MODE` and `OPIP_COMMITTEE_MODE` are explicitly pinned to `off` in the core service, the legacy path remains the sole new-entry paper authority, the target spine is shadow and non-authoritative, the bounded capture cron entries remain the scheduler mechanism and are never invoked from inside the protected unified cycle, the rollback posture is `SAFE_BASELINE` (the rollback Compose override deterministically disables capture even when the previous code SHA has a different profile marker), and no funded/live, exchange, order, margin or Committee authority is introduced
+`OPIP_PAPER_V2_MODE` and `OPIP_COMMITTEE_MODE` are explicitly pinned to `off` in the core service, the EVIDENCE_SHADOW feasibility-capture notional is pinned to `1000.0`, the legacy path remains the sole new-entry paper authority, the target spine is shadow and non-authoritative, the bounded capture cron entries remain the scheduler mechanism and are never invoked from inside the protected unified cycle, the rollback posture is `SAFE_BASELINE` (the rollback Compose override deterministically disables capture even when the previous code SHA has a different profile marker), and no funded/live, exchange, order, margin or Committee authority is introduced
 
 AC-007:
+GIVEN:
+the F5 feasibility-validation notional for the first prospective evidence epoch
+WHEN:
+the profile, the production compose and the capture are inspected and exercised
+THEN:
+the notional is a fixed repo-controlled evidence constant: `EVIDENCE_SHADOW` resolves `OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD=1000.0` and the core service pins exactly `"1000.0"` as a literal (never derived from live account equity, and not varied within the epoch), while `SAFE_BASELINE` resolves `0.0` so capture stays disabled; `validate_profile_contract` rejects an arbitrary or free-form notional (a non-`1000.0` value for `EVIDENCE_SHADOW`, any non-zero value for `SAFE_BASELINE`); the architecture gate passes only when the configured notional equals the profile value and fails closed on drift; the capture resolves the notional from the configured value and refuses a `--notional-usd` override that differs from it (so an arbitrary notional can never influence an epoch); and the change grants no new-entry, reservation, order, exchange, funded or Committee authority
+
+AC-008:
 GIVEN:
 a pull request or a commit pushed to `main`
 WHEN:
@@ -74,7 +82,7 @@ the release CI workflow evaluates the commit
 THEN:
 it runs the exact allowlisted `EVIDENCE_SHADOW` architecture evaluator, emits `ARCHITECTURE_GATE`, `PROFILE`, `NEW_ENTRY_AUTHORITY`, `FUNDED_AUTHORITY`, `PAPER_V2`, `COMMITTEE_MODE`, `PROTECTION`, `FEATURE_BUS`, `CANONICAL_WRITER` and `TARGET_SPINE`, retains a bounded receipt, and a successful main run produces an exact-SHA release-candidate receipt only after pytest, ATDD scope, architecture and security gates pass; the candidate does not deploy
 
-AC-008:
+AC-009:
 GIVEN:
 an exact-SHA release candidate and the existing issue #64 deployment control plane
 WHEN:
@@ -82,7 +90,7 @@ the owner requests `/deploy-profile <PROFILE> <40-char-sha>`
 THEN:
 only the repository OWNER on issue #64 (or repository-owner-only manual dispatch) is accepted; `EVIDENCE_SHADOW` is the only deployable profile, `SAFE_BASELINE` is rollback-only, and `TARGET_PAPER` remains blocked; the SHA equals the current `main`; the exact-SHA pytest/ATDD/security/architecture workflow is green; the checked-out SHA's Compose profile marker and literal modes match the requested profile; the host refuses untracked or unexpected ignored files in the application build context, and Docker excludes secrets and generated caches; approval is auditable in the workflow receipt; and deployment uses only the existing forced-command `deploy <sha>` path, with the legacy `/deploy <sha>` spelling subject to identical `EVIDENCE_SHADOW` gates
 
-AC-009:
+AC-010:
 GIVEN:
 an owner-approved exact-SHA EVIDENCE_SHADOW deployment
 WHEN:
@@ -90,7 +98,7 @@ the candidate services and scheduler have started
 THEN:
 the host records read-only canonical cursors before deployment, verifies the running container image label and fixed mode literals against the approved SHA, and invokes a read-only verifier bounded to 360 seconds; that verifier requires two fresh consecutive 60-second snapshots created after candidate readiness, at least one matching prospective F5 record whose source cutoff is not later than its evaluation time, HEALTHY read-only protection, and the target spine's inert no-source/no-handoff posture; the host also proves each unified/capture scheduler entry occurs once and retains flock/timeout bounds; any missing or malformed evidence fails before the core commit point and enters the existing rollback transaction
 
-AC-010:
+AC-011:
 GIVEN:
 the runtime verifier or a pre-commit deploy assertion fails
 WHEN:
@@ -107,11 +115,11 @@ EXPLICITLY OUT OF SCOPE:
 - Weakening the bridge no-weakening protection into a generic relaxation
 
 FROZEN BOUNDARIES:
-Release profile as the activation authority. The only mechanism that may place the Feature Bus into `shadow` is the explicit selection and validation of the `EVIDENCE_SHADOW` release profile. Free-form `.env` mode values are never the activation authority, and the core-service modes are literals that override `env_file: .env`. `SAFE_BASELINE` remains the rollback posture and resolves the Feature Bus `off`.
+Release profile as the activation authority. The only mechanism that may place the Feature Bus into `shadow` is the explicit selection and validation of the `EVIDENCE_SHADOW` release profile. Free-form `.env` mode values are never the activation authority, and the core-service modes are literals that override `env_file: .env`. `SAFE_BASELINE` remains the rollback posture and resolves the Feature Bus `off` and feasibility-capture notional `0.0`.
 
 History preserved. The supersession edits only *current-runtime* assertions. Every historical contract statement that the Feature Bus remained `off` at that increment is preserved and labelled as history; no historical intent is rewritten.
 
-Bounded authorization. `EVIDENCE_SHADOW` authorizes exactly Feature Bus `shadow` + canonical writer `shadow` + target spine `shadow` + Paper-v2 `off` + Committee `off`. It grants no new-entry, reservation, order, exchange, funded, margin, Committee, dashboard or Telegram authority, and it does not authorize `TARGET_PAPER`. The bounded SHADOW capture remains dual-gated (Feature Bus AND writer exactly `shadow`) and never runs inside the protected unified cycle.
+Bounded authorization. `EVIDENCE_SHADOW` authorizes exactly Feature Bus `shadow` + canonical writer `shadow` + target spine `shadow` + Paper-v2 `off` + Committee `off` + feasibility-capture notional `1000.0`. It grants no new-entry, reservation, order, exchange, funded, margin, Committee, dashboard or Telegram authority, and it does not authorize `TARGET_PAPER`. The bounded SHADOW capture remains dual-gated (Feature Bus AND writer exactly `shadow`) and never runs inside the protected unified cycle.
 
 ACCEPTANCE TEST TRACEABILITY:
 AC-001 -> tests/test_opip_release_pipeline_v1.py::test_ac_001_profile_allowlist_and_exact_modes
@@ -125,16 +133,18 @@ AC-004 -> tests/test_opip_release_pipeline_v1.py::test_ac_004_bridge_guard_allow
 AC-004 -> tests/test_opip_release_pipeline_v1.py::test_ac_004_bridge_guard_still_fails_unapproved_weakening
 AC-005 -> tests/test_opip_release_pipeline_v1.py::test_ac_005_gate_fails_closed_and_receipt
 AC-006 -> tests/test_opip_release_pipeline_v1.py::test_ac_006_paper_v2_off_legacy_sole_authority
-AC-007 -> tests/test_opip_release_pipeline_v1.py::test_ac_007_ci_gate_and_main_candidate_are_non_deploying
-AC-008 -> tests/test_opip_release_pipeline_v1.py::test_ac_008_profile_approval_is_owner_only_exact_sha_and_gated
-AC-008 -> tests/test_release_runtime_verifier.py::test_safe_baseline_is_not_a_deploy_candidate
-AC-009 -> tests/test_release_runtime_verifier.py::test_runtime_evidence_requires_consecutive_fresh_snapshots_and_matching_fev
-AC-009 -> tests/test_release_runtime_verifier.py::test_runtime_evidence_rejects_backfill_gaps_and_late_source_cutoffs
-AC-009 -> tests/test_release_runtime_verifier.py::test_runtime_evidence_rejects_stale_snapshots_and_unmatched_fev
-AC-009 -> tests/test_release_runtime_verifier.py::test_runtime_evidence_rejects_future_timestamps
-AC-009 -> tests/test_opip_release_pipeline_v1.py::test_ac_009_runtime_verifier_precedes_commit_and_rolls_back_to_baseline
-AC-009 -> tests/test_opip_release_pipeline_v1.py::test_ac_009_deployment_receipt_requires_runtime_verifier_and_baseline_rollback
-AC-010 -> tests/test_opip_release_pipeline_v1.py::test_ac_010_rollback_success_requires_verified_safe_baseline_modes
+AC-007 -> tests/test_opip_release_pipeline_v1.py::test_ac_007_evidence_notional_is_repo_controlled
+AC-007 -> tests/test_opip_release_pipeline_v1.py::test_ac_007_capture_refuses_a_free_form_notional_override
+AC-008 -> tests/test_opip_release_pipeline_v1.py::test_ac_008_ci_gate_and_main_candidate_are_non_deploying
+AC-009 -> tests/test_opip_release_pipeline_v1.py::test_ac_009_profile_approval_is_owner_only_exact_sha_and_gated
+AC-009 -> tests/test_release_runtime_verifier.py::test_safe_baseline_is_not_a_deploy_candidate
+AC-010 -> tests/test_release_runtime_verifier.py::test_runtime_evidence_requires_consecutive_fresh_snapshots_and_matching_fev
+AC-010 -> tests/test_release_runtime_verifier.py::test_runtime_evidence_rejects_backfill_gaps_and_late_source_cutoffs
+AC-010 -> tests/test_release_runtime_verifier.py::test_runtime_evidence_rejects_stale_snapshots_and_unmatched_fev
+AC-010 -> tests/test_release_runtime_verifier.py::test_runtime_evidence_rejects_future_timestamps
+AC-010 -> tests/test_opip_release_pipeline_v1.py::test_ac_010_runtime_verifier_precedes_commit_and_rolls_back_to_baseline
+AC-010 -> tests/test_opip_release_pipeline_v1.py::test_ac_010_deployment_receipt_requires_runtime_verifier_and_baseline_rollback
+AC-011 -> tests/test_opip_release_pipeline_v1.py::test_ac_011_rollback_success_requires_verified_safe_baseline_modes
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/services/release_profiles.py
@@ -175,27 +185,34 @@ AC-006 -> .github/copilot-instructions.md
 AC-006 -> AGENTS.md
 AC-006 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
 AC-006 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
-AC-007 -> .github/workflows/pytest.yml
 AC-007 -> OHM-Trade-Agent-v1/app/services/release_profiles.py
+AC-007 -> OHM-Trade-Agent-v1/app/jobs/capture_feasibility_evidence_shadow.py
+AC-007 -> OHM-Trade-Agent-v1/docker-compose.yml
 AC-007 -> OHM-Trade-Agent-v1/tests/test_opip_release_pipeline_v1.py
-AC-008 -> .github/workflows/deploy-production.yml
+AC-007 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
+AC-007 -> OHM-Trade-Agent-v1/docs/release/README.md
+AC-007 -> OHM-Trade-Agent-v1/docs/architecture/OPIP_F6_OWNER_ENABLEMENT_PACKETS.md
 AC-008 -> .github/workflows/pytest.yml
-AC-008 -> OHM-Trade-Agent-v1/.dockerignore
+AC-008 -> OHM-Trade-Agent-v1/app/services/release_profiles.py
 AC-008 -> OHM-Trade-Agent-v1/tests/test_opip_release_pipeline_v1.py
-AC-009 -> OHM-Trade-Agent-v1/app/services/release_runtime_verifier.py
-AC-009 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
-AC-009 -> OHM-Trade-Agent-v1/app/jobs/run_cycle.py
-AC-009 -> OHM-Trade-Agent-v1/Dockerfile
-AC-009 -> OHM-Trade-Agent-v1/tests/test_release_runtime_verifier.py
-AC-009 -> OHM-Trade-Agent-v1/tests/test_opip_deployment_transaction_boundary_v1.py
-AC-009 -> OHM-Trade-Agent-v1/tests/test_opip_ml_scheduler_isolation_v1.py
-AC-009 -> OHM-Trade-Agent-v1/tests/test_opip_streaming_safety_v1.py
-AC-009 -> OHM-Trade-Agent-v1/tests/test_opip_canonical_writer_pr2.py
+AC-009 -> .github/workflows/deploy-production.yml
+AC-009 -> .github/workflows/pytest.yml
+AC-009 -> OHM-Trade-Agent-v1/.dockerignore
+AC-009 -> OHM-Trade-Agent-v1/tests/test_opip_release_pipeline_v1.py
+AC-010 -> OHM-Trade-Agent-v1/app/services/release_runtime_verifier.py
 AC-010 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
-AC-010 -> .github/workflows/deploy-production.yml
+AC-010 -> OHM-Trade-Agent-v1/app/jobs/run_cycle.py
+AC-010 -> OHM-Trade-Agent-v1/Dockerfile
+AC-010 -> OHM-Trade-Agent-v1/tests/test_release_runtime_verifier.py
+AC-010 -> OHM-Trade-Agent-v1/tests/test_opip_deployment_transaction_boundary_v1.py
+AC-010 -> OHM-Trade-Agent-v1/tests/test_opip_ml_scheduler_isolation_v1.py
+AC-010 -> OHM-Trade-Agent-v1/tests/test_opip_streaming_safety_v1.py
+AC-010 -> OHM-Trade-Agent-v1/tests/test_opip_canonical_writer_pr2.py
+AC-011 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
+AC-011 -> .github/workflows/deploy-production.yml
 
 DEFERRED DISCOVERIES:
-- `TARGET_PAPER` remains BLOCKED. Activating it (Paper-v2) requires the AC-011 comparator evidence, F11 protection READY, legacy drain READY and explicit OWNER approval, and is a separate OWNER increment; this contract does not authorize it.
+- `TARGET_PAPER` remains BLOCKED. Activating it (Paper-v2) requires the ATDD-R4-B2 AC-011 comparator evidence, F11 protection READY, legacy drain READY and explicit OWNER approval, and is a separate OWNER increment; this contract does not authorize it.
 - Production runtime evidence has not been observed in this coding session. The verifier is implemented as a deployment gate, but only an owner-authorized run on production can produce its runtime receipt; a CI candidate is not runtime proof.
 
 UNAPPROVED SCOPE CHANGES:

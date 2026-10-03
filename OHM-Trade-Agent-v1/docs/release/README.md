@@ -18,6 +18,11 @@ The release profile contract is exact and allowlisted.
 - OPIP_TARGET_SPINE_MODE must resolve to shadow for the evidence profile.
 - OPIP_PAPER_V2_MODE must remain off for EVIDENCE_SHADOW.
 - OPIP_COMMITTEE_MODE must remain off for every release profile.
+- OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD is the fixed F5 validation notional for
+  the first epoch: `1000.0` for EVIDENCE_SHADOW and `0.0` for SAFE_BASELINE
+  (capture disabled). It is a repo-controlled evidence constant, never derived
+  from live equity, and is not varied within an epoch; an arbitrary `--notional-usd`
+  override is refused by the capture.
 
 The architecture gate fails closed whenever a profile is missing, malformed, or inconsistent with the repository-controlled runtime posture.
 

@@ -78,6 +78,13 @@ services:
       # NON-AUTHORITATIVE shadow path (no snapshot source, so it is a recorded
       # no-op that can never admit, reserve, order or protect).
       OPIP_TARGET_SPINE_MODE: "shadow"
+      # Fixed evidence constant for the first prospective epoch (owner decision):
+      # the F5 feasibility-validation notional, measured at the intended paper trade
+      # size (1,000 USD of the 10,000 USD starting equity). It is a repo-controlled
+      # literal, never derived from live equity, and is not varied within an epoch.
+      # SAFE_BASELINE keeps this at "0.0" (capture disabled); the capture refuses a
+      # free-form --notional-usd override that differs from this configured value.
+      OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD: "1000.0"
     ports:
       - "127.0.0.1:8000:8000"
     volumes:

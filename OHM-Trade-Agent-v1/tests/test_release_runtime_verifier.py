@@ -27,7 +27,7 @@ def _evidence(cutoff: datetime, source_cutoff: datetime | None = None):
 
 
 def test_runtime_evidence_requires_consecutive_fresh_snapshots_and_matching_fev():
-    """ATDD-RELEASE-PIPELINE-v1/AC-009: fresh sequential snapshots need matching prospective F5 evidence."""
+    """ATDD-RELEASE-PIPELINE-v1/AC-010: fresh sequential snapshots need matching prospective F5 evidence."""
     ready_after = datetime(2026, 1, 1, 12, 0, 5, tzinfo=timezone.utc)
     first_cutoff = datetime(2026, 1, 1, 12, 1, tzinfo=timezone.utc)
     second_cutoff = first_cutoff + timedelta(minutes=1)
@@ -46,7 +46,7 @@ def test_runtime_evidence_requires_consecutive_fresh_snapshots_and_matching_fev(
 
 
 def test_runtime_evidence_rejects_backfill_gaps_and_late_source_cutoffs():
-    """ATDD-RELEASE-PIPELINE-v1/AC-009: gaps and late source timestamps fail closed."""
+    """ATDD-RELEASE-PIPELINE-v1/AC-010: gaps and late source timestamps fail closed."""
     ready_after = datetime(2026, 1, 1, 12, 0, 5, tzinfo=timezone.utc)
     first_cutoff = datetime(2026, 1, 1, 12, 1, tzinfo=timezone.utc)
     second_cutoff = first_cutoff + timedelta(minutes=2)
@@ -65,7 +65,7 @@ def test_runtime_evidence_rejects_backfill_gaps_and_late_source_cutoffs():
 
 
 def test_runtime_evidence_rejects_stale_snapshots_and_unmatched_fev():
-    """ATDD-RELEASE-PIPELINE-v1/AC-009: stale or unmatched evidence fails closed."""
+    """ATDD-RELEASE-PIPELINE-v1/AC-010: stale or unmatched evidence fails closed."""
     ready_after = datetime(2026, 1, 1, 12, 0, 5, tzinfo=timezone.utc)
     first_cutoff = datetime(2026, 1, 1, 12, 1, tzinfo=timezone.utc)
     second_cutoff = first_cutoff + timedelta(minutes=1)
@@ -83,7 +83,7 @@ def test_runtime_evidence_rejects_stale_snapshots_and_unmatched_fev():
 
 
 def test_runtime_evidence_rejects_future_timestamps():
-    """ATDD-RELEASE-PIPELINE-v1/AC-009: prospective evidence cannot be future-dated."""
+    """ATDD-RELEASE-PIPELINE-v1/AC-010: prospective evidence cannot be future-dated."""
     ready_after = datetime(2026, 1, 1, 12, 0, 5, tzinfo=timezone.utc)
     first_cutoff = datetime(2026, 1, 1, 12, 1, tzinfo=timezone.utc)
     second_cutoff = first_cutoff + timedelta(minutes=1)
@@ -102,7 +102,7 @@ def test_runtime_evidence_rejects_future_timestamps():
 
 
 def test_safe_baseline_is_not_a_deploy_candidate(monkeypatch):
-    """ATDD-RELEASE-PIPELINE-v1/AC-008: SAFE_BASELINE is rollback-only."""
+    """ATDD-RELEASE-PIPELINE-v1/AC-009: SAFE_BASELINE is rollback-only."""
     monkeypatch.setenv("OPIP_RELEASE_PROFILE", "SAFE_BASELINE")
     with pytest.raises(ValueError, match="SAFE_BASELINE is rollback-only"):
         release_runtime_verifier.verify_release_runtime(
