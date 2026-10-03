@@ -1,26 +1,52 @@
-# O'Pip Feature Bus SHADOW evidence capture
+# O'Pip Feature Bus SHADOW evidence capture (R4-B2 shadow cadence bridge)
 # Dedicated, bounded, non-overlapping evidence producer for the R4-B2 shadow
 # comparator path. This is NOT the protected unified cycle: it runs as its own
 # process on the one scheduler (cron) and never takes the unified-cycle lock, so
 # it cannot delay or skip a protection cycle.
 #
-# Cadence: every 15 minutes. The capture is authorized only when
-# OPIP_FEATURE_BUS_MODE=shadow AND OPIP_CANONICAL_WRITER_MODE=shadow; otherwise it
-# is an inert recorded no-op.
+# Cadence: every minute. The frozen F3 IGNITION detector requires a 60-second
+# evaluation grid, evaluation_time == snapshot.evaluation_cutoff, and two
+# CONSECUTIVE 60-second qualifying evaluations. A slower cadence materializes
+# snapshots at non-adjacent cutoffs, so F3 could never reach persistence. One
+# pass = one closed minute = one genuine FeatureSnapshot per target instrument.
 #
-# Bounds (derived, not arbitrary):
-#   * internal total wall-clock budget: OPIP_FEATURE_BUS_CAPTURE_BUDGET_SECONDS
-#     (default 180s; capped at 220 so budget + one 20s reservation <= the 240s
-#     timeout below, keeping the internal budget the graceful stop).
-#   * per-request reservation: 20s (Kraken client request timeout is 15s + slack)
-#   * max requests per pass: capture limit (8) + universe refresh (2) ~= 10
-#   * worst-case request time ~= 10 * 20s = 200s; the internal budget stops the
-#     pass once the remaining budget cannot fit one more bounded request, and the
-#     outer timeout below is final containment only.
-#   * outer timeout 240s < the 900s cadence, so two passes cannot overlap; flock
-#     adds explicit non-overlap safety.
-#   * 240s is independent of, and never contends with, the 60s unified cycle.
+# Capture is authorized only when OPIP_FEATURE_BUS_MODE=shadow AND
+# OPIP_CANONICAL_WRITER_MODE=shadow; otherwise it is an inert recorded no-op.
+#
+# Non-overlap is guaranteed at TWO levels, and the ENFORCEABLE one is INSIDE the
+# container:
+#   * The capture process itself holds a process-level advisory lock
+#     (OPIP_FEATURE_BUS_CAPTURE_LOCK, default /tmp/opip-feature-bus-capture.lock)
+#     for the whole pass. This directly guarantees the invariant "at most one
+#     capture_feature_bus_shadow process executes inside the container at any
+#     instant", even if the host Docker client dies independently and leaves a
+#     surviving in-container process. A refused invocation records an explicit
+#     SKIPPED_LOCK_HELD disposition rather than silently exiting.
+#   * The host `flock -n` remains as a cheap first-line guard. It is NOT the
+#     enforceable guard: killing the host Docker client does not reliably
+#     terminate the process created inside the container.
+#
+# Timeout: the enforceable wall-clock bound runs INSIDE the container
+# (`timeout --signal=TERM --kill-after=5s 50 python -m ...`), directly
+# supervising the Python process so it is genuinely terminated. A host-side
+# `timeout` around `docker compose exec` would release the host lock while the
+# in-container process could continue, so NO outer timeout wraps the call; the
+# in-container process lock prevents overlap regardless.
+#
+# Bounds (derived, not arbitrary; the whole pass must finish inside its minute):
+#   * per-instrument request: exactly ONE bounded public Kraken OHLC request (no
+#     bulk multi-pair endpoint exists), with a 15s client request timeout.
+#   * bounded acquisition concurrency: OPIP_FEATURE_BUS_CAPTURE_CONCURRENCY
+#     (default 4, max 8). Worst case = ceil(N / concurrency) request timeouts, so
+#     8 instruments <= 2 * 15s = 30s, well inside the minute. The shared Kraken
+#     transport is thread-safe and rate-limited (token bucket).
+#   * internal wall-clock budget: OPIP_FEATURE_BUS_CAPTURE_BUDGET_SECONDS
+#     (default 45; capped at 50). The internal budget is the graceful stop.
+#   * enforceable termination: in-container `timeout ... 50` with kill-after 5s,
+#     so the Python process is dead by ~55s < the 60s slot.
+#   * protection (the 60s unified cycle) is a separate process on the same
+#     scheduler and is never contended by this pass.
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-*/15 * * * * root flock -n /var/run/opip-feature-bus-capture.lock -c 'cd /opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1 && timeout --signal=TERM --kill-after=20s 240 /usr/bin/docker compose exec -T ohm-trade-agent python -m app.jobs.capture_feature_bus_shadow >> /var/log/opip-feature-bus-capture.log 2>&1'
+* * * * * root flock -n /var/run/opip-feature-bus-capture.lock -c 'cd /opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1 && /usr/bin/docker compose exec -T ohm-trade-agent timeout --signal=TERM --kill-after=5s 50 python -m app.jobs.capture_feature_bus_shadow >> /var/log/opip-feature-bus-capture.log 2>&1'
