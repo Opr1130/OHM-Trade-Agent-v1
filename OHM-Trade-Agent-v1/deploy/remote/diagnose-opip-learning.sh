@@ -1519,7 +1519,13 @@ canonical_evidence_db=""
 if [[ "${replica_dir_name_valid:-NO}" == "YES" && -n "${replica_dir_path:-}" ]]; then
   canonical_evidence_db="$replica_dir_path/opip/canonical/opip_canonical_v1.sqlite3"
 fi
+if [[ -z "$canonical_evidence_db" || ! -f "$canonical_evidence_db" ]]; then
+  # Fallback: locate the canonical snapshot anywhere under the validated export
+  # root, so a layout change cannot silently hide the evidence clock.
+  canonical_evidence_db="$(find "$EXPORT_ROOT" -name 'opip_canonical_v1.sqlite3' -type f 2>/dev/null | head -n 1 || true)"
+fi
 if [[ -n "$canonical_evidence_db" && -f "$canonical_evidence_db" ]] && command -v python3 >/dev/null 2>&1; then
+  echo "canonical_evidence_db_found=YES"
   python3 - "$canonical_evidence_db" <<'PY' || echo "canonical_evidence_counts=UNAVAILABLE"
 import json
 import sqlite3
@@ -1579,6 +1585,7 @@ except Exception:
     print("canonical_evidence_counts=UNAVAILABLE")
 PY
 else
+  echo "canonical_evidence_db_found=NO"
   echo "canonical_evidence_counts=UNAVAILABLE"
 fi
 echo "OPIP_CANONICAL_EVIDENCE_COUNTS_END"
