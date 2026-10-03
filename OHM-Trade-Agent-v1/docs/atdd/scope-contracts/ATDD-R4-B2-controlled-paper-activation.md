@@ -166,6 +166,13 @@ WHEN:
 the capture is scheduled and one pass is exercised
 THEN:
 the capture runs on the frozen F3 60-second evaluation grid so that consecutive passes commit FeatureSnapshots for the same instrument at consecutive cutoffs exactly 60 seconds apart, because one pass materializes exactly one snapshot per instrument at the current closed cutoff and never a backdated catch-up series; the produced snapshots are consumable by the frozen F3 IGNITION detector at each snapshot's own evaluation cutoff; the pass uses a bounded acquisition concurrency (a finite worker pool, never unbounded) with one bounded public Kraken OHLC request per instrument per minute (no bulk multi-pair endpoint exists), the acquisition is parallel while materialization stays strictly sequential on the single canonical writer connection, and the run tolerates a genuine two-per-instrument pair without overlap; the whole pass is bounded strictly inside its 60-second slot by an internal wall-clock budget (default 45, capped at 50) plus an enforceable in-container termination bound, and non-overlap is guaranteed at the process level INSIDE the container: the capture holds a process-level advisory lock for its whole pass, so at most one capture_feature_bus_shadow process executes inside the container at any instant even if the host Docker client dies independently and leaves a surviving in-container process (a refused invocation records an explicit SKIPPED_LOCK_HELD disposition rather than silently exiting); the enforceable timeout runs on the container side, directly supervising the Python process (timeout --signal=TERM --kill-after=5s 50, so the process is dead by ~55s, strictly below 60), and no host-side timeout wraps the docker exec call that could release the only host lock while the in-container process may continue (the host flock is retained only as a cheap first-line guard, never as the enforceable one), so two passes cannot overlap and the protected 60-second unified cycle is never contended, delayed or skipped; a missing or delayed minute yields INCOMPLETE coverage and fails closed rather than fabricating contiguous evidence; a 15-minute gap, a replayed cutoff and a non-adjacent evaluation never advance F3 persistence; the run grants no trading, ranking, admission, allocation, order or exchange authority, keeps Feature Bus production `off` and Paper-v2 `off`/unset, changes no authority, and adds no second market-data truth system
+AC-021:
+GIVEN:
+the bounded PROSPECTIVE SHADOW feasibility-evidence producer (Slice 3A)
+WHEN:
+committed FeatureSnapshots are converted into F5 feasibility evidence
+THEN:
+it is a prospective collector that never backfills history: a missing read cursor cold-starts at the current committed snapshot head (a deterministic, persisted action) and collects only NEW records after activation rather than replaying committed history, and before any live market read it compares the snapshot's evaluation/availability boundary with the real acquisition instant and, when the snapshot is outside a frozen contemporaneous window (two 60-second evaluation intervals), refuses to fetch current market evidence against it and records an explicit stale disposition instead; the evidence epoch is the snapshot's own evaluation cutoff and the source cutoff truthfully describes the source evidence cutoff (the close of the latest completed source candle), with current receipt/visibility never backdated, and the builder fails closed when the source cutoff would fall after the evaluation epoch rather than stamping newer data onto an older epoch; it produces exactly one genuine feasibility.evidence.recorded record per contemporaneous committed snapshot, keyed to the F3 IGNITION detector evaluation with direction supplied through an injectable seam (default LONG for the long-biased IGNITION route, so the R4-B2 SHORT route can drive the same producer with genuine BTNL evidence), and it rejects evidence whose direction does not match the requested direction (a SHORT request can never be satisfied by LONG/spot evidence); it preserves negative evidence: a present REJECT market record and a present INVALID execution record remain present typed evidence (F5 turns them into its existing hard VETO), and missingness/availability are reserved for genuinely absent or unavailable evidence rather than unfavourable evidence; it assembles the evidence from the proven scanner primitives (validate_market_data and evaluate_execution) with an explicit acquisition instant so no hidden clock is read, with no new evidence math and no second market-data authority, and a SHORT request without genuine BTNL margin evidence fails closed (spot evidence is never serialized as BTNL evidence); it advances its persisted read cursor only across a contiguous prefix of snapshots that reached a TERMINAL disposition and halts advancement at the first RETRYABLE snapshot, and the read seam returns one ordered record per committed row each carrying its own canonical event_id and (history_epoch, local_sequence) cursor, so progress is persisted after EVERY terminal row (a malformed committed row is a deterministic terminal rejection that advances to that row's own cursor and is counted and surfaced, never silently skipped and never a livelock; a retryable row halts advancement so it is retried and is never skipped); before each valid snapshot invokes the live evidence builder it proves enough of the internal budget remains for one complete bounded acquisition and, when it does not, sets budget-exhausted and stops with the cursor left at the last terminal row rather than depending on the process timeout to interrupt normal control flow; a transient source failure or unexpected assembly exception is retryable and does not advance past the row; it is authorized only for exactly Feature Bus shadow AND canonical writer shadow (active does not authorize it), and an unauthorized run opens nothing (no canonical store, no market read), with its scheduled module entrypoint executing and emitting a machine-readable inert/refused result; the shadow validation notional is an explicitly configured value, never derived from live account equity; a duplicate replay reaches the writer's DUPLICATE_OK and is counted as a duplicate rather than a second record; it is bounded to a configured limit and internal wall-clock budget and stops cleanly with explicit budget-exhausted evidence; it holds its OWN process-level non-overlap lock (a distinct identity from the Feature Bus capture, so neither producer can suppress the other; two feasibility captures never overlap and two Feature Bus captures never overlap, while a Feature Bus capture and a feasibility capture may run concurrently) and runs from its own bounded scheduler entry with an in-container timeout below the minute, never from inside the protected unified cycle; and it grants no trading, ranking, admission, allocation, order or exchange authority
 
 EXPLICITLY OUT OF SCOPE:
 - Setting `OPIP_PAPER_V2_MODE=active` in production, or any activation, in this freeze PR
@@ -303,6 +310,42 @@ AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_inner_timeout_ter
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_inner_timeout_is_container_side_and_no_outer_lock_release
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_config_bounds_are_within_the_minute_slot
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_unified_cycle_runs_none_of_the_capture_path
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_exact_shadow_gate_matrix
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_records_one_genuine_record_per_contemporaneous_snapshot
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_cold_start_initializes_at_head_and_does_not_refetch_history
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_delayed_snapshot_is_not_stamped_with_current_market
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_out_of_epoch_source_cutoff_fails_closed
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_builder_rejects_source_cutoff_after_epoch
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_future_visible_snapshot_fails_closed_without_advancing
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_real_builder_builds_genuine_contemporaneous_evidence
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_market_reject_stays_present_and_f5_vetoes
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_execution_invalid_stays_present_and_f5_vetoes
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_unavailable_evidence_is_insufficient_not_veto
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_present_veto_reaches_full_f5_decision
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_cursor_advances_across_passes_and_does_not_reread
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_retryable_record_halts_cursor_and_is_retried_next_pass
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_transient_builder_exception_does_not_advance_cursor
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_all_rejected_batch_advances_and_persists_cursor
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_canonical_rejected_is_retryable_not_terminal
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_all_reader_rejected_batch_advances_and_surfaces
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_malformed_then_valid_row_processes_valid_and_advances
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_scheduler_comment_names_the_feasibility_lock
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_deterministic_rejection_is_terminal_and_advances
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_exact_replay_after_restart_produces_no_duplicate_and_advances
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_duplicate_replay_is_counted_not_rejected
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_unsupported_direction_rejected
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_direction_mismatch_rejected
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_missing_builder_records_unavailable_and_does_not_advance
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_budget_expires_after_first_row_persists_first_only
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_locks_are_structurally_distinct
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_feature_bus_lock_does_not_block_feasibility
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_run_capture_locked_uses_own_lock_identity
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_reader_seam_exposes_per_record_provenance
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_module_entrypoint_runs_and_reports_inert
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_no_protected_cycle_dependency
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_configured_notional_is_required_and_bounded
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_has_a_bounded_non_overlapping_scheduler_entry
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_scheduler_reconciliation_installs_capture_once_and_can_roll_back
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-paper-activation.md
 AC-001 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
@@ -372,6 +415,15 @@ AC-020 -> OHM-Trade-Agent-v1/app/core/config.py
 AC-020 -> OHM-Trade-Agent-v1/deploy/cron.d/opip-feature-bus-capture
 AC-020 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_shadow_cadence.py
 AC-020 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_shadow_capture.py
+AC-021 -> OHM-Trade-Agent-v1/app/jobs/capture_feasibility_evidence_shadow.py
+AC-021 -> OHM-Trade-Agent-v1/app/jobs/capture_feature_bus_shadow.py
+AC-021 -> OHM-Trade-Agent-v1/app/opip/canonical/writer.py
+AC-021 -> OHM-Trade-Agent-v1/app/opip/features/committed_snapshot_reader.py
+AC-021 -> OHM-Trade-Agent-v1/app/core/config.py
+AC-021 -> OHM-Trade-Agent-v1/deploy/cron.d/opip-feasibility-evidence-capture
+AC-021 -> OHM-Trade-Agent-v1/deploy/remote/reconcile-scheduler.sh
+AC-021 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_feasibility_producer.py
+AC-021 -> OHM-Trade-Agent-v1/tests/test_opip_canonical_shadow_activation_v1.py
 
 DEFERRED DISCOVERIES:
 - The activation implementation (wiring the target F7 selector as the admission source, the mode/cutover sequence and their behavioral acceptance criteria and implementation map) is a later commit of this same increment and is not authorized by this freeze.

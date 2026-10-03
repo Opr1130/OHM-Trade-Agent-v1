@@ -106,6 +106,14 @@ class Settings(BaseSettings):
     # The shared Kraken transport is thread-safe and rate-limited, so this hides
     # request latency without exceeding the transport's own request rate.
     opip_feature_bus_capture_concurrency: int = Field(default=4, ge=1, le=8)
+    # R4-B2 Slice 3A F5 feasibility-evidence capture. The bounded SHADOW producer
+    # that converts committed FeatureSnapshots into genuine feasibility.evidence.
+    # recorded records. The validation notional is configured explicitly (never
+    # derived from live account equity) so the captured evidence notional is fixed
+    # and auditable. 0 disables the pass (it is never a favourable default).
+    opip_feasibility_capture_notional_usd: float = Field(default=0.0, ge=0.0)
+    opip_feasibility_capture_limit: int = Field(default=8, ge=1, le=32)
+    opip_feasibility_capture_budget_seconds: int = Field(default=45, ge=5, le=50)
     # B/C-3 Paper v2 execution. Default off, and "active" is the only value that
     # enables it: activation is an explicit operator decision, so an unknown or
     # malformed value must fail Settings parsing rather than silently enabling a

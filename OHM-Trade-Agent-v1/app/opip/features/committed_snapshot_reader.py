@@ -25,6 +25,7 @@ It holds no trading, admission, reservation or execution authority.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -200,6 +201,29 @@ class CommittedSnapshotBatch:
     reject_reasons: tuple[str, ...] = field(default_factory=tuple)
 
 
+@dataclass(frozen=True)
+class CommittedSnapshotRecord:
+    """One ordered committed-snapshot result WITH its own canonical provenance.
+
+    Every committed row yields exactly one record, valid or rejected, so a consumer
+    can apply contiguous-prefix cursor semantics: a rejected row is a deterministic
+    terminal result that advances to ITS OWN cursor, and a valid row advances to its
+    own cursor once processed. ``cursor`` is the row's canonical
+    ``(history_epoch, local_sequence)`` position.
+    """
+
+    event_id: str
+    history_epoch: int
+    local_sequence: int
+    snapshot: FeatureSnapshot | None
+    rejected: bool
+    reject_reason: str | None = None
+
+    @property
+    def cursor(self) -> tuple[int, int]:
+        return (self.history_epoch, self.local_sequence)
+
+
 class CommittedSnapshotReader:
     """A bounded, read-only cursor over committed FeatureSnapshots.
 
@@ -220,11 +244,72 @@ class CommittedSnapshotReader:
         """Release the read-only connection."""
         self._reader.close()
 
+    def head_cursor(self) -> tuple[int, int] | None:
+        """The cursor of the newest committed snapshot (prospective cold-start boundary)."""
+        return self._reader.latest_feature_snapshot_cursor()
+
     def __enter__(self) -> "CommittedSnapshotReader":
         return self
 
     def __exit__(self, *exc_info: object) -> None:
         self.close()
+
+    def read_records(
+        self,
+        *,
+        after: tuple[int, int] | None = None,
+        limit: int = DEFAULT_BATCH_LIMIT,
+    ) -> tuple[tuple[CommittedSnapshotRecord, ...], tuple[int, int] | None]:
+        """Return one ordered record per committed row, each with its own cursor.
+
+        Read-only. A malformed/corrupt row becomes a ``rejected=True`` record
+        carrying that row's own canonical cursor and reason, so it is a
+        deterministic terminal result rather than a silent drop. Also returns the
+        tail cursor (or ``after`` when nothing new).
+        """
+        bounded = min(max(1, int(limit)), MAX_BATCH_LIMIT)
+        envelopes, cursor = self._reader.read_feature_snapshot_rows(
+            after=after, limit=bounded
+        )
+        records: list[CommittedSnapshotRecord] = []
+        for envelope in envelopes:
+            epoch = int(envelope["history_epoch"])
+            sequence = int(envelope["local_sequence"])
+            try:
+                payload = json.loads(str(envelope["payload_json"]))
+                snapshot = feature_snapshot_from_payload(payload)
+            except (SnapshotRecordError, ValueError, TypeError) as exc:
+                records.append(
+                    CommittedSnapshotRecord(
+                        event_id=str(envelope["event_id"]),
+                        history_epoch=epoch,
+                        local_sequence=sequence,
+                        snapshot=None,
+                        rejected=True,
+                        reject_reason=f"{type(exc).__name__}: {exc}",
+                    )
+                )
+                continue
+            # Deterministic dedupe across reads: a snapshot already surfaced is
+            # never reclassified as new evidence.
+            if snapshot.snapshot_id in self._seen:
+                continue
+            self._seen.add(snapshot.snapshot_id)
+            records.append(
+                CommittedSnapshotRecord(
+                    event_id=str(envelope["event_id"]),
+                    history_epoch=epoch,
+                    local_sequence=sequence,
+                    snapshot=snapshot,
+                    rejected=False,
+                )
+            )
+        return tuple(records), cursor
+
+    def read_feature_snapshot_rows(self, *, after=None, limit=DEFAULT_BATCH_LIMIT):
+        """Expose committed rows with per-row canonical provenance (read-only)."""
+        bounded = min(max(1, int(limit)), MAX_BATCH_LIMIT)
+        return self._reader.read_feature_snapshot_rows(after=after, limit=bounded)
 
     def read_batch(
         self,
@@ -286,6 +371,7 @@ def read_all_committed_snapshots(db_path: Path) -> tuple[FeatureSnapshot, ...]:
 __all__ = [
     "CommittedSnapshotBatch",
     "CommittedSnapshotReader",
+    "CommittedSnapshotRecord",
     "DEFAULT_BATCH_LIMIT",
     "MAX_BATCH_LIMIT",
     "SnapshotRecordError",
