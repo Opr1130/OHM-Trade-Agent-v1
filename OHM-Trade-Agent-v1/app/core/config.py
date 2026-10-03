@@ -94,12 +94,18 @@ class Settings(BaseSettings):
     # exchange authority. Cadence lives in the cron schedule (the one scheduler),
     # not in a runtime hook, so it is not duplicated here.
     opip_feature_bus_capture_limit: int = Field(default=8, ge=1, le=32)
-    # Total wall-clock budget for one capture pass. The loop stops requesting more
-    # instruments once the remaining budget cannot fit one bounded request; the cron
-    # ``timeout`` is only final containment. Capped below the 240s cron timeout so
-    # the internal budget always stops the pass first, keeping the containment
-    # invariant (internal budget = graceful stop, timeout = last resort).
-    opip_feature_bus_capture_budget_seconds: int = Field(default=180, ge=20, le=220)
+    # R4-B2 shadow cadence bridge. The capture runs on the F3 60-second evaluation
+    # grid, so one pass must finish inside its minute slot. The internal budget
+    # stops the pass first; the cron ``timeout`` (well below 60s) is final
+    # containment only, keeping the containment invariant (internal budget =
+    # graceful stop, timeout = last resort).
+    opip_feature_bus_capture_budget_seconds: int = Field(default=45, ge=20, le=50)
+    # Bounded acquisition concurrency. Kraken has no bulk multi-pair OHLC endpoint,
+    # so one public request per instrument is required per closed minute; a small
+    # worker pool bounds the worst case to ceil(N / concurrency) request timeouts.
+    # The shared Kraken transport is thread-safe and rate-limited, so this hides
+    # request latency without exceeding the transport's own request rate.
+    opip_feature_bus_capture_concurrency: int = Field(default=4, ge=1, le=8)
     # B/C-3 Paper v2 execution. Default off, and "active" is the only value that
     # enables it: activation is an explicit operator decision, so an unknown or
     # malformed value must fail Settings parsing rather than silently enabling a

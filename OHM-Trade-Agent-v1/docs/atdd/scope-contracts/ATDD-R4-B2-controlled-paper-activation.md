@@ -159,6 +159,13 @@ WHEN:
 a consumer reads committed feasibility.evidence.recorded records
 THEN:
 it opens the canonical store read-only through the existing read-only connection (no store lock, no schema initialization) and can never mutate, quarantine or rewrite canonical evidence; it reads only committed feasibility.evidence.recorded records in canonical (history_epoch, local_sequence) order and exposes a bounded, exclusive cursor so a consumer processes each record once, deterministically, and resumes after a restart without reclassifying old records as new; it validates each durable payload through the frozen event trust boundary and reconstructs the exact typed FeasibilityEvidence, recomputing both the F5 evidence_fingerprint and the exact-content payload_hash, so a payload whose declared identities do not match its content is rejected; it fails closed per record without aborting the batch (a malformed, tampered or corrupt record is counted and reported as rejected while unaffected valid records are still returned, and no error escapes as an unhandled exception); it dedupes deterministically by exact payload_hash; it fabricates nothing (an empty store yields an empty batch); and it holds no trading, admission, reservation, execution or exchange authority and performs no market read
+AC-020:
+GIVEN:
+the R4-B2 shadow cadence bridge over the bounded Feature Bus SHADOW capture
+WHEN:
+the capture is scheduled and one pass is exercised
+THEN:
+the capture runs on the frozen F3 60-second evaluation grid so that consecutive passes commit FeatureSnapshots for the same instrument at consecutive cutoffs exactly 60 seconds apart, because one pass materializes exactly one snapshot per instrument at the current closed cutoff and never a backdated catch-up series; the produced snapshots are consumable by the frozen F3 IGNITION detector at each snapshot's own evaluation cutoff; the pass uses a bounded acquisition concurrency (a finite worker pool, never unbounded) with one bounded public Kraken OHLC request per instrument per minute (no bulk multi-pair endpoint exists), the acquisition is parallel while materialization stays strictly sequential on the single canonical writer connection, and the run tolerates a genuine two-per-instrument pair without overlap; the whole pass is bounded strictly inside its 60-second slot by an internal wall-clock budget (default 45, capped at 50) plus an enforceable in-container termination bound, and non-overlap is guaranteed at the process level INSIDE the container: the capture holds a process-level advisory lock for its whole pass, so at most one capture_feature_bus_shadow process executes inside the container at any instant even if the host Docker client dies independently and leaves a surviving in-container process (a refused invocation records an explicit SKIPPED_LOCK_HELD disposition rather than silently exiting); the enforceable timeout runs on the container side, directly supervising the Python process (timeout --signal=TERM --kill-after=5s 50, so the process is dead by ~55s, strictly below 60), and no host-side timeout wraps the docker exec call that could release the only host lock while the in-container process may continue (the host flock is retained only as a cheap first-line guard, never as the enforceable one), so two passes cannot overlap and the protected 60-second unified cycle is never contended, delayed or skipped; a missing or delayed minute yields INCOMPLETE coverage and fails closed rather than fabricating contiguous evidence; a 15-minute gap, a replayed cutoff and a non-adjacent evaluation never advance F3 persistence; the run grants no trading, ranking, admission, allocation, order or exchange authority, keeps Feature Bus production `off` and Paper-v2 `off`/unset, changes no authority, and adds no second market-data truth system
 
 EXPLICITLY OUT OF SCOPE:
 - Setting `OPIP_PAPER_V2_MODE=active` in production, or any activation, in this freeze PR
@@ -280,6 +287,22 @@ AC-019 -> tests/test_opip_r4_b2_feasibility_evidence_reader.py::test_ac_019_tamp
 AC-019 -> tests/test_opip_r4_b2_feasibility_evidence_reader.py::test_ac_019_non_json_committed_row_is_rejected_without_aborting_batch
 AC-019 -> tests/test_opip_r4_b2_feasibility_evidence_reader.py::test_ac_019_reader_holds_no_authority_and_never_mutates
 AC-019 -> tests/test_opip_r4_b2_feasibility_evidence_reader.py::test_ac_019_empty_store_yields_empty_batch
+AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_consecutive_passes_commit_snapshots_60s_apart
+AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_f3_consumes_produced_snapshots_at_their_own_cutoff
+AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_two_consecutive_qualifying_evaluations_produce_claim
+AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_fifteen_minute_gap_does_not_count_as_persistence
+AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_replayed_cutoff_does_not_advance_persistence
+AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_missing_minute_is_incomplete_coverage
+AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_no_historical_catch_up_is_materialized
+AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_acquisition_concurrency_is_bounded
+AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_deadline_stops_further_waves
+AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_materialization_is_sequential
+AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_run_capture_locked_skips_when_lock_held
+AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_process_lock_serializes_capture_bodies
+AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_inner_timeout_terminates_workload_and_releases_lock
+AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_inner_timeout_is_container_side_and_no_outer_lock_release
+AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_config_bounds_are_within_the_minute_slot
+AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_unified_cycle_runs_none_of_the_capture_path
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-paper-activation.md
 AC-001 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
@@ -344,6 +367,11 @@ AC-018 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_feasibility_evidence_event.py
 AC-019 -> OHM-Trade-Agent-v1/app/opip/fev_evidence_reader.py
 AC-019 -> OHM-Trade-Agent-v1/app/opip/canonical/writer.py
 AC-019 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_feasibility_evidence_reader.py
+AC-020 -> OHM-Trade-Agent-v1/app/jobs/capture_feature_bus_shadow.py
+AC-020 -> OHM-Trade-Agent-v1/app/core/config.py
+AC-020 -> OHM-Trade-Agent-v1/deploy/cron.d/opip-feature-bus-capture
+AC-020 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_shadow_cadence.py
+AC-020 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_shadow_capture.py
 
 DEFERRED DISCOVERIES:
 - The activation implementation (wiring the target F7 selector as the admission source, the mode/cutover sequence and their behavioral acceptance criteria and implementation map) is a later commit of this same increment and is not authorized by this freeze.

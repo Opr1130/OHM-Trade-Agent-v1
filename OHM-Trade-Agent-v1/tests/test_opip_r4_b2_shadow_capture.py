@@ -313,7 +313,7 @@ def test_ac_016_configured_limit_and_budget_reach_capture():
 
 
 def test_ac_016_configured_budget_is_read_from_settings():
-    """ATDD-R4-B2-controlled-paper-activation/AC-016: the configured budget is read from Settings. A clock jump that would exhaust the default 180s budget but not the configured larger budget proves the configured value was used."""
+    """ATDD-R4-B2-controlled-paper-activation/AC-016: the configured budget is read from Settings. A clock jump that would exhaust the default 45s budget but not the configured larger budget proves the configured value was used (both stay within the 60-second cadence slot)."""
     versions = _instruments(3)
     batches = {
         version.instrument_version_id: _batch(version, _observations(version))
@@ -321,18 +321,20 @@ def test_ac_016_configured_budget_is_read_from_settings():
     }
     client = _RecordingClient()
     publisher = FeatureBusPublisher(client, enabled=True, settings=_settings())
-    # start tick = 0; the next tick (200s) is past the 180s default but within a
-    # configured 220s budget, so only a real settings read can avoid exhaustion.
-    ticks = iter([0.0, 200.0])
+    # start tick = 0. The per-request reservation is 15s, so the pass proceeds
+    # only while (deadline - now) >= 15. A 33s jump exhausts the default 45s
+    # budget (45-33=12 < 15) but not a configured 50s budget (50-33=17 >= 15),
+    # so only a real settings read can avoid exhaustion.
+    ticks = iter([0.0, 33.0])
 
     def _clock():
         try:
             return next(ticks)
         except StopIteration:
-            return 200.0
+            return 33.0
 
     summary = capture.capture_feature_bus_shadow(
-        settings=_settings(opip_feature_bus_capture_budget_seconds=220),
+        settings=_settings(opip_feature_bus_capture_budget_seconds=50),
         now=NOW,
         publisher=publisher,
         instrument_provider=_provider(versions),
@@ -357,7 +359,7 @@ def test_ac_016_unified_cycle_does_not_run_capture():
 
 
 def test_ac_016_capture_has_a_bounded_non_overlapping_cron_entry():
-    """ATDD-R4-B2-controlled-paper-activation/AC-016: the capture runs from its own cron entry with flock non-overlap and a bounded timeout, on the one scheduler."""
+    """ATDD-R4-B2-controlled-paper-activation/AC-016 and AC-020: the capture runs from its own cron entry on the F3 60-second grid, with flock non-overlap and a timeout that is strictly below the minute so two passes can never overlap."""
     entry = (APP_ROOT / "deploy" / "cron.d" / "opip-feature-bus-capture").read_text(
         encoding="utf-8"
     )
@@ -373,9 +375,10 @@ def test_ac_016_capture_has_a_bounded_non_overlapping_cron_entry():
     line = command[0]
     assert "app.jobs.capture_feature_bus_shadow" in line
     assert "flock -n /var/run/opip-feature-bus-capture.lock" in line
-    assert "timeout --signal=TERM --kill-after=20s 240" in line
-    # Cadence must not be every minute: it is a separate, bounded pass.
-    assert not line.startswith("* * * * *")
+    # The R4-B2 cadence bridge requires the 60-second F3 evaluation grid, and the
+    # containment timeout must sit strictly below that slot so passes cannot overlap.
+    assert line.startswith("* * * * *")
+    assert "timeout --signal=TERM --kill-after=5s 50" in line
 
 
 def test_ac_016_scheduler_reconciliation_installs_capture_once():
