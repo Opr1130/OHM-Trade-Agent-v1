@@ -181,6 +181,54 @@ a SHORT direction is requested for a committed snapshot
 THEN:
 margin eligibility is discovered from Kraken's Bitnomial execution venue (the same authority the live scanner uses) by delegating to the live scanner's validate_short_margin_eligibility rather than re-implementing venue/leverage policy, resolving a margin_venue_symbol carrying the `:BTNL` provenance F5 requires for a trusted SHORT margin book and a genuine leverage tier bounded by the account ceiling, with a pair absent from the venue recorded INELIGIBLE and an unavailable discovery recorded UNAVAILABLE (never fabricated eligible); the SHORT execution liquidity evidence is built from the BTNL margin book (get_pre_trade/get_post_trade with the `:BTNL` margin venue symbol) and never from the spot book, and when the pair is ineligible or the BTNL book is unavailable the execution record is explicitly UNAVAILABLE present evidence (so F5 abstains with INSUFFICIENT_EVIDENCE) rather than spot evidence substituted as BTNL; market data is validated on the spot candles because it is direction-agnostic, while margin and execution are strictly BTNL-scoped; the evidence carries the `:BTNL` provenance so F5 trusts the margin book, and the same honest evaluation_time/source_cutoff contract (with the fail-closed epoch check) applies as for LONG; the producer dispatches the requested direction to the direction-appropriate builder and rejects evidence whose direction does not match the request (a SHORT request is never satisfied by LONG/spot evidence); it generates no new evidence math or market-data authority beyond the proven scanner primitives (validate_market_data, discover_short_margin, evaluate_execution); and it grants no trading, ranking, admission, allocation, order or exchange authority
 
+AC-023:
+GIVEN:
+the prospective F6 evidence contract and the ONE committed canonical paper outcome authority (the `paper_execution` attempt/fill records, the `paper_execution.opportunity_disposition.recorded` admission disposition, and the `paper_outcome.terminal.recorded` terminal record)
+WHEN:
+one economic opportunity's committed canonical evidence is projected onto the F6 entry-execution family (Slice 3B prospective label projection)
+THEN:
+the projection resolves the exact frozen F6 entry token `NO_FILL`/`PARTIAL_FILL`/`FULL_FILL` and never invents one; a `FILLED` execution whose accepted quantity reached the intended quantity resolves `FULL_FILL`, a `PARTIALLY_FILLED` (or `FILLED` short of intended) positive-but-below-intended quantity resolves `PARTIAL_FILL`, and a terminal no-fill execution (`REJECTED`/`CANCELLED`/`EXPIRED` with zero accepted quantity) or the `NO_FILL_EXPIRED` admission disposition resolves `NO_FILL`; a deliberately unadmitted opportunity (`CAPACITY_REJECTED`, `CAPITAL_REJECTED`, `NOT_ACTIONABLE`, `UNSUPPORTED`, `DISABLED`, `EVIDENCE_INCOMPLETE`, `ALREADY_TRACKED`, `CANCELLED`, `DO_NOT_CHASE`, `UNRESOLVED`) is retained explicitly as the cash/no-trade population with no entry outcome and no path, never scored as a fill; an ambiguous or unsupported entry that the canonical vocabulary cannot unambiguously support (a `FILLED`/`PARTIALLY_FILLED` entry with no positive accepted quantity, a `PARTIALLY_FILLED` entry that in fact reached the intended quantity, a non-terminal state, an unknown execution-state token, or an expired admission that also accepted quantity) fails closed to `UNRESOLVED` with no fabricated fill and no favorable default; a malformed token fails closed per record without raising, so one bad field cannot abort a batch; it reuses the frozen F6 `EntryExecutionOutcome` enum rather than defining a second vocabulary; and it grants no trading, admission, reservation, execution or exchange authority
+
+AC-024:
+GIVEN:
+the prospective F6 evidence contract and the committed canonical post-fill path evidence (the `paper_outcome.terminal.recorded` `exit_reason` and the `paper_protection.trigger.recorded` `trigger_type`)
+WHEN:
+the same opportunity's committed canonical evidence is projected onto the F6 conditional post-fill path family
+THEN:
+the projection resolves the exact frozen F6 path token `TARGET`/`STOP`/`TIMEOUT`/`RISK_EXIT` and never invents one, using a frozen canonical-to-F6 mapping table that only ever yields a member of the frozen F6 `PostFillPathOutcome` enum or an explicit non-label: `TARGET_2` resolves `TARGET`, `STOP` and `ENTRY_CANDLE_STOP` resolve `STOP`, `TIME_EXIT` resolves `TIMEOUT`, and an independently triggered risk exit (a protection `EMERGENCY` trigger) resolves `RISK_EXIT`; a `NO_FILL` entry carries NO post-fill path label (its path state is `INSUFFICIENT_EVIDENCE` and its path outcome is `None`) and never receives a fabricated `STOP` or `TIMEOUT`; an ambiguous within-bar path (`OHLC_GAP`) is `INCOMPLETE_COVERAGE` and is never a clean exact path label and never a negative; a non-market termination (`OPERATOR_OFF`), a genuinely `UNRESOLVED` reason, an unmapped exit reason and a terminal `UNRESOLVED` status all fail closed to `UNRESOLVED` with no path outcome; a `TIMEOUT` is scored from its recorded realized return and is never equated with a negative return; the entry-execution and post-fill path families are never mixed and are never collapsed into a single win probability; and the projection grants no trading, admission, reservation, execution or exchange authority
+
+AC-025:
+GIVEN:
+a projected F6 label and the committed canonical economics
+WHEN:
+the realized net return and the simulation-fidelity grade are derived
+THEN:
+the realized net return is the dimensionless net-over-capital ratio (`net_pnl / capital_committed`, so `0.0125` means plus one point two five percent) and never a percent, a score, a probability or a scaled-by-one-hundred value; an opportunity that deployed no capital (a `NO_FILL` entry, or a deliberately unadmitted / cash-no-trade decision) has a realized net return of exactly zero and is never recorded as a loss; an absent or non-finite profit or capital figure leaves the return `UNRESOLVED` rather than guessed; and the fidelity grade is never inferred as `A` (no current canonical record attests exact-replay grade-A fidelity), native paper resolves `B` only when the canonical lineage attestation is exactly `COMPLETE`, and an ambiguous path (`INCOMPLETE_COVERAGE`), an incomplete lineage token, or an absent or unknown lineage value resolves `C` rather than silently resolving `B`; a terminal status outside the frozen canonical set (`CLOSED`/`CANCELLED`/`UNRESOLVED`) fails closed to `UNRESOLVED`
+
+AC-026:
+GIVEN:
+the F6 prospective label-projection module
+WHEN:
+its purity, imports, durable effects and authority are audited
+THEN:
+it is a pure, deterministic function of its declared inputs (identical inputs yield an identical label) that reads no clock (`datetime.now`/`utcnow`/`time.time`), no environment, no filesystem, no database and no network, and opens nothing; it writes no store, table, JSONL stream or canonical event type and creates no second outcome truth, second outcome engine or parallel calibration spine (it is a read-only projection over the canonical writer's committed evidence, which remains the single outcome authority); it imports no exchange, order, Committee, AI or allocation surface and holds no trading, ranking, admission, reservation, sizing, execution or exchange authority; it reads no ordinal score, confidence or Committee rubric as a probability; the label-resolution and fidelity vocabulary it uses lives in the F6 vocabulary module `app/opip/contracts/forecast.py` (re-exported unchanged by `app/opip/forecast_evaluation.py`), so it is consumable without importing the F6 engine or evaluation module and without duplicating the vocabulary; and it changes no F3-F7 behaviour
+
+AC-027:
+GIVEN:
+the prospective F6 evidence contract required before any calibrated forecast can legitimately be evaluated
+WHEN:
+the frozen contract document is inspected
+THEN:
+it exists as a repository artifact and freezes, before any outcome is observed, the FULL POPULATION (every eligible prospective evaluation unit, including selected, rejected, abstained, no-trade, no-fill, incomplete and unresolved cases), the CALIBRATION-ELIGIBLE SUBSET (only cases whose required outcome is cleanly resolved under the frozen label/fidelity policy), the retained UNRESOLVED/INCOMPLETE population (never silently recoded negative), the separately-reported LONG and SHORT populations, and the retained CASH/NO-TRADE population for matched comparison; it keeps the entry-execution family (`NO_FILL`/`PARTIAL_FILL`/`FULL_FILL`) and the post-fill path family (`TARGET`/`STOP`/`TIMEOUT`/`RISK_EXIT`) separate, states that a `NO_FILL` has no post-fill path label and that a `TIMEOUT` is an observed horizon expiry scored from its recorded return rather than an automatic negative; it freezes population inclusion, the feature/input schema, the evaluation instant, the evidence cutoff, the availability rule, the forecast horizon, the entry deadline, the FIRST_FILL post-fill path anchor, the label policy, the missingness policy, the fidelity policy, the fee policy, the correction policy, the maturity policy, the sealing policy, the training cutoff and the dataset-manifest identity, and explicitly records that none of these is chosen after viewing future outcomes; and it states the dependence-aware maturation gate and the `REAL_EVIDENCE_MATURATION_REQUIRED` disposition, without inventing a universal sample-count or calibration-pass threshold
+
+AC-028:
+GIVEN:
+the future OWNER control-plane actions for the F6 evidence path (SHADOW evidence enablement) and the later R4-B2 controlled Paper-v2 cutover
+WHEN:
+the prepared owner packets are inspected
+THEN:
+both packets exist as repository artifacts and are PREPARED ONLY (they execute no authority change); each names the exact SHA, the exact modes to change, the exact protected-environment/control-plane mechanism, the prerequisites, the preflight commands, the rollback, the post-deploy verification, the authority-collision proof, the protection-health proof, the legacy-drain requirements and the current blockers; the SHADOW packet states that SHADOW runtime creates no new-entry authority, and the cutover packet states that activation is a distinct owner-controlled switch that is not set by any artifact here and that exactly one new-entry paper authority must exist throughout; and neither packet claims activation, changes a production mode, or grants funded/exchange/Committee authority
+
 EXPLICITLY OUT OF SCOPE:
 - Setting `OPIP_PAPER_V2_MODE=active` in production, or any activation, in this freeze PR
 - Funded or live trading, exchange order placement, modification, cancellation or confirmation, margin, asset borrow or leverage
@@ -364,6 +412,21 @@ AC-022 -> tests/test_opip_r4_b2_feasibility_short.py::test_ac_022_btnl_book_fail
 AC-022 -> tests/test_opip_r4_b2_feasibility_short.py::test_ac_022_short_execution_carries_btnl_provenance_for_f5
 AC-022 -> tests/test_opip_r4_b2_feasibility_short.py::test_ac_022_invalid_status_sort_order_constant_is_importable
 AC-022 -> tests/test_opip_r4_b2_feasibility_short.py::test_ac_022_producer_dispatches_short_direction
+AC-023 -> tests/test_opip_r4_b2_f6_label_projection.py::test_ac_023_full_and_partial_fill_resolve
+AC-023 -> tests/test_opip_r4_b2_f6_label_projection.py::test_ac_023_no_fill_variants_resolve
+AC-023 -> tests/test_opip_r4_b2_f6_label_projection.py::test_ac_023_non_admission_is_cash_no_trade
+AC-023 -> tests/test_opip_r4_b2_f6_label_projection.py::test_ac_023_ambiguous_entry_fails_closed
+AC-024 -> tests/test_opip_r4_b2_f6_label_projection.py::test_ac_024_path_family_maps_exactly
+AC-024 -> tests/test_opip_r4_b2_f6_label_projection.py::test_ac_024_no_fill_has_no_path_label
+AC-024 -> tests/test_opip_r4_b2_f6_label_projection.py::test_ac_024_unresolved_and_incomplete_are_never_negative
+AC-024 -> tests/test_opip_r4_b2_f6_label_projection.py::test_ac_024_no_family_token_is_invented
+AC-025 -> tests/test_opip_r4_b2_f6_label_projection.py::test_ac_025_fidelity_is_never_inferred_as_a
+AC-025 -> tests/test_opip_r4_b2_f6_label_projection.py::test_ac_025_realized_return_is_dimensionless_and_zero_without_capital
+AC-025 -> tests/test_opip_r4_b2_f6_label_projection.py::test_ac_025_timeout_scores_its_recorded_return
+AC-026 -> tests/test_opip_r4_b2_f6_label_projection.py::test_ac_026_projection_is_pure_and_deterministic
+AC-026 -> tests/test_opip_r4_b2_f6_label_projection.py::test_ac_026_malformed_token_fails_closed_per_record
+AC-027 -> tests/test_opip_r4_b2_f6_prospective_contract.py::test_ac_027_contract_freezes_population_and_policies
+AC-028 -> tests/test_opip_r4_b2_f6_prospective_contract.py::test_ac_028_owner_packets_are_prepared_only
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-paper-activation.md
 AC-001 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
@@ -444,6 +507,23 @@ AC-021 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_feasibility_producer.py
 AC-021 -> OHM-Trade-Agent-v1/tests/test_opip_canonical_shadow_activation_v1.py
 AC-022 -> OHM-Trade-Agent-v1/app/jobs/capture_feasibility_evidence_shadow.py
 AC-022 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_feasibility_short.py
+AC-023 -> OHM-Trade-Agent-v1/app/opip/forecast_labels.py
+AC-023 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_f6_label_projection.py
+AC-024 -> OHM-Trade-Agent-v1/app/opip/forecast_labels.py
+AC-024 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_f6_label_projection.py
+AC-025 -> OHM-Trade-Agent-v1/app/opip/forecast_labels.py
+AC-025 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_f6_label_projection.py
+AC-026 -> OHM-Trade-Agent-v1/app/opip/forecast_labels.py
+AC-026 -> OHM-Trade-Agent-v1/app/opip/contracts/forecast.py
+AC-026 -> OHM-Trade-Agent-v1/app/opip/contracts/__init__.py
+AC-026 -> OHM-Trade-Agent-v1/app/opip/forecast_evaluation.py
+AC-026 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_f6_label_projection.py
+AC-027 -> OHM-Trade-Agent-v1/docs/architecture/OPIP_F6_PROSPECTIVE_EVIDENCE_CONTRACT.md
+AC-027 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_f6_prospective_contract.py
+AC-027 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-paper-activation.md
+AC-028 -> OHM-Trade-Agent-v1/docs/architecture/OPIP_F6_OWNER_ENABLEMENT_PACKETS.md
+AC-028 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_f6_prospective_contract.py
+AC-028 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-paper-activation.md
 
 DEFERRED DISCOVERIES:
 - The activation implementation (wiring the target F7 selector as the admission source, the mode/cutover sequence and their behavioral acceptance criteria and implementation map) is a later commit of this same increment and is not authorized by this freeze.
