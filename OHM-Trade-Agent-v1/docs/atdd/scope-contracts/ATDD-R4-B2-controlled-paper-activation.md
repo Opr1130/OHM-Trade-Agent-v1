@@ -138,6 +138,13 @@ WHEN:
 the producer and its scheduling are inspected and exercised
 THEN:
 it reuses the proven Feature Bus components (the Kraken source and instrument provider the manual pilot uses, the fixed evaluation grid, rolling-state/checkpoint continuity, the revision ledger and the FeatureBusPublisher) with no new feature math, schema or second market-data authority; it is authorized only when the Feature Bus is in exactly `shadow` mode AND the canonical writer is in exactly `shadow` mode (Feature Bus `active` does not authorize this SHADOW producer, and the shared publisher helper's broader semantics are unchanged); it is bounded to a configured instrument limit and a total wall-clock budget; it publishes only canonical FEATURE_SNAPSHOT_RECORDED evidence through the existing writer, using the completed fetch time (not the pre-fetch start) as the decision availability and preserving snapshot identity, cutoffs, availability times, consumed-input watermark and gap/restart state; it isolates an unexpected per-instrument source failure so other instruments still complete, records the failure, and never fabricates a batch or a snapshot; a batch carrying a source error publishes no fresh snapshot for that instrument while the error stays observable and unaffected instruments continue; once the remaining budget cannot fit one bounded request it stops requesting more instruments and records explicit budget-exhausted evidence; it grants no trading, ranking, admission, allocation, order or exchange authority; and it runs from its own bounded, non-overlapping scheduler entry on the single existing scheduler, never from inside the protected unified cycle, so it can never delay or skip a protection cycle
+AC-017:
+GIVEN:
+the durable FeasibilityEvidence record codec (Slice 3A)
+WHEN:
+the durable wire record is built, validated and reconstructed
+THEN:
+the durable schema is explicit and frozen (not derived from the dataclass), persisting every substantive top-level field and every field of the nested MarketDataValidation and ExecutionValidation records so the exact typed F5 evidence can be reconstructed; the record carries the frozen F5 semantic `evidence_fingerprint` (FEV, unchanged, covering only the F5-normalized subset) AND an independent exact-content `payload_hash` (FEVH) computed over the complete canonical durable body excluding the hash itself, mirroring the Paper-v2 semantic-identity plus content-hash precedent; building requires a real FeasibilityEvidence, serializes all ratified fields and both nested typed records, and emits one deterministic wrapper; validation requires exact field sets (wrapper and body and both nested records), rejecting unknown fields, missing fields, wrong types, invalid enum/status tokens, malformed or naive datetimes, non-canonical nested structures, non-finite numbers and an invalid fingerprint or payload_hash, with no favorable defaults; reconstruction strictly rebuilds MarketDataValidation, ExecutionValidation and FeasibilityEvidence and performs three independent checks - the reconstructed F5 fingerprint, the rebuilt exact payload_hash, and canonical wrapper equality - where the third does not replace the second; a mutation of a field outside the F5 summary (for example ExecutionValidation.best_bid, mid_price, a depth field, a `*_complete` boolean or buy_vwap) leaves the F5 fingerprint unchanged yet changes payload_hash and is rejected; and the codec grants no trading, admission, reservation, execution or exchange authority, performs no market read and holds no clock
 
 EXPLICITLY OUT OF SCOPE:
 - Setting `OPIP_PAPER_V2_MODE=active` in production, or any activation, in this freeze PR
@@ -226,7 +233,21 @@ AC-016 -> tests/test_opip_r4_b2_shadow_capture.py::test_ac_016_configured_budget
 AC-016 -> tests/test_opip_r4_b2_shadow_capture.py::test_ac_016_unified_cycle_does_not_run_capture
 AC-016 -> tests/test_opip_r4_b2_shadow_capture.py::test_ac_016_capture_has_a_bounded_non_overlapping_cron_entry
 AC-016 -> tests/test_opip_r4_b2_shadow_capture.py::test_ac_016_scheduler_reconciliation_installs_capture_once
-
+AC-017 -> tests/test_opip_r4_b2_feasibility_evidence_codec.py::test_ac_017_long_round_trip_is_exact
+AC-017 -> tests/test_opip_r4_b2_feasibility_evidence_codec.py::test_ac_017_short_round_trip_is_exact
+AC-017 -> tests/test_opip_r4_b2_feasibility_evidence_codec.py::test_ac_017_fingerprint_survives_round_trip
+AC-017 -> tests/test_opip_r4_b2_feasibility_evidence_codec.py::test_ac_017_non_finite_ticker_last_round_trips
+AC-017 -> tests/test_opip_r4_b2_feasibility_evidence_codec.py::test_ac_017_payload_hash_catches_summary_excluded_mutation
+AC-017 -> tests/test_opip_r4_b2_feasibility_evidence_codec.py::test_ac_017_fingerprint_ignores_best_bid_but_hash_does_not
+AC-017 -> tests/test_opip_r4_b2_feasibility_evidence_codec.py::test_ac_017_tampered_margin_evidence_rejected
+AC-017 -> tests/test_opip_r4_b2_feasibility_evidence_codec.py::test_ac_017_missing_required_field_rejected
+AC-017 -> tests/test_opip_r4_b2_feasibility_evidence_codec.py::test_ac_017_unknown_field_rejected
+AC-017 -> tests/test_opip_r4_b2_feasibility_evidence_codec.py::test_ac_017_wrong_type_and_non_finite_rejected
+AC-017 -> tests/test_opip_r4_b2_feasibility_evidence_codec.py::test_ac_017_invalid_enum_and_status_tokens_rejected
+AC-017 -> tests/test_opip_r4_b2_feasibility_evidence_codec.py::test_ac_017_bad_fingerprint_and_bad_hash_rejected
+AC-017 -> tests/test_opip_r4_b2_feasibility_evidence_codec.py::test_ac_017_bad_datetime_rejected
+AC-017 -> tests/test_opip_r4_b2_feasibility_evidence_codec.py::test_ac_017_non_canonical_timestamp_rejected_consistently
+AC-017 -> tests/test_opip_r4_b2_feasibility_evidence_codec.py::test_ac_017_reconstruction_fails_closed_on_hash_mismatch
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-paper-activation.md
 AC-001 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
@@ -281,6 +302,9 @@ AC-016 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_shadow_capture.py
 AC-016 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R2-feature-bus-shadow-parity.md
 AC-016 -> OHM-Trade-Agent-v1/tests/test_opip_feature_bus_r2_shadow_parity.py
 AC-016 -> OHM-Trade-Agent-v1/tests/test_opip_canonical_shadow_activation_v1.py
+AC-017 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-paper-activation.md
+AC-017 -> OHM-Trade-Agent-v1/app/opip/feasibility_evidence_record.py
+AC-017 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_feasibility_evidence_codec.py
 
 DEFERRED DISCOVERIES:
 - The activation implementation (wiring the target F7 selector as the admission source, the mode/cutover sequence and their behavioral acceptance criteria and implementation map) is a later commit of this same increment and is not authorized by this freeze.
