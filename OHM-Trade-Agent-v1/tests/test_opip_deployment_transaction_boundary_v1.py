@@ -385,6 +385,7 @@ def _classify(
     harness.write_text(
         "set +e\n"
         f"GITHUB_OUTPUT={_shell_quote(str(tmp_path / 'github_output'))}\n"
+        f"APPROVED_PROFILE=EVIDENCE_SHADOW\nTARGET_SHA={_shell_quote(RELEASE_SHA)}\n"
         ': > "$GITHUB_OUTPUT"\n'
         + _classification_block()
         + "\n"
@@ -414,11 +415,25 @@ def _classify(
     return fields
 
 
+RELEASE_RUNTIME_OK_LOG = "\n".join(
+    [
+        "OPIP_RELEASE_RUNTIME_VERIFICATION=PASS",
+        f"OPIP_RELEASE_RUNTIME_SHA={RELEASE_SHA}",
+        "OPIP_RELEASE_EVIDENCE_CAPTURE=PASS",
+        "OPIP_RELEASE_PROFILE=EVIDENCE_SHADOW",
+        "OPIP_RELEASE_PROTECTION=HEALTHY",
+        "OPIP_RELEASE_TARGET_AUTHORITY=ABSENT",
+        "OPIP_RELEASE_SCHEDULER=UNIQUE_BOUNDED",
+        "OPIP_UNIFIED_CYCLE=HEALTHY",
+    ]
+)
+
 CORE_OK_LOG = "\n".join(
     [
         '"status":"ok"',
         "O'Pip scheduler reconciliation: OK",
         "OPIP_CORE_DEPLOY_STATUS=SUCCESS",
+        RELEASE_RUNTIME_OK_LOG,
         "OPIP_PAPER_REGISTRY_GENESIS_STATUS=OK",
         "OPIP_CORE_POSTCOMMIT_HEALTH=OK",
     ]
@@ -460,11 +475,31 @@ LEGACY_RC0_TRANSITION_LOG = "\n".join(
 
 @requires_bash
 def test_case_a_core_failure_before_commit_still_reports_rollback(tmp_path):
-    """A: a genuine core failure keeps the existing failure/rollback semantics."""
-    log = "deployment failed; rolling back to " + OTHER_SHA + "\nrollback health check passed\n"
+    """A failed core is classified as rolled back only with a verified receipt."""
+    log = "\n".join(
+        [
+            "deployment failed; rolling back to " + OTHER_SHA,
+            "OPIP_SAFE_BASELINE_ROLLBACK=SUCCESS",
+            "rollback health and paper checks passed",
+        ]
+    )
     fields = _classify(tmp_path, log, rc=1)
     assert fields["RESULT"] == "ROLLED BACK"
     assert fields["ROLLBACK"] == "YES"
+    assert fields["GATE"] == "FAIL"
+
+
+@requires_bash
+def test_rollback_without_safe_baseline_receipt_is_unproven(tmp_path):
+    log = "\n".join(
+        [
+            "deployment failed; rolling back to " + OTHER_SHA,
+            "rollback health check passed",
+        ]
+    )
+    fields = _classify(tmp_path, log, rc=1)
+    assert fields["RESULT"] == "SERVER DEPLOY FAILED"
+    assert fields["ROLLBACK"] == "UNKNOWN OR FAILED"
     assert fields["GATE"] == "FAIL"
 
 
@@ -644,6 +679,7 @@ def test_contradictory_learning_markers_are_blocked(tmp_path):
             "O'Pip scheduler reconciliation: OK",
             # Genesis is proven here so this fixture isolates the LEARNING
             # contradiction it is about; genesis gating is covered separately.
+            RELEASE_RUNTIME_OK_LOG,
             "OPIP_PAPER_REGISTRY_GENESIS_STATUS=OK",
             "OPIP_LEARNING_EXPORT_STATUS=FAILED",
             'OPIP_LEARNING_READINESS=READY',
@@ -667,6 +703,7 @@ def test_ready_readiness_without_export_success_is_blocked(tmp_path):
             "OPIP_CORE_DEPLOY_STATUS=SUCCESS",
             '"status":"ok"',
             "O'Pip scheduler reconciliation: OK",
+            RELEASE_RUNTIME_OK_LOG,
             "OPIP_LEARNING_READINESS=READY",
             "O'Pip deployment succeeded",
         ]
@@ -717,7 +754,8 @@ def test_genuine_precommit_core_failure_is_never_retried(tmp_path):
             [
                 "production core health check failed",
                 "deployment failed; rolling back to " + OTHER_SHA,
-                "rollback health check passed",
+                "OPIP_SAFE_BASELINE_ROLLBACK=SUCCESS",
+                "rollback health and paper checks passed",
             ]
         ),
         "writer-health": "\n".join(
@@ -725,7 +763,8 @@ def test_genuine_precommit_core_failure_is_never_retried(tmp_path):
                 "O'Pip scheduler reconciliation: OK",
                 "production writer health check failed",
                 "deployment failed; rolling back to " + OTHER_SHA,
-                "rollback health check passed",
+                "OPIP_SAFE_BASELINE_ROLLBACK=SUCCESS",
+                "rollback health and paper checks passed",
             ]
         ),
         "paper-topology": "\n".join(
@@ -734,7 +773,8 @@ def test_genuine_precommit_core_failure_is_never_retried(tmp_path):
                 "O'Pip scheduler reconciliation: OK",
                 "Freqtrade paper topology failed health/authority validation",
                 "deployment failed; rolling back to " + OTHER_SHA,
-                "rollback health check passed",
+                "OPIP_SAFE_BASELINE_ROLLBACK=SUCCESS",
+                "rollback health and paper checks passed",
             ]
         ),
         "resource-budget": "\n".join(
@@ -743,7 +783,8 @@ def test_genuine_precommit_core_failure_is_never_retried(tmp_path):
                 "O'Pip scheduler reconciliation: OK",
                 "insufficient host memory headroom after paper startup: available_kb=1000",
                 "deployment failed; rolling back to " + OTHER_SHA,
-                "rollback health check passed",
+                "OPIP_SAFE_BASELINE_ROLLBACK=SUCCESS",
+                "rollback health and paper checks passed",
             ]
         ),
     }
@@ -921,6 +962,7 @@ def test_postcommit_degraded_health_is_reported_but_not_as_a_core_failure(tmp_pa
             "OPIP_LEARNING_EXPORT_STATUS=SUCCESS",
             "OPIP_LEARNING_READINESS=READY",
             "OPIP_CORE_POSTCOMMIT_HEALTH=DEGRADED",
+            RELEASE_RUNTIME_OK_LOG,
             "O'Pip deployment succeeded",
         ]
     )
@@ -996,6 +1038,7 @@ def test_absent_genesis_marker_blocks_the_deployment(tmp_path):
         [
             "OPIP_CORE_DEPLOY_STATUS=SUCCESS",
             "O'Pip scheduler reconciliation: OK",
+            RELEASE_RUNTIME_OK_LOG,
             "OPIP_LEARNING_EXPORT_STATUS=SUCCESS",
             "OPIP_LEARNING_READINESS=READY",
             "OPIP_CORE_POSTCOMMIT_HEALTH=OK",

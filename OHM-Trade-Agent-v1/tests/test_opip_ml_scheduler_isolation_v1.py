@@ -297,9 +297,11 @@ def test_deploy_stops_paper_before_target_build():
         encoding="utf-8"
     )
     marker = "# Stop paper workers during the build/recreate window."
-    section = source[source.index(marker):]
+    normalized = " ".join(source.replace("\\\n", " ").split())
+    section = normalized[normalized.index(marker):]
     assert section.index("stop_paper_stack") < section.index(
-        "docker compose build opip-canonical-writer ohm-trade-agent"
+        'docker compose build --build-arg "OPIP_RELEASE_SHA=$TARGET_SHA" '
+        "opip-canonical-writer ohm-trade-agent"
     )
 
 

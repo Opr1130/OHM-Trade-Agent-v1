@@ -1,5 +1,8 @@
 FROM python:3.12-slim
 
+ARG OPIP_RELEASE_SHA=UNPINNED
+LABEL org.opencontainers.image.revision="${OPIP_RELEASE_SHA}"
+
 WORKDIR /app
 
 COPY requirements.txt .

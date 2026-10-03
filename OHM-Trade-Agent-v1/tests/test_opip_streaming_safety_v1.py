@@ -264,7 +264,11 @@ def test_first_stream_worker_deploy_uses_existing_trusted_reconcile_hook():
     assert "O'Pip deployment succeeded" in workflow
     assert "/diagnose-learning" in workflow
     assert "&& grep -q 'OPIP stream worker reconciliation: OK' deploy.log" not in workflow
-    assert "docker compose build opip-canonical-writer ohm-trade-agent" in deploy
+    normalized_deploy = " ".join(deploy.replace("\\\n", " ").split())
+    assert (
+        'docker compose build --build-arg "OPIP_RELEASE_SHA=$TARGET_SHA" '
+        "opip-canonical-writer ohm-trade-agent"
+    ) in normalized_deploy
     assert "--remove-orphans opip-canonical-writer" in deploy
     assert "--remove-orphans ohm-trade-agent" in deploy
     assert "wait_writer_health" in deploy

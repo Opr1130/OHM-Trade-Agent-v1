@@ -3,6 +3,13 @@ name: deploy-production
 on:
   workflow_dispatch:
     inputs:
+      release_profile:
+        description: 'Allowlisted release profile'
+        required: true
+        type: choice
+        options:
+          - EVIDENCE_SHADOW
+          - TARGET_PAPER
       confirm_production:
         description: 'Explicit production approval'
         required: true
@@ -27,12 +34,14 @@ jobs:
     if: >-
       (github.event_name == 'workflow_dispatch' &&
        github.ref == 'refs/heads/main' &&
+       github.actor == github.repository_owner &&
        inputs.confirm_production == 'DEPLOY') ||
       (github.event_name == 'issue_comment' &&
        github.event.issue.number == 64 &&
        github.event.comment.user.login == github.repository_owner &&
        github.event.comment.author_association == 'OWNER' &&
-       startsWith(github.event.comment.body, '/deploy '))
+       (startsWith(github.event.comment.body, '/deploy-profile ') ||
+        startsWith(github.event.comment.body, '/deploy ')))
     runs-on: ubuntu-latest
     environment: production
     steps:
@@ -40,21 +49,43 @@ jobs:
         id: target
         env:
           EVENT_NAME: ${{ github.event_name }}
+          ACTOR: ${{ github.actor }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
           COMMENT_BODY: ${{ github.event.comment.body }}
+          DISPATCH_PROFILE: ${{ inputs.release_profile }}
         run: |
           set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" \
+            && "$ACTOR" != "$REPOSITORY_OWNER" ]]; then
+            echo "Refusing production deploy: manual dispatch is repository-owner-only." >&2
+            exit 64
+          fi
           if [[ "$EVENT_NAME" == "issue_comment" ]]; then
-            if [[ "$COMMENT_BODY" =~ ^/deploy[[:space:]]+([0-9a-f]{40})[[:space:]]*$ ]]; then
+            if [[ "$COMMENT_BODY" =~ ^/deploy-profile[[:space:]]+(EVIDENCE_SHADOW|TARGET_PAPER)[[:space:]]+([0-9a-f]{40})[[:space:]]*$ ]]; then
+              PROFILE="${BASH_REMATCH[1]}"
+              TARGET_SHA="${BASH_REMATCH[2]}"
+            elif [[ "$COMMENT_BODY" =~ ^/deploy[[:space:]]+([0-9a-f]{40})[[:space:]]*$ ]]; then
+              # Backward-compatible spelling, subject to the same explicit
+              # EVIDENCE_SHADOW profile, exact-SHA and architecture gates.
+              PROFILE="EVIDENCE_SHADOW"
               TARGET_SHA="${BASH_REMATCH[1]}"
             else
-              echo "Refusing production deploy: approval comment format is invalid." >&2
+              echo "Refusing production deploy: approval comment format is invalid or profile is not allowlisted." >&2
               exit 64
             fi
           else
+            PROFILE="$DISPATCH_PROFILE"
             TARGET_SHA="$GITHUB_SHA"
           fi
+          case "$PROFILE" in
+            EVIDENCE_SHADOW|TARGET_PAPER) ;;
+            SAFE_BASELINE) echo "SAFE_BASELINE is rollback-only." >&2; exit 64 ;;
+            *) echo "Refusing production deploy: release profile is not allowlisted." >&2; exit 64 ;;
+          esac
+          echo "profile=$PROFILE" >> "$GITHUB_OUTPUT"
           echo "sha=$TARGET_SHA" >> "$GITHUB_OUTPUT"
-          echo "Approved production SHA: $TARGET_SHA"
+          echo "Owner-approved release profile: $PROFILE"
+          echo "Owner-approved production SHA: $TARGET_SHA"
 
       - name: Require approved SHA to equal current main
         env:
@@ -70,11 +101,13 @@ jobs:
           }
 
       - name: Require successful pytest CI for exact SHA
+        id: exact_ci
         env:
           GH_TOKEN: ${{ github.token }}
           TARGET_SHA: ${{ steps.target.outputs.sha }}
         run: |
           set -euo pipefail
+          echo "status=UNPROVEN" >> "$GITHUB_OUTPUT"
           RESULT="$(gh run list \
             --repo "$GITHUB_REPOSITORY" \
             --workflow pytest.yml \
@@ -83,10 +116,58 @@ jobs:
             --limit 1 \
             --json status,conclusion \
             --jq '.[0] | [.status,.conclusion] | @tsv')"
-          test "$RESULT" = $'completed\tsuccess' || {
+          if [[ "$RESULT" == $'completed\tsuccess' ]]; then
+            echo "status=PASS" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=FAIL" >> "$GITHUB_OUTPUT"
             echo "Refusing production deploy: exact SHA does not have a successful completed pytest run." >&2
             echo "CI result: ${RESULT:-not found}" >&2
             exit 1
+          fi
+
+      - name: Checkout and validate the exact-SHA release profile
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.target.outputs.sha }}
+          persist-credentials: false
+
+      - name: Require the architecture gate and profile at the approved SHA
+        id: profile_gate
+        env:
+          PROFILE: ${{ steps.target.outputs.profile }}
+        working-directory: OHM-Trade-Agent-v1
+        run: |
+          set -euo pipefail
+          python -m pip install PyYAML
+          python -m app.services.release_profiles --profile "$PROFILE" \
+            | tee "$RUNNER_TEMP/release-architecture-gate.txt"
+          grep -Fx 'ARCHITECTURE_GATE=PASS' "$RUNNER_TEMP/release-architecture-gate.txt"
+          grep -Fx "PROFILE=$PROFILE" "$RUNNER_TEMP/release-architecture-gate.txt"
+          grep -Fx 'NEW_ENTRY_AUTHORITY=LEGACY_ONLY' "$RUNNER_TEMP/release-architecture-gate.txt"
+          grep -Fx 'FUNDED_AUTHORITY=ABSENT' "$RUNNER_TEMP/release-architecture-gate.txt"
+          grep -Fx 'PAPER_V2=OFF' "$RUNNER_TEMP/release-architecture-gate.txt"
+          grep -Fx 'COMMITTEE_MODE=off' "$RUNNER_TEMP/release-architecture-gate.txt"
+          grep -Fx 'PROTECTION=INDEPENDENT' "$RUNNER_TEMP/release-architecture-gate.txt"
+          echo "architecture_gate=PASS" >> "$GITHUB_OUTPUT"
+          echo "feature_bus=$(grep -m1 '^FEATURE_BUS=' "$RUNNER_TEMP/release-architecture-gate.txt" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+          echo "canonical_writer=$(grep -m1 '^CANONICAL_WRITER=' "$RUNNER_TEMP/release-architecture-gate.txt" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+          echo "target_spine=$(grep -m1 '^TARGET_SPINE=' "$RUNNER_TEMP/release-architecture-gate.txt" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+          echo "paper_v2=$(grep -m1 '^PAPER_V2=' "$RUNNER_TEMP/release-architecture-gate.txt" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+          echo "committee_mode=$(grep -m1 '^COMMITTEE_MODE=' "$RUNNER_TEMP/release-architecture-gate.txt" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+          echo "new_entry_authority=$(grep -m1 '^NEW_ENTRY_AUTHORITY=' "$RUNNER_TEMP/release-architecture-gate.txt" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+          echo "funded_authority=$(grep -m1 '^FUNDED_AUTHORITY=' "$RUNNER_TEMP/release-architecture-gate.txt" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+          echo "protection=$(grep -m1 '^PROTECTION=' "$RUNNER_TEMP/release-architecture-gate.txt" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+
+      - name: Recheck exact main SHA immediately before production deploy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          MAIN_SHA="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq '.sha')"
+          test "$TARGET_SHA" = "$MAIN_SHA" || {
+            echo "Refusing production deploy: main moved after approval validation." >&2
+            exit 65
           }
 
       - name: Validate deploy secrets
@@ -139,6 +220,7 @@ jobs:
           OHM_DEPLOY_USER: ${{ secrets.OHM_DEPLOY_USER }}
           OHM_DEPLOY_PORT: ${{ secrets.OHM_DEPLOY_PORT }}
           TARGET_SHA: ${{ steps.target.outputs.sha }}
+          APPROVED_PROFILE: ${{ steps.target.outputs.profile }}
         run: |
           set +e
           PORT="${OHM_DEPLOY_PORT:-22}"
@@ -181,6 +263,15 @@ jobs:
             LEARNING_EXPORT_STATUS="$(grep -oE 'OPIP_LEARNING_EXPORT_STATUS=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
             LEARNING_READINESS="$(grep -oE 'OPIP_LEARNING_READINESS=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
             POSTCOMMIT_HEALTH="$(grep -oE 'OPIP_CORE_POSTCOMMIT_HEALTH=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
+            RUNTIME_VERIFICATION="$(grep -oE 'OPIP_RELEASE_RUNTIME_VERIFICATION=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
+            RUNTIME_VERIFIED_AT="$(grep -oE 'OPIP_RELEASE_RUNTIME_VERIFIED_AT=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
+            EVIDENCE_CAPTURE="$(grep -oE 'OPIP_RELEASE_EVIDENCE_CAPTURE=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
+            DEPLOYED_PROFILE="$(grep -oE 'OPIP_RELEASE_PROFILE=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
+            RUNTIME_PROTECTION="$(grep -oE 'OPIP_RELEASE_PROTECTION=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
+            TARGET_AUTHORITY="$(grep -oE 'OPIP_RELEASE_TARGET_AUTHORITY=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
+            RELEASE_SCHEDULER="$(grep -oE 'OPIP_RELEASE_SCHEDULER=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
+            UNIFIED_CYCLE="$(grep -oE 'OPIP_UNIFIED_CYCLE=HEALTHY' "$log" | tail -n 1 | cut -d= -f2)"
+            UNIFIED_CYCLE_COMPLETED_AT="$(grep -oE 'OPIP_UNIFIED_CYCLE_COMPLETED_AT=[^[:space:]]+' "$log" | tail -n 1 | cut -d= -f2)"
             GENESIS_STATUS="$(grep -oE 'OPIP_PAPER_REGISTRY_GENESIS_STATUS=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
             GENESIS_REASON="$(grep -oE 'OPIP_PAPER_REGISTRY_GENESIS_REASON=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
             if grep -q 'OPIP_CORE_DEPLOY_STATUS=' "$log"; then
@@ -205,7 +296,19 @@ jobs:
                && grep -q "O'Pip deployment succeeded" "$log" \
                && grep -q "O'Pip scheduler reconciliation: OK" "$log"; then
               case "${CORE_MARKER}:${CORE_STATUS}" in
-                PRESENT:SUCCESS) core_verdict="PROVEN" ;;
+                PRESENT:SUCCESS)
+                  if [[ "$RUNTIME_VERIFICATION" == "PASS" ]] \
+                    && grep -Fxq "OPIP_RELEASE_RUNTIME_SHA=$TARGET_SHA" "$log" \
+                    && [[ "$DEPLOYED_PROFILE" == "$APPROVED_PROFILE" ]] \
+                    && [[ "$APPROVED_PROFILE" == "EVIDENCE_SHADOW" ]] \
+                    && [[ "$EVIDENCE_CAPTURE" == "PASS" ]] \
+                    && [[ "$RUNTIME_PROTECTION" == "HEALTHY" ]] \
+                    && [[ "$TARGET_AUTHORITY" == "ABSENT" ]] \
+                    && [[ "$RELEASE_SCHEDULER" == "UNIQUE_BOUNDED" ]] \
+                    && [[ "$UNIFIED_CYCLE" == "HEALTHY" ]]; then
+                    core_verdict="PROVEN"
+                  fi
+                  ;;
                 ABSENT:)
                   if grep -q '"status":"ok"' "$log"; then
                     core_verdict="LEGACY"
@@ -216,6 +319,7 @@ jobs:
             fi
 
             TRANSITION_ELIGIBLE="NO"
+            SAFE_BASELINE_ROLLBACK="UNPROVEN"
             if [[ "$legacy_allowed" == "1" && "$CORE_MARKER" == "ABSENT" ]]; then
               # A one-time transition may retry ONLY when the first invocation ran
               # under the pre-#247 contract and provably crossed its commit point.
@@ -284,13 +388,16 @@ jobs:
                 || parts="${parts:+$parts + }POST-COMMIT HEALTH ${POSTCOMMIT_HEALTH:-UNREPORTED}"
               if [[ -z "$parts" ]]; then
                 RESULT="SUCCESS"
+                SAFE_BASELINE_ROLLBACK="NOT_NEEDED"
               else
                 RESULT="CORE DEPLOYED - $parts"
               fi
-            elif grep -q 'rollback health check passed' "$log"; then
+            elif grep -q 'rollback health and paper checks passed' "$log" \
+              && grep -Fxq 'OPIP_SAFE_BASELINE_ROLLBACK=SUCCESS' "$log"; then
               RESULT="ROLLED BACK"
               HEALTH="PREVIOUS RELEASE OK"
               ROLLBACK="YES"
+              SAFE_BASELINE_ROLLBACK="SUCCESS"
             elif grep -qiE 'Permission denied \(publickey\)|Too many authentication failures' "$log"; then
               RESULT="SSH AUTH FAILED"
               HEALTH="NOT CONFIRMED"
@@ -355,6 +462,16 @@ jobs:
           echo "learning_export_status=${LEARNING_EXPORT_STATUS:-UNKNOWN}" >> "$GITHUB_OUTPUT"
           echo "learning_readiness=${LEARNING_READINESS:-UNKNOWN}" >> "$GITHUB_OUTPUT"
           echo "postcommit_health=${POSTCOMMIT_HEALTH:-UNKNOWN}" >> "$GITHUB_OUTPUT"
+          echo "runtime_verification=${RUNTIME_VERIFICATION:-UNPROVEN}" >> "$GITHUB_OUTPUT"
+          echo "runtime_verified_at=${RUNTIME_VERIFIED_AT:-NOT_VERIFIED}" >> "$GITHUB_OUTPUT"
+          echo "evidence_capture=${EVIDENCE_CAPTURE:-UNPROVEN}" >> "$GITHUB_OUTPUT"
+          echo "deployed_profile=${DEPLOYED_PROFILE:-UNPROVEN}" >> "$GITHUB_OUTPUT"
+          echo "runtime_protection=${RUNTIME_PROTECTION:-UNPROVEN}" >> "$GITHUB_OUTPUT"
+          echo "target_authority=${TARGET_AUTHORITY:-UNPROVEN}" >> "$GITHUB_OUTPUT"
+          echo "release_scheduler=${RELEASE_SCHEDULER:-UNPROVEN}" >> "$GITHUB_OUTPUT"
+          echo "unified_cycle=${UNIFIED_CYCLE:-UNPROVEN}" >> "$GITHUB_OUTPUT"
+          echo "unified_cycle_completed_at=${UNIFIED_CYCLE_COMPLETED_AT:-UNPROVEN}" >> "$GITHUB_OUTPUT"
+          echo "safe_baseline_rollback=$SAFE_BASELINE_ROLLBACK" >> "$GITHUB_OUTPUT"
           echo "genesis_status=${GENESIS_STATUS:-UNKNOWN}" >> "$GITHUB_OUTPUT"
           echo "genesis_reason=${GENESIS_REASON:-UNKNOWN}" >> "$GITHUB_OUTPUT"
           echo "transition_retry=$TRANSITION_RETRY" >> "$GITHUB_OUTPUT"
@@ -365,6 +482,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TARGET_SHA: ${{ steps.target.outputs.sha }}
+          RELEASE_PROFILE: ${{ steps.target.outputs.profile }}
+          EXACT_CI_RESULT: ${{ steps.exact_ci.outputs.status }}
+          ARCH_GATE: ${{ steps.profile_gate.outputs.architecture_gate }}
+          FEATURE_BUS: ${{ steps.profile_gate.outputs.feature_bus }}
+          CANONICAL_WRITER: ${{ steps.profile_gate.outputs.canonical_writer }}
+          TARGET_SPINE: ${{ steps.profile_gate.outputs.target_spine }}
+          PAPER_V2: ${{ steps.profile_gate.outputs.paper_v2 }}
+          COMMITTEE_MODE: ${{ steps.profile_gate.outputs.committee_mode }}
+          NEW_ENTRY_AUTHORITY: ${{ steps.profile_gate.outputs.new_entry_authority }}
+          FUNDED_AUTHORITY: ${{ steps.profile_gate.outputs.funded_authority }}
+          PROTECTION: ${{ steps.profile_gate.outputs.protection }}
           SSH_CONFIG_RESULT: ${{ steps.ssh_config.outputs.result }}
           SSH_CONFIG_RC: ${{ steps.ssh_config.outputs.rc }}
           DEPLOY_RESULT: ${{ steps.production_deploy.outputs.result }}
@@ -375,6 +503,16 @@ jobs:
           LEARNING_EXPORT_STATUS: ${{ steps.production_deploy.outputs.learning_export_status }}
           LEARNING_READINESS: ${{ steps.production_deploy.outputs.learning_readiness }}
           POSTCOMMIT_HEALTH: ${{ steps.production_deploy.outputs.postcommit_health }}
+          RUNTIME_VERIFICATION: ${{ steps.production_deploy.outputs.runtime_verification }}
+          RUNTIME_VERIFIED_AT: ${{ steps.production_deploy.outputs.runtime_verified_at }}
+          EVIDENCE_CAPTURE: ${{ steps.production_deploy.outputs.evidence_capture }}
+          DEPLOYED_PROFILE: ${{ steps.production_deploy.outputs.deployed_profile }}
+          RUNTIME_PROTECTION: ${{ steps.production_deploy.outputs.runtime_protection }}
+          TARGET_AUTHORITY: ${{ steps.production_deploy.outputs.target_authority }}
+          RELEASE_SCHEDULER: ${{ steps.production_deploy.outputs.release_scheduler }}
+          UNIFIED_CYCLE: ${{ steps.production_deploy.outputs.unified_cycle }}
+          UNIFIED_CYCLE_COMPLETED_AT: ${{ steps.production_deploy.outputs.unified_cycle_completed_at }}
+          SAFE_BASELINE_ROLLBACK: ${{ steps.production_deploy.outputs.safe_baseline_rollback }}
           GENESIS_STATUS: ${{ steps.production_deploy.outputs.genesis_status }}
           GENESIS_REASON: ${{ steps.production_deploy.outputs.genesis_reason }}
           TRANSITION_RETRY: ${{ steps.production_deploy.outputs.transition_retry }}
@@ -394,29 +532,45 @@ jobs:
           # healthy committed core with a blocked learning export is never
           # described as a failed or rolled-back deployment.
           BODY=$(cat <<EOF
-          ## OHM Production Deployment Receipt
-          - **Result:** $RESULT
-          - **SHA:** \`$TARGET_SHA\`
-          - **Core health:** $HEALTH
-          - **Rollback:** $ROLLBACK
-          - **Core deployment:** ${CORE_STATUS:-UNKNOWN}
-          - **Paper registry genesis:** ${GENESIS_STATUS:-UNKNOWN}${GENESIS_REASON:+ (\`$GENESIS_REASON\`)}
-          - **Learning export:** ${LEARNING_EXPORT_STATUS:-UNKNOWN}
-          - **Learning readiness:** ${LEARNING_READINESS:-UNKNOWN}
-          - **Post-commit health:** ${POSTCOMMIT_HEALTH:-UNKNOWN}
-          - **Transition retry:** ${TRANSITION_RETRY:-NO}
-          - **Deploy exit code:** $RC
-          - **Workflow run:** $RUN_URL
+          **Core health:** $HEALTH
+          **Learning export:** ${LEARNING_EXPORT_STATUS:-UNKNOWN}
+          **Learning readiness:** ${LEARNING_READINESS:-UNKNOWN}
 
-          \`Learning readiness\` proves a fresh committed canonical replica for this
-          exact SHA. \`Paper registry genesis\` proves durable initialization
-          provenance exists. \`BLOCKED\` on either means the production side could not
-          prove it; neither indicates a core release failure.
+          SHA=$TARGET_SHA
+          PROFILE=$RELEASE_PROFILE
+          DEPLOYED_PROFILE=${DEPLOYED_PROFILE:-UNPROVEN}
+          DEPLOY_RESULT=$RESULT
+          ARCHITECTURE_GATE=${ARCH_GATE:-UNPROVEN}
+          PYTEST=${EXACT_CI_RESULT:-UNPROVEN}
+          ATDD_SCOPE=${EXACT_CI_RESULT:-UNPROVEN}
+          SECURITY=${EXACT_CI_RESULT:-UNPROVEN}
+          PROTECTION=${RUNTIME_PROTECTION:-UNVERIFIED}
+          PROTECTION_POSTURE=${PROTECTION:-UNVERIFIED}
+          FEATURE_BUS=${FEATURE_BUS:-UNPROVEN}
+          CANONICAL_WRITER=${CANONICAL_WRITER:-UNPROVEN}
+          TARGET_SPINE=${TARGET_SPINE:-UNPROVEN}
+          PAPER_V2=${PAPER_V2:-UNPROVEN}
+          COMMITTEE_MODE=${COMMITTEE_MODE:-UNPROVEN}
+          NEW_ENTRY_AUTHORITY=${NEW_ENTRY_AUTHORITY:-UNPROVEN}
+          FUNDED_AUTHORITY=${FUNDED_AUTHORITY:-UNPROVEN}
+          EVIDENCE_CAPTURE=${EVIDENCE_CAPTURE:-UNVERIFIED}
+          TARGET_AUTHORITY=${TARGET_AUTHORITY:-UNVERIFIED}
+          RELEASE_SCHEDULER=${RELEASE_SCHEDULER:-UNVERIFIED}
+          UNIFIED_CYCLE=${UNIFIED_CYCLE:-UNVERIFIED}
+          UNIFIED_CYCLE_COMPLETED_AT=${UNIFIED_CYCLE_COMPLETED_AT:-UNVERIFIED}
+          ROLLBACK=$ROLLBACK
+          SAFE_BASELINE_ROLLBACK=${SAFE_BASELINE_ROLLBACK:-UNVERIFIED}
+          RUNTIME_VERIFIED_AT=${RUNTIME_VERIFIED_AT:-NOT_VERIFIED}
 
-          \`Transition retry\` records the one-time first-deploy bootstrap: when the
-          first invocation ran the previously installed ohm-deploy, exactly one
-          further invocation of the same SHA completed the transition under the new
-          contract. It is never used for a genuine core failure.
+          CORE_HEALTH=$HEALTH
+          CORE_STATUS=${CORE_STATUS:-UNKNOWN}
+          LEARNING_EXPORT_STATUS=${LEARNING_EXPORT_STATUS:-UNKNOWN}
+          LEARNING_READINESS=${LEARNING_READINESS:-UNKNOWN}
+          POSTCOMMIT_HEALTH=${POSTCOMMIT_HEALTH:-UNKNOWN}
+          PAPER_REGISTRY_GENESIS=${GENESIS_STATUS:-UNKNOWN}
+          TRANSITION_RETRY=${TRANSITION_RETRY:-NO}
+          DEPLOY_EXIT_CODE=$RC
+          WORKFLOW_RUN=$RUN_URL
           EOF
           )
 
@@ -528,4 +682,3 @@ jobs:
       - name: Fail if diagnostics command failed
         if: steps.diagnose.outputs.rc != '0'
         run: exit 1
-
