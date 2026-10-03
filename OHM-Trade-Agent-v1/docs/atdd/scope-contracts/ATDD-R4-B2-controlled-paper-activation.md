@@ -131,6 +131,13 @@ WHEN:
 the reader is inspected and exercised
 THEN:
 it reads only committed FEATURE_SNAPSHOT_RECORDED records through a read-only canonical surface, reconstructs the canonical FeatureSnapshot contract, re-derives and validates snapshot_id and content_hash, rejects malformed or identity-inconsistent payloads (including a malformed watermark and unknown enum values) as SnapshotRecordError rather than repairing them or escaping a raw error, returns records in canonical commit order (history_epoch, local_sequence) with the exclusive cursor advancing deterministically across bounded batches, dedupes deterministically by identity, exposes the cursor so a consumer owns resume persistence across restart, and never mutates or quarantines canonical production state
+AC-016:
+GIVEN:
+the bounded Feature Bus SHADOW capture that produces the evidence the reader consumes
+WHEN:
+the producer and its scheduling are inspected and exercised
+THEN:
+it reuses the proven Feature Bus components (the Kraken source and instrument provider the manual pilot uses, the fixed evaluation grid, rolling-state/checkpoint continuity, the revision ledger and the FeatureBusPublisher) with no new feature math, schema or second market-data authority; it is authorized only when the Feature Bus is in exactly `shadow` mode AND the canonical writer is in exactly `shadow` mode (Feature Bus `active` does not authorize this SHADOW producer, and the shared publisher helper's broader semantics are unchanged); it is bounded to a configured instrument limit and a total wall-clock budget; it publishes only canonical FEATURE_SNAPSHOT_RECORDED evidence through the existing writer, using the completed fetch time (not the pre-fetch start) as the decision availability and preserving snapshot identity, cutoffs, availability times, consumed-input watermark and gap/restart state; it isolates an unexpected per-instrument source failure so other instruments still complete, records the failure, and never fabricates a batch or a snapshot; a batch carrying a source error publishes no fresh snapshot for that instrument while the error stays observable and unaffected instruments continue; once the remaining budget cannot fit one bounded request it stops requesting more instruments and records explicit budget-exhausted evidence; it grants no trading, ranking, admission, allocation, order or exchange authority; and it runs from its own bounded, non-overlapping scheduler entry on the single existing scheduler, never from inside the protected unified cycle, so it can never delay or skip a protection cycle
 
 EXPLICITLY OUT OF SCOPE:
 - Setting `OPIP_PAPER_V2_MODE=active` in production, or any activation, in this freeze PR
@@ -209,6 +216,16 @@ AC-015 -> tests/test_opip_r4_b2_committed_snapshot_reader.py::test_ac_015_bounde
 AC-015 -> tests/test_opip_r4_b2_committed_snapshot_reader.py::test_ac_015_rejects_malformed_and_tampered_payloads
 AC-015 -> tests/test_opip_r4_b2_committed_snapshot_reader.py::test_ac_015_reader_never_mutates_or_quarantines
 AC-015 -> tests/test_opip_r4_b2_committed_snapshot_reader.py::test_ac_015_batch_survives_a_corrupt_stored_record
+AC-016 -> tests/test_opip_r4_b2_shadow_capture.py::test_ac_016_exact_shadow_gate_matrix
+AC-016 -> tests/test_opip_r4_b2_shadow_capture.py::test_ac_016_evaluated_at_is_post_fetch
+AC-016 -> tests/test_opip_r4_b2_shadow_capture.py::test_ac_016_per_instrument_fault_isolation
+AC-016 -> tests/test_opip_r4_b2_shadow_capture.py::test_ac_016_errored_batch_publishes_no_fresh_snapshot
+AC-016 -> tests/test_opip_r4_b2_shadow_capture.py::test_ac_016_internal_budget_stops_further_requests
+AC-016 -> tests/test_opip_r4_b2_shadow_capture.py::test_ac_016_configured_limit_and_budget_reach_capture
+AC-016 -> tests/test_opip_r4_b2_shadow_capture.py::test_ac_016_configured_budget_is_read_from_settings
+AC-016 -> tests/test_opip_r4_b2_shadow_capture.py::test_ac_016_unified_cycle_does_not_run_capture
+AC-016 -> tests/test_opip_r4_b2_shadow_capture.py::test_ac_016_capture_has_a_bounded_non_overlapping_cron_entry
+AC-016 -> tests/test_opip_r4_b2_shadow_capture.py::test_ac_016_scheduler_reconciliation_installs_capture_once
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-paper-activation.md
@@ -254,6 +271,16 @@ AC-015 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-pap
 AC-015 -> OHM-Trade-Agent-v1/app/opip/canonical/writer.py
 AC-015 -> OHM-Trade-Agent-v1/app/opip/features/committed_snapshot_reader.py
 AC-015 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_committed_snapshot_reader.py
+AC-016 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-paper-activation.md
+AC-016 -> OHM-Trade-Agent-v1/app/jobs/capture_feature_bus_shadow.py
+AC-016 -> OHM-Trade-Agent-v1/app/jobs/run_cycle.py
+AC-016 -> OHM-Trade-Agent-v1/app/core/config.py
+AC-016 -> OHM-Trade-Agent-v1/deploy/cron.d/opip-feature-bus-capture
+AC-016 -> OHM-Trade-Agent-v1/deploy/remote/reconcile-scheduler.sh
+AC-016 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_shadow_capture.py
+AC-016 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R2-feature-bus-shadow-parity.md
+AC-016 -> OHM-Trade-Agent-v1/tests/test_opip_feature_bus_r2_shadow_parity.py
+AC-016 -> OHM-Trade-Agent-v1/tests/test_opip_canonical_shadow_activation_v1.py
 
 DEFERRED DISCOVERIES:
 - The activation implementation (wiring the target F7 selector as the admission source, the mode/cutover sequence and their behavioral acceptance criteria and implementation map) is a later commit of this same increment and is not authorized by this freeze.

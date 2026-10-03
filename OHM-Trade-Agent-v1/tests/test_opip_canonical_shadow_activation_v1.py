@@ -336,6 +336,8 @@ def test_canonical_capture_gate_is_only_consumed_by_evidence_producers():
       delegates to the outbox gate above.
     * ``run_feature_bus_pilot.py`` - documentation of the dual gate; it names
       the variable in a docstring and consults no gate at runtime.
+    * ``capture_feature_bus_shadow.py`` - R4-B2 bounded SHADOW feature-bus capture
+      (dual-gated, fails closed); evidence only, no trading authority.
 
     The scan is textual, so a docstring mention counts. That is deliberate: an
     over-approximation fails closed by forcing a new consumer to be classified
@@ -350,6 +352,7 @@ def test_canonical_capture_gate_is_only_consumed_by_evidence_producers():
     )
     expected = {
         "app/jobs/run_feature_bus_pilot.py",
+        "app/jobs/capture_feature_bus_shadow.py",
         "app/opip/canonical/bridge.py",
         "app/opip/features/publisher.py",
         "app/services/paper_outcome_outbox.py",
