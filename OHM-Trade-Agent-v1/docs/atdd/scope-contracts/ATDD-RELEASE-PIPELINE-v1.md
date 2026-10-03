@@ -72,7 +72,7 @@ the F5 feasibility-validation notional for the first prospective evidence epoch
 WHEN:
 the profile, the production compose and the capture are inspected and exercised
 THEN:
-the notional is a fixed repo-controlled evidence constant: `EVIDENCE_SHADOW` resolves `OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD=1000.0` and the core service pins exactly `"1000.0"` as a literal (never derived from live account equity, and not varied within the epoch), while `SAFE_BASELINE` resolves `0.0` so capture stays disabled; `validate_profile_contract` rejects an arbitrary or free-form notional (a non-`1000.0` value for `EVIDENCE_SHADOW`, any non-zero value for `SAFE_BASELINE`); the architecture gate passes only when the configured notional equals the profile value and fails closed on drift; the capture resolves the notional from the configured value and refuses a `--notional-usd` override that differs from it (so an arbitrary notional can never influence an epoch); and the change grants no new-entry, reservation, order, exchange, funded or Committee authority
+the notional is a fixed repo-controlled evidence constant: `EVIDENCE_SHADOW` resolves `OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD=1000.0` and the core service pins exactly `"1000.0"` as a literal (never derived from live account equity, and not varied within the epoch), while `SAFE_BASELINE` resolves `0.0` so capture stays disabled; `validate_profile_contract` rejects an arbitrary or free-form notional (a non-`1000.0` value for `EVIDENCE_SHADOW`, any non-zero value for `SAFE_BASELINE`); the architecture gate passes only when the configured notional equals the profile value and fails closed on drift; the capture resolves the notional from the configured value and refuses a `--notional-usd` override that differs from it (so an arbitrary notional can never influence an epoch); a read-only diagnostics probe reports the committed `feature.snapshot.recorded` and `feasibility.evidence.recorded` counts, the canonical high-water sequence and the latest feasibility `validation_notional_usd` by reading the exported canonical replica read-only (it opens no live store, takes no lock and mutates nothing, and reports `UNAVAILABLE` rather than a fabricated zero when the replica is absent); and the change grants no new-entry, reservation, order, exchange, funded or Committee authority
 
 EXPLICITLY OUT OF SCOPE:
 - Activating TARGET_PAPER, Paper-v2, the Committee, or any funded/live/exchange/order authority
@@ -102,6 +102,7 @@ AC-005 -> tests/test_opip_release_pipeline_v1.py::test_ac_005_gate_fails_closed_
 AC-006 -> tests/test_opip_release_pipeline_v1.py::test_ac_006_paper_v2_off_legacy_sole_authority
 AC-007 -> tests/test_opip_release_pipeline_v1.py::test_ac_007_evidence_notional_is_repo_controlled
 AC-007 -> tests/test_opip_release_pipeline_v1.py::test_ac_007_capture_refuses_a_free_form_notional_override
+AC-007 -> tests/test_opip_release_pipeline_v1.py::test_ac_007_read_only_canonical_evidence_verifier
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/services/release_profiles.py
@@ -145,6 +146,7 @@ AC-006 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.
 AC-007 -> OHM-Trade-Agent-v1/app/services/release_profiles.py
 AC-007 -> OHM-Trade-Agent-v1/app/jobs/capture_feasibility_evidence_shadow.py
 AC-007 -> OHM-Trade-Agent-v1/docker-compose.yml
+AC-007 -> OHM-Trade-Agent-v1/deploy/remote/diagnose-opip-learning.sh
 AC-007 -> OHM-Trade-Agent-v1/tests/test_opip_release_pipeline_v1.py
 AC-007 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
 AC-007 -> OHM-Trade-Agent-v1/docs/release/README.md
