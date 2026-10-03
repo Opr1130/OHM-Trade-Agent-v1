@@ -146,6 +146,11 @@ from app.opip.market.instrument_version_store import instrument_version_from_pay
 # as a module alias so the trust boundary names are used exactly once.
 from app.opip.contracts import opportunity_persistence as opportunity_persistence_contract
 
+# R4-B2 Slice 3A: the F5 feasibility-evidence vocabulary (event type, stream,
+# priority, payload validation and the deterministic idempotency key). It is a
+# separate LOW-priority evidence class, NOT part of FEATURE_BUS_EVENT_TYPES.
+from app.opip import fev_evidence_event as fev_evidence_event_contract
+
 MAX_PAYLOAD_BYTES = 16 * 1024
 _UTC_OFFSET = "+00:00"
 _UTC_Z = "Z"
@@ -211,6 +216,13 @@ IDEMPOTENT_PAYLOAD_EVENT_TYPES = frozenset(
     # otherwise-identical resubmission carrying a different deadline/state is an
     # integrity conflict rather than a duplicate.
     | opportunity_persistence_contract.OPPORTUNITY_LIFECYCLE_EVENT_TYPES
+    # R4-B2 Slice 3A F5 feasibility evidence joins the full-payload conflict set.
+    # The validated payload embeds the whole durable record and contains no
+    # volatile receipt clock, so an exact replay is byte-identical and an
+    # otherwise-identical resubmission carrying different evidence content is an
+    # integrity conflict rather than a duplicate. Idempotency is already bound to
+    # the exact payload_hash, so this is a second, independent guarantee.
+    | fev_evidence_event_contract.FEASIBILITY_EVIDENCE_EVENT_TYPES
 )
 
 #: Wall-clock / hash fields that may move on an otherwise identical snapshot.
@@ -285,6 +297,7 @@ ACCEPTED_EVENT_TYPES = (
     | PAPER_OUTCOME_EVENT_TYPES
     | PAPER_V2_WRITER_EVENT_TYPES
     | opportunity_persistence_contract.OPPORTUNITY_LIFECYCLE_EVENT_TYPES
+    | fev_evidence_event_contract.FEASIBILITY_EVIDENCE_EVENT_TYPES
 )
 
 
@@ -5005,6 +5018,48 @@ class CanonicalWriter:
         return normalized
 
     @staticmethod
+    def _validate_feasibility_evidence_intent(intent: WriterIntent) -> dict:
+        """Validate one F5 feasibility-evidence record intent at the persistence boundary.
+
+        Enforces LOW priority, no ops handoff, an exact canonical payload, and the
+        deterministic durable identity: the idempotency key, ``event_time``,
+        correlation id and causation id must all match what the validated record
+        itself implies, so a forger cannot decouple the envelope from the record.
+        It must never fall through to the alert-ops validation branch below.
+        """
+        contract = fev_evidence_event_contract
+        if intent.priority != contract.FEASIBILITY_EVIDENCE_PRIORITY:
+            raise ValueError("feasibility evidence events must use LOW priority")
+        if intent.ops_handoff is not None:
+            raise ValueError("feasibility evidence events must not carry ops_handoff")
+        try:
+            normalized = contract.validate_feasibility_evidence_recorded_payload(
+                intent.event_type, intent.payload
+            )
+        except contract.FeasibilityEvidenceEventError as exc:
+            raise ValueError(str(exc)) from exc
+        expected_key = contract.feasibility_evidence_event_idempotency_key(normalized)
+        if intent.idempotency_key != expected_key:
+            raise ValueError(
+                "feasibility evidence idempotency_key does not match its record identity"
+            )
+        if intent.event_time != contract.feasibility_evidence_event_time(normalized):
+            raise ValueError(
+                "feasibility evidence event_time must equal the record evaluation time"
+            )
+        if intent.correlation_id != contract.feasibility_evidence_event_correlation_id(
+            normalized
+        ):
+            raise ValueError(
+                "feasibility evidence correlation_id must be the source snapshot id"
+            )
+        if intent.causation_id != contract.feasibility_evidence_event_causation_id(
+            normalized
+        ):
+            raise ValueError("feasibility evidence causation_id must be None")
+        return normalized
+
+    @staticmethod
     def _validate_alert_ops_intent(intent: WriterIntent) -> None:
         if intent.event_type == _ALERT_CAPTURE_GAP_RECORDED:
             if intent.ops_handoff is not None:
@@ -5068,6 +5123,14 @@ class CanonicalWriter:
             # trusted just because it arrived over IPC, and it must never fall
             # through to the alert-ops validation branch below.
             return self._validate_opportunity_transition_intent(intent)
+        if (
+            intent.event_type
+            in fev_evidence_event_contract.FEASIBILITY_EVIDENCE_EVENT_TYPES
+        ):
+            # The F5 feasibility-evidence trust boundary: a producer payload is
+            # not trusted just because it arrived over IPC, and it must never
+            # fall through to the alert-ops validation branch below.
+            return self._validate_feasibility_evidence_intent(intent)
 
         self._validate_alert_ops_intent(intent)
         return intent.payload
@@ -5095,6 +5158,11 @@ class CanonicalWriter:
             in opportunity_persistence_contract.OPPORTUNITY_LIFECYCLE_EVENT_TYPES
         ):
             return opportunity_persistence_contract.OPPORTUNITY_LIFECYCLE_STREAM
+        if (
+            event_type
+            in fev_evidence_event_contract.FEASIBILITY_EVIDENCE_EVENT_TYPES
+        ):
+            return fev_evidence_event_contract.FEASIBILITY_EVIDENCE_STREAM
         return STREAM_EARLY_WATCH
 
     @staticmethod
@@ -5107,6 +5175,8 @@ class CanonicalWriter:
             and event_type not in PAPER_V2_ALL_EVENT_TYPES
             and event_type
             not in opportunity_persistence_contract.OPPORTUNITY_LIFECYCLE_EVENT_TYPES
+            and event_type
+            not in fev_evidence_event_contract.FEASIBILITY_EVIDENCE_EVENT_TYPES
         )
 
     def _upsert_alert_identity_projection(

@@ -62,6 +62,12 @@ EventType = Literal[
     # the literal is restated here only because the type annotation cannot be
     # computed from that frozenset. LOW priority, no ops handoff.
     "opportunity_lifecycle.transition.recorded",
+    # R4-B2 Slice 3A F5 feasibility-evidence persistence. Owned by the F5
+    # feasibility-evidence event module; the literal is restated here only because
+    # the annotation cannot be computed from that frozenset. It is a separate
+    # LOW-priority evidence class, deliberately NOT part of the feature bus.
+    # LOW priority, no ops handoff, no execution/admission authority.
+    "feasibility.evidence.recorded",
 ]
 OpsOperation = Literal["RECORD", "RELEASE"]
 HandoffStatus = Literal["PENDING", "APPLIED", "SUPERSEDED"]
