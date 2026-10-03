@@ -418,6 +418,8 @@ def test_ac_010_runtime_verifier_precedes_commit_and_rolls_back_to_baseline() ->
     assert "validate_release_scheduler_contract" in deploy
     assert "write_safe_baseline_override" in deploy
     assert 'OPIP_RELEASE_PROFILE: "SAFE_BASELINE"' in deploy
+    assert 'OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD: "0.0"' in deploy
+    assert "'OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD=0.0'" in deploy
     assert 'org.opencontainers.image.revision: "$PREVIOUS_SHA"' in deploy
     assert 'echo "OPIP_SAFE_BASELINE_ROLLBACK=SUCCESS"' in deploy
     assert "--timeout-seconds \"$REMAINING_VERIFY_SECONDS\"" in deploy

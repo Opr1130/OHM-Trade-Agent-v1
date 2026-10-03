@@ -301,6 +301,7 @@ services:
       OPIP_TARGET_SPINE_MODE: "off"
       OPIP_PAPER_V2_MODE: "off"
       OPIP_COMMITTEE_MODE: "off"
+      OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD: "0.0"
     labels:
       org.opencontainers.image.revision: "$PREVIOUS_SHA"
 PROFILE
@@ -314,14 +315,15 @@ validate_safe_baseline_modes() {
     return 1
   }
   actual="$(docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' ohm-trade-agent \
-    | grep -E '^OPIP_(RELEASE_PROFILE|FEATURE_BUS_MODE|CANONICAL_WRITER_MODE|TARGET_SPINE_MODE|PAPER_V2_MODE|COMMITTEE_MODE)=')"
+    | grep -E '^OPIP_(RELEASE_PROFILE|FEATURE_BUS_MODE|CANONICAL_WRITER_MODE|TARGET_SPINE_MODE|PAPER_V2_MODE|COMMITTEE_MODE|FEASIBILITY_CAPTURE_NOTIONAL_USD)=')"
   for expected in \
     'OPIP_RELEASE_PROFILE=SAFE_BASELINE' \
     'OPIP_FEATURE_BUS_MODE=off' \
     'OPIP_CANONICAL_WRITER_MODE=off' \
     'OPIP_TARGET_SPINE_MODE=off' \
     'OPIP_PAPER_V2_MODE=off' \
-    'OPIP_COMMITTEE_MODE=off'; do
+    'OPIP_COMMITTEE_MODE=off' \
+    'OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD=0.0'; do
     grep -Fxq "$expected" <<< "$actual" || {
       echo "SAFE_BASELINE rollback mode is unproven: $expected" >&2
       return 1

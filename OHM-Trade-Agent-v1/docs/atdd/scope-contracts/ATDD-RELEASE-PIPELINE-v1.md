@@ -96,7 +96,7 @@ an owner-approved exact-SHA EVIDENCE_SHADOW deployment
 WHEN:
 the candidate services and scheduler have started
 THEN:
-the host records read-only canonical cursors before deployment, verifies the running container image label and fixed mode literals against the approved SHA, and invokes a read-only verifier bounded to 360 seconds; that verifier requires two fresh consecutive 60-second snapshots created after candidate readiness, at least one matching prospective F5 record whose source cutoff is not later than its evaluation time, HEALTHY read-only protection, and the target spine's inert no-source/no-handoff posture; the host also proves each unified/capture scheduler entry occurs once and retains flock/timeout bounds; any missing or malformed evidence fails before the core commit point and enters the existing rollback transaction
+the host records read-only canonical cursors before deployment, verifies the running container image label and every fixed mode literal (including the fixed feasibility-capture notional) against the approved SHA, and invokes a read-only verifier bounded to 360 seconds; that verifier requires two fresh consecutive 60-second snapshots on an exact 60-second grid created after candidate readiness, at least one matching prospective F5 record whose source cutoff is not later than its evaluation time, HEALTHY read-only protection, and the target spine's inert no-source/no-handoff posture; the host also proves each unified/capture scheduler entry occurs once and retains flock/timeout bounds; any missing or malformed evidence fails before the core commit point and enters the existing rollback transaction
 
 AC-011:
 GIVEN:
@@ -104,7 +104,7 @@ the runtime verifier or a pre-commit deploy assertion fails
 WHEN:
 the existing `ohm-deploy` rollback runs
 THEN:
-it restores the previous code SHA but overlays explicit SAFE_BASELINE literals for Feature Bus, writer, target spine, Paper-v2 and Committee; core, writer and paper topology health must pass and the running core's effective mode literals must be re-read before the host emits `OPIP_SAFE_BASELINE_ROLLBACK=SUCCESS`; otherwise rollback remains unproven and the workflow fails closed; the deployment receipt cannot report runtime success without the exact approved SHA, runtime marker, capture, protection, scheduler and rollback dispositions
+it restores the previous code SHA but overlays explicit SAFE_BASELINE literals for Feature Bus, writer, target spine, Paper-v2 and Committee and sets feasibility-capture notional to `0.0`; core, writer and paper topology health must pass and the running core's effective mode literals must be re-read before the host emits `OPIP_SAFE_BASELINE_ROLLBACK=SUCCESS`; otherwise rollback remains unproven and the workflow fails closed; the deployment receipt cannot report runtime success without the exact approved SHA, runtime marker, capture, protection, scheduler and rollback dispositions
 
 EXPLICITLY OUT OF SCOPE:
 - Activating TARGET_PAPER, Paper-v2, the Committee, or any funded/live/exchange/order authority
@@ -140,8 +140,10 @@ AC-009 -> tests/test_opip_release_pipeline_v1.py::test_ac_009_profile_approval_i
 AC-009 -> tests/test_release_runtime_verifier.py::test_safe_baseline_is_not_a_deploy_candidate
 AC-010 -> tests/test_release_runtime_verifier.py::test_runtime_evidence_requires_consecutive_fresh_snapshots_and_matching_fev
 AC-010 -> tests/test_release_runtime_verifier.py::test_runtime_evidence_rejects_backfill_gaps_and_late_source_cutoffs
+AC-010 -> tests/test_release_runtime_verifier.py::test_runtime_evidence_rejects_non_60_second_snapshot_grid
 AC-010 -> tests/test_release_runtime_verifier.py::test_runtime_evidence_rejects_stale_snapshots_and_unmatched_fev
 AC-010 -> tests/test_release_runtime_verifier.py::test_runtime_evidence_rejects_future_timestamps
+AC-010 -> tests/test_release_runtime_verifier.py::test_runtime_posture_requires_profile_notional
 AC-010 -> tests/test_opip_release_pipeline_v1.py::test_ac_010_runtime_verifier_precedes_commit_and_rolls_back_to_baseline
 AC-010 -> tests/test_opip_release_pipeline_v1.py::test_ac_010_deployment_receipt_requires_runtime_verifier_and_baseline_rollback
 AC-011 -> tests/test_opip_release_pipeline_v1.py::test_ac_011_rollback_success_requires_verified_safe_baseline_modes

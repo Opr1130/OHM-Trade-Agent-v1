@@ -59,15 +59,17 @@ is introduced.
 The host deploy verifies the built core image's revision label, active Compose
 modes, unique bounded scheduler entries, and a successful unified-cycle marker.
 The read-only EVIDENCE_SHADOW runtime verifier is limited to 360 seconds and
-requires two fresh consecutive FeatureSnapshots plus matching prospective F5
-evidence, HEALTHY protection, and an inert no-source/no-handoff target spine. It
+requires two fresh consecutive FeatureSnapshots on an exact 60-second grid plus
+matching prospective F5 evidence, HEALTHY protection, and an inert
+no-source/no-handoff target spine. It
 runs before the deployment commit point; missing, stale, malformed, or late
-evidence invokes the existing rollback transaction. Rollback overlays and rechecks explicit
-SAFE_BASELINE modes before reporting success. The approval-issue receipt reports
-exact-SHA CI, architecture, capture, protection, unified-cycle, scheduler,
-rollback, and verification-time dispositions. A CI candidate alone remains no
-proof of deployment or runtime health; production evidence is only available
-after the owner-gated deployment flow runs. `TARGET_PAPER` remains BLOCKED.
+evidence invokes the existing rollback transaction. Rollback overlays and
+rechecks explicit SAFE_BASELINE modes, including feasibility-capture notional
+`0.0`, before reporting success. The approval-issue receipt reports exact-SHA
+CI, architecture, capture, protection, unified-cycle, scheduler, rollback, and
+verification-time dispositions. A CI candidate alone remains no proof of
+deployment or runtime health; production evidence is only available after the
+owner-gated deployment flow runs. `TARGET_PAPER` remains BLOCKED.
 
 ## Governance
 

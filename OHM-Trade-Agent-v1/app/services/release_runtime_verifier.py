@@ -23,12 +23,14 @@ MAX_WAIT_SECONDS = 360
 POLL_INTERVAL_SECONDS = 10
 MAX_EVIDENCE_AGE = timedelta(seconds=180)
 MAX_FEV_SOURCE_AGE = timedelta(seconds=120)
+REQUIRED_SNAPSHOT_GRID_SECONDS = 60
 REQUIRED_MODES = (
     "OPIP_FEATURE_BUS_MODE",
     "OPIP_CANONICAL_WRITER_MODE",
     "OPIP_TARGET_SPINE_MODE",
     "OPIP_PAPER_V2_MODE",
     "OPIP_COMMITTEE_MODE",
+    "OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD",
 )
 
 
@@ -72,8 +74,9 @@ def _new_evidence_is_valid(
         for older, newer in zip(ordered, ordered[1:]):
             gap = newer.evaluation_cutoff - older.evaluation_cutoff
             if (
-                gap == timedelta(seconds=older.evaluation_grid_seconds)
-                and older.evaluation_grid_seconds == newer.evaluation_grid_seconds
+                gap == timedelta(seconds=REQUIRED_SNAPSHOT_GRID_SECONDS)
+                and older.evaluation_grid_seconds == REQUIRED_SNAPSHOT_GRID_SECONDS
+                and newer.evaluation_grid_seconds == REQUIRED_SNAPSHOT_GRID_SECONDS
             ):
                 cadence_pair = (older, newer)
                 break
