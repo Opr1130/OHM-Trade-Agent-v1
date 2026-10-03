@@ -37,7 +37,7 @@ def _filled(**overrides):
         terminal_status="CLOSED",
         net_pnl=12.5,
         capital_committed=1000.0,
-        lineage_complete=True,
+        lineage_completeness="COMPLETE",
     )
     base.update(overrides)
     return project_forecast_labels(**base)
@@ -169,14 +169,17 @@ def test_ac_024_no_family_token_is_invented() -> None:
 
 @pytest.mark.acceptance
 def test_ac_025_fidelity_is_never_inferred_as_a() -> None:
-    """ATDD-R4-B2-controlled-paper-activation/AC-025: grade A is never inferred; native paper is B and an ambiguous path or incomplete lineage is C."""
+    """ATDD-R4-B2-controlled-paper-activation/AC-025: grade A is never inferred; native paper is B and an ambiguous path or unproven lineage is C."""
     assert _filled().fidelity is ForecastFidelityGrade.B
     assert _filled(exit_reason="OHLC_GAP").fidelity is ForecastFidelityGrade.C
-    assert _filled(lineage_complete=False).fidelity is ForecastFidelityGrade.C
-    # No input combination this projection accepts ever yields grade A.
-    for lineage in (True, False, None):
+    # Only the exact canonical COMPLETE lineage token grades B; an incomplete,
+    # absent or unknown lineage value grades C rather than silently grading B.
+    assert _filled(lineage_completeness="LINEAGE_INCOMPLETE").fidelity is ForecastFidelityGrade.C
+    assert _filled(lineage_completeness=None).fidelity is ForecastFidelityGrade.C
+    assert _filled(lineage_completeness="something-else").fidelity is ForecastFidelityGrade.C
+    for lineage in ("COMPLETE", "LINEAGE_INCOMPLETE", None, "unknown"):
         for reason in ("TARGET_2", "OHLC_GAP"):
-            assert _filled(lineage_complete=lineage, exit_reason=reason).fidelity is not (
+            assert _filled(lineage_completeness=lineage, exit_reason=reason).fidelity is not (
                 ForecastFidelityGrade.A
             )
 
@@ -245,3 +248,8 @@ def test_ac_026_malformed_token_fails_closed_per_record() -> None:
 
     non_string = project_forecast_labels(entry_execution_state=123)
     assert non_string.entry_label_state is ForecastLabelState.UNRESOLVED
+
+    # A terminal status outside the frozen canonical set is not evidence.
+    unknown_status = _filled(terminal_status="OPEN")
+    assert unknown_status.entry_label_state is ForecastLabelState.UNRESOLVED
+    assert unknown_status.population is ForecastEvidencePopulation.UNRESOLVED

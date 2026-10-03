@@ -58,6 +58,7 @@ from app.opip.contracts.forecast import (
     ForecastLabelState,
     PostFillPathOutcome,
 )
+from app.opip.contracts.paper_outcome import LINEAGE_COMPLETE, TERMINAL_STATUSES
 
 #: Semantic version of the frozen prospective F6 label-projection policy.
 FORECAST_LABEL_PROJECTION_VERSION = "forecast-label-projection-v1"
@@ -96,6 +97,7 @@ NON_ADMISSION_DISPOSITIONS: frozenset[str] = frozenset(
         "CAPITAL_REJECTED",
         "NOT_ACTIONABLE",
         "DO_NOT_CHASE",
+        "CANCELLED",
         "UNSUPPORTED",
         "EVIDENCE_INCOMPLETE",
         "DISABLED",
@@ -406,17 +408,20 @@ def _derive_realized_return(
 def _derive_fidelity(
     *,
     path_state: ForecastLabelState,
-    lineage_complete: bool | None,
+    lineage_completeness: str | None,
 ) -> ForecastFidelityGrade:
     """Derive the simulation-fidelity grade, never inferring grade A.
 
     The native paper path is grade B; an ambiguous path or incomplete lineage is
     grade C. Grade A is an exact-replay fidelity that no current canonical record
-    attests, so it is never inferred from absence of a defect.
+    attests, so it is never inferred from absence of a defect. Lineage is proven
+    complete only by the exact canonical ``COMPLETE`` token: any other value,
+    including an absent or unknown one, grades ``C`` rather than silently grading
+    ``B`` for a value the canonical vocabulary does not attest.
     """
     if path_state is ForecastLabelState.INCOMPLETE_COVERAGE:
         return ForecastFidelityGrade.C
-    if lineage_complete is False:
+    if lineage_completeness != LINEAGE_COMPLETE:
         return ForecastFidelityGrade.C
     return ForecastFidelityGrade.B
 
@@ -432,7 +437,7 @@ def project_forecast_labels(
     terminal_status: str | None = None,
     net_pnl: float | None = None,
     capital_committed: float | None = None,
-    lineage_complete: bool | None = None,
+    lineage_completeness: str | None = None,
     exit_timestamp: datetime | str | None = None,
 ) -> ForecastEvidenceLabel:
     """Project committed canonical evidence onto the frozen F6 label contract.
@@ -472,6 +477,23 @@ def project_forecast_labels(
             exit_reason=None,
             entry_execution_state=None,
             reason="|".join(malformed),
+        )
+
+    # A terminal status outside the frozen canonical set is not evidence.
+    if terminal_status is not None and terminal_status not in TERMINAL_STATUSES:
+        return ForecastEvidenceLabel(
+            population=ForecastEvidencePopulation.UNRESOLVED,
+            entry_outcome=None,
+            entry_label_state=ForecastLabelState.UNRESOLVED,
+            post_fill_outcome=None,
+            post_fill_label_state=ForecastLabelState.UNRESOLVED,
+            realized_net_return=None,
+            realized_return_label_state=ForecastLabelState.UNRESOLVED,
+            fidelity=ForecastFidelityGrade.C,
+            label_available_at=None,
+            exit_reason=exit_reason,
+            entry_execution_state=entry_execution_state,
+            reason=f"UNKNOWN_TERMINAL_STATUS:{terminal_status}",
         )
 
     clean_net_pnl = _optional_finite_number(net_pnl)
@@ -515,7 +537,7 @@ def project_forecast_labels(
         capital_committed=clean_capital,
     )
     fidelity = _derive_fidelity(
-        path_state=path_state, lineage_complete=lineage_complete
+        path_state=path_state, lineage_completeness=lineage_completeness
     )
 
     # If the entry itself is unresolved, nothing downstream may be claimed either.
