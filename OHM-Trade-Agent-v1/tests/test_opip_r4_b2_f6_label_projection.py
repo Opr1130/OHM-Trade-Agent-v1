@@ -266,10 +266,34 @@ def test_ac_026_no_favorable_label_without_supporting_evidence() -> None:
     exit_reasons = [None, "TARGET_2", "STOP", "ENTRY_CANDLE_STOP", "TIME_EXIT", "OHLC_GAP", "OPERATOR_OFF", "UNRESOLVED", "NEW_REASON"]
     terminal_statuses = [None, "CLOSED", "CANCELLED", "UNRESOLVED", "OPEN"]
     economics = [(None, None), (12.5, 1000.0), (-5.0, 1000.0), (5.0, 0.0)]
+    triggers = [None, "EMERGENCY"]
+    expected = (
+        len(dispositions)
+        * len(exec_states)
+        * len(quantities)
+        * len(exit_reasons)
+        * len(terminal_statuses)
+        * len(economics)
+        * len(triggers)
+    )
 
     checked = 0
-    for disp, state, (intended, accepted), reason, status, (net, capital) in itertools.product(
-        dispositions, exec_states, quantities, exit_reasons, terminal_statuses, economics
+    for (
+        disp,
+        state,
+        (intended, accepted),
+        reason,
+        status,
+        (net, capital),
+        trigger,
+    ) in itertools.product(
+        dispositions,
+        exec_states,
+        quantities,
+        exit_reasons,
+        terminal_statuses,
+        economics,
+        triggers,
     ):
         label = project_forecast_labels(
             disposition=disp,
@@ -277,6 +301,7 @@ def test_ac_026_no_favorable_label_without_supporting_evidence() -> None:
             intended_quantity=intended,
             accepted_quantity=accepted,
             exit_reason=reason,
+            protection_trigger_type=trigger,
             terminal_status=status,
             net_pnl=net,
             capital_committed=capital,
@@ -291,6 +316,7 @@ def test_ac_026_no_favorable_label_without_supporting_evidence() -> None:
             intended_quantity=intended,
             accepted_quantity=accepted,
             exit_reason=reason,
+            protection_trigger_type=trigger,
             terminal_status=status,
             net_pnl=net,
             capital_committed=capital,
@@ -320,7 +346,8 @@ def test_ac_026_no_favorable_label_without_supporting_evidence() -> None:
         if label.post_fill_outcome is PostFillPathOutcome.TIMEOUT:
             assert reason == "TIME_EXIT"
         if label.post_fill_outcome is PostFillPathOutcome.RISK_EXIT:
-            assert label.post_fill_outcome is PostFillPathOutcome.RISK_EXIT
+            # A risk exit is only ever produced by a real risk trigger.
+            assert trigger == "EMERGENCY"
 
         # A NO_FILL entry never carries a path label.
         if label.entry_outcome is EntryExecutionOutcome.NO_FILL:
@@ -338,4 +365,4 @@ def test_ac_026_no_favorable_label_without_supporting_evidence() -> None:
             assert label.entry_outcome is None
             assert label.post_fill_outcome is None
             assert label.realized_net_return is None
-    assert checked > 1000
+    assert checked == expected == 86_400
