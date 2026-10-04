@@ -423,17 +423,53 @@ validate_release_scheduler_contract() {
   # --- release-scheduler lock verification (end) ----------------------------
 }
 
+#: Bounded grace added to the authorized scheduler hard runtime bound so an
+#: in-flight cycle can finish and one fresh cycle can be observed, covering cron
+#: scheduling jitter (the cycle is scheduled on the one-minute grid). This is
+#: explicit and finite; the wait is never unbounded.
+UNIFIED_CYCLE_RELEASE_GRACE_SECONDS=120
+
+#: The release runtime verifier keeps its OWN independent bounded window. It must
+#: equal `app.services.release_runtime_verifier.MAX_WAIT_SECONDS` (a larger value
+#: is rejected by the verifier); a test asserts the two stay equal.
+RUNTIME_VERIFIER_TIMEOUT_SECONDS=360
+
+#: Extract the authorized unified-cycle hard runtime bound from the installed
+#: scheduler entry (``timeout --signal=TERM --kill-after=Ns <BOUND> ...'').
+#: Returns the bound on stdout, or non-zero when it cannot be determined.
+scheduler_hard_bound_seconds() {
+  local entry="/etc/cron.d/ohm-unified-cycle" value
+  # The path override is honored ONLY under an explicit test marker, so a
+  # production deploy cannot be pointed at an arbitrary entry to extend the wait.
+  if [[ "${OPIP_DEPLOY_TEST_SEAMS:-0}" == "1" && -n "${OPIP_RELEASE_SCHEDULER_ENTRY:-}" ]]; then
+    entry="$OPIP_RELEASE_SCHEDULER_ENTRY"
+  fi
+  [[ -s "$entry" ]] || return 1
+  value="$(grep -m1 -oE 'timeout --signal=TERM --kill-after=[0-9]+s [0-9]+' "$entry" 2>/dev/null \
+    | grep -oE '[0-9]+$' || true)"
+  [[ "$value" =~ ^[0-9]+$ && "$value" -ge 1 ]] || return 1
+  printf '%s' "$value"
+}
+
 wait_unified_cycle_success() {
   local ready_after="$1" deadline="$2"
+  local cycle_log="/var/log/ohm-unified-cycle.log"
+  # The log override is honored ONLY under an explicit test marker, so a
+  # production deploy cannot be pointed at a forged log to fake the success signal.
+  if [[ "${OPIP_DEPLOY_TEST_SEAMS:-0}" == "1" && -n "${OPIP_RELEASE_CYCLE_LOG:-}" ]]; then
+    cycle_log="$OPIP_RELEASE_CYCLE_LOG"
+  fi
   local status completed_at completed_epoch ready_epoch
   ready_epoch="$(date -u -d "$ready_after" +%s)"
   while (( SECONDS < deadline )); do
     status="$(grep -oE 'OPIP_UNIFIED_CYCLE_STATUS=(SUCCESS|DEGRADED)' \
-      /var/log/ohm-unified-cycle.log 2>/dev/null | tail -n 1 | cut -d= -f2 || true)"
+      "$cycle_log" 2>/dev/null | tail -n 1 | cut -d= -f2 || true)"
     completed_at="$(grep -oE 'OPIP_UNIFIED_CYCLE_COMPLETED_AT=[^[:space:]]+' \
-      /var/log/ohm-unified-cycle.log 2>/dev/null | tail -n 1 | cut -d= -f2 || true)"
+      "$cycle_log" 2>/dev/null | tail -n 1 | cut -d= -f2 || true)"
     if [[ -n "$status" && -n "$completed_at" ]]; then
       completed_epoch="$(date -u -d "$completed_at" +%s 2>/dev/null || true)"
+      # A stale pre-readiness completion is not proof: only a cycle that
+      # completed at or after candidate readiness counts.
       if [[ "$completed_epoch" =~ ^[0-9]+$ ]] && (( completed_epoch >= ready_epoch )); then
         [[ "$status" == "SUCCESS" ]] || {
           echo "unified cycle reported DEGRADED after candidate readiness" >&2
@@ -663,20 +699,35 @@ READY_AFTER="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 RELEASE_PROFILE="$(docker compose exec -T ohm-trade-agent \
   python -c 'import os; print(os.environ.get("OPIP_RELEASE_PROFILE", ""))')"
 echo "O'Pip bounded $RELEASE_PROFILE runtime verification started at $READY_AFTER"
-DEPLOY_VERIFY_DEADLINE=$((SECONDS + 360))
-wait_unified_cycle_success "$READY_AFTER" "$DEPLOY_VERIFY_DEADLINE"
-REMAINING_VERIFY_SECONDS=$((DEPLOY_VERIFY_DEADLINE - SECONDS))
-(( REMAINING_VERIFY_SECONDS > 0 )) || {
-  echo "release verifier exhausted its shared 360-second deadline" >&2
+
+# The unified cycle is scheduled by cron with an explicit hard runtime bound
+# (`timeout --signal=TERM --kill-after=30s <BOUND> ... app.jobs.run_cycle`). A
+# healthy cycle may legitimately consume that whole window, so the release wait
+# must be aligned with it (never an arbitrary shorter value, or a slow-but-healthy
+# cycle is falsely rejected). The bound is DERIVED from the installed scheduler
+# entry, not hardcoded; failure to derive it fails closed.
+SCHEDULER_HARD_BOUND_SECONDS="$(scheduler_hard_bound_seconds || true)"
+[[ "$SCHEDULER_HARD_BOUND_SECONDS" =~ ^[0-9]+$ && "$SCHEDULER_HARD_BOUND_SECONDS" -ge 1 ]] || {
+  echo "cannot determine the authorized scheduler hard runtime bound" >&2
   false
 }
-timeout --signal=TERM --kill-after=5s "$((REMAINING_VERIFY_SECONDS + 10))" \
+UNIFIED_CYCLE_RELEASE_WAIT_SECONDS=$((SCHEDULER_HARD_BOUND_SECONDS + UNIFIED_CYCLE_RELEASE_GRACE_SECONDS))
+echo "OPIP_SCHEDULER_HARD_BOUND_SECONDS=$SCHEDULER_HARD_BOUND_SECONDS"
+echo "OPIP_UNIFIED_CYCLE_WAIT_SECONDS=$UNIFIED_CYCLE_RELEASE_WAIT_SECONDS"
+echo "OPIP_RUNTIME_VERIFY_BUDGET_SECONDS=$RUNTIME_VERIFIER_TIMEOUT_SECONDS"
+
+wait_unified_cycle_success "$READY_AFTER" "$((SECONDS + UNIFIED_CYCLE_RELEASE_WAIT_SECONDS))"
+
+# The runtime verifier is given its own independent bounded window (it never
+# inherits only the leftover of the cycle wait), so a cycle completing near the
+# end of its window cannot starve the verifier.
+timeout --signal=TERM --kill-after=5s "$((RUNTIME_VERIFIER_TIMEOUT_SECONDS + 10))" \
   docker compose exec -T ohm-trade-agent \
   python -m app.services.release_runtime_verifier \
     --expected-sha "$TARGET_SHA" \
     --baseline-json "$RELEASE_EVIDENCE_BASELINE" \
     --ready-after "$READY_AFTER" \
-    --timeout-seconds "$REMAINING_VERIFY_SECONDS"
+    --timeout-seconds "$RUNTIME_VERIFIER_TIMEOUT_SECONDS"
 
 # All rollback-sensitive validation is complete. Make the exact SHA
 # authoritative before the owner-authorized irreversible P1 retirement so a
