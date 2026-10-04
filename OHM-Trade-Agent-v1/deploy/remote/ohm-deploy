@@ -287,6 +287,33 @@ cleanup_snapshot() {
   rm -f "$SAFE_BASELINE_OVERRIDE"
 }
 
+#: Fail-closed abort disposal: PRESERVE the pre-deploy scheduler transaction
+#: instead of deleting it. The snapshot is the only durable copy of the
+#: pre-deploy cron.d entries, the root crontab and the installed remote-op
+#: scripts, including any emergency containment that is newer than the previous
+#: revision, so it is MOVED out of the `scheduler-before.*` namespace rather than
+#: destroyed: leaving a transaction directory behind would break the
+#: deploy-controller bootstrap's exactly-one-transaction proof on the next
+#: deploy. The SAFE_BASELINE override is dropped because no rollback was applied,
+#: and ownership of `SCHEDULER_SNAPSHOT` is cleared so nothing later restores
+#: from a directory that is no longer there.
+preserve_scheduler_snapshot_on_abort() {
+  local preserved=""
+  if [[ -n "${SCHEDULER_SNAPSHOT:-}" && -d "$SCHEDULER_SNAPSHOT" && ! -L "$SCHEDULER_SNAPSHOT" ]]; then
+    preserved="$STATE_DIR/scheduler-recovery.${SCHEDULER_SNAPSHOT##*/}"
+    if [[ -e "$preserved" ]]; then
+      preserved="$preserved.$$"
+    fi
+    if mv -- "$SCHEDULER_SNAPSHOT" "$preserved"; then
+      SCHEDULER_SNAPSHOT=""
+    else
+      preserved="$SCHEDULER_SNAPSHOT"
+    fi
+  fi
+  echo "OPIP_ROLLBACK_SCHEDULER_SNAPSHOT_PRESERVED=$preserved"
+  rm -f "$SAFE_BASELINE_OVERRIDE"
+}
+
 write_safe_baseline_override() {
   [[ "$PREVIOUS_SHA" =~ ^[0-9a-f]{40}$ ]] || {
     echo "SAFE_BASELINE rollback SHA is malformed" >&2
@@ -914,9 +941,11 @@ rollback() {
     echo "OPIP_SAFE_BASELINE_ROLLBACK=UNPROVEN" >&2
     # The candidate producer schedule was removed and is deliberately NOT
     # restored: re-arming producers whose quiescence is unproven is the exact
-    # race this barrier exists to prevent. Only transaction state is cleaned up
-    # so a later operator-driven deploy starts from a clean scheduler snapshot.
-    cleanup_snapshot
+    # race this barrier exists to prevent. The pre-deploy scheduler transaction is
+    # PRESERVED, never deleted: it is the only durable copy of the pre-deploy
+    # cron.d entries, root crontab and installed remote-op scripts, so a later
+    # operator-driven recovery is still possible from a fail-closed abort.
+    preserve_scheduler_snapshot_on_abort
     exit "$rc"
   fi
 

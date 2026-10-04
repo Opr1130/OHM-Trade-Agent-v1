@@ -780,6 +780,7 @@ def _rollback_harness(tmp: Path, quiescence_rc: int) -> subprocess.CompletedProc
         'git() { echo "git $*" >>"$LOG"; return 0; }\n'
         'stop_paper_stack() { echo "stop_paper_stack" >>"$LOG"; }\n'
         'cleanup_snapshot() { echo "cleanup_snapshot" >>"$LOG"; }\n'
+        'preserve_scheduler_snapshot_on_abort() { echo "preserve_scheduler_snapshot_on_abort" >>"$LOG"; }\n'
         'restore_scheduler_state() { echo "restore_scheduler_state" >>"$LOG"; }\n'
         'release_evidence_producer_locks() { echo "release_evidence_producer_locks" >>"$LOG"; }\n'
         'write_safe_baseline_override() { echo "write_safe_baseline_override" >>"$LOG"; }\n'
@@ -1107,6 +1108,10 @@ def test_ac_015_quiescence_survivor_after_sigkill_is_fail_closed(tmp_path):
     assert "wait_writer_health" not in calls
     assert "restore_scheduler_state" not in calls
     assert "release_evidence_producer_locks" not in calls
+    # The abort must not destroy the pre-deploy scheduler transaction; it is
+    # preserved as durable operator recovery evidence instead.
+    assert "cleanup_snapshot" not in calls
+    assert "preserve_scheduler_snapshot_on_abort" in calls
     assert "OPIP_SAFE_BASELINE_ROLLBACK=SUCCESS" not in (harness.stdout + harness.stderr)
     assert "OPIP_SAFE_BASELINE_ROLLBACK=UNPROVEN" in harness.stderr
     assert "OPIP_ROLLBACK_ABORTED=PRODUCER_QUIESCENCE_UNPROVEN" in harness.stderr
@@ -1148,6 +1153,8 @@ def test_ac_015_quiescence_exec_failure_is_fail_closed(tmp_path):
     assert "git reset" not in calls
     assert "opip-canonical-writer" not in calls
     assert "release_evidence_producer_locks" not in calls
+    assert "cleanup_snapshot" not in calls
+    assert "preserve_scheduler_snapshot_on_abort" in calls
     assert "OPIP_SAFE_BASELINE_ROLLBACK=SUCCESS" not in (harness.stdout + harness.stderr)
     assert "OPIP_ROLLBACK_ABORTED=PRODUCER_QUIESCENCE_UNPROVEN" in harness.stderr
 
@@ -1235,6 +1242,78 @@ def test_ac_015_clean_quiescence_holds_locks_until_scheduler_restore_then_succee
         "release_evidence_producer_locks"
     )
     assert "OPIP_SAFE_BASELINE_ROLLBACK=SUCCESS" in harness.stdout
+
+
+def test_ac_015_quiescence_abort_preserves_the_scheduler_snapshot(tmp_path):
+    """ATDD-RELEASE-PIPELINE-v1/AC-015: a fail-closed quiescence abort must not delete the pre-deploy scheduler transaction. The snapshot is the only durable copy of the pre-deploy cron.d entries, root crontab and installed remote-op scripts, so it is preserved under a name that cannot break the deploy-controller bootstrap's exactly-one-transaction proof."""
+    block = _rollback_block()
+
+    # The abort branch never calls the destructive cleanup; it preserves.
+    abort = block[
+        block.index("if ! quiesce_evidence_producers") : block.index(
+            '  "${GIT[@]}" checkout -f main'
+        )
+    ]
+    assert "cleanup_snapshot" not in abort
+    assert "preserve_scheduler_snapshot_on_abort" in abort
+
+    fn = _function_block(
+        "preserve_scheduler_snapshot_on_abort", "write_safe_baseline_override"
+    )
+    assert "OPIP_ROLLBACK_SCHEDULER_SNAPSHOT_PRESERVED" in fn
+    # A preserved copy lives outside the transaction namespace that the
+    # deploy-controller bootstrap counts, and nothing is deleted.
+    assert "scheduler-recovery." in fn
+    assert "rm -rf" not in fn
+    # The override is dropped: no rollback was applied.
+    assert 'rm -f "$SAFE_BASELINE_OVERRIDE"' in fn
+
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is not available in this environment")
+
+    state = tmp_path / "state"
+    state.mkdir()
+    snapshot = state / "scheduler-before.A1B2C3"
+    snapshot.mkdir()
+    (snapshot / "ohm-unified-cycle").write_text("MAILTO=opip\n", encoding="utf-8")
+    (snapshot / "root.crontab.present").write_text("", encoding="utf-8")
+    override = tmp_path / "safe-baseline-rollback.override.yml"
+    override.write_text("services: {}\n", encoding="utf-8")
+
+    script = (
+        "set -uo pipefail\n"
+        f"STATE_DIR={shlex.quote(state.as_posix())}\n"
+        f"SCHEDULER_SNAPSHOT={shlex.quote(snapshot.as_posix())}\n"
+        f"SAFE_BASELINE_OVERRIDE={shlex.quote(override.as_posix())}\n"
+        f"{fn}\n"
+        "preserve_scheduler_snapshot_on_abort\n"
+    )
+    proc = _run_bash_script(script, str(tmp_path), name="preserve.sh", timeout=60)
+    if _is_fork_failure(proc):
+        pytest.skip("bash cannot fork reliably in this environment")
+
+    assert proc.returncode == 0, proc.stderr
+    # The transaction is gone from the namespace the bootstrap proof counts,
+    # but its content survives intact elsewhere.
+    assert not snapshot.exists()
+    assert list(state.glob("scheduler-before.*")) == []
+    preserved = list(state.glob("scheduler-recovery.*"))
+    assert len(preserved) == 1, proc.stdout
+    assert (preserved[0] / "ohm-unified-cycle").read_text(
+        encoding="utf-8"
+    ) == "MAILTO=opip\n"
+    assert (preserved[0] / "root.crontab.present").is_file()
+    markers = [
+        line
+        for line in proc.stdout.splitlines()
+        if line.startswith("OPIP_ROLLBACK_SCHEDULER_SNAPSHOT_PRESERVED=")
+    ]
+    assert len(markers) == 1, proc.stdout
+    assert markers[0].split("=", 1)[1].endswith(
+        f"scheduler-recovery.{snapshot.name}"
+    )
+    assert not override.exists()
 
 
 @pytest.mark.parametrize(
