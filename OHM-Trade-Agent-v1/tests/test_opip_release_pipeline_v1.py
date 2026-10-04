@@ -422,8 +422,8 @@ def test_ac_010_runtime_verifier_precedes_commit_and_rolls_back_to_baseline() ->
     assert "'OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD=0.0'" in deploy
     assert 'org.opencontainers.image.revision: "$PREVIOUS_SHA"' in deploy
     assert 'echo "OPIP_SAFE_BASELINE_ROLLBACK=SUCCESS"' in deploy
-    assert "--timeout-seconds \"$REMAINING_VERIFY_SECONDS\"" in deploy
-    assert "DEPLOY_VERIFY_DEADLINE=$((SECONDS + 360))" in deploy
+    assert "--timeout-seconds \"$RUNTIME_VERIFIER_TIMEOUT_SECONDS\"" in deploy
+    assert "UNIFIED_CYCLE_RELEASE_WAIT_SECONDS=$((SCHEDULER_HARD_BOUND_SECONDS + UNIFIED_CYCLE_RELEASE_GRACE_SECONDS))" in deploy
     assert "wait_unified_cycle_success" in deploy
     cycle = (APP_ROOT / "app" / "jobs" / "run_cycle.py").read_text(encoding="utf-8")
     assert "OPIP_UNIFIED_CYCLE_STATUS=" in cycle

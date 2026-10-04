@@ -114,6 +114,14 @@ the scheduler lock invariant is verified
 THEN:
 the verification checks the REAL invariant rather than a stale symbol name: the shared in-container process-level advisory lock implementation (`class CaptureProcessLock`, `run_capture_locked`) is present and BOTH producers use the locked capture entrypoint; each producer's lock identity is a genuine path assignment; the Feature Bus identity (`FEATURE_BUS_CAPTURE_LOCK_PATH`, with `DEFAULT_PROCESS_LOCK_PATH` retained as a same-value backwards-compatible alias) is DISTINCT from the feasibility identity (`FEASIBILITY_CAPTURE_LOCK_PATH`); and the host cron locks remain unique and bounded (one `flock -n` entry per producer on its own `/var/run` lock, no duplicate command in root crontab); the check is explicit and diagnostic (each failure names the missing guard or the shared identity on stderr and returns non-zero) rather than a silent `grep -Fq` that aborts the release, and the identity extraction itself cannot abort silently (a no-match is captured and reported as a diagnostic); it emits `OPIP_RELEASE_SCHEDULER=UNIQUE_BOUNDED` on success; an adversarial test runs the actual verification logic against the real producer sources and proves it fails closed when the process-lock guard is removed, when the lock identity is undefined, and when the two producers share an identity; and the change alters no release profile, mode, capture authorization, notional, or trading/paper/funded/Committee authority
 
+AC-013:
+GIVEN:
+the deploy-time runtime verification that waits for a fresh healthy unified cycle and then runs the release runtime verifier
+WHEN:
+the two verification stages are budgeted and exercised
+THEN:
+the unified-cycle wait and the runtime verifier have SEPARATE, independently named budgets (no single shared deadline, and the verifier never receives only the leftover of the cycle wait); the cycle wait budget is DERIVED from the authorized unified-cycle hard runtime bound declared in the installed scheduler entry (`timeout --signal=TERM --kill-after=Ns <BOUND> ... app.jobs.run_cycle`) plus a bounded, documented grace covering an in-flight cycle and one fresh cycle plus cron scheduling jitter, and failure to derive the bound fails closed rather than using an arbitrary value; the runtime verifier keeps its own bounded window equal to `app.services.release_runtime_verifier.MAX_WAIT_SECONDS`; success semantics are unchanged and strict (only a cycle whose completion time is at or after candidate readiness counts; a fresh completion must be `SUCCESS`; a fresh `DEGRADED` fails immediately; a stale pre-readiness completion never passes; no fresh completion within the bounded window fails); it emits the machine-readable markers `OPIP_UNIFIED_CYCLE_WAIT_SECONDS`, `OPIP_RUNTIME_VERIFY_BUDGET_SECONDS` (and the existing `OPIP_UNIFIED_CYCLE=HEALTHY` / `OPIP_UNIFIED_CYCLE_COMPLETED_AT` on success); it launches no second cycle or scheduler and mutates no protection semantics; and adversarial tests prove a healthy cycle completing beyond the former 360-second window is not falsely rejected, that `DEGRADED`, stale success and no-completion all fail, and that the scheduler hard-bound derivation fails closed when it cannot be determined
+
 EXPLICITLY OUT OF SCOPE:
 - Activating TARGET_PAPER, Paper-v2, the Committee, or any funded/live/exchange/order authority
 - Deleting, rewriting or rescoping the historical ATDD increments that recorded the Feature Bus `off`
@@ -147,6 +155,16 @@ AC-007 -> tests/test_opip_release_pipeline_v1.py::test_ac_007_read_only_canonica
 AC-012 -> tests/test_release_scheduler_lock_verifier.py::test_ac_012_verifier_checks_the_real_lock_invariant
 AC-012 -> tests/test_release_scheduler_lock_verifier.py::test_ac_012_feature_bus_lock_identity_is_present_and_distinct
 AC-012 -> tests/test_release_scheduler_lock_verifier.py::test_ac_012_verifier_accepts_the_real_producers_and_fails_on_weakening
+AC-013 -> tests/test_opip_deploy_verify_budget_v1.py::test_ac_013_cycle_wait_and_verifier_budgets_are_separated
+AC-013 -> tests/test_opip_deploy_verify_budget_v1.py::test_ac_013_verifier_budget_matches_the_app_max
+AC-013 -> tests/test_opip_deploy_verify_budget_v1.py::test_ac_013_wait_budget_aligns_with_the_scheduler_hard_bound
+AC-013 -> tests/test_opip_deploy_verify_budget_v1.py::test_ac_013_no_second_scheduler_or_cycle_is_launched
+AC-013 -> tests/test_opip_deploy_verify_budget_v1.py::test_ac_013_functional_accepts_a_fresh_success
+AC-013 -> tests/test_opip_deploy_verify_budget_v1.py::test_ac_013_functional_accepts_a_cycle_that_exceeded_the_old_window
+AC-013 -> tests/test_opip_deploy_verify_budget_v1.py::test_ac_013_functional_rejects_degraded_immediately
+AC-013 -> tests/test_opip_deploy_verify_budget_v1.py::test_ac_013_functional_rejects_a_stale_pre_readiness_success
+AC-013 -> tests/test_opip_deploy_verify_budget_v1.py::test_ac_013_functional_rejects_no_completion_within_the_window
+AC-013 -> tests/test_opip_deploy_verify_budget_v1.py::test_ac_013_scheduler_bound_is_derived_and_fails_closed
 AC-008 -> tests/test_opip_release_pipeline_v1.py::test_ac_008_ci_gate_and_main_candidate_are_non_deploying
 AC-009 -> tests/test_opip_release_pipeline_v1.py::test_ac_009_profile_approval_is_owner_only_exact_sha_and_gated
 AC-009 -> tests/test_release_runtime_verifier.py::test_safe_baseline_is_not_a_deploy_candidate
@@ -229,6 +247,9 @@ AC-012 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
 AC-012 -> OHM-Trade-Agent-v1/app/jobs/capture_feature_bus_shadow.py
 AC-012 -> OHM-Trade-Agent-v1/tests/test_release_scheduler_lock_verifier.py
 AC-012 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
+AC-013 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
+AC-013 -> OHM-Trade-Agent-v1/tests/test_opip_deploy_verify_budget_v1.py
+AC-013 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
 
 DEFERRED DISCOVERIES:
 - `TARGET_PAPER` remains BLOCKED. Activating it (Paper-v2) requires the ATDD-R4-B2 AC-011 comparator evidence, F11 protection READY, legacy drain READY and explicit OWNER approval, and is a separate OWNER increment; this contract does not authorize it.
