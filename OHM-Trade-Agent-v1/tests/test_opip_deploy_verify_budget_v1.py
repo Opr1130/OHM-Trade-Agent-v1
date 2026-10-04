@@ -50,7 +50,7 @@ def _bash() -> str | None:
 def _is_fork_failure(proc: subprocess.CompletedProcess) -> bool:
     stderr = proc.stderr or ""
     return (
-        proc.returncode == 254
+        proc.returncode in (254, 3221225794)
         or "fork:" in stderr
         or "dofork" in stderr
         or "Resource temporarily unavailable" in stderr
@@ -145,6 +145,7 @@ def _run_wait(ready_after: str, deadline_seconds: int, log_body: str) -> subproc
         tmp_log.write_text(log_body, encoding="utf-8")
         script = (
             "set -Eeuo pipefail\n"
+            "export OPIP_DEPLOY_TEST_SEAMS=1\n"
             f"export OPIP_RELEASE_CYCLE_LOG='{tmp_log.as_posix()}'\n"
             f"{fn}\n"
             f'wait_unified_cycle_success "{ready_after}" "$((SECONDS + {deadline_seconds}))"\n'
@@ -219,6 +220,20 @@ def test_ac_013_functional_rejects_no_completion_within_the_window() -> None:
 
 
 @pytest.mark.acceptance
+def test_ac_013_test_seams_are_gated_by_an_explicit_marker() -> None:
+    """ATDD-RELEASE-PIPELINE-v1/AC-013: the log/entry test seams are inert in production (honored only under an explicit test marker), so a forged log cannot fake the success signal."""
+    deploy = _deploy()
+    # Both overrides are guarded by the marker, so production cannot be pointed
+    # at a forged cycle log or an arbitrary scheduler entry.
+    assert deploy.count('"${OPIP_DEPLOY_TEST_SEAMS:-0}" == "1"') >= 2
+    assert 'cycle_log="$OPIP_RELEASE_CYCLE_LOG"' in deploy
+    assert 'entry="$OPIP_RELEASE_SCHEDULER_ENTRY"' in deploy
+    # The production defaults remain the real paths.
+    assert 'local cycle_log="/var/log/ohm-unified-cycle.log"' in deploy
+    assert 'local entry="/etc/cron.d/ohm-unified-cycle"' in deploy
+
+
+@pytest.mark.acceptance
 def test_ac_013_scheduler_bound_is_derived_and_fails_closed() -> None:
     """ATDD-RELEASE-PIPELINE-v1/AC-013: scheduler_hard_bound_seconds derives the bound from the entry and fails closed when it cannot."""
     bash = _bash()
@@ -236,6 +251,7 @@ def test_ac_013_scheduler_bound_is_derived_and_fails_closed() -> None:
         bad.write_text("no bound here\n", encoding="utf-8")
         script = (
             "set -Eeuo pipefail\n"
+            "export OPIP_DEPLOY_TEST_SEAMS=1\n"
             f"{fn}\n"
             f"echo \"$(OPIP_RELEASE_SCHEDULER_ENTRY='{good.as_posix()}' scheduler_hard_bound_seconds)\"\n"
             f"if OPIP_RELEASE_SCHEDULER_ENTRY='{bad.as_posix()}' scheduler_hard_bound_seconds; then echo UNEXPECTED; exit 9; else echo CLOSED; fi\n"

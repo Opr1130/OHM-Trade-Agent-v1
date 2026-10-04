@@ -438,7 +438,12 @@ RUNTIME_VERIFIER_TIMEOUT_SECONDS=360
 #: scheduler entry (``timeout --signal=TERM --kill-after=Ns <BOUND> ...'').
 #: Returns the bound on stdout, or non-zero when it cannot be determined.
 scheduler_hard_bound_seconds() {
-  local entry="${OPIP_RELEASE_SCHEDULER_ENTRY:-/etc/cron.d/ohm-unified-cycle}" value
+  local entry="/etc/cron.d/ohm-unified-cycle" value
+  # The path override is honored ONLY under an explicit test marker, so a
+  # production deploy cannot be pointed at an arbitrary entry to extend the wait.
+  if [[ "${OPIP_DEPLOY_TEST_SEAMS:-0}" == "1" && -n "${OPIP_RELEASE_SCHEDULER_ENTRY:-}" ]]; then
+    entry="$OPIP_RELEASE_SCHEDULER_ENTRY"
+  fi
   [[ -s "$entry" ]] || return 1
   value="$(grep -m1 -oE 'timeout --signal=TERM --kill-after=[0-9]+s [0-9]+' "$entry" 2>/dev/null \
     | grep -oE '[0-9]+$' || true)"
@@ -448,7 +453,12 @@ scheduler_hard_bound_seconds() {
 
 wait_unified_cycle_success() {
   local ready_after="$1" deadline="$2"
-  local cycle_log="${OPIP_RELEASE_CYCLE_LOG:-/var/log/ohm-unified-cycle.log}"
+  local cycle_log="/var/log/ohm-unified-cycle.log"
+  # The log override is honored ONLY under an explicit test marker, so a
+  # production deploy cannot be pointed at a forged log to fake the success signal.
+  if [[ "${OPIP_DEPLOY_TEST_SEAMS:-0}" == "1" && -n "${OPIP_RELEASE_CYCLE_LOG:-}" ]]; then
+    cycle_log="$OPIP_RELEASE_CYCLE_LOG"
+  fi
   local status completed_at completed_epoch ready_epoch
   ready_epoch="$(date -u -d "$ready_after" +%s)"
   while (( SECONDS < deadline )); do
