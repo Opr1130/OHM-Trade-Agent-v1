@@ -122,6 +122,14 @@ the two verification stages are budgeted and exercised
 THEN:
 the unified-cycle wait and the runtime verifier have SEPARATE, independently named budgets (no single shared deadline, and the verifier never receives only the leftover of the cycle wait); the cycle wait budget is DERIVED from the authorized unified-cycle hard runtime bound declared in the installed scheduler entry (`timeout --signal=TERM --kill-after=Ns <BOUND> ... app.jobs.run_cycle`) plus a bounded, documented grace covering an in-flight cycle and one fresh cycle plus cron scheduling jitter, and failure to derive the bound fails closed rather than using an arbitrary value; the runtime verifier keeps its own bounded window equal to `app.services.release_runtime_verifier.MAX_WAIT_SECONDS`; success semantics are unchanged and strict (only a cycle whose completion time is at or after candidate readiness counts; a fresh completion must be `SUCCESS`; a fresh `DEGRADED` fails immediately; a stale pre-readiness completion never passes; no fresh completion within the bounded window fails); it emits the machine-readable markers `OPIP_UNIFIED_CYCLE_WAIT_SECONDS`, `OPIP_RUNTIME_VERIFY_BUDGET_SECONDS` (and the existing `OPIP_UNIFIED_CYCLE=HEALTHY` / `OPIP_UNIFIED_CYCLE_COMPLETED_AT` on success); it launches no second cycle or scheduler and mutates no protection semantics; and adversarial tests prove a healthy cycle completing beyond the former 360-second window is not falsely rejected, that `DEGRADED`, stale success and no-completion all fail, and that the scheduler hard-bound derivation fails closed when it cannot be determined; the log/entry test seams are inert in production (honored only under an explicit `OPIP_DEPLOY_TEST_SEAMS=1` marker) so a forged log or an arbitrary scheduler entry cannot fake the success signal or extend the wait
 
+AC-014:
+GIVEN:
+an in-flight production deploy whose controller has already snapshotted `/usr/local/sbin/ohm-deploy` into exactly one `/var/lib/ohm-deploy/scheduler-before.*` transaction and then checked out the target SHA
+WHEN:
+that target SHA's `deploy/remote/reconcile-scheduler.sh` runs, before it alters the transaction snapshot
+THEN:
+it proves the repository HEAD is a 40-character SHA, proves `deploy/remote/ohm-deploy` is a non-empty regular file, passes `bash -n` on that target controller, requires exactly one real `scheduler-before.*` directory, requires that snapshot's `remote-op-ohm-deploy.present` marker and a non-empty regular snapshot controller, and compares the snapshot controller to the target; when they differ it atomically replaces only `scheduler-before.*/remote-op-ohm-deploy` with the target controller at mode `0755` (so a later rollback can execute it) and emits `OPIP_DEPLOY_CONTROLLER_BOOTSTRAP=ARMED` plus `OPIP_DEPLOY_CONTROLLER_BOOTSTRAP_SHA=<target SHA>`; when they already match it emits `OPIP_DEPLOY_CONTROLLER_BOOTSTRAP=NOT_NEEDED` and does not rewrite the snapshot; zero snapshot directories, multiple snapshot directories, a missing present marker, a non-regular or empty snapshot controller, a non-regular target, a `bash -n` failure, or a HEAD that is not a 40-character SHA fail closed without replacing the snapshot; the SSH gateway, learning reader, learning diagnostics, cron snapshots, root crontab snapshot, `last-good-sha`, and SAFE_BASELINE application rollback are not modified; a reconcile with no `scheduler-before.*` entry (initial host bootstrap) does not invent a snapshot and does not fail; path overrides are inert unless `OPIP_DEPLOY_TEST_SEAMS=1`; Paper-v2 stays `off`, legacy remains the sole new-entry authority, funded/live authority stays absent, Committee stays `off`, and `TARGET_PAPER` stays blocked
+
 EXPLICITLY OUT OF SCOPE:
 - Activating TARGET_PAPER, Paper-v2, the Committee, or any funded/live/exchange/order authority
 - Deleting, rewriting or rescoping the historical ATDD increments that recorded the Feature Bus `off`
@@ -166,6 +174,17 @@ AC-013 -> tests/test_opip_deploy_verify_budget_v1.py::test_ac_013_functional_rej
 AC-013 -> tests/test_opip_deploy_verify_budget_v1.py::test_ac_013_functional_rejects_no_completion_within_the_window
 AC-013 -> tests/test_opip_deploy_verify_budget_v1.py::test_ac_013_scheduler_bound_is_derived_and_fails_closed
 AC-013 -> tests/test_opip_deploy_verify_budget_v1.py::test_ac_013_test_seams_are_gated_by_an_explicit_marker
+AC-014 -> tests/test_opip_deploy_controller_bootstrap.py::test_ac_014_changed_controller_updates_only_the_deploy_snapshot
+AC-014 -> tests/test_opip_deploy_controller_bootstrap.py::test_ac_014_identical_controller_is_idempotent
+AC-014 -> tests/test_opip_deploy_controller_bootstrap.py::test_ac_014_zero_snapshots_fail_closed
+AC-014 -> tests/test_opip_deploy_controller_bootstrap.py::test_ac_014_multiple_snapshots_fail_closed
+AC-014 -> tests/test_opip_deploy_controller_bootstrap.py::test_ac_014_non_regular_snapshot_fails_closed
+AC-014 -> tests/test_opip_deploy_controller_bootstrap.py::test_ac_014_missing_present_marker_fails_closed
+AC-014 -> tests/test_opip_deploy_controller_bootstrap.py::test_ac_014_bash_invalid_target_fails_closed
+AC-014 -> tests/test_opip_deploy_controller_bootstrap.py::test_ac_014_malformed_head_fails_closed
+AC-014 -> tests/test_opip_deploy_controller_bootstrap.py::test_ac_014_no_transaction_reconcile_does_not_invent_a_snapshot
+AC-014 -> tests/test_opip_deploy_controller_bootstrap.py::test_ac_014_test_seams_are_inert_without_the_marker
+AC-014 -> tests/test_opip_deploy_controller_bootstrap.py::test_ac_014_safe_baseline_rollback_and_authority_remain_unchanged
 AC-008 -> tests/test_opip_release_pipeline_v1.py::test_ac_008_ci_gate_and_main_candidate_are_non_deploying
 AC-009 -> tests/test_opip_release_pipeline_v1.py::test_ac_009_profile_approval_is_owner_only_exact_sha_and_gated
 AC-009 -> tests/test_release_runtime_verifier.py::test_safe_baseline_is_not_a_deploy_candidate
@@ -251,6 +270,9 @@ AC-012 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.
 AC-013 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
 AC-013 -> OHM-Trade-Agent-v1/tests/test_opip_deploy_verify_budget_v1.py
 AC-013 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
+AC-014 -> OHM-Trade-Agent-v1/deploy/remote/reconcile-scheduler.sh
+AC-014 -> OHM-Trade-Agent-v1/tests/test_opip_deploy_controller_bootstrap.py
+AC-014 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
 
 DEFERRED DISCOVERIES:
 - `TARGET_PAPER` remains BLOCKED. Activating it (Paper-v2) requires the ATDD-R4-B2 AC-011 comparator evidence, F11 protection READY, legacy drain READY and explicit OWNER approval, and is a separate OWNER increment; this contract does not authorize it.
