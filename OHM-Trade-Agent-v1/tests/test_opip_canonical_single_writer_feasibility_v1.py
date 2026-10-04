@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -713,6 +714,112 @@ def _rollback_block() -> str:
     return text[start:end]
 
 
+def _quiescence_helpers() -> str:
+    """The complete AC-015 rollback producer-quiescence implementation.
+
+    Release, launch-lock acquisition, the in-container process proof, and the
+    composing barrier are extracted together so the adversarial tests exercise the
+    real descriptor/lock mechanics rather than a paraphrase.
+    """
+    text = _deploy()
+    start = text.index("release_evidence_producer_locks() {")
+    end = text.index("writer_health_diagnostics() {", start)
+    return text[start:end].rstrip()
+
+
+def _quiescence_header(workdir: str, wait_seconds: int = 5) -> str:
+    """Deterministic globals for driving the quiescence functions in isolation.
+
+    Lock identities are relative to ``workdir`` so the tests never touch the real
+    ``/var/run`` producer locks.
+    """
+    return (
+        "set -Eeuo pipefail\n"
+        f"cd {shlex.quote(Path(workdir).as_posix())}\n"
+        "EVIDENCE_PRODUCER_CRON_ENTRIES=(opip-feature-bus-capture opip-feasibility-evidence-capture)\n"
+        "EVIDENCE_PRODUCER_QUIESCE_SECONDS=60\n"
+        "EVIDENCE_PRODUCER_HOST_LOCKS=(opip-feature-bus-capture.lock opip-feasibility-capture.lock)\n"
+        f"EVIDENCE_PRODUCER_LOCK_WAIT_SECONDS={wait_seconds}\n"
+        'EVIDENCE_PRODUCER_QUIESCENCE_REASON=""\n'
+        'EVIDENCE_PRODUCER_PROCESS_STATE=""\n'
+        "EVIDENCE_PRODUCER_LOCK_FDS=()\n"
+    )
+
+
+#: A zero-producer, container-present `docker`/`timeout` seam: `ps` returns a
+#: container id and the bounded exec reports no matching producer processes.
+_ZERO_PRODUCER_SEAM = (
+    'docker() { if [[ "${1:-}" == "compose" && "${2:-}" == "ps" ]]; then echo "cid-1"; return 0; fi; return 0; }\n'
+    "timeout() {\n"
+    '  echo "OPIP_EVIDENCE_PRODUCER_PROCESSES_SIGNALLED=0"\n'
+    '  echo "OPIP_EVIDENCE_PRODUCER_PROCESSES_REMAINING=0"\n'
+    '  echo "OPIP_EVIDENCE_PRODUCER_PROCESS_QUIESCENCE=QUIESCED"\n'
+    "  return 0\n"
+    "}\n"
+)
+
+
+def _rollback_harness(tmp: Path, quiescence_rc: int) -> subprocess.CompletedProcess:
+    """Run the REAL rollback control flow with every external effect stubbed.
+
+    Every side effect is recorded in ``<tmp>/calls.log`` so a test can prove what
+    did and did not execute: a fail-closed quiescence must never reach the SHA
+    reset, the writer rebuild/start, or the SAFE_BASELINE success receipt.
+    """
+    log = tmp / "calls.log"
+    block = _rollback_block()
+    script = (
+        "set -uo pipefail\n"
+        f"LOG={shlex.quote(log.as_posix())}\n"
+        ': >"$LOG"\n'
+        "PREVIOUS_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        f"APP_ROOT={shlex.quote(tmp.as_posix())}\n"
+        f"SAFE_BASELINE_OVERRIDE={shlex.quote((tmp / 'override.yml').as_posix())}\n"
+        f"LAST_GOOD_FILE={shlex.quote((tmp / 'last-good-sha').as_posix())}\n"
+        "GIT=(git)\n"
+        'git() { echo "git $*" >>"$LOG"; return 0; }\n'
+        'stop_paper_stack() { echo "stop_paper_stack" >>"$LOG"; }\n'
+        'cleanup_snapshot() { echo "cleanup_snapshot" >>"$LOG"; }\n'
+        'restore_scheduler_state() { echo "restore_scheduler_state" >>"$LOG"; }\n'
+        'release_evidence_producer_locks() { echo "release_evidence_producer_locks" >>"$LOG"; }\n'
+        'write_safe_baseline_override() { echo "write_safe_baseline_override" >>"$LOG"; }\n'
+        'wait_core_health() { echo "wait_core_health" >>"$LOG"; return 0; }\n'
+        'wait_writer_health() { echo "wait_writer_health" >>"$LOG"; return 0; }\n'
+        'writer_health_diagnostics() { echo "writer_health_diagnostics" >>"$LOG"; return 0; }\n'
+        'validate_safe_baseline_modes() { echo "validate_safe_baseline_modes" >>"$LOG"; return 0; }\n'
+        'start_paper_stack() { echo "start_paper_stack" >>"$LOG"; return 0; }\n'
+        'wait_paper_health() { echo "wait_paper_health" >>"$LOG"; return 0; }\n'
+        'docker() { echo "docker $*" >>"$LOG"; '
+        'if [[ " $* " == *" config "* && " $* " == *" --services "* ]]; then echo "opip-canonical-writer"; fi; '
+        "return 0; }\n"
+        f'quiesce_evidence_producers() {{ echo "quiesce_evidence_producers" >>"$LOG"; return {int(quiescence_rc)}; }}\n'
+        f"{block}\n"
+        "false\n"
+        "rollback\n"
+    )
+    return _run_bash_script(script, str(tmp), name="rollback.sh", timeout=60)
+
+
+def _writer_restoration_precedes_barrier(block: str) -> bool:
+    """True when a canonical-writer restoration step appears before the quiescence guard.
+
+    The AC-015 invariant is positional, not merely ordered: NO restoration step may
+    precede the barrier, so a mutation that hoists one above it is detected even
+    though every token is still present.
+    """
+    guard = block.index("if ! quiesce_evidence_producers")
+    for token in (
+        "checkout -f main",
+        "reset --hard",
+        "write_safe_baseline_override",
+        "opip-canonical-writer",
+    ):
+        found = block.find(token)
+        if found != -1 and found < guard:
+            return True
+    return False
+
+
 def _bash() -> str | None:
     found = shutil.which("bash")
     if found:
@@ -736,16 +843,32 @@ def _is_fork_failure(proc: subprocess.CompletedProcess) -> bool:
     )
 
 
+def _run_bash_script(
+    script: str, tmpdir: str, *, name: str = "script.sh", timeout: int = 90
+) -> subprocess.CompletedProcess:
+    """Run a multi-line script from a file (not ``-c``).
+
+    A file is used because a long multi-line ``-c`` argument can be silently
+    dropped by some bash builds, and because heredocs are parsed reliably there.
+    """
+    path = Path(tmpdir) / name
+    path.write_text(script, encoding="utf-8")
+    return subprocess.run(
+        [_bash(), str(path)], capture_output=True, text=True, timeout=timeout
+    )
+
+
 def test_ac_015_rollback_quiesces_producers_before_the_writer_restore():
     """ATDD-RELEASE-PIPELINE-v1/AC-015: rollback quiesces candidate evidence producers before the SHA reset/rebuild, and only emits SAFE_BASELINE_ROLLBACK=SUCCESS after health, modes, scheduler and paper are proven."""
     block = _rollback_block()
 
-    # Quiescence happens exactly once, after the paper stack is stopped and
-    # BEFORE any rebuild/reset that could let a producer win the store lock.
-    assert block.count("quiesce_evidence_producers") == 1
+    # Quiescence is invoked exactly once, as a fail-closed precondition, after the
+    # paper stack is stopped and BEFORE any rebuild/reset that could let a
+    # producer win the store lock.
+    assert block.count("if ! quiesce_evidence_producers; then") == 1
     order = (
         "stop_paper_stack",
-        "quiesce_evidence_producers",
+        "if ! quiesce_evidence_producers; then",
         "checkout -f main",
         "reset --hard",
         "write_safe_baseline_override",
@@ -753,6 +876,7 @@ def test_ac_015_rollback_quiesces_producers_before_the_writer_restore():
         "wait_writer_health",
         "validate_safe_baseline_modes",
         "restore_scheduler_state",
+        "release_evidence_producer_locks",
         "wait_paper_health",
         "OPIP_SAFE_BASELINE_ROLLBACK=SUCCESS",
     )
@@ -765,6 +889,16 @@ def test_ac_015_rollback_quiesces_producers_before_the_writer_restore():
         found = block.find(token, cursor)
         assert found != -1, f"rollback is missing or misorders {token!r}"
         cursor = found + len(token)
+
+    # The barrier is a precondition, not just an ordering: nothing that restores
+    # the canonical writer may appear before the quiescence guard, and the held
+    # launch locks are released only after the LAST scheduler restore.
+    assert not _writer_restoration_precedes_barrier(block)
+    assert block.rfind("release_evidence_producer_locks") > block.rfind(
+        "restore_scheduler_state"
+    )
+    assert "OPIP_ROLLBACK_ABORTED=PRODUCER_QUIESCENCE_UNPROVEN" in block
+    assert "OPIP_SAFE_BASELINE_ROLLBACK=UNPROVEN" in block
 
     # A writer-health failure surfaces classified diagnostics before the exit.
     writer_failure = block.index("rollback writer health check failed")
@@ -780,65 +914,327 @@ def test_ac_015_rollback_quiesces_producers_before_the_writer_restore():
 
 
 def test_ac_015_rollback_never_claims_unproven_producer_quiescence():
-    """ATDD-RELEASE-PIPELINE-v1/AC-015: a failed quiescence exec reports UNKNOWN (never a claimed QUIESCED), and survivors are reported NOT_QUIESCED after a bounded TERM/KILL escalation."""
+    """ATDD-RELEASE-PIPELINE-v1/AC-015: quiescence is fail-closed. A failed exec returns nonzero and reports `FAILED` with a reason (never a claimed `QUIESCED`), the launch locks are taken before any process proof, and ownership is never released by unlinking a lock file."""
     bash = _bash()
     if bash is None:
         pytest.skip("bash is not available in this environment")
-    fn = _function_block("quiesce_evidence_producers", "writer_health_diagnostics")
+    fn = _quiescence_helpers()
 
-    header = (
-        "set -Eeuo pipefail\n"
-        "EVIDENCE_PRODUCER_CRON_ENTRIES=(opip-feature-bus-capture opip-feasibility-evidence-capture)\n"
-        "EVIDENCE_PRODUCER_QUIESCE_SECONDS=60\n"
-    )
-
-    # (1) No container: honest NO_CONTAINER, zero counters, no lock-file surgery.
-    no_container = subprocess.run(
-        [
-            bash,
-            "-c",
-            header
+    with tempfile.TemporaryDirectory() as d:
+        # (1) No container: honest NO_CONTAINER, zero counters, launch locks taken.
+        no_container = _run_bash_script(
+            _quiescence_header(d)
             + 'docker() { return 0; }\n'
             + f"{fn}\n"
             + "quiesce_evidence_producers\n",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    if _is_fork_failure(no_container):
-        pytest.skip("bash cannot fork reliably in this environment")
-    assert no_container.returncode == 0, no_container.stderr
-    assert "OPIP_EVIDENCE_PRODUCER_QUIESCENCE=NO_CONTAINER" in no_container.stdout
-    assert "OPIP_EVIDENCE_PRODUCER_PROCESSES_REMAINING=0" in no_container.stdout
+            d,
+            name="no_container.sh",
+            timeout=60,
+        )
+        if _is_fork_failure(no_container):
+            pytest.skip("bash cannot fork reliably in this environment")
+        assert no_container.returncode == 0, no_container.stderr
+        assert "OPIP_EVIDENCE_PRODUCER_QUIESCENCE=NO_CONTAINER" in no_container.stdout
+        assert "OPIP_EVIDENCE_PRODUCER_PROCESSES_REMAINING=0" in no_container.stdout
+        assert "OPIP_EVIDENCE_PRODUCER_LAUNCH_LOCKS=ACQUIRED" in no_container.stdout
+        assert "OPIP_EVIDENCE_PRODUCER_LAUNCH_LOCK_COUNT=2" in no_container.stdout
 
-    # (2) The exec itself fails: reported UNKNOWN, never asserted as quiescence.
-    failed_exec = subprocess.run(
-        [
-            bash,
-            "-c",
-            header
+        # (2) The exec itself fails: FAILED + reason, nonzero, never `QUIESCED`.
+        failed_exec = _run_bash_script(
+            _quiescence_header(d)
             + 'docker() { if [[ "${1:-}" == "compose" && "${2:-}" == "ps" ]]; then echo "cid-1"; return 0; fi; return 0; }\n'
             + "timeout() { return 1; }\n"
             + f"{fn}\n"
-            + "quiesce_evidence_producers\n",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    if _is_fork_failure(failed_exec):
-        pytest.skip("bash cannot fork reliably in this environment")
-    assert failed_exec.returncode == 0, failed_exec.stderr
-    assert "OPIP_EVIDENCE_PRODUCER_QUIESCENCE=UNKNOWN" in failed_exec.stderr
-    assert "OPIP_EVIDENCE_PRODUCER_QUIESCENCE=QUIESCED" not in failed_exec.stdout
+            + "if quiesce_evidence_producers; then echo QUIESCE_RC=0; else echo QUIESCE_RC=$?; fi\n",
+            d,
+            name="failed_exec.sh",
+            timeout=60,
+        )
+        if _is_fork_failure(failed_exec):
+            pytest.skip("bash cannot fork reliably in this environment")
+        assert failed_exec.returncode == 0, failed_exec.stderr
+        assert "OPIP_EVIDENCE_PRODUCER_QUIESCENCE=FAILED" in failed_exec.stderr
+        assert (
+            "OPIP_EVIDENCE_PRODUCER_QUIESCENCE_REASON=PRODUCER_PROCESS_STATE_UNKNOWN"
+            in failed_exec.stderr
+        )
+        assert "QUIESCE_RC=1" in failed_exec.stdout
+        assert "OPIP_EVIDENCE_PRODUCER_QUIESCENCE=QUIESCED" not in failed_exec.stdout
 
-    # Structural: the escalation re-proves absence and reports survivors, and
-    # ownership is never released by unlinking a lock file.
-    assert "SIGKILL" in fn
-    assert "NOT_QUIESCED" in fn
-    assert "writer.lock" not in fn
-    assert "store_lock" not in fn
+        # Structural: the escalation re-proves absence and reports survivors, the
+        # launch barrier is a bounded `flock`, and no `.lock` file is ever removed.
+        assert "SIGKILL" in fn
+        assert "NOT_QUIESCED" in fn
+        assert "flock -x -w" in fn
+        assert "writer.lock" not in fn
+        assert "store_lock" not in fn
+        for line in fn.splitlines():
+            if ".lock" in line:
+                assert "rm " not in line, line
+
+
+def test_ac_015_rollback_launch_lock_barrier_waits_for_an_in_flight_wrapper():
+    """ATDD-RELEASE-PIPELINE-v1/AC-015: an already-running cron wrapper owns a producer launch lock, so quiescence bounds its wait against that owner, fails closed on timeout, and proceeds only once the lock is free."""
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is not available in this environment")
+    fn = _quiescence_helpers()
+
+    with tempfile.TemporaryDirectory() as d:
+        script = (
+            _quiescence_header(d, wait_seconds=2)
+            + 'docker() { return 0; }\n'
+            + f"{fn}\n"
+            # An in-flight host cron wrapper: a SEPARATE process owns the launch
+            # lock and has not yet exited.
+            + "( exec 200>opip-feature-bus-capture.lock; flock -x 200; exec sleep 30 ) &\n"
+            + "HOLDER=$!\n"
+            + "sleep 1\n"
+            + "start=$(date +%s)\n"
+            + "if quiesce_evidence_producers; then echo QUIESCE_RC=0; else echo QUIESCE_RC=$?; fi\n"
+            + 'echo "WAITED_SECONDS=$(( $(date +%s) - start ))"\n'
+            + "kill \"$HOLDER\" 2>/dev/null || true\n"
+            + "wait \"$HOLDER\" 2>/dev/null || true\n"
+            + "sleep 1\n"
+            + "if quiesce_evidence_producers; then echo RETRY_RC=0; else echo RETRY_RC=$?; fi\n"
+        )
+        proc = _run_bash_script(script, d, timeout=90)
+    if _is_fork_failure(proc):
+        pytest.skip("bash cannot fork reliably in this environment")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "OPIP_EVIDENCE_PRODUCER_QUIESCENCE=FAILED" in proc.stderr
+    assert "OPIP_EVIDENCE_PRODUCER_QUIESCENCE_REASON=LAUNCH_LOCK_TIMEOUT" in proc.stderr
+    assert "QUIESCE_RC=1" in proc.stdout
+    assert "OPIP_EVIDENCE_PRODUCER_QUIESCENCE=QUIESCED" not in proc.stdout
+    # It bounded and actually WAITED for the owner rather than declaring quiescence.
+    waited = int(re.search(r"WAITED_SECONDS=(\d+)", proc.stdout).group(1))
+    assert waited >= 1, proc.stdout
+    # Once the wrapper finished and released, the barrier is acquired and detail
+    # quiescence proceeds.
+    assert "RETRY_RC=0" in proc.stdout
+    assert "OPIP_EVIDENCE_PRODUCER_LAUNCH_LOCKS=ACQUIRED" in proc.stdout
+
+
+def test_ac_015_rollback_launch_lock_barrier_blocks_a_delayed_producer():
+    """ATDD-RELEASE-PIPELINE-v1/AC-015: cron removal alone is insufficient. A wrapper can launch a producer before the barrier, and a producer that appears only after the first clean process scan is blocked by the held launch locks until release."""
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is not available in this environment")
+    fn = _quiescence_helpers()
+
+    with tempfile.TemporaryDirectory() as d:
+        script = (
+            _quiescence_header(d, wait_seconds=5)
+            + _ZERO_PRODUCER_SEAM
+            + f"{fn}\n"
+            # (1) BEFORE rollback takes the barrier, a wrapper can launch a producer.
+            + "if flock -n opip-feature-bus-capture.lock -c 'echo EARLY_PRODUCER_LAUNCHED'; then echo EARLY_WRAPPER=ACQUIRED; else echo EARLY_WRAPPER=BLOCKED; fi\n"
+            # (2) Quiescence proves zero in-container processes and RETAINS locks.
+            + "if quiesce_evidence_producers; then echo QUIESCE_RC=0; else echo QUIESCE_RC=$?; fi\n"
+            # (3) The dangerous gap: the producer appears only now, after the empty
+            # scan. Its wrapper must be blocked by the barrier rollback holds.
+            + "if flock -n opip-feature-bus-capture.lock -c 'echo LATE_PRODUCER_LAUNCHED'; then echo LATE_WRAPPER=ACQUIRED; else echo LATE_WRAPPER=BLOCKED; fi\n"
+            + "if flock -n opip-feasibility-capture.lock -c 'echo LATE_FEASIBILITY_PRODUCER_LAUNCHED'; then echo LATE_FEASIBILITY_WRAPPER=ACQUIRED; else echo LATE_FEASIBILITY_WRAPPER=BLOCKED; fi\n"
+            # (4) Release, then prove the locks are genuinely freed again.
+            + "release_evidence_producer_locks\n"
+            + "if flock -n opip-feature-bus-capture.lock -c 'echo POST_RELEASE_PRODUCER_LAUNCHED'; then echo POST_RELEASE_WRAPPER=ACQUIRED; else echo POST_RELEASE_WRAPPER=BLOCKED; fi\n"
+        )
+        proc = _run_bash_script(script, d, timeout=60)
+    if _is_fork_failure(proc):
+        pytest.skip("bash cannot fork reliably in this environment")
+
+    assert proc.returncode == 0, proc.stderr
+    # The race is real: without the barrier a wrapper starts a producer.
+    assert "EARLY_PRODUCER_LAUNCHED" in proc.stdout
+    assert "EARLY_WRAPPER=ACQUIRED" in proc.stdout
+    # Quiescence proved zero processes and kept the barrier.
+    assert "QUIESCE_RC=0" in proc.stdout
+    assert "OPIP_EVIDENCE_PRODUCER_QUIESCENCE=QUIESCED" in proc.stdout
+    # The delayed launch is blocked while the barrier is held.
+    assert "LATE_PRODUCER_LAUNCHED" not in proc.stdout
+    assert "LATE_WRAPPER=BLOCKED" in proc.stdout
+    assert "LATE_FEASIBILITY_PRODUCER_LAUNCHED" not in proc.stdout
+    assert "LATE_FEASIBILITY_WRAPPER=BLOCKED" in proc.stdout
+    # Release frees them only when rollback is done with the barrier.
+    assert "OPIP_EVIDENCE_PRODUCER_LAUNCH_LOCKS=RELEASED" in proc.stdout
+    assert "POST_RELEASE_PRODUCER_LAUNCHED" in proc.stdout
+    assert "POST_RELEASE_WRAPPER=ACQUIRED" in proc.stdout
+
+
+def test_ac_015_quiescence_survivor_after_sigkill_is_fail_closed(tmp_path):
+    """ATDD-RELEASE-PIPELINE-v1/AC-015: a producer that survives TERM/KILL makes quiescence return nonzero, and rollback never resets the SHA, restores the writer, or emits a success receipt."""
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is not available in this environment")
+    fn = _quiescence_helpers()
+
+    with tempfile.TemporaryDirectory() as d:
+        script = (
+            _quiescence_header(d, wait_seconds=5)
+            + 'docker() { if [[ "${1:-}" == "compose" && "${2:-}" == "ps" ]]; then echo "cid-1"; return 0; fi; return 0; }\n'
+            + "timeout() {\n"
+            + '  echo "OPIP_EVIDENCE_PRODUCER_PROCESSES_SIGNALLED=1"\n'
+            + '  echo "OPIP_EVIDENCE_PRODUCER_PROCESSES_REMAINING=1"\n'
+            + '  echo "OPIP_EVIDENCE_PRODUCER_PROCESS_QUIESCENCE=NOT_QUIESCED"\n'
+            + "  return 1\n"
+            + "}\n"
+            + f"{fn}\n"
+            + "if quiesce_evidence_producers; then echo QUIESCE_RC=0; else echo QUIESCE_RC=$?; fi\n"
+        )
+        proc = _run_bash_script(script, d, timeout=60)
+    if _is_fork_failure(proc):
+        pytest.skip("bash cannot fork reliably in this environment")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "OPIP_EVIDENCE_PRODUCER_QUIESCENCE=FAILED" in proc.stderr
+    assert (
+        "OPIP_EVIDENCE_PRODUCER_QUIESCENCE_REASON=PRODUCER_SURVIVED_TERM_AND_KILL"
+        in proc.stderr
+    )
+    assert "OPIP_EVIDENCE_PRODUCER_PROCESS_STATE=NOT_QUIESCED" in proc.stderr
+    assert "QUIESCE_RC=1" in proc.stdout
+    assert "OPIP_EVIDENCE_PRODUCER_QUIESCENCE=QUIESCED" not in proc.stdout
+
+    harness = _rollback_harness(tmp_path, quiescence_rc=1)
+    if _is_fork_failure(harness):
+        pytest.skip("bash cannot fork reliably in this environment")
+    calls = (tmp_path / "calls.log").read_text(encoding="utf-8")
+    assert "git checkout" not in calls
+    assert "git reset" not in calls
+    assert "write_safe_baseline_override" not in calls
+    assert "wait_core_health" not in calls
+    assert "wait_writer_health" not in calls
+    assert "restore_scheduler_state" not in calls
+    assert "release_evidence_producer_locks" not in calls
+    assert "OPIP_SAFE_BASELINE_ROLLBACK=SUCCESS" not in (harness.stdout + harness.stderr)
+    assert "OPIP_SAFE_BASELINE_ROLLBACK=UNPROVEN" in harness.stderr
+    assert "OPIP_ROLLBACK_ABORTED=PRODUCER_QUIESCENCE_UNPROVEN" in harness.stderr
+
+
+def test_ac_015_quiescence_exec_failure_is_fail_closed(tmp_path):
+    """ATDD-RELEASE-PIPELINE-v1/AC-015: an unprovable process state (`UNKNOWN`) returns nonzero, and rollback stops before any canonical-writer restoration instead of proceeding on a guess."""
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is not available in this environment")
+    fn = _quiescence_helpers()
+
+    with tempfile.TemporaryDirectory() as d:
+        script = (
+            _quiescence_header(d, wait_seconds=5)
+            + 'docker() { if [[ "${1:-}" == "compose" && "${2:-}" == "ps" ]]; then echo "cid-1"; return 0; fi; return 0; }\n'
+            + "timeout() { return 1; }\n"
+            + f"{fn}\n"
+            + "if quiesce_evidence_producers; then echo QUIESCE_RC=0; else echo QUIESCE_RC=$?; fi\n"
+        )
+        proc = _run_bash_script(script, d, timeout=60)
+    if _is_fork_failure(proc):
+        pytest.skip("bash cannot fork reliably in this environment")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "OPIP_EVIDENCE_PRODUCER_QUIESCENCE=FAILED" in proc.stderr
+    assert (
+        "OPIP_EVIDENCE_PRODUCER_QUIESCENCE_REASON=PRODUCER_PROCESS_STATE_UNKNOWN"
+        in proc.stderr
+    )
+    assert "OPIP_EVIDENCE_PRODUCER_PROCESS_STATE=UNKNOWN" in proc.stderr
+    assert "QUIESCE_RC=1" in proc.stdout
+    assert "OPIP_EVIDENCE_PRODUCER_QUIESCENCE=QUIESCED" not in proc.stdout
+
+    harness = _rollback_harness(tmp_path, quiescence_rc=1)
+    if _is_fork_failure(harness):
+        pytest.skip("bash cannot fork reliably in this environment")
+    calls = (tmp_path / "calls.log").read_text(encoding="utf-8")
+    assert "git reset" not in calls
+    assert "opip-canonical-writer" not in calls
+    assert "release_evidence_producer_locks" not in calls
+    assert "OPIP_SAFE_BASELINE_ROLLBACK=SUCCESS" not in (harness.stdout + harness.stderr)
+    assert "OPIP_ROLLBACK_ABORTED=PRODUCER_QUIESCENCE_UNPROVEN" in harness.stderr
+
+
+def test_ac_015_producer_barrier_precedes_writer_restoration():
+    """ATDD-RELEASE-PIPELINE-v1/AC-015: the quiescence barrier is a positional precondition — remove schedule, take both launch locks, prove zero in-container producers, and only then touch the writer — and hoisting a restoration step above it is detected."""
+    block = _rollback_block()
+
+    # No canonical-writer restoration step may appear before the barrier guard.
+    assert not _writer_restoration_precedes_barrier(block)
+    assert block.index("if ! quiesce_evidence_producers") < block.index("reset --hard")
+    # The held launch locks are released only after the LAST scheduler restore.
+    assert block.rfind("release_evidence_producer_locks") > block.rfind(
+        "restore_scheduler_state"
+    )
+
+    # Inside the barrier the order is exactly: schedule removal -> launch locks ->
+    # process proof.
+    qfn = _function_block("quiesce_evidence_producers", "writer_health_diagnostics")
+    schedule = qfn.index("OPIP_EVIDENCE_PRODUCER_ENTRIES_REMOVED")
+    locks = qfn.index("acquire_evidence_producer_locks")
+    procs = qfn.index("producer_process_quiescence")
+    assert schedule < locks < procs
+
+    # Sentinel mutation: hoisting the SHA reset above the barrier must fail the
+    # positional check even though every token is still present.
+    mutated = block.replace(
+        "  if ! quiesce_evidence_producers; then",
+        '  "${GIT[@]}" reset --hard "$PREVIOUS_SHA"\n  if ! quiesce_evidence_producers; then',
+        1,
+    )
+    assert mutated != block
+    assert _writer_restoration_precedes_barrier(mutated)
+
+
+def test_ac_015_clean_quiescence_holds_locks_until_scheduler_restore_then_succeeds(tmp_path):
+    """ATDD-RELEASE-PIPELINE-v1/AC-015: a clean quiescence acquires BOTH launch locks, proves zero producers, keeps the barrier through writer/core/mode validation, and the rollback control flow restores the scheduler before releasing them and still emits `OPIP_SAFE_BASELINE_ROLLBACK=SUCCESS`."""
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is not available in this environment")
+    fn = _quiescence_helpers()
+
+    with tempfile.TemporaryDirectory() as d:
+        script = (
+            _quiescence_header(d, wait_seconds=5)
+            + _ZERO_PRODUCER_SEAM
+            + f"{fn}\n"
+            + "if quiesce_evidence_producers; then echo QUIESCE_RC=0; else echo QUIESCE_RC=$?; fi\n"
+            # While rollback holds the barrier a late wrapper cannot launch.
+            + "if flock -n opip-feature-bus-capture.lock -c 'echo UNEXPECTED_PRODUCER'; then echo HELD=NO; else echo HELD=YES; fi\n"
+            + "release_evidence_producer_locks\n"
+            + "if flock -n opip-feature-bus-capture.lock -c 'echo EXPECTED_PRODUCER'; then echo FREED=YES; else echo FREED=NO; fi\n"
+        )
+        proc = _run_bash_script(script, d, timeout=60)
+    if _is_fork_failure(proc):
+        pytest.skip("bash cannot fork reliably in this environment")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "QUIESCE_RC=0" in proc.stdout
+    assert "OPIP_EVIDENCE_PRODUCER_LAUNCH_LOCKS=ACQUIRED" in proc.stdout
+    assert "OPIP_EVIDENCE_PRODUCER_LAUNCH_LOCK_COUNT=2" in proc.stdout
+    assert "OPIP_EVIDENCE_PRODUCER_PROCESSES_REMAINING=0" in proc.stdout
+    assert "OPIP_EVIDENCE_PRODUCER_QUIESCENCE=QUIESCED" in proc.stdout
+    assert "HELD=YES" in proc.stdout
+    assert "OPIP_EVIDENCE_PRODUCER_LAUNCH_LOCKS=RELEASED" in proc.stdout
+    assert "FREED=YES" in proc.stdout
+    assert "UNEXPECTED_PRODUCER" not in proc.stdout
+
+    harness = _rollback_harness(tmp_path, quiescence_rc=0)
+    if _is_fork_failure(harness):
+        pytest.skip("bash cannot fork reliably in this environment")
+    calls = (tmp_path / "calls.log").read_text(encoding="utf-8")
+    for expected in (
+        "git checkout -f main",
+        "git reset --hard",
+        "write_safe_baseline_override",
+        "wait_core_health",
+        "wait_writer_health",
+        "validate_safe_baseline_modes",
+        "start_paper_stack",
+    ):
+        assert expected in calls, expected
+    assert calls.index("quiesce_evidence_producers") < calls.index("git reset --hard")
+    assert calls.index("restore_scheduler_state") < calls.index(
+        "release_evidence_producer_locks"
+    )
+    assert "OPIP_SAFE_BASELINE_ROLLBACK=SUCCESS" in harness.stdout
 
 
 @pytest.mark.parametrize(

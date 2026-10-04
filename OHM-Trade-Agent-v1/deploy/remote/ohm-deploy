@@ -597,10 +597,102 @@ EVIDENCE_PRODUCER_CRON_ENTRIES=(
 #: bounded `/proc` scan loop, never a slow network or market read.
 EVIDENCE_PRODUCER_QUIESCE_SECONDS=60
 
-#: Terminate every candidate evidence producer that could touch canonical
-#: storage, prove the absence of survivors, and remove the candidate's producer
-#: schedule. The candidate core container is still the running one at this point,
-#: so the producers are terminated inside it.
+#: The producer host LAUNCH-LOCK identities: the SAME paths the cron entries pass
+#: to `flock -n`. Acquiring them is a REAL synchronization barrier, so:
+#:   * a cron wrapper that cron already spawned before the schedule was removed
+#:     (but has not yet started its in-container producer) is WAITED FOR, and
+#:   * once rollback owns both, no late wrapper can successfully start another
+#:     producer, because its own `flock -n` fails immediately.
+#: Removing the cron entries alone cannot do either: it is a race, not a barrier.
+EVIDENCE_PRODUCER_HOST_LOCKS=(
+  /var/run/opip-feature-bus-capture.lock
+  /var/run/opip-feasibility-capture.lock
+)
+
+#: Finite bound for acquiring both launch locks. One producer invocation is
+#: itself bounded (cron runs `timeout ... 50`) and runs at most once a minute, so
+#: this covers one in-flight wrapper plus Docker exec startup while remaining a
+#: bounded wait, never an open-ended block and never an arbitrary sleep.
+EVIDENCE_PRODUCER_LOCK_WAIT_SECONDS=120
+
+#: Fail-closed reason for the most recent quiescence attempt, surfaced as
+#: OPIP_EVIDENCE_PRODUCER_QUIESCENCE_REASON.
+EVIDENCE_PRODUCER_QUIESCENCE_REASON=""
+
+#: Most recent in-container producer process state: NO_CONTAINER, PROVEN,
+#: NOT_QUIESCED or UNKNOWN. NO_CONTAINER is a proven absence (no core container
+#: exists, so no producer can be running), never an unknown state.
+EVIDENCE_PRODUCER_PROCESS_STATE=""
+
+#: Path/limit overrides are INERT unless explicitly enabled, mirroring the
+#: AC-013/AC-014 seam convention: production can never be pointed at a different
+#: lock directory or shortened wait by an ambient environment variable.
+if [[ "${OPIP_DEPLOY_TEST_SEAMS:-0}" == "1" ]]; then
+  if [[ -n "${OPIP_PRODUCER_LOCK_DIR:-}" ]]; then
+    EVIDENCE_PRODUCER_HOST_LOCKS=(
+      "$OPIP_PRODUCER_LOCK_DIR/opip-feature-bus-capture.lock"
+      "$OPIP_PRODUCER_LOCK_DIR/opip-feasibility-capture.lock"
+    )
+  fi
+  if [[ -n "${OPIP_PRODUCER_LOCK_WAIT_SECONDS:-}" ]]; then
+    EVIDENCE_PRODUCER_LOCK_WAIT_SECONDS="$OPIP_PRODUCER_LOCK_WAIT_SECONDS"
+  fi
+fi
+
+#: File descriptors that RETAIN the held launch locks. Ownership must persist
+#: across the whole critical section (previous SHA reset, SAFE_BASELINE override,
+#: writer rebuild/start, core rebuild/start, health and mode proofs), so the locks
+#: are opened on stable descriptors and closed only by
+#: release_evidence_producer_locks. Closing them early would reopen the exact
+#: window this barrier exists to close.
+EVIDENCE_PRODUCER_LOCK_FDS=()
+
+release_evidence_producer_locks() {
+  local fd
+  for fd in "${EVIDENCE_PRODUCER_LOCK_FDS[@]:-}"; do
+    [[ -n "$fd" ]] || continue
+    flock -u "$fd" 2>/dev/null || true
+    eval "exec $fd>&-" 2>/dev/null || true
+  done
+  EVIDENCE_PRODUCER_LOCK_FDS=()
+  echo "OPIP_EVIDENCE_PRODUCER_LAUNCH_LOCKS=RELEASED"
+}
+
+#: Take exclusive ownership of BOTH producer host launch locks with a finite,
+#: fail-closed wait. Returns nonzero (and releases anything already taken) when
+#: an identity is missing, a lock cannot be opened, or the bounded wait expires.
+acquire_evidence_producer_locks() {
+  local path fd
+  EVIDENCE_PRODUCER_LOCK_FDS=()
+  if [[ "${#EVIDENCE_PRODUCER_HOST_LOCKS[@]}" -eq 0 ]]; then
+    EVIDENCE_PRODUCER_QUIESCENCE_REASON=LAUNCH_LOCK_IDENTITIES_MISSING
+    return 1
+  fi
+  for path in "${EVIDENCE_PRODUCER_HOST_LOCKS[@]}"; do
+    if ! exec {fd}>"$path"; then
+      EVIDENCE_PRODUCER_QUIESCENCE_REASON=LAUNCH_LOCK_OPEN_FAILED
+      release_evidence_producer_locks
+      return 1
+    fi
+    # `flock -w` is a BOUNDED wait, never an open-ended block: a wrapper that
+    # already owns the lock is waited for, and a timeout fails closed rather than
+    # proceeding to reset the SHA under a still-live producer.
+    if ! flock -x -w "$EVIDENCE_PRODUCER_LOCK_WAIT_SECONDS" "$fd"; then
+      eval "exec $fd>&-" 2>/dev/null || true
+      EVIDENCE_PRODUCER_QUIESCENCE_REASON=LAUNCH_LOCK_TIMEOUT
+      release_evidence_producer_locks
+      return 1
+    fi
+    EVIDENCE_PRODUCER_LOCK_FDS+=("$fd")
+  done
+  echo "OPIP_EVIDENCE_PRODUCER_LAUNCH_LOCKS=ACQUIRED"
+  echo "OPIP_EVIDENCE_PRODUCER_LAUNCH_LOCK_COUNT=${#EVIDENCE_PRODUCER_LOCK_FDS[@]}"
+  return 0
+}
+
+#: Terminate every candidate evidence producer inside `ohm-trade-agent` and prove
+#: that zero remain. Returns nonzero unless the process state was PROVABLE and no
+#: survivor remains, so `UNKNOWN`/`NOT_QUIESCED` can never be claimed as safe.
 #:
 #: `pkill`/`pgrep` are NOT available: the core image is `python:3.12-slim` and
 #: ships no `procps`, so a `pkill`-based quiescence step is a silent no-op that
@@ -611,32 +703,28 @@ EVIDENCE_PRODUCER_QUIESCE_SECONDS=60
 #: Canonical ownership is an OS advisory-lock invariant. This function NEVER
 #: deletes a lock file; waiting for the owning process to exit is the only sound
 #: release mechanism.
-quiesce_evidence_producers() {
-  local name removed=0
-  for name in "${EVIDENCE_PRODUCER_CRON_ENTRIES[@]}"; do
-    if [[ -e "/etc/cron.d/$name" ]]; then
-      rm -f "/etc/cron.d/$name"
-      removed=$((removed + 1))
-    fi
-  done
-  echo "OPIP_EVIDENCE_PRODUCER_ENTRIES_REMOVED=$removed"
-
-  if [[ -z "$(docker compose ps -q ohm-trade-agent 2>/dev/null || true)" ]]; then
-    echo "OPIP_EVIDENCE_PRODUCER_QUIESCENCE=NO_CONTAINER"
+producer_process_quiescence() {
+  local cid rc=0 out
+  EVIDENCE_PRODUCER_PROCESS_STATE=""
+  cid="$(docker compose ps -q ohm-trade-agent 2>/dev/null || true)"
+  if [[ -z "$cid" ]]; then
     echo "OPIP_EVIDENCE_PRODUCER_PROCESSES_SIGNALLED=0"
     echo "OPIP_EVIDENCE_PRODUCER_PROCESSES_REMAINING=0"
+    echo "OPIP_EVIDENCE_PRODUCER_PROCESS_STATE=NO_CONTAINER"
+    EVIDENCE_PRODUCER_PROCESS_STATE=NO_CONTAINER
     return 0
   fi
 
   # The host has coreutils (its own cron entries use `timeout`), so the outer
   # `timeout` bounds the whole exec. The in-container script bounds its own wait
   # too, so a stalled `docker compose exec` client can never hold the rollback.
-  # A failed exec is reported as UNKNOWN and never claimed as quiescence; the
-  # SAFE_BASELINE writer health gate below remains the fail-closed proof.
-  if timeout --signal=TERM --kill-after=5s "$EVIDENCE_PRODUCER_QUIESCE_SECONDS" \
+  # A failed exec is explicitly UNKNOWN and fails closed; the SAFE_BASELINE
+  # writer health gate no longer has to be the only proof.
+  out="$(timeout --signal=TERM --kill-after=5s "$EVIDENCE_PRODUCER_QUIESCE_SECONDS" \
     docker compose exec -T ohm-trade-agent python - <<'PY'
 import os
 import signal
+import sys
 import time
 
 # The scheduled release-scheduler evidence producers. Only these two modules may
@@ -689,15 +777,72 @@ if remaining:
 print(f"OPIP_EVIDENCE_PRODUCER_PROCESSES_SIGNALLED={len(first)}")
 print(f"OPIP_EVIDENCE_PRODUCER_PROCESSES_REMAINING={len(remaining)}")
 print(
-    "OPIP_EVIDENCE_PRODUCER_QUIESCENCE="
+    "OPIP_EVIDENCE_PRODUCER_PROCESS_QUIESCENCE="
     + ("QUIESCED" if not remaining else "NOT_QUIESCED")
 )
+sys.exit(0 if not remaining else 1)
 PY
-  then
-    :
-  else
-    echo "OPIP_EVIDENCE_PRODUCER_QUIESCENCE=UNKNOWN" >&2
+  )" || rc=$?
+  if [[ -n "$out" ]]; then
+    printf '%s\n' "$out"
   fi
+  if [[ "$rc" -ne 0 ]]; then
+    if grep -q 'OPIP_EVIDENCE_PRODUCER_PROCESS_QUIESCENCE=NOT_QUIESCED' <<<"$out"; then
+      echo "OPIP_EVIDENCE_PRODUCER_PROCESS_STATE=NOT_QUIESCED" >&2
+      EVIDENCE_PRODUCER_PROCESS_STATE=NOT_QUIESCED
+      EVIDENCE_PRODUCER_QUIESCENCE_REASON=PRODUCER_SURVIVED_TERM_AND_KILL
+    else
+      echo "OPIP_EVIDENCE_PRODUCER_PROCESS_STATE=UNKNOWN" >&2
+      EVIDENCE_PRODUCER_PROCESS_STATE=UNKNOWN
+      EVIDENCE_PRODUCER_QUIESCENCE_REASON=PRODUCER_PROCESS_STATE_UNKNOWN
+    fi
+    return 1
+  fi
+  echo "OPIP_EVIDENCE_PRODUCER_PROCESS_STATE=PROVEN"
+  EVIDENCE_PRODUCER_PROCESS_STATE=PROVEN
+  return 0
+}
+
+#: The rollback quiescence barrier. Removes the candidate producer schedule,
+#: takes BOTH producer host launch locks with a bounded wait, proves zero
+#: in-container producers, and RETURNS NONZERO unless every one of those proofs
+#: succeeded. On success the launch locks are deliberately LEFT HELD so the
+#: caller completes the canonical-writer recovery under the barrier and releases
+#: them only after SAFE_BASELINE is proven.
+quiesce_evidence_producers() {
+  local name removed=0
+  for name in "${EVIDENCE_PRODUCER_CRON_ENTRIES[@]}"; do
+    if [[ -e "/etc/cron.d/$name" ]]; then
+      rm -f "/etc/cron.d/$name"
+      removed=$((removed + 1))
+    fi
+  done
+  echo "OPIP_EVIDENCE_PRODUCER_ENTRIES_REMOVED=$removed"
+
+  # Barrier BEFORE any process proof: once both host launch locks are held, a
+  # late cron wrapper cannot start a producer (`flock -n` fails), and a wrapper
+  # that was already launched has finished. A failure to establish the barrier is
+  # fail-closed.
+  if ! acquire_evidence_producer_locks; then
+    echo "OPIP_EVIDENCE_PRODUCER_QUIESCENCE=FAILED" >&2
+    echo "OPIP_EVIDENCE_PRODUCER_QUIESCENCE_REASON=$EVIDENCE_PRODUCER_QUIESCENCE_REASON" >&2
+    return 1
+  fi
+
+  if ! producer_process_quiescence; then
+    echo "OPIP_EVIDENCE_PRODUCER_QUIESCENCE=FAILED" >&2
+    echo "OPIP_EVIDENCE_PRODUCER_QUIESCENCE_REASON=$EVIDENCE_PRODUCER_QUIESCENCE_REASON" >&2
+    return 1
+  fi
+
+  # NO_CONTAINER is a PROVEN absence (no core container => no producer process),
+  # distinct from the UNKNOWN/NOT_QUIESCED failure states above.
+  if [[ "$EVIDENCE_PRODUCER_PROCESS_STATE" == "NO_CONTAINER" ]]; then
+    echo "OPIP_EVIDENCE_PRODUCER_QUIESCENCE=NO_CONTAINER"
+  else
+    echo "OPIP_EVIDENCE_PRODUCER_QUIESCENCE=QUIESCED"
+  fi
+  return 0
 }
 
 #: Bounded diagnostics for a writer that did not become healthy, detailed enough
@@ -757,7 +902,23 @@ rollback() {
   # producer that starts inside the writer-rebuild window can win the canonical
   # store lock from the about-to-restore writer, which then fails closed and can
   # never report healthy inside the bounded writer health window.
-  quiesce_evidence_producers
+  #
+  # FAIL CLOSED: the barrier is a PRECONDITION for resetting the SHA or
+  # restarting the previous writer. If the bounded host-launch-lock wait expires,
+  # the producer process state is unprovable, the exec fails, or a producer
+  # survives TERM/KILL, rollback MUST NOT touch the canonical writer. On success
+  # `quiesce_evidence_producers` leaves BOTH host launch locks HELD so no late
+  # cron wrapper can start a producer during writer recovery.
+  if ! quiesce_evidence_producers; then
+    echo "OPIP_ROLLBACK_ABORTED=PRODUCER_QUIESCENCE_UNPROVEN" >&2
+    echo "OPIP_SAFE_BASELINE_ROLLBACK=UNPROVEN" >&2
+    # The candidate producer schedule was removed and is deliberately NOT
+    # restored: re-arming producers whose quiescence is unproven is the exact
+    # race this barrier exists to prevent. Only transaction state is cleaned up
+    # so a later operator-driven deploy starts from a clean scheduler snapshot.
+    cleanup_snapshot
+    exit "$rc"
+  fi
 
   "${GIT[@]}" checkout -f main
   "${GIT[@]}" reset --hard "$PREVIOUS_SHA"
@@ -815,8 +976,11 @@ rollback() {
 
   # Restore the exact scheduler state that was installed before this deploy.
   # This preserves any emergency production containment that is newer than the
-  # previous repository revision.
+  # previous repository revision. It happens while the launch locks are STILL
+  # held, so a cron tick inside this window cannot start a producer; only after
+  # SAFE_BASELINE is fully proven are the held locks released.
   restore_scheduler_state
+  release_evidence_producer_locks
 
   if ! start_paper_stack || ! wait_paper_health; then
     echo "rollback paper topology validation failed" >&2
