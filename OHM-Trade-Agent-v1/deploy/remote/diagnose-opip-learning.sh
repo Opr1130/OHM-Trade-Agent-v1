@@ -1635,10 +1635,17 @@ if [[ -f "$UNIFIED_CYCLE_CRON" ]]; then
   echo "unified_cycle_cron_exists=YES"
   unified_cycle_cron_epoch="$(stat -c '%Y' "$UNIFIED_CYCLE_CRON" 2>/dev/null || true)"
   echo "unified_cycle_cron_mtime_utc=$(date -u -d "@${unified_cycle_cron_epoch:-0}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo UNKNOWN)"
-  # Static read of the installed entry: the first five fields are the schedule.
+  # Static read of the installed entry: the first five fields of the first real
+  # job line are the schedule. A cron.d file may carry environment assignments
+  # (`SHELL=`, `PATH=`, `MAILTO=`) before the job line, so those are skipped
+  # exactly like comments and blank lines - otherwise the reported "schedule"
+  # would be an assignment such as `SHELL=/bin/bash`.
   unified_cycle_cron_schedule="$(
-    grep -v '^#' "$UNIFIED_CYCLE_CRON" 2>/dev/null \
-      | awk 'NF {print $1" "$2" "$3" "$4" "$5; exit}' || true
+    awk '
+      /^[[:space:]]*#/ {next}
+      /^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=/ {next}
+      NF {print $1" "$2" "$3" "$4" "$5; exit}
+    ' "$UNIFIED_CYCLE_CRON" 2>/dev/null || true
   )"
   echo "unified_cycle_cron_schedule=${unified_cycle_cron_schedule:-UNKNOWN}"
   # The hard runtime bound is derived with the SAME expression the release

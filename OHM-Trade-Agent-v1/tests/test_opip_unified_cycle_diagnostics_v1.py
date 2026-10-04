@@ -111,6 +111,19 @@ def test_block_reports_the_installed_cycle_entry_and_its_bound():
     assert 'echo "unified_cycle_hard_runtime_bound_seconds=UNKNOWN"' in block
 
 
+def test_schedule_read_skips_cron_d_environment_assignments():
+    """A cron.d file carries `SHELL=`/`PATH=`/`MAILTO=` before the job line.
+
+    Regression cover: reading the first non-comment line reported an assignment
+    such as ``SHELL=/bin/bash`` as the cycle schedule on a real host, which is
+    exactly where this field is read.
+    """
+    block = _block()
+    assert r"/^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=/ {next}" in block
+    assert r"/^[[:space:]]*#/ {next}" in block
+    assert "grep -v '^#'" not in block
+
+
 def test_block_reports_the_cycle_completion_history():
     block = _block()
     for field in (
@@ -440,11 +453,13 @@ def test_tail_is_line_bounded_and_keeps_the_newest_entries(tmp_path):
     )
     assert fields["unified_cycle_log_tail_lines_requested"] == "200"
     assert len(tail) == 200
-    assert "cycle-0500 line" in tail
-    assert "cycle-0301 line" in tail
+    # 500 lines are written (0000..0499), so the bounded newest window is
+    # 0300..0499 and the just-evicted boundary line is 0299.
+    assert "cycle-0499 line" in tail
+    assert "cycle-0300 line" in tail
     # Everything older than the bounded window is genuinely not read.
-    assert "cycle-0300 line" not in tail
-    assert "cycle-0001 line" not in tail
+    assert "cycle-0299 line" not in tail
+    assert "cycle-0000 line" not in tail
 
 
 @pytestmark_posix
@@ -502,6 +517,10 @@ def test_installed_entry_reports_schedule_and_derived_bound(tmp_path):
     fields, _ = _run_block(tmp_path, cron_text=CRON_ENTRY)
     assert fields["unified_cycle_cron_exists"] == "YES"
     assert fields["unified_cycle_cron_schedule"] == "* * * * *"
+    # The fixture is a realistic cron.d file whose first lines are environment
+    # assignments; neither may be reported as the schedule.
+    assert "SHELL=" not in fields["unified_cycle_cron_schedule"]
+    assert "PATH=" not in fields["unified_cycle_cron_schedule"]
     assert fields["unified_cycle_hard_runtime_bound_seconds"] == "3600"
     assert fields["unified_cycle_cron_mtime_utc"].endswith("Z")
 
