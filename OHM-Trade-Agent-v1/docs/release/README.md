@@ -71,6 +71,22 @@ verification-time dispositions. A CI candidate alone remains no proof of
 deployment or runtime health; production evidence is only available after the
 owner-gated deployment flow runs. `TARGET_PAPER` remains BLOCKED.
 
+### Unified-cycle observability in diagnostics
+
+A deploy that never observes a unified-cycle `SUCCESS` fails closed, but the
+deploy receipt records only that verdict. The read-only learning diagnostics
+(`deploy/remote/diagnose-opip-learning.sh`) therefore also report, without ever
+running, signalling or locking the cycle:
+
+- the installed `ohm-unified-cycle` cron entry, its schedule, and the hard
+  runtime bound derived with the same expression the release controller uses;
+- a line- and byte-bounded, redacted tail of `/var/log/ohm-unified-cycle.log`
+  with tail counts for `SUCCESS`, `DEGRADED`, completions, lock-contention skips
+  and tracebacks, plus the latest status, completion timestamp and its age.
+
+Absent or unreadable inputs report `UNKNOWN`/`NONE`; the block never changes the
+diagnostics verdict.
+
 ## Governance
 
 See `OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md` for the bounded OWNER governance supersession, and `OHM-Trade-Agent-v1/docs/architecture/OPIP_F6_OWNER_ENABLEMENT_PACKETS.md` for Packet A.

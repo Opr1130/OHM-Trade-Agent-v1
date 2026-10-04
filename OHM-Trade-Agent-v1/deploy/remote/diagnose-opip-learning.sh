@@ -41,6 +41,17 @@ MAX_SYNC_AGE_SECONDS=720
 MAX_CAPTURE_AGE_SECONDS=900
 MAX_OUTCOMES_AGE_SECONDS=1800
 MAX_FUTURE_SKEW_SECONDS=120
+# Unified-cycle observability targets. A release deploy fails closed when no
+# unified cycle reports SUCCESS inside the bounded release window, but the deploy
+# records only that verdict. These paths are read, never written, so the
+# diagnostics can separate "the scheduler stopped invoking the cycle" from
+# "cycles run but never complete / never report SUCCESS". Both the line count and
+# the byte count read from the log are bounded, so a growing log cannot flood the
+# diagnostics output.
+UNIFIED_CYCLE_CRON="/etc/cron.d/ohm-unified-cycle"
+UNIFIED_CYCLE_LOG="/var/log/ohm-unified-cycle.log"
+UNIFIED_CYCLE_LOG_TAIL_LINES=200
+UNIFIED_CYCLE_LOG_MAX_BYTES=64000
 
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   echo "run O'Pip learning diagnostics as root" >&2
@@ -1589,6 +1600,128 @@ else
   echo "canonical_evidence_counts=UNAVAILABLE"
 fi
 echo "OPIP_CANONICAL_EVIDENCE_COUNTS_END"
+
+# ---------------------------------------------------------------------------
+# Read-only unified-cycle observability (Release Pipeline v1).
+#
+# A release deploy fails closed when no unified cycle reports SUCCESS inside the
+# bounded release window, but the deploy records only that verdict. On its own
+# the verdict cannot separate the failure modes that matter operationally:
+#
+#   * the installed cycle cron entry is missing or edited, so cycles stopped
+#     being invoked at all;
+#   * runs are invoked but the in-process cycle lock makes every one skip;
+#   * runs start but never reach a completion marker (hung, or killed at the
+#     authorized timeout bound);
+#   * runs complete and report DEGRADED rather than SUCCESS.
+#
+# This probe reports the installed scheduler entry and a bounded, redacted tail
+# of the cycle's own log, so a missing-success failure is explainable afterwards.
+# It is strictly observational:
+#
+#   * it never runs, signals, times out, restarts or repairs the cycle;
+#   * it never takes a lock, and never creates, empties or removes a file;
+#   * it bounds both the line count and the byte count it reads;
+#   * absent or unreadable inputs report UNKNOWN/NONE, never a fabricated value.
+#
+# It deliberately does NOT call degrade(). Freshness inside a release window is
+# not a learning-readiness property, and the export stall threshold is far below
+# a cycle's authorized runtime bound, so folding either verdict in here would
+# misreport a healthy in-flight cycle as a stalled component.
+# ---------------------------------------------------------------------------
+echo "OPIP_UNIFIED_CYCLE"
+echo "unified_cycle_cron_path=$UNIFIED_CYCLE_CRON"
+if [[ -f "$UNIFIED_CYCLE_CRON" ]]; then
+  echo "unified_cycle_cron_exists=YES"
+  unified_cycle_cron_epoch="$(stat -c '%Y' "$UNIFIED_CYCLE_CRON" 2>/dev/null || true)"
+  echo "unified_cycle_cron_mtime_utc=$(date -u -d "@${unified_cycle_cron_epoch:-0}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo UNKNOWN)"
+  # Static read of the installed entry: the first five fields of the first real
+  # job line are the schedule. A cron.d file may carry environment assignments
+  # (`SHELL=`, `PATH=`, `MAILTO=`) before the job line, so those are skipped
+  # exactly like comments and blank lines - otherwise the reported "schedule"
+  # would be an assignment such as `SHELL=/bin/bash`.
+  unified_cycle_cron_schedule="$(
+    awk '
+      /^[[:space:]]*#/ {next}
+      /^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=/ {next}
+      NF {print $1" "$2" "$3" "$4" "$5; exit}
+    ' "$UNIFIED_CYCLE_CRON" 2>/dev/null || true
+  )"
+  echo "unified_cycle_cron_schedule=${unified_cycle_cron_schedule:-UNKNOWN}"
+  # The hard runtime bound is derived with the SAME expression the release
+  # controller uses to size its own bounded cycle wait, so diagnostics can never
+  # report a different bound than the one the deploy enforced.
+  unified_cycle_bound="$(
+    grep -m1 -oE 'timeout --signal=TERM --kill-after=[0-9]+s [0-9]+' "$UNIFIED_CYCLE_CRON" 2>/dev/null \
+      | grep -oE '[0-9]+$' || true
+  )"
+  if [[ "$unified_cycle_bound" =~ ^[0-9]+$ && "$unified_cycle_bound" -ge 1 ]]; then
+    echo "unified_cycle_hard_runtime_bound_seconds=$unified_cycle_bound"
+  else
+    echo "unified_cycle_hard_runtime_bound_seconds=UNKNOWN"
+  fi
+else
+  echo "unified_cycle_cron_exists=NO"
+  echo "unified_cycle_cron_mtime_utc=UNKNOWN"
+  echo "unified_cycle_cron_schedule=UNKNOWN"
+  echo "unified_cycle_hard_runtime_bound_seconds=UNKNOWN"
+fi
+echo "unified_cycle_log_tail_lines_requested=$UNIFIED_CYCLE_LOG_TAIL_LINES"
+echo "unified_cycle_log_tail_bytes_limit=$UNIFIED_CYCLE_LOG_MAX_BYTES"
+if [[ -f "$UNIFIED_CYCLE_LOG" ]]; then
+  echo "unified_cycle_log_exists=YES"
+  echo "unified_cycle_log_size_bytes=$(stat -c '%s' "$UNIFIED_CYCLE_LOG" 2>/dev/null || echo UNKNOWN)"
+  unified_cycle_log_epoch="$(stat -c '%Y' "$UNIFIED_CYCLE_LOG" 2>/dev/null || true)"
+  echo "unified_cycle_log_mtime_utc=$(date -u -d "@${unified_cycle_log_epoch:-0}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo UNKNOWN)"
+  if [[ "$unified_cycle_log_epoch" =~ ^[0-9]+$ ]] && (( unified_cycle_log_epoch <= now_epoch )); then
+    echo "unified_cycle_log_age_seconds=$((now_epoch - unified_cycle_log_epoch))"
+  else
+    echo "unified_cycle_log_age_seconds=UNKNOWN"
+  fi
+  # One bounded, non-locking read of the tail, reused for every derived field.
+  unified_cycle_tail="$(tail -n "$UNIFIED_CYCLE_LOG_TAIL_LINES" "$UNIFIED_CYCLE_LOG" 2>/dev/null | head -c "$UNIFIED_CYCLE_LOG_MAX_BYTES" || true)"
+  # grep -c prints 0 and exits non-zero when nothing matches, so every pipeline is
+  # guarded to keep set -e intact. A count is a count of matching lines.
+  unified_cycle_tail_success_count="$(printf '%s\n' "$unified_cycle_tail" | grep -c 'OPIP_UNIFIED_CYCLE_STATUS=SUCCESS' || true)"
+  unified_cycle_tail_degraded_count="$(printf '%s\n' "$unified_cycle_tail" | grep -c 'OPIP_UNIFIED_CYCLE_STATUS=DEGRADED' || true)"
+  unified_cycle_tail_completed_count="$(printf '%s\n' "$unified_cycle_tail" | grep -c 'OPIP_UNIFIED_CYCLE_COMPLETED_AT=' || true)"
+  unified_cycle_tail_skip_count="$(printf '%s\n' "$unified_cycle_tail" | grep -c 'Unified Cycle skipped' || true)"
+  unified_cycle_tail_error_count="$(printf '%s\n' "$unified_cycle_tail" | grep -cE 'Traceback \(most recent call last\)' || true)"
+  echo "unified_cycle_log_tail_success_count=$unified_cycle_tail_success_count"
+  echo "unified_cycle_log_tail_degraded_count=$unified_cycle_tail_degraded_count"
+  echo "unified_cycle_log_tail_completed_count=$unified_cycle_tail_completed_count"
+  echo "unified_cycle_log_tail_skip_count=$unified_cycle_tail_skip_count"
+  echo "unified_cycle_log_tail_error_count=$unified_cycle_tail_error_count"
+  # SUCCESS and DEGRADED are the only statuses the release controller accepts, but
+  # the tail is matched with a permissive shape so an unexpected third status is
+  # surfaced verbatim instead of being silently ignored.
+  unified_cycle_latest_status="$(printf '%s\n' "$unified_cycle_tail" | grep -oE 'OPIP_UNIFIED_CYCLE_STATUS=[A-Z_]+' | tail -n 1 | sed 's/^[^=]*=//' || true)"
+  unified_cycle_latest_completed_at="$(printf '%s\n' "$unified_cycle_tail" | grep -oE 'OPIP_UNIFIED_CYCLE_COMPLETED_AT=[^[:space:]]+' | tail -n 1 | sed 's/^[^=]*=//' || true)"
+  echo "unified_cycle_log_latest_status=${unified_cycle_latest_status:-NONE}"
+  echo "unified_cycle_log_latest_completed_at=${unified_cycle_latest_completed_at:-NONE}"
+  unified_cycle_latest_age="$(age_seconds "$unified_cycle_latest_completed_at" 2>/dev/null || true)"
+  echo "unified_cycle_log_latest_completion_age_seconds=${unified_cycle_latest_age:-UNKNOWN}"
+else
+  echo "unified_cycle_log_exists=NO"
+  echo "unified_cycle_log_size_bytes=UNKNOWN"
+  echo "unified_cycle_log_mtime_utc=UNKNOWN"
+  echo "unified_cycle_log_age_seconds=UNKNOWN"
+  echo "unified_cycle_log_tail_success_count=UNKNOWN"
+  echo "unified_cycle_log_tail_degraded_count=UNKNOWN"
+  echo "unified_cycle_log_tail_completed_count=UNKNOWN"
+  echo "unified_cycle_log_tail_skip_count=UNKNOWN"
+  echo "unified_cycle_log_tail_error_count=UNKNOWN"
+  echo "unified_cycle_log_latest_status=NONE"
+  echo "unified_cycle_log_latest_completed_at=NONE"
+  echo "unified_cycle_log_latest_completion_age_seconds=UNKNOWN"
+fi
+# The bounded tail is emitted last and through the existing redactor, so an
+# unexpected credential in the cycle's structured log lines cannot reach the
+# diagnostics output.
+echo "OPIP_UNIFIED_CYCLE_LOG_TAIL"
+printf '%s\n' "${unified_cycle_tail:-}" | redact_export_secrets || true
+echo "OPIP_UNIFIED_CYCLE_LOG_TAIL_END"
+echo "OPIP_UNIFIED_CYCLE_END"
 
 echo "diagnostics_status=$status"
 [[ "$status" != "FAIL" ]]
