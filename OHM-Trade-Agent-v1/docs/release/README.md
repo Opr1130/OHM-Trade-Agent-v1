@@ -87,6 +87,34 @@ running, signalling or locking the cycle:
 Absent or unreadable inputs report `UNKNOWN`/`NONE`; the block never changes the
 diagnostics verdict.
 
+### Unified-cycle wait-failure evidence in the deploy log
+
+The diagnostics helper above is a *post-deploy* tool, and it is installed from
+the release being deployed. When a candidate release fails the unified-cycle
+wait, rollback restores the **previous** release — and with it the previous
+`/usr/local/sbin/diagnose-opip-learning` — so any diagnostics merged into the
+candidate are gone by the time an operator can run them. The deploy controller
+therefore emits its own bounded failure evidence, at the moment the wait fails
+and before rollback starts, on both failing paths (no fresh completion, and a
+fresh `DEGRADED`):
+
+- `OPIP_UNIFIED_CYCLE_WAIT_FAILURE` (`NO_FRESH_COMPLETION` /
+  `DEGRADED_AFTER_READINESS`) and a best-effort `..._WAIT_FAILURE_CLASS`;
+- cycle-log existence, size and mtime, with tail counts for `SUCCESS`,
+  `DEGRADED`, completions, lock-contention skips and tracebacks, the latest
+  status/completion time and its age;
+- the installed cron entry's existence, schedule and log target, read the same
+  way the wait derives its budget;
+- the host wrapper lock's path plus `PRESENT`/`HELD`, read from the kernel lock
+  table by the lock's own device:inode — never by taking, releasing or deleting
+  the lock, and never by inspecting the container;
+- a line-, match-, byte- and per-line-bounded tail allowlisted to release
+  markers and exception frames, never arbitrary application output.
+
+The reporter runs only after the failure is already decided and mutates nothing,
+so it cannot change the wait's success semantics or mask the original failure
+reason; every probe degrades to `UNKNOWN` rather than guessing.
+
 ## Governance
 
 See `OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md` for the bounded OWNER governance supersession, and `OHM-Trade-Agent-v1/docs/architecture/OPIP_F6_OWNER_ENABLEMENT_PACKETS.md` for Packet A.
