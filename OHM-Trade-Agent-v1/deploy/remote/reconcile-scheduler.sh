@@ -55,6 +55,118 @@ for required in \
   fi
 done
 
+# The deploy controller snapshots /usr/local/sbin/ohm-deploy before this script
+# runs, then keeps executing the old controller. A later rollback restores that
+# snapshot and would otherwise put the pre-deploy controller back. When a
+# transaction snapshot is present, replace only its deploy-controller file with
+# the checked-out target after the proofs below. No snapshot means this is not
+# an in-flight deploy (initial host bootstrap); do not invent one.
+preserve_target_deploy_controller_snapshot() {
+  local app_root="/opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1"
+  local state_dir="/var/lib/ohm-deploy"
+  if [[ "${OPIP_DEPLOY_TEST_SEAMS:-0}" == "1" ]]; then
+    if [[ -n "${OPIP_BOOTSTRAP_APP_ROOT:-}" ]]; then
+      app_root="$OPIP_BOOTSTRAP_APP_ROOT"
+    fi
+    if [[ -n "${OPIP_BOOTSTRAP_STATE_DIR:-}" ]]; then
+      state_dir="$OPIP_BOOTSTRAP_STATE_DIR"
+    fi
+  fi
+
+  command -v git >/dev/null 2>&1 || {
+    echo "deploy-controller bootstrap: git is required" >&2
+    return 1
+  }
+  command -v cmp >/dev/null 2>&1 || {
+    echo "deploy-controller bootstrap: cmp is required" >&2
+    return 1
+  }
+
+  local head_sha target_controller
+  head_sha="$(git -c safe.directory='*' -C "$app_root" rev-parse --verify HEAD 2>/dev/null || true)"
+  [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] || {
+    echo "deploy-controller bootstrap: repository HEAD is not a 40-char SHA" >&2
+    return 1
+  }
+
+  target_controller="$app_root/deploy/remote/ohm-deploy"
+  [[ -f "$target_controller" && ! -L "$target_controller" && -s "$target_controller" ]] || {
+    echo "deploy-controller bootstrap: target controller is not a regular file" >&2
+    return 1
+  }
+  if ! bash -n "$target_controller"; then
+    echo "deploy-controller bootstrap: target controller failed bash -n" >&2
+    return 1
+  fi
+
+  local matches=() dirs=() candidate snapshot staged
+  shopt -s nullglob
+  matches=("$state_dir"/scheduler-before.*)
+  shopt -u nullglob
+  if [[ "${#matches[@]}" -gt 0 ]]; then
+    for candidate in "${matches[@]}"; do
+      if [[ -d "$candidate" && ! -L "$candidate" ]]; then
+        dirs+=("$candidate")
+      fi
+    done
+  fi
+  if [[ "${#dirs[@]}" -ne 1 ]]; then
+    echo "deploy-controller bootstrap: expected exactly one scheduler-before transaction snapshot" >&2
+    return 1
+  fi
+  snapshot="${dirs[0]}"
+
+  [[ -f "$snapshot/remote-op-ohm-deploy.present" && ! -L "$snapshot/remote-op-ohm-deploy.present" ]] || {
+    echo "deploy-controller bootstrap: snapshot controller present marker is missing" >&2
+    return 1
+  }
+  [[ -f "$snapshot/remote-op-ohm-deploy" && ! -L "$snapshot/remote-op-ohm-deploy" && -s "$snapshot/remote-op-ohm-deploy" ]] || {
+    echo "deploy-controller bootstrap: snapshot controller is not a regular file" >&2
+    return 1
+  }
+
+  if cmp -s -- "$snapshot/remote-op-ohm-deploy" "$target_controller"; then
+    echo "OPIP_DEPLOY_CONTROLLER_BOOTSTRAP=NOT_NEEDED"
+    echo "OPIP_DEPLOY_CONTROLLER_BOOTSTRAP_SHA=$head_sha"
+    return 0
+  fi
+
+  staged="$(mktemp "$snapshot/remote-op-ohm-deploy.bootstrap.XXXXXX")"
+  rm -f -- "$staged"
+  # Restore copies this file with cp -a, so it must be executable or the next
+  # deploy cannot start the preserved controller.
+  install -m 0755 -- "$target_controller" "$staged"
+  mv -f -- "$staged" "$snapshot/remote-op-ohm-deploy"
+  echo "OPIP_DEPLOY_CONTROLLER_BOOTSTRAP=ARMED"
+  echo "OPIP_DEPLOY_CONTROLLER_BOOTSTRAP_SHA=$head_sha"
+}
+
+preserve_target_deploy_controller_snapshot_if_transaction_present() {
+  local state_dir="/var/lib/ohm-deploy"
+  if [[ "${OPIP_DEPLOY_TEST_SEAMS:-0}" == "1" && -n "${OPIP_BOOTSTRAP_STATE_DIR:-}" ]]; then
+    state_dir="$OPIP_BOOTSTRAP_STATE_DIR"
+  fi
+  local matches=() real=0 other=0 candidate
+  shopt -s nullglob
+  matches=("$state_dir"/scheduler-before.*)
+  shopt -u nullglob
+  if [[ "${#matches[@]}" -gt 0 ]]; then
+    for candidate in "${matches[@]}"; do
+      if [[ -d "$candidate" && ! -L "$candidate" ]]; then
+        real=$((real + 1))
+      else
+        other=$((other + 1))
+      fi
+    done
+  fi
+  if [[ "$real" -eq 0 && "$other" -eq 0 ]]; then
+    return 0
+  fi
+  preserve_target_deploy_controller_snapshot
+}
+
+preserve_target_deploy_controller_snapshot_if_transaction_present
+
 tmpdir="$(mktemp -d)"
 had_canonical=0
 had_learning_export=0
