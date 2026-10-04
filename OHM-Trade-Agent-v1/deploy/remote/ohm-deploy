@@ -221,7 +221,8 @@ finally:
 
 snapshot_scheduler_state() {
   SCHEDULER_SNAPSHOT="$(mktemp -d "$STATE_DIR/scheduler-before.XXXXXX")"
-  for name in ohm-unified-cycle opip-learning-export opip-ml-evidence ohm-movement-discovery; do
+  for name in ohm-unified-cycle opip-learning-export opip-ml-evidence ohm-movement-discovery \
+    opip-feature-bus-capture opip-feasibility-evidence-capture; do
     if [[ -e "/etc/cron.d/$name" ]]; then
       cp -a "/etc/cron.d/$name" "$SCHEDULER_SNAPSHOT/$name"
     fi
@@ -249,7 +250,8 @@ OPS
 
 restore_scheduler_state() {
   [[ -n "$SCHEDULER_SNAPSHOT" && -d "$SCHEDULER_SNAPSHOT" ]] || return 0
-  for name in ohm-unified-cycle opip-learning-export opip-ml-evidence ohm-movement-discovery; do
+  for name in ohm-unified-cycle opip-learning-export opip-ml-evidence ohm-movement-discovery \
+    opip-feature-bus-capture opip-feasibility-evidence-capture; do
     if [[ -e "$SCHEDULER_SNAPSHOT/$name" ]]; then
       cp -a "$SCHEDULER_SNAPSHOT/$name" "/etc/cron.d/$name"
     else
@@ -434,6 +436,18 @@ UNIFIED_CYCLE_RELEASE_GRACE_SECONDS=120
 #: is rejected by the verifier); a test asserts the two stay equal.
 RUNTIME_VERIFIER_TIMEOUT_SECONDS=360
 
+#: Emergency containment margin for the verifier process. The outer `timeout` is
+#: NOT the normal failure mechanism: an ordinary evidence deficiency must always
+#: surface as the verifier's own structured FAIL receipt. The margin therefore has
+#: to cover everything that happens OUTSIDE the verifier's self-timed window:
+#:   * `docker compose exec` connect + container-side interpreter/import startup;
+#:   * one in-flight bounded canonical read on expiry
+#:     (`release_runtime_verifier.MAX_SINGLE_READ_SECONDS`, currently 10s);
+#:   * receipt flush + `docker compose exec` teardown;
+#:   * a reserve for host/container scheduling delay.
+#: A test proves the margin exceeds MAX_SINGLE_READ_SECONDS plus that reserve.
+RUNTIME_VERIFIER_CONTAINMENT_MARGIN_SECONDS=60
+
 #: Extract the authorized unified-cycle hard runtime bound from the installed
 #: scheduler entry (``timeout --signal=TERM --kill-after=Ns <BOUND> ...'').
 #: Returns the bound on stdout, or non-zero when it cannot be determined.
@@ -564,6 +578,168 @@ RELEASE_EVIDENCE_BASELINE="$(capture_release_evidence_baseline)"
 
 snapshot_scheduler_state
 
+#: Candidate evidence producers that can contend with the canonical writer's
+#: store lock. They are installed by the CANDIDATE revision's scheduler
+#: reconciliation, they are the only scheduled processes that open canonical
+#: storage, and they run inside `ohm-trade-agent` -- which rollback leaves
+#: running until the previous core is recreated. They must therefore be BOTH
+#: snapshotted (so the previous revision's exact scheduler state is restored)
+#: AND quiesced at the start of a rollback (so no producer can start inside the
+#: writer-rebuild window and win the store lock from the about-to-restore
+#: writer).
+EVIDENCE_PRODUCER_CRON_ENTRIES=(
+  opip-feature-bus-capture
+  opip-feasibility-evidence-capture
+)
+
+#: Host-side bound for the whole producer-quiescence exec (schedule removal plus
+#: TERM/KILL escalation and the absence re-proof). It only has to cover one
+#: bounded `/proc` scan loop, never a slow network or market read.
+EVIDENCE_PRODUCER_QUIESCE_SECONDS=60
+
+#: Terminate every candidate evidence producer that could touch canonical
+#: storage, prove the absence of survivors, and remove the candidate's producer
+#: schedule. The candidate core container is still the running one at this point,
+#: so the producers are terminated inside it.
+#:
+#: `pkill`/`pgrep` are NOT available: the core image is `python:3.12-slim` and
+#: ships no `procps`, so a `pkill`-based quiescence step is a silent no-op that
+#: would leave a producer owning the store across the writer restore. Process
+#: ownership is therefore proven from `/proc` directly with the interpreter that
+#: is guaranteed to exist in the image.
+#:
+#: Canonical ownership is an OS advisory-lock invariant. This function NEVER
+#: deletes a lock file; waiting for the owning process to exit is the only sound
+#: release mechanism.
+quiesce_evidence_producers() {
+  local name removed=0
+  for name in "${EVIDENCE_PRODUCER_CRON_ENTRIES[@]}"; do
+    if [[ -e "/etc/cron.d/$name" ]]; then
+      rm -f "/etc/cron.d/$name"
+      removed=$((removed + 1))
+    fi
+  done
+  echo "OPIP_EVIDENCE_PRODUCER_ENTRIES_REMOVED=$removed"
+
+  if [[ -z "$(docker compose ps -q ohm-trade-agent 2>/dev/null || true)" ]]; then
+    echo "OPIP_EVIDENCE_PRODUCER_QUIESCENCE=NO_CONTAINER"
+    echo "OPIP_EVIDENCE_PRODUCER_PROCESSES_SIGNALLED=0"
+    echo "OPIP_EVIDENCE_PRODUCER_PROCESSES_REMAINING=0"
+    return 0
+  fi
+
+  # The host has coreutils (its own cron entries use `timeout`), so the outer
+  # `timeout` bounds the whole exec. The in-container script bounds its own wait
+  # too, so a stalled `docker compose exec` client can never hold the rollback.
+  # A failed exec is reported as UNKNOWN and never claimed as quiescence; the
+  # SAFE_BASELINE writer health gate below remains the fail-closed proof.
+  if timeout --signal=TERM --kill-after=5s "$EVIDENCE_PRODUCER_QUIESCE_SECONDS" \
+    docker compose exec -T ohm-trade-agent python - <<'PY'
+import os
+import signal
+import time
+
+# The scheduled release-scheduler evidence producers. Only these two modules may
+# open canonical storage, and each is started as
+# `python -m app.jobs.<module>` inside this container.
+PATTERNS = (
+    "app.jobs.capture_feasibility_evidence_shadow",
+    "app.jobs.capture_feature_bus_shadow",
+)
+
+
+def offenders() -> list[int]:
+    found = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == os.getpid():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as handle:
+                cmdline = handle.read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        if any(pattern in cmdline for pattern in PATTERNS):
+            found.append(pid)
+    return found
+
+
+def signal_all(pids, sig) -> None:
+    for pid in pids:
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            pass
+
+
+first = offenders()
+signal_all(first, signal.SIGTERM)
+remaining = first
+deadline = time.monotonic() + 20.0
+while remaining and time.monotonic() < deadline:
+    time.sleep(0.5)
+    remaining = offenders()
+if remaining:
+    # Escalate once, then re-prove. A survivor is reported, never assumed away.
+    signal_all(remaining, signal.SIGKILL)
+    time.sleep(0.5)
+    remaining = offenders()
+print(f"OPIP_EVIDENCE_PRODUCER_PROCESSES_SIGNALLED={len(first)}")
+print(f"OPIP_EVIDENCE_PRODUCER_PROCESSES_REMAINING={len(remaining)}")
+print(
+    "OPIP_EVIDENCE_PRODUCER_QUIESCENCE="
+    + ("QUIESCED" if not remaining else "NOT_QUIESCED")
+)
+PY
+  then
+    :
+  else
+    echo "OPIP_EVIDENCE_PRODUCER_QUIESCENCE=UNKNOWN" >&2
+  fi
+}
+
+#: Bounded diagnostics for a writer that did not become healthy, detailed enough
+#: to tell the operator which of the five realistic failure classes occurred:
+#: process crash, store-lock contention, SQLite/schema/integrity failure, a stale
+#: Unix socket, or a pure container healthcheck failure.
+writer_health_diagnostics() {
+  local cid status exit_code restarts log classification
+  cid="$(docker compose ps -q opip-canonical-writer 2>/dev/null || true)"
+  if [[ -z "$cid" ]]; then
+    echo "OPIP_WRITER_DIAG=NO_CONTAINER" >&2
+    return 0
+  fi
+  status="$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null || true)"
+  exit_code="$(docker inspect --format='{{.State.ExitCode}}' "$cid" 2>/dev/null || true)"
+  restarts="$(docker inspect --format='{{.RestartCount}}' "$cid" 2>/dev/null || true)"
+  echo "OPIP_WRITER_DIAG_HEALTH=$status" >&2
+  echo "OPIP_WRITER_DIAG_EXIT_CODE=$exit_code" >&2
+  echo "OPIP_WRITER_DIAG_RESTART_COUNT=$restarts" >&2
+
+  # One bounded log window carries the fail-closed reason; classification is by
+  # the exception/OS token the writer itself logs.
+  log="$(docker compose logs --tail=200 --no-log-prefix opip-canonical-writer 2>/dev/null || true)"
+  case "$log" in
+    *CanonicalStoreBusyError*)
+      classification="STORE_LOCK_CONTENTION" ;;
+    *CanonicalDbValidationError*|*SchemaVersionError*|*CanonicalCheckpointError*|*"database disk image is malformed"*|*"file is not a database"*|*"no such table"*)
+      classification="SQLITE_SCHEMA_OR_INTEGRITY" ;;
+    *"Address already in use"*|*"Errno 98"*|*"AF_UNIX"*)
+      classification="STALE_UNIX_SOCKET" ;;
+    *Traceback*)
+      classification="WRITER_PROCESS_CRASH" ;;
+    *)
+      classification="CONTAINER_HEALTHCHECK_OR_STARTUP" ;;
+  esac
+  echo "OPIP_WRITER_DIAG_CLASSIFICATION=$classification" >&2
+  echo "OPIP_WRITER_DIAG_LOG_BEGIN" >&2
+  printf '%s\n' "$log" | tail -n 40 >&2 || true
+  echo "OPIP_WRITER_DIAG_LOG_END" >&2
+  return 0
+}
+
 rollback() {
   rc=$?
   trap - ERR
@@ -574,6 +750,14 @@ rollback() {
 
   # Free paper-worker memory before rebuilding the previous deterministic core.
   stop_paper_stack
+
+  # Quiesce candidate evidence producers BEFORE any rebuild. The candidate's
+  # producer schedule is still installed and its producers run inside the
+  # candidate core container, which stays up through the whole build window. A
+  # producer that starts inside the writer-rebuild window can win the canonical
+  # store lock from the about-to-restore writer, which then fails closed and can
+  # never report healthy inside the bounded writer health window.
+  quiesce_evidence_producers
 
   "${GIT[@]}" checkout -f main
   "${GIT[@]}" reset --hard "$PREVIOUS_SHA"
@@ -603,6 +787,7 @@ rollback() {
     fi
     if ! wait_writer_health; then
       echo "rollback writer health check failed" >&2
+      writer_health_diagnostics
       restore_scheduler_state
       cleanup_snapshot
       exit "$rc"
@@ -674,6 +859,7 @@ if ! wait_core_health; then
 fi
 if ! wait_writer_health; then
   echo "production writer health check failed" >&2
+  writer_health_diagnostics
   false
 fi
 if ! validate_writer_resource_limits; then
@@ -720,8 +906,13 @@ wait_unified_cycle_success "$READY_AFTER" "$((SECONDS + UNIFIED_CYCLE_RELEASE_WA
 
 # The runtime verifier is given its own independent bounded window (it never
 # inherits only the leftover of the cycle wait), so a cycle completing near the
-# end of its window cannot starve the verifier.
-timeout --signal=TERM --kill-after=5s "$((RUNTIME_VERIFIER_TIMEOUT_SECONDS + 10))" \
+# end of its window cannot starve the verifier. The containment margin means a
+# normal evidence deficiency is reported by the VERIFIER's own bounded, structured
+# FAIL receipt rather than by this outer watchdog (which exists only so a hung
+# process cannot outlive the deploy transaction).
+VERIFIER_CONTAINMENT_SECONDS=$((RUNTIME_VERIFIER_TIMEOUT_SECONDS + RUNTIME_VERIFIER_CONTAINMENT_MARGIN_SECONDS))
+echo "OPIP_RUNTIME_VERIFY_CONTAINMENT_SECONDS=$VERIFIER_CONTAINMENT_SECONDS"
+timeout --signal=TERM --kill-after=5s "$VERIFIER_CONTAINMENT_SECONDS" \
   docker compose exec -T ohm-trade-agent \
   python -m app.services.release_runtime_verifier \
     --expected-sha "$TARGET_SHA" \

@@ -130,6 +130,18 @@ that target SHA's `deploy/remote/reconcile-scheduler.sh` runs, before it alters 
 THEN:
 it proves the repository HEAD is a 40-character SHA, proves `deploy/remote/ohm-deploy` is a non-empty regular file, passes `bash -n` on that target controller, requires exactly one real `scheduler-before.*` directory, requires that snapshot's `remote-op-ohm-deploy.present` marker and a non-empty regular snapshot controller, and compares the snapshot controller to the target; when they differ it atomically replaces only `scheduler-before.*/remote-op-ohm-deploy` with the target controller at mode `0755` (so a later rollback can execute it) and emits `OPIP_DEPLOY_CONTROLLER_BOOTSTRAP=ARMED` plus `OPIP_DEPLOY_CONTROLLER_BOOTSTRAP_SHA=<target SHA>`; when they already match it emits `OPIP_DEPLOY_CONTROLLER_BOOTSTRAP=NOT_NEEDED` and does not rewrite the snapshot; zero snapshot directories, multiple snapshot directories, a missing present marker, a non-regular or empty snapshot controller, a non-regular target, a `bash -n` failure, or a HEAD that is not a 40-character SHA fail closed without replacing the snapshot; the SSH gateway, learning reader, learning diagnostics, cron snapshots, root crontab snapshot, `last-good-sha`, and SAFE_BASELINE application rollback are not modified; a reconcile with no `scheduler-before.*` entry (initial host bootstrap) does not invent a snapshot and does not fail; path overrides are inert unless `OPIP_DEPLOY_TEST_SEAMS=1`; Paper-v2 stays `off`, legacy remains the sole new-entry authority, funded/live authority stays absent, Committee stays `off`, and `TARGET_PAPER` stays blocked
 
+AC-015:
+GIVEN:
+the production Release Pipeline failure of run 37174893501 (a healthy unified cycle, no runtime-verifier PASS/FAIL receipt, a deploy that exited `124`, and a rollback after which `opip-canonical-writer` was unhealthy and `SAFE_BASELINE_ROLLBACK` was `UNPROVEN`)
+WHEN:
+the release pipeline's canonical-writer authority, runtime-verifier window and rollback ordering are exercised
+THEN:
+(a) `opip-canonical-writer` is the SOLE writable canonical-store owner (it holds `CanonicalStoreLock` for its process lifetime and acquisition fails closed with no wait-and-retry), the F5 feasibility-evidence producer opens no second writable store handle and submits `feasibility.evidence.recorded` as a `WriterIntent` through the canonical writer client/service, a real writer server owning the store still refuses a second writable `CanonicalWriter`, and a submission over the client path becomes readable canonical history with its existing idempotency key, event schema, LOW priority, correlation id, cursor and retry semantics unchanged; no second writer architecture, store owner or lock-file deletion is introduced
+(b) failure to reach the canonical writer is fail-closed and retryable: the producer counts a retryable disposition, publishes nothing, and does NOT advance or drop the evidence cursor, so the record is re-attempted rather than silently skipped
+(c) `MAX_WAIT_SECONDS` stays exactly 360 and every operation inside the runtime verifier's polling loop is bounded against the verifier's own deadline: the deadline is tested BEFORE each read, the inter-attempt sleep is clamped to the remaining budget, and a single read exceeding the declared `MAX_SINGLE_READ_SECONDS` bound stops the loop with an explicit `READ_OVERRUN` reason, so an ordinary "matching F5 evidence never arrived" outcome terminates under the verifier's own control within its own budget and emits a machine-readable FAIL receipt (`OPIP_RELEASE_RUNTIME_VERIFICATION=FAIL`, the failure class, stage, attempts, observed seconds, and the last observed feature-snapshot count, fresh-instrument count, consecutive-60s-snapshot status, feasibility-evidence count and matching-F5 status) instead of the outer watchdog's `124`; a slow but successful read is never falsely failed; and the deploy's outer containment exceeds the verifier window plus the declared single-read bound, so that watchdog is emergency containment only and never the normal timeout mechanism
+(d) rollback quiesces candidate evidence producers BEFORE any rebuild: it removes the candidate producer schedule and terminates, then SIGKILL-escalates, every process matching the two evidence-producer modules by scanning `/proc` with the container's own interpreter (no `pkill`/`pgrep` dependency), all under a bounded host exec; only then does it restore the previous SHA, apply the SAFE_BASELINE override, rebuild and prove core health, prove writer health when the writer is part of that SHA, validate SAFE_BASELINE modes, restore the previously snapshotted scheduler state and the paper topology, and finally emit `OPIP_SAFE_BASELINE_ROLLBACK=SUCCESS`; canonical ownership is never released by deleting a lock file, a failed quiescence exec is reported `UNKNOWN` and surviving processes are reported `NOT_QUIESCED` rather than assumed away, and a writer health failure additionally emits bounded classified diagnostics distinguishing store-lock contention, SQLite/schema/integrity failure, a stale Unix socket, a writer process crash, and a container healthcheck/startup failure
+(e) no authority is widened anywhere in this increment: Paper-v2 stays `off`, the Committee stays absent, funded/live and exchange/order authority remain absent, the legacy path remains the sole new-entry authority, and `TARGET_PAPER` remains BLOCKED
+
 EXPLICITLY OUT OF SCOPE:
 - Activating TARGET_PAPER, Paper-v2, the Committee, or any funded/live/exchange/order authority
 - Deleting, rewriting or rescoping the historical ATDD increments that recorded the Feature Bus `off`
@@ -197,6 +209,20 @@ AC-010 -> tests/test_release_runtime_verifier.py::test_runtime_posture_requires_
 AC-010 -> tests/test_opip_release_pipeline_v1.py::test_ac_010_runtime_verifier_precedes_commit_and_rolls_back_to_baseline
 AC-010 -> tests/test_opip_release_pipeline_v1.py::test_ac_010_deployment_receipt_requires_runtime_verifier_and_baseline_rollback
 AC-011 -> tests/test_opip_release_pipeline_v1.py::test_ac_011_rollback_success_requires_verified_safe_baseline_modes
+AC-015 -> tests/test_opip_canonical_single_writer_feasibility_v1.py::test_ac_015_sole_writer_owns_the_store_and_refuses_a_second_writer
+AC-015 -> tests/test_opip_canonical_single_writer_feasibility_v1.py::test_ac_015_feasibility_capture_publishes_through_the_writer_client_into_canonical_history
+AC-015 -> tests/test_opip_canonical_single_writer_feasibility_v1.py::test_ac_015_writer_client_outage_is_fail_closed_and_does_not_advance_or_drop_evidence
+AC-015 -> tests/test_opip_canonical_single_writer_feasibility_v1.py::test_ac_015_production_submitter_is_a_client_and_the_module_opens_no_writable_store
+AC-015 -> tests/test_opip_canonical_single_writer_feasibility_v1.py::test_ac_015_valid_evidence_returns_pass_within_the_verifier_budget
+AC-015 -> tests/test_opip_canonical_single_writer_feasibility_v1.py::test_ac_015_missing_matching_f5_evidence_returns_structured_fail_within_the_budget
+AC-015 -> tests/test_opip_canonical_single_writer_feasibility_v1.py::test_ac_015_receipt_cli_reports_structured_fail_instead_of_the_outer_watchdog
+AC-015 -> tests/test_opip_canonical_single_writer_feasibility_v1.py::test_ac_015_slow_read_stops_at_the_declared_read_bound_without_overrunning
+AC-015 -> tests/test_opip_canonical_single_writer_feasibility_v1.py::test_ac_015_slow_but_successful_read_is_not_falsely_failed
+AC-015 -> tests/test_opip_canonical_single_writer_feasibility_v1.py::test_ac_015_deploy_containment_exceeds_the_verifier_window_and_is_not_the_normal_timeout
+AC-015 -> tests/test_opip_canonical_single_writer_feasibility_v1.py::test_ac_015_rollback_quiesces_producers_before_the_writer_restore
+AC-015 -> tests/test_opip_canonical_single_writer_feasibility_v1.py::test_ac_015_rollback_never_claims_unproven_producer_quiescence
+AC-015 -> tests/test_opip_canonical_single_writer_feasibility_v1.py::test_ac_015_writer_health_failure_is_classified_for_the_operator
+AC-015 -> tests/test_opip_canonical_single_writer_feasibility_v1.py::test_ac_015_no_authority_is_widened_by_this_increment
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/services/release_profiles.py
@@ -273,6 +299,11 @@ AC-013 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.
 AC-014 -> OHM-Trade-Agent-v1/deploy/remote/reconcile-scheduler.sh
 AC-014 -> OHM-Trade-Agent-v1/tests/test_opip_deploy_controller_bootstrap.py
 AC-014 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
+AC-015 -> OHM-Trade-Agent-v1/app/jobs/capture_feasibility_evidence_shadow.py
+AC-015 -> OHM-Trade-Agent-v1/app/services/release_runtime_verifier.py
+AC-015 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
+AC-015 -> OHM-Trade-Agent-v1/tests/test_opip_canonical_single_writer_feasibility_v1.py
+AC-015 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
 
 DEFERRED DISCOVERIES:
 - `TARGET_PAPER` remains BLOCKED. Activating it (Paper-v2) requires the ATDD-R4-B2 AC-011 comparator evidence, F11 protection READY, legacy drain READY and explicit OWNER approval, and is a separate OWNER increment; this contract does not authorize it.

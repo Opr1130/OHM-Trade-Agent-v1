@@ -46,6 +46,15 @@ never inside the protected unified cycle, and holds its OWN process-level lock
 other). It is authorized only when the Feature Bus AND the canonical writer are
 both in ``shadow``. It grants no trading, ranking, admission, allocation, order or
 exchange authority.
+
+SINGLE CANONICAL WRITER
+-----------------------
+``opip-canonical-writer`` is the SOLE writable owner of the canonical store: it
+holds ``CanonicalStoreLock`` for its process lifetime, and acquisition fails
+closed rather than waiting. This producer is therefore strictly a store CONSUMER.
+It submits ``feasibility.evidence.recorded`` through ``CanonicalWriterClient``
+(see ``resolve_canonical_submitter``) and never opens a writable canonical store
+handle, so a second writer can never contend for or corrupt canonical ownership.
 """
 
 from __future__ import annotations
@@ -793,11 +802,13 @@ def build_short_feasibility_evidence(
     )
 
 
-def _make_canonical_submit(writer: Any) -> Callable[[dict], str]:
+def _make_canonical_submit(client: Any) -> Callable[[dict], str]:
     """Build the live canonical-writer submit callable for one evidence payload.
 
-    The writer lifecycle is owned by the caller (created before the pass, closed
-    after) so the single connection is reused for the whole bounded pass.
+    ``client`` is the canonical writer CLIENT (``WriterClient`` protocol), never a
+    store owner. The client lifecycle is owned by the caller; the production
+    client opens one bounded socket round-trip per submission, so no store
+    connection, lock, or transaction is held across the pass.
     """
     from app.opip.canonical.models import WriterIntent
     from app.opip.canonical.paths import EVENT_SCHEMA_VERSION
@@ -807,7 +818,7 @@ def _make_canonical_submit(writer: Any) -> Callable[[dict], str]:
     )
 
     def _submit(payload: dict) -> str:
-        return writer.submit(
+        return client.submit(
             WriterIntent(
                 schema_version=EVENT_SCHEMA_VERSION,
                 priority=FEASIBILITY_EVIDENCE_PRIORITY,
@@ -822,6 +833,32 @@ def _make_canonical_submit(writer: Any) -> Callable[[dict], str]:
         ).status
 
     return _submit
+
+
+def resolve_canonical_submitter(client: Any | None = None) -> Callable[[dict], str]:
+    """Return the production canonical-writer submit callable for feasibility evidence.
+
+    SINGLE-WRITER INVARIANT. This producer is a canonical-store *consumer*, never
+    an owner. ``opip-canonical-writer`` (``CanonicalWriterServer`` ->
+    ``CanonicalWriter``) holds ``CanonicalStoreLock`` for its whole process
+    lifetime, and lock acquisition is deliberately fail-closed with no
+    wait-and-retry. A second writable ``CanonicalWriter`` opened here could
+    therefore never own the live store -- it raises ``CanonicalStoreBusyError``
+    and publishes no ``feasibility.evidence.recorded`` at all, while
+    ``release_runtime_verifier`` waits for matching F5 evidence. Production
+    submits ``WriterIntent`` over the canonical writer socket through
+    ``CanonicalWriterClient``, exactly like the Feature Bus publisher and the
+    alert-governor bridge.
+
+    ``client`` is an injectable seam so a test can drive the genuine submission
+    path (``_make_canonical_submit``) without a Unix socket. Production always
+    constructs the socket client; no writable store handle is ever created.
+    """
+    if client is None:
+        from app.opip.canonical.client import CanonicalWriterClient
+
+        client = CanonicalWriterClient()
+    return _make_canonical_submit(client)
 
 
 def main() -> None:
@@ -859,42 +896,36 @@ def main() -> None:
 
     from app.exchanges.kraken import KrakenClient
     from app.jobs.capture_feature_bus_shadow import run_capture_locked
-    from app.opip.canonical.paths import db_path
-    from app.opip.canonical.writer import CanonicalWriter
 
     client = KrakenClient()
-    writer = CanonicalWriter(db_path())
-    try:
-        submit = _make_canonical_submit(writer)
+    submit = resolve_canonical_submitter()
 
-        def _build(snapshot, direction):
-            if direction == "SHORT":
-                return build_short_feasibility_evidence(
-                    snapshot,
-                    client=client,
-                    notional_usd=notional,
-                    acquisition_instant=datetime.now(timezone.utc),
-                )
-            return build_long_feasibility_evidence(
+    def _build(snapshot, direction):
+        if direction == "SHORT":
+            return build_short_feasibility_evidence(
                 snapshot,
                 client=client,
                 notional_usd=notional,
                 acquisition_instant=datetime.now(timezone.utc),
             )
-
-        result = run_capture_locked(
-            lock_path=args.lock_path or None,
-            lock_env=FEASIBILITY_CAPTURE_LOCK_ENV,
-            lock_default=FEASIBILITY_CAPTURE_LOCK_PATH,
-            capture_fn=lambda: capture_feasibility_evidence_shadow(
-                settings=settings,
-                evidence_builder=_build,
-                submit_payload=submit,
-                cursor_path=args.cursor_path or None,
-            ),
+        return build_long_feasibility_evidence(
+            snapshot,
+            client=client,
+            notional_usd=notional,
+            acquisition_instant=datetime.now(timezone.utc),
         )
-    finally:
-        writer.close()
+
+    result = run_capture_locked(
+        lock_path=args.lock_path or None,
+        lock_env=FEASIBILITY_CAPTURE_LOCK_ENV,
+        lock_default=FEASIBILITY_CAPTURE_LOCK_PATH,
+        capture_fn=lambda: capture_feasibility_evidence_shadow(
+            settings=settings,
+            evidence_builder=_build,
+            submit_payload=submit,
+            cursor_path=args.cursor_path or None,
+        ),
+    )
     print("O'Pip Feasibility Evidence SHADOW capture — EVIDENCE ONLY")
     print("Trading authority: NONE")
     print(json.dumps(result, indent=2, sort_keys=True))
@@ -921,4 +952,5 @@ __all__ = [
     "feasibility_capture_authorized",
     "main",
     "resolve_capture_notional",
+    "resolve_canonical_submitter",
 ]
