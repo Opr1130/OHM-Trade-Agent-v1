@@ -1,4 +1,46 @@
-"""Bounded, read-only verifier for an allowlisted active release profile."""
+"""Bounded, read-only verifier for an allowlisted active release profile.
+
+Bounded-window contract
+-----------------------
+``MAX_WAIT_SECONDS`` is the verifier's OWN window and is deliberately not
+raised. Three rules keep the process inside its own window plus at most ONE
+in-flight read:
+
+* the deadline is tested BEFORE every read attempt, so the loop can never start
+  a read with no remaining budget (the pre-fix bug: the deadline was tested only
+  AFTER a read, so the loop always performed one more full read and slept up to a
+  whole poll interval past the deadline);
+* the sleep between attempts is clamped to the remaining budget, so the loop
+  cannot overshoot by a poll interval;
+* a read that exceeds the DECLARED worst-case single-read bound
+  (``MAX_SINGLE_READ_SECONDS``) stops the loop immediately with a structured
+  ``READ_OVERRUN`` receipt instead of polling again on top of an already
+  anomalous read.
+
+Those rules give the enforceable bound
+
+    total wall time <= MAX_WAIT_SECONDS + MAX_SINGLE_READ_SECONDS
+
+because at most one read can be in flight when the deadline passes.
+``MAX_SINGLE_READ_SECONDS`` is the documented bound of one bounded canonical
+read: a read-only connection over a local SQLite/WAL file, two indexed range
+reads of at most 1000 rows, and JSON parsing of those rows. The deploy's outer
+containment MUST exceed ``MAX_WAIT_SECONDS + MAX_SINGLE_READ_SECONDS`` by a
+margin that also covers container-exec startup, interpreter import and receipt
+flush, so the outer watchdog is emergency containment only and never the normal
+timeout mechanism.
+
+A normal "matching evidence never arrived" outcome therefore terminates under
+the verifier's own control and emits a structured receipt
+(``OPIP_RELEASE_RUNTIME_VERIFICATION=FAIL`` plus the last observed evidence
+counters).
+
+Read path
+---------
+The verifier is a canonical-store CONSUMER. ``_read_new_evidence`` uses
+``CanonicalWriter.for_reads`` (read-only connection, no store lock), so it never
+contends with ``opip-canonical-writer``, the sole writable owner.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +48,7 @@ import argparse
 import json
 import os
 import re
+import sqlite3
 import sys
 import time
 from collections import defaultdict
@@ -24,6 +67,27 @@ POLL_INTERVAL_SECONDS = 10
 MAX_EVIDENCE_AGE = timedelta(seconds=180)
 MAX_FEV_SOURCE_AGE = timedelta(seconds=120)
 REQUIRED_SNAPSHOT_GRID_SECONDS = 60
+
+#: Worst-case wall time that one already-started bounded canonical read can add
+#: AFTER this verifier's own deadline expires: the read-only canonical connection
+#: uses a 5.0s SQLite timeout and scans a local file with no network. The deploy's
+#: outer containment margin must exceed this (plus container-exec startup,
+#: interpreter import and receipt flush), so an evidence deficiency surfaces as
+#: this verifier's structured FAIL and never as the outer watchdog's ``124``.
+#: Enforced by the loop's ``READ_OVERRUN`` guard; ``main()`` is verified against
+#: the deploy's outer timeout by the AC-015 receipt/containment tests.
+MAX_SINGLE_READ_SECONDS = 10.0
+
+#: The evidence counters that make a FAIL receipt actionable on its own. Each is
+#: printed as ``OPIP_RELEASE_<UPPER_SNAKE>=<value>``.
+FAILURE_EVIDENCE_KEYS = (
+    "feature_snapshot_count",
+    "fresh_instrument_count",
+    "consecutive_60s_snapshots",
+    "feasibility_evidence_count",
+    "feasibility_matches_fresh_snapshot",
+)
+
 REQUIRED_MODES = (
     "OPIP_FEATURE_BUS_MODE",
     "OPIP_CANONICAL_WRITER_MODE",
@@ -32,6 +96,40 @@ REQUIRED_MODES = (
     "OPIP_COMMITTEE_MODE",
     "OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD",
 )
+
+
+class ReleaseRuntimeVerificationTimeout(TimeoutError):
+    """The bounded window expired without proving fresh evidence.
+
+    Carries the last observed evidence diagnostics so an ordinary evidence
+    deficiency always produces a structured, machine-readable FAIL receipt
+    instead of a bare timeout (or the outer watchdog's exit ``124``).
+    """
+
+    stage = "EVIDENCE_TIMEOUT"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        evidence: Mapping[str, Any] | None = None,
+        attempts: int = 0,
+        observed_seconds: float = 0.0,
+        stage: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.evidence: dict[str, Any] = dict(evidence or {})
+        self.attempts = attempts
+        self.observed_seconds = observed_seconds
+        if stage is not None:
+            self.stage = stage
+
+
+def _receipt_value(value: Any) -> str:
+    """Render a receipt value deterministically (JSON-style booleans)."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
 
 
 def _aware_utc(value: str, *, name: str) -> datetime:
@@ -217,8 +315,31 @@ def verify_release_runtime(
         raise ValueError("runtime verification permits only EVIDENCE_SHADOW; SAFE_BASELINE is rollback-only")
 
     deadline = time.monotonic() + timeout_seconds
+    started = time.monotonic()
+    attempts = 0
+    evidence_report: dict[str, Any] | None = None
+
+    def _window_expired() -> ReleaseRuntimeVerificationTimeout:
+        return ReleaseRuntimeVerificationTimeout(
+            "fresh consecutive snapshots and matching F5 evidence were not "
+            f"proven within {timeout_seconds}s",
+            evidence=evidence_report,
+            attempts=attempts,
+            observed_seconds=time.monotonic() - started,
+        )
+
     while True:
+        # The deadline is enforced BEFORE any read is started. This is the
+        # fix for the production failure: the old loop tested the deadline only
+        # AFTER a read, so it always began one more full read -- and then slept
+        # up to a whole poll interval -- past its own window, landing on the
+        # deploy's outer watchdog as a bare exit 124.
+        if deadline - time.monotonic() <= 0:
+            raise _window_expired()
+        read_started = time.monotonic()
         snapshots, evidence = _read_new_evidence(baseline)
+        read_seconds = time.monotonic() - read_started
+        attempts += 1
         now = datetime.now(timezone.utc)
         evidence_passed, evidence_report = _new_evidence_is_valid(
             snapshots,
@@ -235,10 +356,49 @@ def verify_release_runtime(
                 "evidence": evidence_report,
                 **posture,
             }
+        # A read past the declared bound invalidates the containment arithmetic,
+        # so stop here with an explicit reason instead of stacking more unbounded
+        # work on top of it. Checked only after a PASS, so a slow-but-successful
+        # read is never reported as a failure.
+        if read_seconds > MAX_SINGLE_READ_SECONDS:
+            raise ReleaseRuntimeVerificationTimeout(
+                "one canonical read exceeded the declared "
+                f"{MAX_SINGLE_READ_SECONDS}s bound "
+                f"(observed {read_seconds:.3f}s); the bounded window contract "
+                "cannot be honoured",
+                evidence=evidence_report,
+                attempts=attempts,
+                observed_seconds=time.monotonic() - started,
+                stage="READ_OVERRUN",
+            )
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise TimeoutError("fresh consecutive snapshots and matching F5 evidence were not proven")
+            raise _window_expired()
         time.sleep(min(POLL_INTERVAL_SECONDS, remaining))
+
+
+def _emit_failure_diagnostics(exc: BaseException) -> None:
+    """Print the deterministic FAIL receipt for a bounded verification failure."""
+    print("OPIP_RELEASE_RUNTIME_VERIFICATION=FAIL")
+    print(f"OPIP_RELEASE_RUNTIME_FAILURE={type(exc).__name__}")
+    stage = getattr(exc, "stage", None)
+    if isinstance(stage, str) and stage:
+        print(f"OPIP_RELEASE_RUNTIME_FAILURE_STAGE={stage}")
+    attempts = getattr(exc, "attempts", None)
+    if isinstance(attempts, int) and not isinstance(attempts, bool):
+        print(f"OPIP_RELEASE_RUNTIME_ATTEMPTS={attempts}")
+    observed = getattr(exc, "observed_seconds", None)
+    if isinstance(observed, (int, float)) and not isinstance(observed, bool):
+        print(f"OPIP_RELEASE_RUNTIME_OBSERVED_SECONDS={observed:.3f}")
+    evidence = getattr(exc, "evidence", None)
+    reported = 0
+    if isinstance(evidence, Mapping):
+        for key in FAILURE_EVIDENCE_KEYS:
+            if key in evidence:
+                print(f"OPIP_RELEASE_{key.upper()}={_receipt_value(evidence[key])}")
+                reported += 1
+    if reported == 0:
+        print("OPIP_RELEASE_RUNTIME_OBSERVED_EVIDENCE=NONE")
 
 
 def main() -> None:
@@ -258,9 +418,15 @@ def main() -> None:
             ready_after=_aware_utc(args.ready_after, name="ready-after"),
             timeout_seconds=args.timeout_seconds,
         )
-    except (OSError, RuntimeError, TypeError, ValueError, TimeoutError) as exc:
-        print("OPIP_RELEASE_RUNTIME_VERIFICATION=FAIL")
-        print(f"OPIP_RELEASE_RUNTIME_FAILURE={type(exc).__name__}")
+    except (
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        sqlite3.Error,
+        TimeoutError,
+    ) as exc:
+        _emit_failure_diagnostics(exc)
         sys.exit(1)
     print("OPIP_RELEASE_RUNTIME_VERIFICATION=PASS")
     print(f"OPIP_RELEASE_RUNTIME_SHA={result['sha']}")
@@ -270,7 +436,7 @@ def main() -> None:
     print(f"OPIP_RELEASE_PROTECTION={result['protection']}")
     print(f"OPIP_RELEASE_TARGET_AUTHORITY={result['target_authority']}")
     for key, value in sorted(result["evidence"].items()):
-        print(f"OPIP_RELEASE_{key.upper()}={value}")
+        print(f"OPIP_RELEASE_{key.upper()}={_receipt_value(value)}")
 
 
 if __name__ == "__main__":  # pragma: no cover
