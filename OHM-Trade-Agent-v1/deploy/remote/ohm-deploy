@@ -475,6 +475,192 @@ RUNTIME_VERIFIER_TIMEOUT_SECONDS=360
 #: A test proves the margin exceeds MAX_SINGLE_READ_SECONDS plus that reserve.
 RUNTIME_VERIFIER_CONTAINMENT_MARGIN_SECONDS=60
 
+#: ---------------------------------------------------------------------------
+#: Read-only unified-cycle wait-failure evidence (AC-013).
+#:
+#: "no successful unified cycle was observed" is the SYMPTOM, not the cause. On
+#: this host that symptom has causes the structured log alone cannot separate:
+#: the cron wrapper never ran; the wrapper ran but could not take its `flock`, so
+#: NOTHING is appended to the log at all; or a cycle ran and was skipped behind
+#: the in-container cycle lock, or died without printing its completion pair.
+#: Naming which one it was turns a bounded blind wait into a receipt that is
+#: diagnosable without an interactive investigation -- and it must happen HERE,
+#: in the deploy log, because rollback restores the previous release's
+#: diagnostics helper and would otherwise discard the evidence.
+#:
+#: Scope discipline: this reporter runs ONLY after the wait has already failed,
+#: and it is strictly observational -- it opens no lock, takes no lock, starts no
+#: cycle/container/scheduler, creates, truncates and deletes no file, and every
+#: probe is individually failure-tolerant. It therefore cannot change the wait's
+#: success semantics, and it can neither replace nor mask the original failure
+#: reason. It never inspects the in-container cycle lock, because that would
+#: require starting a process inside the production container.
+#:
+#: Leak discipline: the surfaced tail is line-bounded, byte-bounded, truncated per
+#: line, and allowlisted to release markers and exception frames only -- never
+#: arbitrary application output -- so a bounded diagnostic cannot become an
+#: unintended evidence-export channel.
+UNIFIED_CYCLE_DIAGNOSTIC_TAIL_LINES=200
+UNIFIED_CYCLE_DIAGNOSTIC_TAIL_MATCHES=60
+UNIFIED_CYCLE_DIAGNOSTIC_TAIL_BYTES=8000
+UNIFIED_CYCLE_DIAGNOSTIC_LINE_BYTES=400
+UNIFIED_CYCLE_DIAGNOSTIC_LINE_FILTER='^(OPIP_[A-Z0-9_]+=|OHM Unified Cycle skipped|Traceback \(most recent call last\)|  File |[A-Za-z_][A-Za-z0-9_.]*(Error|Exception)(:|$))'
+
+#: Read-only lock-ownership probe. `flock(2)`/`fcntl(3)` locks are enumerated by
+#: the kernel in ``/proc/locks`` as
+#: ``<id>: <TYPE> <MODE> <ACCESS> <pid> <major>:<minor>:<inode>``, so matching the
+#: lock file's OWN device:inode identifies a currently held lock WITHOUT taking,
+#: releasing or deleting anything. `stat` reports the raw device number in hex,
+#: which is decoded into the kernel's major/minor split. An undeterminable probe
+#: reports UNKNOWN instead of guessing.
+unified_cycle_lock_probe() {
+  local path="$1" locks_file="${2:-/proc/locks}"
+  local dev_hex ino dev major minor needle
+  [[ -e "$path" ]] || { echo "MISSING"; return 0; }
+  dev_hex="$(stat -c '%D' "$path" 2>/dev/null || true)"
+  ino="$(stat -c '%i' "$path" 2>/dev/null || true)"
+  [[ "$dev_hex" =~ ^[0-9a-fA-F]+$ && "$ino" =~ ^[0-9]+$ ]] || { echo "UNKNOWN"; return 0; }
+  dev=$(( 16#$dev_hex ))
+  major=$(( (dev >> 20) & 0xfff ))
+  minor=$(( dev & 0xfffff ))
+  needle="$(printf '%02x:%02x:%s' "$major" "$minor" "$ino")"
+  if grep -qE " ${needle}([[:space:]]|$)" "$locks_file" 2>/dev/null; then
+    echo "HELD"
+  else
+    echo "NOT_HELD"
+  fi
+}
+
+report_unified_cycle_wait_failure() {
+  local cycle_log="$1" ready_after="$2" reason="$3"
+  local entry="/etc/cron.d/ohm-unified-cycle"
+  local locks_file="/proc/locks"
+  # Both overrides are inert in production: they are honored only under the same
+  # explicit test marker the wait's own seams require, and they can only change a
+  # diagnostic string -- never the wait's success semantics.
+  if [[ "${OPIP_DEPLOY_TEST_SEAMS:-0}" == "1" ]]; then
+    if [[ -n "${OPIP_RELEASE_SCHEDULER_ENTRY:-}" ]]; then
+      entry="$OPIP_RELEASE_SCHEDULER_ENTRY"
+    fi
+    if [[ -n "${OPIP_RELEASE_LOCKS_FILE:-}" ]]; then
+      locks_file="$OPIP_RELEASE_LOCKS_FILE"
+    fi
+  fi
+
+  echo "OPIP_UNIFIED_CYCLE_WAIT_FAILURE=$reason"
+  echo "OPIP_UNIFIED_CYCLE_WAIT_READY_AFTER=$ready_after"
+  echo "OPIP_UNIFIED_CYCLE_DIAGNOSTIC=READ_ONLY"
+  echo "OPIP_UNIFIED_CYCLE_TAIL_LINES_REQUESTED=$UNIFIED_CYCLE_DIAGNOSTIC_TAIL_LINES"
+  echo "OPIP_UNIFIED_CYCLE_TAIL_BYTES_LIMIT=$UNIFIED_CYCLE_DIAGNOSTIC_TAIL_BYTES"
+
+  local size mtime
+  if [[ -s "$cycle_log" ]]; then
+    echo "OPIP_UNIFIED_CYCLE_LOG_EXISTS=YES"
+    size="$(wc -c < "$cycle_log" 2>/dev/null || true)"
+    size="${size//[[:space:]]/}"
+    echo "OPIP_UNIFIED_CYCLE_LOG_SIZE_BYTES=${size:-UNKNOWN}"
+    mtime="$(date -u -r "$cycle_log" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
+    echo "OPIP_UNIFIED_CYCLE_LOG_MTIME_UTC=${mtime:-UNKNOWN}"
+  else
+    echo "OPIP_UNIFIED_CYCLE_LOG_EXISTS=NO"
+    echo "OPIP_UNIFIED_CYCLE_LOG_SIZE_BYTES=UNKNOWN"
+    echo "OPIP_UNIFIED_CYCLE_LOG_MTIME_UTC=UNKNOWN"
+  fi
+
+  # One bounded, non-locking read of the tail, reused for every derived field, so
+  # the probe adds a single read of a hot log and never races the scheduler.
+  # `grep -c` prints 0 and exits non-zero when nothing matches, so every pipeline
+  # is guarded to keep `set -e` intact.
+  local tail_lines scanned success_count degraded_count completed_count skip_count traceback_count
+  tail_lines="$(tail -n "$UNIFIED_CYCLE_DIAGNOSTIC_TAIL_LINES" "$cycle_log" 2>/dev/null || true)"
+  # Counted as NON-BLANK lines, so an absent or empty log reports 0 rather than 1.
+  scanned="$(printf '%s\n' "$tail_lines" | grep -c '[^[:space:]]' || true)"
+  success_count="$(printf '%s\n' "$tail_lines" | grep -c 'OPIP_UNIFIED_CYCLE_STATUS=SUCCESS' || true)"
+  degraded_count="$(printf '%s\n' "$tail_lines" | grep -c 'OPIP_UNIFIED_CYCLE_STATUS=DEGRADED' || true)"
+  completed_count="$(printf '%s\n' "$tail_lines" | grep -c 'OPIP_UNIFIED_CYCLE_COMPLETED_AT=' || true)"
+  skip_count="$(printf '%s\n' "$tail_lines" | grep -c 'OHM Unified Cycle skipped' || true)"
+  traceback_count="$(printf '%s\n' "$tail_lines" | grep -c 'Traceback (most recent call last)' || true)"
+  echo "OPIP_UNIFIED_CYCLE_TAIL_SCANNED_LINES=$scanned"
+  echo "OPIP_UNIFIED_CYCLE_TAIL_SUCCESS_COUNT=$success_count"
+  echo "OPIP_UNIFIED_CYCLE_TAIL_DEGRADED_COUNT=$degraded_count"
+  echo "OPIP_UNIFIED_CYCLE_TAIL_COMPLETED_COUNT=$completed_count"
+  echo "OPIP_UNIFIED_CYCLE_TAIL_SKIPPED_COUNT=$skip_count"
+  echo "OPIP_UNIFIED_CYCLE_TAIL_TRACEBACK_COUNT=$traceback_count"
+
+  # SUCCESS and DEGRADED are the only statuses the release controller accepts, but
+  # the tail is matched with a permissive shape so an unexpected third status is
+  # surfaced verbatim instead of being silently ignored.
+  local last_status last_completed completed_epoch now_epoch age
+  last_status="$(printf '%s\n' "$tail_lines" | grep -oE 'OPIP_UNIFIED_CYCLE_STATUS=[A-Z_]+' | tail -n 1 | cut -d= -f2 || true)"
+  last_completed="$(printf '%s\n' "$tail_lines" | grep -oE 'OPIP_UNIFIED_CYCLE_COMPLETED_AT=[^[:space:]]+' | tail -n 1 | cut -d= -f2 || true)"
+  echo "OPIP_UNIFIED_CYCLE_LAST_STATUS=${last_status:-NONE}"
+  echo "OPIP_UNIFIED_CYCLE_LAST_COMPLETED_AT=${last_completed:-NONE}"
+  completed_epoch="$(date -u -d "$last_completed" +%s 2>/dev/null || true)"
+  now_epoch="$(date -u +%s)"
+  if [[ "$completed_epoch" =~ ^[0-9]+$ ]] && (( completed_epoch <= now_epoch )); then
+    age=$(( now_epoch - completed_epoch ))
+    echo "OPIP_UNIFIED_CYCLE_LAST_COMPLETION_AGE_SECONDS=$age"
+  else
+    echo "OPIP_UNIFIED_CYCLE_LAST_COMPLETION_AGE_SECONDS=UNKNOWN"
+  fi
+
+  local cron_schedule cron_log_target
+  if [[ -s "$entry" ]]; then
+    echo "OPIP_UNIFIED_CYCLE_CRON_EXISTS=YES"
+    # A cron.d entry is environment assignments plus exactly one schedule line.
+    # Report the schedule only, never the command line, so the receipt cannot echo
+    # unrelated host configuration.
+    cron_schedule="$(awk '
+      /^[[:space:]]*#/ {next}
+      /^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=/ {next}
+      NF {print $1" "$2" "$3" "$4" "$5; exit}
+    ' "$entry" 2>/dev/null || true)"
+    echo "OPIP_UNIFIED_CYCLE_CRON_SCHEDULE=${cron_schedule:-UNKNOWN}"
+    cron_log_target="$(grep -oE '>>[[:space:]]*/[^[:space:]]+' "$entry" 2>/dev/null | tail -n 1 | sed -E 's/^>>[[:space:]]*//' || true)"
+    echo "OPIP_UNIFIED_CYCLE_CRON_LOG_TARGET=${cron_log_target:-UNKNOWN}"
+  else
+    echo "OPIP_UNIFIED_CYCLE_CRON_EXISTS=NO"
+    echo "OPIP_UNIFIED_CYCLE_CRON_SCHEDULE=UNKNOWN"
+    echo "OPIP_UNIFIED_CYCLE_CRON_LOG_TARGET=UNKNOWN"
+  fi
+
+  # The wrapper lock identity is read from the same installed entry the wrapper
+  # uses, so the diagnosis follows the schedule instead of a hardcoded assumption.
+  local lock_path lock_state lock_present lock_held failure_class
+  lock_path="$(grep -m1 -oE 'flock -n [^[:space:]]+' "$entry" 2>/dev/null | awk '{print $3}' || true)"
+  echo "OPIP_UNIFIED_CYCLE_HOST_LOCK_PATH=${lock_path:-UNKNOWN}"
+  lock_state="$(unified_cycle_lock_probe "${lock_path:-/var/run/ohm-unified-cycle.lock}" "$locks_file")"
+  case "$lock_state" in
+    HELD) lock_present=YES; lock_held=YES ;;
+    NOT_HELD) lock_present=YES; lock_held=NO ;;
+    MISSING) lock_present=NO; lock_held=UNKNOWN ;;
+    *) lock_present=UNKNOWN; lock_held=UNKNOWN ;;
+  esac
+  echo "OPIP_UNIFIED_CYCLE_HOST_LOCK_PRESENT=$lock_present"
+  echo "OPIP_UNIFIED_CYCLE_HOST_LOCK_HELD=$lock_held"
+
+  # Best-effort classification derived ONLY from the fields above; it never
+  # asserts a cause the evidence cannot support (UNCLASSIFIED otherwise).
+  failure_class="UNCLASSIFIED"
+  if [[ "$lock_held" == "YES" ]]; then
+    failure_class="HOST_WRAPPER_LOCK_HELD"
+  elif (( scanned == 0 )); then
+    failure_class="NO_CYCLE_LOG_ACTIVITY"
+  elif (( skip_count > 0 && completed_count == 0 )); then
+    failure_class="SKIPPED_BEHIND_RUNNING_CYCLE"
+  fi
+  echo "OPIP_UNIFIED_CYCLE_WAIT_FAILURE_CLASS=$failure_class"
+
+  echo "OPIP_UNIFIED_CYCLE_TAIL"
+  printf '%s\n' "$tail_lines" \
+    | grep -E "$UNIFIED_CYCLE_DIAGNOSTIC_LINE_FILTER" 2>/dev/null \
+    | tail -n "$UNIFIED_CYCLE_DIAGNOSTIC_TAIL_MATCHES" \
+    | cut -c "1-$UNIFIED_CYCLE_DIAGNOSTIC_LINE_BYTES" \
+    | head -c "$UNIFIED_CYCLE_DIAGNOSTIC_TAIL_BYTES" || true
+  echo
+  echo "OPIP_UNIFIED_CYCLE_TAIL_END"
+}
+
 #: Extract the authorized unified-cycle hard runtime bound from the installed
 #: scheduler entry (``timeout --signal=TERM --kill-after=Ns <BOUND> ...'').
 #: Returns the bound on stdout, or non-zero when it cannot be determined.
@@ -514,6 +700,7 @@ wait_unified_cycle_success() {
       if [[ "$completed_epoch" =~ ^[0-9]+$ ]] && (( completed_epoch >= ready_epoch )); then
         [[ "$status" == "SUCCESS" ]] || {
           echo "unified cycle reported DEGRADED after candidate readiness" >&2
+          report_unified_cycle_wait_failure "$cycle_log" "$ready_after" DEGRADED_AFTER_READINESS
           return 1
         }
         echo "OPIP_UNIFIED_CYCLE=HEALTHY"
@@ -524,6 +711,7 @@ wait_unified_cycle_success() {
     sleep 5
   done
   echo "no successful unified cycle was observed within the bounded release window" >&2
+  report_unified_cycle_wait_failure "$cycle_log" "$ready_after" NO_FRESH_COMPLETION
   return 1
 }
 
