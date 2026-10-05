@@ -43,6 +43,7 @@ from app.opip.contracts.identity import (  # noqa: E402
 from app.opip.contracts.detector import DetectorState  # noqa: E402
 from app.opip.contracts.observation import SourceWatermark  # noqa: E402
 from app.opip.detectors import ignition  # noqa: E402
+from app.opip.features.pipeline import declared_cycle_submit_bound  # noqa: E402
 from app.opip.features.publisher import FeatureBusPublisher  # noqa: E402
 from app.opip.market.source import (  # noqa: E402
     PolledMinuteBarSource,
@@ -855,13 +856,19 @@ def test_ac_020_materialization_reserve_is_retained_for_phase_b(monkeypatch):
 
 
 class _SlowWriterClient(_RecordingClient):
-    """A canonical writer whose OWN submissions consume the pass budget.
+    """A PERSISTENT canonical writer whose OWN submissions consume the pass budget.
 
-    Proves an individual canonical operation is bounded by the materialization
+    Proves a whole cycle of canonical submits is bounded by the materialization
     deadline rather than by the outer cron containment: the client records the
-    timeout in force at each submission and advances the pass clock by its own
-    (slow) write cost.
+    timeout in force at every PHASE-B submission and advances the pass clock by its
+    own (slow) write cost. Recording every phase-B submit -- not just the snapshot --
+    is what makes the per-cycle bound visible: one cycle performs many dependent
+    submits. Instrument-version publishes happen before Phase B and are not part of
+    the materialization bound, so they are excluded.
     """
+
+    #: Pre-Phase-B institutional submit: published before any materialization work.
+    _NON_MATERIALIZE_EVENT = "market.instrument_version.recorded"
 
     def __init__(self, *, write_seconds: float, timeout: float = 30.0):
         super().__init__()
@@ -871,17 +878,170 @@ class _SlowWriterClient(_RecordingClient):
         self.on_submit = None
 
     def submit(self, intent):
-        payload = getattr(intent, "payload", None) or {}
-        if payload.get("record_type") == "FeatureSnapshot":
+        if str(getattr(intent, "event_type", "")) != self._NON_MATERIALIZE_EVENT:
             self.write_timeouts.append(self.timeout)
             if self.on_submit is not None:
                 self.on_submit()
         return super().submit(intent)
 
 
-def test_ac_020_slow_writer_is_bounded_by_the_materialize_deadline_not_containment(monkeypatch):
-    """ATDD-R4-B2-controlled-paper-activation/AC-020 and ATDD-RELEASE-PIPELINE-v1/AC-017: Phase B enforces its OWN absolute deadline -- a slow canonical submission cannot consume the reserve and cross containment; a write whose declared maximum cannot fit the remaining materialization budget is never started, an explicit durable disposition is emitted, and done=OK is never claimed."""
-    versions = [_instrument(i) for i in range(2)]
+def test_ac_020_production_publisher_resolves_one_client_and_keeps_the_timeout_clamp(
+    monkeypatch,
+):
+    """ATDD-R4-B2-controlled-paper-activation/AC-020 and ATDD-RELEASE-PIPELINE-v1/AC-017: a PRODUCTION-style publisher (no injected client) constructs the canonical writer ONCE and reuses that SAME object for every submit, so the per-operation timeout a producer narrows is the one the writes that actually run are bounded by."""
+    import app.opip.features.publisher as publisher_module
+
+    constructed: list[Any] = []
+
+    class _CountingClient:
+        def __init__(self):
+            self.timeout = 5.0
+            self.submit_timeouts: list[float] = []
+            self.intents: list[Any] = []
+            constructed.append(self)
+
+        def submit(self, intent):
+            self.submit_timeouts.append(self.timeout)
+            self.intents.append(intent)
+            return _FakeAck(seq=len(self.intents))
+
+    monkeypatch.setattr(publisher_module, "CanonicalWriterClient", _CountingClient)
+    version = _instrument(1)
+    observation = _observations(version)[-1]
+
+    publisher = FeatureBusPublisher(settings=_settings())
+    assert publisher.enabled is True
+
+    resolved = publisher.resolved_writer_client()
+    assert len(constructed) == 1
+    assert constructed[0] is resolved
+    # Every later resolution -- and every produce path -- reuses the SAME object.
+    assert publisher.resolved_writer_client() is resolved
+    assert publisher._resolve_client() is resolved
+
+    # The producer narrows the resolved client's per-operation timeout for Phase B;
+    # the narrowing must PERSIST into subsequent publish() calls instead of being
+    # spent on a throwaway client that the next publish() replaces.
+    assert capture._bound_writer_operation_timeout(publisher, 0.25) == pytest.approx(0.25)
+    assert resolved.timeout == pytest.approx(0.25)
+
+    publisher.publish_observations([observation])
+    publisher.publish_observations([observation])
+
+    assert len(constructed) == 1
+    assert resolved.submit_timeouts == [pytest.approx(0.25)] * 2
+    # Never widened back to the client's declared default.
+    assert resolved.timeout == pytest.approx(0.25)
+
+
+def test_ac_020_materialization_admission_bounds_every_submit_of_a_cycle(monkeypatch):
+    """ATDD-R4-B2-controlled-paper-activation/AC-020 and ATDD-RELEASE-PIPELINE-v1/AC-017: Phase B admits a cycle against the pipeline's declared submit bound for the ACTUAL batch -- observations, coverage gaps, snapshot, restart and checkpoint -- so the enforced per-submit timeout is the remaining materialization budget shared across ALL of them, never a single 5-second write."""
+    version = _instrument(1)
+    batches = {version.instrument_version_id: _batch(version, _observations(version))}
+    tick = {"value": 0.0}
+
+    client = _SlowWriterClient(write_seconds=10_000.0)
+    client.on_submit = None
+    publisher = FeatureBusPublisher(client, enabled=True, settings=_settings())
+    budget = 45.0
+    summary = capture.capture_feature_bus_shadow(
+        settings=_settings(
+            opip_feature_bus_capture_budget_seconds=budget,
+            opip_feature_bus_capture_concurrency=1,
+        ),
+        now=T0,
+        publisher=publisher,
+        instrument_provider=_provider([version]),
+        source=_source(batches),
+        restore_continuity=lambda versions: ({}, {}, {}),
+        clock=lambda: tick["value"],
+    )
+    assert summary.cycles == 1
+
+    submit_bound = declared_cycle_submit_bound(len(_observations(version)))
+    # The bound covers EVERY dependent submit of one cycle, so it is strictly more
+    # than the snapshot + checkpoint a single-write assumption would count.
+    assert submit_bound > 2
+    # One cycle really does perform MANY submits.
+    assert len(client.write_timeouts) > 1
+    assert len(client.write_timeouts) <= submit_bound
+
+    # Admission split the whole Phase-B budget across those submits, so the timeout
+    # in force is the time-share -- far below both the client default and the
+    # single-write bound the pass used to admit against.
+    time_share = budget / submit_bound
+    assert min(client.write_timeouts) == pytest.approx(time_share)
+    assert max(client.write_timeouts) == pytest.approx(time_share)
+    assert client.write_timeouts[0] < capture.CAPTURE_MATERIALIZE_WRITE_BOUND_SECONDS
+
+
+def test_ac_020_cycle_whose_declared_maximum_cannot_fit_is_not_started(monkeypatch):
+    """ATDD-R4-B2-controlled-paper-activation/AC-020 and ATDD-RELEASE-PIPELINE-v1/AC-017: a cycle whose declared per-cycle submit cost cannot fit the remaining materialization budget is NOT STARTED -- no canonical submit runs, an explicit durable materialize_incomplete disposition is emitted, and done=OK is never claimed."""
+    version = _instrument(1)
+    batches = {version.instrument_version_id: _batch(version, _observations(version))}
+    tick = {"value": 0.0}
+
+    def _clock():
+        return tick["value"]
+
+    class _Source:
+        venue = "kraken"
+        source_label = "kraken_ohlc"
+        interval_seconds = 60
+
+        def fetch_through(self, version, *, watermark, now):
+            tick["value"] += 14.0  # acquisition eats the pass budget down to 6s
+            return batches[version.instrument_version_id]
+
+    lines = _record_markers(monkeypatch)
+    budget = 20.0
+    client = _SlowWriterClient(write_seconds=10_000.0)
+    original_timeout = client.timeout
+    publisher = FeatureBusPublisher(client, enabled=True, settings=_settings())
+    summary = capture.capture_feature_bus_shadow(
+        settings=_settings(
+            opip_feature_bus_capture_budget_seconds=budget,
+            opip_feature_bus_capture_concurrency=1,
+        ),
+        now=T0,
+        publisher=publisher,
+        instrument_provider=_provider([version]),
+        source=_Source(),
+        restore_continuity=lambda versions: ({}, {}, {}),
+        clock=_clock,
+    )
+
+    submit_bound = declared_cycle_submit_bound(len(_observations(version)))
+    remaining = budget - 14.0
+    # 6s left cannot give each of the cycle's possible submits a meaningful bound.
+    assert remaining / submit_bound < capture.CAPTURE_MATERIALIZE_MIN_WRITE_SECONDS
+
+    # NOTHING was started: no submit, no fabricated snapshot, no narrowed timeout.
+    assert client.write_timeouts == []
+    assert client.snapshot_payloads() == []
+    assert client.timeout == original_timeout
+    assert summary.fetched == 0
+    assert summary.cycles == 0
+
+    assert summary.materialize_incomplete is True
+    incomplete = [line for line in lines if "PHASE=materialize_incomplete" in line]
+    assert len(incomplete) == 1
+    assert "reason=INSUFFICIENT_MATERIALIZE_BUDGET" in incomplete[0]
+    assert _marker_field(incomplete[0], "submit_bound") == float(submit_bound)
+    assert _marker_field(incomplete[0], "remaining_seconds") == pytest.approx(remaining)
+    assert _marker_field(incomplete[0], "required_seconds") == pytest.approx(
+        submit_bound * capture.CAPTURE_MATERIALIZE_MIN_WRITE_SECONDS
+    )
+
+    assert lines[-1].startswith("OPIP_FEATURE_BUS_CAPTURE_PHASE=done")
+    assert "status=MATERIALIZE_INCOMPLETE" in lines[-1]
+    assert "materialize_incomplete=True" in lines[-1]
+    assert "status=OK" not in lines[-1]
+
+
+def test_ac_020_slow_persistent_writer_cannot_exceed_the_materialize_deadline(monkeypatch):
+    """ATDD-R4-B2-controlled-paper-activation/AC-020 and ATDD-RELEASE-PIPELINE-v1/AC-017: Phase B enforces its OWN absolute deadline -- a persistent writer that consumes its whole declared per-submit timeout on EVERY submit of a cycle cannot cross the deadline into cron containment; a cycle that no longer fits is never started, an explicit durable disposition is emitted, and done=OK is never claimed."""
+    versions = [_instrument(i) for i in range(3)]
     batches = {
         version.instrument_version_id: _batch(version, _observations(version))
         for version in versions
@@ -897,15 +1057,14 @@ def test_ac_020_slow_writer_is_bounded_by_the_materialize_deadline_not_containme
         interval_seconds = 60
 
         def fetch_through(self, version, *, watermark, now):
-            tick["value"] += 13.0  # one bounded request consumes a real slice
             return batches[version.instrument_version_id]
 
     lines = _record_markers(monkeypatch)
     budget = 45.0
-    # The raw submission would take 22s, but the producer clamps the writer's OWN
-    # per-operation timeout to the remaining phase-B budget, so the client returns
-    # (here: advances the pass clock) inside the deadline it was admitted under.
-    client = _SlowWriterClient(write_seconds=22.0)
+    # The raw submission would take 10000s, but the producer clamps the writer's OWN
+    # per-operation timeout, so the client returns (here: advances the pass clock)
+    # inside the bound it was admitted under. Every submit pays it.
+    client = _SlowWriterClient(write_seconds=10_000.0)
     original_timeout = client.timeout
     client.on_submit = lambda: tick.__setitem__(
         "value", tick["value"] + min(client.write_seconds, client.timeout)
@@ -924,46 +1083,44 @@ def test_ac_020_slow_writer_is_bounded_by_the_materialize_deadline_not_containme
         clock=_clock,
     )
 
-    # Both instruments were ACQUIRED inside the reserve-protected window (26s of
-    # the 45s budget), so nothing was refused for lack of acquisition budget: the
-    # reserve alone does NOT bound a slow Phase B.
+    submit_bound = declared_cycle_submit_bound(len(_observations(versions[0])))
+    # Acquisitions are instant here, so Phase B starts with the whole pass budget.
     materialize = [line for line in lines if "PHASE=materialize " in line]
     assert len(materialize) == 1
-    assert _marker_field(materialize[0], "count") == 2.0
-    assert _marker_field(materialize[0], "deadline_remaining") == pytest.approx(
-        budget - 26.0
-    )
+    assert _marker_field(materialize[0], "count") == 3.0
+    assert _marker_field(materialize[0], "deadline_remaining") == pytest.approx(budget)
     assert summary.budget_exhausted is False
 
-    # The FIRST write was admitted with the writer's OWN per-operation timeout
-    # clamped to the remaining materialization budget, so it cannot outlive the
-    # deadline it was admitted under.
-    assert client.write_timeouts[0] == pytest.approx(budget - 26.0)
+    # The FIRST cycle was admitted against the time-share: the remaining budget
+    # divided across every submit that cycle may make, and the SAME persistent
+    # client carried that narrowed timeout into every submit it performed.
+    assert client.write_timeouts
+    assert client.write_timeouts[0] == pytest.approx(budget / submit_bound)
     assert client.write_timeouts[0] < original_timeout
-    assert client.timeout == pytest.approx(budget - 26.0)
+    assert client.timeout <= client.write_timeouts[0]
 
-    # The SECOND write could not fit the remaining budget, so it was NEVER
-    # STARTED -- no fabricated commit, an explicit durable disposition instead.
-    assert len(client.write_timeouts) == 1
-    assert len(client.snapshot_payloads()) == 1
-    assert summary.fetched == 1
+    # The canonical submits of a cycle can NEVER consume more than the declared
+    # Phase-B budget, and the pass stops ITSELF inside it: cron containment is final
+    # containment only, never the mechanism that bounds Phase B.
+    assert sum(client.write_timeouts) <= budget + 1e-9
+    assert summary.elapsed_seconds <= budget + 1e-9
+    assert _marker_field(lines[-1], "elapsed_seconds") <= budget + 1e-9
+
+    # At least one acquired instrument could no longer fit a bounded cycle, so it was
+    # NEVER STARTED: no fabricated commit, an explicit durable disposition instead.
+    assert summary.fetched < len(versions)
+    assert len(client.snapshot_payloads()) == summary.fetched
+    assert summary.cycles == summary.fetched
     assert summary.materialize_incomplete is True
     incomplete = [line for line in lines if "PHASE=materialize_incomplete" in line]
     assert len(incomplete) == 1
     assert "reason=INSUFFICIENT_MATERIALIZE_BUDGET" in incomplete[0]
-    assert _marker_field(incomplete[0], "remaining_seconds") < (
-        capture.CAPTURE_MATERIALIZE_WRITE_BOUND_SECONDS
-    )
+    assert _marker_field(incomplete[0], "submit_bound") == float(submit_bound)
 
     # done=OK is NEVER claimed when acquired evidence could not be committed.
     assert lines[-1].startswith("OPIP_FEATURE_BUS_CAPTURE_PHASE=done")
     assert "status=MATERIALIZE_INCOMPLETE" in lines[-1]
     assert "materialize_incomplete=True" in lines[-1]
-    # The producer stopped ITSELF inside its own pass budget and returned a
-    # complete summary: cron containment is final containment only, never the
-    # normal mechanism that bounds Phase B.
-    assert summary.elapsed_seconds <= budget
-    assert _marker_field(lines[-1], "elapsed_seconds") <= budget
 
 
 def test_ac_020_failed_acquisition_emits_a_durable_disposition_marker(monkeypatch):

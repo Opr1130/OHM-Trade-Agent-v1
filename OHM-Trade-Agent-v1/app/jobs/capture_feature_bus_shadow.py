@@ -61,7 +61,11 @@ from time import monotonic
 from typing import Any, Callable
 
 from app.opip.canonical.bridge import resolve_writer_mode
-from app.opip.features.pipeline import CycleIdentityMismatch, run_cycle
+from app.opip.features.pipeline import (
+    CycleIdentityMismatch,
+    declared_cycle_submit_bound,
+    run_cycle,
+)
 from app.opip.features.publisher import (
     FeatureBusPublisher,
     resolve_feature_bus_mode,
@@ -101,16 +105,23 @@ PER_REQUEST_BUDGET_SECONDS = 15.0
 #: while the writer was still working. Clamped so it can never exceed the pass.
 CAPTURE_MATERIALIZE_RESERVE_SECONDS = 10.0
 
-#: Declared worst-case wall clock of ONE Phase-B canonical materialization write.
-#: The reserve above bounds ACQUISITION; this constant bounds MATERIALIZATION
-#: itself. Phase B runs strictly sequentially on the single canonical writer
-#: connection, so this is also the granularity at which its absolute deadline is
-#: enforced: a canonical write is never STARTED unless the remaining Phase-B budget
-#: can fit this bound. It mirrors the canonical writer client's own per-submit
-#: socket timeout (``CanonicalWriterClient(timeout=5.0)``), so an admitted write
-#: cannot outlive the bound it was admitted under. The cron ``timeout`` stays final
-#: containment ONLY and must never be the mechanism that bounds Phase B.
+#: Declared worst-case wall clock of ONE Phase-B canonical submit. The reserve
+#: above bounds ACQUISITION; this constant bounds the CEILING of a single
+#: MATERIALIZATION write, because it mirrors the canonical writer client's own
+#: per-submit socket timeout (``CanonicalWriterClient(timeout=5.0)``). A producer
+#: never admits a cycle unless the remaining Phase-B budget covers
+#: :func:`declared_cycle_submit_bound` submits at the per-submit timeout it is
+#: about to enforce, so the cron ``timeout`` stays final containment ONLY and is
+#: never the mechanism that bounds Phase B.
 CAPTURE_MATERIALIZE_WRITE_BOUND_SECONDS = 5.0
+
+#: Smallest per-submit timeout Phase B is willing to DECLARE. Phase B shares the
+#: remaining materialization budget equally across every submit the cycle may make
+#: (``declared_cycle_submit_bound``), so a cycle whose share falls below this floor
+#: cannot be given a meaningful bounded submit at all: it is not started, and the
+#: acquired evidence is recorded as an explicit incomplete disposition instead of
+#: being run against the cron containment.
+CAPTURE_MATERIALIZE_MIN_WRITE_SECONDS = 0.05
 
 #: Bounded acquisition concurrency. Kraken has no bulk multi-pair OHLC endpoint,
 #: so one public request per instrument is required for each closed minute. A
@@ -195,17 +206,20 @@ def emit_capture_marker(
     print(line, flush=True)
 
 
-def _bound_writer_operation_timeout(publisher: Any, remaining_seconds: float) -> float | None:
-    """Tighten the canonical writer's OWN per-operation timeout to the budget left.
+def _bound_writer_operation_timeout(
+    publisher: Any, per_submit_seconds: float
+) -> float | None:
+    """Tighten the canonical writer's OWN per-operation timeout for this cycle.
 
-    Phase B admits a write only when the remaining materialization budget fits
-    :data:`CAPTURE_MATERIALIZE_WRITE_BOUND_SECONDS`; this additionally clamps the
-    writer client's own socket timeout to the remaining budget where the client
-    exposes one, so an individual canonical operation cannot outlive the deadline
-    it was admitted under. It only ever NARROWS a timeout: a client that exposes
-    no timeout keeps its own bound, and no timeout is ever widened. Returns the
-    timeout now in force (``None`` when the client exposes none). Observability and
-    bounding only: it grants no authority and changes no evidence content.
+    Phase B admits a cycle only when the remaining materialization budget covers
+    EVERY submit that cycle may make at ``per_submit_seconds`` each; this clamps the
+    SAME persistent writer instance the cycle's submits will use (``publisher``
+    resolves one client and reuses it), so the enforced timeout is the one the
+    budget was proved against rather than a discarded instance's. It only ever
+    NARROWS a timeout: a client that exposes no timeout keeps its own bound, and no
+    timeout is ever widened. Returns the timeout now in force (``None`` when the
+    client exposes none). Observability and bounding only: it grants no authority
+    and changes no evidence content.
     """
     try:
         client = publisher.resolved_writer_client()
@@ -214,7 +228,7 @@ def _bound_writer_operation_timeout(publisher: Any, remaining_seconds: float) ->
     current = getattr(client, "timeout", None)
     if not isinstance(current, (int, float)) or float(current) <= 0.0:
         return None
-    bounded = max(0.05, min(float(current), float(remaining_seconds)))
+    bounded = max(CAPTURE_MATERIALIZE_MIN_WRITE_SECONDS, min(float(current), float(per_submit_seconds)))
     try:
         setattr(client, "timeout", bounded)
     except Exception:  # noqa: BLE001 - a read-only client keeps its own bound
@@ -509,6 +523,7 @@ def capture_feature_bus_shadow(
         count=len(acquired),
         deadline_remaining=round(materialize_deadline - tick(), 3),
         write_bound_seconds=round(CAPTURE_MATERIALIZE_WRITE_BOUND_SECONDS, 3),
+        min_write_seconds=round(CAPTURE_MATERIALIZE_MIN_WRITE_SECONDS, 3),
     )
     pending_commits = sum(
         1
@@ -537,17 +552,25 @@ def capture_feature_bus_shadow(
             summary.errors.append(f"{version_id}: source error: {batch.error}")
             continue
 
-        # Budget proof BEFORE every dependent canonical write: never start a write
-        # whose declared maximum cannot fit the remaining Phase-B budget. The
-        # writer's OWN per-operation timeout is tightened to the same remaining
-        # budget where the client exposes one, so an individual write cannot
-        # outlive the deadline it was admitted under.
+        # Budget proof BEFORE starting this cycle: one ``run_cycle`` performs MANY
+        # dependent canonical submits (every newly committed observation, every
+        # coverage gap, the snapshot, the optional restart, the checkpoint), so the
+        # per-cycle cost is the pipeline's declared submit bound for THIS batch
+        # times the per-submit timeout actually enforced. The remaining Phase-B
+        # budget is shared equally across those submits, and the cycle is started
+        # only when that share is a meaningful submit timeout; otherwise no submit
+        # of this cycle is started at all.
         remaining = materialize_deadline - tick()
-        if remaining < CAPTURE_MATERIALIZE_WRITE_BOUND_SECONDS:
+        submit_bound = declared_cycle_submit_bound(len(batch.observations))
+        per_submit = min(
+            CAPTURE_MATERIALIZE_WRITE_BOUND_SECONDS, remaining / submit_bound
+        )
+        if per_submit < CAPTURE_MATERIALIZE_MIN_WRITE_SECONDS:
             summary.materialize_incomplete = True
             summary.errors.append(
                 f"{version_id}: materialization incomplete: "
-                f"{remaining:.3f}s remaining cannot fit one bounded canonical write"
+                f"{remaining:.3f}s remaining cannot fit "
+                f"{submit_bound} bounded canonical submits"
             )
             emit_capture_marker(
                 "materialize_incomplete",
@@ -555,12 +578,18 @@ def capture_feature_bus_shadow(
                 reason="INSUFFICIENT_MATERIALIZE_BUDGET",
                 instrument=version_id,
                 remaining_seconds=round(remaining, 3),
-                required_seconds=round(CAPTURE_MATERIALIZE_WRITE_BOUND_SECONDS, 3),
+                submit_bound=submit_bound,
+                required_seconds=round(
+                    submit_bound * CAPTURE_MATERIALIZE_MIN_WRITE_SECONDS, 3
+                ),
                 committed=committed_this_phase,
                 pending=pending_commits,
             )
             break
-        _bound_writer_operation_timeout(publisher, remaining)
+        # The SAME persistent writer instance every submit of this cycle will use,
+        # narrowed to the per-submit timeout the budget was proved against. Only
+        # ever tightens; never widened.
+        _bound_writer_operation_timeout(publisher, per_submit)
         summary.fetched += 1
 
         prior = restored_states.get(version_id)
@@ -800,7 +829,9 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "CAPTURE_MATERIALIZE_MIN_WRITE_SECONDS",
     "CAPTURE_MATERIALIZE_RESERVE_SECONDS",
+    "CAPTURE_MATERIALIZE_WRITE_BOUND_SECONDS",
     "CaptureProcessLock",
     "DEFAULT_BUDGET_SECONDS",
     "DEFAULT_CAPTURE_LIMIT",

@@ -412,6 +412,37 @@ def run_cycle(
     )
 
 
+#: Canonical submits ``run_cycle`` may make per eligible observation: the
+#: observation itself, plus AT MOST one coverage-gap record it can start. Gaps are
+#: maximal runs of missing minutes, so each gap is separated by at least one
+#: present interval; the present intervals are the deduplicated evidence, which can
+#: never exceed the batch. Counting one gap per observation is therefore a
+#: conservative upper bound (the last run may be trailing, hence the +1 below).
+MAX_CYCLE_SUBMITS_PER_OBSERVATION = 2
+
+#: Canonical submits ``run_cycle`` makes regardless of batch size: the snapshot,
+#: the optional restart record, the checkpoint, and the trailing coverage gap.
+MAX_CYCLE_FIXED_SUBMITS = 4
+
+
+def declared_cycle_submit_bound(observation_count: int) -> int:
+    """Conservative count of canonical submits ONE ``run_cycle`` may perform.
+
+    The bound belongs here, beside the publication order it describes, so a
+    producer that must prove a per-cycle wall-clock budget cannot drift from the
+    pipeline it is budgeting. It counts EVERY dependent submit a cycle can make
+    (observations, coverage gaps, snapshot, restart, checkpoint) rather than
+    assuming one instrument equals one writer submit.
+
+    ``observation_count`` is the size of the batch handed to ``run_cycle``, so the
+    bound is derived from the actual batch and state rather than a fixed constant.
+    """
+    return (
+        MAX_CYCLE_SUBMITS_PER_OBSERVATION * max(0, int(observation_count))
+        + MAX_CYCLE_FIXED_SUBMITS
+    )
+
+
 __all__ = [
     "CycleIdentityMismatch",
     "CycleResult",
@@ -419,5 +450,6 @@ __all__ = [
     "DISPOSITION_DEFERRED_UNCOMMITTED",
     "DISPOSITION_DRY_RUN",
     "DISPOSITION_OK",
+    "declared_cycle_submit_bound",
     "run_cycle",
 ]

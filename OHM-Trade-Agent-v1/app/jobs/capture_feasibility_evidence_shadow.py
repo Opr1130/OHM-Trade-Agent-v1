@@ -251,6 +251,12 @@ class PointInTimeInput:
             f":input={self.name}"
             f":kind={self.kind}"
             f":event={_compact_z(self.event_cutoff)}"
+            # ``epoch_invariant`` is PERSISTED, not inferred on read: venue
+            # metadata carries a post-epoch acquisition cutoff that is only
+            # PIT-valid BECAUSE it is epoch-invariant, so a reader that defaulted
+            # the flag would recompute the durable ``pit_valid`` as False and the
+            # audit would contradict itself.
+            f":epoch_invariant={self.epoch_invariant}"
             f":evaluation_time={_compact_z(evaluation_time)}"
             f":pit_valid={self.pit_valid(evaluation_time)}"
         )
@@ -287,6 +293,10 @@ def point_in_time_inputs(refs: Sequence[str]) -> tuple[PointInTimeInput, ...]:
                 name=fields.get("input", "UNKNOWN"),
                 kind=fields.get("kind", PIT_KIND_MARKET),
                 event_cutoff=event,
+                # Deterministic round-trip of the persisted flag. An ABSENT or
+                # malformed token reads as non-invariant, which is the stricter
+                # (fail-closed) reading: it can only make a post-epoch input
+                # invalid, never rescue one.
                 epoch_invariant=fields.get("epoch_invariant", "False") == "True",
             )
         )

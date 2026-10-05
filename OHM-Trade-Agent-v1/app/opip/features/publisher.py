@@ -305,11 +305,16 @@ class FeatureBusPublisher:
         return self._enabled
 
     def _resolve_client(self) -> WriterClient:
+        # ONE resolved client per publisher: a fresh instance per call would make
+        # any per-operation timeout a producer narrows (see
+        # ``resolved_writer_client``) apply to a discarded object, leaving the
+        # writes that actually run on a client with the full default timeout.
         if self._client is not None:
             return self._client
         if _client_override is not None:
             return _client_override
-        return CanonicalWriterClient()
+        self._client = CanonicalWriterClient()
+        return self._client
 
     def resolved_writer_client(self) -> WriterClient:
         """The canonical writer client this publisher will submit through.

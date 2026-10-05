@@ -363,6 +363,7 @@ AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_acquisition_concu
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_capture_client_declares_a_bounded_public_only_request_budget
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_config_bounds_are_within_the_minute_slot
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_consecutive_passes_commit_snapshots_60s_apart
+AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_cycle_whose_declared_maximum_cannot_fit_is_not_started
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_deadline_exhaustion_emits_a_durable_disposition_marker
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_deadline_stops_further_waves
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_f3_consumes_produced_snapshots_at_their_own_cutoff
@@ -371,15 +372,17 @@ AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_fifteen_minute_ga
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_first_attempt_rate_limit_wait_is_inside_the_declared_wave_bound
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_inner_timeout_is_container_side_and_no_outer_lock_release
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_inner_timeout_terminates_workload_and_releases_lock
+AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_materialization_admission_bounds_every_submit_of_a_cycle
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_materialization_is_sequential
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_materialization_reserve_is_retained_for_phase_b
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_missing_minute_is_incomplete_coverage
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_no_historical_catch_up_is_materialized
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_process_lock_serializes_capture_bodies
+AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_production_publisher_resolves_one_client_and_keeps_the_timeout_clamp
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_replayed_cutoff_does_not_advance_persistence
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_retry_and_backoff_never_start_without_remaining_budget
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_run_capture_locked_skips_when_lock_held
-AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_slow_writer_is_bounded_by_the_materialize_deadline_not_containment
+AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_slow_persistent_writer_cannot_exceed_the_materialize_deadline
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_stalled_request_cannot_consume_the_complete_pass_budget
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_two_consecutive_qualifying_evaluations_produce_claim
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_two_minute_passes_satisfy_the_runtime_verifier
@@ -441,7 +444,9 @@ AC-022 -> tests/test_opip_r4_b2_feasibility_short.py::test_ac_022_ineligible_pai
 AC-022 -> tests/test_opip_r4_b2_feasibility_short.py::test_ac_022_btnl_book_failure_is_unavailable_present_evidence
 AC-022 -> tests/test_opip_r4_b2_feasibility_short.py::test_ac_022_short_execution_carries_btnl_provenance_for_f5
 AC-022 -> tests/test_opip_r4_b2_feasibility_short.py::test_ac_022_invalid_status_sort_order_constant_is_importable
+AC-022 -> tests/test_opip_r4_b2_feasibility_short.py::test_ac_022_point_in_time_provenance_round_trips_epoch_invariance
 AC-022 -> tests/test_opip_r4_b2_feasibility_short.py::test_ac_022_producer_dispatches_short_direction
+AC-022 -> tests/test_opip_r4_b2_feasibility_short.py::test_ac_022_short_margin_venue_provenance_survives_the_durable_audit
 AC-023 -> tests/test_opip_r4_b2_f6_label_projection.py::test_ac_023_full_and_partial_fill_resolve
 AC-023 -> tests/test_opip_r4_b2_f6_label_projection.py::test_ac_023_no_fill_variants_resolve
 AC-023 -> tests/test_opip_r4_b2_f6_label_projection.py::test_ac_023_non_admission_is_cash_no_trade
