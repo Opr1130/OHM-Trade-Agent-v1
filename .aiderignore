@@ -1,0 +1,44 @@
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*api-key*.txt
+*apikey*.txt
+*secret*.txt
+
+# Python/generated
+.venv/
+venv/
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/.pytest_tmp*/
+**/.pytest-basetemp-*/
+**/.ruff_cache/
+**/.mypy_cache/
+
+# Generated/build/runtime output
+coverage/
+htmlcov/
+dist/
+build/
+outputs/
+artifacts/
+*.log
+*.tmp
+*.sqlite
+*.db
+
+# AI/editor runtime noise
+.cursor/
+.serena/
+.aider.chat.history.md
+.aider.input.history
+.aider.llm.history
+.aider.tags.cache.v4/
+.coverage
+.coverage.*
+coverage.xml
