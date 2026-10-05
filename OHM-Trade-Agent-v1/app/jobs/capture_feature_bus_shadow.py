@@ -19,9 +19,20 @@ protection. THREE independent bounds contain it:
 * the F3 60-second evaluation grid: one pass is one closed minute, so consecutive
   passes yield consecutive ``FeatureSnapshot`` cutoffs (the R4-B2 cadence bridge);
 * an internal total wall-clock budget (``budget_seconds``), clamped below the
-  60-second slot: before each instrument the loop proves enough budget remains for
-  the next bounded request and stops requesting more when it does not; and
+  60-second slot, split into an ACQUISITION deadline and a reserved
+  materialization window: before each acquisition wave the loop proves that the
+  DECLARED worst-case cost of one full request (every attempt, every inter-attempt
+  backoff/jitter sleep and every rate-limiter wait, bounded by the pass-scoped
+  client's derived per-attempt timeout) still fits the remaining acquisition
+  budget, so no upstream operation ever starts that cannot complete, and one
+  instrument can never consume the whole pass; and
 * a cron ``timeout`` subprocess bound (final containment only), also below 60s.
+
+Every phase and every disposition is emitted as a flushed, line-buffered
+``OPIP_FEATURE_BUS_CAPTURE_PHASE=`` marker (including an explicit
+deadline-exhausted disposition, a per-instrument failure classification, a
+lock-contention skip and a zero-materialized-snapshot disposition), so a pass that
+IS terminated by the containment bound is still attributable from its own log.
 
 Acquisition is bounded-concurrent (Phase A) and materialization is strictly
 sequential (Phase B): Kraken has no bulk multi-pair OHLC endpoint, so each target
@@ -42,6 +53,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -59,6 +71,9 @@ from app.opip.market.instrument_version_store import hydrate_instrument_version_
 from app.services.opip_feature_bus_market_source import (
     KRAKEN_OHLC_SOURCE_LABEL,
     KrakenInstrumentProvider,
+    capture_kraken_client,
+    capture_worst_case_request_seconds,
+    classify_capture_error,
     kraken_minute_source,
 )
 
@@ -73,12 +88,18 @@ DEFAULT_BUDGET_SECONDS = 45.0
 MAX_BUDGET_SECONDS = 50.0
 
 #: Conservative per-request reservation used to gate each acquisition wave. The
-#: Kraken client request timeout is 15s, so a bounded single attempt plus slack
-#: cannot exceed this; the pass starts a wave only when at least this much budget
-#: remains. The shared transport may retry a genuinely failing request and the
-#: cron timeout (below the cadence) is the final containment, so wave gating
-#: bounds the worst-case overrun past the internal deadline to a single wave.
+#: pass-scoped Kraken client's per-attempt timeout is DERIVED so that one complete
+#: request + all retries + all retry backoff + all rate-limiter waiting fits this
+#: budget (see ``capture_worst_case_request_seconds``); the pass starts a wave only
+#: when at least that declared worst case remains before the acquisition deadline.
+#: The cron timeout (below the cadence) stays final containment only.
 PER_REQUEST_BUDGET_SECONDS = 15.0
+
+#: Time RESERVED at the end of the pass for Phase B (sequential canonical
+#: materialization). Acquisition may never consume it, so a completed acquisition
+#: is always committed rather than discarded because the pass deadline expired
+#: while the writer was still working. Clamped so it can never exceed the pass.
+CAPTURE_MATERIALIZE_RESERVE_SECONDS = 10.0
 
 #: Bounded acquisition concurrency. Kraken has no bulk multi-pair OHLC endpoint,
 #: so one public request per instrument is required for each closed minute. A
@@ -132,6 +153,35 @@ class FeatureBusCaptureSummary:
         }
 
 
+def line_buffered_stdout() -> None:
+    """Make every disposition line durable before a process bound can kill it.
+
+    The cron runs this producer with stdout redirected to a log file, where Python
+    block-buffers by default. A pass terminated by the cron ``timeout`` therefore
+    loses EVERY buffered line and leaves no durable record at all -- the release
+    pipeline cannot then distinguish a stalled producer from a silent evidence
+    drop. Line buffering makes each emitted marker durable as it is written.
+    """
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):  # pragma: no cover - non-reconfigurable stream
+        pass
+
+
+def emit_capture_marker(
+    stage: str, *, prefix: str = "OPIP_FEATURE_BUS_CAPTURE", **fields: Any
+) -> None:
+    """Emit one durable, machine-readable capture disposition marker.
+
+    Mirrors the unified-cycle phase markers: flushed line-by-line so the LAST
+    marker written before any termination names the stage that overran. This is
+    observability only; it grants no authority and changes no behavior.
+    """
+    detail = " ".join(f"{key}={value}" for key, value in fields.items())
+    line = f"{prefix}_PHASE={stage} {detail}".rstrip()
+    print(line, flush=True)
+
+
 def shadow_capture_authorized(settings: Any) -> bool:
     """Exact SHADOW authorization for THIS producer.
 
@@ -181,6 +231,7 @@ def capture_feature_bus_shadow(
 
     mode = resolve_feature_bus_mode(settings)
     if not shadow_capture_authorized(settings):
+        emit_capture_marker("inert", reason="FEATURE_BUS_CAPTURE_NOT_AUTHORIZED_SHADOW")
         return _inert_summary(mode, "FEATURE_BUS_CAPTURE_NOT_AUTHORIZED_SHADOW")
 
     resolved_limit = (
@@ -213,32 +264,84 @@ def capture_feature_bus_shadow(
     tick = clock or monotonic
     started = tick()
     deadline = started + budget
+    # Phase B (sequential canonical materialization) is reserved out of the pass
+    # budget so ACQUISITION can never consume the time needed to COMMIT what it
+    # acquired: a pass that fetched successfully but could not write would be an
+    # evidence drop with no disposition.
+    materialize_reserve = min(
+        CAPTURE_MATERIALIZE_RESERVE_SECONDS, max(0.0, budget - PER_REQUEST_BUDGET_SECONDS)
+    )
+    acquisition_deadline = deadline - materialize_reserve
     moment = now or datetime.now(timezone.utc)
     now_utc = wall_clock or (lambda: datetime.now(timezone.utc))
     cycle_cutoff = grid_floor(moment)
     publisher = publisher or FeatureBusPublisher(settings=settings)
 
+    emit_capture_marker(
+        "start",
+        limit=bounded,
+        budget_seconds=budget,
+        concurrency=workers,
+        cycle_cutoff=cycle_cutoff.isoformat(),
+    )
+
     if restore_continuity is None:
         from app.jobs.run_feature_bus_pilot import restore_pilot_continuity
 
         restore_continuity = restore_pilot_continuity
+    #: Declared worst-case wall clock of ONE acquisition request (all attempts,
+    #: all retry backoff, all rate-limiter waiting). No upstream operation may
+    #: start when its worst-case bounded cost cannot fit the remaining budget.
+    wave_bound = PER_REQUEST_BUDGET_SECONDS
+    if instrument_provider is None or source is None:
+        # ONE pass-scoped client so the provider and the minute source share the
+        # pass-bounded request timeout, the pass acquisition deadline and the
+        # shared rate limiter. Without this a single stalled public request could
+        # consume the whole pass budget through transport retries and the producer
+        # would be killed before recording any disposition.
+        wave_bound = capture_worst_case_request_seconds(
+            wave_budget_seconds=PER_REQUEST_BUDGET_SECONDS
+        )
+        market_client = capture_kraken_client(
+            wave_budget_seconds=PER_REQUEST_BUDGET_SECONDS,
+            deadline_monotonic=acquisition_deadline,
+        )
+        emit_capture_marker(
+            "budget_declared",
+            wave_bound_seconds=round(wave_bound, 3),
+            acquisition_budget_seconds=round(acquisition_deadline - started, 3),
+            materialize_reserve_seconds=round(materialize_reserve, 3),
+            request_timeout_seconds=round(market_client.timeout_seconds, 3),
+        )
     if instrument_provider is None:
         registry = hydrate_instrument_version_registry()
-        instrument_provider = KrakenInstrumentProvider(registry=registry)
+        instrument_provider = KrakenInstrumentProvider(
+            registry=registry, client=market_client
+        )
     if source is None:
-        source = kraken_minute_source()
+        source = kraken_minute_source(market_client)
 
     summary = FeatureBusCaptureSummary(mode=mode, enabled=True, inert=False)
+    emit_capture_marker("refresh_universe")
     try:
         universe = instrument_provider.refresh(observed_at_utc=moment)
     except Exception as exc:  # noqa: BLE001 - an unavailable source must not fabricate
         summary.errors.append(f"instrument refresh failed: {type(exc).__name__}: {exc}")
         summary.elapsed_seconds = tick() - started
+        emit_capture_marker(
+            "done",
+            where="refresh_universe",
+            status="FAILED",
+            elapsed_seconds=round(summary.elapsed_seconds, 3),
+            error=f"{type(exc).__name__}",
+        )
         return summary
+    emit_capture_marker("universe_ready", instruments=len(universe))
 
     selected = list(universe[:bounded])
     summary.instruments = len(selected)
 
+    emit_capture_marker("publish_instrument_versions", count=len(selected))
     committed_versions = []
     for version in selected:
         outcome = publisher.publish_instrument_version(version)
@@ -254,10 +357,23 @@ def capture_feature_bus_shadow(
         summary.errors.append("no instrument version committed; nothing captured")
         summary.publish_counts = publisher.summary()
         summary.elapsed_seconds = tick() - started
+        emit_capture_marker(
+            "done",
+            where="publish_instrument_versions",
+            status="NOTHING_CAPTURED",
+            elapsed_seconds=round(summary.elapsed_seconds, 3),
+        )
         return summary
+    emit_capture_marker(
+        "instrument_versions_committed", committed=len(committed_versions)
+    )
 
+    emit_capture_marker("restore_continuity", instruments=len(committed_versions))
     restored_states, restored_ledgers, source_watermarks = restore_continuity(
         committed_versions
+    )
+    emit_capture_marker(
+        "continuity_restored", elapsed_seconds=round(tick() - started, 3)
     )
 
     # Phase A - bounded-concurrent acquisition. Each target instrument needs
@@ -278,13 +394,32 @@ def capture_feature_bus_shadow(
             now=cycle_cutoff,
         )
 
+    emit_capture_marker(
+        "acquire",
+        instruments=len(committed_versions),
+        concurrency=workers,
+        budget_remaining=round(acquisition_deadline - tick(), 3),
+        wave_bound_seconds=round(wave_bound, 3),
+    )
     wave_index = 0
     while wave_index < len(committed_versions):
-        if deadline - tick() < PER_REQUEST_BUDGET_SECONDS:
-            # Not enough budget for one more bounded wave: stop cleanly and say so.
+        remaining = acquisition_deadline - tick()
+        if remaining < wave_bound:
+            # Not enough budget for one more bounded request: stop cleanly, emit a
+            # DURABLE deadline-exhausted disposition, and never start work whose
+            # worst-case cost cannot fit.
             summary.budget_exhausted = True
             summary.errors.append(
                 "budget exhausted before fetching all instruments"
+            )
+            emit_capture_marker(
+                "deadline_exhausted",
+                where="acquire",
+                reason="INSUFFICIENT_ACQUISITION_BUDGET",
+                remaining_seconds=round(remaining, 3),
+                required_seconds=round(wave_bound, 3),
+                instruments_acquired=len(acquired),
+                instruments_pending=len(committed_versions) - wave_index,
             )
             break
         wave = committed_versions[wave_index : wave_index + workers]
@@ -302,10 +437,29 @@ def capture_feature_bus_shadow(
                     acquired[version_id] = (future.result(), completed_at)
                 except Exception as exc:  # noqa: BLE001 - one instrument must not stop others
                     acquired[version_id] = (exc, completed_at)
+                    # A failed acquisition is a DURABLE disposition, never a silent
+                    # gap: the release receipt must be able to distinguish a stalled
+                    # request from a silent evidence drop.
+                    emit_capture_marker(
+                        "acquire_failure",
+                        instrument=version_id,
+                        reason=classify_capture_error(exc),
+                        error=type(exc).__name__,
+                        elapsed_seconds=round(tick() - started, 3),
+                    )
+
+    emit_capture_marker(
+        "acquire_complete",
+        acquired=len(acquired),
+        budget_exhausted=summary.budget_exhausted,
+        deadline_remaining=round(acquisition_deadline - tick(), 3),
+        elapsed_seconds=round(tick() - started, 3),
+    )
 
     # Phase B - sequential materialization. The canonical writer has a single
     # connection, so dependent writes commit in instrument order, never
     # concurrently: acquisition is bounded and parallel, evidence stays serial.
+    emit_capture_marker("materialize", count=len(acquired))
     for version in committed_versions:
         version_id = version.instrument_version_id
         if version_id not in acquired:
@@ -369,6 +523,33 @@ def capture_feature_bus_shadow(
 
     summary.publish_counts = publisher.summary()
     summary.elapsed_seconds = tick() - started
+    if summary.cycles == 0:
+        # Explicit, durable zero-materialization disposition: an empty evidence
+        # minute must never be indistinguishable from a silent drop.
+        emit_capture_marker(
+            "zero_snapshots",
+            where="materialize",
+            fetched=summary.fetched,
+            source_errors=summary.source_errors,
+            budget_exhausted=summary.budget_exhausted,
+        )
+    emit_capture_marker(
+        "done",
+        status=(
+            "DEADLINE_EXHAUSTED"
+            if summary.cycles == 0 and summary.budget_exhausted
+            else "NO_SNAPSHOTS"
+            if summary.cycles == 0
+            else "OK"
+        ),
+        fetched=summary.fetched,
+        cycles=summary.cycles,
+        promoted=summary.promoted,
+        deferred=summary.deferred,
+        source_errors=summary.source_errors,
+        budget_exhausted=summary.budget_exhausted,
+        elapsed_seconds=round(summary.elapsed_seconds, 3),
+    )
     return summary
 
 
@@ -489,6 +670,7 @@ def run_capture_locked(
     capture_fn: Callable[[], FeatureBusCaptureSummary] | None = None,
     lock_env: str = "OPIP_FEATURE_BUS_CAPTURE_LOCK",
     lock_default: str = FEATURE_BUS_CAPTURE_LOCK_PATH,
+    marker_prefix: str = "OPIP_FEATURE_BUS_CAPTURE",
 ) -> dict[str, Any]:
     """Run one capture pass guarded by the process-level non-overlap lock.
 
@@ -500,11 +682,15 @@ def run_capture_locked(
     pass a distinct identity (for example the feasibility producer passes
     ``OPIP_FEASIBILITY_CAPTURE_LOCK`` and its own default path) so one producer's
     lock can never suppress another's: the locking IMPLEMENTATION is shared, the
-    identity is not.
+    identity is not. ``marker_prefix`` selects the durable disposition marker's
+    producer identity for the same reason.
     """
     path = lock_path or os.getenv(lock_env, lock_default)
     lock = CaptureProcessLock(path)
     if not lock.acquire():
+        emit_capture_marker(
+            "skipped_lock_held", prefix=marker_prefix, lock_path=path
+        )
         return {"status": "SKIPPED_LOCK_HELD", "lock_path": path}
     try:
         fn = capture_fn or capture_feature_bus_shadow
@@ -515,6 +701,7 @@ def run_capture_locked(
 
 
 def main() -> None:
+    line_buffered_stdout()
     result = run_capture_locked()
     print("O'Pip Feature Bus SHADOW capture — EVIDENCE ONLY")
     print("Trading authority: NONE")
@@ -526,6 +713,7 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "CAPTURE_MATERIALIZE_RESERVE_SECONDS",
     "CaptureProcessLock",
     "DEFAULT_BUDGET_SECONDS",
     "DEFAULT_CAPTURE_LIMIT",
@@ -537,6 +725,8 @@ __all__ = [
     "MAX_CAPTURE_LIMIT",
     "MAX_CONCURRENCY",
     "capture_feature_bus_shadow",
+    "emit_capture_marker",
+    "line_buffered_stdout",
     "main",
     "run_capture_locked",
     "shadow_capture_authorized",

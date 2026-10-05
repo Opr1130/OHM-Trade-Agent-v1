@@ -54,9 +54,15 @@ class KrakenClient:
         timeout_seconds: float = 15.0,
         *,
         transport: KrakenPublicTransport | None = None,
+        deadline_monotonic: float | None = None,
     ) -> None:
         self.timeout_seconds = timeout_seconds
         self.transport = transport or get_shared_kraken_transport()
+        #: Optional absolute ``time.monotonic()`` deadline for THIS client's whole
+        #: request+retry+backoff sequence. A capture producer sets it so no
+        #: single request can consume a bounded pass; ``None`` (every other
+        #: caller) preserves the pre-existing request semantics.
+        self.deadline_monotonic = deadline_monotonic
 
     def _get(self, endpoint: str, params: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -64,6 +70,7 @@ class KrakenClient:
                 endpoint,
                 params,
                 timeout_seconds=self.timeout_seconds,
+                deadline_monotonic=self.deadline_monotonic,
             )
         except KrakenTransportError as exc:
             raise KrakenAPIError(str(exc)) from exc

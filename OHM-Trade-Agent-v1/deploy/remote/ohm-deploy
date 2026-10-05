@@ -37,6 +37,10 @@ EXPORT_ROOT="/var/lib/opip-learning-export"
 EXPORT_PROOF_FRESHNESS_SECONDS=600
 EXPORT_PROOF_WAIT_SECONDS=360
 SCHEDULER_SNAPSHOT=""
+# Set immediately BEFORE the runtime verifier runs, so the rollback handler can
+# emit the capture producers' own durable disposition when the verifier is the
+# failing command that triggered the rollback.
+RELEASE_RUNTIME_VERIFIER_ATTEMPTED=""
 
 if [[ ! "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
   echo "invalid target sha" >&2
@@ -684,6 +688,65 @@ scheduler_hard_bound_seconds() {
   printf '%s' "$value"
 }
 
+# ---------------------------------------------------------------------------
+# Capture-producer disposition evidence
+#
+# The two evidence producers are separate bounded processes on the ONE scheduler,
+# so their runtime disposition lives in their OWN logs and in the host launch
+# locks -- never in the deploy log. When the runtime verifier fails on missing
+# evidence, the release must therefore surface the producers' durable disposition
+# itself: without it a stalled or bound-killed producer is indistinguishable from
+# a silent evidence drop, and the deployed controller cannot be diagnosed from
+# its own receipt.
+#
+# Read-only, bounded, and non-destructive: only each producer's own machine-
+# readable ``OPIP_*_CAPTURE_PHASE=`` markers, the last few log lines, and a
+# non-destructive host-launch-lock probe are emitted. No canonical store is
+# opened, no producer is started, and no failure semantics change.
+# ---------------------------------------------------------------------------
+OPIP_CAPTURE_DISPOSITION_TAIL_LINES="${OPIP_CAPTURE_DISPOSITION_TAIL_LINES:-6}"
+
+emit_capture_producer_disposition_evidence() {
+  local entry label log lock marker line lock_state
+  local -a producers=(
+    'FEATURE_BUS|/var/log/opip-feature-bus-capture.log|/var/run/opip-feature-bus-capture.lock|OPIP_FEATURE_BUS_CAPTURE_PHASE'
+    'FEASIBILITY|/var/log/opip-feasibility-capture.log|/var/run/opip-feasibility-capture.lock|OPIP_FEASIBILITY_CAPTURE_PHASE'
+  )
+  local tail_lines="$OPIP_CAPTURE_DISPOSITION_TAIL_LINES"
+  [[ "$tail_lines" =~ ^[0-9]+$ ]] || tail_lines=6
+  for entry in "${producers[@]}"; do
+    IFS='|' read -r label log lock marker <<< "$entry"
+    echo "OPIP_CAPTURE_PRODUCER=$label"
+    if [[ -s "$log" ]]; then
+      echo "OPIP_CAPTURE_LOG_BYTES=$(wc -c < "$log" 2>/dev/null || printf 'UNKNOWN')"
+      echo "OPIP_CAPTURE_LOG_MTIME_UTC=$(date -u -r "$log" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf 'UNKNOWN')"
+    else
+      echo "OPIP_CAPTURE_LOG_MISSING=1"
+    fi
+    # The LAST durable producer marker names the stage that overran, if any.
+    local last_marker
+    last_marker="$(grep -oE "${marker}=[^[:space:]]+.*" "$log" 2>/dev/null | tail -n 1 || true)"
+    echo "OPIP_CAPTURE_LAST_MARKER=${last_marker:-NONE}"
+    while IFS= read -r line; do
+      echo "OPIP_CAPTURE_TAIL=${label}|${line}"
+    done < <(tail -n "$tail_lines" "$log" 2>/dev/null || true)
+    # A held host launch lock is direct evidence that a producer pass was still
+    # running inside its bound while the release transaction executed. The probe
+    # acquires and immediately releases, so it never blocks a producer.
+    if [[ -e "$lock" ]]; then
+      if flock -n "$lock" true 2>/dev/null; then
+        lock_state="PRESENT|HELD=NO"
+      else
+        lock_state="PRESENT|HELD=YES"
+      fi
+      echo "OPIP_CAPTURE_HOST_LOCK=${label}|${lock_state}"
+    else
+      echo "OPIP_CAPTURE_HOST_LOCK=${label}|ABSENT"
+    fi
+  done
+  return 0
+}
+
 wait_unified_cycle_success() {
   local ready_after="$1" deadline="$2"
   local cycle_log="/var/log/ohm-unified-cycle.log"
@@ -1114,6 +1177,14 @@ rollback() {
   echo "OPIP_CORE_DEPLOY_STATUS=FAILED"
   echo "deployment failed; rolling back to $PREVIOUS_SHA" >&2
 
+  # Surface the capture producers' OWN durable disposition when the runtime
+  # verifier is what failed, BEFORE any rollback work: a missing-evidence failure
+  # must be diagnosable from the deploy receipt alone. Bounded and read-only.
+  if [[ "$RELEASE_RUNTIME_VERIFIER_ATTEMPTED" == "1" ]]; then
+    echo "OPIP_RELEASE_RUNTIME_VERIFIER_EXIT=$rc"
+    emit_capture_producer_disposition_evidence || true
+  fi
+
   # Free paper-worker memory before rebuilding the previous deterministic core.
   stop_paper_stack
 
@@ -1299,6 +1370,9 @@ wait_unified_cycle_success "$READY_AFTER" "$((SECONDS + UNIFIED_CYCLE_RELEASE_WA
 # process cannot outlive the deploy transaction).
 VERIFIER_CONTAINMENT_SECONDS=$((RUNTIME_VERIFIER_TIMEOUT_SECONDS + RUNTIME_VERIFIER_CONTAINMENT_MARGIN_SECONDS))
 echo "OPIP_RUNTIME_VERIFY_CONTAINMENT_SECONDS=$VERIFIER_CONTAINMENT_SECONDS"
+# Marked BEFORE the call so the rollback handler knows the verifier was the
+# failing stage and should emit the producers' own disposition evidence.
+RELEASE_RUNTIME_VERIFIER_ATTEMPTED="1"
 timeout --signal=TERM --kill-after=5s "$VERIFIER_CONTAINMENT_SECONDS" \
   docker compose exec -T ohm-trade-agent \
   python -m app.services.release_runtime_verifier \

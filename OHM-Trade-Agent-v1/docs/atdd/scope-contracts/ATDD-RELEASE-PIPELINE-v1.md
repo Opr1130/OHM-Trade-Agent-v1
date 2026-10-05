@@ -150,6 +150,19 @@ the local tooling bootstrap is inspected for scope, authority and reproducibilit
 THEN:
 Microsoft VS Code and Aider are local engineering support tooling only and hold no authority; GitHub Linux CI remains the canonical full regression and Linux execution authority; the Windows targeted pytest task is not equivalent to the canonical full Linux regression; the Windows targeted coverage task is local and advisory only; the Engineering Health task remains advisory; the local tooling grants no runtime authority, no production deployment authority, no live or funded trading authority, no Paper-v2 activation authority, no Committee activation authority and no PR merge authority; it introduces no automatic git push and no automatic commit; `.aiderignore` excludes secrets and generated/runtime artifacts; `pytest-cov` and `pyright` are reproducible DEVELOPMENT-only dependencies recorded in `requirements-dev.txt`; `requirements.txt` remains the production/runtime dependency authority and is unchanged; and the existing release-profile, trading, scheduler, protection, writer, Feature Bus and deployment semantics are unchanged
 
+AC-017:
+GIVEN:
+two PROVEN `EVIDENCE_SHADOW` runtime-qualification blockers: a Feature Bus capture pass whose retry/backoff sequence can consume the whole bounded pass and is killed by cron containment before it records anything (`CAPTURE_PASS_OVERRUN`), and an F5 feasibility source cutoff derived only from the close of the latest completed 60-minute candle, which can satisfy the UNCHANGED 120-second runtime source-age contract only in the ~two minutes after an hour boundary
+WHEN:
+the two evidence producers are exercised against the production timing and containment contracts
+THEN:
+(a) every Feature Bus acquisition obeys the remaining pass/wave deadline: the transport's FULL sequence -- every attempt, every inter-attempt backoff+jitter sleep and every rate-limiter wait -- is bounded by the pass-scoped client's absolute monotonic deadline and by a per-attempt timeout DERIVED so `attempts * attempt_timeout * KRAKEN_ATTEMPT_PHASE_BOUND + worst_case_backoff + rate_wait <= wave budget` (never the naive `budget / attempts`), no retry begins when its worst-case cost cannot fit the remaining budget, the pass splits its declared budget into an acquisition deadline and a reserved Phase-B materialization window so an acquisition wave can never consume the time needed to COMMIT what it acquired, no snapshot is materialized when acquisition failed, and one pass-scoped client (rather than repeated default-timeout clients) serves both the instrument provider and the minute source
+(b) producer progress is durable even when the outer 50-second cron containment kills the process: each pass emits explicitly flushed, line-buffered `OPIP_FEATURE_BUS_CAPTURE_PHASE=` / `OPIP_FEASIBILITY_CAPTURE_PHASE=` markers for start, universe/refresh readiness, acquire, acquire_complete, materialize and done, plus explicit dispositions for deadline exhaustion, request timeout, acquisition failure, lock contention and zero materialized snapshots, so a bounded pass is never a silent evidence drop and the last durable marker names the stage that overran; the outer containment remains emergency termination only, not the normal producer stop
+(c) the F5 feasibility producer keeps its EXISTING 60-minute analytical horizon (interval, thresholds, continuity and spike semantics unchanged) and SEPARATELY acquires a fresh closed one-minute Kraken observation of the SAME instrument during the same acquisition, using that anchor's close as the canonical `source_cutoff` -- the freshest market datum that genuinely supports the determination -- so `F5 commit time - source_cutoff <= MAX_FEV_SOURCE_AGE` holds for a normally functioning one-minute capture regardless of where the pass falls within the hour
+(d) the evidence records BOTH provenance planes explicitly as version-compatible `source_evidence_refs` tokens (the analytical interval/bars/latest hourly cutoff AND the freshness anchor's interval, bar open/close, acquisition instant and calculated source age) with NO schema change, and F5 lineage still names exactly the originating `FeatureSnapshot`
+(e) a missing, not-yet-visible, after-epoch or over-age freshness anchor fails closed (no synthetic or backdated timestamp is ever manufactured) and is recorded as a durable flushed disposition, while the UNCHANGED `release_runtime_verifier` still rejects the old hourly-anchored cutoff at the production timings and accepts only the corrected freshness-anchor semantics
+(f) no release-profile mode, freshness window, 3600/3720 timing contract, trading/paper/funded/Committee authority, Feature Bus/canonical-writer/spine mode, protection semantics or deploy control plane is changed
+
 EXPLICITLY OUT OF SCOPE:
 - Activating TARGET_PAPER, Paper-v2, the Committee, or any funded/live/exchange/order authority
 - Deleting, rewriting or rescoping the historical ATDD increments that recorded the Feature Bus `off`
@@ -261,6 +274,21 @@ AC-016 -> tests/test_opip_local_engineering_bootstrap_v1.py::test_ac_016_no_task
 AC-016 -> tests/test_opip_local_engineering_bootstrap_v1.py::test_ac_016_aiderignore_excludes_secrets_and_generated_artifacts
 AC-016 -> tests/test_opip_local_engineering_bootstrap_v1.py::test_ac_016_dev_dependencies_are_reproducible_and_local_only
 AC-016 -> tests/test_opip_local_engineering_bootstrap_v1.py::test_ac_016_requirements_txt_remains_runtime_authority
+AC-017 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_analytical_horizon_and_fresh_anchor_are_separately_acquired
+AC-017 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_anchor_beyond_the_max_source_age_fails_closed
+AC-017 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_evidence_lineage_points_to_the_exact_source_snapshot
+AC-017 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_freshness_anchor_holds_anywhere_within_the_hour
+AC-017 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_freshness_dispositions_are_flushed_durable_markers
+AC-017 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_hourly_cutoff_cannot_satisfy_the_verifier_but_the_fresh_anchor_does
+AC-017 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_stale_freshness_anchor_fails_closed_without_synthetic_freshness
+AC-017 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_capture_client_declares_a_bounded_public_only_request_budget
+AC-017 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_deadline_exhaustion_emits_a_durable_disposition_marker
+AC-017 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_failed_acquisition_emits_a_durable_disposition_marker
+AC-017 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_materialization_reserve_is_retained_for_phase_b
+AC-017 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_retry_and_backoff_never_start_without_remaining_budget
+AC-017 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_stalled_request_cannot_consume_the_complete_pass_budget
+AC-017 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_two_minute_passes_satisfy_the_runtime_verifier
+AC-017 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_zero_materialization_emits_a_durable_disposition_marker
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/services/release_profiles.py
@@ -349,6 +377,18 @@ AC-016 -> .vscode/tasks.json
 AC-016 -> OHM-Trade-Agent-v1/requirements-dev.txt
 AC-016 -> OHM-Trade-Agent-v1/tests/test_opip_local_engineering_bootstrap_v1.py
 AC-016 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
+AC-017 -> OHM-Trade-Agent-v1/app/exchanges/kraken.py
+AC-017 -> OHM-Trade-Agent-v1/app/jobs/capture_feasibility_evidence_shadow.py
+AC-017 -> OHM-Trade-Agent-v1/app/jobs/capture_feature_bus_shadow.py
+AC-017 -> OHM-Trade-Agent-v1/app/services/kraken_transport.py
+AC-017 -> OHM-Trade-Agent-v1/app/services/opip_feature_bus_market_source.py
+AC-017 -> OHM-Trade-Agent-v1/deploy/cron.d/opip-feasibility-evidence-capture
+AC-017 -> OHM-Trade-Agent-v1/deploy/cron.d/opip-feature-bus-capture
+AC-017 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
+AC-017 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
+AC-017 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-paper-activation.md
+AC-017 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_feasibility_producer.py
+AC-017 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_shadow_cadence.py
 
 DEFERRED DISCOVERIES:
 - `TARGET_PAPER` remains BLOCKED. Activating it (Paper-v2) requires the ATDD-R4-B2 AC-011 comparator evidence, F11 protection READY, legacy drain READY and explicit OWNER approval, and is a separate OWNER increment; this contract does not authorize it.

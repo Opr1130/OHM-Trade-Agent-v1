@@ -21,6 +21,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 
 APP_ROOT = Path(__file__).resolve().parents[1]
@@ -430,15 +431,27 @@ def test_ac_020_deadline_stops_further_waves():
         version.instrument_version_id: _batch(version, _observations(version))
         for version in versions
     }
-    # start=0; the first wave gate sees 0 (budget intact); the second wave gate
-    # jumps past the deadline, so only the first wave (2 instruments) is fetched.
-    ticks = iter([0.0, 0.0, 1000.0])
+    # The SOURCE advances the pass clock: the first wave (2 instruments) completes,
+    # then the clock is past the acquisition deadline, so the next wave gate cannot
+    # fit one more bounded request and no further instrument is fetched.
+    clock = {"value": 0.0}
 
     def _clock():
-        try:
-            return next(ticks)
-        except StopIteration:
-            return 1000.0
+        return clock["value"]
+
+    class _AdvancingSource:
+        venue = "kraken"
+        source_label = "kraken_ohlc"
+        interval_seconds = 60
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def fetch_through(self, version, *, watermark, now):
+            self.calls += 1
+            if self.calls >= 2:
+                clock["value"] = 1000.0
+            return batches[version.instrument_version_id]
 
     client = _RecordingClient()
     publisher = FeatureBusPublisher(client, enabled=True, settings=_settings())
@@ -450,7 +463,7 @@ def test_ac_020_deadline_stops_further_waves():
         now=T0,
         publisher=publisher,
         instrument_provider=_provider(versions),
-        source=_source(batches),
+        source=_AdvancingSource(),
         restore_continuity=lambda versions: ({}, {}, {}),
         clock=_clock,
     )
@@ -458,6 +471,507 @@ def test_ac_020_deadline_stops_further_waves():
     assert summary.fetched == 2
     assert len(client.snapshot_payloads()) == 2
     assert any("budget exhausted" in err for err in summary.errors)
+
+
+# ---------------------------------------------------------------------------
+# AC-020 bounded request/retry sequence, pass deadline and durable dispositions
+# ---------------------------------------------------------------------------
+
+#: The declared worst-case wall clock of ONE acquisition wave, as the pass-scoped
+#: client and the wave gate both derive it (see capture_request_timeout_seconds).
+WAVE_BUDGET_SECONDS = 15.0
+
+
+def _record_markers(monkeypatch):
+    """Capture every producer disposition marker and assert each one is FLUSHED."""
+    lines: list[str] = []
+
+    def _fake_print(*args, **kwargs):
+        assert kwargs.get("flush") is True, (
+            "durable capture markers must be flushed; a buffered line is lost when "
+            "the outer containment kills the producer"
+        )
+        lines.append(" ".join(str(arg) for arg in args))
+
+    monkeypatch.setattr(capture, "print", _fake_print, raising=False)
+    return lines
+
+
+def _marker_field(line: str, key: str) -> float | None:
+    for field in line.split(" "):
+        if field.startswith(f"{key}="):
+            try:
+                return float(field.split("=", 1)[1])
+            except ValueError:
+                return None
+    return None
+
+
+class _VirtualKrakenClock:
+    """A virtual monotonic clock: the ONLY way to prove a bounded retry sequence.
+
+    Wall-clock sleeps would make the test as slow as the failure it proves, so the
+    transport's ``time`` module reference is replaced and every sleep advances the
+    virtual clock by exactly the amount the transport asked for. A stalled attempt
+    consumes its whole httpx timeout, which is what a real connect+read stall does
+    (httpx applies the float to connect and read SEPARATELY).
+    """
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.sleeps: list[float] = []
+        self.attempts: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(float(seconds))
+        self.now += float(seconds)
+
+
+def _stalling_transport(monkeypatch, clock, *, max_retries: int = 2, error=None):
+    from app.services import kraken_transport as transport_module
+
+    transport = transport_module.KrakenPublicTransport(
+        requests_per_second=1000.0, burst=10, max_retries=max_retries
+    )
+    monkeypatch.setattr(
+        transport_module,
+        "time",
+        SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep),
+    )
+    failure = error if error is not None else httpx.ReadTimeout("stalled public read")
+
+    def _stalled_get(url, params=None, timeout=None):
+        clock.attempts.append(float(timeout))
+        clock.now += float(timeout)  # a stalled connect+read consumes its full timeout
+        raise failure
+
+    monkeypatch.setattr(transport._client, "get", _stalled_get)
+    return transport, transport_module
+
+
+def test_ac_020_stalled_request_cannot_consume_the_complete_pass_budget(monkeypatch):
+    """ATDD-R4-B2-controlled-paper-activation/AC-020 and ATDD-RELEASE-PIPELINE-v1/AC-017: a fully stalled request (every attempt timing out) still finishes inside ONE wave budget -- retries, backoff, jitter and rate-limit waiting included."""
+    from app.services import opip_feature_bus_market_source as market_source
+    from app.services.kraken_transport import KrakenTransportError
+
+    clock = _VirtualKrakenClock()
+    transport, _ = _stalling_transport(monkeypatch, clock, max_retries=2)
+    timeout_seconds = market_source.capture_request_timeout_seconds(
+        wave_budget_seconds=WAVE_BUDGET_SECONDS, max_retries=2
+    )
+    started = clock.now
+    deadline = started + WAVE_BUDGET_SECONDS
+    with pytest.raises(KrakenTransportError):
+        transport.request(
+            "OHLC",
+            {"pair": "SOLUSD", "interval": 1},
+            timeout_seconds=timeout_seconds,
+            deadline_monotonic=deadline,
+        )
+    # EVERY attempt (not just the derived timeout) is bounded by the wave budget.
+    assert len(clock.attempts) == 3
+    assert clock.now - started <= WAVE_BUDGET_SECONDS
+    assert sum(clock.sleeps) + sum(clock.attempts) <= WAVE_BUDGET_SECONDS
+    # The naive ``15s / 3 attempts = 5s`` shortcut is NOT what bounds this: the
+    # derived per-attempt timeout first subtracts backoff + rate-wait overhead.
+    assert timeout_seconds < WAVE_BUDGET_SECONDS / 3
+    assert market_source.capture_worst_case_request_seconds(
+        wave_budget_seconds=WAVE_BUDGET_SECONDS, max_retries=2
+    ) <= WAVE_BUDGET_SECONDS
+
+
+def test_ac_020_retry_and_backoff_never_start_without_remaining_budget(monkeypatch):
+    """ATDD-R4-B2-controlled-paper-activation/AC-020 and ATDD-RELEASE-PIPELINE-v1/AC-017: a retry (and its backoff sleep) never begins when it cannot fit the remaining deadline, and an exhausted budget starts no upstream work at all."""
+    from app.services import opip_feature_bus_market_source as market_source
+    from app.services.kraken_transport import KrakenTransportDeadlineExceeded
+
+    # One attempt can fit but a FULL retry sequence cannot: the transport shrinks
+    # the attempt timeout to the remaining budget and then refuses the retry that
+    # cannot fit -- it never sleeps past the deadline.
+    clock = _VirtualKrakenClock()
+    transport, _ = _stalling_transport(monkeypatch, clock, max_retries=2)
+    started = clock.now
+    deadline = started + 1.9
+    with pytest.raises(KrakenTransportDeadlineExceeded):
+        transport.request(
+            "OHLC", {"pair": "SOLUSD"}, timeout_seconds=1.0, deadline_monotonic=deadline
+        )
+    assert len(clock.attempts) <= 3
+    assert all(attempt <= 1.0 for attempt in clock.attempts)
+    assert clock.attempts[-1] < clock.attempts[0]  # derived from the REMAINING budget
+    assert clock.now <= deadline
+    assert clock.now - started <= 1.9
+    assert started + sum(clock.sleeps) + sum(clock.attempts) <= deadline
+
+    # A single attempt that cannot fit the remaining budget starts NOTHING.
+    clock = _VirtualKrakenClock()
+    transport, _ = _stalling_transport(monkeypatch, clock, max_retries=2)
+    started = clock.now
+    with pytest.raises(KrakenTransportDeadlineExceeded):
+        transport.request(
+            "OHLC",
+            {"pair": "SOLUSD"},
+            timeout_seconds=1.0,
+            deadline_monotonic=started + 0.3,
+        )
+    assert clock.attempts == []
+    assert clock.sleeps == []
+
+    # An already-exhausted budget starts NOTHING (no attempt, no sleep).
+    clock = _VirtualKrakenClock()
+    transport, _ = _stalling_transport(monkeypatch, clock, max_retries=2)
+    started = clock.now
+    with pytest.raises(KrakenTransportDeadlineExceeded):
+        transport.request(
+            "OHLC",
+            {"pair": "SOLUSD"},
+            timeout_seconds=1.0,
+            deadline_monotonic=started + 0.05,
+        )
+    assert clock.attempts == []
+    assert clock.sleeps == []
+    assert clock.now - started <= 0.05
+    assert (
+        market_source.classify_capture_error(
+            KrakenTransportDeadlineExceeded("deadline exhausted")
+        )
+        == "DEADLINE_EXHAUSTED"
+    )
+    # A rate-limiter wait that cannot fit the deadline also starts nothing.
+    clock = _VirtualKrakenClock()
+    from app.services.kraken_transport import KrakenPublicTransport
+
+    transport = KrakenPublicTransport(requests_per_second=0.25, burst=1, max_retries=2)
+    transport._tokens = 0.0
+    transport._last_refill = clock.now
+    monkeypatch.setattr(
+        sys.modules["app.services.kraken_transport"],
+        "time",
+        SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep),
+    )
+    with pytest.raises(KrakenTransportDeadlineExceeded):
+        transport.request(
+            "OHLC",
+            {"pair": "SOLUSD"},
+            timeout_seconds=1.0,
+            deadline_monotonic=clock.now + 0.5,
+        )
+    assert clock.attempts == []
+    assert clock.sleeps == []
+
+
+def test_ac_020_capture_client_declares_a_bounded_public_only_request_budget(monkeypatch):
+    """ATDD-R4-B2-controlled-paper-activation/AC-020 and ATDD-RELEASE-PIPELINE-v1/AC-017: the pass-scoped capture client declares a derived per-attempt timeout AND the pass deadline, exposes only public read endpoints, and its worst case fits the declared wave for every retry policy."""
+    from app.services import opip_feature_bus_market_source as market_source
+
+    # The SHIPPED retry policy fits ONE wave exactly; a policy that cannot fit is
+    # reported honestly (never understated), so the wave gate fail-closes instead
+    # of starting work that would overrun the pass.
+    assert market_source.capture_worst_case_request_seconds(
+        wave_budget_seconds=WAVE_BUDGET_SECONDS
+    ) <= WAVE_BUDGET_SECONDS + 1e-9
+    assert market_source.capture_worst_case_request_seconds(
+        wave_budget_seconds=WAVE_BUDGET_SECONDS, max_retries=5
+    ) > WAVE_BUDGET_SECONDS
+
+    deadline = 1234.5
+    client = market_source.capture_kraken_client(
+        wave_budget_seconds=WAVE_BUDGET_SECONDS, deadline_monotonic=deadline
+    )
+    assert client.timeout_seconds == market_source.capture_request_timeout_seconds(
+        wave_budget_seconds=WAVE_BUDGET_SECONDS
+    )
+    assert client.deadline_monotonic == deadline
+    # Public reads only: the capture client has no order authority of any kind.
+    for forbidden in (
+        "place_order",
+        "add_order",
+        "create_order",
+        "cancel_order",
+        "amend_order",
+        "withdraw",
+    ):
+        assert not hasattr(client, forbidden), forbidden
+
+
+def test_ac_020_materialization_reserve_is_retained_for_phase_b(monkeypatch):
+    """ATDD-R4-B2-controlled-paper-activation/AC-020 and ATDD-RELEASE-PIPELINE-v1/AC-017: Phase A can never consume the time reserved for Phase B, so every acquired snapshot is still committed (with a durable marker) after a deadline-exhausted acquisition."""
+    versions = [_instrument(i) for i in range(6)]
+    batches = {
+        version.instrument_version_id: _batch(version, _observations(version))
+        for version in versions
+    }
+    tick = {"value": 0.0}
+
+    def _clock():
+        return tick["value"]
+
+    class _SlowSource:
+        venue = "kraken"
+        source_label = "kraken_ohlc"
+        interval_seconds = 60
+
+        def fetch_through(self, version, *, watermark, now):
+            tick["value"] += 14.0  # one bounded request consumes its whole wave
+            return batches[version.instrument_version_id]
+
+    lines = _record_markers(monkeypatch)
+    client = _RecordingClient()
+    publisher = FeatureBusPublisher(client, enabled=True, settings=_settings())
+    budget = 45.0
+    summary = capture.capture_feature_bus_shadow(
+        settings=_settings(
+            opip_feature_bus_capture_budget_seconds=budget,
+            opip_feature_bus_capture_concurrency=2,
+        ),
+        now=T0,
+        publisher=publisher,
+        instrument_provider=_provider(versions),
+        source=_SlowSource(),
+        restore_continuity=lambda versions: ({}, {}, {}),
+        clock=_clock,
+    )
+
+    reserve = min(
+        capture.CAPTURE_MATERIALIZE_RESERVE_SECONDS,
+        max(0.0, budget - capture.PER_REQUEST_BUDGET_SECONDS),
+    )
+    assert reserve == capture.CAPTURE_MATERIALIZE_RESERVE_SECONDS == 10.0
+    assert capture.CAPTURE_MATERIALIZE_RESERVE_SECONDS < capture.MAX_BUDGET_SECONDS
+
+    # Acquisition stopped at its own (earlier) deadline...
+    assert summary.budget_exhausted is True
+    assert summary.fetched == 2
+    acquire_complete = [
+        line for line in lines if "PHASE=acquire_complete" in line
+    ]
+    assert len(acquire_complete) == 1
+    acquired_elapsed = _marker_field(acquire_complete[0], "elapsed_seconds")
+    assert acquired_elapsed == 28.0
+    assert acquired_elapsed <= budget - reserve
+    # The REFUSED wave would have been admitted without the reserve (45 - 28 = 17
+    # >= 15) and would then have run the pass to 56s -- past both the pass budget
+    # and the 50-second containment. The reserve is what refuses it at 7s.
+    assert budget - reserve - acquired_elapsed < WAVE_BUDGET_SECONDS
+    assert budget - acquired_elapsed >= WAVE_BUDGET_SECONDS
+    assert acquired_elapsed + 2 * 14.0 > budget
+    # ...and Phase B still committed EVERY acquired snapshot (nothing dropped).
+    assert any("PHASE=materialize" in line for line in lines)
+    assert any("PHASE=deadline_exhausted" in line for line in lines)
+    assert summary.cycles == 2
+    assert len(client.snapshot_payloads()) == 2
+    assert lines[-1].startswith("OPIP_FEATURE_BUS_CAPTURE_PHASE=done")
+    assert _marker_field(lines[-1], "elapsed_seconds") <= budget
+
+
+def test_ac_020_failed_acquisition_emits_a_durable_disposition_marker(monkeypatch):
+    """ATDD-R4-B2-controlled-paper-activation/AC-020 and ATDD-RELEASE-PIPELINE-v1/AC-017: a timed-out instrument emits a FLUSHED failure disposition naming the reason, while the remaining instruments still commit and nothing is fabricated."""
+    versions = [_instrument(1), _instrument(2)]
+    batches = {
+        version.instrument_version_id: _batch(version, _observations(version))
+        for version in versions
+    }
+    failing = versions[1].instrument_version_id
+
+    class _StallingSource:
+        venue = "kraken"
+        source_label = "kraken_ohlc"
+        interval_seconds = 60
+
+        def fetch_through(self, version, *, watermark, now):
+            if version.instrument_version_id == failing:
+                raise httpx.ReadTimeout("stalled public read")
+            return batches[version.instrument_version_id]
+
+    lines = _record_markers(monkeypatch)
+    client = _RecordingClient()
+    publisher = FeatureBusPublisher(client, enabled=True, settings=_settings())
+    summary = capture.capture_feature_bus_shadow(
+        settings=_settings(),
+        now=T0,
+        publisher=publisher,
+        instrument_provider=_provider(versions),
+        source=_StallingSource(),
+        restore_continuity=lambda versions: ({}, {}, {}),
+    )
+
+    failures = [line for line in lines if "PHASE=acquire_failure" in line]
+    assert len(failures) == 1
+    assert f"instrument={failing}" in failures[0]
+    assert "reason=REQUEST_TIMEOUT" in failures[0]
+    assert summary.source_errors == 1
+    # The healthy instrument is still materialized; the failed one is NOT.
+    assert len(client.snapshot_payloads()) == 1
+    assert summary.cycles == 1
+    done = [line for line in lines if line.startswith("OPIP_FEATURE_BUS_CAPTURE_PHASE=done")]
+    assert len(done) == 1
+    assert "status=OK" in done[0]
+    # The full phase sequence is observable, not only the failure.
+    stages = [line.split(" ")[0].split("=", 1)[1] for line in lines]
+    for stage in (
+        "start",
+        "universe_ready",
+        "acquire",
+        "acquire_complete",
+        "materialize",
+        "done",
+    ):
+        assert stage in stages, stage
+
+
+def test_ac_020_zero_materialization_emits_a_durable_disposition_marker(monkeypatch):
+    """ATDD-R4-B2-controlled-paper-activation/AC-020 and ATDD-RELEASE-PIPELINE-v1/AC-017: a pass that materializes zero snapshots is never indistinguishable from a silent evidence drop -- it emits an explicit flushed zero-snapshot disposition."""
+    versions = [_instrument(1), _instrument(2)]
+    batches = {
+        version.instrument_version_id: _batch(version, _observations(version))
+        for version in versions
+    }
+
+    class _AllFailingSource:
+        venue = "kraken"
+        source_label = "kraken_ohlc"
+        interval_seconds = 60
+
+        def fetch_through(self, version, *, watermark, now):
+            raise RuntimeError("unexpected transport failure")
+
+    lines = _record_markers(monkeypatch)
+    client = _RecordingClient()
+    publisher = FeatureBusPublisher(client, enabled=True, settings=_settings())
+    summary = capture.capture_feature_bus_shadow(
+        settings=_settings(),
+        now=T0,
+        publisher=publisher,
+        instrument_provider=_provider(versions),
+        source=_AllFailingSource(),
+        restore_continuity=lambda versions: ({}, {}, {}),
+    )
+    assert summary.cycles == 0
+    assert client.snapshot_payloads() == []
+    zero = [line for line in lines if "PHASE=zero_snapshots" in line]
+    assert len(zero) == 1
+    assert "fetched=0" in zero[0] and "source_errors=2" in zero[0]
+    done = [line for line in lines if line.startswith("OPIP_FEATURE_BUS_CAPTURE_PHASE=done")]
+    assert "status=NO_SNAPSHOTS" in done[0]
+
+
+def test_ac_020_deadline_exhaustion_emits_a_durable_disposition_marker(monkeypatch):
+    """ATDD-R4-B2-controlled-paper-activation/AC-020 and ATDD-RELEASE-PIPELINE-v1/AC-017: an exhausted acquisition deadline is recorded as an explicit durable disposition naming the reason and the remaining/required budget."""
+    versions = [_instrument(i) for i in range(6)]
+    batches = {
+        version.instrument_version_id: _batch(version, _observations(version))
+        for version in versions
+    }
+    clock = {"value": 0.0}
+
+    def _clock():
+        return clock["value"]
+
+    class _AdvancingSource:
+        venue = "kraken"
+        source_label = "kraken_ohlc"
+        interval_seconds = 60
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def fetch_through(self, version, *, watermark, now):
+            self.calls += 1
+            if self.calls >= 2:
+                clock["value"] = 1000.0
+            return batches[version.instrument_version_id]
+
+    lines = _record_markers(monkeypatch)
+    client = _RecordingClient()
+    publisher = FeatureBusPublisher(client, enabled=True, settings=_settings())
+    summary = capture.capture_feature_bus_shadow(
+        settings=_settings(opip_feature_bus_capture_concurrency=2),
+        now=T0,
+        publisher=publisher,
+        instrument_provider=_provider(versions),
+        source=_AdvancingSource(),
+        restore_continuity=lambda versions: ({}, {}, {}),
+        clock=_clock,
+    )
+    assert summary.budget_exhausted is True
+    deadline = [line for line in lines if "PHASE=deadline_exhausted" in line]
+    assert len(deadline) == 1
+    assert "where=acquire" in deadline[0]
+    assert "reason=INSUFFICIENT_ACQUISITION_BUDGET" in deadline[0]
+    assert "instruments_acquired=2" in deadline[0]
+    assert "instruments_pending=4" in deadline[0]
+    assert _marker_field(deadline[0], "required_seconds") == WAVE_BUDGET_SECONDS
+    done = [line for line in lines if line.startswith("OPIP_FEATURE_BUS_CAPTURE_PHASE=done")]
+    assert "budget_exhausted=True" in done[0]
+
+
+def test_ac_020_two_minute_passes_satisfy_the_runtime_verifier():
+    """ATDD-R4-B2-controlled-paper-activation/AC-020 and ATDD-RELEASE-PIPELINE-v1/AC-017: the two consecutive minute passes satisfy the UNCHANGED runtime verifier (exact 60-second cadence plus a matching fresh F5), and the same pair fails it when F5 is anchored only to the top of the hour."""
+    from app.opip.contracts.feasibility_evidence import FeasibilityEvidence
+    from app.opip.features.committed_snapshot_reader import feature_snapshot_from_payload
+    from app.services.release_runtime_verifier import (
+        MAX_FEV_SOURCE_AGE,
+        _new_evidence_is_valid,
+    )
+
+    assert MAX_FEV_SOURCE_AGE == timedelta(seconds=120)
+    version = _instrument(1)
+    batches_a = {
+        version.instrument_version_id: _batch(version, _observations(version, T0))
+    }
+    batches_b = {
+        version.instrument_version_id: _batch(version, _observations(version, T60))
+    }
+    _, client_a = _run_pass(now=T0, versions=[version], batches=batches_a)
+    _, client_b = _run_pass(now=T60, versions=[version], batches=batches_b)
+    snap_a = feature_snapshot_from_payload(client_a.snapshot_payloads()[0])
+    snap_b = feature_snapshot_from_payload(client_b.snapshot_payloads()[0])
+    assert snap_a.evaluation_grid_seconds == 60
+    assert snap_b.evaluation_grid_seconds == 60
+    assert snap_b.evaluation_cutoff - snap_a.evaluation_cutoff == timedelta(seconds=60)
+
+    def _evidence(source_cutoff):
+        return FeasibilityEvidence(
+            instrument_version_id=snap_b.instrument_version_id,
+            venue_instrument_id=snap_b.venue_instrument_id,
+            direction="LONG",
+            evaluation_time=snap_b.evaluation_cutoff,
+            source_cutoff=source_cutoff,
+            source_snapshot_id=snap_b.snapshot_id,
+            source_evidence_refs=(snap_b.snapshot_id,),
+            market_data_validation=None,
+            margin_validation_status=None,
+            margin_eligible=None,
+            margin_venue_symbol=None,
+            margin_max_leverage=None,
+            execution_validation=None,
+            availability="AVAILABLE",
+            missingness=(),
+            kraken_public_symbol=snap_b.venue_instrument_id,
+            primary_pair=snap_b.venue_instrument_id,
+        )
+
+    now = T60 + timedelta(seconds=72)  # the production commit-lag shape
+    ready_after = T0 - timedelta(seconds=1)
+    passed, report = _new_evidence_is_valid(
+        [snap_a, snap_b], [_evidence(T60)], ready_after=ready_after, now=now
+    )
+    assert passed is True
+    assert report["consecutive_60s_snapshots"] is True
+    assert report["feasibility_matches_fresh_snapshot"] is True
+
+    # Same lineage, same cadence -- only the source anchor is stale (HH:00).
+    hourly_only = _evidence(T0)
+    assert now - hourly_only.source_cutoff > MAX_FEV_SOURCE_AGE
+    passed_hourly, report_hourly = _new_evidence_is_valid(
+        [snap_a, snap_b], [hourly_only], ready_after=ready_after, now=now
+    )
+    assert passed_hourly is False
+    assert report_hourly["consecutive_60s_snapshots"] is True
+    assert report_hourly["feasibility_matches_fresh_snapshot"] is False
 
 
 def test_ac_020_materialization_is_sequential(monkeypatch):
