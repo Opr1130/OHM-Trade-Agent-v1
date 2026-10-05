@@ -61,6 +61,7 @@ from time import monotonic
 from typing import Any, Callable
 
 from app.opip.canonical.bridge import resolve_writer_mode
+from app.opip.canonical.protocol import WriterDeadlineExceeded
 from app.opip.features.pipeline import (
     CycleIdentityMismatch,
     declared_cycle_submit_bound,
@@ -122,6 +123,12 @@ CAPTURE_MATERIALIZE_WRITE_BOUND_SECONDS = 5.0
 #: acquired evidence is recorded as an explicit incomplete disposition instead of
 #: being run against the cron containment.
 CAPTURE_MATERIALIZE_MIN_WRITE_SECONDS = 0.05
+
+#: The canonical writer's explicit deadline-cut exception name, as recorded on a
+#: refused ``PublishOutcome``. A submit that could not START before the absolute
+#: Phase-B deadline elapsed leaves acquired evidence uncommitted, which is an
+#: explicit incomplete disposition rather than a silent partial write.
+WRITER_DEADLINE_ERROR_NAME = WriterDeadlineExceeded.__name__
 
 #: Bounded acquisition concurrency. Kraken has no bulk multi-pair OHLC endpoint,
 #: so one public request per instrument is required for each closed minute. A
@@ -234,6 +241,38 @@ def _bound_writer_operation_timeout(
     except Exception:  # noqa: BLE001 - a read-only client keeps its own bound
         return float(current)
     return bounded
+
+
+def _bind_writer_deadline(publisher: Any, deadline_monotonic: float) -> float | None:
+    """Bind ONE absolute Phase-B wall-clock deadline onto the persistent writer.
+
+    Phase B performs MANY dependent canonical submits. A per-operation timeout can
+    only bound a SINGLE blocking socket call, and one roundtrip makes several
+    (connect, sendall, and every individual ``recv`` inside ``_recvexact``), so the
+    ABSOLUTE ``materialize_deadline`` is the only enforceable wall-clock bound.
+    Binding it ONCE on the SAME client every submit uses means each later submit
+    inherits only the time REMAINING in the original Phase-B window instead of a
+    fresh per-submit budget. A client that exposes no deadline seam keeps its own
+    behavior (the per-submit timeout clamp still applies). Returns the deadline now
+    in force, or ``None`` when the client cannot be bounded this way.
+    """
+    try:
+        client = publisher.resolved_writer_client()
+    except Exception:  # noqa: BLE001 - an unresolvable client keeps the write bound
+        return None
+    binder = getattr(client, "bind_deadline", None)
+    if callable(binder):
+        try:
+            return binder(deadline_monotonic)
+        except Exception:  # noqa: BLE001 - a refusing client keeps the write bound
+            return None
+    if hasattr(client, "deadline_monotonic"):
+        try:
+            client.deadline_monotonic = deadline_monotonic
+            return deadline_monotonic
+        except Exception:  # noqa: BLE001
+            return None
+    return None
 
 
 def shadow_capture_authorized(settings: Any) -> bool:
@@ -518,6 +557,11 @@ def capture_feature_bus_shadow(
     # consume the reserve and cross cron containment with acquired evidence
     # uncommitted. A write that cannot fit is never started.
     materialize_deadline = deadline
+    # ONE absolute Phase-B deadline, bound onto the SAME persistent writer client
+    # every submit of every cycle uses. A per-operation socket timeout cannot bound
+    # a multi-call roundtrip; this deadline is the final enforceable wall-clock
+    # bound and is inherited as TIME REMAINING, never re-created per submit.
+    _bind_writer_deadline(publisher, materialize_deadline)
     emit_capture_marker(
         "materialize",
         count=len(acquired),
@@ -631,6 +675,33 @@ def capture_feature_bus_shadow(
             summary.promoted += 1
         else:
             summary.deferred += 1
+
+        # The ABSOLUTE writer deadline is the final enforceable wall-clock bound.
+        # If it cut a submit inside this cycle, that submit never started: the
+        # acquired evidence is uncommitted, which is an explicit durable
+        # disposition -- never a silent partial write and never done=OK. Detect it
+        # from the pipeline's OWN outcome so a fully committed cycle that merely
+        # ends at the deadline is not mislabelled incomplete.
+        if any(
+            str(getattr(outcome, "error_code", "")) == WRITER_DEADLINE_ERROR_NAME
+            for outcome in result.outcomes
+        ):
+            summary.materialize_incomplete = True
+            summary.errors.append(
+                f"{version_id}: materialization incomplete: the Phase-B absolute "
+                f"deadline cut a canonical submit"
+            )
+            emit_capture_marker(
+                "materialize_incomplete",
+                where="materialize",
+                reason="MATERIALIZE_DEADLINE_EXHAUSTED",
+                instrument=version_id,
+                remaining_seconds=round(materialize_deadline - tick(), 3),
+                submit_bound=submit_bound,
+                committed=committed_this_phase,
+                pending=pending_commits,
+            )
+            break
 
     summary.publish_counts = publisher.summary()
     summary.elapsed_seconds = tick() - started

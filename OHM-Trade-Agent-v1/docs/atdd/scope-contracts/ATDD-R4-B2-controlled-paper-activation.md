@@ -359,6 +359,8 @@ AC-019 -> tests/test_opip_r4_b2_feasibility_evidence_reader.py::test_ac_019_tamp
 AC-019 -> tests/test_opip_r4_b2_feasibility_evidence_reader.py::test_ac_019_non_json_committed_row_is_rejected_without_aborting_batch
 AC-019 -> tests/test_opip_r4_b2_feasibility_evidence_reader.py::test_ac_019_reader_holds_no_authority_and_never_mutates
 AC-019 -> tests/test_opip_r4_b2_feasibility_evidence_reader.py::test_ac_019_empty_store_yields_empty_batch
+AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_absolute_deadline_cut_emits_a_durable_materialize_incomplete
+AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_absolute_writer_deadline_bounds_every_recv_of_a_multichunk_roundtrip
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_acquisition_concurrency_is_bounded
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_capture_client_declares_a_bounded_public_only_request_budget
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_config_bounds_are_within_the_minute_slot
@@ -376,7 +378,9 @@ AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_materialization_a
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_materialization_is_sequential
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_materialization_reserve_is_retained_for_phase_b
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_missing_minute_is_incomplete_coverage
+AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_no_deadline_roundtrip_keeps_the_full_per_operation_timeout
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_no_historical_catch_up_is_materialized
+AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_phase_b_binds_one_absolute_deadline_shared_by_every_submit
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_process_lock_serializes_capture_bodies
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_production_publisher_resolves_one_client_and_keeps_the_timeout_clamp
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_replayed_cutoff_does_not_advance_persistence
@@ -530,6 +534,10 @@ AC-019 -> OHM-Trade-Agent-v1/app/opip/fev_evidence_reader.py
 AC-019 -> OHM-Trade-Agent-v1/app/opip/canonical/writer.py
 AC-019 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_feasibility_evidence_reader.py
 AC-020 -> OHM-Trade-Agent-v1/app/jobs/capture_feature_bus_shadow.py
+AC-020 -> OHM-Trade-Agent-v1/app/opip/canonical/client.py
+AC-020 -> OHM-Trade-Agent-v1/app/opip/canonical/protocol.py
+AC-020 -> OHM-Trade-Agent-v1/app/opip/features/pipeline.py
+AC-020 -> OHM-Trade-Agent-v1/app/opip/features/publisher.py
 AC-020 -> OHM-Trade-Agent-v1/app/services/kraken_transport.py
 AC-020 -> OHM-Trade-Agent-v1/app/services/opip_feature_bus_market_source.py
 AC-020 -> OHM-Trade-Agent-v1/app/exchanges/kraken.py

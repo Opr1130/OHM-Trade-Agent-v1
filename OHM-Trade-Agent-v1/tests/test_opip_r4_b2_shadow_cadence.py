@@ -29,6 +29,9 @@ if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
 
 import app.jobs.capture_feature_bus_shadow as capture  # noqa: E402
+from app.opip.canonical import client as canonical_client_module  # noqa: E402
+from app.opip.canonical import protocol as canonical_protocol  # noqa: E402
+from app.opip.canonical.client import CanonicalWriterClient  # noqa: E402
 from app.opip.contracts.enums import (  # noqa: E402
     CoverageState,
     Missingness,
@@ -137,6 +140,138 @@ def _provider(versions):
             return list(versions)
 
     return _P()
+
+
+class _ScriptedClock:
+    """A deterministic monotonic clock: wall time only moves when an op spends it."""
+
+    def __init__(self, start: float = 0.0) -> None:
+        self.value = start
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
+
+
+class _ScriptedSocket:
+    """A fake socket whose EVERY blocking op spends scripted wall clock.
+
+    ``recv`` hands the framed response back in MULTIPLE chunks, which is what a
+    real UDS read does for a large frame. A per-operation timeout re-armed per
+    chunk would let each chunk spend a fresh full timeout while the roundtrip kept
+    going; only an absolute deadline can bound the whole path. Records every
+    ``settimeout`` so a test can prove the timeout is only ever narrowed.
+    """
+
+    def __init__(self, *, clock, connect_cost=0.0, send_cost=0.0, recv_script=()):
+        self._clock = clock
+        self._connect_cost = connect_cost
+        self._send_cost = send_cost
+        self._recv_script = list(recv_script)
+        self._timeout: float | None = None
+        self.set_timeouts: list[float] = []
+        self.connect_calls = 0
+        self.recvs = 0
+
+    # -- socket surface used by the client/protocol seam -------------------
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def settimeout(self, value):
+        self._timeout = value
+        self.set_timeouts.append(value)
+
+    def gettimeout(self):
+        return self._timeout
+
+    def connect(self, address):
+        self.connect_calls += 1
+        self._clock.advance(self._connect_cost)
+
+    def sendall(self, data):
+        self._clock.advance(self._send_cost)
+
+    def recv(self, size):
+        if not self._recv_script:
+            raise AssertionError("recv past the scripted response")
+        chunk, cost = self._recv_script.pop(0)
+        assert len(chunk) <= size, "a recv must never be asked for more than remaining"
+        self.recvs += 1
+        self._clock.advance(cost)
+        return chunk
+
+
+def _frame_chunks(payload, *, header_split, body_split, header_cost, body_cost):
+    """Split one framed JSON response into scripted ``(bytes, cost)`` recv chunks."""
+    import json as _json
+
+    body = _json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    header = canonical_protocol._HEADER.pack(len(body))
+    script: list[tuple[bytes, float]] = []
+    for part in (header[:header_split], header[header_split:]):
+        script.append((part, header_cost))
+    size = max(1, len(body) // body_split)
+    for index in range(0, len(body), size):
+        script.append((body[index : index + size], body_cost))
+    return script
+
+
+class _DeadlineRecordingClient(_RecordingClient):
+    """A PERSISTENT writer that records the ABSOLUTE deadline it is bound to."""
+
+    def __init__(self):
+        super().__init__()
+        self.timeout = 30.0
+        self.deadline_monotonic: float | None = None
+        self.bind_calls: list[float] = []
+        self.submit_deadlines: list[float | None] = []
+
+    def bind_deadline(self, deadline_monotonic):
+        self.bind_calls.append(deadline_monotonic)
+        self.deadline_monotonic = deadline_monotonic
+        return self.deadline_monotonic
+
+    def submit(self, intent):
+        self.submit_deadlines.append(self.deadline_monotonic)
+        return super().submit(intent)
+
+
+class _ExpiringDeadlineClient(_RecordingClient):
+    """A persistent writer that enforces the ABSOLUTE deadline across submits.
+
+    Models the real ``CanonicalWriterClient``: an accepted submit spends real wall
+    clock out of the SAME Phase-B window, and once the bound deadline has elapsed
+    NO further submit can start -- it raises the explicit deadline-cut exception.
+    """
+
+    def __init__(self, *, clock, advance, overrun):
+        super().__init__()
+        self.timeout = 30.0
+        self.deadline_monotonic: float | None = None
+        self._advance = advance
+        self._overrun = overrun
+        self.clock_get = clock
+        self.refused_after_deadline = 0
+
+    def bind_deadline(self, deadline_monotonic):
+        self.deadline_monotonic = deadline_monotonic
+        return deadline_monotonic
+
+    def submit(self, intent):
+        deadline = self.deadline_monotonic
+        if deadline is not None:
+            if self.clock_get() >= deadline:
+                self.refused_after_deadline += 1
+                raise canonical_protocol.WriterDeadlineExceeded(
+                    "Phase-B absolute deadline elapsed before submit"
+                )
+            self._advance(self._overrun)
+        return super().submit(intent)
 
 
 def _batch(version, observations, *, error=None) -> SourceBatch:
@@ -1032,6 +1167,181 @@ def test_ac_020_cycle_whose_declared_maximum_cannot_fit_is_not_started(monkeypat
     assert _marker_field(incomplete[0], "required_seconds") == pytest.approx(
         submit_bound * capture.CAPTURE_MATERIALIZE_MIN_WRITE_SECONDS
     )
+
+    assert lines[-1].startswith("OPIP_FEATURE_BUS_CAPTURE_PHASE=done")
+    assert "status=MATERIALIZE_INCOMPLETE" in lines[-1]
+    assert "materialize_incomplete=True" in lines[-1]
+    assert "status=OK" not in lines[-1]
+
+
+def test_ac_020_absolute_writer_deadline_bounds_every_recv_of_a_multichunk_roundtrip(
+    monkeypatch,
+):
+    """ATDD-R4-B2-controlled-paper-activation/AC-020 and ATDD-RELEASE-PIPELINE-v1/AC-017: the canonical writer's ABSOLUTE deadline bounds the WHOLE roundtrip -- connect, sendall and EVERY individual recv -- so a frame delivered in several chunks cannot escape it by re-arming a fresh per-operation timeout, and no operation starts once the deadline has elapsed."""
+    payload = {"method": "HEALTH", "status": "OK", "sequence": 7}
+    clock = _ScriptedClock()
+    monkeypatch.setattr(canonical_protocol, "monotonic", clock)
+
+    # connect (1.0) + send (1.0) + two header recvs (0.5 each) reaches 3.0; five body
+    # recvs (1.0 each) then cross the 7.5s absolute deadline. EVERY individual
+    # operation is far inside the OLD per-operation timeout (5.0), so a per-operation
+    # bound -- or a guessed phase multiplier -- cannot catch the cumulative overrun.
+    legacy_timeout = 5.0
+    deadline = 7.5
+    script = _frame_chunks(
+        payload, header_split=2, body_split=6, header_cost=0.5, body_cost=1.0
+    )
+    sock = _ScriptedSocket(
+        clock=clock, connect_cost=1.0, send_cost=1.0, recv_script=script
+    )
+    stub = SimpleNamespace(
+        AF_UNIX=object(), SOCK_STREAM=object(), socket=lambda *a, **k: sock
+    )
+    monkeypatch.setattr(canonical_client_module, "socket", stub)
+
+    client = CanonicalWriterClient(timeout=legacy_timeout, deadline_monotonic=deadline)
+    with pytest.raises(canonical_protocol.WriterDeadlineExceeded):
+        client._roundtrip({"method": "HEALTH"})
+
+    # The abort happened INSIDE the multi-chunk read, past the absolute bound.
+    assert clock.value > deadline
+    assert sock.recvs >= 6  # two header recvs + at least five body recvs
+    assert sock.connect_calls == 1
+    # Timings were ABSOLUTE: every armed timeout stays at or below the legacy
+    # per-operation bound and only ever NARROWS, so the framing layer never resets a
+    # full timeout after time has already been consumed.
+    assert all(t <= legacy_timeout for t in sock.set_timeouts)
+    assert sock.set_timeouts == sorted(sock.set_timeouts, reverse=True)
+    assert sock.set_timeouts[-1] < legacy_timeout
+
+
+def test_ac_020_no_deadline_roundtrip_keeps_the_full_per_operation_timeout(monkeypatch):
+    """ATDD-R4-B2-controlled-paper-activation/AC-020 and ATDD-RELEASE-PIPELINE-v1/AC-017: a caller that supplies NO absolute deadline keeps the existing per-operation behavior exactly -- the framing layer never touches the socket timeout and no deadline exception is raised even when the cumulative roundtrip costs more than that timeout."""
+    payload = {"method": "HEALTH", "status": "OK"}
+    clock = _ScriptedClock()
+    monkeypatch.setattr(canonical_protocol, "monotonic", clock)
+    legacy_timeout = 5.0
+    script = _frame_chunks(
+        payload, header_split=2, body_split=4, header_cost=2.0, body_cost=2.0
+    )
+    sock = _ScriptedSocket(
+        clock=clock, connect_cost=4.0, send_cost=4.0, recv_script=script
+    )
+    stub = SimpleNamespace(
+        AF_UNIX=object(), SOCK_STREAM=object(), socket=lambda *a, **k: sock
+    )
+    monkeypatch.setattr(canonical_client_module, "socket", stub)
+
+    client = CanonicalWriterClient(timeout=legacy_timeout)
+    response = client._roundtrip({"method": "HEALTH"})
+
+    assert response == payload
+    # The whole roundtrip costs far more than the per-operation timeout, yet with no
+    # opt-in deadline the timeout is set ONCE (the client's own) and never narrowed.
+    assert clock.value > legacy_timeout
+    assert sock.set_timeouts == [legacy_timeout]
+
+
+def test_ac_020_phase_b_binds_one_absolute_deadline_shared_by_every_submit():
+    """ATDD-R4-B2-controlled-paper-activation/AC-020 and ATDD-RELEASE-PIPELINE-v1/AC-017: Phase B binds exactly ONE absolute wall-clock deadline onto the persistent writer client, so every canonical submit of every cycle inherits only the time REMAINING in the original Phase-B window rather than being handed a fresh per-submit budget."""
+    versions = [_instrument(i) for i in range(2)]
+    batches = {
+        version.instrument_version_id: _batch(version, _observations(version))
+        for version in versions
+    }
+    client = _DeadlineRecordingClient()
+    publisher = FeatureBusPublisher(client, enabled=True, settings=_settings())
+    budget = 45.0
+    tick = {"value": 0.0}
+    summary = capture.capture_feature_bus_shadow(
+        settings=_settings(
+            opip_feature_bus_capture_budget_seconds=budget,
+            opip_feature_bus_capture_concurrency=1,
+        ),
+        now=T0,
+        publisher=publisher,
+        instrument_provider=_provider(versions),
+        source=_source(batches),
+        restore_continuity=lambda versions: ({}, {}, {}),
+        clock=lambda: tick["value"],
+    )
+
+    assert summary.cycles == 2
+    assert summary.materialize_incomplete is False
+    # Bound EXACTLY once, to the pass-level ABSOLUTE Phase-B deadline.
+    assert client.bind_calls == [pytest.approx(budget)]
+    # Pre-Phase-B instrument-version publishes carry no materialize deadline ...
+    assert client.submit_deadlines[0] is None
+    assert any(deadline is None for deadline in client.submit_deadlines)
+    # ... while EVERY Phase-B submit of BOTH cycles shares the ONE deadline. A fresh
+    # per-submit budget would move the deadline; inherited remaining time cannot.
+    materialize = [deadline for deadline in client.submit_deadlines if deadline is not None]
+    assert materialize
+    assert len(set(materialize)) == 1
+    assert all(deadline == pytest.approx(budget) for deadline in materialize)
+
+
+def test_ac_020_absolute_deadline_cut_emits_a_durable_materialize_incomplete(monkeypatch):
+    """ATDD-R4-B2-controlled-paper-activation/AC-020 and ATDD-RELEASE-PIPELINE-v1/AC-017: when the absolute Phase-B deadline cuts a canonical submit, Phase B stops, the acquired evidence is recorded as a DURABLE materialize_incomplete disposition, and done=OK is never claimed -- a deadline cut is never a silent partial write."""
+    versions = [_instrument(i) for i in range(2)]
+    batches = {
+        version.instrument_version_id: _batch(version, _observations(version))
+        for version in versions
+    }
+    tick = {"value": 0.0}
+
+    def _clock():
+        return tick["value"]
+
+    def _advance(seconds):
+        tick["value"] += seconds
+
+    class _Source:
+        venue = "kraken"
+        source_label = "kraken_ohlc"
+        interval_seconds = 60
+
+        def fetch_through(self, version, *, watermark, now):
+            tick["value"] += 4.0  # acquisition leaves the reserve for Phase B
+            return batches[version.instrument_version_id]
+
+    lines = _record_markers(monkeypatch)
+    budget = 20.0
+    # Phase B starts with 16s left (admitted), then the FIRST accepted submit spends
+    # 20s of wall clock -- a slow writer's roundtrip -- so the absolute deadline has
+    # elapsed by the next submit, which must therefore refuse to start.
+    client = _ExpiringDeadlineClient(clock=_clock, advance=_advance, overrun=20.0)
+    publisher = FeatureBusPublisher(client, enabled=True, settings=_settings())
+    summary = capture.capture_feature_bus_shadow(
+        settings=_settings(
+            opip_feature_bus_capture_budget_seconds=budget,
+            opip_feature_bus_capture_concurrency=1,
+        ),
+        now=T0,
+        publisher=publisher,
+        instrument_provider=_provider(versions),
+        source=_Source(),
+        restore_continuity=lambda versions: ({}, {}, {}),
+        clock=_clock,
+    )
+
+    observations = _observations(versions[0])
+    submit_bound = declared_cycle_submit_bound(len(observations))
+    # The admission decision really did admit this cycle: the remaining Phase-B
+    # window covered a meaningful share per declared submit.
+    assert (budget - 4.0) / submit_bound >= capture.CAPTURE_MATERIALIZE_MIN_WRITE_SECONDS
+    assert client.timeout < 30.0
+    # The absolute deadline then refused at least one canonical submit.
+    assert client.refused_after_deadline >= 1
+    assert summary.materialize_incomplete is True
+    assert summary.fetched == 1
+    assert summary.cycles == 1
+
+    incomplete = [line for line in lines if "PHASE=materialize_incomplete" in line]
+    assert len(incomplete) == 1
+    assert "reason=MATERIALIZE_DEADLINE_EXHAUSTED" in incomplete[0]
+    assert _marker_field(incomplete[0], "submit_bound") == float(submit_bound)
+    assert _marker_field(incomplete[0], "remaining_seconds") < 0.0
 
     assert lines[-1].startswith("OPIP_FEATURE_BUS_CAPTURE_PHASE=done")
     assert "status=MATERIALIZE_INCOMPLETE" in lines[-1]

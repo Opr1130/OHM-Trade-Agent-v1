@@ -286,6 +286,8 @@ AC-017 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_point_in_ti
 AC-017 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_point_in_time_violation_is_terminal_and_never_published
 AC-017 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_post_epoch_live_reads_are_not_published_as_point_in_time_support
 AC-017 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_stale_freshness_anchor_fails_closed_without_synthetic_freshness
+AC-017 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_absolute_deadline_cut_emits_a_durable_materialize_incomplete
+AC-017 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_absolute_writer_deadline_bounds_every_recv_of_a_multichunk_roundtrip
 AC-017 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_capture_client_declares_a_bounded_public_only_request_budget
 AC-017 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_cycle_whose_declared_maximum_cannot_fit_is_not_started
 AC-017 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_deadline_exhaustion_emits_a_durable_disposition_marker
@@ -293,6 +295,8 @@ AC-017 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_failed_acquisitio
 AC-017 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_first_attempt_rate_limit_wait_is_inside_the_declared_wave_bound
 AC-017 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_materialization_admission_bounds_every_submit_of_a_cycle
 AC-017 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_materialization_reserve_is_retained_for_phase_b
+AC-017 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_no_deadline_roundtrip_keeps_the_full_per_operation_timeout
+AC-017 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_phase_b_binds_one_absolute_deadline_shared_by_every_submit
 AC-017 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_production_publisher_resolves_one_client_and_keeps_the_timeout_clamp
 AC-017 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_retry_and_backoff_never_start_without_remaining_budget
 AC-017 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_slow_persistent_writer_cannot_exceed_the_materialize_deadline
@@ -393,6 +397,9 @@ AC-016 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.
 AC-017 -> OHM-Trade-Agent-v1/app/exchanges/kraken.py
 AC-017 -> OHM-Trade-Agent-v1/app/jobs/capture_feasibility_evidence_shadow.py
 AC-017 -> OHM-Trade-Agent-v1/app/jobs/capture_feature_bus_shadow.py
+AC-017 -> OHM-Trade-Agent-v1/app/opip/canonical/client.py
+AC-017 -> OHM-Trade-Agent-v1/app/opip/canonical/protocol.py
+AC-017 -> OHM-Trade-Agent-v1/app/opip/features/pipeline.py
 AC-017 -> OHM-Trade-Agent-v1/app/opip/features/publisher.py
 AC-017 -> OHM-Trade-Agent-v1/app/services/kraken_transport.py
 AC-017 -> OHM-Trade-Agent-v1/app/services/opip_feature_bus_market_source.py
@@ -402,6 +409,7 @@ AC-017 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
 AC-017 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
 AC-017 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-paper-activation.md
 AC-017 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_feasibility_producer.py
+AC-017 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_feasibility_short.py
 AC-017 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_shadow_cadence.py
 AC-017 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_shadow_capture.py
 
