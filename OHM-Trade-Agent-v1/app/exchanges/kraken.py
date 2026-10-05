@@ -66,12 +66,18 @@ class KrakenClient:
 
     def _get(self, endpoint: str, params: dict[str, Any]) -> dict[str, Any]:
         try:
-            return self.transport.request(
-                endpoint,
-                params,
-                timeout_seconds=self.timeout_seconds,
-                deadline_monotonic=self.deadline_monotonic,
-            )
+            request_kwargs: dict[str, Any] = {
+                "timeout_seconds": self.timeout_seconds,
+            }
+            # A deadline is passed ONLY when one was declared. This keeps the
+            # transport call shape unchanged for every existing caller and test
+            # double (which implement the pre-existing
+            # ``request(endpoint, params, timeout_seconds)`` signature), while the
+            # capture producers that DO declare a pass deadline get the bounded
+            # request/retry/backoff behaviour.
+            if self.deadline_monotonic is not None:
+                request_kwargs["deadline_monotonic"] = self.deadline_monotonic
+            return self.transport.request(endpoint, params, **request_kwargs)
         except KrakenTransportError as exc:
             raise KrakenAPIError(str(exc)) from exc
 

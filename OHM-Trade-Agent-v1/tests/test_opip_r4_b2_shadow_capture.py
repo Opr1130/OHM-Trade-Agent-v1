@@ -321,17 +321,22 @@ def test_ac_016_configured_budget_is_read_from_settings():
     }
     client = _RecordingClient()
     publisher = FeatureBusPublisher(client, enabled=True, settings=_settings())
-    # start tick = 0. The per-request reservation is 15s, so the pass proceeds
-    # only while (deadline - now) >= 15. A 33s jump exhausts the default 45s
-    # budget (45-33=12 < 15) but not a configured 50s budget (50-33=17 >= 15),
-    # so only a real settings read can avoid exhaustion.
-    ticks = iter([0.0, 33.0])
+    # start tick = 0. Acquisition may proceed only while
+    # (acquisition_deadline - now) >= 15, where
+    # acquisition_deadline = budget - materialize_reserve and the reserve is
+    # min(10, budget - 15) = 10s for BOTH a default 45s and a configured 50s budget.
+    # So the gate is (45-10-now) >= 15 for the default and (50-10-now) >= 15 for the
+    # configured budget. A 23s jump exhausts the default 45s budget
+    # (35-23=12 < 15) but not a configured 50s budget (40-23=17 >= 15), so only a
+    # real settings read can avoid exhaustion -- and the reserved Phase-B window is
+    # honoured at exactly the same margins as the pre-reserve contract.
+    ticks = iter([0.0, 23.0])
 
     def _clock():
         try:
             return next(ticks)
         except StopIteration:
-            return 33.0
+            return 23.0
 
     summary = capture.capture_feature_bus_shadow(
         settings=_settings(opip_feature_bus_capture_budget_seconds=50),

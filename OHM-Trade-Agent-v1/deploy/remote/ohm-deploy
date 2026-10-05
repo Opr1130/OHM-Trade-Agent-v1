@@ -1180,7 +1180,9 @@ rollback() {
   # Surface the capture producers' OWN durable disposition when the runtime
   # verifier is what failed, BEFORE any rollback work: a missing-evidence failure
   # must be diagnosable from the deploy receipt alone. Bounded and read-only.
-  if [[ "$RELEASE_RUNTIME_VERIFIER_ATTEMPTED" == "1" ]]; then
+  # ``${VAR:-}`` keeps this safe under ``set -u`` when the controller's globals
+  # are not in scope (for example the AC-015 rollback-control-flow harness).
+  if [[ "${RELEASE_RUNTIME_VERIFIER_ATTEMPTED:-}" == "1" ]]; then
     echo "OPIP_RELEASE_RUNTIME_VERIFIER_EXIT=$rc"
     emit_capture_producer_disposition_evidence || true
   fi
