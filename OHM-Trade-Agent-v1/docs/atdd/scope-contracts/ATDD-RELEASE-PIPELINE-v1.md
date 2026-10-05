@@ -142,6 +142,14 @@ THEN:
 (d) rollback quiesces candidate evidence producers BEFORE any rebuild: it removes the candidate producer schedule and terminates, then SIGKILL-escalates, every process matching the two evidence-producer modules by scanning `/proc` with the container's own interpreter (no `pkill`/`pgrep` dependency), all under a bounded host exec; cron removal alone is NOT sufficient, because cron may already have spawned a host wrapper (`flock -n <lock> ... docker compose exec ...`) whose in-container producer has not yet appeared, so quiescence ALSO takes exclusive ownership of the two EXISTING producer host launch-lock identities (`/var/run/opip-feature-bus-capture.lock`, `/var/run/opip-feasibility-capture.lock`) with a finite bounded wait and HOLDS them on stable file descriptors across the whole critical section — previous SHA reset, SAFE_BASELINE override creation, previous writer rebuild/start, previous core rebuild/start, core health proof, writer health proof and SAFE_BASELINE mode validation — so an already-launched wrapper is waited for and no late wrapper can start a producer; ownership is never proven by deleting a lock file; quiescence returns NONZERO, and rollback aborts before `git reset --hard`, before rebuilding or starting the previous writer, emitting `OPIP_EVIDENCE_PRODUCER_QUIESCENCE=FAILED` with `OPIP_EVIDENCE_PRODUCER_QUIESCENCE_REASON=<reason>`, `OPIP_ROLLBACK_ABORTED=PRODUCER_QUIESCENCE_UNPROVEN` and `OPIP_SAFE_BASELINE_ROLLBACK=UNPROVEN`, whenever the bounded launch-lock wait expires, the producer process state cannot be established, the `docker compose exec` fails, a matching producer survives TERM/KILL, or any other proof of launch-barrier ownership plus zero in-container producers fails; a fail-closed abort never deletes the pre-deploy scheduler transaction — it is preserved under a `scheduler-recovery.*` name outside the `scheduler-before.*` namespace the deploy-controller bootstrap counts, so the next deploy's exactly-one-transaction proof still holds, its path is published as `OPIP_ROLLBACK_SCHEDULER_SNAPSHOT_PRESERVED=<path>`, and only the SAFE_BASELINE override is dropped; the held launch locks are released only AFTER the previously snapshotted scheduler state has been restored, so restored cron entries cannot relaunch a producer before SAFE_BASELINE is proven; only then does it continue to restore the previous SHA, apply the SAFE_BASELINE override, prove core health, prove writer health when the writer is part of that SHA, validate SAFE_BASELINE modes, restore the paper topology, and finally emit `OPIP_SAFE_BASELINE_ROLLBACK=SUCCESS`; a failed quiescence exec is reported `UNKNOWN` and surviving processes are reported `NOT_QUIESCED` rather than assumed away, and a writer health failure additionally emits bounded classified diagnostics distinguishing store-lock contention, SQLite/schema/integrity failure, a stale Unix socket, a writer process crash, and a container healthcheck/startup failure
 (e) no authority is widened anywhere in this increment: Paper-v2 stays `off`, the Committee stays absent, funded/live and exchange/order authority remain absent, the legacy path remains the sole new-entry authority, and `TARGET_PAPER` remains BLOCKED
 
+AC-016:
+GIVEN:
+the local engineering support tooling added for this repository: the Microsoft VS Code workspace configuration under `.vscode/`, the local Aider editing bootstrap, `.aiderignore`, and the local reproducibility dependencies recorded in `requirements-dev.txt`
+WHEN:
+the local tooling bootstrap is inspected for scope, authority and reproducibility
+THEN:
+Microsoft VS Code and Aider are local engineering support tooling only and hold no authority; GitHub Linux CI remains the canonical full regression and Linux execution authority; the Windows targeted pytest task is not equivalent to the canonical full Linux regression; the Windows targeted coverage task is local and advisory only; the Engineering Health task remains advisory; the local tooling grants no runtime authority, no production deployment authority, no live or funded trading authority, no Paper-v2 activation authority, no Committee activation authority and no PR merge authority; it introduces no automatic git push and no automatic commit; `.aiderignore` excludes secrets and generated/runtime artifacts; `pytest-cov` and `pyright` are reproducible DEVELOPMENT-only dependencies recorded in `requirements-dev.txt`; `requirements.txt` remains the production/runtime dependency authority and is unchanged; and the existing release-profile, trading, scheduler, protection, writer, Feature Bus and deployment semantics are unchanged
+
 EXPLICITLY OUT OF SCOPE:
 - Activating TARGET_PAPER, Paper-v2, the Committee, or any funded/live/exchange/order authority
 - Deleting, rewriting or rescoping the historical ATDD increments that recorded the Feature Bus `off`
@@ -158,6 +166,8 @@ History preserved. The supersession edits only *current-runtime* assertions. Eve
 Bounded authorization. `EVIDENCE_SHADOW` authorizes exactly Feature Bus `shadow` + canonical writer `shadow` + target spine `shadow` + Paper-v2 `off` + Committee `off` + feasibility-capture notional `1000.0`. It grants no new-entry, reservation, order, exchange, funded, margin, Committee, dashboard or Telegram authority, and it does not authorize `TARGET_PAPER`. The bounded SHADOW capture remains dual-gated (Feature Bus AND writer exactly `shadow`) and never runs inside the protected unified cycle.
 
 Rollback writer-recovery barrier. Before rollback may touch the canonical writer, rollback must have exclusive ownership of BOTH scheduled-producer host launch locks and must prove that no candidate evidence producer process remains inside the candidate core container. The launch locks are the existing producer flock identities the cron entries already use; their acquisition is a finite, fail-closed wait, never an unbounded block or an arbitrary sleep, and never a lock-file deletion. Ownership is held on stable file descriptors through previous-SHA reset, SAFE_BASELINE override creation, previous writer rebuild/start, previous core rebuild/start, core health proof, writer health proof and SAFE_BASELINE mode validation, and is released only after the previously snapshotted scheduler state is restored. Removing the candidate cron entries alone is explicitly NOT a quiescence proof. `UNKNOWN`, `NOT_QUIESCED` and launch-lock timeout all fail closed: rollback must not reset the SHA or restore the writer, and `OPIP_SAFE_BASELINE_ROLLBACK=SUCCESS` is never emitted in that case. A fail-closed abort preserves the pre-deploy scheduler transaction as durable recovery evidence and never deletes it; it is moved out of the `scheduler-before.*` namespace so the deploy-controller bootstrap's exactly-one-transaction proof is not broken on the next deploy. Paper-v2 stays `off`, the Committee stays `off`, funded/live authority stays absent, legacy remains the sole new-entry authority, and `TARGET_PAPER` stays BLOCKED.
+
+Local engineering tooling. The `chore/vscode-aider-bootstrap-v2` local bootstrap (VS Code tasks/settings, Aider ignore rules and its development-only `pytest-cov`/`pyright` pins) is not an architecture or authority change. It adds no deploy, trading, Paper-v2, Committee or merge capability, and it does not alter the release-profile, scheduler, protection, writer or Feature Bus contracts above.
 
 ACCEPTANCE TEST TRACEABILITY:
 AC-001 -> tests/test_opip_release_pipeline_v1.py::test_ac_001_profile_allowlist_and_exact_modes
@@ -242,6 +252,15 @@ AC-015 -> tests/test_opip_canonical_single_writer_feasibility_v1.py::test_ac_015
 AC-015 -> tests/test_opip_canonical_single_writer_feasibility_v1.py::test_ac_015_clean_quiescence_holds_locks_until_scheduler_restore_then_succeeds
 AC-015 -> tests/test_opip_canonical_single_writer_feasibility_v1.py::test_ac_015_quiescence_abort_preserves_the_scheduler_snapshot
 AC-015 -> tests/test_opip_canonical_single_writer_feasibility_v1.py::test_ac_015_no_authority_is_widened_by_this_increment
+AC-016 -> tests/test_opip_local_engineering_bootstrap_v1.py::test_ac_016_vscode_tasks_are_valid_json
+AC-016 -> tests/test_opip_local_engineering_bootstrap_v1.py::test_ac_016_targeted_pytest_task_defers_to_canonical_regression
+AC-016 -> tests/test_opip_local_engineering_bootstrap_v1.py::test_ac_016_targeted_coverage_task_is_local_and_advisory
+AC-016 -> tests/test_opip_local_engineering_bootstrap_v1.py::test_ac_016_pre_pr_local_gate_is_not_a_full_suite_run
+AC-016 -> tests/test_opip_local_engineering_bootstrap_v1.py::test_ac_016_engineering_health_remains_advisory
+AC-016 -> tests/test_opip_local_engineering_bootstrap_v1.py::test_ac_016_no_task_grants_deploy_trading_or_merge_authority
+AC-016 -> tests/test_opip_local_engineering_bootstrap_v1.py::test_ac_016_aiderignore_excludes_secrets_and_generated_artifacts
+AC-016 -> tests/test_opip_local_engineering_bootstrap_v1.py::test_ac_016_dev_dependencies_are_reproducible_and_local_only
+AC-016 -> tests/test_opip_local_engineering_bootstrap_v1.py::test_ac_016_requirements_txt_remains_runtime_authority
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/services/release_profiles.py
@@ -324,6 +343,12 @@ AC-015 -> OHM-Trade-Agent-v1/app/services/release_runtime_verifier.py
 AC-015 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
 AC-015 -> OHM-Trade-Agent-v1/tests/test_opip_canonical_single_writer_feasibility_v1.py
 AC-015 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
+AC-016 -> .aiderignore
+AC-016 -> .vscode/settings.json
+AC-016 -> .vscode/tasks.json
+AC-016 -> OHM-Trade-Agent-v1/requirements-dev.txt
+AC-016 -> OHM-Trade-Agent-v1/tests/test_opip_local_engineering_bootstrap_v1.py
+AC-016 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
 
 DEFERRED DISCOVERIES:
 - `TARGET_PAPER` remains BLOCKED. Activating it (Paper-v2) requires the ATDD-R4-B2 AC-011 comparator evidence, F11 protection READY, legacy drain READY and explicit OWNER approval, and is a separate OWNER increment; this contract does not authorize it.
