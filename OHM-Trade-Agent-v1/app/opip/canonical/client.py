@@ -25,7 +25,11 @@ from app.opip.contracts.paper_execution_runtime import (
 )
 from app.opip.contracts import opportunity_persistence as opportunity_persistence_contract
 from app.opip.canonical.paths import socket_path
-from app.opip.canonical.protocol import recv_json, send_json
+from app.opip.canonical.protocol import (
+    arm_operation_deadline,
+    recv_json,
+    send_json,
+)
 
 if TYPE_CHECKING:
     from app.opip.canonical.server import CanonicalWriterServer
@@ -100,9 +104,30 @@ def _handoffs_from_response(response: dict[str, Any]) -> list[PendingHandoff]:
 
 
 class CanonicalWriterClient:
-    def __init__(self, sock_path: Path | None = None, *, timeout: float = 5.0) -> None:
+    def __init__(
+        self,
+        sock_path: Path | None = None,
+        *,
+        timeout: float = 5.0,
+        deadline_monotonic: float | None = None,
+    ) -> None:
         self.socket_path = Path(sock_path or socket_path())
         self.timeout = timeout
+        #: Optional ABSOLUTE (monotonic) wall-clock deadline shared by every
+        #: submit this client makes. ``timeout`` bounds ONE blocking socket call;
+        #: this bounds the WHOLE roundtrip (connect + sendall + every individual
+        #: recv). ``None`` preserves the previous per-operation behavior exactly.
+        self.deadline_monotonic = deadline_monotonic
+
+    def bind_deadline(self, deadline_monotonic: float | None) -> float | None:
+        """Bind (or clear) the ABSOLUTE deadline for every later roundtrip.
+
+        A producer binds ONE Phase-B deadline onto the persistent client, so each
+        subsequent submit inherits only the time REMAINING in that original window
+        rather than being handed a fresh per-submit budget.
+        """
+        self.deadline_monotonic = deadline_monotonic
+        return self.deadline_monotonic
 
     def submit(self, intent: WriterIntent) -> WriterAck:
         response = self._roundtrip({"method": "SUBMIT", "intent": intent.to_dict()})
@@ -202,11 +227,16 @@ class CanonicalWriterClient:
     def _roundtrip(self, request: dict[str, Any]) -> dict[str, Any]:
         if not hasattr(socket, "AF_UNIX"):
             raise RuntimeError("AF_UNIX_UNAVAILABLE")
+        deadline = self.deadline_monotonic
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.settimeout(self.timeout)
+            # connect() is itself a blocking operation that spends the deadline,
+            # exactly like sendall and every individual recv, so it is armed from
+            # the same absolute bound instead of only the per-operation timeout.
+            arm_operation_deadline(sock, deadline, operation="connect")
             sock.connect(str(self.socket_path))
-            send_json(sock, request)
-            return recv_json(sock)
+            send_json(sock, request, deadline_monotonic=deadline)
+            return recv_json(sock, deadline_monotonic=deadline)
 
 
 class InProcessWriterClient:

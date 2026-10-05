@@ -35,9 +35,15 @@
 #
 # Bounds (derived, not arbitrary; the whole pass must finish inside its minute):
 #   * per-instrument request: exactly ONE bounded public Kraken OHLC request (no
-#     bulk multi-pair endpoint exists), with a 15s client request timeout.
+#     bulk multi-pair endpoint exists). The client's per-ATTEMPT timeout is
+#     DERIVED so the transport's WHOLE retry budget still fits one 15s wave
+#     (15s / (KRAKEN_PUBLIC_MAX_RETRIES + 1); currently 5s per attempt). See
+#     app/services/opip_feature_bus_market_source.capture_request_timeout_seconds.
+#     Without that derivation a single stalled request could consume 3 * 15s = 45s
+#     -- the entire pass budget -- and this producer would be killed by the bound
+#     below before it could record any disposition (a silent evidence drop).
 #   * bounded acquisition concurrency: OPIP_FEATURE_BUS_CAPTURE_CONCURRENCY
-#     (default 4, max 8). Worst case = ceil(N / concurrency) request timeouts, so
+#     (default 4, max 8). Worst case = ceil(N / concurrency) bounded requests, so
 #     8 instruments <= 2 * 15s = 30s, well inside the minute. The shared Kraken
 #     transport is thread-safe and rate-limited (token bucket).
 #   * internal wall-clock budget: OPIP_FEATURE_BUS_CAPTURE_BUDGET_SECONDS

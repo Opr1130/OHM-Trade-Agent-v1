@@ -19,6 +19,9 @@
 #   * the producer reads one bounded batch of committed snapshots after its persisted
 #     cursor, materializes the whole batch, then persists the advanced cursor, so
 #     successive passes progress instead of re-reading the oldest batch.
+#   * per-snapshot market reads use the SAME pass-bounded per-attempt timeout as the
+#     Feature Bus producer (see capture_request_timeout_seconds), so one stalled
+#     public request cannot consume the whole pass budget and leave no disposition.
 #   * internal wall-clock budget: OPIP_FEASIBILITY_CAPTURE_BUDGET_SECONDS (default 45,
 #     capped at 50) bounds how many batches one pass attempts.
 #   * enforceable termination: in-container `timeout ... 50` with kill-after 5s, so

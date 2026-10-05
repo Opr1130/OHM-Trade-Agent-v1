@@ -328,6 +328,476 @@ def test_ac_021_real_builder_builds_genuine_contemporaneous_evidence():
 
 
 # ---------------------------------------------------------------------------
+# AC-021 analytical horizon vs freshness anchor (two-plane provenance)
+# ---------------------------------------------------------------------------
+
+#: The exact production F5 shape that failed: snapshot cutoff 12:51:00Z, F5
+#: commit instant ~12:52:12Z, and an hourly-only analytical cutoff of 12:00:00Z
+#: (source age 3132s) which the 120-second runtime source-age contract rejects.
+LATE = datetime(2026, 10, 2, 12, 51, tzinfo=timezone.utc)
+LATE_COMMIT = datetime(2026, 10, 2, 12, 52, 12, tzinfo=timezone.utc)
+HOURLY_CUTOFF = datetime(2026, 10, 2, 12, 0, tzinfo=timezone.utc)
+
+
+def _two_plane_client(
+    *, epoch: datetime, hourly_count: int = 8, minute_count: int = 6
+) -> _FakeClient:
+    """Distinct 60-minute analytical history AND a fresh closed 1-minute anchor."""
+    return _FakeClient(
+        candles=_hourly_candles(
+            end_epoch=epoch.replace(minute=0, second=0, microsecond=0),
+            count=hourly_count,
+        ),
+        candles_1m=_minute_candles(end_epoch=epoch, count=minute_count),
+    )
+
+
+def test_ac_021_analytical_horizon_and_fresh_anchor_are_separately_acquired():
+    """ATDD-R4-B2-controlled-paper-activation/AC-021 and ATDD-RELEASE-PIPELINE-v1/AC-017: the 60-minute analytical series keeps its existing semantics while a SEPARATE fresh closed 1-minute observation of the same instrument anchors source_cutoff, and both planes are recorded in provenance."""
+    snapshot = _Snapshot(1, cutoff=LATE)
+    client = _two_plane_client(epoch=LATE)
+    evidence = producer.build_long_feasibility_evidence(
+        snapshot, client=client, notional_usd=500.0, acquisition_instant=LATE_COMMIT,
+    )
+
+    # Two SEPARATE reads: the analytical horizon first, the freshness anchor second.
+    assert client.intervals == [60, 1]
+    refs = evidence.source_evidence_refs
+    assert (
+        "analytical:kraken_public_ohlc:interval_seconds=3600:bars=7"
+        ":latest_close=2026-10-02T12:00:00Z"
+    ) in refs
+    assert (
+        "freshness:kraken_public_ohlc:interval_seconds=60"
+        ":bar_open=2026-10-02T12:50:00Z:bar_close=2026-10-02T12:51:00Z"
+    ) in refs
+    assert producer.anchor_source_age_seconds(refs) == 72.0
+
+    # source_cutoff is the freshest datum that ACTUALLY supports this epoch: not
+    # the hourly close, and never the acquisition instant (no fabricated freshness).
+    assert evidence.source_cutoff == LATE
+    assert evidence.source_cutoff != HOURLY_CUTOFF
+    assert evidence.source_cutoff != LATE_COMMIT
+    assert evidence.source_cutoff == evidence.evaluation_time == snapshot.evaluation_cutoff
+
+
+# ---------------------------------------------------------------------------
+# AC-021 point-in-time F5 integrity: every supporting input is audited
+# ---------------------------------------------------------------------------
+
+
+def test_ac_021_post_epoch_live_reads_are_not_published_as_point_in_time_support():
+    """ATDD-R4-B2-controlled-paper-activation/AC-021 and ATDD-RELEASE-PIPELINE-v1/AC-017: a live market read taken AFTER the snapshot's evaluation epoch is never published as point-in-time support -- the record keeps the retained closed epoch-candle datum, the execution plane is explicitly UNAVAILABLE, and every admitted input declares an event cutoff at or before the epoch."""
+    snapshot = _Snapshot(1, cutoff=LATE)
+    client = _InstrumentedClient(
+        candles=_hourly_candles(
+            end_epoch=LATE.replace(minute=0, second=0, microsecond=0), count=8
+        ),
+        candles_1m=_minute_candles(end_epoch=LATE, count=6),
+    )
+    evidence = producer.build_long_feasibility_evidence(
+        snapshot, client=client, notional_usd=500.0, acquisition_instant=LATE_COMMIT,
+    )
+
+    # The record is keyed to the snapshot cutoff, and its price datum is the CLOSED
+    # one-minute anchor candle whose event cutoff is EXACTLY that epoch.
+    assert evidence.evaluation_time == snapshot.evaluation_cutoff == LATE
+    assert evidence.source_cutoff == LATE
+    assert evidence.source_cutoff <= evidence.evaluation_time
+
+    # No POST-EPOCH live observation supports it: the live ticker is never
+    # consulted as the record's price, and the order book / recent trades (live-only
+    # reads, taken after the epoch here) are not attached to an epoch-anchored
+    # record as if they were epoch liquidity.
+    assert client.ticker_calls == 0
+    assert client.book_calls == 0
+    assert client.trade_calls == 0
+    assert evidence.execution_validation.status == "UNAVAILABLE"
+    assert producer.PIT_UNAVAILABLE_REASON in evidence.execution_validation.warnings
+
+    # EVERY admitted input carries an explicit event cutoff <= the epoch and is
+    # durably auditable from the record's own provenance refs.
+    inputs = producer.point_in_time_inputs(evidence.source_evidence_refs)
+    assert {entry.name for entry in inputs} == {
+        "analytical_60m_ohlc",
+        "freshness_1m_anchor",
+    }
+    for entry in inputs:
+        assert entry.event_cutoff <= evidence.evaluation_time
+        assert entry.pit_valid(evidence.evaluation_time) is True
+
+
+def test_ac_021_point_in_time_audit_refuses_a_post_epoch_input():
+    """ATDD-R4-B2-controlled-paper-activation/AC-021 and ATDD-RELEASE-PIPELINE-v1/AC-017: the point-in-time audit fails closed on any supporting market input observed after the evaluation epoch, so a record can never be stamped with an older cutoff over newer live observations."""
+    post_epoch = producer.PointInTimeInput(
+        name="live_ticker",
+        kind=producer.PIT_KIND_MARKET,
+        event_cutoff=LATE_COMMIT,
+    )
+    assert post_epoch.pit_valid(LATE) is False
+    with pytest.raises(producer.FeasibilityPointInTimeError):
+        producer.assert_point_in_time_support([post_epoch], evaluation_time=LATE)
+    # The durable provenance ref records pit_valid=False and reading the audit back
+    # preserves the offending event cutoff instead of trusting a summary.
+    ref = post_epoch.provenance_ref(LATE)
+    assert "pit_valid=False" in ref
+    (parsed,) = producer.point_in_time_inputs([ref])
+    assert parsed.event_cutoff == LATE_COMMIT
+    assert parsed.pit_valid(LATE) is False
+    # Venue metadata whose truth does not depend on the epoch stays admissible.
+    producer.assert_point_in_time_support(
+        [
+            producer.PointInTimeInput(
+                name="venue_capability",
+                kind=producer.PIT_KIND_VENUE_METADATA,
+                event_cutoff=LATE_COMMIT,
+                epoch_invariant=True,
+            )
+        ],
+        evaluation_time=LATE,
+    )
+
+
+def test_ac_021_in_epoch_live_reads_are_admitted_with_their_own_cutoff():
+    """ATDD-R4-B2-controlled-paper-activation/AC-021 and ATDD-RELEASE-PIPELINE-v1/AC-017: a live read taken AT or BEFORE the evaluation epoch is admitted with its OWN event cutoff -- never a fabricated or backdated one -- so genuine in-epoch depth still supports the record."""
+    snapshot = _Snapshot(1, cutoff=LATE)
+    client = _InstrumentedClient(
+        candles=_hourly_candles(
+            end_epoch=LATE.replace(minute=0, second=0, microsecond=0), count=8
+        ),
+        candles_1m=_minute_candles(end_epoch=LATE, count=6),
+    )
+    evidence = producer.build_long_feasibility_evidence(
+        snapshot, client=client, notional_usd=500.0, acquisition_instant=LATE,
+    )
+    assert client.book_calls == 1
+    assert client.trade_calls == 1
+    assert client.ticker_calls == 0
+    assert evidence.execution_validation.status != "UNAVAILABLE"
+    inputs = {
+        entry.name: entry
+        for entry in producer.point_in_time_inputs(evidence.source_evidence_refs)
+    }
+    assert set(inputs) == {
+        "analytical_60m_ohlc",
+        "freshness_1m_anchor",
+        "spot_order_book",
+    }
+    book = inputs["spot_order_book"]
+    # The read's OWN instant (the epoch here), not the older candle close.
+    assert book.event_cutoff == LATE
+    assert book.pit_valid(evidence.evaluation_time) is True
+
+
+def test_ac_021_pending_anchor_retains_the_cursor_then_publishes_once_it_publishes(cursor_path):
+    """ATDD-R4-B2-controlled-paper-activation/AC-021 and ATDD-RELEASE-PIPELINE-v1/AC-017: an epoch minute the venue has NOT published yet is RETRYABLE -- the cursor does not advance and the snapshot is retried -- and once the candle publishes, exactly one F5 record is produced with lineage to that same snapshot."""
+    snapshot = _Snapshot(1, cutoff=LATE)
+    client = _AnchorLaggingClient(
+        candles=_hourly_candles(
+            end_epoch=LATE.replace(minute=0, second=0, microsecond=0), count=8
+        ),
+        candles_1m=_minute_candles(end_epoch=LATE, count=6),
+    )
+    built = []
+
+    def _builder(snap, direction):
+        evidence = producer.build_long_feasibility_evidence(
+            snap, client=client, notional_usd=500.0, acquisition_instant=LATE_COMMIT,
+        )
+        built.append(evidence)
+        return evidence
+
+    published = []
+    pass_1 = producer.capture_feasibility_evidence_shadow(
+        settings=_settings(),
+        reader=_FakeReader([snapshot]),
+        evidence_builder=_builder,
+        submit_payload=lambda payload: published.append(_status_of(payload)) or "OK",
+        cursor_path=cursor_path,
+        now=LATE,
+    )
+    # 1) the venue had not published this epoch's closed one-minute candle yet...
+    assert client.unpublished_reads == 1
+    # 2) ...so the pass reports a RETRYABLE disposition and commits NOTHING...
+    assert pass_1.recorded == 0
+    assert pass_1.retryable == 1
+    assert published == []
+    # 3) ...and the CURSOR DOES NOT ADVANCE: the snapshot stays for the next pass.
+    assert producer._load_cursor(cursor_path) in (None, (0, 0))
+
+    # 4) the candle publishes and the SAME snapshot is retried...
+    client.published = True
+    pass_2 = producer.capture_feasibility_evidence_shadow(
+        settings=_settings(),
+        reader=_FakeReader([snapshot]),
+        evidence_builder=_builder,
+        submit_payload=lambda payload: published.append(_status_of(payload)) or "OK",
+        cursor_path=cursor_path,
+        now=LATE_COMMIT,
+    )
+    # 5) ...and F5 is produced EXACTLY ONCE, with the correct lineage.
+    assert pass_2.recorded == 1
+    assert published == ["SNAP:1"]
+    assert len(built) == 1
+    evidence = built[0]
+    assert evidence.evaluation_time == LATE
+    assert evidence.source_cutoff == LATE
+    assert evidence.source_snapshot_id == snapshot.snapshot_id
+    assert producer._load_cursor(cursor_path) == (0, 1)
+
+
+def test_ac_021_point_in_time_violation_is_terminal_and_never_published(cursor_path):
+    """ATDD-R4-B2-controlled-paper-activation/AC-021 and ATDD-RELEASE-PIPELINE-v1/AC-017: a supported-by-post-epoch-input record is NEVER published and can never become valid on replay -- the snapshot's epoch is fixed -- so it is terminally REJECTED (not retried, not published)."""
+    def _builder(snapshot, direction):
+        raise producer.FeasibilityPointInTimeError(
+            "live_ticker@2026-10-02T12:52:12Z is after the evaluation epoch"
+        )
+
+    published = []
+    summary = producer.capture_feasibility_evidence_shadow(
+        settings=_settings(),
+        reader=_FakeReader([_Snapshot(1)]),
+        evidence_builder=_builder,
+        submit_payload=lambda payload: published.append(_status_of(payload)) or "OK",
+        cursor_path=cursor_path,
+        now=T,
+    )
+    assert summary.recorded == 0
+    assert summary.rejected == 1
+    assert summary.retryable == 0  # never retried forever
+    assert published == []  # nothing was published
+    assert producer._load_cursor(cursor_path) == (0, 1)
+
+
+@pytest.mark.parametrize("minute", [1, 17, 43, 58, 59])
+def test_ac_021_freshness_anchor_holds_anywhere_within_the_hour(minute):
+    """ATDD-R4-B2-controlled-paper-activation/AC-021 and ATDD-RELEASE-PIPELINE-v1/AC-017: the freshness anchor satisfies the runtime source-age window regardless of where the minute falls inside the hour, while the analytical cutoff stays at the top of the hour."""
+    epoch = datetime(2026, 10, 2, 12, minute, tzinfo=timezone.utc)
+    commit = epoch + timedelta(seconds=12)
+    evidence = producer.build_long_feasibility_evidence(
+        _Snapshot(1, cutoff=epoch),
+        client=_two_plane_client(epoch=epoch),
+        notional_usd=500.0,
+        acquisition_instant=commit,
+    )
+    assert evidence.source_cutoff == epoch
+    assert (commit - evidence.source_cutoff).total_seconds() <= 120
+    assert producer.anchor_source_age_seconds(evidence.source_evidence_refs) == 12.0
+    assert any(
+        "latest_close=2026-10-02T12:00:00Z" in ref for ref in evidence.source_evidence_refs
+    )
+
+
+def test_ac_021_hourly_cutoff_cannot_satisfy_the_verifier_but_the_fresh_anchor_does():
+    """ATDD-R4-B2-controlled-paper-activation/AC-021 and ATDD-RELEASE-PIPELINE-v1/AC-017: the OLD hourly-anchored source_cutoff fails the UNCHANGED runtime verifier at the production timings, and only the corrected freshness-anchor semantics pass it."""
+    from dataclasses import replace
+
+    from app.services.release_runtime_verifier import (
+        MAX_FEV_SOURCE_AGE,
+        _new_evidence_is_valid,
+    )
+
+    # The fixed reference is untouched by this increment.
+    assert MAX_FEV_SOURCE_AGE == timedelta(seconds=120)
+    assert producer.MAX_FRESH_ANCHOR_AGE_SECONDS == MAX_FEV_SOURCE_AGE.total_seconds()
+
+    older = _real_feature_snapshot(1, cutoff=LATE - timedelta(seconds=60))
+    newer = _real_feature_snapshot(1, cutoff=LATE)
+    ready_after = older.evaluation_cutoff - timedelta(seconds=1)
+    fresh = producer.build_long_feasibility_evidence(
+        newer,
+        client=_two_plane_client(epoch=LATE),
+        notional_usd=500.0,
+        acquisition_instant=LATE_COMMIT,
+    )
+
+    # The production failure, exactly: consecutive fresh snapshots + matching
+    # lineage, but an HH:00 hourly source_cutoff read 72s after the commit instant.
+    hourly_anchored = replace(
+        fresh, source_cutoff=HOURLY_CUTOFF, evidence_fingerprint=""
+    )
+    assert (LATE_COMMIT - HOURLY_CUTOFF).total_seconds() == 3132.0
+    passed_old, report_old = _new_evidence_is_valid(
+        [older, newer], [hourly_anchored], ready_after=ready_after, now=LATE_COMMIT,
+    )
+    assert passed_old is False
+    assert report_old["consecutive_60s_snapshots"] is True
+    assert report_old["feasibility_matches_fresh_snapshot"] is False
+
+    passed_new, report_new = _new_evidence_is_valid(
+        [older, newer], [fresh], ready_after=ready_after, now=LATE_COMMIT,
+    )
+    assert passed_new is True
+    assert report_new["consecutive_60s_snapshots"] is True
+    assert report_new["feasibility_matches_fresh_snapshot"] is True
+
+
+def test_ac_021_stale_freshness_anchor_fails_closed_without_synthetic_freshness():
+    """ATDD-R4-B2-controlled-paper-activation/AC-021 and ATDD-RELEASE-PIPELINE-v1/AC-017: a window with no candle closing at this epoch never backdates and is never stamped with the acquisition instant. A candle the venue has NOT PUBLISHED YET is RETRYABLE; a definitively absent candle, or an epoch already past the 120s contract, is terminal stale; an empty anchor read stays retryable."""
+    snapshot = _Snapshot(1, cutoff=LATE)
+    hourly = _hourly_candles(end_epoch=HOURLY_CUTOFF, count=8)
+
+    # (a) The source has not yet reached the epoch minute (its newest row starts
+    # BEFORE the epoch) and the 120s contract has not expired: the candle can still
+    # be published, so this must be RETRYABLE -- never a terminal skip.
+    pending = _FakeClient(
+        candles=hourly,
+        candles_1m=_minute_candles(end_epoch=LATE - timedelta(seconds=60), count=6),
+    )
+    with pytest.raises(producer.FeasibilityAnchorPendingError) as pending_exc:
+        producer.build_long_feasibility_evidence(
+            snapshot, client=pending, notional_usd=500.0, acquisition_instant=LATE_COMMIT,
+        )
+    assert not isinstance(pending_exc.value, producer.FeasibilityEvidenceStaleError)
+
+    # (b) The source has DEFINITIVELY advanced past the epoch minute (its newest row
+    # starts at epoch + 60s) and the epoch candle is absent from the window: waiting
+    # can no longer produce it, so this is terminal stale.
+    advanced = [
+        candle
+        for candle in _minute_candles(end_epoch=LATE + timedelta(seconds=60), count=6)
+        if int(candle.timestamp)
+        not in {
+            int(LATE.timestamp()),
+            int((LATE - timedelta(seconds=60)).timestamp()),
+        }
+    ]
+    with pytest.raises(producer.FeasibilityEvidenceStaleError) as stale_exc:
+        producer.build_long_feasibility_evidence(
+            snapshot,
+            client=_FakeClient(candles=hourly, candles_1m=advanced),
+            notional_usd=500.0,
+            acquisition_instant=LATE_COMMIT,
+        )
+    assert "no closed 1m candle" in str(stale_exc.value)
+
+    # (c) The epoch is already older than the 120s source-age contract, so no candle
+    # published from now on could ever be fresh enough: terminal, never retried
+    # forever.
+    expired = producer.MAX_FRESH_ANCHOR_AGE_SECONDS + 1.0
+    with pytest.raises(producer.FeasibilityEvidenceStaleError) as expired_exc:
+        producer.build_long_feasibility_evidence(
+            snapshot,
+            client=_FakeClient(
+                candles=hourly,
+                candles_1m=_minute_candles(
+                    end_epoch=LATE - timedelta(seconds=60), count=6
+                ),
+            ),
+            notional_usd=500.0,
+            acquisition_instant=LATE + timedelta(seconds=expired),
+        )
+    assert not isinstance(expired_exc.value, producer.FeasibilityAnchorPendingError)
+    assert "no closed 1m candle" in str(expired_exc.value)
+
+    # An empty anchor read is a transient failure: retryable, and still no
+    # manufactured timestamp.
+    with pytest.raises(producer.FeasibilityCaptureError) as empty_exc:
+        producer.build_long_feasibility_evidence(
+            snapshot,
+            client=_FakeClient(candles=hourly, candles_1m=[]),
+            notional_usd=500.0,
+            acquisition_instant=LATE_COMMIT,
+        )
+    assert type(empty_exc.value) is producer.FeasibilityCaptureError
+
+
+def test_ac_021_anchor_beyond_the_max_source_age_fails_closed():
+    """ATDD-R4-B2-controlled-paper-activation/AC-021 and ATDD-RELEASE-PIPELINE-v1/AC-017: an anchor that would already exceed the runtime source-age window at acquisition is refused rather than reported as fresh."""
+    snapshot = _Snapshot(1, cutoff=LATE)
+    client = _two_plane_client(epoch=LATE)
+    with pytest.raises(producer.FeasibilityEvidenceStaleError) as excinfo:
+        producer.build_long_feasibility_evidence(
+            snapshot,
+            client=client,
+            notional_usd=500.0,
+            acquisition_instant=LATE + timedelta(seconds=121),
+        )
+    assert "source-age contract" in str(excinfo.value)
+
+
+def test_ac_021_evidence_lineage_points_to_the_exact_source_snapshot():
+    """ATDD-R4-B2-controlled-paper-activation/AC-021 and ATDD-RELEASE-PIPELINE-v1/AC-017: the freshness anchor changes freshness ONLY -- lineage still names exactly the originating FeatureSnapshot and its own evaluation epoch."""
+    snapshot = _Snapshot(3, cutoff=LATE)
+    evidence = producer.build_long_feasibility_evidence(
+        snapshot,
+        client=_two_plane_client(epoch=LATE),
+        notional_usd=500.0,
+        acquisition_instant=LATE_COMMIT,
+    )
+    assert evidence.source_snapshot_id == snapshot.snapshot_id
+    assert evidence.source_evidence_refs[0] == snapshot.snapshot_id
+    assert evidence.evaluation_time == snapshot.evaluation_cutoff
+    assert evidence.instrument_version_id == snapshot.instrument_version_id
+    assert evidence.source_cutoff <= evidence.evaluation_time
+
+
+def test_ac_021_freshness_dispositions_are_flushed_durable_markers(
+    monkeypatch, cursor_path
+):
+    """ATDD-R4-B2-controlled-paper-activation/AC-021 and ATDD-RELEASE-PIPELINE-v1/AC-017: a stale freshness anchor and a timed-out market read each leave a FLUSHED, machine-readable disposition naming the reason, so a bound-killed pass is never a silent evidence drop."""
+    import httpx
+
+    lines: list[str] = []
+
+    def _fake_print(*args, **kwargs):
+        assert kwargs.get("flush") is True, (
+            "durable feasibility markers must be flushed; a buffered line is lost "
+            "when the outer containment kills the producer"
+        )
+        lines.append(" ".join(str(arg) for arg in args))
+
+    # The markers are emitted by the SHARED emitter (its ``print`` is resolved in
+    # the feature-bus module), so that is the reference to intercept.
+    monkeypatch.setattr(fb_capture, "print", _fake_print, raising=False)
+
+    def _stale_builder(snapshot, direction):
+        raise producer.FeasibilityEvidenceStaleError(
+            "no closed 1m candle closes at the evaluation epoch"
+        )
+
+    summary = producer.capture_feasibility_evidence_shadow(
+        settings=_settings(),
+        reader=_FakeReader([_Snapshot(1)]),
+        cursor_path=cursor_path,
+        now=T,
+        evidence_builder=_stale_builder,
+        submit_payload=lambda payload: "OK",
+    )
+    assert summary.stale == 1
+    assert lines[0].startswith("OPIP_FEASIBILITY_CAPTURE_PHASE=start")
+    stale = [line for line in lines if "PHASE=stale" in line]
+    assert len(stale) == 1
+    assert "snapshot=SNAP:1" in stale[0]
+    assert "reason=FRESHNESS_ANCHOR" in stale[0]
+    done = [line for line in lines if line.startswith("OPIP_FEASIBILITY_CAPTURE_PHASE=done")]
+    assert len(done) == 1
+    assert "stale=1" in done[0]
+
+    # A timed-out market read is classified identically to the Feature Bus
+    # producer's failure disposition, and the cursor does NOT advance.
+    lines.clear()
+    producer._save_cursor(cursor_path, (0, 0))
+
+    def _timeout_builder(snapshot, direction):
+        raise httpx.ReadTimeout("stalled public read")
+
+    summary = producer.capture_feasibility_evidence_shadow(
+        settings=_settings(),
+        reader=_FakeReader([_Snapshot(1)]),
+        cursor_path=cursor_path,
+        now=T,
+        evidence_builder=_timeout_builder,
+        submit_payload=lambda payload: "OK",
+    )
+    assert summary.retryable == 1
+    retryable = [line for line in lines if "PHASE=retryable" in line]
+    assert len(retryable) == 1
+    assert "reason=REQUEST_TIMEOUT" in retryable[0]
+    assert producer._load_cursor(cursor_path) == (0, 0)
+
+
+# ---------------------------------------------------------------------------
 # AC-021 negative evidence stays PRESENT
 # ---------------------------------------------------------------------------
 
@@ -959,7 +1429,7 @@ def test_ac_021_scheduler_reconciliation_installs_capture_once_and_can_roll_back
 # ---------------------------------------------------------------------------
 
 
-def _real_feature_snapshot(n: int):
+def _real_feature_snapshot(n: int, *, cutoff: datetime = T):
     from app.jobs.run_feature_bus_pilot import _synthetic_observations
     from app.opip.contracts.identity import InstrumentVersion
     from app.opip.features.pipeline import run_cycle
@@ -972,17 +1442,19 @@ def _real_feature_snapshot(n: int):
         venue_instrument_id=f"SYNTHETIC-SYN{n}USD",
         version=1,
         reference_data_version="opip-evidence-identity-v1",
-        observed_at_utc=T,
+        observed_at_utc=cutoff,
         price_decimals=2,
         tick_size=0.01,
         min_order_size=0.2,
     )
-    observations = _synthetic_observations(version, cutoff=T, intervals=140, now=T)
+    observations = _synthetic_observations(
+        version, cutoff=cutoff, intervals=140, now=cutoff
+    )
     return run_cycle(
         observations,
         instrument_version=version,
-        evaluation_cutoff=T,
-        evaluated_at_utc=T,
+        evaluation_cutoff=cutoff,
+        evaluated_at_utc=cutoff,
         state=initial_state(version),
         source_version="r4b2-provenance-fixture",
     ).snapshot
@@ -1007,11 +1479,38 @@ def _minute_candles(*, end_epoch: datetime, count: int) -> list[Candle]:
     return candles
 
 
+def _hourly_candles(*, end_epoch: datetime, count: int) -> list[Candle]:
+    """A 60-minute analytical series whose last row is still forming at ``end_epoch``.
+
+    Kraken returns the forming interval last, and the producer drops it, so the
+    latest COMPLETED hourly close is ``end_epoch`` itself.
+    """
+    candles = []
+    for i in range(count):
+        ts = int(end_epoch.timestamp()) - (count - 1 - i) * 3600
+        candles.append(
+            Candle(
+                timestamp=ts, open=100.0, high=101.0, low=99.0, close=100.0,
+                vwap=100.0, volume=10.0, trade_count=1,
+            )
+        )
+    return candles
+
+
 class _FakeClient:
-    def __init__(self, *, candles):
+    def __init__(self, *, candles, candles_1m=None, intervals=None):
         self._candles = list(candles)
+        self._candles_1m = (
+            list(candles) if candles_1m is None else list(candles_1m)
+        )
+        #: Records every requested interval so a test can prove the analytical
+        #: horizon and the freshness anchor are SEPARATELY acquired reads.
+        self.intervals = intervals if intervals is not None else []
 
     def get_ohlc(self, pair, interval=60, since=None):
+        self.intervals.append(interval)
+        if int(interval) == 1:
+            return list(self._candles_1m)
         return list(self._candles)
 
     def get_ticker(self, pair):
@@ -1026,3 +1525,48 @@ class _FakeClient:
 
     def get_post_trade(self, symbol, count=100):
         return []
+
+
+class _InstrumentedClient(_FakeClient):
+    """Records every LIVE read so a test can prove what the record actually USED."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.ticker_calls = 0
+        self.book_calls = 0
+        self.trade_calls = 0
+
+    def get_ticker(self, pair):
+        self.ticker_calls += 1
+        return {"last": 123.456}
+
+    def get_pre_trade(self, symbol):
+        self.book_calls += 1
+        return super().get_pre_trade(symbol)
+
+    def get_post_trade(self, symbol, count=100):
+        self.trade_calls += 1
+        return super().get_post_trade(symbol, count=count)
+
+
+class _AnchorLaggingClient(_InstrumentedClient):
+    """A venue that has not yet PUBLISHED the just-closed epoch minute candle.
+
+    Kraken returns the still-forming interval last, so a venue that is a minute
+    behind simply has no row that closes at the epoch. Once ``published`` is set
+    the epoch's own closed candle is returned, exactly as a later poll would.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.published = False
+        self.unpublished_reads = 0
+
+    def get_ohlc(self, pair, interval=60, since=None):
+        if int(interval) == 1 and not self.published:
+            self.unpublished_reads += 1
+            self.intervals.append(int(interval))
+            # Drop the epoch candle AND its predecessor, so the newest returned row
+            # is still well before the epoch: the source has not advanced past it.
+            return list(self._candles_1m[:-2])
+        return super().get_ohlc(pair, interval=interval, since=since)

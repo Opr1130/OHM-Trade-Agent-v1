@@ -215,6 +215,90 @@ def test_ac_022_invalid_status_sort_order_constant_is_importable():
     assert UNAVAILABLE == "UNAVAILABLE"
 
 
+def test_ac_022_point_in_time_provenance_round_trips_epoch_invariance():
+    """ATDD-R4-B2-controlled-paper-activation/AC-022 and ATDD-RELEASE-PIPELINE-v1/AC-017: the durable point-in-time provenance token PERSISTS ``epoch_invariant``, so serialize -> parse reproduces the exact semantics that were published instead of silently downgrading epoch-invariant venue metadata to a post-epoch market observation; an absent or falsified flag makes the same input fail PIT validation."""
+    epoch = T
+    post_epoch = T + timedelta(seconds=30)
+
+    market = producer.PointInTimeInput(
+        name="freshness_1m_anchor",
+        kind=producer.PIT_KIND_MARKET,
+        event_cutoff=epoch,
+        epoch_invariant=False,
+    )
+    venue = producer.PointInTimeInput(
+        name="margin_venue_discovery",
+        kind=producer.PIT_KIND_VENUE_METADATA,
+        event_cutoff=post_epoch,
+        epoch_invariant=True,
+    )
+    refs = (market.provenance_ref(epoch), venue.provenance_ref(epoch))
+    assert "epoch_invariant=False" in refs[0]
+    assert "epoch_invariant=True" in refs[1]
+    # The published token's own pit_valid is what the reader must reproduce.
+    assert "pit_valid=True" in refs[0]
+    assert "pit_valid=True" in refs[1]
+
+    parsed = {entry.name: entry for entry in producer.point_in_time_inputs(refs)}
+    assert parsed["freshness_1m_anchor"].epoch_invariant is False
+    assert parsed["freshness_1m_anchor"].event_cutoff == epoch
+    assert parsed["margin_venue_discovery"].epoch_invariant is True
+    assert parsed["margin_venue_discovery"].event_cutoff == post_epoch
+    # pit_valid recomputed from parsed provenance matches the published semantics
+    # on BOTH inputs, so the durable audit cannot contradict itself.
+    assert parsed["freshness_1m_anchor"].pit_valid(epoch) is True
+    assert parsed["margin_venue_discovery"].pit_valid(epoch) is True
+    producer.assert_point_in_time_support(parsed.values(), evaluation_time=epoch)
+
+    # Invariance is NEVER inferred from the input's name on read: dropping the
+    # persisted token makes the same post-epoch venue metadata PIT-INVALID.
+    stripped = ":".join(
+        token
+        for token in refs[1].split(":")
+        if not token.startswith("epoch_invariant=")
+    )
+    (degraded,) = producer.point_in_time_inputs([stripped])
+    assert degraded.name == "margin_venue_discovery"
+    assert degraded.epoch_invariant is False
+    assert degraded.pit_valid(epoch) is False
+    with pytest.raises(producer.FeasibilityPointInTimeError):
+        producer.assert_point_in_time_support([degraded], evaluation_time=epoch)
+
+
+def test_ac_022_short_margin_venue_provenance_survives_the_durable_audit():
+    """ATDD-R4-B2-controlled-paper-activation/AC-022 and ATDD-RELEASE-PIPELINE-v1/AC-017: a SHORT record whose margin-venue capability was acquired AFTER the evaluation epoch serializes an audit that still supports the record when read back, so the durable provenance never flags valid epoch-invariant venue metadata as a point-in-time violation."""
+    snapshot = _Snapshot(cutoff=T)
+    acquisition_instant = T + timedelta(seconds=30)
+    evidence = producer.build_short_feasibility_evidence(
+        snapshot,
+        client=_ShortClient(),
+        notional_usd=500.0,
+        acquisition_instant=acquisition_instant,
+        interval_minutes=1,
+        interval_seconds=60,
+    )
+    assert evidence.evaluation_time == T
+
+    parsed = {
+        entry.name: entry
+        for entry in producer.point_in_time_inputs(evidence.source_evidence_refs)
+    }
+    margin = parsed["margin_venue_discovery"]
+    assert margin.kind == producer.PIT_KIND_VENUE_METADATA
+    assert margin.event_cutoff == acquisition_instant > evidence.evaluation_time
+    assert margin.epoch_invariant is True
+    assert margin.pit_valid(evidence.evaluation_time) is True
+
+    # Every admitted input still supports the record after a serialize -> parse
+    # round trip: the audit contradicts nothing it published.
+    producer.assert_point_in_time_support(
+        parsed.values(), evaluation_time=evidence.evaluation_time
+    )
+    assert all(
+        entry.pit_valid(evidence.evaluation_time) for entry in parsed.values()
+    )
+
+
 def test_ac_022_producer_dispatches_short_direction(cursor_path):
     """ATDD-R4-B2-controlled-paper-activation/AC-022: the producer's injectable builder receives the requested SHORT direction and records genuine SHORT evidence."""
     producer._save_cursor(cursor_path, (0, 0))
