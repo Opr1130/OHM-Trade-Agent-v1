@@ -424,8 +424,8 @@ def test_ac_020_acquisition_concurrency_is_bounded():
     assert summary.cycles == 6
 
 
-def test_ac_020_deadline_stops_further_waves():
-    """ATDD-R4-B2-controlled-paper-activation/AC-020: the internal budget is the graceful stop. Once the remaining budget cannot fit one more bounded wave, no further instruments are fetched and the pass records explicit budget-exhausted evidence."""
+def test_ac_020_deadline_stops_further_waves(monkeypatch):
+    """ATDD-R4-B2-controlled-paper-activation/AC-020: the internal budget is the graceful stop. Once the remaining budget cannot fit one more bounded wave, no further instruments are fetched and the pass records explicit budget-exhausted evidence. A source that blows the WHOLE pass budget (past Phase B's own deadline) cannot then commit acquired evidence with an unbounded write: every dependent write needs remaining materialization budget, so the pass emits an explicit materialize_incomplete disposition instead of claiming OK."""
     versions = [_instrument(i) for i in range(6)]
     batches = {
         version.instrument_version_id: _batch(version, _observations(version))
@@ -453,6 +453,7 @@ def test_ac_020_deadline_stops_further_waves():
                 clock["value"] = 1000.0
             return batches[version.instrument_version_id]
 
+    lines = _record_markers(monkeypatch)
     client = _RecordingClient()
     publisher = FeatureBusPublisher(client, enabled=True, settings=_settings())
     summary = capture.capture_feature_bus_shadow(
@@ -468,9 +469,17 @@ def test_ac_020_deadline_stops_further_waves():
         clock=_clock,
     )
     assert summary.budget_exhausted is True
-    assert summary.fetched == 2
-    assert len(client.snapshot_payloads()) == 2
     assert any("budget exhausted" in err for err in summary.errors)
+    # Phase B's deadline is already blown: no write may be STARTED, so nothing is
+    # fabricated and the uncommitted evidence is an explicit durable disposition.
+    assert summary.materialize_incomplete is True
+    assert summary.fetched == 0
+    assert client.snapshot_payloads() == []
+    incomplete = [line for line in lines if "PHASE=materialize_incomplete" in line]
+    assert len(incomplete) == 1
+    assert "reason=INSUFFICIENT_MATERIALIZE_BUDGET" in incomplete[0]
+    assert lines[-1].startswith("OPIP_FEATURE_BUS_CAPTURE_PHASE=done")
+    assert "status=MATERIALIZE_INCOMPLETE" in lines[-1]
 
 
 # ---------------------------------------------------------------------------
@@ -663,6 +672,84 @@ def test_ac_020_retry_and_backoff_never_start_without_remaining_budget(monkeypat
     assert clock.sleeps == []
 
 
+def test_ac_020_first_attempt_rate_limit_wait_is_inside_the_declared_wave_bound(monkeypatch):
+    """ATDD-R4-B2-controlled-paper-activation/AC-020 and ATDD-RELEASE-PIPELINE-v1/AC-017: the declared worst case of one request owns a rate-limiter wait for EVERY transport attempt -- the first one included, because the transport takes a rate-budget token before attempt #1 -- so a bucket that is already DEPLETED when the request starts cannot overrun the wave."""
+    from app.services import opip_feature_bus_market_source as market_source
+    from app.services.kraken_transport import (
+        KRAKEN_ATTEMPT_PHASE_BOUND,
+        KrakenTransportError,
+        retry_backoff_worst_case_seconds,
+    )
+
+    retries = 2
+    attempts = market_source.capture_transport_attempt_count(retries)
+    allowance = market_source.capture_rate_limit_wait_allowance_seconds(retries)
+    # attempts = retries + 1: attempt #1 takes a token too, so it owns a wait.
+    assert attempts == retries + 1 == 3
+    assert allowance == attempts * market_source.CAPTURE_RATE_LIMIT_WAIT_ALLOWANCE_SECONDS
+    # The naive ``retries * allowance`` accounting is NOT what is declared: it
+    # omits the first attempt's wait entirely.
+    assert allowance > retries * market_source.CAPTURE_RATE_LIMIT_WAIT_ALLOWANCE_SECONDS
+
+    # The declared bound is the transport's REAL schedule, decomposed exactly.
+    per_attempt = market_source.capture_request_timeout_seconds(
+        wave_budget_seconds=WAVE_BUDGET_SECONDS, max_retries=retries
+    )
+    assert market_source.capture_worst_case_request_seconds(
+        wave_budget_seconds=WAVE_BUDGET_SECONDS, max_retries=retries
+    ) == pytest.approx(
+        attempts * per_attempt * KRAKEN_ATTEMPT_PHASE_BOUND
+        + allowance
+        + retry_backoff_worst_case_seconds(retries)
+    )
+    assert market_source.capture_worst_case_request_seconds(
+        wave_budget_seconds=WAVE_BUDGET_SECONDS, max_retries=retries
+    ) <= WAVE_BUDGET_SECONDS + 1e-9
+
+    # ADVERSARIAL: the shared token bucket is DEPLETED before attempt #1, so the
+    # very first attempt must WAIT for a token instead of being admitted for free.
+    clock = _VirtualKrakenClock()
+    transport, _ = _stalling_transport(monkeypatch, clock, max_retries=retries)
+    transport.requests_per_second = 1.0
+    transport._tokens = 0.0
+    transport._last_refill = clock.now
+    started = clock.now
+    with pytest.raises(KrakenTransportError):
+        transport.request(
+            "OHLC",
+            {"pair": "SOLUSD"},
+            timeout_seconds=per_attempt,
+            deadline_monotonic=started + WAVE_BUDGET_SECONDS,
+        )
+    # The limiter wait happened BEFORE attempt #1 (nothing was attempted yet)...
+    assert clock.sleeps[0] == pytest.approx(1.0)
+    assert transport._metrics["rate_wait_seconds"] >= 1.0
+    assert clock.attempts  # attempt #1 was made AFTER the depleted-bucket wait
+    # ...and the declared allowance already covers the observed first-attempt wait.
+    assert allowance >= transport._metrics["rate_wait_seconds"]
+    assert clock.now - started <= WAVE_BUDGET_SECONDS + 1e-9
+    assert sum(clock.sleeps) + sum(clock.attempts) <= WAVE_BUDGET_SECONDS + 1e-9
+
+    # ADVERSARIAL: a bucket so depleted that a single acquire needs several capped
+    # rounds still cannot overrun: the transport refuses to WAIT past the deadline.
+    clock = _VirtualKrakenClock()
+    transport, _ = _stalling_transport(monkeypatch, clock, max_retries=retries)
+    transport.requests_per_second = 0.25
+    transport.burst = 1
+    transport._tokens = 0.0
+    transport._last_refill = clock.now
+    started = clock.now
+    with pytest.raises(KrakenTransportError):
+        transport.request(
+            "OHLC",
+            {"pair": "SOLUSD"},
+            timeout_seconds=per_attempt,
+            deadline_monotonic=started + WAVE_BUDGET_SECONDS,
+        )
+    assert any(sleep >= 1.0 for sleep in clock.sleeps)
+    assert clock.now - started <= WAVE_BUDGET_SECONDS + 1e-9
+
+
 def test_ac_020_capture_client_declares_a_bounded_public_only_request_budget(monkeypatch):
     """ATDD-R4-B2-controlled-paper-activation/AC-020 and ATDD-RELEASE-PIPELINE-v1/AC-017: the pass-scoped capture client declares a derived per-attempt timeout AND the pass deadline, exposes only public read endpoints, and its worst case fits the declared wave for every retry policy."""
     from app.services import opip_feature_bus_market_source as market_source
@@ -764,6 +851,118 @@ def test_ac_020_materialization_reserve_is_retained_for_phase_b(monkeypatch):
     assert summary.cycles == 2
     assert len(client.snapshot_payloads()) == 2
     assert lines[-1].startswith("OPIP_FEATURE_BUS_CAPTURE_PHASE=done")
+    assert _marker_field(lines[-1], "elapsed_seconds") <= budget
+
+
+class _SlowWriterClient(_RecordingClient):
+    """A canonical writer whose OWN submissions consume the pass budget.
+
+    Proves an individual canonical operation is bounded by the materialization
+    deadline rather than by the outer cron containment: the client records the
+    timeout in force at each submission and advances the pass clock by its own
+    (slow) write cost.
+    """
+
+    def __init__(self, *, write_seconds: float, timeout: float = 30.0):
+        super().__init__()
+        self.write_seconds = write_seconds
+        self.timeout = timeout
+        self.write_timeouts: list[float] = []
+        self.on_submit = None
+
+    def submit(self, intent):
+        payload = getattr(intent, "payload", None) or {}
+        if payload.get("record_type") == "FeatureSnapshot":
+            self.write_timeouts.append(self.timeout)
+            if self.on_submit is not None:
+                self.on_submit()
+        return super().submit(intent)
+
+
+def test_ac_020_slow_writer_is_bounded_by_the_materialize_deadline_not_containment(monkeypatch):
+    """ATDD-R4-B2-controlled-paper-activation/AC-020 and ATDD-RELEASE-PIPELINE-v1/AC-017: Phase B enforces its OWN absolute deadline -- a slow canonical submission cannot consume the reserve and cross containment; a write whose declared maximum cannot fit the remaining materialization budget is never started, an explicit durable disposition is emitted, and done=OK is never claimed."""
+    versions = [_instrument(i) for i in range(2)]
+    batches = {
+        version.instrument_version_id: _batch(version, _observations(version))
+        for version in versions
+    }
+    tick = {"value": 0.0}
+
+    def _clock():
+        return tick["value"]
+
+    class _Source:
+        venue = "kraken"
+        source_label = "kraken_ohlc"
+        interval_seconds = 60
+
+        def fetch_through(self, version, *, watermark, now):
+            tick["value"] += 13.0  # one bounded request consumes a real slice
+            return batches[version.instrument_version_id]
+
+    lines = _record_markers(monkeypatch)
+    budget = 45.0
+    # The raw submission would take 22s, but the producer clamps the writer's OWN
+    # per-operation timeout to the remaining phase-B budget, so the client returns
+    # (here: advances the pass clock) inside the deadline it was admitted under.
+    client = _SlowWriterClient(write_seconds=22.0)
+    original_timeout = client.timeout
+    client.on_submit = lambda: tick.__setitem__(
+        "value", tick["value"] + min(client.write_seconds, client.timeout)
+    )
+    publisher = FeatureBusPublisher(client, enabled=True, settings=_settings())
+    summary = capture.capture_feature_bus_shadow(
+        settings=_settings(
+            opip_feature_bus_capture_budget_seconds=budget,
+            opip_feature_bus_capture_concurrency=1,
+        ),
+        now=T0,
+        publisher=publisher,
+        instrument_provider=_provider(versions),
+        source=_Source(),
+        restore_continuity=lambda versions: ({}, {}, {}),
+        clock=_clock,
+    )
+
+    # Both instruments were ACQUIRED inside the reserve-protected window (26s of
+    # the 45s budget), so nothing was refused for lack of acquisition budget: the
+    # reserve alone does NOT bound a slow Phase B.
+    materialize = [line for line in lines if "PHASE=materialize " in line]
+    assert len(materialize) == 1
+    assert _marker_field(materialize[0], "count") == 2.0
+    assert _marker_field(materialize[0], "deadline_remaining") == pytest.approx(
+        budget - 26.0
+    )
+    assert summary.budget_exhausted is False
+
+    # The FIRST write was admitted with the writer's OWN per-operation timeout
+    # clamped to the remaining materialization budget, so it cannot outlive the
+    # deadline it was admitted under.
+    assert client.write_timeouts[0] == pytest.approx(budget - 26.0)
+    assert client.write_timeouts[0] < original_timeout
+    assert client.timeout == pytest.approx(budget - 26.0)
+
+    # The SECOND write could not fit the remaining budget, so it was NEVER
+    # STARTED -- no fabricated commit, an explicit durable disposition instead.
+    assert len(client.write_timeouts) == 1
+    assert len(client.snapshot_payloads()) == 1
+    assert summary.fetched == 1
+    assert summary.materialize_incomplete is True
+    incomplete = [line for line in lines if "PHASE=materialize_incomplete" in line]
+    assert len(incomplete) == 1
+    assert "reason=INSUFFICIENT_MATERIALIZE_BUDGET" in incomplete[0]
+    assert _marker_field(incomplete[0], "remaining_seconds") < (
+        capture.CAPTURE_MATERIALIZE_WRITE_BOUND_SECONDS
+    )
+
+    # done=OK is NEVER claimed when acquired evidence could not be committed.
+    assert lines[-1].startswith("OPIP_FEATURE_BUS_CAPTURE_PHASE=done")
+    assert "status=MATERIALIZE_INCOMPLETE" in lines[-1]
+    assert "materialize_incomplete=True" in lines[-1]
+    # The producer stopped ITSELF inside its own pass budget and returned a
+    # complete summary: cron containment is final containment only, never the
+    # normal mechanism that bounds Phase B.
+    assert summary.elapsed_seconds <= budget
     assert _marker_field(lines[-1], "elapsed_seconds") <= budget
 
 

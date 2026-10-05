@@ -101,6 +101,17 @@ PER_REQUEST_BUDGET_SECONDS = 15.0
 #: while the writer was still working. Clamped so it can never exceed the pass.
 CAPTURE_MATERIALIZE_RESERVE_SECONDS = 10.0
 
+#: Declared worst-case wall clock of ONE Phase-B canonical materialization write.
+#: The reserve above bounds ACQUISITION; this constant bounds MATERIALIZATION
+#: itself. Phase B runs strictly sequentially on the single canonical writer
+#: connection, so this is also the granularity at which its absolute deadline is
+#: enforced: a canonical write is never STARTED unless the remaining Phase-B budget
+#: can fit this bound. It mirrors the canonical writer client's own per-submit
+#: socket timeout (``CanonicalWriterClient(timeout=5.0)``), so an admitted write
+#: cannot outlive the bound it was admitted under. The cron ``timeout`` stays final
+#: containment ONLY and must never be the mechanism that bounds Phase B.
+CAPTURE_MATERIALIZE_WRITE_BOUND_SECONDS = 5.0
+
 #: Bounded acquisition concurrency. Kraken has no bulk multi-pair OHLC endpoint,
 #: so one public request per instrument is required for each closed minute. A
 #: small worker pool bounds the worst case to ``ceil(N / concurrency)`` request
@@ -128,6 +139,7 @@ class FeatureBusCaptureSummary:
     rejected_identity: int = 0
     source_errors: int = 0
     budget_exhausted: bool = False
+    materialize_incomplete: bool = False
     elapsed_seconds: float = 0.0
     publish_counts: dict[str, int] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
@@ -147,6 +159,7 @@ class FeatureBusCaptureSummary:
             "rejected_identity": self.rejected_identity,
             "source_errors": self.source_errors,
             "budget_exhausted": self.budget_exhausted,
+            "materialize_incomplete": self.materialize_incomplete,
             "elapsed_seconds": round(self.elapsed_seconds, 3),
             "publish_counts": dict(self.publish_counts),
             "errors": list(self.errors[:8]),
@@ -180,6 +193,33 @@ def emit_capture_marker(
     detail = " ".join(f"{key}={value}" for key, value in fields.items())
     line = f"{prefix}_PHASE={stage} {detail}".rstrip()
     print(line, flush=True)
+
+
+def _bound_writer_operation_timeout(publisher: Any, remaining_seconds: float) -> float | None:
+    """Tighten the canonical writer's OWN per-operation timeout to the budget left.
+
+    Phase B admits a write only when the remaining materialization budget fits
+    :data:`CAPTURE_MATERIALIZE_WRITE_BOUND_SECONDS`; this additionally clamps the
+    writer client's own socket timeout to the remaining budget where the client
+    exposes one, so an individual canonical operation cannot outlive the deadline
+    it was admitted under. It only ever NARROWS a timeout: a client that exposes
+    no timeout keeps its own bound, and no timeout is ever widened. Returns the
+    timeout now in force (``None`` when the client exposes none). Observability and
+    bounding only: it grants no authority and changes no evidence content.
+    """
+    try:
+        client = publisher.resolved_writer_client()
+    except Exception:  # noqa: BLE001 - an unresolvable client keeps the write bound
+        return None
+    current = getattr(client, "timeout", None)
+    if not isinstance(current, (int, float)) or float(current) <= 0.0:
+        return None
+    bounded = max(0.05, min(float(current), float(remaining_seconds)))
+    try:
+        setattr(client, "timeout", bounded)
+    except Exception:  # noqa: BLE001 - a read-only client keeps its own bound
+        return float(current)
+    return bounded
 
 
 def shadow_capture_authorized(settings: Any) -> bool:
@@ -456,10 +496,26 @@ def capture_feature_bus_shadow(
         elapsed_seconds=round(tick() - started, 3),
     )
 
-    # Phase B - sequential materialization. The canonical writer has a single
-    # connection, so dependent writes commit in instrument order, never
-    # concurrently: acquisition is bounded and parallel, evidence stays serial.
-    emit_capture_marker("materialize", count=len(acquired))
+    # Phase B - sequential materialization with its OWN absolute deadline. The
+    # canonical writer has a single connection, so dependent writes commit in
+    # instrument order, never concurrently: acquisition is bounded and parallel,
+    # evidence stays serial. The reserve stops ACQUISITION early; this deadline
+    # bounds MATERIALIZATION itself, so a slow canonical submission can never
+    # consume the reserve and cross cron containment with acquired evidence
+    # uncommitted. A write that cannot fit is never started.
+    materialize_deadline = deadline
+    emit_capture_marker(
+        "materialize",
+        count=len(acquired),
+        deadline_remaining=round(materialize_deadline - tick(), 3),
+        write_bound_seconds=round(CAPTURE_MATERIALIZE_WRITE_BOUND_SECONDS, 3),
+    )
+    pending_commits = sum(
+        1
+        for result_or_error, _ in acquired.values()
+        if not isinstance(result_or_error, BaseException) and result_or_error.error is None
+    )
+    committed_this_phase = 0
     for version in committed_versions:
         version_id = version.instrument_version_id
         if version_id not in acquired:
@@ -480,6 +536,31 @@ def capture_feature_bus_shadow(
             summary.source_errors += 1
             summary.errors.append(f"{version_id}: source error: {batch.error}")
             continue
+
+        # Budget proof BEFORE every dependent canonical write: never start a write
+        # whose declared maximum cannot fit the remaining Phase-B budget. The
+        # writer's OWN per-operation timeout is tightened to the same remaining
+        # budget where the client exposes one, so an individual write cannot
+        # outlive the deadline it was admitted under.
+        remaining = materialize_deadline - tick()
+        if remaining < CAPTURE_MATERIALIZE_WRITE_BOUND_SECONDS:
+            summary.materialize_incomplete = True
+            summary.errors.append(
+                f"{version_id}: materialization incomplete: "
+                f"{remaining:.3f}s remaining cannot fit one bounded canonical write"
+            )
+            emit_capture_marker(
+                "materialize_incomplete",
+                where="materialize",
+                reason="INSUFFICIENT_MATERIALIZE_BUDGET",
+                instrument=version_id,
+                remaining_seconds=round(remaining, 3),
+                required_seconds=round(CAPTURE_MATERIALIZE_WRITE_BOUND_SECONDS, 3),
+                committed=committed_this_phase,
+                pending=pending_commits,
+            )
+            break
+        _bound_writer_operation_timeout(publisher, remaining)
         summary.fetched += 1
 
         prior = restored_states.get(version_id)
@@ -516,6 +597,7 @@ def capture_feature_bus_shadow(
             )
             continue
         summary.cycles += 1
+        committed_this_phase += 1
         if result.promoted:
             summary.promoted += 1
         else:
@@ -536,12 +618,17 @@ def capture_feature_bus_shadow(
     emit_capture_marker(
         "done",
         status=(
-            "DEADLINE_EXHAUSTED"
+            # An incomplete materialization is NEVER reported as OK: acquired
+            # evidence that could not be committed is an explicit disposition.
+            "MATERIALIZE_INCOMPLETE"
+            if summary.materialize_incomplete
+            else "DEADLINE_EXHAUSTED"
             if summary.cycles == 0 and summary.budget_exhausted
             else "NO_SNAPSHOTS"
             if summary.cycles == 0
             else "OK"
         ),
+        materialize_incomplete=summary.materialize_incomplete,
         fetched=summary.fetched,
         cycles=summary.cycles,
         promoted=summary.promoted,

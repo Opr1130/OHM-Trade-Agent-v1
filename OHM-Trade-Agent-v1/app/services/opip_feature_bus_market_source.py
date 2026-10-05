@@ -51,6 +51,10 @@ MIN_CAPTURE_REQUEST_TIMEOUT_SECONDS = 1.0
 
 #: ONE token-bucket refill step the shared transport may wait for before an
 #: attempt. The transport's own rate limiter uses at most a 1.0s sleep per step.
+#: The per-REQUEST allowance is ``attempts * this`` (see
+#: :func:`capture_rate_limit_wait_allowance_seconds`), NOT ``retries * this``:
+#: ``KrakenPublicTransport._acquire_budget`` runs before EVERY attempt, the FIRST
+#: one included, so a depleted token bucket makes attempt #1 wait too.
 CAPTURE_RATE_LIMIT_WAIT_ALLOWANCE_SECONDS = 1.0
 
 
@@ -59,6 +63,30 @@ def _resolved_max_retries(max_retries: int | None) -> int:
         return max(0, int(max_retries))
     return max(
         0, int(os.getenv("KRAKEN_PUBLIC_MAX_RETRIES", str(DEFAULT_KRAKEN_PUBLIC_MAX_RETRIES)))
+    )
+
+
+def capture_transport_attempt_count(max_retries: int | None = None) -> int:
+    """Attempts the shared transport may make for ONE request (``retries + 1``).
+
+    Derived from the transport's own schedule -- ``KrakenPublicTransport.request``
+    loops ``for attempt in range(self.max_retries + 1)`` -- so the rate-limiter
+    allowance below cannot drift from the retry policy it is derived from.
+    """
+    return max(1, _resolved_max_retries(max_retries) + 1)
+
+
+def capture_rate_limit_wait_allowance_seconds(max_retries: int | None = None) -> float:
+    """Worst-case rate-limiter waiting for ONE complete request.
+
+    ``_acquire_budget`` executes before EVERY attempt, INCLUDING attempt #1, so
+    every possible attempt owns one allowance. Counting only the retries omits the
+    first wait and understates the derived timeout whenever the shared token
+    bucket is already depleted when the request starts.
+    """
+    return (
+        capture_transport_attempt_count(max_retries)
+        * CAPTURE_RATE_LIMIT_WAIT_ALLOWANCE_SECONDS
     )
 
 
@@ -76,9 +104,13 @@ def capture_request_timeout_seconds(
     every one of those costs first:
 
         attempts * attempt_timeout * KRAKEN_ATTEMPT_PHASE_BOUND
-            + retries * rate_wait_allowance
+            + attempts * rate_wait_allowance
             + retry_backoff_worst_case_seconds(retries)
         <= wave_budget_seconds
+
+    ``attempts`` (not ``retries``) is the multiplier on the rate-limit allowance
+    because the transport takes a rate-budget token before EVERY attempt, the
+    first one included.
 
     so the resulting per-attempt timeout makes the enforceable invariant true by
     construction (see ``capture_worst_case_request_seconds``, which the wave gate
@@ -92,7 +124,7 @@ def capture_request_timeout_seconds(
     retries = _resolved_max_retries(max_retries)
     attempts = max(1, retries + 1)
     overhead = (
-        retries * CAPTURE_RATE_LIMIT_WAIT_ALLOWANCE_SECONDS
+        capture_rate_limit_wait_allowance_seconds(retries)
         + retry_backoff_worst_case_seconds(retries)
     )
     available = float(wave_budget_seconds) - overhead
@@ -111,7 +143,11 @@ def capture_worst_case_request_seconds(
 ) -> float:
     """Worst-case wall clock of ONE request whose attempts all time out.
 
-    ``attempts * attempt_timeout * phase_bound + backoff + rate_wait_allowance``.
+    ``attempts * attempt_timeout * phase_bound + attempts * rate_wait_allowance
+    + retry_backoff_worst_case_seconds``. Every attempt owns a rate-limiter wait
+    (the transport takes a token before attempt #1 as well), so the declared bound
+    the wave gate checks cannot understate a depleted-bucket start.
+
     A producer must not start any upstream operation whose worst-case bounded cost
     cannot fit in the remaining acquisition budget; this is that cost.
     """
@@ -127,7 +163,7 @@ def capture_worst_case_request_seconds(
     )
     return (
         attempts * per_attempt * KRAKEN_ATTEMPT_PHASE_BOUND
-        + retries * CAPTURE_RATE_LIMIT_WAIT_ALLOWANCE_SECONDS
+        + capture_rate_limit_wait_allowance_seconds(retries)
         + retry_backoff_worst_case_seconds(retries)
     )
 
@@ -259,7 +295,9 @@ __all__ = [
     "KrakenInstrumentProvider",
     "KrakenMinuteBarFetcher",
     "capture_kraken_client",
+    "capture_rate_limit_wait_allowance_seconds",
     "capture_request_timeout_seconds",
+    "capture_transport_attempt_count",
     "capture_worst_case_request_seconds",
     "classify_capture_error",
     "kraken_minute_source",

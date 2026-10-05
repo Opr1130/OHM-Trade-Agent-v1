@@ -159,6 +159,23 @@ ANALYTICAL_PROVENANCE_PREFIX = "analytical:kraken_public_ohlc"
 FRESHNESS_PROVENANCE_PREFIX = "freshness:kraken_public_ohlc"
 FRESHNESS_AGE_PROVENANCE_PREFIX = "freshness:anchor_provenance"
 
+#: Point-in-time audit provenance: one token per supporting input naming its KIND
+#: and its own event cutoff beside the record's evaluation epoch, so a reader can
+#: confirm that no input observed AFTER the epoch supports an epoch-anchored record.
+#: Carried in the existing frozen ``source_evidence_refs`` text-list: no schema
+#: change and no new store, exactly like the two provenance planes above.
+PIT_PROVENANCE_PREFIX = "pit:kraken_public_ohlc"
+
+#: Durable reason recorded when a market plane that would require a LIVE read after
+#: the evaluation epoch cannot be truthfully reconstructed as-of that epoch. The
+#: plane is then recorded as explicitly UNAVAILABLE (present, never fabricated)
+#: instead of being populated with post-epoch prices, depth or trades.
+PIT_UNAVAILABLE_REASON = (
+    "point-in-time integrity: a live market read after the evaluation epoch "
+    "cannot be reconstructed as-of that epoch, so this plane is explicitly "
+    "unavailable rather than stamped with the epoch cutoff"
+)
+
 
 #: The feasibility producer's OWN process-lock identity. Deliberately distinct
 #: from the Feature Bus capture lock so neither producer can suppress the other.
@@ -180,9 +197,144 @@ class FeasibilityEvidenceStaleError(FeasibilityCaptureError):
     """The source evidence is not contemporaneous with the snapshot's evaluation epoch."""
 
 
+class FeasibilityAnchorPendingError(FeasibilityCaptureError):
+    """The epoch's own closed one-minute anchor candle is not published YET.
+
+    Deliberately NOT a :class:`FeasibilityEvidenceStaleError`: a candle the venue
+    has not published yet can appear on the next poll, so the snapshot must stay at
+    the cursor and be RETRIED rather than skipped. It becomes terminal only when
+    waiting can no longer help -- the source has definitively advanced past the
+    required epoch, or the 120-second source-age contract has already expired (see
+    :func:`resolve_source_evidence_anchor`).
+    """
+
+
+class FeasibilityPointInTimeError(FeasibilityCaptureError):
+    """A supporting market input was observed AFTER the record's evaluation epoch.
+
+    Point-in-time integrity: a record whose ``evaluation_time`` is the snapshot
+    cutoff may only be supported by market inputs whose own event cutoff is at or
+    before that epoch. Raising this means the record is NOT published rather than
+    being stamped with an older candle cutoff over newer live observations.
+    """
+
+
+#: Kinds of input admitted to an F5 record's point-in-time audit.
+PIT_KIND_MARKET = "market"
+PIT_KIND_VENUE_METADATA = "venue_metadata"
+
+
+@dataclass(frozen=True)
+class PointInTimeInput:
+    """One supporting input's EXPLICIT event/cutoff semantics.
+
+    ``event_cutoff`` is the instant the observation itself is about (a closed
+    candle's close, the venue's trade time, the instant a live read was taken).
+    ``pit_valid`` is ``event_cutoff <= <record evaluation_time>`` for a market
+    input, or ``epoch_invariant`` venue metadata (a venue capability lookup whose
+    truth does not depend on the epoch) -- never a fabricated timestamp.
+    """
+
+    name: str
+    kind: str
+    event_cutoff: datetime
+    epoch_invariant: bool = False
+
+    def pit_valid(self, evaluation_time: datetime) -> bool:
+        if self.kind == PIT_KIND_VENUE_METADATA and self.epoch_invariant:
+            return True
+        return self.event_cutoff <= evaluation_time
+
+    def provenance_ref(self, evaluation_time: datetime) -> str:
+        return (
+            f"{PIT_PROVENANCE_PREFIX}"
+            f":input={self.name}"
+            f":kind={self.kind}"
+            f":event={_compact_z(self.event_cutoff)}"
+            f":evaluation_time={_compact_z(evaluation_time)}"
+            f":pit_valid={self.pit_valid(evaluation_time)}"
+        )
+
+
+def point_in_time_inputs(refs: Sequence[str]) -> tuple[PointInTimeInput, ...]:
+    """Read back the durable per-input point-in-time audit from provenance refs.
+
+    Parses the tokens the producer wrote, so a reader can confirm WHICH inputs
+    supported a record and what event cutoff each one declared instead of trusting
+    a summary. Diagnostics only: it grants no authority.
+
+    A ref carrying this audit's prefix that cannot be parsed is a DEFECT, not a
+    silently dropped entry: the audit would otherwise understate which inputs
+    supported a record, so it fails closed.
+    """
+    parsed: list[PointInTimeInput] = []
+    for ref in refs:
+        if not ref.startswith(f"{PIT_PROVENANCE_PREFIX}:"):
+            continue
+        fields: dict[str, str] = {}
+        for token in ref.split(":")[2:]:
+            if "=" in token:
+                key, value = token.split("=", 1)
+                fields[key] = value
+        try:
+            event = _parse_pit_instant(fields["event"])
+        except (KeyError, ValueError) as exc:  # pragma: no cover - defensive
+            raise FeasibilityPointInTimeError(
+                f"unreadable point-in-time provenance ref: {ref}"
+            ) from exc
+        parsed.append(
+            PointInTimeInput(
+                name=fields.get("input", "UNKNOWN"),
+                kind=fields.get("kind", PIT_KIND_MARKET),
+                event_cutoff=event,
+                epoch_invariant=fields.get("epoch_invariant", "False") == "True",
+            )
+        )
+    return tuple(parsed)
+
+
+def assert_point_in_time_support(
+    inputs: Sequence[PointInTimeInput], *, evaluation_time: datetime
+) -> None:
+    """Fail closed when ANY supporting input postdates the evaluation epoch.
+
+    This is the enforcement behind the point-in-time contract: a record keyed to
+    ``evaluation_time`` may never be supported by an input observed after it, so an
+    input that cannot be truthfully reconstructed as-of the epoch refuses the
+    record instead of being stamped with an older candle cutoff.
+    """
+    violations = [
+        entry for entry in inputs if not entry.pit_valid(evaluation_time)
+    ]
+    if violations:
+        described = ", ".join(
+            f"{entry.name}@{_iso_z(entry.event_cutoff)}" for entry in violations
+        )
+        raise FeasibilityPointInTimeError(
+            f"supporting input(s) observed after the evaluation epoch "
+            f"{_iso_z(evaluation_time)}: {described}"
+        )
+
+
 def _iso_z(moment: datetime) -> str:
     """Canonical UTC second-resolution rendering used inside provenance tokens."""
     return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _compact_z(moment: datetime) -> str:
+    """COLON-FREE UTC rendering for colon-delimited ``key=value`` provenance tokens.
+
+    The point-in-time audit ref is a ``:``-delimited ``key=value`` list, so a full
+    ISO timestamp -- which itself contains ``:`` -- is split apart by any reader
+    that tokenizes the ref and the audit becomes unreadable. This keeps the
+    timestamp lossless AND machine-readable in that form.
+    """
+    return moment.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _parse_pit_instant(value: str) -> datetime:
+    """Parse the compact colon-free UTC form written by :func:`_compact_z`."""
+    return datetime.strptime(value, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
 
 
 def _closed_candles(candles: Sequence[Any]) -> list[Any]:
@@ -213,6 +365,11 @@ class SourceEvidenceAnchor:
     anchor_interval_seconds: int
     anchor_open: datetime
     anchor_close: datetime
+    #: The anchor candle's OWN close price: the epoch's last observed price. Its
+    #: event cutoff is exactly the evaluation epoch, so it is the point-in-time
+    #: price a record for that epoch may be supported by (a live ticker read taken
+    #: later must never be substituted for it).
+    anchor_close_price: float
     acquisition_instant: datetime
     source_age_seconds: float
 
@@ -262,10 +419,22 @@ def resolve_source_evidence_anchor(
     same instrument, and it must be the candle that closes exactly at the
     snapshot's own evaluation epoch. That is the freshest datum which (a) genuinely
     supports this epoch's determination and (b) satisfies
-    ``source_cutoff <= evaluation_time`` in the runtime verifier. A window with no
-    such candle, a candle whose close is after the acquisition instant, or an
-    anchor older than :data:`MAX_FRESH_ANCHOR_AGE_SECONDS` all fail closed: no
+    ``source_cutoff <= evaluation_time`` in the runtime verifier. An anchor older
+    than :data:`MAX_FRESH_ANCHOR_AGE_SECONDS` at acquisition fails closed: no
     synthetic timestamp is ever manufactured.
+
+    A MISSING epoch candle is classified from the source's own semantics, never
+    assumed terminal:
+
+    * ``ANCHOR_PENDING`` -- the source has not yet published it (its newest row,
+      including the still-forming one, starts at or before the epoch minute) and
+      the 120s source-age contract has not expired: RETRYABLE
+      (:class:`FeasibilityAnchorPendingError`), so the snapshot stays at the cursor
+      and is retried instead of being silently skipped;
+    * terminal stale -- the source has definitively advanced past the epoch minute
+      (its newest row starts at or after ``epoch + 60s``) and the candle is still
+      absent, or the epoch is already older than the 120s contract so no candle
+      published later could ever be fresh enough.
     """
     completed = _closed_candles(candles)
     if not completed:
@@ -291,7 +460,25 @@ def resolve_source_evidence_anchor(
         if int(candle.timestamp) + FRESHNESS_ANCHOR_INTERVAL_SECONDS == epoch_seconds:
             anchor = candle
     if anchor is None:
-        # This epoch's own minute can never appear later: non-retryable, fail closed.
+        # The epoch's own minute is not in the returned window. Kraken publishes a
+        # closed interval with a lag and its response includes the still-forming
+        # interval LAST, so the newest returned row's start tells which side of the
+        # epoch the SOURCE has reached -- a missing candle is not automatically
+        # terminal, and the snapshot may simply have been read too early.
+        newest_row_start = max(int(row.timestamp) for row in candles_1m)
+        epoch_age_seconds = (acquisition_instant - evaluation_time).total_seconds()
+        still_publishable = epoch_age_seconds <= MAX_FRESH_ANCHOR_AGE_SECONDS
+        source_past_epoch = newest_row_start >= epoch_seconds + FRESHNESS_ANCHOR_INTERVAL_SECONDS
+        if still_publishable and not source_past_epoch:
+            # RETRYABLE: the candle can still appear (and still be within the 120s
+            # source-age contract). The caller must NOT advance its cursor.
+            raise FeasibilityAnchorPendingError(
+                f"{snapshot_id}: the closed {FRESHNESS_ANCHOR_INTERVAL_MINUTES}m "
+                f"candle for the evaluation epoch {_iso_z(evaluation_time)} is not "
+                f"published yet ({epoch_age_seconds:.1f}s after the epoch, source "
+                f"newest row {_iso_z(datetime.fromtimestamp(newest_row_start, tz=timezone.utc))}); "
+                "retryable within the freshness window"
+            )
         raise FeasibilityEvidenceStaleError(
             f"{snapshot_id}: no closed {FRESHNESS_ANCHOR_INTERVAL_MINUTES}m candle "
             f"closes at the evaluation epoch {_iso_z(evaluation_time)}; a fresh "
@@ -330,6 +517,7 @@ def resolve_source_evidence_anchor(
         anchor_interval_seconds=FRESHNESS_ANCHOR_INTERVAL_SECONDS,
         anchor_open=datetime.fromtimestamp(int(anchor.timestamp), tz=timezone.utc),
         anchor_close=anchor_close,
+        anchor_close_price=float(anchor.close),
         acquisition_instant=acquisition_instant,
         source_age_seconds=source_age_seconds,
     )
@@ -800,6 +988,35 @@ def _process_snapshot(
         # 3. Build genuine contemporaneous evidence.
         try:
             evidence = evidence_builder(snapshot, direction)
+        except FeasibilityPointInTimeError as exc:
+            # Deterministic, and NOT recoverable: a snapshot's evaluation epoch is
+            # fixed, so an input observed after it can never become point-in-time
+            # valid on replay. The record is REJECTED (terminal) instead of being
+            # published with post-epoch observations.
+            summary.rejected += 1
+            summary.errors.append(f"{snapshot_id}: point-in-time integrity: {exc}")
+            emit_capture_marker(
+                "rejected",
+                prefix="OPIP_FEASIBILITY_CAPTURE",
+                snapshot=snapshot_id,
+                reason="POINT_IN_TIME_VIOLATION",
+                error=type(exc).__name__,
+            )
+            return True
+        except FeasibilityAnchorPendingError as exc:
+            # NOT terminal: the venue has simply not published this epoch's closed
+            # one-minute candle yet. Keep the cursor HERE so the same snapshot (and
+            # every later one) is retried on the next pass.
+            summary.retryable += 1
+            summary.errors.append(f"{snapshot_id}: freshness anchor pending: {exc}")
+            emit_capture_marker(
+                "retryable",
+                prefix="OPIP_FEASIBILITY_CAPTURE",
+                snapshot=snapshot_id,
+                reason="FRESHNESS_ANCHOR_PENDING",
+                error=type(exc).__name__,
+            )
+            return False
         except FeasibilityEvidenceStaleError as exc:
             summary.stale += 1
             summary.errors.append(f"{snapshot_id}: out-of-epoch evidence: {exc}")
@@ -897,10 +1114,21 @@ def build_long_feasibility_evidence(
       datum that actually supports this epoch. A missing/stale anchor fails closed
       rather than being fabricated or backdated.
 
+    POINT-IN-TIME INTEGRITY (see :class:`PointInTimeInput`): every supporting
+    market input must carry an explicit event cutoff at or before the record's
+    evaluation epoch, and each one is recorded durably in ``source_evidence_refs``.
+    The epoch's own last price is the CLOSED one-minute anchor candle's close (its
+    event time is exactly the epoch); a live ticker read is never used as the
+    record's price. The order book can only be read live, so it is admitted only
+    when the read itself is at or before the epoch -- otherwise the execution plane
+    is recorded as explicitly UNAVAILABLE rather than presenting post-epoch depth
+    and liquidity as epoch liquidity. A post-epoch input refuses the record
+    outright (:func:`assert_point_in_time_support`).
+
     A SHORT request is refused here (the SHORT route must supply genuine BTNL
     evidence through its own builder).
     """
-    from app.scanner.execution_validation import evaluate_execution
+    from app.scanner.execution_validation import evaluate_execution, unavailable_execution
     from app.scanner.market_data_validation import validate_market_data
 
     symbol = str(snapshot.venue_instrument_id)
@@ -913,23 +1141,6 @@ def build_long_feasibility_evidence(
     # observation is what the runtime source-age contract is evaluated against.
     candles_1m = list(
         client.get_ohlc(symbol, interval=FRESHNESS_ANCHOR_INTERVAL_MINUTES)
-    )
-    ticker_last = float(client.get_ticker(symbol)["last"])
-    market = validate_market_data(
-        candles, ticker_last, interval_minutes=interval_minutes, now=moment
-    )
-    book = client.get_pre_trade(symbol)
-    try:
-        trades = client.get_post_trade(symbol, count=100)
-    except Exception:  # noqa: BLE001 - unavailable recent trades are still present-earlier
-        trades = None
-    execution = evaluate_execution(
-        book=book,
-        validation_notional_usd=float(notional_usd),
-        ticker_last=ticker_last,
-        quote_to_usd_rate=1.0,
-        trades=trades,
-        now=moment,
     )
 
     evaluation_time = snapshot.evaluation_cutoff
@@ -949,6 +1160,58 @@ def build_long_feasibility_evidence(
         interval_seconds=interval_seconds,
     )
 
+    # POINT-IN-TIME PRICE: the epoch's own last price is the closed one-minute
+    # anchor candle's close. Its event cutoff is EXACTLY the evaluation epoch, so
+    # it is the retained point-in-time datum this record's price checks may use.
+    # ``get_ticker`` is a LIVE read: when it happens after the epoch its value
+    # postdates the record's epoch and must not be substituted in its place.
+    epoch_last = float(anchor.anchor_close_price)
+
+    market = validate_market_data(
+        candles, epoch_last, interval_minutes=interval_minutes, now=moment
+    )
+    market_inputs = [
+        PointInTimeInput(
+            name="analytical_60m_ohlc",
+            kind=PIT_KIND_MARKET,
+            event_cutoff=anchor.analytical_latest_cutoff,
+        ),
+        PointInTimeInput(
+            name="freshness_1m_anchor",
+            kind=PIT_KIND_MARKET,
+            event_cutoff=anchor.anchor_close,
+        ),
+    ]
+    # Liquidity can only be observed LIVE. When that observation happens after the
+    # evaluation epoch it cannot be truthfully reconstructed as-of the epoch, so
+    # the plane is recorded as explicitly unavailable instead of attaching
+    # post-epoch depth/liquidity to an epoch-anchored record.
+    live_read_is_point_in_time = acquisition_instant <= evaluation_time
+    if live_read_is_point_in_time:
+        book = client.get_pre_trade(symbol)
+        try:
+            trades = client.get_post_trade(symbol, count=100)
+        except Exception:  # noqa: BLE001 - absent recent trades are still present
+            trades = None
+        execution = evaluate_execution(
+            book=book,
+            validation_notional_usd=float(notional_usd),
+            ticker_last=epoch_last,
+            quote_to_usd_rate=1.0,
+            trades=trades,
+            now=moment,
+        )
+        market_inputs.append(
+            PointInTimeInput(
+                name="spot_order_book",
+                kind=PIT_KIND_MARKET,
+                event_cutoff=acquisition_instant,
+            )
+        )
+    else:
+        execution = unavailable_execution(PIT_UNAVAILABLE_REASON)
+    assert_point_in_time_support(market_inputs, evaluation_time=evaluation_time)
+
     return FeasibilityEvidence(
         instrument_version_id=snapshot.instrument_version_id,
         venue_instrument_id=symbol,
@@ -956,8 +1219,12 @@ def build_long_feasibility_evidence(
         evaluation_time=evaluation_time,
         source_cutoff=anchor.source_cutoff,
         source_snapshot_id=snapshot.snapshot_id,
-        source_evidence_refs=anchor.provenance_refs(
-            snapshot_id=str(snapshot.snapshot_id)
+        source_evidence_refs=(
+            *anchor.provenance_refs(snapshot_id=str(snapshot.snapshot_id)),
+            *(
+                entry.provenance_ref(evaluation_time)
+                for entry in market_inputs
+            ),
         ),
         market_data_validation=market,
         margin_validation_status=None,
@@ -1060,39 +1327,6 @@ def build_short_feasibility_evidence(
     candles_1m = list(
         client.get_ohlc(symbol, interval=FRESHNESS_ANCHOR_INTERVAL_MINUTES)
     )
-    ticker_last = float(client.get_ticker(symbol)["last"])
-    market = validate_market_data(
-        candles, ticker_last, interval_minutes=interval_minutes, now=moment
-    )
-
-    margin = discover_short_margin(
-        snapshot, client=client, account_leverage_ceiling=account_leverage_ceiling
-    )
-    if margin["margin_eligible"] and margin["margin_venue_symbol"]:
-        # Genuine BTNL margin book (the SHORT quality thresholds are defined for it).
-        venue_symbol = margin["margin_venue_symbol"]
-        try:
-            book = client.get_pre_trade(venue_symbol)
-            try:
-                trades = client.get_post_trade(venue_symbol, count=100)
-            except Exception:  # noqa: BLE001 - absent recent trades are still present
-                trades = None
-            execution = evaluate_execution(
-                book=book,
-                validation_notional_usd=float(notional_usd),
-                ticker_last=ticker_last,
-                quote_to_usd_rate=1.0,
-                trades=trades,
-                now=moment,
-            )
-        except Exception as exc:  # noqa: BLE001 - BTNL book unavailable -> explicit absence
-            execution = unavailable_execution(f"BTNL PreTrade unavailable: {exc}")
-    else:
-        # No genuine BTNL provenance: the SHORT execution record is explicitly
-        # UNAVAILABLE (missing evidence). Spot evidence is never used as BTNL.
-        execution = unavailable_execution(
-            "BTNL margin not eligible for this pair; SHORT execution evidence unavailable"
-        )
 
     evaluation_time = snapshot.evaluation_cutoff
     # Same two-plane source contract as the LONG builder: the analytical 60-minute
@@ -1107,6 +1341,83 @@ def build_short_feasibility_evidence(
         interval_minutes=interval_minutes,
         interval_seconds=interval_seconds,
     )
+    # POINT-IN-TIME PRICE (identical rule to the LONG builder): the epoch's own last
+    # price is the closed one-minute anchor candle's close, never a live ticker read
+    # taken after the epoch.
+    epoch_last = float(anchor.anchor_close_price)
+    market = validate_market_data(
+        candles, epoch_last, interval_minutes=interval_minutes, now=moment
+    )
+    market_inputs = [
+        PointInTimeInput(
+            name="analytical_60m_ohlc",
+            kind=PIT_KIND_MARKET,
+            event_cutoff=anchor.analytical_latest_cutoff,
+        ),
+        PointInTimeInput(
+            name="freshness_1m_anchor",
+            kind=PIT_KIND_MARKET,
+            event_cutoff=anchor.anchor_close,
+        ),
+    ]
+
+    margin = discover_short_margin(
+        snapshot, client=client, account_leverage_ceiling=account_leverage_ceiling
+    )
+    # Margin discovery is a VENUE CAPABILITY lookup (does the margin venue list this
+    # pair, at what leverage tier). Its truth is epoch-invariant, so it carries its
+    # own explicit acquisition cutoff as venue metadata rather than pretending to be
+    # an epoch-bounded market observation. The epoch price above is unaffected by it.
+    market_inputs.append(
+        PointInTimeInput(
+            name="margin_venue_discovery",
+            kind=PIT_KIND_VENUE_METADATA,
+            event_cutoff=acquisition_instant,
+            epoch_invariant=True,
+        )
+    )
+    # The BTNL margin book can only be observed LIVE, so (identical rule to the LONG
+    # builder) it is admitted only when the read itself is at or before the epoch;
+    # otherwise the execution plane is explicitly unavailable instead of presenting
+    # post-epoch BTNL depth as epoch liquidity.
+    live_read_is_point_in_time = acquisition_instant <= evaluation_time
+    if margin["margin_eligible"] and margin["margin_venue_symbol"] and live_read_is_point_in_time:
+        # Genuine BTNL margin book (the SHORT quality thresholds are defined for it).
+        venue_symbol = margin["margin_venue_symbol"]
+        try:
+            book = client.get_pre_trade(venue_symbol)
+            try:
+                trades = client.get_post_trade(venue_symbol, count=100)
+            except Exception:  # noqa: BLE001 - absent recent trades are still present
+                trades = None
+            execution = evaluate_execution(
+                book=book,
+                validation_notional_usd=float(notional_usd),
+                ticker_last=epoch_last,
+                quote_to_usd_rate=1.0,
+                trades=trades,
+                now=moment,
+            )
+            market_inputs.append(
+                PointInTimeInput(
+                    name="btnl_margin_book",
+                    kind=PIT_KIND_MARKET,
+                    event_cutoff=acquisition_instant,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - BTNL book unavailable -> explicit absence
+            execution = unavailable_execution(f"BTNL PreTrade unavailable: {exc}")
+    elif margin["margin_eligible"] and margin["margin_venue_symbol"]:
+        # Eligible, but the only book available was observed AFTER the epoch: it
+        # cannot support an epoch-anchored record.
+        execution = unavailable_execution(PIT_UNAVAILABLE_REASON)
+    else:
+        # No genuine BTNL provenance: the SHORT execution record is explicitly
+        # UNAVAILABLE (missing evidence). Spot evidence is never used as BTNL.
+        execution = unavailable_execution(
+            "BTNL margin not eligible for this pair; SHORT execution evidence unavailable"
+        )
+    assert_point_in_time_support(market_inputs, evaluation_time=evaluation_time)
 
     return FeasibilityEvidence(
         instrument_version_id=snapshot.instrument_version_id,
@@ -1115,8 +1426,9 @@ def build_short_feasibility_evidence(
         evaluation_time=evaluation_time,
         source_cutoff=anchor.source_cutoff,
         source_snapshot_id=snapshot.snapshot_id,
-        source_evidence_refs=anchor.provenance_refs(
-            snapshot_id=str(snapshot.snapshot_id)
+        source_evidence_refs=(
+            *anchor.provenance_refs(snapshot_id=str(snapshot.snapshot_id)),
+            *(entry.provenance_ref(evaluation_time) for entry in market_inputs),
         ),
         market_data_validation=market,
         margin_validation_status=margin["margin_validation_status"],
@@ -1292,20 +1604,29 @@ __all__ = [
     "FRESHNESS_ANCHOR_INTERVAL_SECONDS",
     "FRESHNESS_AGE_PROVENANCE_PREFIX",
     "FRESHNESS_PROVENANCE_PREFIX",
+    "FeasibilityAnchorPendingError",
     "FeasibilityCaptureError",
     "FeasibilityCaptureSummary",
     "FeasibilityEvidenceStaleError",
+    "FeasibilityPointInTimeError",
     "MAX_CONTEMPORANEOUS_AGE_SECONDS",
     "MAX_FRESH_ANCHOR_AGE_SECONDS",
     "PER_REQUEST_BUDGET_SECONDS",
+    "PIT_KIND_MARKET",
+    "PIT_KIND_VENUE_METADATA",
+    "PIT_PROVENANCE_PREFIX",
+    "PIT_UNAVAILABLE_REASON",
+    "PointInTimeInput",
     "SourceEvidenceAnchor",
     "anchor_source_age_seconds",
+    "assert_point_in_time_support",
     "build_long_feasibility_evidence",
     "build_short_feasibility_evidence",
     "capture_feasibility_evidence_shadow",
     "discover_short_margin",
     "feasibility_capture_authorized",
     "main",
+    "point_in_time_inputs",
     "resolve_capture_budget_seconds",
     "resolve_capture_notional",
     "resolve_canonical_submitter",

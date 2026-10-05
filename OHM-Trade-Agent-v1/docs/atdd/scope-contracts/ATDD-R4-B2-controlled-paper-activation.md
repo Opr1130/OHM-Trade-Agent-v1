@@ -368,6 +368,7 @@ AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_deadline_stops_fu
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_f3_consumes_produced_snapshots_at_their_own_cutoff
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_failed_acquisition_emits_a_durable_disposition_marker
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_fifteen_minute_gap_does_not_count_as_persistence
+AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_first_attempt_rate_limit_wait_is_inside_the_declared_wave_bound
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_inner_timeout_is_container_side_and_no_outer_lock_release
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_inner_timeout_terminates_workload_and_releases_lock
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_materialization_is_sequential
@@ -378,6 +379,7 @@ AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_process_lock_seri
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_replayed_cutoff_does_not_advance_persistence
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_retry_and_backoff_never_start_without_remaining_budget
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_run_capture_locked_skips_when_lock_held
+AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_slow_writer_is_bounded_by_the_materialize_deadline_not_containment
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_stalled_request_cannot_consume_the_complete_pass_budget
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_two_consecutive_qualifying_evaluations_produce_claim
 AC-020 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_two_minute_passes_satisfy_the_runtime_verifier
@@ -407,6 +409,9 @@ AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_freshness_d
 AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_future_visible_snapshot_fails_closed_without_advancing
 AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_has_a_bounded_non_overlapping_scheduler_entry
 AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_hourly_cutoff_cannot_satisfy_the_verifier_but_the_fresh_anchor_does
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_in_epoch_live_reads_are_admitted_with_their_own_cutoff
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_point_in_time_audit_refuses_a_post_epoch_input
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_post_epoch_live_reads_are_not_published_as_point_in_time_support
 AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_locks_are_structurally_distinct
 AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_malformed_then_valid_row_processes_valid_and_advances
 AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_market_reject_stays_present_and_f5_vetoes
@@ -414,6 +419,8 @@ AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_missing_bui
 AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_module_entrypoint_runs_and_reports_inert
 AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_no_protected_cycle_dependency
 AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_out_of_epoch_source_cutoff_fails_closed
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_pending_anchor_retains_the_cursor_then_publishes_once_it_publishes
+AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_point_in_time_violation_is_terminal_and_never_published
 AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_present_veto_reaches_full_f5_decision
 AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_reader_seam_exposes_per_record_provenance
 AC-021 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_real_builder_builds_genuine_contemporaneous_evidence

@@ -313,7 +313,7 @@ def test_ac_016_configured_limit_and_budget_reach_capture():
 
 
 def test_ac_016_configured_budget_is_read_from_settings():
-    """ATDD-R4-B2-controlled-paper-activation/AC-016: the configured budget is read from Settings. A clock jump that would exhaust the default 45s budget but not the configured larger budget proves the configured value was used (both stay within the 60-second cadence slot)."""
+    """ATDD-R4-B2-controlled-paper-activation/AC-016 and ATDD-RELEASE-PIPELINE-v1/AC-017: the configured budget is read from Settings. A clock jump that would exhaust the default 45s budget but not the configured larger budget proves the configured value was used (both stay within the 60-second cadence slot)."""
     versions = _instruments(3)
     batches = {
         version.instrument_version_id: _batch(version, _observations(version))

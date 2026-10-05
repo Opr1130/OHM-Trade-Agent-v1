@@ -311,6 +311,16 @@ class FeatureBusPublisher:
             return _client_override
         return CanonicalWriterClient()
 
+    def resolved_writer_client(self) -> WriterClient:
+        """The canonical writer client this publisher will submit through.
+
+        Read-only seam so a producer can bound the writer's OWN per-operation
+        timeout by its remaining budget. It exposes the same capability the
+        publisher already holds; it grants no additional authority and cannot
+        widen a timeout, only tighten one.
+        """
+        return self._resolve_client()
+
     def _archive(self) -> BoundedJsonlArchive:
         path = _spool_path(self._spool_dir)
         return BoundedJsonlArchive(

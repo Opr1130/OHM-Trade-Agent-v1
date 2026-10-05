@@ -280,15 +280,23 @@ AC-017 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_evidence_li
 AC-017 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_freshness_anchor_holds_anywhere_within_the_hour
 AC-017 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_freshness_dispositions_are_flushed_durable_markers
 AC-017 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_hourly_cutoff_cannot_satisfy_the_verifier_but_the_fresh_anchor_does
+AC-017 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_in_epoch_live_reads_are_admitted_with_their_own_cutoff
+AC-017 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_pending_anchor_retains_the_cursor_then_publishes_once_it_publishes
+AC-017 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_point_in_time_audit_refuses_a_post_epoch_input
+AC-017 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_point_in_time_violation_is_terminal_and_never_published
+AC-017 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_post_epoch_live_reads_are_not_published_as_point_in_time_support
 AC-017 -> tests/test_opip_r4_b2_feasibility_producer.py::test_ac_021_stale_freshness_anchor_fails_closed_without_synthetic_freshness
 AC-017 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_capture_client_declares_a_bounded_public_only_request_budget
 AC-017 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_deadline_exhaustion_emits_a_durable_disposition_marker
 AC-017 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_failed_acquisition_emits_a_durable_disposition_marker
+AC-017 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_first_attempt_rate_limit_wait_is_inside_the_declared_wave_bound
 AC-017 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_materialization_reserve_is_retained_for_phase_b
 AC-017 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_retry_and_backoff_never_start_without_remaining_budget
+AC-017 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_slow_writer_is_bounded_by_the_materialize_deadline_not_containment
 AC-017 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_stalled_request_cannot_consume_the_complete_pass_budget
 AC-017 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_two_minute_passes_satisfy_the_runtime_verifier
 AC-017 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_zero_materialization_emits_a_durable_disposition_marker
+AC-017 -> tests/test_opip_r4_b2_shadow_capture.py::test_ac_016_configured_budget_is_read_from_settings
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/services/release_profiles.py
@@ -380,6 +388,7 @@ AC-016 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.
 AC-017 -> OHM-Trade-Agent-v1/app/exchanges/kraken.py
 AC-017 -> OHM-Trade-Agent-v1/app/jobs/capture_feasibility_evidence_shadow.py
 AC-017 -> OHM-Trade-Agent-v1/app/jobs/capture_feature_bus_shadow.py
+AC-017 -> OHM-Trade-Agent-v1/app/opip/features/publisher.py
 AC-017 -> OHM-Trade-Agent-v1/app/services/kraken_transport.py
 AC-017 -> OHM-Trade-Agent-v1/app/services/opip_feature_bus_market_source.py
 AC-017 -> OHM-Trade-Agent-v1/deploy/cron.d/opip-feasibility-evidence-capture
@@ -389,6 +398,7 @@ AC-017 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.
 AC-017 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B2-controlled-paper-activation.md
 AC-017 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_feasibility_producer.py
 AC-017 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_shadow_cadence.py
+AC-017 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_shadow_capture.py
 
 DEFERRED DISCOVERIES:
 - `TARGET_PAPER` remains BLOCKED. Activating it (Paper-v2) requires the ATDD-R4-B2 AC-011 comparator evidence, F11 protection READY, legacy drain READY and explicit OWNER approval, and is a separate OWNER increment; this contract does not authorize it.
