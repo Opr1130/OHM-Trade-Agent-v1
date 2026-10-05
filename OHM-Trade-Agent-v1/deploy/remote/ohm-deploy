@@ -590,11 +590,17 @@ report_unified_cycle_wait_failure() {
   # SUCCESS and DEGRADED are the only statuses the release controller accepts, but
   # the tail is matched with a permissive shape so an unexpected third status is
   # surfaced verbatim instead of being silently ignored.
-  local last_status last_completed completed_epoch now_epoch age
+  local last_status last_completed last_phase completed_epoch now_epoch age
   last_status="$(printf '%s\n' "$tail_lines" | grep -oE 'OPIP_UNIFIED_CYCLE_STATUS=[A-Z_]+' | tail -n 1 | cut -d= -f2 || true)"
   last_completed="$(printf '%s\n' "$tail_lines" | grep -oE 'OPIP_UNIFIED_CYCLE_COMPLETED_AT=[^[:space:]]+' | tail -n 1 | cut -d= -f2 || true)"
+  # The cycle emits a flushed phase marker as each phase is entered, so the last
+  # phase reached survives even when the scheduler's hard bound killed the cycle
+  # before it could write a status. That is what names the phase consuming the
+  # window instead of leaving the timeout unexplained.
+  last_phase="$(printf '%s\n' "$tail_lines" | grep -oE 'OPIP_UNIFIED_CYCLE_PHASE=[A-Z0-9_]+' | tail -n 1 | cut -d= -f2 || true)"
   echo "OPIP_UNIFIED_CYCLE_LAST_STATUS=${last_status:-NONE}"
   echo "OPIP_UNIFIED_CYCLE_LAST_COMPLETED_AT=${last_completed:-NONE}"
+  echo "OPIP_UNIFIED_CYCLE_LAST_PHASE=${last_phase:-NONE}"
   completed_epoch="$(date -u -d "$last_completed" +%s 2>/dev/null || true)"
   now_epoch="$(date -u +%s)"
   if [[ "$completed_epoch" =~ ^[0-9]+$ ]] && (( completed_epoch <= now_epoch )); then
