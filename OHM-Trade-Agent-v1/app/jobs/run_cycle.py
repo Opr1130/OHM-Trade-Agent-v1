@@ -39,6 +39,24 @@ CYCLE_LOCK_FILE = Path("/app/data/.unified_cycle.lock")
 EARLY_WATCH_STATE_FILE = Path("/app/data/early_watch_scheduler_state.json")
 EARLY_WATCH_LOCK_FILE = EARLY_WATCH_STATE_FILE.parent / ".early_watch_scheduler.lock"
 
+#: Durable unified-cycle progress markers.
+#:
+#: The canonical cycle runs under the scheduler's authorized hard runtime bound
+#: (``timeout --signal=TERM --kill-after=Ns <BOUND>`` wrapping
+#: ``python -m app.jobs.run_cycle`` over a non-TTY ``docker compose exec`` pipe).
+#: When that bound fires the process is terminated and block-buffered stdout is
+#: discarded, so a terminal-only completion marker cannot survive a bound kill.
+#: The release wait and the AC-013 deploy-log evidence are then unable to tell a
+#: hung cycle from a cycle that never started. Every phase boundary therefore
+#: emits one bounded, explicitly flushed marker, so the last phase reached stays
+#: durable in the cycle log even when the cycle is killed mid-workload.
+_CYCLE_PHASE_PREFIX = "OPIP_UNIFIED_CYCLE_PHASE="
+
+
+def _cycle_phase(name: str) -> None:
+    """Record the phase the canonical cycle has entered, durably."""
+    print(f"{_CYCLE_PHASE_PREFIX}{name}", flush=True)
+
 
 def _run_paper_v2_protection_fail_open() -> None:
     """Advance Paper-v2 protection/EXIT/reconciliation independently of discovery.
@@ -473,6 +491,7 @@ def _run_broad_discovery_if_due(*, decision, entry_watch_ready: bool, settings) 
 
 
 def _run_cycle_once() -> bool:
+    _cycle_phase("KRAKEN_RECONCILIATION")
     try:
         reconciliation = reconcile_kraken_account()
     except Exception as exc:
@@ -498,6 +517,7 @@ def _run_cycle_once() -> bool:
     try:
         decision = get_operator_decision()
     except Exception as exc:
+        _cycle_phase("OPERATOR_STATE_UNAVAILABLE")
         reason = f"operator/capacity state unavailable: {type(exc).__name__}: {exc}"
         print("OHM Unified Cycle degraded:", reason)
         try:
@@ -528,6 +548,7 @@ def _run_cycle_once() -> bool:
     print("Quiet hours:", decision.quiet_hours)
     print("Reason:", decision.reason)
 
+    _cycle_phase("ACTIVE_POSITION_PROTECTION")
     # Active-position protection is the only production workload permitted
     # ahead of a normally due broad discovery pass. Paper-v2 protection rides the
     # same protection phase so it survives discovery being disabled or failing; the
@@ -539,6 +560,7 @@ def _run_cycle_once() -> bool:
         _run_paper_v2_protection_fail_open()
 
     if decision.effective_mode == "MAINTENANCE":
+        _cycle_phase("MAINTENANCE_WORKLOADS")
         _run_external_order_review_fail_open()
         _run_learning_fail_open()
         print(
@@ -557,6 +579,7 @@ def _run_cycle_once() -> bool:
     # non-authoritative workloads. This prevents pending/recheck/AI-supporting
     # side work from starving market discovery.
     if normal_search_due:
+        _cycle_phase("BROAD_DISCOVERY")
         _run_broad_discovery_if_due(
             decision=decision,
             entry_watch_ready=False,
@@ -565,34 +588,45 @@ def _run_cycle_once() -> bool:
 
     # Previously qualified alert recovery remains ahead of pending lifecycle
     # work when there was no due scan, preserving its reliability priority.
+    _cycle_phase("QUALIFIED_ALERT_RETRY")
     _run_qualified_alert_retry_fail_open(settings=settings)
 
     # Entry Watch may accelerate a full scan only when normal cadence was not
     # already due. A normal due scan must never wait for this recheck.
+    _cycle_phase("ENTRY_WATCH_RECHECK")
     entry_watch_ready = _run_entry_watch_recheck_fail_open()
     if not normal_search_due:
+        _cycle_phase("BROAD_DISCOVERY")
         _run_broad_discovery_if_due(
             decision=decision,
             entry_watch_ready=entry_watch_ready,
             settings=settings,
         )
 
+    _cycle_phase("PENDING_SETUP_MONITOR")
     if decision.quiet_hours:
         print("Pending setup monitor skipped during quiet hours.")
     else:
         monitor_pending_main()
 
+    _cycle_phase("EARLY_WATCH")
     _run_early_watch_if_due(
         settings=settings,
         quiet_hours=decision.quiet_hours,
     )
+    _cycle_phase("PAPER_MONITOR")
     _run_paper_monitor_fail_open()
+    _cycle_phase("EVENT_INTELLIGENCE")
     _run_event_intelligence_fail_open(settings=settings)
+    _cycle_phase("EXTERNAL_ORDER_REVIEW")
     _run_external_order_review_fail_open()
+    _cycle_phase("LEARNING")
     _run_learning_fail_open()
     # R4-B1 dormant target spine: last, and only after every protection and
     # non-authoritative workload above. It is inert when the gate is off.
+    _cycle_phase("TARGET_SPINE")
     _run_target_spine_fail_open()
+    _cycle_phase("WORKLOAD_COMPLETE")
     return True
 
 
@@ -602,16 +636,18 @@ def main() -> None:
     try:
         cycle_lock.__enter__()
     except TimeoutError:
+        _cycle_phase("LOCK_CONTENTION_SKIPPED")
         print("OHM Unified Cycle skipped: previous cycle still running.")
         return
 
     try:
+        _cycle_phase("RECOVER_INTERRUPTED_SEARCH")
         if recover_interrupted_search():
             print("O'Pip recovered interrupted broad-search lifecycle as FAILED.")
         completed = _run_cycle_once()
         completed_at = datetime.now(timezone.utc).isoformat()
-        print(f"OPIP_UNIFIED_CYCLE_STATUS={'SUCCESS' if completed else 'DEGRADED'}")
-        print(f"OPIP_UNIFIED_CYCLE_COMPLETED_AT={completed_at}")
+        print(f"OPIP_UNIFIED_CYCLE_STATUS={'SUCCESS' if completed else 'DEGRADED'}", flush=True)
+        print(f"OPIP_UNIFIED_CYCLE_COMPLETED_AT={completed_at}", flush=True)
     finally:
         cycle_lock.__exit__(None, None, None)
 

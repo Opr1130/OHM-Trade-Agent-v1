@@ -18,9 +18,11 @@ original failure reason.
 
 from __future__ import annotations
 
+import inspect
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -394,6 +396,7 @@ _EVIDENCE_MARKERS = (
     "OPIP_UNIFIED_CYCLE_TAIL_TRACEBACK_COUNT=",
     "OPIP_UNIFIED_CYCLE_LAST_STATUS=",
     "OPIP_UNIFIED_CYCLE_LAST_COMPLETED_AT=",
+    "OPIP_UNIFIED_CYCLE_LAST_PHASE=",
     "OPIP_UNIFIED_CYCLE_LAST_COMPLETION_AGE_SECONDS=",
     "OPIP_UNIFIED_CYCLE_CRON_EXISTS=",
     "OPIP_UNIFIED_CYCLE_CRON_SCHEDULE=",
@@ -513,6 +516,103 @@ def test_ac_013_functional_no_completion_reports_structured_evidence() -> None:
     # The reporter observed the log without touching it.
     assert _marker(proc.stdout, "PRECHECK_LOG_SHA") == _marker(proc.stdout, "POSTCHECK_LOG_SHA")
     assert _marker(proc.stdout, "PRECHECK_LOG_BYTES") == _marker(proc.stdout, "POSTCHECK_LOG_BYTES")
+
+
+@pytest.mark.acceptance
+def test_ac_013_names_the_last_cycle_phase_reached_before_a_bound_kill() -> None:
+    """ATDD-RELEASE-PIPELINE-v1/AC-013: a cycle killed at the authorized hard bound still names the phase that consumed the window."""
+    stale = _iso(600)
+    # A bound kill discards block-buffered stdout, so all the log retains from the
+    # in-flight cycle is its last durably flushed phase marker: no status and no
+    # completion for the current attempt.
+    log = (
+        "OPIP_UNIFIED_CYCLE_PHASE=KRAKEN_RECONCILIATION\n"
+        "OPIP_UNIFIED_CYCLE_PHASE=ACTIVE_POSITION_PROTECTION\n"
+        "OPIP_UNIFIED_CYCLE_PHASE=BROAD_DISCOVERY\n"
+        f"OPIP_UNIFIED_CYCLE_STATUS=SUCCESS\nOPIP_UNIFIED_CYCLE_COMPLETED_AT={stale}\n"
+    )
+    proc = _run_wait(_iso(30), 1, log)
+    if _is_fork_failure(proc):
+        pytest.skip("bash cannot fork reliably in this environment")
+    assert proc.returncode != 0
+    assert _marker(proc.stdout, "OPIP_UNIFIED_CYCLE_WAIT_FAILURE") == "NO_FRESH_COMPLETION"
+    # The last phase reached is the release blocker, named instead of guessed.
+    assert _marker(proc.stdout, "OPIP_UNIFIED_CYCLE_LAST_PHASE") == "BROAD_DISCOVERY"
+    # A durable phase marker must never be mistaken for a terminal status.
+    assert _marker(proc.stdout, "OPIP_UNIFIED_CYCLE_LAST_STATUS") == "SUCCESS"
+    assert _marker(proc.stdout, "OPIP_UNIFIED_CYCLE_TAIL_COMPLETED_COUNT") == "1"
+
+
+@pytest.mark.acceptance
+def test_ac_013_reports_no_phase_when_the_log_carries_none() -> None:
+    """ATDD-RELEASE-PIPELINE-v1/AC-013: a log with no phase marker reports NONE rather than inventing a phase."""
+    proc = _run_wait(_iso(30), 1, "OHM Unified Cycle skipped: previous cycle still running.\n")
+    if _is_fork_failure(proc):
+        pytest.skip("bash cannot fork reliably in this environment")
+    assert proc.returncode != 0
+    assert _marker(proc.stdout, "OPIP_UNIFIED_CYCLE_LAST_PHASE") == "NONE"
+
+
+@pytest.mark.acceptance
+def test_unified_cycle_phase_markers_are_flushed_so_a_bound_kill_keeps_them() -> None:
+    """ATDD-RELEASE-PIPELINE-v1/AC-013: the canonical cycle flushes every phase marker, so the hard bound cannot erase the last phase reached."""
+    from app.jobs import run_cycle
+
+    written: list[str] = []
+    flushed: list[int] = []
+
+    class _Recorder:
+        def write(self, value: str) -> int:
+            written.append(value)
+            return len(value)
+
+        def flush(self) -> None:
+            flushed.append(1)
+
+    original = sys.stdout
+    sys.stdout = _Recorder()  # type: ignore[assignment]
+    try:
+        run_cycle._cycle_phase("BROAD_DISCOVERY")
+    finally:
+        sys.stdout = original
+
+    assert "".join(written) == "OPIP_UNIFIED_CYCLE_PHASE=BROAD_DISCOVERY\n"
+    # Durability is the point: a block-buffered marker would be discarded when the
+    # authorized timeout terminates the process mid-phase.
+    assert flushed == [1]
+
+
+@pytest.mark.acceptance
+def test_unified_cycle_phase_markers_cover_the_ordered_phases_and_terminal_status() -> None:
+    """ATDD-RELEASE-PIPELINE-v1/AC-013: every ordered top-level phase is observable, and the terminal markers are flushed too."""
+    from app.jobs import run_cycle
+
+    assert run_cycle._CYCLE_PHASE_PREFIX == "OPIP_UNIFIED_CYCLE_PHASE="
+    single = inspect.getsource(run_cycle._run_cycle_once)
+    ordered = (
+        "KRAKEN_RECONCILIATION",
+        "ACTIVE_POSITION_PROTECTION",
+        "BROAD_DISCOVERY",
+        "QUALIFIED_ALERT_RETRY",
+        "ENTRY_WATCH_RECHECK",
+        "PENDING_SETUP_MONITOR",
+        "EARLY_WATCH",
+        "PAPER_MONITOR",
+        "EVENT_INTELLIGENCE",
+        "EXTERNAL_ORDER_REVIEW",
+        "LEARNING",
+        "TARGET_SPINE",
+        "WORKLOAD_COMPLETE",
+    )
+    positions = [single.index(f'_cycle_phase("{name}")') for name in ordered]
+    assert positions == sorted(positions)
+    main_source = inspect.getsource(run_cycle.main)
+    # Lock contention is decided before the work: a durable skip must be recorded
+    # instead of a silent exit with no trace.
+    assert '_cycle_phase("LOCK_CONTENTION_SKIPPED")' in main_source
+    assert "OPIP_UNIFIED_CYCLE_STATUS=" in main_source
+    assert "OPIP_UNIFIED_CYCLE_COMPLETED_AT=" in main_source
+    assert main_source.count("flush=True") == 2
 
 
 @pytest.mark.acceptance
