@@ -1,0 +1,217 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "O'Pip: Compileall",
+      "type": "process",
+      "command": "${workspaceFolder}\\OHM-Trade-Agent-v1\\.venv\\Scripts\\python.exe",
+      "args": [
+        "-m",
+        "compileall",
+        "-q",
+        "app"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}\\OHM-Trade-Agent-v1"
+      }
+    },
+    {
+      "label": "O'Pip: ATDD Scope",
+      "type": "process",
+      "command": "powershell.exe",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        "$inc=(Get-Content 'docs\\atdd\\ACTIVE_INCREMENT' -Raw).Trim(); Write-Host ('Active increment: ' + $inc); & '.\\.venv\\Scripts\\python.exe' 'tests\\atdd_scope.py' --increment $inc --git-base origin/main; exit $LASTEXITCODE"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}\\OHM-Trade-Agent-v1"
+      }
+    },
+    {
+      "label": "O'Pip: Architecture Gate",
+      "type": "process",
+      "command": "powershell.exe",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        "$out=& '.\\.venv\\Scripts\\python.exe' -m app.services.release_profiles --profile EVIDENCE_SHADOW; $out | Write-Output; $required=@('ARCHITECTURE_GATE=PASS','PROFILE=EVIDENCE_SHADOW','FEATURE_BUS=shadow','CANONICAL_WRITER=shadow','TARGET_SPINE=shadow','NEW_ENTRY_AUTHORITY=LEGACY_ONLY','FUNDED_AUTHORITY=ABSENT','PAPER_V2=OFF','COMMITTEE_MODE=off','PROTECTION=INDEPENDENT'); foreach($r in $required){if($out -notcontains $r){Write-Error ('Missing architecture invariant: '+$r); exit 1}}"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}\\OHM-Trade-Agent-v1"
+      }
+    },
+    {
+      "label": "O'Pip: Release Security Gate",
+      "type": "process",
+      "command": "${workspaceFolder}\\OHM-Trade-Agent-v1\\.venv\\Scripts\\bandit.exe",
+      "args": [
+        "app/services/release_profiles.py",
+        "app/services/release_runtime_verifier.py",
+        "-c",
+        "pyproject.toml"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}\\OHM-Trade-Agent-v1"
+      }
+    },
+    {
+      "label": "O'Pip: Ruff (Advisory)",
+      "type": "process",
+      "command": "${workspaceFolder}\\OHM-Trade-Agent-v1\\.venv\\Scripts\\ruff.exe",
+      "args": [
+        "check",
+        "app",
+        "tools"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}\\OHM-Trade-Agent-v1"
+      }
+    },
+    {
+      "label": "O'Pip: Dependency Audit (Advisory)",
+      "type": "process",
+      "command": "${workspaceFolder}\\OHM-Trade-Agent-v1\\.venv\\Scripts\\pip-audit.exe",
+      "args": [
+        "-r",
+        "requirements.txt"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}\\OHM-Trade-Agent-v1"
+      }
+    },
+    {
+      "label": "O'Pip: GitHub Pytest Runs",
+      "type": "process",
+      "command": "gh",
+      "args": [
+        "run",
+        "list",
+        "--workflow",
+        "pytest.yml",
+        "--limit",
+        "10"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      }
+    },
+    {
+      "label": "O'Pip: Current PR Checks",
+      "type": "process",
+      "command": "gh",
+      "args": [
+        "pr",
+        "checks"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      }
+    },
+    {
+      "label": "O'Pip: Pyright (Advisory)",
+      "type": "process",
+      "command": "${workspaceFolder}\\OHM-Trade-Agent-v1\\.venv\\Scripts\\python.exe",
+      "args": [
+        "-m",
+        "pyright",
+        "app"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}\\OHM-Trade-Agent-v1"
+      },
+      "presentation": {
+        "panel": "dedicated",
+        "reveal": "always",
+        "clear": true
+      }
+    },
+    {
+      "label": "O'Pip: Targeted Pytest (Windows)",
+      "detail": "Runs one explicitly selected Windows-compatible pytest target. GitHub remains canonical for full regression.",
+      "type": "process",
+      "command": "${workspaceFolder}\\OHM-Trade-Agent-v1\\.venv\\Scripts\\python.exe",
+      "args": [
+        "-m",
+        "pytest",
+        "-q",
+        "${input:pytestTarget}"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}\\OHM-Trade-Agent-v1",
+        "env": {
+          "APP_ENV": "test"
+        }
+      },
+      "group": "test",
+      "presentation": {
+        "panel": "dedicated",
+        "reveal": "always",
+        "clear": true
+      }
+    },
+    {
+      "label": "O'Pip: Targeted Coverage (Windows)",
+      "detail": "Coverage for one explicitly selected Windows-compatible pytest target; not a substitute for GitHub regression.",
+      "type": "process",
+      "command": "${workspaceFolder}\\OHM-Trade-Agent-v1\\.venv\\Scripts\\python.exe",
+      "args": [
+        "-m",
+        "pytest",
+        "-q",
+        "${input:pytestTarget}",
+        "--cov=app",
+        "--cov-branch",
+        "--cov-report=term-missing"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}\\OHM-Trade-Agent-v1",
+        "env": {
+          "APP_ENV": "test"
+        }
+      },
+      "presentation": {
+        "panel": "dedicated",
+        "reveal": "always",
+        "clear": true
+      }
+    },
+    {
+      "label": "O'Pip: Pre-PR Local Gate",
+      "detail": "Windows-safe local checks only. GitHub pytest.yml remains the canonical full regression and Linux execution gate.",
+      "dependsOrder": "sequence",
+      "dependsOn": [
+        "O'Pip: ATDD Scope",
+        "O'Pip: Architecture Gate",
+        "O'Pip: Release Security Gate",
+        "O'Pip: Compileall"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
+    },
+    {
+      "label": "O'Pip: Engineering Health (Advisory)",
+      "detail": "Advisory type, lint and dependency checks. Findings do not replace GitHub required checks.",
+      "dependsOrder": "sequence",
+      "dependsOn": [
+        "O'Pip: Pyright (Advisory)",
+        "O'Pip: Ruff (Advisory)",
+        "O'Pip: Dependency Audit (Advisory)"
+      ]
+    }
+  ],
+  "inputs": [
+    {
+      "id": "pytestTarget",
+      "type": "promptString",
+      "description": "Windows-compatible pytest target, e.g. tests/test_file.py or tests/test_file.py::test_name",
+      "default": "tests/"
+    }
+  ]
+}

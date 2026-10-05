@@ -1,0 +1,26 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}\\OHM-Trade-Agent-v1\\.venv\\Scripts\\python.exe",
+  "python.terminal.activateEnvironment": true,
+  "python.testing.pytestEnabled": true,
+  "python.testing.unittestEnabled": false,
+  "python.testing.cwd": "${workspaceFolder}\\OHM-Trade-Agent-v1",
+  "python.testing.pytestArgs": [
+    "tests"
+  ],
+  "git.autofetch": true,
+  "git.confirmSync": true,
+  "git.detectWorktrees": true,
+  "scm.alwaysShowRepositories": true,
+  "[python]": {
+    "editor.formatOnSave": false
+  },
+  "search.exclude": {
+    "**/.venv": true,
+    "**/__pycache__": true,
+    "**/.pytest_cache": true,
+    "**/.pytest_tmp*": true,
+    "**/.pytest-basetemp-*": true,
+    "**/.ruff_cache": true,
+    "**/.mypy_cache": true
+  }
+}
