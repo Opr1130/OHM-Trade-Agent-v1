@@ -423,8 +423,11 @@ def test_ac_010_runtime_verifier_precedes_commit_and_rolls_back_to_baseline() ->
     assert 'org.opencontainers.image.revision: "$PREVIOUS_SHA"' in deploy
     assert 'echo "OPIP_SAFE_BASELINE_ROLLBACK=SUCCESS"' in deploy
     assert "--timeout-seconds \"$RUNTIME_VERIFIER_TIMEOUT_SECONDS\"" in deploy
-    assert "UNIFIED_CYCLE_RELEASE_WAIT_SECONDS=$((SCHEDULER_HARD_BOUND_SECONDS + UNIFIED_CYCLE_RELEASE_GRACE_SECONDS))" in deploy
-    assert "wait_unified_cycle_success" in deploy
+    # EVIDENCE_SHADOW release decoupling: the unified cycle is observed read-only
+    # for a short, bounded window and is NOT a release gate.
+    assert "UNIFIED_CYCLE_OBSERVATION_SECONDS=" in deploy
+    assert "observe_unified_cycle" in deploy
+    assert "wait_unified_cycle_success" not in deploy
     cycle = (APP_ROOT / "app" / "jobs" / "run_cycle.py").read_text(encoding="utf-8")
     assert "OPIP_UNIFIED_CYCLE_STATUS=" in cycle
 
@@ -447,7 +450,11 @@ def test_ac_010_deployment_receipt_requires_runtime_verifier_and_baseline_rollba
     assert "SAFE_BASELINE_ROLLBACK=" in workflow
     assert 'APPROVED_PROFILE" == "EVIDENCE_SHADOW"' in workflow
     assert 'DEPLOYED_PROFILE" == "$APPROVED_PROFILE"' in workflow
-    assert '&& [[ "$UNIFIED_CYCLE" == "HEALTHY" ]]' in workflow
+    # EVIDENCE_SHADOW release decoupling: the unified cycle is a legacy
+    # observation surface, so its completion is NOT a release gate. The
+    # authoritative prospective-evidence gate is the runtime verifier.
+    assert '&& [[ "$UNIFIED_CYCLE" == "HEALTHY" ]]' not in workflow
+    assert '"$RUNTIME_VERIFICATION" == "PASS"' in workflow
 
 
 @pytest.mark.acceptance

@@ -456,11 +456,13 @@ validate_release_scheduler_contract() {
   # --- release-scheduler lock verification (end) ----------------------------
 }
 
-#: Bounded grace added to the authorized scheduler hard runtime bound so an
-#: in-flight cycle can finish and one fresh cycle can be observed, covering cron
-#: scheduling jitter (the cycle is scheduled on the one-minute grid). This is
-#: explicit and finite; the wait is never unbounded.
-UNIFIED_CYCLE_RELEASE_GRACE_SECONDS=120
+#: EVIDENCE_SHADOW release decoupling. The unified cycle is a LEGACY observation
+#: surface: it is not part of the EVIDENCE_SHADOW evidence plane, and its
+#: completion is not a release gate. The deploy therefore OBSERVES the cycle
+#: read-only for a short, bounded window and reports what it saw, but never
+#: blocks the release on it and never adds a second long wait. The runtime
+#: verifier remains the authoritative prospective-evidence gate.
+UNIFIED_CYCLE_OBSERVATION_SECONDS=30
 
 #: The release runtime verifier keeps its OWN independent bounded window. It must
 #: equal `app.services.release_runtime_verifier.MAX_WAIT_SECONDS` (a larger value
@@ -605,7 +607,15 @@ report_unified_cycle_wait_failure() {
   echo "OPIP_UNIFIED_CYCLE_LAST_STATUS=${last_status:-NONE}"
   echo "OPIP_UNIFIED_CYCLE_LAST_COMPLETED_AT=${last_completed:-NONE}"
   echo "OPIP_UNIFIED_CYCLE_LAST_PHASE=${last_phase:-NONE}"
-  completed_epoch="$(date -u -d "$last_completed" +%s 2>/dev/null || true)"
+  # An EMPTY completion value must never be handed to `date -d`: GNU date treats
+  # an empty string as midnight of the current day, which would fabricate a
+  # plausible-looking age for a cycle that never completed. The value is
+  # therefore required to be non-empty AND to match the emitted timestamp shape
+  # before it is parsed at all.
+  completed_epoch=""
+  if [[ -n "$last_completed" && "$last_completed" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+    completed_epoch="$(date -u -d "$last_completed" +%s 2>/dev/null || true)"
+  fi
   now_epoch="$(date -u +%s)"
   if [[ "$completed_epoch" =~ ^[0-9]+$ ]] && (( completed_epoch <= now_epoch )); then
     age=$(( now_epoch - completed_epoch ))
@@ -747,11 +757,21 @@ emit_capture_producer_disposition_evidence() {
   return 0
 }
 
-wait_unified_cycle_success() {
+#: Read-only, bounded unified-cycle OBSERVATION for the EVIDENCE_SHADOW release.
+#:
+#: The unified cycle is a legacy surface and is NOT part of the EVIDENCE_SHADOW
+#: evidence plane, so its completion is not a release gate. This function
+#: therefore never fails the deploy: it observes the cycle log for a short,
+#: bounded window, emits the same structured, read-only evidence the failure
+#: reporter emits (so the receipt is still diagnosable), and always returns 0.
+#:
+#: It launches no second cycle or scheduler, takes no lock, writes no file, and
+#: adds no long wait. The runtime verifier remains the authoritative gate.
+observe_unified_cycle() {
   local ready_after="$1" deadline="$2"
   local cycle_log="/var/log/ohm-unified-cycle.log"
   # The log override is honored ONLY under an explicit test marker, so a
-  # production deploy cannot be pointed at a forged log to fake the success signal.
+  # production deploy cannot be pointed at a forged log to fake the observation.
   if [[ "${OPIP_DEPLOY_TEST_SEAMS:-0}" == "1" && -n "${OPIP_RELEASE_CYCLE_LOG:-}" ]]; then
     cycle_log="$OPIP_RELEASE_CYCLE_LOG"
   fi
@@ -764,24 +784,28 @@ wait_unified_cycle_success() {
       "$cycle_log" 2>/dev/null | tail -n 1 | cut -d= -f2 || true)"
     if [[ -n "$status" && -n "$completed_at" ]]; then
       completed_epoch="$(date -u -d "$completed_at" +%s 2>/dev/null || true)"
-      # A stale pre-readiness completion is not proof: only a cycle that
-      # completed at or after candidate readiness counts.
+      # A stale pre-readiness completion is not a fresh observation: only a cycle
+      # that completed at or after candidate readiness is reported as observed.
       if [[ "$completed_epoch" =~ ^[0-9]+$ ]] && (( completed_epoch >= ready_epoch )); then
-        [[ "$status" == "SUCCESS" ]] || {
-          echo "unified cycle reported DEGRADED after candidate readiness" >&2
-          report_unified_cycle_wait_failure "$cycle_log" "$ready_after" DEGRADED_AFTER_READINESS
-          return 1
-        }
-        echo "OPIP_UNIFIED_CYCLE=HEALTHY"
+        echo "OPIP_UNIFIED_CYCLE_OBSERVED=$status"
         echo "OPIP_UNIFIED_CYCLE_COMPLETED_AT=$completed_at"
+        if [[ "$status" == "SUCCESS" ]]; then
+          echo "OPIP_UNIFIED_CYCLE=HEALTHY"
+        else
+          echo "OPIP_UNIFIED_CYCLE=DEGRADED"
+        fi
         return 0
       fi
     fi
     sleep 5
   done
-  echo "no successful unified cycle was observed within the bounded release window" >&2
+  # No fresh completion within the bounded observation window. This is NOT a
+  # release failure: the cycle is a legacy surface, so the observation is
+  # reported and the deploy continues to the authoritative runtime verifier.
+  echo "OPIP_UNIFIED_CYCLE_OBSERVED=NONE"
+  echo "OPIP_UNIFIED_CYCLE=NOT_OBSERVED"
   report_unified_cycle_wait_failure "$cycle_log" "$ready_after" NO_FRESH_COMPLETION
-  return 1
+  return 0
 }
 
 validate_candidate_container_identity() {
@@ -1347,34 +1371,40 @@ RELEASE_PROFILE="$(docker compose exec -T ohm-trade-agent \
 echo "O'Pip bounded $RELEASE_PROFILE runtime verification started at $READY_AFTER"
 
 # The unified cycle is scheduled by cron with an explicit hard runtime bound
-# (`timeout --signal=TERM --kill-after=30s <BOUND> ... app.jobs.run_cycle`). A
-# healthy cycle may legitimately consume that whole window, so the release wait
-# must be aligned with it (never an arbitrary shorter value, or a slow-but-healthy
-# cycle is falsely rejected). The bound is DERIVED from the installed scheduler
-# entry, not hardcoded; failure to derive it fails closed.
+# (`timeout --signal=TERM --kill-after=30s <BOUND> ... app.jobs.run_cycle`). The
+# bound is still DERIVED from the installed scheduler entry (never hardcoded) so
+# the observation window and the receipt stay aligned with the authorized
+# scheduler; failure to derive it fails closed, exactly as before.
 SCHEDULER_HARD_BOUND_SECONDS="$(scheduler_hard_bound_seconds || true)"
 [[ "$SCHEDULER_HARD_BOUND_SECONDS" =~ ^[0-9]+$ && "$SCHEDULER_HARD_BOUND_SECONDS" -ge 1 ]] || {
   echo "cannot determine the authorized scheduler hard runtime bound" >&2
   false
 }
-UNIFIED_CYCLE_RELEASE_WAIT_SECONDS=$((SCHEDULER_HARD_BOUND_SECONDS + UNIFIED_CYCLE_RELEASE_GRACE_SECONDS))
 echo "OPIP_SCHEDULER_HARD_BOUND_SECONDS=$SCHEDULER_HARD_BOUND_SECONDS"
-echo "OPIP_UNIFIED_CYCLE_WAIT_SECONDS=$UNIFIED_CYCLE_RELEASE_WAIT_SECONDS"
+echo "OPIP_UNIFIED_CYCLE_WAIT_SECONDS=$UNIFIED_CYCLE_OBSERVATION_SECONDS"
 echo "OPIP_RUNTIME_VERIFY_BUDGET_SECONDS=$RUNTIME_VERIFIER_TIMEOUT_SECONDS"
 
-wait_unified_cycle_success "$READY_AFTER" "$((SECONDS + UNIFIED_CYCLE_RELEASE_WAIT_SECONDS))"
+# EVIDENCE_SHADOW release decoupling: the unified cycle is a LEGACY observation
+# surface, not part of the EVIDENCE_SHADOW evidence plane, so its completion is
+# NOT a release gate. The deploy observes it read-only for a short, bounded
+# window and reports what it saw, then proceeds to the authoritative runtime
+# verifier. No second long wait is added and no success signal is fabricated.
+echo "OPIP_DEPLOY_PHASE=UNIFIED_CYCLE_OBSERVATION_BEGIN"
+observe_unified_cycle "$READY_AFTER" "$((SECONDS + UNIFIED_CYCLE_OBSERVATION_SECONDS))"
+echo "OPIP_DEPLOY_PHASE=UNIFIED_CYCLE_OBSERVATION_END"
 
 # The runtime verifier is given its own independent bounded window (it never
-# inherits only the leftover of the cycle wait), so a cycle completing near the
-# end of its window cannot starve the verifier. The containment margin means a
-# normal evidence deficiency is reported by the VERIFIER's own bounded, structured
-# FAIL receipt rather than by this outer watchdog (which exists only so a hung
-# process cannot outlive the deploy transaction).
+# inherits only the leftover of the cycle observation), so a cycle completing
+# near the end of its window cannot starve the verifier. The containment margin
+# means a normal evidence deficiency is reported by the VERIFIER's own bounded,
+# structured FAIL receipt rather than by this outer watchdog (which exists only
+# so a hung process cannot outlive the deploy transaction).
 VERIFIER_CONTAINMENT_SECONDS=$((RUNTIME_VERIFIER_TIMEOUT_SECONDS + RUNTIME_VERIFIER_CONTAINMENT_MARGIN_SECONDS))
 echo "OPIP_RUNTIME_VERIFY_CONTAINMENT_SECONDS=$VERIFIER_CONTAINMENT_SECONDS"
 # Marked BEFORE the call so the rollback handler knows the verifier was the
 # failing stage and should emit the producers' own disposition evidence.
 RELEASE_RUNTIME_VERIFIER_ATTEMPTED="1"
+echo "OPIP_DEPLOY_PHASE=RUNTIME_VERIFICATION_BEGIN"
 timeout --signal=TERM --kill-after=5s "$VERIFIER_CONTAINMENT_SECONDS" \
   docker compose exec -T ohm-trade-agent \
   python -m app.services.release_runtime_verifier \
@@ -1382,6 +1412,7 @@ timeout --signal=TERM --kill-after=5s "$VERIFIER_CONTAINMENT_SECONDS" \
     --baseline-json "$RELEASE_EVIDENCE_BASELINE" \
     --ready-after "$READY_AFTER" \
     --timeout-seconds "$RUNTIME_VERIFIER_TIMEOUT_SECONDS"
+echo "OPIP_DEPLOY_PHASE=RUNTIME_VERIFICATION_END"
 
 # All rollback-sensitive validation is complete. Make the exact SHA
 # authoritative before the owner-authorized irreversible P1 retirement so a
