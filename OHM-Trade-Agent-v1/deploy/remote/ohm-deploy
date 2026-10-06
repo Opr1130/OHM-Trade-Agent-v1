@@ -456,12 +456,6 @@ validate_release_scheduler_contract() {
   # --- release-scheduler lock verification (end) ----------------------------
 }
 
-#: Bounded grace added to the authorized scheduler hard runtime bound so an
-#: in-flight cycle can finish and one fresh cycle can be observed, covering cron
-#: scheduling jitter (the cycle is scheduled on the one-minute grid). This is
-#: explicit and finite; the wait is never unbounded.
-UNIFIED_CYCLE_RELEASE_GRACE_SECONDS=120
-
 #: EVIDENCE_SHADOW release decoupling. The unified cycle is a LEGACY observation
 #: surface: it is not part of the EVIDENCE_SHADOW evidence plane, and its
 #: completion is not a release gate. The deploy therefore OBSERVES the cycle
