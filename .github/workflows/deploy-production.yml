@@ -297,6 +297,14 @@ jobs:
                && grep -q "O'Pip scheduler reconciliation: OK" "$log"; then
               case "${CORE_MARKER}:${CORE_STATUS}" in
                 PRESENT:SUCCESS)
+                  # EVIDENCE_SHADOW release decoupling: the unified cycle is a
+                  # LEGACY observation surface, not part of the EVIDENCE_SHADOW
+                  # evidence plane, so its completion is NOT a release gate. The
+                  # authoritative prospective-evidence gate is the runtime
+                  # verifier (RUNTIME_VERIFICATION=PASS + exact-SHA runtime
+                  # marker). The unified-cycle observation is still parsed and
+                  # reported in the receipt, but it is never required to be
+                  # HEALTHY and is never fabricated.
                   if [[ "$RUNTIME_VERIFICATION" == "PASS" ]] \
                     && grep -Fxq "OPIP_RELEASE_RUNTIME_SHA=$TARGET_SHA" "$log" \
                     && [[ "$DEPLOYED_PROFILE" == "$APPROVED_PROFILE" ]] \
@@ -304,8 +312,7 @@ jobs:
                     && [[ "$EVIDENCE_CAPTURE" == "PASS" ]] \
                     && [[ "$RUNTIME_PROTECTION" == "HEALTHY" ]] \
                     && [[ "$TARGET_AUTHORITY" == "ABSENT" ]] \
-                    && [[ "$RELEASE_SCHEDULER" == "UNIQUE_BOUNDED" ]] \
-                    && [[ "$UNIFIED_CYCLE" == "HEALTHY" ]]; then
+                    && [[ "$RELEASE_SCHEDULER" == "UNIQUE_BOUNDED" ]]; then
                     core_verdict="PROVEN"
                   fi
                   ;;

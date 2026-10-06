@@ -88,19 +88,23 @@ def _is_fork_failure(proc: subprocess.CompletedProcess) -> bool:
 
 @pytest.mark.acceptance
 def test_ac_013_cycle_wait_and_verifier_budgets_are_separated() -> None:
-    """ATDD-RELEASE-PIPELINE-v1/AC-013: the cycle wait and the runtime verifier have separate, independently named budgets."""
+    """ATDD-RELEASE-PIPELINE-v1/AC-013: the cycle observation and the runtime verifier have separate, independently named budgets."""
     deploy = _deploy()
     # The shared leftover-based deadline is gone.
     assert "DEPLOY_VERIFY_DEADLINE" not in deploy
     assert "REMAINING_VERIFY_SECONDS" not in deploy
-    # The cycle wait is derived from the authorized scheduler hard bound plus a
-    # bounded grace, not an arbitrary shared constant.
+    # The scheduler hard bound is still DERIVED from the installed entry (never
+    # hardcoded) so the observation window and receipt stay aligned with the
+    # authorized scheduler.
     assert "scheduler_hard_bound_seconds" in deploy
     assert "SCHEDULER_HARD_BOUND_SECONDS=" in deploy
-    assert (
-        "UNIFIED_CYCLE_RELEASE_WAIT_SECONDS=$((SCHEDULER_HARD_BOUND_SECONDS + UNIFIED_CYCLE_RELEASE_GRACE_SECONDS))"
-        in deploy
-    )
+    # EVIDENCE_SHADOW release decoupling: the unified cycle is observed read-only
+    # for a short, bounded window and is NOT a release gate. The old blocking
+    # wait (derived from the scheduler hard bound plus a grace) is gone.
+    assert "UNIFIED_CYCLE_RELEASE_WAIT_SECONDS" not in deploy
+    assert "wait_unified_cycle_success" not in deploy
+    assert "UNIFIED_CYCLE_OBSERVATION_SECONDS=" in deploy
+    assert "observe_unified_cycle" in deploy
     # The verifier keeps its own independent window.
     assert "RUNTIME_VERIFIER_TIMEOUT_SECONDS=360" in deploy
     assert '--timeout-seconds "$RUNTIME_VERIFIER_TIMEOUT_SECONDS"' in deploy
@@ -123,19 +127,24 @@ def test_ac_013_verifier_budget_matches_the_app_max() -> None:
 
 @pytest.mark.acceptance
 def test_ac_013_wait_budget_aligns_with_the_scheduler_hard_bound() -> None:
-    """ATDD-RELEASE-PIPELINE-v1/AC-013: the cycle wait is at least the scheduler hard bound, so a healthy cycle up to that bound is not falsely rejected."""
+    """ATDD-RELEASE-PIPELINE-v1/AC-013: the scheduler hard bound is still derived, and the observation window is short and bounded."""
     cron = CRON.read_text(encoding="utf-8")
-    # The scheduler authorizes a long hard runtime bound.
+    # The scheduler authorizes a long hard runtime bound; the deploy still
+    # derives it (never hardcodes it) so the receipt stays aligned.
     assert "timeout --signal=TERM --kill-after=30s 3600" in cron
     deploy = _deploy()
-    # A 3600s bound + 120s grace is far above the old 360s window.
-    assert "UNIFIED_CYCLE_RELEASE_GRACE_SECONDS=120" in deploy
+    assert "scheduler_hard_bound_seconds" in deploy
+    # EVIDENCE_SHADOW release decoupling: the observation window is short and
+    # bounded, and is NOT derived from the scheduler hard bound (no second long
+    # wait). The old grace constant is gone.
+    assert "UNIFIED_CYCLE_OBSERVATION_SECONDS=30" in deploy
+    assert "UNIFIED_CYCLE_RELEASE_GRACE_SECONDS" not in deploy
 
 
 @pytest.mark.acceptance
 def test_ac_013_no_second_scheduler_or_cycle_is_launched() -> None:
-    """ATDD-RELEASE-PIPELINE-v1/AC-013: the wait observes the existing scheduler; it launches no second cycle/scheduler and mutates no protection semantics."""
-    block = _function_block("wait_unified_cycle_success", "validate_candidate_container_identity")
+    """ATDD-RELEASE-PIPELINE-v1/AC-013: the observation observes the existing scheduler; it launches no second cycle/scheduler and mutates no protection semantics."""
+    block = _function_block("observe_unified_cycle", "validate_candidate_container_identity")
     for forbidden in (
         "run_cycle",
         "docker compose up",
@@ -185,7 +194,7 @@ def _run_wait(
     bash = _bash()
     if bash is None:
         pytest.skip("bash is not available in this environment")
-    fn = _function_block("wait_unified_cycle_success", "validate_candidate_container_identity")
+    fn = _function_block("observe_unified_cycle", "validate_candidate_container_identity")
     # The failure path under test calls the real reporter, so the harness runs the
     # real bounds, lock probe and reporter definitions instead of stubbing them.
     evidence = (
@@ -244,7 +253,7 @@ def _run_wait(
             f'echo "PRECHECK_LOG_BYTES=$(wc -c < \'{log_path}\')"\n'
             f'echo "PRECHECK_LOG_SHA=$(sha256sum \'{log_path}\' | cut -d" " -f1)"\n'
             "set +e\n"
-            f'wait_unified_cycle_success "{ready_after}" "$((SECONDS + {deadline_seconds}))"\n'
+            f'observe_unified_cycle "{ready_after}" "$((SECONDS + {deadline_seconds}))"\n'
             "rc=$?\n"
             f'echo "POSTCHECK_LOG_BYTES=$(wc -c < \'{log_path}\')"\n'
             f'echo "POSTCHECK_LOG_SHA=$(sha256sum \'{log_path}\' | cut -d" " -f1)"\n'
@@ -268,19 +277,20 @@ def _iso(seconds_ago: int) -> str:
 
 
 @pytest.mark.acceptance
-def test_ac_013_functional_accepts_a_fresh_success() -> None:
-    """ATDD-RELEASE-PIPELINE-v1/AC-013: a fresh SUCCESS completed after candidate readiness passes."""
+def test_ac_013_functional_observes_a_fresh_success() -> None:
+    """ATDD-RELEASE-PIPELINE-v1/AC-013: a fresh SUCCESS completed after candidate readiness is observed and never fails the deploy."""
     log = f"OPIP_UNIFIED_CYCLE_STATUS=SUCCESS\nOPIP_UNIFIED_CYCLE_COMPLETED_AT={_iso(1)}\n"
     proc = _run_wait(_iso(5), 60, log)
     if _is_fork_failure(proc):
         pytest.skip("bash cannot fork reliably in this environment")
     assert proc.returncode == 0, proc.stderr
     assert "OPIP_UNIFIED_CYCLE=HEALTHY" in proc.stdout
+    assert "OPIP_UNIFIED_CYCLE_OBSERVED=SUCCESS" in proc.stdout
 
 
 @pytest.mark.acceptance
-def test_ac_013_functional_accepts_a_cycle_that_exceeded_the_old_window() -> None:
-    """ATDD-RELEASE-PIPELINE-v1/AC-013: a healthy cycle that completed more than 360s after readiness is NOT falsely rejected."""
+def test_ac_013_functional_observes_a_cycle_that_exceeded_the_old_window() -> None:
+    """ATDD-RELEASE-PIPELINE-v1/AC-013: a healthy cycle that completed more than 360s after readiness is observed, not falsely rejected."""
     # ready_after was 400s ago; the cycle completed 1s ago (i.e. ~399s after
     # readiness) -- beyond the old 360s shared window.
     log = f"OPIP_UNIFIED_CYCLE_STATUS=SUCCESS\nOPIP_UNIFIED_CYCLE_COMPLETED_AT={_iso(1)}\n"
@@ -292,41 +302,44 @@ def test_ac_013_functional_accepts_a_cycle_that_exceeded_the_old_window() -> Non
 
 
 @pytest.mark.acceptance
-def test_ac_013_functional_rejects_degraded_immediately() -> None:
-    """ATDD-RELEASE-PIPELINE-v1/AC-013: a fresh DEGRADED cycle fails immediately."""
+def test_ac_013_functional_observes_degraded_without_failing() -> None:
+    """ATDD-RELEASE-PIPELINE-v1/AC-013: a fresh DEGRADED cycle is observed and reported, but never fails the deploy."""
     log = f"OPIP_UNIFIED_CYCLE_STATUS=DEGRADED\nOPIP_UNIFIED_CYCLE_COMPLETED_AT={_iso(1)}\n"
     proc = _run_wait(_iso(30), 30, log)
     if _is_fork_failure(proc):
         pytest.skip("bash cannot fork reliably in this environment")
-    assert proc.returncode != 0
-    assert "DEGRADED" in proc.stderr
+    assert proc.returncode == 0, proc.stderr
+    assert "OPIP_UNIFIED_CYCLE=DEGRADED" in proc.stdout
+    assert "OPIP_UNIFIED_CYCLE_OBSERVED=DEGRADED" in proc.stdout
 
 
 @pytest.mark.acceptance
-def test_ac_013_functional_rejects_a_stale_pre_readiness_success() -> None:
-    """ATDD-RELEASE-PIPELINE-v1/AC-013: a stale SUCCESS that completed before candidate readiness never passes."""
+def test_ac_013_functional_ignores_a_stale_pre_readiness_success() -> None:
+    """ATDD-RELEASE-PIPELINE-v1/AC-013: a stale SUCCESS that completed before candidate readiness is not a fresh observation, but never fails the deploy."""
     # ready_after 60s ago; completion 300s ago (before readiness) -> not fresh.
     log = f"OPIP_UNIFIED_CYCLE_STATUS=SUCCESS\nOPIP_UNIFIED_CYCLE_COMPLETED_AT={_iso(300)}\n"
     proc = _run_wait(_iso(60), 1, log)
     if _is_fork_failure(proc):
         pytest.skip("bash cannot fork reliably in this environment")
-    assert proc.returncode != 0
-    assert "no successful unified cycle" in proc.stderr
+    assert proc.returncode == 0, proc.stderr
+    assert "OPIP_UNIFIED_CYCLE_OBSERVED=NONE" in proc.stdout
+    assert "OPIP_UNIFIED_CYCLE=NOT_OBSERVED" in proc.stdout
 
 
 @pytest.mark.acceptance
-def test_ac_013_functional_rejects_no_completion_within_the_window() -> None:
-    """ATDD-RELEASE-PIPELINE-v1/AC-013: no completion within the bounded window fails closed."""
+def test_ac_013_functional_no_completion_within_the_window_does_not_fail() -> None:
+    """ATDD-RELEASE-PIPELINE-v1/AC-013: no completion within the bounded observation window is reported, not failed."""
     proc = _run_wait(_iso(30), 1, "OPIP_UNIFIED_CYCLE_STATUS=STARTED\n")
     if _is_fork_failure(proc):
         pytest.skip("bash cannot fork reliably in this environment")
-    assert proc.returncode != 0
-    assert "no successful unified cycle" in proc.stderr
+    assert proc.returncode == 0, proc.stderr
+    assert "OPIP_UNIFIED_CYCLE_OBSERVED=NONE" in proc.stdout
+    assert "OPIP_UNIFIED_CYCLE=NOT_OBSERVED" in proc.stdout
 
 
 @pytest.mark.acceptance
 def test_ac_013_test_seams_are_gated_by_an_explicit_marker() -> None:
-    """ATDD-RELEASE-PIPELINE-v1/AC-013: the log/entry test seams are inert in production (honored only under an explicit test marker), so a forged log cannot fake the success signal."""
+    """ATDD-RELEASE-PIPELINE-v1/AC-013: the log/entry test seams are inert in production (honored only under an explicit test marker), so a forged log cannot fake the observation signal."""
     deploy = _deploy()
     # Both overrides are guarded by the marker, so production cannot be pointed
     # at a forged cycle log or an arbitrary scheduler entry.
@@ -344,7 +357,7 @@ def test_ac_013_scheduler_bound_is_derived_and_fails_closed() -> None:
     bash = _bash()
     if bash is None:
         pytest.skip("bash is not available in this environment")
-    fn = _function_block("scheduler_hard_bound_seconds", "wait_unified_cycle_success")
+    fn = _function_block("scheduler_hard_bound_seconds", "observe_unified_cycle")
     with tempfile.TemporaryDirectory() as d:
         good = Path(d) / "good.cron"
         good.write_text(
@@ -433,13 +446,11 @@ def test_ac_013_wait_failure_emits_bounded_structured_evidence() -> None:
     # never arbitrary application output.
     assert "UNIFIED_CYCLE_DIAGNOSTIC_LINE_FILTER=" in consts
     assert 'grep -E "$UNIFIED_CYCLE_DIAGNOSTIC_LINE_FILTER"' in reporter
-    # It is called on BOTH failure paths -- no fresh completion, and a fresh
-    # DEGRADED cycle -- and nowhere else, so it cannot become a success-path side
-    # effect or be silently reused on a healthy wait.
+    # It is called on the observation's no-fresh-completion path, so a bounded
+    # observation is still diagnosable from the deploy log alone.
     deploy = _deploy()
-    assert deploy.count('report_unified_cycle_wait_failure "$cycle_log" "$ready_after"') == 2
+    assert deploy.count('report_unified_cycle_wait_failure "$cycle_log" "$ready_after"') == 1
     assert '"$ready_after" NO_FRESH_COMPLETION' in deploy
-    assert '"$ready_after" DEGRADED_AFTER_READINESS' in deploy
 
 
 @pytest.mark.acceptance
@@ -472,7 +483,7 @@ def test_ac_013_wait_failure_evidence_is_read_only() -> None:
 
 @pytest.mark.acceptance
 def test_ac_013_functional_no_completion_reports_structured_evidence() -> None:
-    """ATDD-RELEASE-PIPELINE-v1/AC-013: a timed-out wait keeps the original failure and reports what the cycle log and schedule actually showed."""
+    """ATDD-RELEASE-PIPELINE-v1/AC-013: a bounded observation with no fresh completion reports what the cycle log and schedule actually showed, without failing the deploy."""
     stale = _iso(600)
     log = (
         "OHM Unified Cycle skipped: previous cycle still running.\n"
@@ -492,10 +503,10 @@ def test_ac_013_functional_no_completion_reports_structured_evidence() -> None:
     proc = _run_wait(_iso(30), 1, log, cron_body=cron)
     if _is_fork_failure(proc):
         pytest.skip("bash cannot fork reliably in this environment")
-    # The failure is still the original, unchanged one.
-    assert proc.returncode != 0
-    assert "no successful unified cycle" in proc.stderr
-    # ... and it is now diagnosable from the log alone.
+    # The observation never fails the deploy.
+    assert proc.returncode == 0, proc.stderr
+    assert "OPIP_UNIFIED_CYCLE_OBSERVED=NONE" in proc.stdout
+    # ... and it is still diagnosable from the log alone.
     assert _marker(proc.stdout, "OPIP_UNIFIED_CYCLE_WAIT_FAILURE") == "NO_FRESH_COMPLETION"
     assert _marker(proc.stdout, "OPIP_UNIFIED_CYCLE_LOG_EXISTS") == "YES"
     assert _marker(proc.stdout, "OPIP_UNIFIED_CYCLE_TAIL_SKIPPED_COUNT") == "3"
@@ -534,9 +545,9 @@ def test_ac_013_names_the_last_cycle_phase_reached_before_a_bound_kill() -> None
     proc = _run_wait(_iso(30), 1, log)
     if _is_fork_failure(proc):
         pytest.skip("bash cannot fork reliably in this environment")
-    assert proc.returncode != 0
+    assert proc.returncode == 0, proc.stderr
     assert _marker(proc.stdout, "OPIP_UNIFIED_CYCLE_WAIT_FAILURE") == "NO_FRESH_COMPLETION"
-    # The last phase reached is the release blocker, named instead of guessed.
+    # The last phase reached is named instead of guessed.
     assert _marker(proc.stdout, "OPIP_UNIFIED_CYCLE_LAST_PHASE") == "BROAD_DISCOVERY"
     # A durable phase marker must never be mistaken for a terminal status.
     assert _marker(proc.stdout, "OPIP_UNIFIED_CYCLE_LAST_STATUS") == "SUCCESS"
@@ -549,8 +560,28 @@ def test_ac_013_reports_no_phase_when_the_log_carries_none() -> None:
     proc = _run_wait(_iso(30), 1, "OHM Unified Cycle skipped: previous cycle still running.\n")
     if _is_fork_failure(proc):
         pytest.skip("bash cannot fork reliably in this environment")
-    assert proc.returncode != 0
+    assert proc.returncode == 0, proc.stderr
     assert _marker(proc.stdout, "OPIP_UNIFIED_CYCLE_LAST_PHASE") == "NONE"
+
+
+@pytest.mark.acceptance
+def test_ac_013_empty_completion_timestamp_is_never_parsed_as_midnight() -> None:
+    """ATDD-RELEASE-PIPELINE-v1/AC-013: an empty completion value must report UNKNOWN, never a fabricated age.
+
+    GNU ``date -d ""`` resolves to midnight of the current day, so an empty
+    completion value would otherwise produce a plausible-looking age for a cycle
+    that never completed. The reporter must require a non-empty, well-shaped
+    timestamp before parsing it at all.
+    """
+    # A log with a status but NO completion timestamp: the reporter must not
+    # fabricate an age from an empty value.
+    log = "OPIP_UNIFIED_CYCLE_STATUS=SUCCESS\n"
+    proc = _run_wait(_iso(30), 1, log)
+    if _is_fork_failure(proc):
+        pytest.skip("bash cannot fork reliably in this environment")
+    assert proc.returncode == 0, proc.stderr
+    assert _marker(proc.stdout, "OPIP_UNIFIED_CYCLE_LAST_COMPLETED_AT") == "NONE"
+    assert _marker(proc.stdout, "OPIP_UNIFIED_CYCLE_LAST_COMPLETION_AGE_SECONDS") == "UNKNOWN"
 
 
 @pytest.mark.acceptance
@@ -616,17 +647,15 @@ def test_unified_cycle_phase_markers_cover_the_ordered_phases_and_terminal_statu
 
 
 @pytest.mark.acceptance
-def test_ac_013_functional_degraded_is_reported_as_evidence() -> None:
-    """ATDD-RELEASE-PIPELINE-v1/AC-013: the immediate DEGRADED failure is attributed, not just reported."""
+def test_ac_013_functional_degraded_is_observed_without_failing() -> None:
+    """ATDD-RELEASE-PIPELINE-v1/AC-013: a fresh DEGRADED cycle is observed and reported, but never fails the deploy."""
     log = f"OPIP_UNIFIED_CYCLE_STATUS=DEGRADED\nOPIP_UNIFIED_CYCLE_COMPLETED_AT={_iso(1)}\n"
     proc = _run_wait(_iso(30), 30, log)
     if _is_fork_failure(proc):
         pytest.skip("bash cannot fork reliably in this environment")
-    assert proc.returncode != 0
-    assert "DEGRADED" in proc.stderr
-    assert _marker(proc.stdout, "OPIP_UNIFIED_CYCLE_WAIT_FAILURE") == "DEGRADED_AFTER_READINESS"
-    assert _marker(proc.stdout, "OPIP_UNIFIED_CYCLE_LAST_STATUS") == "DEGRADED"
-    assert _marker(proc.stdout, "OPIP_UNIFIED_CYCLE_TAIL_DEGRADED_COUNT") == "1"
+    assert proc.returncode == 0, proc.stderr
+    assert "OPIP_UNIFIED_CYCLE=DEGRADED" in proc.stdout
+    assert _marker(proc.stdout, "OPIP_UNIFIED_CYCLE_OBSERVED") == "DEGRADED"
     assert _marker(proc.stdout, "PRECHECK_LOG_SHA") == _marker(proc.stdout, "POSTCHECK_LOG_SHA")
 
 
@@ -637,7 +666,7 @@ def test_ac_013_functional_host_lock_probe_distinguishes_held_from_free(lock_pro
     proc = _run_wait(_iso(30), 1, "OHM Unified Cycle skipped: previous cycle still running.\n", lock_probe=lock_probe)
     if _is_fork_failure(proc):
         pytest.skip("bash cannot fork reliably in this environment")
-    assert proc.returncode != 0
+    assert proc.returncode == 0, proc.stderr
     assert _marker(proc.stdout, "OPIP_UNIFIED_CYCLE_HOST_LOCK_PRESENT") == "YES"
     assert _marker(proc.stdout, "OPIP_UNIFIED_CYCLE_HOST_LOCK_HELD") == expected
     lock_path = _marker(proc.stdout, "OPIP_UNIFIED_CYCLE_HOST_LOCK_PATH")
@@ -657,7 +686,7 @@ def test_ac_013_functional_evidence_classifies_a_silent_log() -> None:
     proc = _run_wait(_iso(30), 1, "")
     if _is_fork_failure(proc):
         pytest.skip("bash cannot fork reliably in this environment")
-    assert proc.returncode != 0
+    assert proc.returncode == 0, proc.stderr
     assert _marker(proc.stdout, "OPIP_UNIFIED_CYCLE_TAIL_SKIPPED_COUNT") == "0"
     assert _marker(proc.stdout, "OPIP_UNIFIED_CYCLE_LAST_STATUS") == "NONE"
     assert _marker(proc.stdout, "OPIP_UNIFIED_CYCLE_WAIT_FAILURE_CLASS") == "NO_CYCLE_LOG_ACTIVITY"
