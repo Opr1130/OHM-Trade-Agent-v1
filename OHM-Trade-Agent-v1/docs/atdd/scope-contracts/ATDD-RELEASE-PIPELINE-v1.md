@@ -203,6 +203,28 @@ THEN:
 
 (f) no release-profile, F5, scheduler, deploy, Paper-v2, Committee, funded/live/exchange/order or other authority change is introduced.
 
+AC-020:
+GIVEN:
+an EVIDENCE_SHADOW production qualification where continuity restoration returned a real but STALE historical source watermark for a committed instrument, so the resumed source path requested an unbounded historical catch-up batch, the declared canonical-submit workload could not fit the unchanged materialization budget, and the producer failed closed with MATERIALIZE_INCOMPLETE while zero FeatureSnapshots and zero F5 evidence were produced
+
+WHEN:
+continuity restoration returns a source watermark whose tip is older than the current declared feature warm-up window ending at the latest closed cutoff
+
+THEN:
+(a) market acquisition is bounded to exactly the feature engine's declared MINIMUM_WARMUP_INTERVALS ending at the current latest closed cutoff, derived from the engine constant and the source interval rather than a magic number, so a stale durable watermark can never request an arbitrary historical catch-up;
+
+(b) rows older than that warm-up floor are rejected before normalization, so even a venue that returns more history than requested cannot inflate normalization work, ingestion ordering or the declared canonical-submit workload;
+
+(c) the re-acquisition is a RESTART_WARMUP, not a NEW_LISTING_COLD_START: the stale watermark is carried rather than reset, ingestion order and watermark lineage stay monotonic and advance truthfully to the new current tip, and the existing RollingState gap/reset/restart logic records the discontinuity instead of a second state machine;
+
+(d) the exact stale boundary is derived from the declared warm-up window and interval -- a tip strictly older than the warm-up floor is stale while a tip exactly at the floor is an ordinary bounded resume -- and both sides of that boundary are tested;
+
+(e) a current or recent restored watermark keeps the existing resumed tip re-admission, OHLC correction, revision/superseding, ingestion order, source sequence and coverage semantics unchanged, and the no-watermark AC-019 cold-start behavior is unchanged;
+
+(f) a default/production-composition run (continuity restore -> stale source watermark -> default Kraken source -> run_cycle) produces exactly one current-cutoff FeatureSnapshot and results in a 140-observation batch that is admissible under the unchanged Phase-B submit-bound budget;
+
+(g) no timeout, verifier, F5, cadence, scheduler, deploy, writer-budget, materialization-reserve, release-profile, Paper-v2, Committee, funded/live/exchange/order or other authority change is introduced.
+
 EXPLICITLY OUT OF SCOPE:
 - Activating TARGET_PAPER, Paper-v2, the Committee, or any funded/live/exchange/order authority
 - Deleting, rewriting or rescoping the historical ATDD increments that recorded the Feature Bus `off`
@@ -371,6 +393,12 @@ AC-018 -> tests/test_opip_feature_bus_continuity_batch.py::test_ac_018_observer_
 AC-018 -> tests/test_opip_r4_b2_shadow_capture.py::test_ac_018_default_capture_composes_batch_restore_observer_without_marker_collision
 AC-019 -> tests/test_opip_feature_bus_pr3_integrity.py::test_source_cold_start_horizon_bounds_request_and_admitted_history
 AC-019 -> tests/test_opip_r4_b2_shadow_capture.py::test_ac_019_default_capture_uses_exact_feature_warmup_horizon
+AC-020 -> tests/test_opip_feature_bus_pr3_integrity.py::test_source_stale_watermark_is_bounded_restart_warmup
+AC-020 -> tests/test_opip_feature_bus_pr3_integrity.py::test_source_stale_boundary_equality_remains_a_normal_resume
+AC-020 -> tests/test_opip_feature_bus_pr3_integrity.py::test_source_recent_watermark_resume_semantics_are_unchanged
+AC-020 -> tests/test_opip_feature_bus_pr3_integrity.py::test_stale_restored_checkpoint_records_a_gap_restart_not_a_cold_start
+AC-020 -> tests/test_opip_r4_b2_shadow_capture.py::test_ac_020_default_composition_bounds_stale_restored_watermark
+AC-020 -> tests/test_opip_r4_b2_shadow_capture.py::test_ac_020_bounded_restart_stays_admissible_after_setup_delay
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/services/release_profiles.py
@@ -493,6 +521,10 @@ AC-019 -> OHM-Trade-Agent-v1/app/services/opip_feature_bus_market_source.py
 AC-019 -> OHM-Trade-Agent-v1/tests/test_opip_feature_bus_pr3_integrity.py
 AC-019 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_shadow_capture.py
 AC-019 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
+AC-020 -> OHM-Trade-Agent-v1/app/opip/market/source.py
+AC-020 -> OHM-Trade-Agent-v1/tests/test_opip_feature_bus_pr3_integrity.py
+AC-020 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_shadow_capture.py
+AC-020 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
 
 DEFERRED DISCOVERIES:
 - `TARGET_PAPER` remains BLOCKED. Activating it (Paper-v2) requires the ATDD-R4-B2 AC-011 comparator evidence, F11 protection READY, legacy drain READY and explicit OWNER approval, and is a separate OWNER increment; this contract does not authorize it.

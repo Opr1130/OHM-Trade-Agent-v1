@@ -17,8 +17,15 @@ import pytest
 
 import app.jobs.capture_feature_bus_shadow as capture
 from app.opip.contracts.enums import CoverageState
+from app.opip.contracts.events import (
+    FEATURE_RESTART_RECORDED,
+    MARKET_OBSERVATION_RECORDED,
+)
 from app.opip.contracts.observation import SourceWatermark
+from app.opip.features.engine import FEATURE_VERSION
 from app.opip.features.publisher import FeatureBusPublisher
+from app.opip.features.state import RollingState
+from app.opip.market.observations import IntervalRow
 from app.opip.market.source import SourceBatch, SourceMetrics
 
 pytestmark = pytest.mark.acceptance
@@ -1361,4 +1368,211 @@ def test_ac_018_default_capture_composes_batch_restore_observer_without_marker_c
         "continuity_stage=continuity_restore_total"
     ) in out
     assert "OPIP_FEATURE_BUS_CAPTURE_PHASE=continuity_restored" in out
+
+
+# ---------------------------------------------------------------------------
+# AC-020 stale restored watermark: PRODUCTION composition bounded restart
+# ---------------------------------------------------------------------------
+
+
+def _stale_resumed_rolling_state(
+    version, *, days: int = 2, intervals: int = 5
+) -> RollingState:
+    """A decodable resumed checkpoint whose tip is far behind the cutoff."""
+    tip_start = NOW - timedelta(days=days)
+    first = tip_start - timedelta(minutes=intervals - 1)
+    series = tuple(100.0 + index for index in range(intervals))
+    return RollingState(
+        instrument_version_id=version.instrument_version_id,
+        venue=version.venue,
+        venue_instrument_id=version.venue_instrument_id,
+        feature_version=FEATURE_VERSION,
+        opens=series,
+        highs=series,
+        lows=series,
+        closes=series,
+        volumes=tuple(10.0 + index for index in range(intervals)),
+        revisions=tuple(1 for _ in range(intervals)),
+        opens_known=tuple(True for _ in range(intervals)),
+        content_fingerprints=tuple(f"fp-{index}" for index in range(intervals)),
+        first_interval_epoch=int(first.timestamp()),
+        interval_seconds=60,
+        resumed_from_checkpoint=True,
+    )
+
+
+def _kraken_minute_rows(*, end_before: datetime, count: int) -> list[IntervalRow]:
+    """Contiguous one-minute rows ending at ``end_before``.
+
+    Deliberately longer than any declared warm-up horizon, so the test proves the
+    SOURCE bounds admission rather than relying on the venue cooperating.
+    """
+    first_epoch = int(end_before.timestamp()) - count * 60
+    rows = []
+    for index in range(count):
+        price = 100.0 + 0.05 * index
+        rows.append(
+            IntervalRow(
+                interval_start_epoch=first_epoch + 60 * index,
+                open=price,
+                high=price * 1.002,
+                low=price * 0.998,
+                close=price,
+                volume=100.0 + index,
+                vwap=price,
+                trade_count=10 + index,
+            )
+        )
+    return rows
+
+
+def _run_default_composition_with_stale_watermark(
+    monkeypatch, *, setup_delay: float = 0.0
+):
+    """Drive the DEFAULT (source=None, provider=None) capture composition with a
+    restored stale continuity checkpoint and an offline fake Kraken fetcher.
+
+    Exercises the real production wiring -- production ``kraken_minute_source``
+    with ``cold_start_intervals=MINIMUM_WARMUP_INTERVALS``, real ``run_cycle``,
+    real publisher -- so a future source-wiring bypass that reintroduced an
+    unbounded historical catch-up would fail this test. No network access.
+    """
+    import app.services.opip_feature_bus_market_source as market_source
+
+    versions = _instruments(1)
+    version = versions[0]
+    stale_state = _stale_resumed_rolling_state(version)
+    stale_watermark = SourceWatermark(
+        instrument_version_id=version.instrument_version_id,
+        through_utc=NOW - timedelta(days=2),
+        last_ingestion_order=1000,
+    )
+    since_calls: list[int | None] = []
+    rows = _kraken_minute_rows(end_before=NOW, count=720)
+
+    class _FakeFetcher:
+        def __init__(self, client=None):
+            self._client = client
+
+        def __call__(self, venue_instrument_id, *, interval_minutes, since_epoch):
+            since_calls.append(since_epoch)
+            return list(rows)
+
+    class _StubKrakenClient:
+        timeout_seconds = 1.0
+        deadline_monotonic = None
+
+    clock = {"value": 0.0}
+
+    def _clock():
+        return clock["value"]
+
+    class _AdvancingProvider:
+        def refresh(self, *, observed_at_utc):
+            clock["value"] += setup_delay
+            return list(versions)
+
+    monkeypatch.setattr(market_source, "KrakenMinuteBarFetcher", _FakeFetcher)
+    monkeypatch.setattr(
+        capture, "capture_kraken_client", lambda **kwargs: _StubKrakenClient()
+    )
+    monkeypatch.setattr(
+        capture,
+        "KrakenInstrumentProvider",
+        lambda registry=None, client=None: _AdvancingProvider(),
+    )
+    monkeypatch.setattr(capture, "hydrate_instrument_version_registry", lambda: None)
+
+    def _restore(_versions):
+        return (
+            {version.instrument_version_id: stale_state},
+            {},
+            {version.instrument_version_id: stale_watermark},
+        )
+
+    client = _RecordingClient()
+    publisher = FeatureBusPublisher(client, enabled=True, settings=_settings())
+    summary = capture.capture_feature_bus_shadow(
+        settings=_settings(opip_feature_bus_capture_budget_seconds=45),
+        now=NOW,
+        publisher=publisher,
+        restore_continuity=_restore,
+        clock=_clock,
+    )
+    return summary, client, since_calls
+
+
+def test_ac_020_default_composition_bounds_stale_restored_watermark(monkeypatch):
+    """ATDD-RELEASE-PIPELINE-v1/AC-020: a stale restored continuity checkpoint
+    drives the DEFAULT capture composition through exactly ONE bounded
+    RESTART_WARMUP acquisition (the declared 140-interval window ending at the
+    latest closed cutoff), producing exactly one current-cutoff FeatureSnapshot
+    and an explicit restart disposition -- never an unbounded historical catch-up
+    batch, a NEW_LISTING_COLD_START classification, or a historical snapshot
+    series. It also proves the resulting 140-observation batch is admissible
+    under the production Phase-B budget.
+
+    This is the end-to-end production-composition regression for the failed
+    EVIDENCE_SHADOW deploy run 37669302469 (MATERIALIZE_INCOMPLETE).
+    """
+    summary, client, since_calls = _run_default_composition_with_stale_watermark(
+        monkeypatch
+    )
+    floor = NOW - timedelta(minutes=capture.MINIMUM_WARMUP_INTERVALS)
+    # (1)/(2) exactly one upstream request, clamped to the declared warm-up horizon.
+    assert since_calls == [int(floor.timestamp()) - 1]
+
+    # The pass completes instead of failing the Phase-B admission gate.
+    assert summary.source_errors == 0
+    assert summary.budget_exhausted is False
+    assert summary.materialize_incomplete is False
+    assert summary.fetched == 1
+    assert summary.cycles == 1
+    assert summary.promoted == 1
+
+    # (9) exactly one current-cutoff FeatureSnapshot; no historical replay series.
+    snapshots = client.snapshot_payloads()
+    assert len(snapshots) == 1
+    assert snapshots[0]["evaluation_cutoff"] == NOW.isoformat().replace("+00:00", "Z")
+
+    # (3)/(4) the admitted batch is exactly the declared warm-up interval count.
+    observation_intents = [
+        intent
+        for intent in client.intents
+        if intent.event_type == MARKET_OBSERVATION_RECORDED
+    ]
+    assert len(observation_intents) == capture.MINIMUM_WARMUP_INTERVALS
+
+    # (5) the discontinuity is recorded as a restart/gap, never a cold start.
+    assert any(
+        intent.event_type == FEATURE_RESTART_RECORDED for intent in client.intents
+    )
+
+    # (10) the resulting production batch is admissible under the Phase-B budget:
+    # declared submit bound 284 * 0.05s = 14.2s, comfortably inside the 45s pass.
+    submit_bound = capture.declared_cycle_submit_bound(len(observation_intents))
+    assert submit_bound == 284
+    assert (
+        submit_bound * capture.CAPTURE_MATERIALIZE_MIN_WRITE_SECONDS
+        <= 45.0
+    )
+
+
+def test_ac_020_bounded_restart_stays_admissible_after_setup_delay(monkeypatch):
+    """ATDD-RELEASE-PIPELINE-v1/AC-020: even when production acquisition/setup
+    timing consumes part of the pass (here a 15s refresh), the bounded stale
+    restart still produces its single current-cutoff snapshot and clears the
+    Phase-B materialization admission gate -- proving the fix does not merely
+    depend on the fastest possible pass.
+    """
+    summary, client, since_calls = _run_default_composition_with_stale_watermark(
+        monkeypatch, setup_delay=15.0
+    )
+    floor = NOW - timedelta(minutes=capture.MINIMUM_WARMUP_INTERVALS)
+    assert since_calls == [int(floor.timestamp()) - 1]
+    assert summary.budget_exhausted is False
+    assert summary.materialize_incomplete is False
+    assert summary.fetched == 1
+    assert summary.cycles == 1
+    assert len(client.snapshot_payloads()) == 1
 

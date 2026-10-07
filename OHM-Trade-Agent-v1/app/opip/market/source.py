@@ -158,14 +158,21 @@ def _expected_tip_window_epochs(
     *,
     now: datetime,
     interval_seconds: int,
+    restart_warmup: bool = False,
 ) -> tuple[int, ...] | None:
     """Closed interval starts expected when resuming from a tip watermark.
 
     Cold starts (no through_utc) still require the returned tip to equal the
     latest closed interval at ``now``. Resumed polls must cover tip through that
     same latest closed cutoff, or coverage stays incomplete.
+
+    A bounded ``restart_warmup`` re-acquisition (see
+    :meth:`PolledMinuteBarSource.fetch_through`) is NOT an ordinary tip resume:
+    it admits the declared warm-up window ending at the current cutoff instead of
+    the stale tip-to-cutoff span, so it is coverage-checked the same way a cold
+    start is rather than against the (stale) restored tip.
     """
-    if previous.through_utc is None:
+    if previous.through_utc is None or restart_warmup:
         return None
     tip_start = previous.through_utc - timedelta(seconds=interval_seconds)
     cutoff = latest_closed_cutoff(now, interval_seconds=interval_seconds)
@@ -189,6 +196,7 @@ def _coverage_for_completed(
     now: datetime,
     interval_seconds: int,
     rejected: bool,
+    restart_warmup: bool = False,
 ) -> CoverageState:
     if rejected or not completed:
         return CoverageState.INCOMPLETE_COVERAGE
@@ -196,7 +204,10 @@ def _coverage_for_completed(
     if not _epochs_are_contiguous(epochs, interval_seconds=interval_seconds):
         return CoverageState.INCOMPLETE_COVERAGE
     expected = _expected_tip_window_epochs(
-        previous, now=now, interval_seconds=interval_seconds
+        previous,
+        now=now,
+        interval_seconds=interval_seconds,
+        restart_warmup=restart_warmup,
     )
     if expected is None:
         # Cold start: still require the returned tip to reach the latest closed
@@ -224,6 +235,16 @@ class PolledMinuteBarSource:
     ``transport_errors`` is empty by default, so an unexpected exception
     propagates instead of being silently recorded as a coverage gap. A venue
     adapter names its own transport failure type explicitly.
+
+    ``cold_start_intervals`` names the declared feature warm-up horizon. It
+    bounds BOTH a true cold start (no watermark) AND a STALE restored watermark
+    whose tip is older than that horizon: in both cases the request and the
+    admitted rows are clamped to the current warm-up window ending at the latest
+    closed cutoff, so no venue response can inflate the canonical write workload.
+    A stale-restart re-acquisition is semantically a RESTART_WARMUP, NOT a
+    ``NEW_LISTING_COLD_START``: the stale watermark is retained for truthful
+    ingestion-order lineage and advancement, and the existing RollingState
+    gap/reset logic records the discontinuity downstream.
     """
 
     def __init__(
@@ -258,6 +279,19 @@ class PolledMinuteBarSource:
     def sequence_prefix(self) -> str:
         return f"{self._sequence_prefix}-{self._interval_minutes}m"
 
+    def _declared_warmup_floor(self, now: datetime) -> datetime | None:
+        """Oldest interval start inside the declared warm-up window at ``now``.
+
+        Derived from the declared horizon and the evaluation grid (never a magic
+        number): ``latest_closed_cutoff(now) - interval_seconds * warmup``.
+        """
+        if self._cold_start_intervals is None:
+            return None
+        cutoff = latest_closed_cutoff(now, interval_seconds=self.interval_seconds)
+        return cutoff - timedelta(
+            seconds=self.interval_seconds * self._cold_start_intervals
+        )
+
     def fetch_through(
         self,
         instrument_version: InstrumentVersion,
@@ -272,23 +306,37 @@ class PolledMinuteBarSource:
             raise ValueError("watermark belongs to a different instrument version")
 
         since: int | None = None
-        cold_start_floor: datetime | None = None
+        admission_floor: datetime | None = None
+        restart_warmup = False
+        warmup_floor = self._declared_warmup_floor(now)
         if previous.through_utc is not None:
             # Request from the tip closed interval start (through_utc is its
             # end), not through_utc-1s, so venue rows at the tip can be
             # re-admitted for OHLC correction / superseding revisions.
             tip_start = previous.through_utc - timedelta(seconds=self.interval_seconds)
-            since = int(tip_start.timestamp()) - 1
-        elif self._cold_start_intervals is not None:
+            if warmup_floor is not None and tip_start < warmup_floor:
+                # STALE RESTORED WATERMARK: the restored tip is older than the
+                # declared warm-up window, so an ordinary tip resume would ask
+                # the venue for arbitrarily older history than the feature engine
+                # needs for one current-cutoff evaluation. Bound the
+                # re-acquisition to the SAME declared warm-up horizon a cold
+                # start uses and let the existing RollingState gap/reset logic
+                # record the restart. The stale watermark is still carried (never
+                # replaced with ``None``) so ingestion-order lineage and truthful
+                # watermark advancement survive: this is RESTART_WARMUP, not a
+                # NEW_LISTING_COLD_START.
+                restart_warmup = True
+                admission_floor = warmup_floor
+                since = int(admission_floor.timestamp()) - 1
+            else:
+                since = int(tip_start.timestamp()) - 1
+        elif warmup_floor is not None:
             # A prospective cold start needs only the declared warm-up horizon
             # ending at the current closed cutoff. Bound BOTH the upstream request
             # and the admitted rows so a venue returning more history than asked
             # for cannot inflate the canonical write workload.
-            cutoff = latest_closed_cutoff(now, interval_seconds=self.interval_seconds)
-            cold_start_floor = cutoff - timedelta(
-                seconds=self.interval_seconds * self._cold_start_intervals
-            )
-            since = int(cold_start_floor.timestamp()) - 1
+            admission_floor = warmup_floor
+            since = int(admission_floor.timestamp()) - 1
 
         started = time.monotonic()
         try:
@@ -313,8 +361,11 @@ class PolledMinuteBarSource:
                 ),
                 error=message,
             )
-        if cold_start_floor is not None:
-            floor_epoch = int(cold_start_floor.timestamp())
+        if admission_floor is not None:
+            # Reject pre-horizon rows BEFORE normalization so a venue that returns
+            # more history than requested cannot inflate normalization work, the
+            # ingestion order, or the declared canonical submit workload.
+            floor_epoch = int(admission_floor.timestamp())
             rows = [
                 row
                 for row in rows
@@ -336,7 +387,7 @@ class PolledMinuteBarSource:
         )
         closed = completed_observations(result.observations)
         completed = closed
-        if previous.through_utc is not None:
+        if previous.through_utc is not None and not restart_warmup:
             # Re-admit the tip closed interval (through_utc is its end) so an
             # OHLC correction can reach revise_against_retained / supersede.
             tip_start = previous.through_utc - timedelta(seconds=self.interval_seconds)
@@ -345,11 +396,13 @@ class PolledMinuteBarSource:
                 for item in closed
                 if item.source_event_time >= tip_start
             )
-        elif cold_start_floor is not None:
+        elif admission_floor is not None:
+            # Cold start OR stale-restart warm-up: admit only the declared
+            # warm-up window, never an older historical catch-up.
             completed = tuple(
                 item
                 for item in closed
-                if item.source_event_time >= cold_start_floor
+                if item.source_event_time >= admission_floor
             )
         coverage = _coverage_for_completed(
             completed,
@@ -357,6 +410,7 @@ class PolledMinuteBarSource:
             now=now,
             interval_seconds=self.interval_seconds,
             rejected=bool(result.rejected),
+            restart_warmup=restart_warmup,
         )
         return SourceBatch(
             instrument_version=instrument_version,
