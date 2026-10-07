@@ -961,6 +961,7 @@ def test_source_readmits_tip_interval_for_correction():
     assert second.coverage is CoverageState.COMPLETE
 
 
+@pytest.mark.acceptance
 def test_source_cold_start_horizon_bounds_request_and_admitted_history():
     """ATDD-RELEASE-PIPELINE-v1/AC-019: a bounded cold start requests and
     admits only the exact declared feature warm-up horizon ending at the latest
