@@ -163,6 +163,26 @@ THEN:
 (e) a missing, not-yet-visible, after-epoch or over-age freshness anchor fails closed (no synthetic or backdated timestamp is ever manufactured) and is recorded as a durable flushed disposition, while the UNCHANGED `release_runtime_verifier` still rejects the old hourly-anchored cutoff at the production timings and accepts only the corrected freshness-anchor semantics
 (f) no release-profile mode, freshness window, 3600/3720 timing contract, trading/paper/funded/Committee authority, Feature Bus/canonical-writer/spine mode, protection semantics or deploy control plane is changed
 
+AC-018:
+GIVEN:
+an EVIDENCE_SHADOW production qualification where Feature Bus failed closed during restore_continuity with INSUFFICIENT_SETUP_BUDGET before acquisition, producing zero FeatureSnapshots and therefore zero F5 evidence
+
+WHEN:
+continuity is restored for the committed instrument batch
+
+THEN:
+(a) production scans FEATURE_CHECKPOINT_RECORDED at most once per restore batch and MARKET_OBSERVATION_RECORDED at most once per restore batch and reconstructs per-instrument state/ledger/watermark;
+
+(b) canonical ordering, validation/filter order, feature-version semantics, interval semantics, independent since_interval_epoch, revision/conflict behavior remain unchanged;
+
+(c) the same absolute setup deadline and clock bind SQLite and Python reconstruction, failure is fail-closed, no partial output, no continuity skip/cold-start fallback;
+
+(d) single-instrument loader APIs and historical injected restore callbacks remain compatible;
+
+(e) bounded telemetry attributes checkpoint, ledger and total restore time;
+
+(f) no timeout, verifier, F5, cadence, scheduler, deploy, Paper-v2, Committee or authority change.
+
 EXPLICITLY OUT OF SCOPE:
 - Activating TARGET_PAPER, Paper-v2, the Committee, or any funded/live/exchange/order authority
 - Deleting, rewriting or rescoping the historical ATDD increments that recorded the Feature Bus `off`
@@ -307,6 +327,27 @@ AC-017 -> tests/test_opip_r4_b2_shadow_cadence.py::test_ac_020_zero_materializat
 AC-017 -> tests/test_opip_r4_b2_feasibility_short.py::test_ac_022_point_in_time_provenance_round_trips_epoch_invariance
 AC-017 -> tests/test_opip_r4_b2_feasibility_short.py::test_ac_022_short_margin_venue_provenance_survives_the_durable_audit
 AC-017 -> tests/test_opip_r4_b2_shadow_capture.py::test_ac_016_configured_budget_is_read_from_settings
+AC-018 -> tests/test_opip_feature_bus_continuity_batch.py::test_ac_018_checkpoint_batch_restores_multiple_instruments_in_one_scan
+AC-018 -> tests/test_opip_feature_bus_continuity_batch.py::test_ac_018_checkpoint_preserves_canonical_validation_precedence
+AC-018 -> tests/test_opip_feature_bus_continuity_batch.py::test_ac_018_checkpoint_batch_preserves_feature_version_semantics
+AC-018 -> tests/test_opip_feature_bus_continuity_batch.py::test_ac_018_checkpoint_batch_malformed_evidence_matches_single_loader
+AC-018 -> tests/test_opip_feature_bus_continuity_batch.py::test_ac_018_checkpoint_batch_deadline_returns_no_partial_result
+AC-018 -> tests/test_opip_feature_bus_continuity_batch.py::test_ac_018_revision_ledger_batch_restores_multiple_instruments_in_one_scan
+AC-018 -> tests/test_opip_feature_bus_continuity_batch.py::test_ac_018_revision_ledger_batch_decodes_each_row_once
+AC-018 -> tests/test_opip_feature_bus_continuity_batch.py::test_ac_018_revision_ledger_batch_requires_interval_mapping
+AC-018 -> tests/test_opip_feature_bus_continuity_batch.py::test_ac_018_revision_ledger_batch_requires_since_mapping
+AC-018 -> tests/test_opip_feature_bus_continuity_batch.py::test_ac_018_checkpoint_batch_deadline_during_post_scan_selection
+AC-018 -> tests/test_opip_feature_bus_continuity_batch.py::test_ac_018_revision_ledger_batch_preserves_per_instrument_semantics
+AC-018 -> tests/test_opip_feature_bus_continuity_batch.py::test_ac_018_revision_ledger_batch_preserves_revision_ordering
+AC-018 -> tests/test_opip_feature_bus_continuity_batch.py::test_ac_018_revision_ledger_batch_conflicting_duplicate_fails_closed
+AC-018 -> tests/test_opip_feature_bus_continuity_batch.py::test_ac_018_revision_ledger_batch_malformed_evidence_matches_single_loader
+AC-018 -> tests/test_opip_feature_bus_continuity_batch.py::test_ac_018_revision_ledger_batch_deadline_returns_no_partial_map
+AC-018 -> tests/test_opip_feature_bus_continuity_batch.py::test_ac_018_production_batch_restore_calls_each_loader_once
+AC-018 -> tests/test_opip_feature_bus_continuity_batch.py::test_ac_018_production_batch_restore_outputs_are_correct
+AC-018 -> tests/test_opip_feature_bus_continuity_batch.py::test_ac_018_historical_single_instrument_callbacks_are_preserved
+AC-018 -> tests/test_opip_feature_bus_continuity_batch.py::test_ac_018_historical_callbacks_receive_deadline_kwargs_when_supplied
+AC-018 -> tests/test_opip_feature_bus_continuity_batch.py::test_ac_018_observer_receives_bounded_timing_attribution
+AC-018 -> tests/test_opip_feature_bus_continuity_batch.py::test_ac_018_observer_attributes_failed_restore_phase
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/services/release_profiles.py
@@ -416,6 +457,12 @@ AC-017 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_feasibility_producer.py
 AC-017 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_feasibility_short.py
 AC-017 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_shadow_cadence.py
 AC-017 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_shadow_capture.py
+AC-018 -> OHM-Trade-Agent-v1/app/jobs/capture_feature_bus_shadow.py
+AC-018 -> OHM-Trade-Agent-v1/app/jobs/run_feature_bus_pilot.py
+AC-018 -> OHM-Trade-Agent-v1/app/opip/features/checkpoint_store.py
+AC-018 -> OHM-Trade-Agent-v1/app/opip/features/revision_ledger.py
+AC-018 -> OHM-Trade-Agent-v1/tests/test_opip_feature_bus_continuity_batch.py
+AC-018 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
 
 DEFERRED DISCOVERIES:
 - `TARGET_PAPER` remains BLOCKED. Activating it (Paper-v2) requires the ATDD-R4-B2 AC-011 comparator evidence, F11 protection READY, legacy drain READY and explicit OWNER approval, and is a separate OWNER increment; this contract does not authorize it.

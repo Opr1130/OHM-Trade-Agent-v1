@@ -24,11 +24,15 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timedelta, timezone
 import json
+from time import monotonic
 from typing import Any, Callable
 
 from app.opip.contracts.identity import InstrumentVersion
 from app.opip.contracts.observation import SourceWatermark
-from app.opip.features.checkpoint_store import load_rolling_state
+from app.opip.features.checkpoint_store import (
+    load_rolling_state,
+    load_rolling_states_batch,
+)
 from app.opip.features.parity import compare_against_production_indicators
 from app.opip.features.pipeline import CycleIdentityMismatch, run_cycle
 from app.opip.features.publisher import (
@@ -36,7 +40,10 @@ from app.opip.features.publisher import (
     feature_bus_capture_enabled,
     resolve_feature_bus_mode,
 )
-from app.opip.features.revision_ledger import load_revision_ledger
+from app.opip.features.revision_ledger import (
+    load_revision_ledger,
+    load_revision_ledgers_batch,
+)
 from app.opip.market.aggregates import DEFAULT_INTERVAL_SECONDS, grid_floor
 from app.opip.market.instrument_version_store import hydrate_instrument_version_registry
 from app.opip.market.observations import IntervalRow, normalize_interval_rows
@@ -106,6 +113,105 @@ def restore_pilot_continuity(
             since_interval_epoch=since_epoch,
             **deadline_kwargs,
         )
+    return restored_states, restored_ledgers, source_watermarks
+
+
+def restore_pilot_continuity_batch(
+    versions: list[InstrumentVersion],
+    *,
+    load_states_batch=load_rolling_states_batch,
+    load_ledgers_batch=load_revision_ledgers_batch,
+    default_interval_seconds: int = DEFAULT_INTERVAL_SECONDS,
+    deadline_monotonic: float | None = None,
+    clock: Callable[[], float] | None = None,
+    observer: Callable[[str, float], None] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Restore state, revision ledgers, and source watermarks for a live pilot.
+
+    Production/default continuity restoration. Unlike
+    :func:`restore_pilot_continuity` (which preserves the historical
+    single-instrument injected-callback seam), this path scans the canonical
+    checkpoint event family ONCE and the market-observation event family ONCE
+    for the WHOLE requested instrument batch, then reconstructs per-instrument
+    state/ledger/watermark. That removes the repeated full-history amplification
+    implicated by the restore_continuity production overrun.
+
+    ``deadline_monotonic`` (optional) bounds every durable read; it MUST be
+    expressed in the same clock domain as ``clock``. A deadline expiry is NOT
+    swallowed here: the typed exception propagates so the caller can fail closed
+    rather than acquire against partial continuity. No partial result is ever
+    returned.
+
+    ``observer`` (optional) receives bounded attribution as
+    ``observer(stage, seconds)`` for ``checkpoint_restore``,
+    ``revision_ledger_restore`` and ``continuity_restore_total``. It is
+    observability only: it grants no authority and changes no evidence content.
+    """
+    tick = clock or monotonic
+    started = tick()
+    deadline_kwargs: dict[str, Any] = {}
+    if deadline_monotonic is not None:
+        deadline_kwargs["deadline_monotonic"] = deadline_monotonic
+        deadline_kwargs["clock"] = clock
+
+    instrument_version_ids = [v.instrument_version_id for v in versions]
+
+    # Failure-path timing attribution: each phase's timing is emitted whether the
+    # phase succeeds OR raises, so the phase that actually exceeded the setup
+    # deadline is attributable from telemetry. The ORIGINAL typed exception still
+    # propagates and no partial continuity is ever returned. The success-path
+    # stage order is unchanged: checkpoint_restore, revision_ledger_restore,
+    # continuity_restore_total.
+    try:
+        checkpoint_started = tick()
+        try:
+            restored_states = load_states_batch(
+                instrument_version_ids,
+                **deadline_kwargs,
+            )
+        finally:
+            if observer is not None:
+                observer("checkpoint_restore", tick() - checkpoint_started)
+
+        # Derive each instrument's interval/since window from its OWN restored
+        # state, exactly as the historical single-instrument path did.
+        interval_seconds_by_instrument: dict[str, int] = {}
+        since_interval_epoch_by_instrument: dict[str, int | None] = {}
+        source_watermarks: dict[str, Any] = {}
+        for version in versions:
+            instrument_version_id = version.instrument_version_id
+            state = restored_states.get(instrument_version_id)
+            interval_seconds = int(default_interval_seconds)
+            since_epoch = None
+            if state is not None:
+                since_epoch = state.first_interval_epoch
+                interval_seconds = int(state.interval_seconds)
+                if state.last_interval_epoch is not None:
+                    tip_end = datetime.fromtimestamp(
+                        state.last_interval_epoch + state.interval_seconds,
+                        tz=timezone.utc,
+                    )
+                    source_watermarks[instrument_version_id] = SourceWatermark(
+                        instrument_version_id=instrument_version_id,
+                        through_utc=tip_end,
+                    )
+            interval_seconds_by_instrument[instrument_version_id] = interval_seconds
+            since_interval_epoch_by_instrument[instrument_version_id] = since_epoch
+
+        ledger_started = tick()
+        try:
+            restored_ledgers = load_ledgers_batch(
+                instrument_version_ids,
+                interval_seconds_by_instrument=interval_seconds_by_instrument,
+                since_interval_epoch_by_instrument=since_interval_epoch_by_instrument,
+                **deadline_kwargs,
+            )
+        finally:
+            if observer is not None:
+                observer("revision_ledger_restore", tick() - ledger_started)
+    finally:
+        if observer is not None:
+            observer("continuity_restore_total", tick() - started)
     return restored_states, restored_ledgers, source_watermarks
 
 
