@@ -961,6 +961,53 @@ def test_source_readmits_tip_interval_for_correction():
     assert second.coverage is CoverageState.COMPLETE
 
 
+@pytest.mark.acceptance
+def test_source_cold_start_horizon_bounds_request_and_admitted_history():
+    """ATDD-RELEASE-PIPELINE-v1/AC-019: a bounded cold start requests and
+    admits only the exact declared feature warm-up horizon ending at the latest
+    closed cutoff, even when the fetcher returns older history too.
+    """
+    instrument = _instrument()
+    rows = _rows(
+        count=MINIMUM_WARMUP_INTERVALS + 25,
+        end_before=CUTOFF,
+    )
+    calls: list[int | None] = []
+
+    def fetcher(venue_id, *, interval_minutes, since_epoch):
+        calls.append(since_epoch)
+        return rows
+
+    source = PolledMinuteBarSource(
+        fetcher,
+        venue="kraken",
+        source_label="test",
+        sequence_prefix="test",
+        interval_seconds=60,
+        clock=lambda: NOW,
+        cold_start_intervals=MINIMUM_WARMUP_INTERVALS,
+    )
+    batch = source.fetch_through(instrument, watermark=None, now=CUTOFF)
+
+    floor = CUTOFF - timedelta(minutes=MINIMUM_WARMUP_INTERVALS)
+    assert calls == [int(floor.timestamp()) - 1]
+    assert len(batch.observations) == MINIMUM_WARMUP_INTERVALS
+    assert batch.observations[0].source_event_time == floor
+    assert batch.observations[-1].source_event_time == CUTOFF - timedelta(minutes=1)
+    assert batch.watermark.last_ingestion_order == MINIMUM_WARMUP_INTERVALS
+    assert batch.coverage is CoverageState.COMPLETE
+
+    resumed = source.fetch_through(
+        instrument,
+        watermark=batch.watermark,
+        now=CUTOFF,
+    )
+    tip_start = batch.watermark.through_utc - timedelta(seconds=60)
+    assert calls[-1] == int(tip_start.timestamp()) - 1
+    assert len(resumed.observations) == 1
+    assert resumed.observations[0].source_event_time == tip_start
+
+
 def test_source_coverage_incomplete_when_tip_window_has_gaps():
     instrument = _instrument()
     gapped = _rows(count=4, end_before=CUTOFF, skip={1})

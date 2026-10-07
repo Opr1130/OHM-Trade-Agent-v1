@@ -568,7 +568,7 @@ def test_ac_016_setup_bound_refresh_deadline_is_setup_budget_exhaustion(
         lambda registry=None, client=None: _DeadlineProvider(),
     )
     monkeypatch.setattr(
-        capture, "kraken_minute_source", lambda client=None: _SpySource()
+        capture, "kraken_minute_source", lambda client=None, **kwargs: _SpySource()
     )
     monkeypatch.setattr(capture, "hydrate_instrument_version_registry", lambda: None)
 
@@ -872,7 +872,7 @@ def test_ac_016_setup_deadline_uses_actual_wave_bound(monkeypatch, capsys):
         lambda registry=None, client=None: _provider(versions),
     )
     monkeypatch.setattr(
-        capture, "kraken_minute_source", lambda client=None: _source(batches)
+        capture, "kraken_minute_source", lambda client=None, **kwargs: _source(batches)
     )
     monkeypatch.setattr(
         capture, "hydrate_instrument_version_registry", lambda: None
@@ -898,6 +898,49 @@ def test_ac_016_setup_deadline_uses_actual_wave_bound(monkeypatch, capsys):
     # The materialization reserve is unchanged by the setup-budget invariant:
     # the same production-path budget declaration still reports the 10s reserve.
     assert "materialize_reserve_seconds=10.0" in out
+
+
+def test_ac_019_default_capture_uses_exact_feature_warmup_horizon(monkeypatch):
+    """ATDD-RELEASE-PIPELINE-v1/AC-019: the production/default Kraken
+    source is constructed with the feature engine's exact declared warm-up
+    horizon; injected sources remain untouched.
+    """
+    versions = _instruments(1)
+    version = versions[0]
+    batches = {version.instrument_version_id: _batch(version, _observations(version))}
+    client = _RecordingClient()
+    publisher = FeatureBusPublisher(client, enabled=True, settings=_settings())
+    seen: dict[str, int | None] = {}
+
+    class _StubKrakenClient:
+        timeout_seconds = 1.0
+        deadline_monotonic = None
+
+    def _source_factory(client=None, *, cold_start_intervals=None):
+        seen["cold_start_intervals"] = cold_start_intervals
+        return _source(batches)
+
+    monkeypatch.setattr(
+        capture, "capture_kraken_client", lambda **kwargs: _StubKrakenClient()
+    )
+    monkeypatch.setattr(
+        capture,
+        "KrakenInstrumentProvider",
+        lambda registry=None, client=None: _provider(versions),
+    )
+    monkeypatch.setattr(capture, "kraken_minute_source", _source_factory)
+    monkeypatch.setattr(capture, "hydrate_instrument_version_registry", lambda: None)
+
+    summary = capture.capture_feature_bus_shadow(
+        settings=_settings(opip_feature_bus_capture_budget_seconds=45),
+        now=NOW,
+        publisher=publisher,
+        restore_continuity=lambda versions: ({}, {}, {}),
+    )
+
+    assert seen["cold_start_intervals"] == capture.MINIMUM_WARMUP_INTERVALS
+    assert summary.cycles == 1
+    assert len(client.snapshot_payloads()) == 1
 
 
 def test_ac_016_first_wave_boundary_equality_is_admissible(capsys):

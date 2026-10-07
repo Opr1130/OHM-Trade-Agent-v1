@@ -183,6 +183,26 @@ THEN:
 
 (f) no timeout, verifier, F5, cadence, scheduler, deploy, Paper-v2, Committee or authority change.
 
+AC-019:
+GIVEN:
+an EVIDENCE_SHADOW production qualification where continuity restoration completed and acquisition reached Phase B, but the first Feature Bus cold start inherited an oversized venue-history batch, the declared canonical-submit workload could not fit the unchanged materialization budget, the producer failed closed with MATERIALIZE_INCOMPLETE, and zero FeatureSnapshots/F5 evidence were produced
+
+WHEN:
+a production/default Feature Bus source has no restored source watermark for an instrument
+
+THEN:
+(a) the cold-start market request is bounded to exactly the feature engine's declared MINIMUM_WARMUP_INTERVALS ending at the current latest closed cutoff, derived from the engine constant rather than a duplicated number;
+
+(b) rows older than that warm-up floor are not admitted even if the venue returns more history than requested, so upstream behavior cannot silently inflate the canonical write workload;
+
+(c) the pass still executes exactly one current-cutoff Feature Bus cycle/snapshot for the instrument and never emits a backdated catch-up snapshot series;
+
+(d) once a real source watermark exists, the existing resumed tip/revision/correction semantics are unchanged;
+
+(e) the existing Phase-B submit-bound admission, absolute writer deadline, 45/50-second pass budget, 60-second cadence, runtime verifier, continuity semantics and fail-closed behavior are unchanged and are never weakened to force a cold start through;
+
+(f) no release-profile, F5, scheduler, deploy, Paper-v2, Committee, funded/live/exchange/order or other authority change is introduced.
+
 EXPLICITLY OUT OF SCOPE:
 - Activating TARGET_PAPER, Paper-v2, the Committee, or any funded/live/exchange/order authority
 - Deleting, rewriting or rescoping the historical ATDD increments that recorded the Feature Bus `off`
@@ -349,6 +369,8 @@ AC-018 -> tests/test_opip_feature_bus_continuity_batch.py::test_ac_018_historica
 AC-018 -> tests/test_opip_feature_bus_continuity_batch.py::test_ac_018_observer_receives_bounded_timing_attribution
 AC-018 -> tests/test_opip_feature_bus_continuity_batch.py::test_ac_018_observer_attributes_failed_restore_phase
 AC-018 -> tests/test_opip_r4_b2_shadow_capture.py::test_ac_018_default_capture_composes_batch_restore_observer_without_marker_collision
+AC-019 -> tests/test_opip_feature_bus_pr3_integrity.py::test_source_cold_start_horizon_bounds_request_and_admitted_history
+AC-019 -> tests/test_opip_r4_b2_shadow_capture.py::test_ac_019_default_capture_uses_exact_feature_warmup_horizon
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/services/release_profiles.py
@@ -465,6 +487,12 @@ AC-018 -> OHM-Trade-Agent-v1/app/opip/features/revision_ledger.py
 AC-018 -> OHM-Trade-Agent-v1/tests/test_opip_feature_bus_continuity_batch.py
 AC-018 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_shadow_capture.py
 AC-018 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
+AC-019 -> OHM-Trade-Agent-v1/app/jobs/capture_feature_bus_shadow.py
+AC-019 -> OHM-Trade-Agent-v1/app/opip/market/source.py
+AC-019 -> OHM-Trade-Agent-v1/app/services/opip_feature_bus_market_source.py
+AC-019 -> OHM-Trade-Agent-v1/tests/test_opip_feature_bus_pr3_integrity.py
+AC-019 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_shadow_capture.py
+AC-019 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
 
 DEFERRED DISCOVERIES:
 - `TARGET_PAPER` remains BLOCKED. Activating it (Paper-v2) requires the ATDD-R4-B2 AC-011 comparator evidence, F11 protection READY, legacy drain READY and explicit OWNER approval, and is a separate OWNER increment; this contract does not authorize it.
