@@ -176,7 +176,7 @@ def test_runtime_verification_rejects_blocked_target_paper(monkeypatch):
 
 
 def test_posture_failure_receipt_is_actionable(capsys):
-    """A posture failure after proven evidence reports stage, reason and evidence."""
+    """ATDD-RELEASE-PIPELINE-v1/AC-022: a protection posture failure reports the sanitized resolver reason with proven evidence."""
     error = release_runtime_verifier.ReleaseRuntimePostureError(
         "read-only protection health is not HEALTHY",
         reason_codes=("UNAVAILABLE", "EXPOSURE_COVERAGE_INCOMPLETE"),
@@ -199,6 +199,7 @@ def test_posture_failure_receipt_is_actionable(capsys):
 
 
 def test_non_protection_posture_failure_does_not_emit_protection_reason(capsys):
+    """ATDD-RELEASE-PIPELINE-v1/AC-022: non-protection posture failures never fabricate a protection-resolution reason."""
     error = release_runtime_verifier.ReleaseRuntimePostureError(
         "runtime modes do not match the allowlisted profile"
     )
