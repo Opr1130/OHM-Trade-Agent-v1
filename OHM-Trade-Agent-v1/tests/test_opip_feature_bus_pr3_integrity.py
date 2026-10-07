@@ -993,7 +993,18 @@ def test_source_cold_start_horizon_bounds_request_and_admitted_history():
     assert len(batch.observations) == MINIMUM_WARMUP_INTERVALS
     assert batch.observations[0].source_event_time == floor
     assert batch.observations[-1].source_event_time == CUTOFF - timedelta(minutes=1)
+    assert batch.watermark.last_ingestion_order == MINIMUM_WARMUP_INTERVALS
     assert batch.coverage is CoverageState.COMPLETE
+
+    resumed = source.fetch_through(
+        instrument,
+        watermark=batch.watermark,
+        now=CUTOFF,
+    )
+    tip_start = batch.watermark.through_utc - timedelta(seconds=60)
+    assert calls[-1] == int(tip_start.timestamp()) - 1
+    assert len(resumed.observations) == 1
+    assert resumed.observations[0].source_event_time == tip_start
 
 
 def test_source_coverage_incomplete_when_tip_window_has_gaps():
