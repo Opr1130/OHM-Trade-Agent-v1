@@ -63,6 +63,7 @@ from typing import Any, Callable
 from app.opip.canonical.bridge import resolve_writer_mode
 from app.opip.canonical.protocol import WriterDeadlineExceeded
 from app.opip.features.checkpoint_store import CheckpointDeadlineExceeded
+from app.opip.features.engine import MINIMUM_WARMUP_INTERVALS
 from app.opip.features.pipeline import (
     CycleIdentityMismatch,
     declared_cycle_submit_bound,
@@ -508,7 +509,15 @@ def capture_feature_bus_shadow(
             registry=registry, client=market_client
         )
     if source is None:
-        source = kraken_minute_source(market_client)
+        # On a true Feature Bus cold start there is no restored source watermark.
+        # Bound the Kraken history request to the engine's exact declared warm-up
+        # horizon so one prospective current-cutoff snapshot cannot inherit an
+        # unbounded venue-history write workload. Resumed watermark semantics are
+        # unchanged after the first checkpoint.
+        source = kraken_minute_source(
+            market_client,
+            cold_start_intervals=MINIMUM_WARMUP_INTERVALS,
+        )
 
     summary = FeatureBusCaptureSummary(mode=mode, enabled=True, inert=False)
     # Bind the setup deadline onto the writer client BEFORE any pre-acquisition
