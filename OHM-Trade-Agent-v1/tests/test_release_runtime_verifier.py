@@ -173,3 +173,21 @@ def test_runtime_verification_rejects_blocked_target_paper(monkeypatch):
             baseline={},
             ready_after=datetime(2026, 1, 1, tzinfo=timezone.utc),
         )
+
+
+def test_posture_failure_receipt_is_actionable(capsys):
+    """A posture failure after proven evidence reports stage, reason and evidence."""
+    error = release_runtime_verifier.ReleaseRuntimePostureError(
+        "read-only protection health is not HEALTHY",
+        reason_codes=("UNAVAILABLE", "EXPOSURE_COVERAGE_INCOMPLETE"),
+        evidence={"feature_snapshot_count": 4, "consecutive_60s_snapshots": True},
+    )
+
+    release_runtime_verifier._emit_failure_diagnostics(error)
+
+    out = capsys.readouterr().out
+    assert "OPIP_RELEASE_RUNTIME_FAILURE_STAGE=LIVE_POSTURE" in out
+    assert "OPIP_RELEASE_RUNTIME_FAILURE_REASON=read-only protection health is not HEALTHY" in out
+    assert "OPIP_RELEASE_RUNTIME_FAILURE_CODES=UNAVAILABLE,EXPOSURE_COVERAGE_INCOMPLETE" in out
+    assert "OPIP_RELEASE_FEATURE_SNAPSHOT_COUNT=4" in out
+    assert "OBSERVED_EVIDENCE=NONE" not in out
