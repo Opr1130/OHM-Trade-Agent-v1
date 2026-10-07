@@ -249,6 +249,7 @@ def kraken_minute_source(
     client: KrakenClient | None = None,
     *,
     interval_seconds: int = 60,
+    cold_start_intervals: int | None = None,
 ) -> PolledMinuteBarSource:
     """Pilot one-minute Kraken source. Manual measurement use only."""
     return PolledMinuteBarSource(
@@ -258,6 +259,7 @@ def kraken_minute_source(
         sequence_prefix=KRAKEN_OHLC_SEQUENCE_PREFIX,
         interval_seconds=interval_seconds,
         transport_errors=(KrakenAPIError,),
+        cold_start_intervals=cold_start_intervals,
     )
 
 
