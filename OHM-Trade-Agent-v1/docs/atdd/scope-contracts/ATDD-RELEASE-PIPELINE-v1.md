@@ -203,6 +203,24 @@ THEN:
 
 (f) no release-profile, F5, scheduler, deploy, Paper-v2, Committee, funded/live/exchange/order or other authority change is introduced.
 
+AC-021:
+GIVEN:
+an ordinary push to `main` produced failed workflow runs from optional/advisory CI signals that are not release gates -- the advisory quality-security jobs rendered RED on pre-existing findings because `continue-on-error` was job-scoped, and the optional external-review workflows (deepseek-quant-review, gemini-review, pr69-external-reviews, pr69-external-reviews-manual, pr69-external-reviews-repository-dispatch) failed at parse time on every push because a blank line inside a quoted shell body ended the `run: |` block scalar at column zero, and first-party actions still pinned deprecated Node 20 majors
+
+WHEN:
+the CI/CD advisory and optional signals are cleaned up
+
+THEN:
+(a) each advisory-only quality-security job (`ruff (advisory)`, `bandit (advisory)`, `pip-audit (advisory)`, `gitleaks (advisory)`) no longer carries job-level `continue-on-error`; only its scanner/finding step does, so a genuine checkout, Python-setup, dependency-installation or malformed-workflow failure still renders RED while an advisory finding leaves the job SUCCESS with the finding visible in the log;
+
+(b) the optional external-review workflows are valid workflow YAML and no longer run as unconditional push-to-main noise: the two push-triggered reviews are restricted to their explicit one-shot trigger path (`.github/ai-review-pr69.trigger`), the pr69 reviews remain only on their declared `pull_request_target`/`workflow_dispatch`/`repository_dispatch` triggers, and a missing optional review credential produces SKIPPED steps (recorded in `$GITHUB_OUTPUT`) rather than a FAILED check;
+
+(c) every first-party action reference (`actions/checkout`, `actions/setup-python`, `actions/upload-artifact`, `actions/download-artifact`) uses a Node 24-compatible major with its existing inputs preserved, so the runner never force-migrates a deprecated Node 20 action; runner OS and the informational `ubuntu-latest` migration notice are unchanged;
+
+(d) no required release gate is weakened or removed: the required checks `test`, `atdd scope` and `semgrep/ci` remain strict (no job-level `continue-on-error`, `semgrep ci` still runs failing), the `release architecture gate` and `release security gate (Bandit)` jobs remain strict, `quality-security` keeps read-only `contents` permission and gains no `pull_request_target` trigger, and the deploy control plane, release profiles, exact-SHA checks, owner approval, EVIDENCE_SHADOW/TARGET_PAPER semantics, runtime verifier, scheduler and rollback are unchanged;
+
+(e) the cleanup introduces no auto-merge, auto-deploy, second deploy plane, or trading/paper/funded/Committee/exchange/order authority, and `TARGET_PAPER` remains BLOCKED.
+
 EXPLICITLY OUT OF SCOPE:
 - Activating TARGET_PAPER, Paper-v2, the Committee, or any funded/live/exchange/order authority
 - Deleting, rewriting or rescoping the historical ATDD increments that recorded the Feature Bus `off`
@@ -371,6 +389,12 @@ AC-018 -> tests/test_opip_feature_bus_continuity_batch.py::test_ac_018_observer_
 AC-018 -> tests/test_opip_r4_b2_shadow_capture.py::test_ac_018_default_capture_composes_batch_restore_observer_without_marker_collision
 AC-019 -> tests/test_opip_feature_bus_pr3_integrity.py::test_source_cold_start_horizon_bounds_request_and_admitted_history
 AC-019 -> tests/test_opip_r4_b2_shadow_capture.py::test_ac_019_default_capture_uses_exact_feature_warmup_horizon
+AC-021 -> tests/test_opip_ci_advisory_hygiene_v1.py::test_ac_021_advisory_scanners_are_step_scoped_not_job_scoped
+AC-021 -> tests/test_opip_ci_advisory_hygiene_v1.py::test_ac_021_quality_security_keeps_read_only_permissions
+AC-021 -> tests/test_opip_ci_advisory_hygiene_v1.py::test_ac_021_required_release_gates_remain_strict
+AC-021 -> tests/test_opip_ci_advisory_hygiene_v1.py::test_ac_021_optional_review_workflows_parse_and_stop_push_noise
+AC-021 -> tests/test_opip_ci_advisory_hygiene_v1.py::test_ac_021_missing_optional_review_credential_skips_instead_of_failing
+AC-021 -> tests/test_opip_ci_advisory_hygiene_v1.py::test_ac_021_first_party_actions_use_node24_majors
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/services/release_profiles.py
@@ -493,6 +517,24 @@ AC-019 -> OHM-Trade-Agent-v1/app/services/opip_feature_bus_market_source.py
 AC-019 -> OHM-Trade-Agent-v1/tests/test_opip_feature_bus_pr3_integrity.py
 AC-019 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_shadow_capture.py
 AC-019 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
+AC-021 -> .github/workflows/quality-security.yml
+AC-021 -> .github/workflows/deepseek-quant-review.yml
+AC-021 -> .github/workflows/gemini-review.yml
+AC-021 -> .github/workflows/pr69-external-reviews.yml
+AC-021 -> .github/workflows/pr69-external-reviews-manual.yml
+AC-021 -> .github/workflows/pr69-external-reviews-repository-dispatch.yml
+AC-021 -> .github/workflows/pytest.yml
+AC-021 -> .github/workflows/semgrep.yml
+AC-021 -> .github/workflows/deploy-production.yml
+AC-021 -> .github/workflows/deploy-analytics.yml
+AC-021 -> .github/workflows/deploy-committee.yml
+AC-021 -> .github/workflows/deploy-learning.yml
+AC-021 -> .github/workflows/committee-shadow-activation.yml
+AC-021 -> .github/workflows/freqtrade-contract.yml
+AC-021 -> .github/workflows/opip-claude-code.yml
+AC-021 -> OHM-Trade-Agent-v1/tests/test_opip_ci_advisory_hygiene_v1.py
+AC-021 -> OHM-Trade-Agent-v1/tests/test_ai_execution_gateway.py
+AC-021 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
 
 DEFERRED DISCOVERIES:
 - `TARGET_PAPER` remains BLOCKED. Activating it (Paper-v2) requires the ATDD-R4-B2 AC-011 comparator evidence, F11 protection READY, legacy drain READY and explicit OWNER approval, and is a separate OWNER increment; this contract does not authorize it.

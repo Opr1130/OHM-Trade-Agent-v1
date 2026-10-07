@@ -140,7 +140,7 @@ jobs:
 
       - name: Check out exact approved release
         if: steps.command.outputs.sha != ''
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ steps.command.outputs.sha }}
           persist-credentials: false

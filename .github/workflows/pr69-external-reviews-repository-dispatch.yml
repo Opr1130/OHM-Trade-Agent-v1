@@ -18,7 +18,7 @@ jobs:
       GEMINI_MODEL: gemini-3.7-flash
     steps:
       - name: Checkout trusted review configuration
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: main
       - name: Validate Gemini secret
@@ -98,9 +98,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -f body="## Gemini Independent Review
-
-REVIEW_WORKFLOW_FAILED. Inspect the PR69 External AI Reviews Repository Dispatch run before relying on the Gemini gate." >/dev/null || true
+          gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+            -f body="## Gemini Independent Review — REVIEW_WORKFLOW_FAILED. Inspect the PR69 External AI Reviews Repository Dispatch run before relying on the Gemini gate." >/dev/null || true
 
   deepseek:
     runs-on: ubuntu-latest
@@ -110,7 +109,7 @@ REVIEW_WORKFLOW_FAILED. Inspect the PR69 External AI Reviews Repository Dispatch
       DEEPSEEK_MODEL: deepseek-v4-pro
     steps:
       - name: Checkout trusted review configuration
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: main
       - name: Validate DeepSeek secret
@@ -194,6 +193,5 @@ REVIEW_WORKFLOW_FAILED. Inspect the PR69 External AI Reviews Repository Dispatch
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -f body="## DeepSeek Quantitative Review
-
-REVIEW_WORKFLOW_FAILED. Inspect the PR69 External AI Reviews Repository Dispatch run before relying on the DeepSeek gate." >/dev/null || true
+          gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+            -f body="## DeepSeek Quantitative Review — REVIEW_WORKFLOW_FAILED. Inspect the PR69 External AI Reviews Repository Dispatch run before relying on the DeepSeek gate." >/dev/null || true

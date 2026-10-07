@@ -2,8 +2,12 @@ name: quality-security
 
 # Advisory-only quality and security scanners.
 # This workflow is intentionally separate from pytest.yml and must never
-# gate production/analytics deployment. Findings are reported; jobs use
-# continue-on-error so the layer stays non-blocking while logs stay visible.
+# gate production/analytics deployment. Findings are reported; each advisory
+# scanner step uses continue-on-error so the layer stays non-blocking while
+# logs stay visible. continue-on-error is deliberately STEP-scoped, not
+# job-scoped: a genuine workflow/infrastructure failure (checkout, Python
+# setup, dependency installation, malformed workflow) still renders RED,
+# while an advisory scanner finding leaves the job SUCCESS.
 
 on:
   pull_request:
@@ -18,13 +22,12 @@ jobs:
   ruff:
     name: ruff (advisory)
     runs-on: ubuntu-latest
-    continue-on-error: true
     defaults:
       run:
         working-directory: OHM-Trade-Agent-v1
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
           cache: pip
@@ -34,18 +37,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
       - name: Run Ruff (E/F, no E501)
+        continue-on-error: true
         run: ruff check app tools
 
   bandit:
     name: bandit (advisory)
     runs-on: ubuntu-latest
-    continue-on-error: true
     defaults:
       run:
         working-directory: OHM-Trade-Agent-v1
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
           cache: pip
@@ -55,18 +58,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
       - name: Run Bandit on app/
+        continue-on-error: true
         run: bandit -r app -c pyproject.toml -f txt
 
   pip-audit:
     name: pip-audit (advisory)
     runs-on: ubuntu-latest
-    continue-on-error: true
     defaults:
       run:
         working-directory: OHM-Trade-Agent-v1
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
           cache: pip
@@ -78,14 +81,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
       - name: Audit runtime requirements.txt
+        continue-on-error: true
         run: pip-audit -r requirements.txt
 
   gitleaks:
     name: gitleaks (advisory)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Install Gitleaks
@@ -99,4 +102,5 @@ jobs:
           sudo mv gitleaks /usr/local/bin/gitleaks
           gitleaks version
       - name: Detect secrets
+        continue-on-error: true
         run: gitleaks detect --source . --config .gitleaks.toml --verbose --redact
