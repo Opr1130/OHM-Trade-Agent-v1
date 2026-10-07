@@ -62,17 +62,20 @@ from typing import Any, Callable
 
 from app.opip.canonical.bridge import resolve_writer_mode
 from app.opip.canonical.protocol import WriterDeadlineExceeded
+from app.opip.features.checkpoint_store import CheckpointDeadlineExceeded
 from app.opip.features.pipeline import (
     CycleIdentityMismatch,
     declared_cycle_submit_bound,
     run_cycle,
 )
+from app.opip.features.revision_ledger import RevisionLedgerDeadlineExceeded
 from app.opip.features.publisher import (
     FeatureBusPublisher,
     resolve_feature_bus_mode,
 )
 from app.opip.market.aggregates import grid_floor
 from app.opip.market.instrument_version_store import hydrate_instrument_version_registry
+from app.services.kraken_transport import KrakenTransportDeadlineExceeded
 from app.services.opip_feature_bus_market_source import (
     KRAKEN_OHLC_SOURCE_LABEL,
     KrakenInstrumentProvider,
@@ -295,6 +298,53 @@ def _inert_summary(mode: str, reason: str) -> FeatureBusCaptureSummary:
     )
 
 
+def _cause_chain_contains(error: BaseException, target: type[BaseException]) -> bool:
+    """Bounded walk of ``__cause__``/``__context__`` for a typed exception.
+
+    ``KrakenClient._get`` re-raises ``KrakenTransportDeadlineExceeded`` as
+    ``KrakenAPIError`` with the typed exception as ``__cause__``, so the typed
+    deadline is only visible through the chain. Bounded so a pathological cycle
+    cannot hang the producer. Observability only: it grants no authority.
+    """
+    link: BaseException | None = error
+    for _ in range(8):
+        if link is None:
+            return False
+        if isinstance(link, target):
+            return True
+        link = link.__cause__ or link.__context__
+    return False
+
+
+def _setup_deadline_exhausted(
+    summary: FeatureBusCaptureSummary,
+    *,
+    phase: str,
+    setup_deadline: float,
+    tick: Callable[[], float],
+    started: float,
+) -> None:
+    """Record a fail-closed setup-budget exhaustion disposition.
+
+    Called when a mandatory pre-acquisition phase could not complete inside the
+    setup envelope (``acquisition_deadline - wave_bound``). The caller returns
+    immediately afterwards, BEFORE acquisition, so ``fetch_through`` is never
+    called and no snapshot is fabricated. Observability and fail-closed only.
+    """
+    summary.budget_exhausted = True
+    summary.errors.append(
+        f"setup budget exhausted during {phase}; first acquisition wave cannot be admitted"
+    )
+    summary.elapsed_seconds = tick() - started
+    emit_capture_marker(
+        "setup_deadline_exhausted",
+        where=phase,
+        reason="INSUFFICIENT_SETUP_BUDGET",
+        setup_remaining_seconds=round(setup_deadline - tick(), 3),
+        elapsed_seconds=round(summary.elapsed_seconds, 3),
+    )
+
+
 def capture_feature_bus_shadow(
     *,
     settings: Any = None,
@@ -365,6 +415,27 @@ def capture_feature_bus_shadow(
         CAPTURE_MATERIALIZE_RESERVE_SECONDS, max(0.0, budget - PER_REQUEST_BUDGET_SECONDS)
     )
     acquisition_deadline = deadline - materialize_reserve
+    #: Declared worst-case wall clock of ONE acquisition request (all attempts,
+    #: all retry backoff, all rate-limiter waiting). No upstream operation may
+    #: start when its worst-case bounded cost cannot fit the remaining budget.
+    #: Resolved BEFORE the setup envelope so the envelope is derived from the
+    #: ACTUAL bound the acquisition gate will use, not from a duplicated constant:
+    #: retry configuration and the minimum request-timeout floor can make the true
+    #: declared worst case larger than ``PER_REQUEST_BUDGET_SECONDS``.
+    wave_bound = PER_REQUEST_BUDGET_SECONDS
+    if instrument_provider is None or source is None:
+        wave_bound = capture_worst_case_request_seconds(
+            wave_budget_seconds=PER_REQUEST_BUDGET_SECONDS
+        )
+    #: The setup envelope: pre-acquisition work (refresh, publication, continuity)
+    #: may consume at most ``acquisition_deadline - wave_bound``, so the FIRST
+    #: bounded acquisition wave is always still admissible when setup finishes.
+    #: Derived from the SAME ``wave_bound`` the acquisition gate uses, so the two
+    #: can never drift. This is the budget architecture the pass previously left
+    #: implicit: without it, setup could silently consume the first wave's reserve
+    #: and the shortage was only discovered at the acquisition gate, after setup
+    #: had already run.
+    setup_deadline = acquisition_deadline - wave_bound
     moment = now or datetime.now(timezone.utc)
     now_utc = wall_clock or (lambda: datetime.now(timezone.utc))
     cycle_cutoff = grid_floor(moment)
@@ -381,31 +452,47 @@ def capture_feature_bus_shadow(
     if restore_continuity is None:
         from app.jobs.run_feature_bus_pilot import restore_pilot_continuity
 
-        restore_continuity = restore_pilot_continuity
-    #: Declared worst-case wall clock of ONE acquisition request (all attempts,
-    #: all retry backoff, all rate-limiter waiting). No upstream operation may
-    #: start when its worst-case bounded cost cannot fit the remaining budget.
-    wave_bound = PER_REQUEST_BUDGET_SECONDS
+        # Default production continuity is deadline-aware: the adapter captures
+        # the setup deadline AND the same clock domain that produced it, so the
+        # durable reads' SQLite progress handler compares against the SAME clock.
+        # Injected one-argument callables are untouched.
+        def restore_continuity(versions: Any) -> Any:  # type: ignore[misc]
+            return restore_pilot_continuity(
+                versions,
+                deadline_monotonic=setup_deadline,
+                clock=tick,
+            )
+    market_client = None
     if instrument_provider is None or source is None:
         # ONE pass-scoped client so the provider and the minute source share the
         # pass-bounded request timeout, the pass acquisition deadline and the
         # shared rate limiter. Without this a single stalled public request could
         # consume the whole pass budget through transport retries and the producer
         # would be killed before recording any disposition.
-        wave_bound = capture_worst_case_request_seconds(
-            wave_budget_seconds=PER_REQUEST_BUDGET_SECONDS
-        )
+        #
+        # The setup envelope is STRICTER than the acquisition deadline, so the
+        # pass-scoped client is armed with the setup deadline for the
+        # pre-acquisition phases and re-armed with the acquisition deadline
+        # immediately before Phase A. A pre-acquisition request can therefore
+        # never consume the first wave's reserve.
         market_client = capture_kraken_client(
             wave_budget_seconds=PER_REQUEST_BUDGET_SECONDS,
-            deadline_monotonic=acquisition_deadline,
+            deadline_monotonic=setup_deadline,
         )
         emit_capture_marker(
             "budget_declared",
             wave_bound_seconds=round(wave_bound, 3),
             acquisition_budget_seconds=round(acquisition_deadline - started, 3),
+            setup_budget_seconds=round(setup_deadline - started, 3),
             materialize_reserve_seconds=round(materialize_reserve, 3),
             request_timeout_seconds=round(market_client.timeout_seconds, 3),
         )
+    #: Provenance flag: refresh is setup-budget-classifiable ONLY when the
+    #: provider is the locally created one backed by the pass-scoped client that
+    #: was explicitly armed with ``setup_deadline``. An INJECTED provider's
+    #: deadline provenance is not ours, so its chained Kraken deadline keeps
+    #: ordinary provider-failure semantics.
+    refresh_setup_bound = instrument_provider is None
     if instrument_provider is None:
         registry = hydrate_instrument_version_registry()
         instrument_provider = KrakenInstrumentProvider(
@@ -415,10 +502,41 @@ def capture_feature_bus_shadow(
         source = kraken_minute_source(market_client)
 
     summary = FeatureBusCaptureSummary(mode=mode, enabled=True, inert=False)
+    # Bind the setup deadline onto the writer client BEFORE any pre-acquisition
+    # phase, so a canonical submit during publication is bounded by the setup
+    # envelope rather than the (later) materialize deadline. Phase B re-binds the
+    # materialize deadline below, exactly as before.
+    #
+    # Provenance flag: a ``WriterDeadlineExceeded`` outcome is setup-budget
+    # classifiable ONLY when the bind actually took effect on the client the
+    # publisher will submit through. An injected/unbound client that merely
+    # returns that error code keeps ordinary publication-failure semantics,
+    # because we cannot prove the cut belongs to OUR setup deadline.
+    writer_setup_deadline_bound = (
+        _bind_writer_deadline(publisher, setup_deadline) is not None
+    )
     emit_capture_marker("refresh_universe")
+    refresh_started = tick()
     try:
         universe = instrument_provider.refresh(observed_at_utc=moment)
     except Exception as exc:  # noqa: BLE001 - an unavailable source must not fabricate
+        # A typed Kraken deadline during refresh is setup-budget exhaustion ONLY
+        # when refresh is backed by the locally created client we armed with
+        # ``setup_deadline``. Classified by the typed cause chain, NOT by the
+        # clock: a fail-fast transport may raise before the literal deadline when
+        # the remaining budget cannot safely start an attempt. An injected
+        # provider's chained deadline is not ours and keeps ordinary semantics.
+        if refresh_setup_bound and _cause_chain_contains(
+            exc, KrakenTransportDeadlineExceeded
+        ):
+            _setup_deadline_exhausted(
+                summary,
+                phase="refresh_universe",
+                setup_deadline=setup_deadline,
+                tick=tick,
+                started=started,
+            )
+            return summary
         summary.errors.append(f"instrument refresh failed: {type(exc).__name__}: {exc}")
         summary.elapsed_seconds = tick() - started
         emit_capture_marker(
@@ -429,21 +547,46 @@ def capture_feature_bus_shadow(
             error=f"{type(exc).__name__}",
         )
         return summary
-    emit_capture_marker("universe_ready", instruments=len(universe))
+    emit_capture_marker(
+        "universe_ready",
+        instruments=len(universe),
+        phase_seconds=round(tick() - refresh_started, 3),
+        elapsed_seconds=round(tick() - started, 3),
+        budget_remaining=round(acquisition_deadline - tick(), 3),
+        setup_remaining=round(setup_deadline - tick(), 3),
+    )
 
     selected = list(universe[:bounded])
     summary.instruments = len(selected)
 
     emit_capture_marker("publish_instrument_versions", count=len(selected))
+    publish_started = tick()
     committed_versions = []
     for version in selected:
         outcome = publisher.publish_instrument_version(version)
         if outcome.committed:
             committed_versions.append(version)
-        else:
-            summary.errors.append(
-                f"instrument version not committed: {outcome.status} {outcome.error_code}"
+            continue
+        # A writer deadline cut while the writer is setup-bound is setup-budget
+        # exhaustion, not an ordinary publication failure. Classified by the
+        # typed error code AND the bind provenance, NOT by the clock: an
+        # injected/unbound client that merely returns this error code keeps
+        # ordinary publication-failure semantics.
+        if (
+            writer_setup_deadline_bound
+            and str(outcome.error_code) == WRITER_DEADLINE_ERROR_NAME
+        ):
+            _setup_deadline_exhausted(
+                summary,
+                phase="publish_instrument_versions",
+                setup_deadline=setup_deadline,
+                tick=tick,
+                started=started,
             )
+            return summary
+        summary.errors.append(
+            f"instrument version not committed: {outcome.status} {outcome.error_code}"
+        )
     summary.committed_instrument_versions = len(committed_versions)
 
     if not committed_versions:
@@ -458,15 +601,38 @@ def capture_feature_bus_shadow(
         )
         return summary
     emit_capture_marker(
-        "instrument_versions_committed", committed=len(committed_versions)
+        "instrument_versions_committed",
+        committed=len(committed_versions),
+        phase_seconds=round(tick() - publish_started, 3),
+        elapsed_seconds=round(tick() - started, 3),
+        budget_remaining=round(acquisition_deadline - tick(), 3),
+        setup_remaining=round(setup_deadline - tick(), 3),
     )
 
     emit_capture_marker("restore_continuity", instruments=len(committed_versions))
-    restored_states, restored_ledgers, source_watermarks = restore_continuity(
-        committed_versions
-    )
+    continuity_started = tick()
+    try:
+        restored_states, restored_ledgers, source_watermarks = restore_continuity(
+            committed_versions
+        )
+    except (CheckpointDeadlineExceeded, RevisionLedgerDeadlineExceeded):
+        # A durable read that could not finish inside the setup envelope is
+        # setup-budget exhaustion. Fail closed BEFORE acquisition: no partial
+        # continuity is used and fetch_through is never called.
+        _setup_deadline_exhausted(
+            summary,
+            phase="restore_continuity",
+            setup_deadline=setup_deadline,
+            tick=tick,
+            started=started,
+        )
+        return summary
     emit_capture_marker(
-        "continuity_restored", elapsed_seconds=round(tick() - started, 3)
+        "continuity_restored",
+        phase_seconds=round(tick() - continuity_started, 3),
+        elapsed_seconds=round(tick() - started, 3),
+        budget_remaining=round(acquisition_deadline - tick(), 3),
+        setup_remaining=round(setup_deadline - tick(), 3),
     )
 
     # Phase A - bounded-concurrent acquisition. Each target instrument needs
@@ -487,10 +653,18 @@ def capture_feature_bus_shadow(
             now=cycle_cutoff,
         )
 
+    # Setup is complete and within its envelope: re-arm the pass-scoped client
+    # with the acquisition deadline so Phase A may use the full acquisition
+    # window. Only the locally created client is re-armed; an injected
+    # provider/source path never creates one. The existing first-wave gate below
+    # remains the second defensive check and is unchanged.
+    if market_client is not None:
+        market_client.deadline_monotonic = acquisition_deadline
     emit_capture_marker(
         "acquire",
         instruments=len(committed_versions),
         concurrency=workers,
+        pre_acquisition_seconds=round(tick() - started, 3),
         budget_remaining=round(acquisition_deadline - tick(), 3),
         wave_bound_seconds=round(wave_bound, 3),
     )

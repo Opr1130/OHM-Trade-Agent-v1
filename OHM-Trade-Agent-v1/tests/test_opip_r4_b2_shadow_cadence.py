@@ -245,9 +245,21 @@ class _ExpiringDeadlineClient(_RecordingClient):
     """A persistent writer that enforces the ABSOLUTE deadline across submits.
 
     Models the real ``CanonicalWriterClient``: an accepted submit spends real wall
-    clock out of the SAME Phase-B window, and once the bound deadline has elapsed
-    NO further submit can start -- it raises the explicit deadline-cut exception.
+    clock out of the SAME window it belongs to, and once the bound deadline has
+    elapsed NO further submit can start -- it raises the explicit deadline-cut
+    exception.
+
+    The pass binds TWO deadlines: the SETUP deadline for the pre-acquisition
+    instrument-version publications, then the Phase-B deadline for materialization.
+    Setup-bound submits are FAST (they do not advance the scripted overrun), so a
+    healthy setup leaves Phase B with positive time; Phase-B submits are SLOW (they
+    advance by ``overrun``), so the first accepted Phase-B submit can cross the
+    Phase-B deadline and force a subsequent submit to refuse.
     """
+
+    #: The pre-Phase-B institutional submit: published before any materialization
+    #: work, and therefore bound by the SETUP deadline, not the Phase-B deadline.
+    _NON_MATERIALIZE_EVENT = "market.instrument_version.recorded"
 
     def __init__(self, *, clock, advance, overrun):
         super().__init__()
@@ -257,20 +269,28 @@ class _ExpiringDeadlineClient(_RecordingClient):
         self._overrun = overrun
         self.clock_get = clock
         self.refused_after_deadline = 0
+        self.bind_calls: list[float] = []
 
     def bind_deadline(self, deadline_monotonic):
+        self.bind_calls.append(deadline_monotonic)
         self.deadline_monotonic = deadline_monotonic
         return deadline_monotonic
 
     def submit(self, intent):
         deadline = self.deadline_monotonic
+        is_setup_submit = (
+            str(getattr(intent, "event_type", "")) == self._NON_MATERIALIZE_EVENT
+        )
         if deadline is not None:
             if self.clock_get() >= deadline:
                 self.refused_after_deadline += 1
                 raise canonical_protocol.WriterDeadlineExceeded(
-                    "Phase-B absolute deadline elapsed before submit"
+                    "absolute deadline elapsed before submit"
                 )
-            self._advance(self._overrun)
+            # Setup-bound submits are fast: they must not consume the Phase-B
+            # window. Only Phase-B submits pay the scripted overrun.
+            if not is_setup_submit:
+                self._advance(self._overrun)
         return super().submit(intent)
 
 
@@ -1243,7 +1263,7 @@ def test_ac_020_no_deadline_roundtrip_keeps_the_full_per_operation_timeout(monke
 
 
 def test_ac_020_phase_b_binds_one_absolute_deadline_shared_by_every_submit():
-    """ATDD-R4-B2-controlled-paper-activation/AC-020 and ATDD-RELEASE-PIPELINE-v1/AC-017: Phase B binds exactly ONE absolute wall-clock deadline onto the persistent writer client, so every canonical submit of every cycle inherits only the time REMAINING in the original Phase-B window rather than being handed a fresh per-submit budget."""
+    """ATDD-R4-B2-controlled-paper-activation/AC-020 and ATDD-RELEASE-PIPELINE-v1/AC-017: the pass binds exactly TWO absolute wall-clock deadlines onto the persistent writer client -- ONE setup deadline for the pre-acquisition instrument-version publications and ONE Phase-B deadline for materialization -- so every canonical submit of every cycle inherits only the time REMAINING in the window it belongs to rather than being handed a fresh per-submit budget."""
     versions = [_instrument(i) for i in range(2)]
     batches = {
         version.instrument_version_id: _batch(version, _observations(version))
@@ -1268,17 +1288,36 @@ def test_ac_020_phase_b_binds_one_absolute_deadline_shared_by_every_submit():
 
     assert summary.cycles == 2
     assert summary.materialize_incomplete is False
-    # Bound EXACTLY once, to the pass-level ABSOLUTE Phase-B deadline.
-    assert client.bind_calls == [pytest.approx(budget)]
-    # Pre-Phase-B instrument-version publishes carry no materialize deadline ...
-    assert client.submit_deadlines[0] is None
-    assert any(deadline is None for deadline in client.submit_deadlines)
-    # ... while EVERY Phase-B submit of BOTH cycles shares the ONE deadline. A fresh
-    # per-submit budget would move the deadline; inherited remaining time cannot.
-    materialize = [deadline for deadline in client.submit_deadlines if deadline is not None]
+    # budget=45 -> materialize reserve=10, acquisition deadline=35, wave bound=15,
+    # setup deadline=20. The pass binds the SETUP deadline before publication and
+    # then re-binds the Phase-B deadline before materialization: exactly two binds.
+    setup_deadline = 20.0
+    materialize_deadline = budget
+    assert client.bind_calls == [
+        pytest.approx(setup_deadline),
+        pytest.approx(materialize_deadline),
+    ]
+    # The instrument-version setup publications observe the SETUP deadline ...
+    setup_submits = [
+        deadline
+        for deadline in client.submit_deadlines
+        if deadline is not None and deadline == pytest.approx(setup_deadline)
+    ]
+    assert setup_submits, "setup-bound instrument-version submits must observe the setup deadline"
+    # ... while EVERY Phase-B submit of BOTH cycles shares the ONE Phase-B deadline.
+    # A fresh per-submit budget would move the deadline; inherited remaining time
+    # cannot.
+    materialize = [
+        deadline
+        for deadline in client.submit_deadlines
+        if deadline is not None and deadline == pytest.approx(materialize_deadline)
+    ]
     assert materialize
     assert len(set(materialize)) == 1
-    assert all(deadline == pytest.approx(budget) for deadline in materialize)
+    assert all(deadline == pytest.approx(materialize_deadline) for deadline in materialize)
+    # Phase B binds exactly ONCE to the Phase-B deadline: it is never recreated per
+    # submit.
+    assert client.bind_calls.count(pytest.approx(materialize_deadline)) == 1
 
 
 def test_ac_020_absolute_deadline_cut_emits_a_durable_materialize_incomplete(monkeypatch):
@@ -1306,11 +1345,14 @@ def test_ac_020_absolute_deadline_cut_emits_a_durable_materialize_incomplete(mon
             return batches[version.instrument_version_id]
 
     lines = _record_markers(monkeypatch)
-    budget = 20.0
-    # Phase B starts with 16s left (admitted), then the FIRST accepted submit spends
-    # 20s of wall clock -- a slow writer's roundtrip -- so the absolute deadline has
-    # elapsed by the next submit, which must therefore refuse to start.
-    client = _ExpiringDeadlineClient(clock=_clock, advance=_advance, overrun=20.0)
+    # budget=45 -> materialize reserve=10, acquisition deadline=35, wave bound=15,
+    # setup deadline=20, materialize deadline=45. Two sequential acquisitions at
+    # +4s each leave Phase B starting around t=8 with the full Phase-B window.
+    budget = 45.0
+    # The FIRST accepted Phase-B submit spends 50s of wall clock -- a slow writer's
+    # roundtrip -- so the absolute Phase-B deadline has elapsed by the next submit,
+    # which must therefore refuse to start.
+    client = _ExpiringDeadlineClient(clock=_clock, advance=_advance, overrun=50.0)
     publisher = FeatureBusPublisher(client, enabled=True, settings=_settings())
     summary = capture.capture_feature_bus_shadow(
         settings=_settings(
@@ -1327,9 +1369,14 @@ def test_ac_020_absolute_deadline_cut_emits_a_durable_materialize_incomplete(mon
 
     observations = _observations(versions[0])
     submit_bound = declared_cycle_submit_bound(len(observations))
+    # The pass bound the SETUP deadline before publication and the Phase-B deadline
+    # before materialization: exactly two binds, in that order.
+    assert client.bind_calls == [pytest.approx(20.0), pytest.approx(budget)]
     # The admission decision really did admit this cycle: the remaining Phase-B
-    # window covered a meaningful share per declared submit.
-    assert (budget - 4.0) / submit_bound >= capture.CAPTURE_MATERIALIZE_MIN_WRITE_SECONDS
+    # window (budget minus the two +4s acquisitions) covered a meaningful share per
+    # declared submit.
+    remaining_at_phase_b = budget - 8.0
+    assert remaining_at_phase_b / submit_bound >= capture.CAPTURE_MATERIALIZE_MIN_WRITE_SECONDS
     assert client.timeout < 30.0
     # The absolute deadline then refused at least one canonical submit.
     assert client.refused_after_deadline >= 1

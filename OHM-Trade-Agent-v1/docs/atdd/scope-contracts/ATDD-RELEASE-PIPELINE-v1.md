@@ -398,6 +398,9 @@ AC-016 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.
 AC-017 -> OHM-Trade-Agent-v1/app/exchanges/kraken.py
 AC-017 -> OHM-Trade-Agent-v1/app/jobs/capture_feasibility_evidence_shadow.py
 AC-017 -> OHM-Trade-Agent-v1/app/jobs/capture_feature_bus_shadow.py
+AC-017 -> OHM-Trade-Agent-v1/app/jobs/run_feature_bus_pilot.py
+AC-017 -> OHM-Trade-Agent-v1/app/opip/features/checkpoint_store.py
+AC-017 -> OHM-Trade-Agent-v1/app/opip/features/revision_ledger.py
 AC-017 -> OHM-Trade-Agent-v1/app/opip/canonical/client.py
 AC-017 -> OHM-Trade-Agent-v1/app/opip/canonical/protocol.py
 AC-017 -> OHM-Trade-Agent-v1/app/opip/features/pipeline.py

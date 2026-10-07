@@ -312,6 +312,632 @@ def test_ac_016_configured_limit_and_budget_reach_capture():
     assert summary.cycles == 2
 
 
+def test_ac_016_pre_acquisition_phases_are_independently_attributable(capsys):
+    """ATDD-R4-B2-controlled-paper-activation/AC-016: each pre-acquisition phase's wall-clock cost is attributable on its own completion marker, so a production DEADLINE_EXHAUSTED pass can name which phase consumed the setup allowance."""
+    versions = _instruments(1)
+    version = versions[0]
+    batches = {version.instrument_version_id: _batch(version, _observations(version))}
+    client = _RecordingClient()
+    publisher = FeatureBusPublisher(client, enabled=True, settings=_settings())
+
+    # Deterministic monotonic clock. ``tick()`` only READS the current value; the
+    # phase stubs ADVANCE it explicitly for the phase they own. This keeps the
+    # repeated telemetry reads (phase_seconds, elapsed_seconds, budget_remaining)
+    # observational and deterministic: refresh=2s, publish=3s, continuity=4s.
+    clock = {"value": 0.0}
+
+    def _clock():
+        return clock["value"]
+
+    class _AdvancingProvider:
+        def refresh(self, *, observed_at_utc):
+            clock["value"] += 2.0
+            return list(versions)
+
+    class _AdvancingPublisher:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def publish_instrument_version(self, version):
+            clock["value"] += 3.0
+            return self._inner.publish_instrument_version(version)
+
+        def summary(self):
+            return self._inner.summary()
+
+        def resolved_writer_client(self):
+            return self._inner.resolved_writer_client()
+
+        def __getattr__(self, name):
+            # Transparent delegation for every other publisher operation (e.g.
+            # the Phase-B ``run_cycle`` publish path), so the wrapper is a
+            # faithful FeatureBusPublisher everywhere except the timed
+            # instrument-version publication above.
+            return getattr(self._inner, name)
+
+    def _advancing_restore(versions):
+        clock["value"] += 4.0
+        return ({}, {}, {})
+
+    summary = capture.capture_feature_bus_shadow(
+        settings=_settings(),
+        now=NOW,
+        publisher=_AdvancingPublisher(publisher),
+        instrument_provider=_AdvancingProvider(),
+        source=_source(batches),
+        restore_continuity=_advancing_restore,
+        clock=_clock,
+    )
+    assert summary.budget_exhausted is False
+    out = capsys.readouterr().out
+    # Each phase's completion marker carries its own phase_seconds.
+    assert "OPIP_FEATURE_BUS_CAPTURE_PHASE=universe_ready" in out
+    assert "phase_seconds=2.0" in out
+    assert "OPIP_FEATURE_BUS_CAPTURE_PHASE=instrument_versions_committed" in out
+    assert "phase_seconds=3.0" in out
+    assert "OPIP_FEATURE_BUS_CAPTURE_PHASE=continuity_restored" in out
+    assert "phase_seconds=4.0" in out
+    # The acquire marker exposes the total pre-acquisition cost.
+    assert "OPIP_FEATURE_BUS_CAPTURE_PHASE=acquire" in out
+    assert "pre_acquisition_seconds=9.0" in out
+
+
+def test_ac_016_pre_acquisition_delay_rejects_first_wave(capsys):
+    """ATDD-R4-B2-controlled-paper-activation/AC-016: a pre-acquisition delay that consumes the setup allowance makes the EXISTING first-wave gate reject acquisition -- no fetch, no snapshot, explicit budget-exhausted evidence, and telemetry names the consuming phase.
+
+    This regression EXPLICITLY configures the 45-second production budget (it is
+    NOT the implicit test default) so the arithmetic models the target production
+    case exactly:
+
+        budget = 45
+        materialize reserve = 10
+        acquisition_deadline = started + 35
+        pre-acquisition elapsed = 25
+        remaining = 35 - 25 = 10
+        wave_bound = 15
+        10 < 15  =>  the existing gate rejects the first wave
+
+    The gate is strict ``<``, so ``remaining == wave_bound`` would be admitted;
+    this test deliberately lands strictly below it.
+    """
+    versions = _instruments(2)
+    v0, v1 = versions
+    batches = {
+        v0.instrument_version_id: _batch(v0, _observations(v0)),
+        v1.instrument_version_id: _batch(v1, _observations(v1)),
+    }
+    client = _RecordingClient()
+    publisher = FeatureBusPublisher(client, enabled=True, settings=_settings())
+
+    fetch_calls = []
+
+    class _SpySource:
+        venue = "kraken"
+        source_label = "kraken_ohlc"
+        interval_seconds = 60
+
+        def fetch_through(self, version, *, watermark, now):
+            fetch_calls.append(version.instrument_version_id)
+            return batches[version.instrument_version_id]
+
+    # Explicitly configure the 45-second production budget. ``tick()`` only READS
+    # the current value; the stubs ADVANCE it, so the delay is attributable to a
+    # named phase.
+    clock = {"value": 0.0}
+
+    def _clock():
+        return clock["value"]
+
+    class _SlowProvider:
+        def refresh(self, *, observed_at_utc):
+            clock["value"] += 25.0
+            return list(versions)
+
+    summary = capture.capture_feature_bus_shadow(
+        settings=_settings(opip_feature_bus_capture_budget_seconds=45),
+        now=NOW,
+        publisher=publisher,
+        instrument_provider=_SlowProvider(),
+        source=_SpySource(),
+        restore_continuity=lambda versions: ({}, {}, {}),
+        clock=_clock,
+    )
+    # The existing first-wave gate rejected acquisition: nothing was fetched.
+    assert fetch_calls == []
+    assert summary.fetched == 0
+    assert summary.cycles == 0
+    assert summary.source_errors == 0
+    assert summary.budget_exhausted is True
+    # No FeatureSnapshot was fabricated.
+    assert client.snapshot_payloads() == []
+    out = capsys.readouterr().out
+    # Telemetry attributes the delay to the refresh phase and names the rejected wave.
+    assert "OPIP_FEATURE_BUS_CAPTURE_PHASE=universe_ready" in out
+    assert "phase_seconds=25.0" in out
+    assert "OPIP_FEATURE_BUS_CAPTURE_PHASE=acquire" in out
+    assert "pre_acquisition_seconds=25.0" in out
+    assert "budget_remaining=10.0" in out
+    assert "wave_bound_seconds=15.0" in out
+    assert "OPIP_FEATURE_BUS_CAPTURE_PHASE=deadline_exhausted" in out
+    assert "reason=INSUFFICIENT_ACQUISITION_BUDGET" in out
+
+
+def test_ac_016_healthy_setup_within_envelope_reaches_acquisition(capsys):
+    """ATDD-R4-B2-controlled-paper-activation/AC-016: setup that stays inside its envelope (acquisition_deadline - wave_bound) still reaches acquisition and materializes normally."""
+    versions = _instruments(1)
+    version = versions[0]
+    batches = {version.instrument_version_id: _batch(version, _observations(version))}
+    client = _RecordingClient()
+    publisher = FeatureBusPublisher(client, enabled=True, settings=_settings())
+
+    clock = {"value": 0.0}
+
+    def _clock():
+        return clock["value"]
+
+    class _AdvancingProvider:
+        def refresh(self, *, observed_at_utc):
+            clock["value"] += 2.0
+            return list(versions)
+
+    class _AdvancingPublisher:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def publish_instrument_version(self, version):
+            clock["value"] += 3.0
+            return self._inner.publish_instrument_version(version)
+
+        def summary(self):
+            return self._inner.summary()
+
+        def resolved_writer_client(self):
+            return self._inner.resolved_writer_client()
+
+        def __getattr__(self, name):
+            # Transparent delegation for every other publisher operation (e.g.
+            # the Phase-B ``run_cycle`` publish path), so the wrapper is a
+            # faithful FeatureBusPublisher everywhere except the timed
+            # instrument-version publication above.
+            return getattr(self._inner, name)
+
+    def _advancing_restore(versions):
+        clock["value"] += 4.0
+        return ({}, {}, {})
+
+    summary = capture.capture_feature_bus_shadow(
+        settings=_settings(opip_feature_bus_capture_budget_seconds=45),
+        now=NOW,
+        publisher=_AdvancingPublisher(publisher),
+        instrument_provider=_AdvancingProvider(),
+        source=_source(batches),
+        restore_continuity=_advancing_restore,
+        clock=_clock,
+    )
+    # 9s setup < 20s envelope: acquisition proceeds and materializes.
+    assert summary.budget_exhausted is False
+    assert summary.cycles == 1
+    assert len(client.snapshot_payloads()) == 1
+    out = capsys.readouterr().out
+    assert "OPIP_FEATURE_BUS_CAPTURE_PHASE=setup_deadline_exhausted" not in out
+
+
+def test_ac_016_setup_bound_refresh_deadline_is_setup_budget_exhaustion(
+    monkeypatch, capsys
+):
+    """ATDD-R4-B2-controlled-paper-activation/AC-016: a typed Kraken deadline during a SETUP-BOUND refresh (locally created client armed with setup_deadline) is classified as setup-budget exhaustion -- publication and acquisition are never entered, no snapshot is fabricated."""
+    from app.services.kraken_transport import KrakenTransportDeadlineExceeded
+
+    versions = _instruments(1)
+    version = versions[0]
+    batches = {version.instrument_version_id: _batch(version, _observations(version))}
+    client = _RecordingClient()
+    publisher = FeatureBusPublisher(client, enabled=True, settings=_settings())
+
+    fetch_calls = []
+
+    class _SpySource:
+        venue = "kraken"
+        source_label = "kraken_ohlc"
+        interval_seconds = 60
+
+        def fetch_through(self, version, *, watermark, now):
+            fetch_calls.append(version.instrument_version_id)
+            return batches[version.instrument_version_id]
+
+    class _DeadlineProvider:
+        def refresh(self, *, observed_at_utc):
+            # Mirrors KrakenClient._get: the typed deadline is re-raised as a
+            # generic error with the typed exception as __cause__.
+            try:
+                raise KrakenTransportDeadlineExceeded("deadline exhausted before attempt")
+            except KrakenTransportDeadlineExceeded as exc:
+                raise RuntimeError("kraken api error") from exc
+
+    class _StubKrakenClient:
+        timeout_seconds = 1.0
+        deadline_monotonic = None
+
+    # Force the LOCAL-client path so refresh is setup-bound.
+    monkeypatch.setattr(
+        capture, "capture_kraken_client", lambda **kwargs: _StubKrakenClient()
+    )
+    monkeypatch.setattr(
+        capture,
+        "KrakenInstrumentProvider",
+        lambda registry=None, client=None: _DeadlineProvider(),
+    )
+    monkeypatch.setattr(
+        capture, "kraken_minute_source", lambda client=None: _SpySource()
+    )
+    monkeypatch.setattr(capture, "hydrate_instrument_version_registry", lambda: None)
+
+    summary = capture.capture_feature_bus_shadow(
+        settings=_settings(opip_feature_bus_capture_budget_seconds=45),
+        now=NOW,
+        publisher=publisher,
+        restore_continuity=lambda versions: ({}, {}, {}),
+    )
+    assert fetch_calls == []
+    assert summary.fetched == 0
+    assert summary.cycles == 0
+    assert summary.budget_exhausted is True
+    assert client.snapshot_payloads() == []
+    out = capsys.readouterr().out
+    assert "OPIP_FEATURE_BUS_CAPTURE_PHASE=setup_deadline_exhausted" in out
+    assert "where=refresh_universe" in out
+    assert "reason=INSUFFICIENT_SETUP_BUDGET" in out
+    assert "OPIP_FEATURE_BUS_CAPTURE_PHASE=publish_instrument_versions" not in out
+    assert "OPIP_FEATURE_BUS_CAPTURE_PHASE=acquire" not in out
+
+
+def test_ac_016_injected_refresh_deadline_is_ordinary_failure(capsys):
+    """ATDD-R4-B2-controlled-paper-activation/AC-016: an INJECTED provider's chained Kraken deadline is NOT our setup deadline -- it keeps ordinary provider-failure semantics and is NOT misclassified as setup-budget exhaustion."""
+    from app.services.kraken_transport import KrakenTransportDeadlineExceeded
+
+    versions = _instruments(1)
+    client = _RecordingClient()
+    publisher = FeatureBusPublisher(client, enabled=True, settings=_settings())
+
+    class _InjectedDeadlineProvider:
+        def refresh(self, *, observed_at_utc):
+            try:
+                raise KrakenTransportDeadlineExceeded("deadline exhausted before attempt")
+            except KrakenTransportDeadlineExceeded as exc:
+                raise RuntimeError("kraken api error") from exc
+
+    summary = capture.capture_feature_bus_shadow(
+        settings=_settings(opip_feature_bus_capture_budget_seconds=45),
+        now=NOW,
+        publisher=publisher,
+        instrument_provider=_InjectedDeadlineProvider(),
+        source=_source({}),
+        restore_continuity=lambda versions: ({}, {}, {}),
+    )
+    assert summary.budget_exhausted is False
+    assert summary.cycles == 0
+    out = capsys.readouterr().out
+    assert "OPIP_FEATURE_BUS_CAPTURE_PHASE=setup_deadline_exhausted" not in out
+    assert "status=FAILED" in out
+
+
+def test_ac_016_ordinary_refresh_failure_is_not_budget_exhaustion(capsys):
+    """ATDD-R4-B2-controlled-paper-activation/AC-016: an ordinary provider failure keeps its existing FAILED semantics and is NOT misclassified as setup-budget exhaustion."""
+    versions = _instruments(1)
+    client = _RecordingClient()
+    publisher = FeatureBusPublisher(client, enabled=True, settings=_settings())
+
+    class _BrokenProvider:
+        def refresh(self, *, observed_at_utc):
+            raise RuntimeError("kraken api error")
+
+    summary = capture.capture_feature_bus_shadow(
+        settings=_settings(opip_feature_bus_capture_budget_seconds=45),
+        now=NOW,
+        publisher=publisher,
+        instrument_provider=_BrokenProvider(),
+        source=_source({}),
+        restore_continuity=lambda versions: ({}, {}, {}),
+    )
+    assert summary.budget_exhausted is False
+    assert summary.cycles == 0
+    out = capsys.readouterr().out
+    assert "OPIP_FEATURE_BUS_CAPTURE_PHASE=setup_deadline_exhausted" not in out
+    assert "status=FAILED" in out
+
+
+def test_ac_016_setup_bound_writer_deadline_is_setup_budget_exhaustion(capsys):
+    """ATDD-R4-B2-controlled-paper-activation/AC-016: a WriterDeadlineExceeded publish outcome while the writer is SETUP-BOUND is classified as setup-budget exhaustion -- continuity and acquisition are never entered, no snapshot is fabricated."""
+    versions = _instruments(1)
+    version = versions[0]
+    batches = {version.instrument_version_id: _batch(version, _observations(version))}
+    client = _RecordingClient()
+    publisher = FeatureBusPublisher(client, enabled=True, settings=_settings())
+
+    fetch_calls = []
+
+    class _SpySource:
+        venue = "kraken"
+        source_label = "kraken_ohlc"
+        interval_seconds = 60
+
+        def fetch_through(self, version, *, watermark, now):
+            fetch_calls.append(version.instrument_version_id)
+            return batches[version.instrument_version_id]
+
+    class _DeadlinePublisher:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def publish_instrument_version(self, version):
+            from app.opip.features.publisher import PublishOutcome
+
+            return PublishOutcome(
+                event_type="market.instrument_version.recorded",
+                idempotency_key="k",
+                status="SPOOLED",
+                error_code="WriterDeadlineExceeded",
+            )
+
+        def summary(self):
+            return self._inner.summary()
+
+        def resolved_writer_client(self):
+            # A bindable client so ``_bind_writer_deadline`` succeeds and the
+            # writer is provably setup-bound.
+            return _BindableClient()
+
+    class _BindableClient:
+        def __init__(self):
+            self.deadline_monotonic = None
+
+        def bind_deadline(self, deadline_monotonic):
+            self.deadline_monotonic = deadline_monotonic
+            return self.deadline_monotonic
+
+    summary = capture.capture_feature_bus_shadow(
+        settings=_settings(opip_feature_bus_capture_budget_seconds=45),
+        now=NOW,
+        publisher=_DeadlinePublisher(publisher),
+        instrument_provider=_provider(versions),
+        source=_SpySource(),
+        restore_continuity=lambda versions: ({}, {}, {}),
+    )
+    assert fetch_calls == []
+    assert summary.fetched == 0
+    assert summary.cycles == 0
+    assert summary.budget_exhausted is True
+    assert client.snapshot_payloads() == []
+    out = capsys.readouterr().out
+    assert "OPIP_FEATURE_BUS_CAPTURE_PHASE=setup_deadline_exhausted" in out
+    assert "where=publish_instrument_versions" in out
+    assert "OPIP_FEATURE_BUS_CAPTURE_PHASE=restore_continuity" not in out
+    assert "OPIP_FEATURE_BUS_CAPTURE_PHASE=acquire" not in out
+
+
+def test_ac_016_unbound_writer_deadline_is_ordinary_failure(capsys):
+    """ATDD-R4-B2-controlled-paper-activation/AC-016: an UNBOUND/injected publisher that merely returns WriterDeadlineExceeded keeps ordinary publication-failure semantics -- we cannot prove the cut belongs to our setup deadline."""
+    versions = _instruments(1)
+    client = _RecordingClient()
+    publisher = FeatureBusPublisher(client, enabled=True, settings=_settings())
+
+    class _UnboundDeadlinePublisher:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def publish_instrument_version(self, version):
+            from app.opip.features.publisher import PublishOutcome
+
+            return PublishOutcome(
+                event_type="market.instrument_version.recorded",
+                idempotency_key="k",
+                status="SPOOLED",
+                error_code="WriterDeadlineExceeded",
+            )
+
+        def summary(self):
+            return self._inner.summary()
+
+        def resolved_writer_client(self):
+            # No bind_deadline and no deadline_monotonic: the bind cannot take
+            # effect, so the writer is NOT setup-bound.
+            return object()
+
+    summary = capture.capture_feature_bus_shadow(
+        settings=_settings(opip_feature_bus_capture_budget_seconds=45),
+        now=NOW,
+        publisher=_UnboundDeadlinePublisher(publisher),
+        instrument_provider=_provider(versions),
+        source=_source({}),
+        restore_continuity=lambda versions: ({}, {}, {}),
+    )
+    assert summary.budget_exhausted is False
+    out = capsys.readouterr().out
+    assert "OPIP_FEATURE_BUS_CAPTURE_PHASE=setup_deadline_exhausted" not in out
+    assert "status=NOTHING_CAPTURED" in out
+
+
+def test_ac_016_ordinary_publication_failure_preserves_behavior(capsys):
+    """ATDD-R4-B2-controlled-paper-activation/AC-016: an ordinary publication failure keeps its existing semantics and is NOT misclassified as setup-budget exhaustion."""
+    versions = _instruments(1)
+    client = _RecordingClient()
+    publisher = FeatureBusPublisher(client, enabled=True, settings=_settings())
+
+    class _BrokenPublisher:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def publish_instrument_version(self, version):
+            from app.opip.features.publisher import PublishOutcome
+
+            return PublishOutcome(
+                event_type="market.instrument_version.recorded",
+                idempotency_key="k",
+                status="REJECTED",
+                error_code="SOME_OTHER_ERROR",
+            )
+
+        def summary(self):
+            return self._inner.summary()
+
+        def resolved_writer_client(self):
+            return self._inner.resolved_writer_client()
+
+    summary = capture.capture_feature_bus_shadow(
+        settings=_settings(opip_feature_bus_capture_budget_seconds=45),
+        now=NOW,
+        publisher=_BrokenPublisher(publisher),
+        instrument_provider=_provider(versions),
+        source=_source({}),
+        restore_continuity=lambda versions: ({}, {}, {}),
+    )
+    assert summary.budget_exhausted is False
+    out = capsys.readouterr().out
+    assert "OPIP_FEATURE_BUS_CAPTURE_PHASE=setup_deadline_exhausted" not in out
+    assert "status=NOTHING_CAPTURED" in out
+
+
+def test_ac_016_continuity_deadline_is_setup_budget_exhaustion(capsys):
+    """ATDD-R4-B2-controlled-paper-activation/AC-016: a typed continuity deadline is classified as setup-budget exhaustion -- acquisition is never entered, no partial continuity is used, no snapshot is fabricated."""
+    from app.opip.features.checkpoint_store import CheckpointDeadlineExceeded
+
+    versions = _instruments(1)
+    version = versions[0]
+    batches = {version.instrument_version_id: _batch(version, _observations(version))}
+    client = _RecordingClient()
+    publisher = FeatureBusPublisher(client, enabled=True, settings=_settings())
+
+    fetch_calls = []
+
+    class _SpySource:
+        venue = "kraken"
+        source_label = "kraken_ohlc"
+        interval_seconds = 60
+
+        def fetch_through(self, version, *, watermark, now):
+            fetch_calls.append(version.instrument_version_id)
+            return batches[version.instrument_version_id]
+
+    def _deadline_restore(versions):
+        raise CheckpointDeadlineExceeded("deadline exceeded during query")
+
+    summary = capture.capture_feature_bus_shadow(
+        settings=_settings(opip_feature_bus_capture_budget_seconds=45),
+        now=NOW,
+        publisher=publisher,
+        instrument_provider=_provider(versions),
+        source=_SpySource(),
+        restore_continuity=_deadline_restore,
+    )
+    assert fetch_calls == []
+    assert summary.fetched == 0
+    assert summary.cycles == 0
+    assert summary.budget_exhausted is True
+    assert client.snapshot_payloads() == []
+    out = capsys.readouterr().out
+    assert "OPIP_FEATURE_BUS_CAPTURE_PHASE=setup_deadline_exhausted" in out
+    assert "where=restore_continuity" in out
+    assert "OPIP_FEATURE_BUS_CAPTURE_PHASE=acquire" not in out
+
+
+
+def test_ac_016_setup_deadline_uses_actual_wave_bound(monkeypatch, capsys):
+    """ATDD-R4-B2-controlled-paper-activation/AC-016: the setup envelope is derived from the ACTUAL wave bound the acquisition gate uses, so the two can never drift.
+
+    This test REALLY exercises the calculated wave-bound path: it forces the
+    local-client path (no injected provider/source), stubs the local Kraken
+    client/provider construction so no network request is made, and makes
+    ``capture_worst_case_request_seconds`` return a value DIFFERENT from
+    ``PER_REQUEST_BUDGET_SECONDS``. It fails if production goes back to
+    ``setup_deadline = acquisition_deadline - PER_REQUEST_BUDGET_SECONDS``.
+    """
+    versions = _instruments(1)
+    version = versions[0]
+    batches = {version.instrument_version_id: _batch(version, _observations(version))}
+    client = _RecordingClient()
+    publisher = FeatureBusPublisher(client, enabled=True, settings=_settings())
+
+    # Force the local-client path without a network request: the local Kraken
+    # client is a stub, and the provider/source are built from it.
+    class _StubKrakenClient:
+        timeout_seconds = 1.0
+        deadline_monotonic = None
+
+    monkeypatch.setattr(
+        capture, "capture_kraken_client", lambda **kwargs: _StubKrakenClient()
+    )
+    monkeypatch.setattr(
+        capture,
+        "KrakenInstrumentProvider",
+        lambda registry=None, client=None: _provider(versions),
+    )
+    monkeypatch.setattr(
+        capture, "kraken_minute_source", lambda client=None: _source(batches)
+    )
+    monkeypatch.setattr(
+        capture, "hydrate_instrument_version_registry", lambda: None
+    )
+    # The ACTUAL wave bound differs from PER_REQUEST_BUDGET_SECONDS (15.0).
+    monkeypatch.setattr(
+        capture, "capture_worst_case_request_seconds", lambda **kwargs: 17.0
+    )
+
+    summary = capture.capture_feature_bus_shadow(
+        settings=_settings(opip_feature_bus_capture_budget_seconds=45),
+        now=NOW,
+        publisher=publisher,
+        restore_continuity=lambda versions: ({}, {}, {}),
+    )
+    assert summary.budget_exhausted is False
+    out = capsys.readouterr().out
+    # budget=45 -> acquisition_deadline=35, actual wave_bound=17, setup_deadline=18.
+    assert "OPIP_FEATURE_BUS_CAPTURE_PHASE=budget_declared" in out
+    assert "wave_bound_seconds=17.0" in out
+    assert "setup_budget_seconds=18.0" in out
+    assert "acquisition_budget_seconds=35.0" in out
+    # The materialization reserve is unchanged by the setup-budget invariant:
+    # the same production-path budget declaration still reports the 10s reserve.
+    assert "materialize_reserve_seconds=10.0" in out
+
+
+def test_ac_016_first_wave_boundary_equality_is_admissible(capsys):
+    """ATDD-R4-B2-controlled-paper-activation/AC-016: the first-wave gate is strict ``<``, so remaining == wave_bound is ADMITTED -- the boundary semantics are unchanged by the setup envelope."""
+    versions = _instruments(1)
+    version = versions[0]
+    batches = {version.instrument_version_id: _batch(version, _observations(version))}
+    client = _RecordingClient()
+    publisher = FeatureBusPublisher(client, enabled=True, settings=_settings())
+
+    # budget=45 -> acquisition_deadline=35, wave_bound=15. Land EXACTLY on the
+    # boundary: remaining == 15 == wave_bound, which the strict gate admits.
+    clock = {"value": 0.0}
+
+    def _clock():
+        return clock["value"]
+
+    class _BoundaryProvider:
+        def refresh(self, *, observed_at_utc):
+            clock["value"] += 20.0
+            return list(versions)
+
+    summary = capture.capture_feature_bus_shadow(
+        settings=_settings(opip_feature_bus_capture_budget_seconds=45),
+        now=NOW,
+        publisher=publisher,
+        instrument_provider=_BoundaryProvider(),
+        source=_source(batches),
+        restore_continuity=lambda versions: ({}, {}, {}),
+        clock=_clock,
+    )
+    # remaining == wave_bound is admitted: acquisition proceeds.
+    assert summary.budget_exhausted is False
+    assert summary.cycles == 1
+    out = capsys.readouterr().out
+    assert "OPIP_FEATURE_BUS_CAPTURE_PHASE=acquire" in out
+    assert "budget_remaining=15.0" in out
+    assert "wave_bound_seconds=15.0" in out
+
+
 def test_ac_016_configured_budget_is_read_from_settings():
     """ATDD-R4-B2-controlled-paper-activation/AC-016 and ATDD-RELEASE-PIPELINE-v1/AC-017: the configured budget is read from Settings. A clock jump that would exhaust the default 45s budget but not the configured larger budget proves the configured value was used (both stay within the 60-second cadence slot)."""
     versions = _instruments(3)
@@ -354,6 +980,245 @@ def test_ac_016_configured_budget_is_read_from_settings():
 # ---------------------------------------------------------------------------
 # AC-016 scheduler safety
 # ---------------------------------------------------------------------------
+
+
+def test_ac_016_sqlite_progress_handler_interrupts_at_deadline(tmp_path, monkeypatch):
+    """ATDD-R4-B2-controlled-paper-activation/AC-016: a durable checkpoint read is SQLite-VM interruptible at its deadline -- the progress handler aborts the real query and the typed deadline exception is raised, with no partial state returned."""
+    import sqlite3
+
+    from app.opip.canonical import schema as schema_module
+    from app.opip.features import checkpoint_store as store_module
+
+    # Real SQLite DB with a real events table and enough rows that the query runs
+    # many VM instructions. No sleeps: the injected clock moves past the deadline
+    # between the pre-query check and the progress callback.
+    db = tmp_path / "canonical.db"
+    conn = sqlite3.connect(str(db))
+    conn.executescript(schema_module.DDL)
+    conn.execute(
+        "INSERT INTO meta (id, schema_version, history_epoch, next_local_sequence, created_at, updated_at) VALUES (1, ?, 1, 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        (schema_module.SCHEMA_VERSION,),
+    )
+    for i in range(500):
+        conn.execute(
+            "INSERT INTO events (event_id, schema_version, event_type, history_epoch, local_sequence, recorded_at, idempotency_key, payload_json) VALUES (?, ?, ?, 1, ?, '2026-01-01T00:00:00Z', ?, '{}')",
+            (f"EV:{i}", schema_module.SCHEMA_VERSION, "feature.checkpoint.recorded", i + 1, f"K:{i}"),
+        )
+    conn.commit()
+    conn.close()
+
+    # Progress interval 1 guarantees the callback runs as the VM executes.
+    monkeypatch.setattr(store_module, "_SQLITE_DEADLINE_PROGRESS_OPS", 1)
+
+    calls = {"count": 0}
+
+    def fake_clock():
+        calls["count"] += 1
+        return 0.0 if calls["count"] == 1 else 2.0
+
+    with pytest.raises(store_module.CheckpointDeadlineExceeded):
+        store_module.load_latest_checkpoint_payload(
+            "IV:any",
+            db_path=db,
+            deadline_monotonic=1.0,
+            clock=fake_clock,
+        )
+
+
+def test_ac_016_unrelated_sqlite_error_is_not_translated(tmp_path, monkeypatch):
+    """ATDD-R4-B2-controlled-paper-activation/AC-016: an unrelated sqlite3.DatabaseError with deadline_triggered=False propagates unchanged, never misclassified as a deadline."""
+    import sqlite3
+
+    from app.opip.features import checkpoint_store as store_module
+
+    db = tmp_path / "canonical.db"
+    conn = sqlite3.connect(str(db))
+    conn.executescript("CREATE TABLE meta (id INTEGER PRIMARY KEY, schema_version INTEGER);")
+    conn.commit()
+    conn.close()
+
+    # The events table is absent, so the query raises sqlite3.OperationalError
+    # (a DatabaseError) with deadline_triggered=False.
+    with pytest.raises(sqlite3.DatabaseError) as excinfo:
+        store_module.load_latest_checkpoint_payload(
+            "IV:any",
+            db_path=db,
+            deadline_monotonic=1.0,
+            clock=lambda: 0.0,
+        )
+    assert not isinstance(excinfo.value, store_module.CheckpointDeadlineExceeded)
+
+
+def test_ac_016_restore_pilot_continuity_legacy_loaders_without_deadline():
+    """ATDD-R4-B2-controlled-paper-activation/AC-016: restore_pilot_continuity with no deadline sends NO new kwargs, so a legacy injected loader that accepts only the historical arguments keeps working."""
+    from app.jobs.run_feature_bus_pilot import restore_pilot_continuity
+
+    versions = _instruments(1)
+    seen = []
+
+    def _no_state(instrument_version_id: str):
+        seen.append(("state", instrument_version_id))
+        return None
+
+    def _no_ledger(instrument_version_id: str, *, interval_seconds, since_interval_epoch):
+        seen.append(("ledger", instrument_version_id))
+        return None
+
+    states, ledgers, watermarks = restore_pilot_continuity(
+        versions,
+        load_state=_no_state,
+        load_ledger=_no_ledger,
+    )
+    assert states == {}
+    assert watermarks == {}
+    assert len(seen) == 2
+
+
+def test_ac_016_restore_pilot_continuity_forwards_deadline_when_supplied():
+    """ATDD-R4-B2-controlled-paper-activation/AC-016: when a deadline IS supplied, the canonical deadline-aware loaders receive both deadline_monotonic and clock."""
+    from app.jobs.run_feature_bus_pilot import restore_pilot_continuity
+
+    versions = _instruments(1)
+    seen = []
+
+    def _state(instrument_version_id: str, *, deadline_monotonic, clock):
+        seen.append(("state", deadline_monotonic, clock))
+        return None
+
+    def _ledger(
+        instrument_version_id: str,
+        *,
+        interval_seconds,
+        since_interval_epoch,
+        deadline_monotonic,
+        clock,
+    ):
+        seen.append(("ledger", deadline_monotonic, clock))
+        return None
+
+    def _clock():
+        return 0.0
+
+    restore_pilot_continuity(
+        versions,
+        load_state=_state,
+        load_ledger=_ledger,
+        deadline_monotonic=20.0,
+        clock=_clock,
+    )
+    assert len(seen) == 2
+    assert all(entry[1] == 20.0 for entry in seen)
+    assert all(entry[2] is _clock for entry in seen)
+
+
+class _FakeCursor:
+    """Deterministic cursor whose fetchall returns controlled rows immediately.
+
+    Its connection's ``set_progress_handler`` is a no-op, so the SQLite VM can
+    never fire the deadline callback: any deadline exception raised by the code
+    under test MUST come from the post-fetch Python row-processing check.
+    """
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def fetchall(self):
+        return list(self._rows)
+
+
+class _FakeConnection:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def execute(self, *_args, **_kwargs):
+        return _FakeCursor(self._rows)
+
+    def set_progress_handler(self, *_args, **_kwargs):
+        # Deliberately inert: the VM never interrupts, so only the Python
+        # row-processing deadline check can raise.
+        return None
+
+    def close(self):
+        return None
+
+
+def _valid_checkpoint_row(instrument_version_id: str):
+    import json as _json
+
+    payload = {
+        "instrument_version_id": instrument_version_id,
+        "venue_instrument_id": "SYNTHETIC-SYN0USD",
+        "feature_version": "opip-features-v1",
+        "consumed_input_watermark": {"history_epoch": 1, "local_sequence": 1},
+        "rolling_state": {},
+        "restart_state": "COLD_START",
+        "reconstruction_dependencies": ["fixed_interval_aggregate:60s"],
+        "created_at_utc": "2026-01-01T00:00:00Z",
+        "schema_version": 1,
+    }
+    return {"payload_json": _json.dumps(payload)}
+
+
+def test_ac_016_checkpoint_row_processing_observes_deadline(monkeypatch, tmp_path):
+    """ATDD-R4-B2-controlled-paper-activation/AC-016: checkpoint Python row reconstruction observes the SAME deadline as the SQLite query.
+
+    The connection seam is a deterministic fake whose ``set_progress_handler`` is
+    inert, so the SQLite VM cannot fire the deadline callback. The only way this
+    test can raise is the post-fetch Python row-processing check, which is exactly
+    what it must prove.
+    """
+    from app.opip.canonical import schema as schema_module
+    from app.opip.features import checkpoint_store as store_module
+
+    rows = [_valid_checkpoint_row("IV:any")]
+    monkeypatch.setattr(
+        schema_module, "connect", lambda *_a, **_k: _FakeConnection(rows)
+    )
+    # The db file must exist for the read to proceed.
+    db = tmp_path / "canonical.db"
+    db.write_bytes(b"")
+
+    # First read is the pre-query check (below deadline); the next read is the
+    # first Python row-processing check (at/above deadline).
+    calls = {"count": 0}
+
+    def fake_clock():
+        calls["count"] += 1
+        return 0.0 if calls["count"] == 1 else 2.0
+
+    with pytest.raises(store_module.CheckpointDeadlineExceeded):
+        store_module.load_latest_checkpoint_payload(
+            "IV:any", db_path=db, deadline_monotonic=1.0, clock=fake_clock
+        )
+
+
+def test_ac_016_revision_ledger_row_processing_observes_deadline(monkeypatch, tmp_path):
+    """ATDD-R4-B2-controlled-paper-activation/AC-016: revision-ledger Python row reconstruction observes the SAME deadline as the SQLite query.
+
+    The connection seam is a deterministic fake whose ``set_progress_handler`` is
+    inert, so the SQLite VM cannot fire the deadline callback. The only way this
+    test can raise is the post-fetch Python row-processing check.
+    """
+    from app.opip.canonical import schema as schema_module
+    from app.opip.features import revision_ledger as ledger_module
+
+    rows = [{"payload_json": "{}", "history_epoch": 1, "local_sequence": 1}]
+    monkeypatch.setattr(
+        schema_module, "connect", lambda *_a, **_k: _FakeConnection(rows)
+    )
+    db = tmp_path / "canonical.db"
+    db.write_bytes(b"")
+
+    calls = {"count": 0}
+
+    def fake_clock():
+        calls["count"] += 1
+        return 0.0 if calls["count"] == 1 else 2.0
+
+    with pytest.raises(ledger_module.RevisionLedgerDeadlineExceeded):
+        ledger_module.load_revision_ledger(
+            "IV:any", db_path=db, deadline_monotonic=1.0, clock=fake_clock
+        )
 
 
 def test_ac_016_unified_cycle_does_not_run_capture():

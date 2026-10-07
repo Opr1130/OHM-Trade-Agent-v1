@@ -24,7 +24,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timedelta, timezone
 import json
-from typing import Any
+from typing import Any, Callable
 
 from app.opip.contracts.identity import InstrumentVersion
 from app.opip.contracts.observation import SourceWatermark
@@ -56,17 +56,35 @@ def restore_pilot_continuity(
     load_state=load_rolling_state,
     load_ledger=load_revision_ledger,
     default_interval_seconds: int = DEFAULT_INTERVAL_SECONDS,
+    deadline_monotonic: float | None = None,
+    clock: Callable[[], float] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     """Restore state, revision ledgers, and source watermarks for a live pilot.
 
     Revision ledgers load even when no checkpoint exists so observation
     revisions committed before a dependent-write failure survive process restart.
+
+    ``deadline_monotonic`` (optional) bounds every durable read; it MUST be
+    expressed in the same clock domain as ``clock``. A deadline expiry is NOT
+    swallowed here: the typed exception propagates so the caller can fail closed
+    rather than acquire against partial continuity.
     """
     restored_states: dict[str, Any] = {}
     restored_ledgers: dict[str, Any] = {}
     source_watermarks: dict[str, Any] = {}
+    # Only forward the deadline seam when a deadline was actually supplied, so a
+    # legacy injected loader that accepts only the historical arguments keeps
+    # working unchanged. No signature inspection and no TypeError fallback: the
+    # caller either declared a deadline or it did not.
+    deadline_kwargs: dict[str, Any] = {}
+    if deadline_monotonic is not None:
+        deadline_kwargs["deadline_monotonic"] = deadline_monotonic
+        deadline_kwargs["clock"] = clock
     for version in versions:
-        state = load_state(version.instrument_version_id)
+        state = load_state(
+            version.instrument_version_id,
+            **deadline_kwargs,
+        )
         since_epoch = None
         interval_seconds = int(default_interval_seconds)
         if state is not None:
@@ -86,6 +104,7 @@ def restore_pilot_continuity(
             version.instrument_version_id,
             interval_seconds=interval_seconds,
             since_interval_epoch=since_epoch,
+            **deadline_kwargs,
         )
     return restored_states, restored_ledgers, source_watermarks
 
