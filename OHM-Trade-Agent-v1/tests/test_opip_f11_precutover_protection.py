@@ -314,6 +314,7 @@ def test_ac_005_report_is_read_only_and_authority_free(monkeypatch):
     monkeypatch.setattr(report, "protection_incidents_healthy", lambda: True)
     payload = report.build_report()
     assert payload["state"] == ph.STATE_HEALTHY
+    assert "resolution_reason" not in payload
     assert json.loads(json.dumps(payload))["state"] == ph.STATE_HEALTHY
 
     # Unresolvable exposure fails closed.
@@ -335,6 +336,29 @@ def test_ac_005_report_is_read_only_and_authority_free(monkeypatch):
     unproven = report.build_report()
     assert unproven["state"] == ph.STATE_UNAVAILABLE
     assert ph.REASON_INCIDENTS_UNPROVEN in unproven["reason_codes"]
+
+
+def test_report_exposes_incomplete_resolution_reason_without_changing_gate(monkeypatch):
+    import app.jobs.report_protection_health as report
+
+    reason = "active trade registry unavailable: read failed"
+    resolution = SimpleNamespace(
+        exposures=(_exposure("VERIFIED_MANAGED"),),
+        coverage_complete=False,
+        reason=reason,
+    )
+    monkeypatch.setattr(
+        report, "_read_only_resolver", lambda: SimpleNamespace(resolve=lambda: resolution)
+    )
+    monkeypatch.setattr(report, "protection_incidents_healthy", lambda: True)
+
+    payload = report.build_report()
+
+    assert payload["resolution_reason"] == reason
+    assert payload["state"] == ph.STATE_UNAVAILABLE
+    assert payload["admissions_suspended"] is True
+    assert payload["coverage_complete"] is False
+    assert ph.REASON_COVERAGE_INCOMPLETE in payload["reason_codes"]
 
 
 # ---------------------------------------------------------------------------
