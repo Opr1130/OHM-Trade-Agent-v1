@@ -1259,3 +1259,63 @@ def test_ac_016_scheduler_reconciliation_installs_capture_once():
     assert script.count('install -o root -g root -m 0644 "$CAPTURE_SRC" "$CAPTURE_DST"') == 1
     assert "opip-feature-bus-capture" in script
     assert 'had_capture' in script
+
+
+def test_ac_018_default_capture_composes_batch_restore_observer_without_marker_collision(
+    monkeypatch, capsys
+):
+    """ATDD-RELEASE-PIPELINE-v1/AC-018: the production/default Feature Bus
+    capture composition drives the real batch continuity restore observer into
+    durable capture markers without colliding with emit_capture_marker's stage
+    parameter.
+    """
+    import app.jobs.run_feature_bus_pilot as pilot
+
+    versions = _instruments(1)
+    version = versions[0]
+    batches = {
+        version.instrument_version_id: _batch(version, _observations(version))
+    }
+    client = _RecordingClient()
+    publisher = FeatureBusPublisher(client, enabled=True, settings=_settings())
+
+    def _states_batch(ids, **kwargs):
+        assert ids == [version.instrument_version_id]
+        return {}
+
+    def _ledgers_batch(ids, **kwargs):
+        assert ids == [version.instrument_version_id]
+        return {}
+
+    kwdefaults = pilot.restore_pilot_continuity_batch.__kwdefaults__
+    assert kwdefaults is not None
+    monkeypatch.setitem(kwdefaults, "load_states_batch", _states_batch)
+    monkeypatch.setitem(kwdefaults, "load_ledgers_batch", _ledgers_batch)
+
+    summary = capture.capture_feature_bus_shadow(
+        settings=_settings(opip_feature_bus_capture_budget_seconds=45),
+        now=NOW,
+        publisher=publisher,
+        instrument_provider=_provider(versions),
+        source=_source(batches),
+    )
+
+    assert summary.budget_exhausted is False
+    assert summary.cycles == 1
+    assert len(client.snapshot_payloads()) == 1
+
+    out = capsys.readouterr().out
+    assert (
+        "OPIP_FEATURE_BUS_CAPTURE_PHASE=continuity_phase "
+        "continuity_stage=checkpoint_restore"
+    ) in out
+    assert (
+        "OPIP_FEATURE_BUS_CAPTURE_PHASE=continuity_phase "
+        "continuity_stage=revision_ledger_restore"
+    ) in out
+    assert (
+        "OPIP_FEATURE_BUS_CAPTURE_PHASE=continuity_phase "
+        "continuity_stage=continuity_restore_total"
+    ) in out
+    assert "OPIP_FEATURE_BUS_CAPTURE_PHASE=continuity_restored" in out
+

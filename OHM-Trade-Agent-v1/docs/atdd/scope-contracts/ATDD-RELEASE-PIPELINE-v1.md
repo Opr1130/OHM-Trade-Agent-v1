@@ -348,6 +348,7 @@ AC-018 -> tests/test_opip_feature_bus_continuity_batch.py::test_ac_018_historica
 AC-018 -> tests/test_opip_feature_bus_continuity_batch.py::test_ac_018_historical_callbacks_receive_deadline_kwargs_when_supplied
 AC-018 -> tests/test_opip_feature_bus_continuity_batch.py::test_ac_018_observer_receives_bounded_timing_attribution
 AC-018 -> tests/test_opip_feature_bus_continuity_batch.py::test_ac_018_observer_attributes_failed_restore_phase
+AC-018 -> tests/test_opip_r4_b2_shadow_capture.py::test_ac_018_default_capture_composes_batch_restore_observer_without_marker_collision
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/services/release_profiles.py
@@ -462,6 +463,7 @@ AC-018 -> OHM-Trade-Agent-v1/app/jobs/run_feature_bus_pilot.py
 AC-018 -> OHM-Trade-Agent-v1/app/opip/features/checkpoint_store.py
 AC-018 -> OHM-Trade-Agent-v1/app/opip/features/revision_ledger.py
 AC-018 -> OHM-Trade-Agent-v1/tests/test_opip_feature_bus_continuity_batch.py
+AC-018 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_shadow_capture.py
 AC-018 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
 
 DEFERRED DISCOVERIES:

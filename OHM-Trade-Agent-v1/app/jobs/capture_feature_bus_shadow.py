@@ -467,7 +467,7 @@ def capture_feature_bus_shadow(
                 clock=tick,
                 observer=lambda stage, seconds: emit_capture_marker(
                     "continuity_phase",
-                    stage=stage,
+                    continuity_stage=stage,
                     phase_seconds=round(seconds, 3),
                 ),
             )
