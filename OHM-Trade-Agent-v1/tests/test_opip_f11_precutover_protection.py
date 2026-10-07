@@ -339,6 +339,7 @@ def test_ac_005_report_is_read_only_and_authority_free(monkeypatch):
 
 
 def test_report_exposes_incomplete_resolution_reason_without_changing_gate(monkeypatch):
+    """ATDD-RELEASE-PIPELINE-v1/AC-022: incomplete exposure coverage preserves resolver diagnostics without changing the fail-closed decision."""
     import app.jobs.report_protection_health as report
 
     reason = "active trade registry unavailable: read failed"
