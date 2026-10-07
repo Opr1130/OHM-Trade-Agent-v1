@@ -160,7 +160,7 @@ def _receipt_value(value: Any) -> str:
 
 def _single_line_receipt_text(value: Any) -> str:
     """Sanitize diagnostic text for a deterministic single-line receipt."""
-    return re.sub(r"[\\x00-\\x1f\\x7f]+", " ", str(value)).strip()
+    return re.sub(r"[\x00-\x1f\x7f]+", " ", str(value)).strip()
 
 
 def _aware_utc(value: str, *, name: str) -> datetime:
