@@ -236,9 +236,12 @@ class PolledMinuteBarSource:
         interval_seconds: int = 60,
         transport_errors: tuple[type[BaseException], ...] = (),
         clock: Callable[[], datetime] | None = None,
+        cold_start_intervals: int | None = None,
     ) -> None:
         if interval_seconds <= 0 or interval_seconds % 60 != 0:
             raise ValueError("interval_seconds must be a positive whole minute")
+        if cold_start_intervals is not None and int(cold_start_intervals) <= 0:
+            raise ValueError("cold_start_intervals must be positive when supplied")
         self._fetcher = fetcher
         self.venue = str(venue)
         self.source_label = str(source_label)
@@ -247,6 +250,9 @@ class PolledMinuteBarSource:
         self._transport_errors = tuple(transport_errors)
         self._interval_minutes = int(interval_seconds // 60)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._cold_start_intervals = (
+            int(cold_start_intervals) if cold_start_intervals is not None else None
+        )
 
     @property
     def sequence_prefix(self) -> str:
@@ -266,12 +272,23 @@ class PolledMinuteBarSource:
             raise ValueError("watermark belongs to a different instrument version")
 
         since: int | None = None
+        cold_start_floor: datetime | None = None
         if previous.through_utc is not None:
             # Request from the tip closed interval start (through_utc is its
             # end), not through_utc-1s, so venue rows at the tip can be
             # re-admitted for OHLC correction / superseding revisions.
             tip_start = previous.through_utc - timedelta(seconds=self.interval_seconds)
             since = int(tip_start.timestamp()) - 1
+        elif self._cold_start_intervals is not None:
+            # A prospective cold start needs only the declared warm-up horizon
+            # ending at the current closed cutoff. Bound BOTH the upstream request
+            # and the admitted rows so a venue returning more history than asked
+            # for cannot inflate the canonical write workload.
+            cutoff = latest_closed_cutoff(now, interval_seconds=self.interval_seconds)
+            cold_start_floor = cutoff - timedelta(
+                seconds=self.interval_seconds * self._cold_start_intervals
+            )
+            since = int(cold_start_floor.timestamp()) - 1
 
         started = time.monotonic()
         try:
@@ -320,6 +337,12 @@ class PolledMinuteBarSource:
                 item
                 for item in closed
                 if item.source_event_time >= tip_start
+            )
+        elif cold_start_floor is not None:
+            completed = tuple(
+                item
+                for item in closed
+                if item.source_event_time >= cold_start_floor
             )
         coverage = _coverage_for_completed(
             completed,
