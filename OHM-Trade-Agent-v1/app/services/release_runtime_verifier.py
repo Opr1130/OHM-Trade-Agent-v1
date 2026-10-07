@@ -141,10 +141,14 @@ class ReleaseRuntimePostureError(ValueError):
         *,
         reason_codes: Sequence[str] = (),
         evidence: Mapping[str, Any] | None = None,
+        protection_reason: str | None = None,
     ) -> None:
         super().__init__(message)
         self.reason_codes = tuple(str(code) for code in reason_codes)
         self.evidence: dict[str, Any] = dict(evidence or {})
+        self.protection_reason = (
+            str(protection_reason) if protection_reason not in (None, "") else None
+        )
 
 
 def _receipt_value(value: Any) -> str:
@@ -152,6 +156,11 @@ def _receipt_value(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     return str(value)
+
+
+def _single_line_receipt_text(value: Any) -> str:
+    """Sanitize diagnostic text for a deterministic single-line receipt."""
+    return re.sub(r"[\\x00-\\x1f\\x7f]+", " ", str(value)).strip()
 
 
 def _aware_utc(value: str, *, name: str) -> datetime:
@@ -312,6 +321,7 @@ def _verify_live_posture(profile_name: str) -> dict[str, Any]:
                 str(protection.get("state")),
                 *(str(code) for code in protection.get("reason_codes") or ()),
             ),
+            protection_reason=protection.get("resolution_reason"),
         )
     return {
         "profile": profile_name,
@@ -423,6 +433,11 @@ def _emit_failure_diagnostics(exc: BaseException) -> None:
         print(f"OPIP_RELEASE_RUNTIME_FAILURE_REASON={exc}")
         if exc.reason_codes:
             print(f"OPIP_RELEASE_RUNTIME_FAILURE_CODES={','.join(exc.reason_codes)}")
+        if exc.protection_reason:
+            print(
+                "OPIP_RELEASE_RUNTIME_PROTECTION_REASON="
+                f"{_single_line_receipt_text(exc.protection_reason)}"
+            )
     attempts = getattr(exc, "attempts", None)
     if isinstance(attempts, int) and not isinstance(attempts, bool):
         print(f"OPIP_RELEASE_RUNTIME_ATTEMPTS={attempts}")
