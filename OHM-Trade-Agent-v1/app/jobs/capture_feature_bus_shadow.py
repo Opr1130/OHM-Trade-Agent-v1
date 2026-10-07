@@ -450,17 +450,26 @@ def capture_feature_bus_shadow(
     )
 
     if restore_continuity is None:
-        from app.jobs.run_feature_bus_pilot import restore_pilot_continuity
+        from app.jobs.run_feature_bus_pilot import restore_pilot_continuity_batch
 
-        # Default production continuity is deadline-aware: the adapter captures
-        # the setup deadline AND the same clock domain that produced it, so the
-        # durable reads' SQLite progress handler compares against the SAME clock.
-        # Injected one-argument callables are untouched.
+        # Default production continuity is deadline-aware AND batch-scoped: the
+        # adapter captures the setup deadline AND the same clock domain that
+        # produced it, so the durable reads' SQLite progress handler compares
+        # against the SAME clock. The batch path scans each canonical event
+        # family ONCE for the whole instrument batch instead of once per
+        # instrument, removing the repeated full-history amplification
+        # implicated by the restore_continuity production overrun. Injected
+        # one-argument callables are untouched.
         def restore_continuity(versions: Any) -> Any:  # type: ignore[misc]
-            return restore_pilot_continuity(
+            return restore_pilot_continuity_batch(
                 versions,
                 deadline_monotonic=setup_deadline,
                 clock=tick,
+                observer=lambda stage, seconds: emit_capture_marker(
+                    "continuity_phase",
+                    stage=stage,
+                    phase_seconds=round(seconds, 3),
+                ),
             )
     market_client = None
     if instrument_provider is None or source is None:
