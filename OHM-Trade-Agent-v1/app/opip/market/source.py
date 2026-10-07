@@ -313,6 +313,13 @@ class PolledMinuteBarSource:
                 ),
                 error=message,
             )
+        if cold_start_floor is not None:
+            floor_epoch = int(cold_start_floor.timestamp())
+            rows = [
+                row
+                for row in rows
+                if int(row.interval_start_epoch) >= floor_epoch
+            ]
         # Receipt time is when the payload arrived, not when the request started.
         receipt_time = self._clock()
         elapsed = time.monotonic() - started
