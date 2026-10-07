@@ -11,10 +11,12 @@ Additive reads from the generic events table — no physical schema bump.
 from __future__ import annotations
 
 import json
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Mapping, Sequence
+from time import monotonic
+from typing import Callable, Mapping, Sequence
 
 from app.opip.contracts.events import MARKET_OBSERVATION_RECORDED
 from app.opip.contracts.identity import ConsumedInputWatermark, InstrumentVersion
@@ -23,9 +25,24 @@ from app.opip.features.publisher import PublishOutcome
 from app.opip.market.aggregates import DEFAULT_INTERVAL_SECONDS
 from app.opip.market.observations import aggregate_content_fingerprint
 
+#: SQLite VM instruction interval for the deadline progress handler. Our explicit
+#: engineering constant (NOT a SQLite default); see ``checkpoint_store`` for the
+#: rationale. PRIVATE: internal tuning, not public API. A focused test may
+#: monkeypatch this module attribute to 1 for determinism.
+_SQLITE_DEADLINE_PROGRESS_OPS = 1000
+
 
 class RevisionLedgerIntegrityError(ValueError):
     """Committed observation/revision payload is corrupt or non-reconstructable."""
+
+
+class RevisionLedgerDeadlineExceeded(TimeoutError):
+    """A durable revision-ledger read could not finish inside its absolute deadline.
+
+    Raised only when a caller supplied ``deadline_monotonic``. Subclasses
+    ``TimeoutError`` so existing timeout handling treats it the same way, while
+    staying a DISTINCT type a producer can name in a durable disposition.
+    """
 
 
 @dataclass(frozen=True)
@@ -128,6 +145,8 @@ def load_revision_ledger(
     interval_seconds: int = DEFAULT_INTERVAL_SECONDS,
     db_path: Path | None = None,
     since_interval_epoch: int | None = None,
+    deadline_monotonic: float | None = None,
+    clock: Callable[[], float] | None = None,
 ) -> RevisionLedger:
     """Rebuild the ledger from committed market.observation.recorded events.
 
@@ -135,6 +154,12 @@ def load_revision_ledger(
     aggregate rows missing required identity/provenance fields, fail closed.
     Other instruments and other aggregate cadences are filtered out without
     reinterpretation.
+
+    ``deadline_monotonic`` (optional) bounds the durable read: it MUST be
+    expressed in the same clock domain as ``clock`` (default ``time.monotonic``).
+    The SQLite VM is interrupted via a progress handler once the deadline
+    elapses, so a long scan/sort cannot silently continue past it. No partial
+    ledger is ever returned.
     """
     from app.opip.canonical.schema import connect
 
@@ -150,18 +175,46 @@ def load_revision_ledger(
     )
     if not target.exists():
         return empty
+    tick = clock or monotonic
+    if deadline_monotonic is not None and tick() >= deadline_monotonic:
+        raise RevisionLedgerDeadlineExceeded(
+            "revision ledger read deadline already elapsed before query"
+        )
     conn = connect(target, read_only=True)
+    deadline_triggered = False
+
+    def _progress_handler() -> int:
+        nonlocal deadline_triggered
+        if deadline_monotonic is not None and tick() >= deadline_monotonic:
+            deadline_triggered = True
+            return 1
+        return 0
+
     try:
-        rows = conn.execute(
-            """
-            SELECT payload_json, history_epoch, local_sequence
-            FROM events
-            WHERE event_type = ?
-            ORDER BY history_epoch ASC, local_sequence ASC
-            """,
-            (MARKET_OBSERVATION_RECORDED,),
-        ).fetchall()
+        if deadline_monotonic is not None:
+            conn.set_progress_handler(_progress_handler, _SQLITE_DEADLINE_PROGRESS_OPS)
+        try:
+            rows = conn.execute(
+                """
+                SELECT payload_json, history_epoch, local_sequence
+                FROM events
+                WHERE event_type = ?
+                ORDER BY history_epoch ASC, local_sequence ASC
+                """,
+                (MARKET_OBSERVATION_RECORDED,),
+            ).fetchall()
+        except sqlite3.DatabaseError as exc:
+            if deadline_triggered:
+                raise RevisionLedgerDeadlineExceeded(
+                    "revision ledger read deadline exceeded during query"
+                ) from exc
+            raise
     finally:
+        if deadline_monotonic is not None:
+            try:
+                conn.set_progress_handler(None, 0)
+            except sqlite3.Error:
+                pass
         conn.close()
 
     updated: dict[int, CommittedObservationRevision] = {}
@@ -171,6 +224,14 @@ def load_revision_ledger(
     seen_fingerprints: dict[tuple[int, int], str] = {}
     step = int(interval_seconds)
     for row in rows:
+        # The SQLite progress handler bounds the VM, but fetchall() is followed by
+        # Python reconstruction. Bound that work too, with the SAME clock domain,
+        # so a large committed history cannot outlive the setup envelope after the
+        # query itself returned. No partial ledger is ever returned.
+        if deadline_monotonic is not None and tick() >= deadline_monotonic:
+            raise RevisionLedgerDeadlineExceeded(
+                "revision ledger read deadline exceeded during row processing"
+            )
         payload = json.loads(str(row["payload_json"]))
         if not isinstance(payload, dict):
             raise RevisionLedgerIntegrityError(
@@ -219,6 +280,14 @@ def load_revision_ledger(
                 "committed observation for "
                 f"{instrument_version_id} at epoch {epoch} has non-object "
                 "values; refusing to skip or invent a content fingerprint"
+            )
+        # Fingerprinting is the materially expensive per-row operation, and the
+        # validation above it can consume real time on a large history. Re-check
+        # the SAME deadline immediately before it so the bound is enforced at the
+        # expensive boundary, not only at the top of the row.
+        if deadline_monotonic is not None and tick() >= deadline_monotonic:
+            raise RevisionLedgerDeadlineExceeded(
+                "revision ledger read deadline exceeded during row processing"
             )
         fingerprint = aggregate_content_fingerprint(dict(values))
         raw_revision = payload.get("revision")
@@ -322,6 +391,7 @@ def load_revision_ledger(
 __all__ = [
     "CommittedObservationRevision",
     "RevisionLedger",
+    "RevisionLedgerDeadlineExceeded",
     "RevisionLedgerIntegrityError",
     "load_revision_ledger",
 ]
