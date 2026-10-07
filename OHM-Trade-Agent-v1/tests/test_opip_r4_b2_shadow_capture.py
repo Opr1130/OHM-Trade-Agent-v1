@@ -1260,7 +1260,10 @@ def test_ac_016_scheduler_reconciliation_installs_capture_once():
     assert "opip-feature-bus-capture" in script
     assert 'had_capture' in script
 
-def test_ac_018_default_capture_composes_batch_restore_observer_without_marker_collision(monkeypatch, capsys):
+
+def test_ac_018_default_capture_composes_batch_restore_observer_without_marker_collision(
+    monkeypatch, capsys
+):
     """ATDD-RELEASE-PIPELINE-v1/AC-018: the production/default Feature Bus
     capture composition drives the real batch continuity restore observer into
     durable capture markers without colliding with emit_capture_marker's stage
