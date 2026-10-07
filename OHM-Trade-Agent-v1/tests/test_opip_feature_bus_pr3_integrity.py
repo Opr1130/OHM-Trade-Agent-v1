@@ -16,8 +16,10 @@ from app.opip.contracts.events import (
 )
 from app.opip.contracts.features import FeatureSnapshot
 from app.opip.contracts.identity import ConsumedInputWatermark, InstrumentVersion
+from app.opip.contracts.observation import SourceWatermark
 from app.opip.contracts.temporal import AvailabilityStamp
 from app.opip.features.engine import (
+    FEATURE_VERSION,
     FEATURE_WINDOW_INTERVALS,
     MINIMUM_WARMUP_INTERVALS,
     NOT_RETAINED_INPUTS,
@@ -30,7 +32,10 @@ from app.opip.features.pipeline import (
     DISPOSITION_DEFERRED_UNCOMMITTED,
     DISPOSITION_DRY_RUN,
     DISPOSITION_OK,
+    MAX_CYCLE_FIXED_SUBMITS,
+    MAX_CYCLE_SUBMITS_PER_OBSERVATION,
     CycleIdentityMismatch,
+    declared_cycle_submit_bound,
     run_cycle,
 )
 from app.opip.features.publisher import (
@@ -46,6 +51,7 @@ from app.opip.features.revision_ledger import (
 )
 from app.opip.market.observations import aggregate_content_fingerprint
 from app.opip.features.state import (
+    RollingState,
     advance_state,
     alignment_from_state,
     from_checkpoint,
@@ -1006,6 +1012,197 @@ def test_source_cold_start_horizon_bounds_request_and_admitted_history():
     assert calls[-1] == int(tip_start.timestamp()) - 1
     assert len(resumed.observations) == 1
     assert resumed.observations[0].source_event_time == tip_start
+
+
+def _minute_source_with_declared_warmup(fetcher):
+    return PolledMinuteBarSource(
+        fetcher,
+        venue="kraken",
+        source_label="test",
+        sequence_prefix="test",
+        interval_seconds=60,
+        clock=lambda: NOW,
+        cold_start_intervals=MINIMUM_WARMUP_INTERVALS,
+    )
+
+
+@pytest.mark.acceptance
+def test_source_stale_watermark_is_bounded_restart_warmup():
+    """ATDD-RELEASE-PIPELINE-v1/AC-020: a restored STALE source watermark is
+    re-acquired under bounded RESTART_WARMUP semantics -- the upstream request
+    and the admitted rows are clamped to the declared feature warm-up horizon
+    ending at the latest closed cutoff -- instead of an unbounded historical
+    catch-up, even when the venue returns older history than requested.
+    """
+    instrument = _instrument()
+    rows = _rows(count=MINIMUM_WARMUP_INTERVALS + 25, end_before=CUTOFF)
+    calls: list[int | None] = []
+
+    def fetcher(venue_id, *, interval_minutes, since_epoch):
+        calls.append(since_epoch)
+        return rows
+
+    source = _minute_source_with_declared_warmup(fetcher)
+    stale = SourceWatermark(
+        instrument_version_id=instrument.instrument_version_id,
+        through_utc=CUTOFF - timedelta(days=2),
+        last_source_sequence=42,
+        last_ingestion_order=777,
+    )
+    batch = source.fetch_through(instrument, watermark=stale, now=CUTOFF)
+
+    floor = CUTOFF - timedelta(minutes=MINIMUM_WARMUP_INTERVALS)
+    # (2) the upstream request is bounded to the current declared warm-up horizon
+    assert calls == [int(floor.timestamp()) - 1]
+    # (1)/(4) exactly the declared warm-up count, ending at the latest closed cutoff
+    assert len(batch.observations) == MINIMUM_WARMUP_INTERVALS
+    assert batch.observations[0].source_event_time == floor
+    assert batch.observations[-1].source_event_time == CUTOFF - timedelta(minutes=1)
+    # (3) pre-horizon rows are rejected before admission
+    assert all(item.source_event_time >= floor for item in batch.observations)
+    assert batch.coverage is CoverageState.COMPLETE
+    # (8) provenance stays monotonic and the watermark advances truthfully
+    assert batch.watermark.through_utc == CUTOFF
+    assert batch.watermark.last_ingestion_order == 777 + MINIMUM_WARMUP_INTERVALS
+    # (3) the declared canonical submit workload is the BOUNDED warm-up bound
+    assert declared_cycle_submit_bound(len(batch.observations)) == (
+        MAX_CYCLE_SUBMITS_PER_OBSERVATION * MINIMUM_WARMUP_INTERVALS
+        + MAX_CYCLE_FIXED_SUBMITS
+    )
+
+
+@pytest.mark.acceptance
+def test_source_stale_boundary_equality_remains_a_normal_resume():
+    """ATDD-RELEASE-PIPELINE-v1/AC-020: the stale threshold is strict. A tip
+    exactly one warm-up window behind the cutoff is an ordinary resume; one
+    interval older is a bounded restart. Either way the admitted batch is a
+    bounded warm-up window, never an unbounded catch-up.
+    """
+    instrument = _instrument()
+    rows = _rows(count=MINIMUM_WARMUP_INTERVALS + 60, end_before=CUTOFF)
+    floor = CUTOFF - timedelta(minutes=MINIMUM_WARMUP_INTERVALS)
+
+    calls: list[int | None] = []
+
+    def fetcher(venue_id, *, interval_minutes, since_epoch):
+        calls.append(since_epoch)
+        return rows
+
+    source = _minute_source_with_declared_warmup(fetcher)
+
+    # tip_start == floor exactly -> normal resumed path (bounded to the window).
+    equality = SourceWatermark(
+        instrument_version_id=instrument.instrument_version_id,
+        through_utc=floor + timedelta(seconds=60),
+    )
+    equal_batch = source.fetch_through(instrument, watermark=equality, now=CUTOFF)
+    assert calls[-1] == int(floor.timestamp()) - 1
+    assert len(equal_batch.observations) == MINIMUM_WARMUP_INTERVALS
+    assert equal_batch.coverage is CoverageState.COMPLETE
+
+    # tip_start one interval before floor -> stale restart, same bounded window.
+    just_stale = SourceWatermark(
+        instrument_version_id=instrument.instrument_version_id,
+        through_utc=floor,
+    )
+    stale_batch = source.fetch_through(instrument, watermark=just_stale, now=CUTOFF)
+    assert calls[-1] == int(floor.timestamp()) - 1
+    assert len(stale_batch.observations) == MINIMUM_WARMUP_INTERVALS
+    assert stale_batch.observations[0].source_event_time == floor
+    assert stale_batch.coverage is CoverageState.COMPLETE
+
+
+@pytest.mark.acceptance
+def test_source_recent_watermark_resume_semantics_are_unchanged():
+    """ATDD-RELEASE-PIPELINE-v1/AC-020: a current/recent restored watermark is
+    NOT treated as stale -- the ordinary resumed tip re-admission and
+    revision/superseding behavior is preserved.
+    """
+    instrument = _instrument()
+    rows = _rows(count=MINIMUM_WARMUP_INTERVALS + 60, end_before=CUTOFF)
+    calls: list[int | None] = []
+
+    def fetcher(venue_id, *, interval_minutes, since_epoch):
+        calls.append(since_epoch)
+        return rows
+
+    source = _minute_source_with_declared_warmup(fetcher)
+    recent = SourceWatermark(
+        instrument_version_id=instrument.instrument_version_id,
+        through_utc=CUTOFF - timedelta(seconds=60),
+    )
+    batch = source.fetch_through(instrument, watermark=recent, now=CUTOFF)
+
+    tip_start = recent.through_utc - timedelta(seconds=60)
+    # Ordinary resumed request: from the tip start, NOT the warm-up floor.
+    assert calls == [int(tip_start.timestamp()) - 1]
+    # The whole tip-to-cutoff span is re-admitted for OHLC correction.
+    assert [item.source_event_time for item in batch.observations] == [
+        tip_start,
+        tip_start + timedelta(seconds=60),
+    ]
+    assert batch.coverage is CoverageState.COMPLETE
+
+
+def _stale_resumed_state(instrument, *, days: int = 2, intervals: int = 5) -> RollingState:
+    """A decodable resumed checkpoint whose tip is far behind the cutoff."""
+    tip_start = CUTOFF - timedelta(days=days)
+    first = tip_start - timedelta(minutes=intervals - 1)
+    series = tuple(100.0 + index for index in range(intervals))
+    return RollingState(
+        instrument_version_id=instrument.instrument_version_id,
+        venue=instrument.venue,
+        venue_instrument_id=instrument.venue_instrument_id,
+        feature_version=FEATURE_VERSION,
+        opens=series,
+        highs=series,
+        lows=series,
+        closes=series,
+        volumes=tuple(10.0 + index for index in range(intervals)),
+        revisions=tuple(1 for _ in range(intervals)),
+        opens_known=tuple(True for _ in range(intervals)),
+        content_fingerprints=tuple(f"fp-{index}" for index in range(intervals)),
+        first_interval_epoch=int(first.timestamp()),
+        interval_seconds=60,
+        resumed_from_checkpoint=True,
+    )
+
+
+@pytest.mark.acceptance
+def test_stale_restored_checkpoint_records_a_gap_restart_not_a_cold_start():
+    """ATDD-RELEASE-PIPELINE-v1/AC-020: a bounded stale-restart re-acquisition
+    reuses the existing RollingState gap/reset/restart logic -- it records an
+    explicit discontinuity and emits exactly one current-cutoff snapshot, never a
+    fabricated NEW_LISTING_COLD_START, a watermark reset to ``None``, or a
+    backdated historical snapshot series.
+    """
+    instrument = _instrument()
+    restored = _stale_resumed_state(instrument)
+    assert restored.resumed_from_checkpoint is True
+    observations = _observations(
+        _rows(count=MINIMUM_WARMUP_INTERVALS, end_before=CUTOFF)
+    )
+    assert restored.last_interval_epoch is not None
+    window_start = datetime.fromtimestamp(
+        restored.last_interval_epoch, tz=timezone.utc
+    )
+    result = run_cycle(
+        observations,
+        instrument_version=instrument,
+        evaluation_cutoff=CUTOFF,
+        evaluated_at_utc=NOW,
+        state=restored,
+        publisher=None,
+        source_version="test",
+        window_start=window_start,
+    )
+    # The discontinuity is recorded through the existing gap semantics.
+    assert result.gap_detected is True
+    assert result.state.gap_resets == restored.gap_resets + 1
+    assert result.state.interval_count == MINIMUM_WARMUP_INTERVALS
+    # Exactly one current-cutoff snapshot; never a historical catch-up series.
+    assert result.snapshot.evaluation_cutoff == CUTOFF
+    assert result.snapshot.restart_state is not RestartState.NEW_LISTING_COLD_START
 
 
 def test_source_coverage_incomplete_when_tip_window_has_gaps():
