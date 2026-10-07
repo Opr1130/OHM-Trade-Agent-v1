@@ -71,7 +71,7 @@ jobs:
           }
 
       - name: Check out exact approved release
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ steps.target.outputs.sha }}
 

@@ -115,7 +115,7 @@ def test_infrastructure_contract_keeps_claude_out_of_production_runtime() -> Non
     assert "--allowedTools" in workflow
     assert "ANTHROPIC_API_KEY" in workflow
     assert "secrets.GITHUB_TOKEN" in workflow
-    assert "actions/upload-artifact@v4" in workflow
+    assert "actions/upload-artifact@v7" in workflow
 
     assert "ANTHROPIC_API_KEY" not in compose
     assert "anthropic" not in requirements.casefold()

@@ -27,19 +27,29 @@ jobs:
 
     steps:
       - name: Checkout trusted review configuration
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: main
 
       - name: Validate inputs and secret
+        id: gate
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           set -euo pipefail
           [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid PR number"; exit 64; }
-          [ -n "$GEMINI_API_KEY" ] || { echo "GEMINI_API_KEY is missing"; exit 65; }
+          # An optional external review integration must not turn a missing
+          # advisory credential into a failed check: absence produces SKIPPED
+          # steps, not FAILURE.
+          if [ -n "$GEMINI_API_KEY" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "GEMINI_API_KEY is not configured; skipping the advisory Gemini review."
+          fi
 
       - name: Fetch pull request diff
+        if: ${{ steps.gate.outputs.available == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -55,6 +65,7 @@ jobs:
           fi
 
       - name: Ask Gemini for independent review
+        if: ${{ steps.gate.outputs.available == 'true' }}
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
@@ -127,6 +138,7 @@ jobs:
           PY
 
       - name: Post Gemini review to pull request
+        if: ${{ steps.gate.outputs.available == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -135,10 +147,9 @@ jobs:
           gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -f body="$body" >/dev/null
 
       - name: Report Gemini workflow failure
-        if: ${{ failure() }}
+        if: ${{ failure() && steps.gate.outputs.available == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -f body="## Gemini Independent Review
-
-REVIEW_WORKFLOW_FAILED. Inspect the Gemini PR Review Actions run before relying on this review gate." >/dev/null || true
+          gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+            -f body="## Gemini Independent Review — REVIEW_WORKFLOW_FAILED. Inspect the Gemini PR Review Actions run before relying on this review gate." >/dev/null || true
