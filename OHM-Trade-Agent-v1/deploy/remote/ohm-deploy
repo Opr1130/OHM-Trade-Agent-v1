@@ -1314,6 +1314,8 @@ rollback() {
   echo "rollback health and paper checks passed" >&2
   exit "$rc"
 }
+trap rollback ERR
+
 # Candidate-version read-only protection preflight (AC-024).
 #
 # Bootstrap limitation: the host executes the already-installed
@@ -1363,7 +1365,6 @@ run_protection_preflight() {
 
   rc=1
   if [[ -d "$candidate_app" && -n "$image" && -f "$APP_ROOT/.env" ]]; then
-    set +e
     docker run --rm \
       --read-only \
       --tmpfs /tmp:rw,nosuid,size=32m \
@@ -1377,9 +1378,7 @@ run_protection_preflight() {
       python -m app.jobs.preflight_protection_health \
         --candidate-sha "$TARGET_SHA" \
         --release-profile EVIDENCE_SHADOW \
-      > "$receipt"
-    rc=$?
-    set -e
+      > "$receipt" || rc=$?
   fi
 
   raw="$("$PYTHON_BIN" - "$receipt" "$TARGET_SHA" "$rc" <<'PY'
@@ -1557,7 +1556,10 @@ PY
 # disposes of the pre-deploy scheduler snapshot so the next deploy still sees
 # exactly one transaction.
 if ! run_protection_preflight; then
-  cleanup_snapshot
+  # The refusal is not a command failure: disarm the trap first so the
+  # cleanup below can never be interpreted as a post-mutation failure.
+  trap - ERR
+  cleanup_snapshot || true
   echo "OPIP_PROTECTION_PREFLIGHT_ABORT=REFUSED_BEFORE_MUTATION" >&2
   exit 77
 fi
@@ -1570,8 +1572,6 @@ cd "$APP_ROOT"
   echo "checked-out repository SHA changed before build" >&2
   false
 }
-
-trap rollback ERR
 
 # Stop paper workers during the build/recreate window. Their dry-run state is
 # bind-mounted and survives the stop, while roughly two worker RSS footprints

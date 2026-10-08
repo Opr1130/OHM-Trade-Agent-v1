@@ -94,7 +94,7 @@ def _function_code() -> str:
 
 def _boundary_block() -> str:
     start = DEPLOY.index("# AC-024 read-only protection boundary.")
-    end = DEPLOY.index("\ntrap rollback ERR\n", start)
+    end = DEPLOY.index("# Stop paper workers during the build/recreate window.", start)
     return DEPLOY[start:end]
 
 
@@ -314,10 +314,12 @@ def test_ac_024_live_checkout_is_unchanged_until_preflight_pass():
     invocation = DEPLOY.index("if ! run_protection_preflight; then", start)
     checkout = DEPLOY.index('checkout -f main', start)
     reset = DEPLOY.index('reset --hard "$TARGET_SHA"', start)
-    trap = DEPLOY.index("\ntrap rollback ERR\n", start)
-    assert invocation < checkout < reset < trap
-    boundary = _without_comments(DEPLOY[invocation:trap])
+    mutation = DEPLOY.index("\nstop_paper_stack\n", reset)
+    trap = DEPLOY.index("\ntrap rollback ERR\n")
+    assert trap < invocation < checkout < reset < mutation
+    boundary = _without_comments(DEPLOY[invocation:checkout])
     assert "cleanup_snapshot" in boundary
+    assert "trap - ERR" in boundary
     assert "stop_paper_stack" not in boundary
     assert "docker compose" not in boundary
     assert "LAST_GOOD_FILE" not in boundary
@@ -336,7 +338,9 @@ def test_ac_024_preflight_refusal_precedes_every_mutation():
     ):
         assert forbidden not in code
         assert forbidden not in boundary
-    after = DEPLOY[DEPLOY.index("\ntrap rollback ERR\n") :]
+    after = _without_comments(
+        DEPLOY[DEPLOY.index("\nstop_paper_stack\n") :]
+    )
     assert after.index("stop_paper_stack") < after.index(
         'docker compose build --build-arg "OPIP_RELEASE_SHA=$TARGET_SHA"'
     )
