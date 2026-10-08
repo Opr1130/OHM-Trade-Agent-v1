@@ -282,7 +282,31 @@ THEN:
 (f) existing fail-closed protection, runtime verification, scheduler, Feature Bus, Paper-v2, Committee, TARGET_PAPER, funded/live/order/exchange authority and genuine post-mutation rollback semantics remain unchanged.
 
 HISTORICAL BOOTSTRAP LIMITATION (AC-024 is not retroactive over the installed controller):
-The host executes the already-installed `/usr/local/sbin/ohm-deploy` for a given deploy, not the candidate revision's copy. The prior deployment receipt showed `OPIP_DEPLOY_CONTROLLER_BOOTSTRAP=NOT_NEEDED` and `OPIP_DEPLOY_CONTROLLER_BOOTSTRAP_SHA=6cfcd47405216b35fcff039c659663d2af4fc2c4`, so the first deploy after AC-024 merges may still run a controller that predates this boundary. AC-024 governs the transaction only once this revision is the installed controller; it makes no claim about that first bootstrap execution, and no manual controller install is introduced. This is documented so the boundary is never reported as protecting a run it did not execute.
+The host executes the already-installed `/usr/local/sbin/ohm-deploy` for a given deploy, not the candidate revision's copy. The prior deployment receipt showed `OPIP_DEPLOY_CONTROLLER_BOOTSTRAP=NOT_NEEDED` and `OPIP_DEPLOY_CONTROLLER_BOOTSTRAP_SHA=6cfcd47405216b35fcff039c659663d2af4fc2c4`, so the first deploy after AC-024 merges may still run a controller that predates this boundary. AC-024 governs the transaction only once this revision is the installed controller; it makes no claim about that first bootstrap execution, and no manual controller install is introduced. This is documented so the boundary is never reported as protecting a run it did not execute. AC-025 is the explicit operational resolution of this limitation.
+
+AC-025:
+GIVEN:
+the merged and exact-main-qualified release contains AC-024 protection preflight, but the production host still has a pre-AC-024 /usr/local/sbin/ohm-deploy controller installed
+
+WHEN:
+the OWNER explicitly performs the one-time controller-only bootstrap against an exact 40-character lowercase SHA that still equals current origin/main
+
+THEN:
+(a) the operation holds the canonical deploy lock, proves there is no active scheduler-before.* deployment transaction, and obtains the target controller directly from the exact target git object without changing the production worktree;
+
+(b) the target controller passes shell syntax validation and proves the AC-024 pre-mutation protection-preflight contract before installation;
+
+(c) only /usr/local/sbin/ohm-deploy is atomically replaced, as root:root mode 0755, and its bytes and SHA-256 are proven identical to the exact target controller; an already-installed controller is reported NOT_NEEDED only when it satisfies the COMPLETE installed-controller invariant (regular non-symlink file, exact bytes, valid shell syntax, all AC-024 signatures, mode exactly 0755 and, in production, owner and group exactly root:root), which one shared verifier enforces for both the idempotence decision and post-install verification;
+
+(d) any argument, resolution, validation, installation or post-install verification failure fails closed and leaves or restores the previous installed controller, and no partially verified controller is left installed; every failure at or after installation reports the restoration verdict as `OPIP_CONTROLLER_BOOTSTRAP_RESTORE=VERIFIED` or `=UNPROVEN` with an explicit operator action, and a production ownership requirement is proven rather than silently waived;
+
+(e) services, containers, writer, scheduler, cron, last-good-sha, SAFE_BASELINE, the SSH gateway, sudoers, credentials, protection state, incident state, lifecycle state, exchange state, Paper-v2, Committee, TARGET_PAPER and funded/live/order authority remain unchanged;
+
+(f) the forced-command SSH gateway remains exactly deploy <sha> and diagnose-learning, the helper is never reachable through it, and it is never invoked by the deploy workflow;
+
+(g) once the controller-only bootstrap succeeds, the NEXT deployment starts under an AC-024-capable controller and must therefore reach the read-only protection preflight before production runtime mutation, where a non-HEALTHY decision blocks before mutation instead of causing a rollback;
+
+(h) path overrides for the repository root, state directory, destination controller and lock are inert unless the explicit OPIP_DEPLOY_TEST_SEAMS=1 seam is enabled, so production can never be redirected by an ambient environment variable.
 
 EXPLICITLY OUT OF SCOPE:
 - Activating TARGET_PAPER, Paper-v2, the Committee, or any funded/live/exchange/order authority
@@ -481,6 +505,33 @@ AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_docker_exit
 AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_shell_path_preflight_uses_the_docker_exit_code
 AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_workflow_distinguishes_preflight_block_from_rollback
 AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_successful_release_classification_is_unchanged
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_bootstrap_touches_no_forbidden_control_plane
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_ssh_gateway_remains_exactly_two_commands
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_bootstrap_is_not_wired_into_the_deploy_path
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_test_overrides_are_inert_without_the_seam
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_malformed_sha_fails_before_modification
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_target_must_equal_origin_main
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_missing_target_controller_fails_closed
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_invalid_target_controller_is_refused
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_active_deploy_lock_causes_refusal
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_active_deployment_transaction_causes_refusal
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_success_installs_target_controller_from_the_git_object
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_success_touches_only_the_controller_destination
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_second_invocation_is_idempotent
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_first_success_backs_up_the_previous_controller
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_receipt_is_bounded_restrictive_and_secretless
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_next_deploy_controller_has_the_ac024_preflight
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_post_install_failure_restores_the_previous_controller
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_failure_before_install_leaves_the_controller_unchanged
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_idempotent_not_needed_requires_full_invariant
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_identical_bytes_with_wrong_mode_is_not_not_needed
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_identical_bytes_through_a_symlink_is_not_not_needed
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_production_verifier_requires_root_owner_and_group
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_live_head_change_before_not_needed_fails_closed
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_post_install_ownership_failure_restores
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_installation_failure_reports_verified_restore
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_installation_and_restore_failure_reports_unproven
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_no_forbidden_tooling_is_required
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/services/release_profiles.py
@@ -622,6 +673,9 @@ AC-024 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
 AC-024 -> .github/workflows/deploy-production.yml
 AC-024 -> OHM-Trade-Agent-v1/tests/test_release_protection_preflight_v1.py
 AC-024 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
+AC-025 -> OHM-Trade-Agent-v1/deploy/remote/bootstrap-deploy-controller-only.sh
+AC-025 -> OHM-Trade-Agent-v1/tests/test_opip_deploy_controller_bootstrap_only.py
+AC-025 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
 
 DEFERRED DISCOVERIES:
 - `TARGET_PAPER` remains BLOCKED. Activating it (Paper-v2) requires the ATDD-R4-B2 AC-011 comparator evidence, F11 protection READY, legacy drain READY and explicit OWNER approval, and is a separate OWNER increment; this contract does not authorize it.
