@@ -255,12 +255,33 @@ def _real_cp() -> str:
     return shutil.which("cp") or "/bin/cp"
 
 
+def _cp_shim_body(patterns: str) -> str:
+    """A `cp` shim that fails only when the SOURCE matches `patterns`.
+
+    The first non-flag argument is the source (``cp [-p] [--] SRC DST``), so the
+    bounded backup (whose source is the installed controller) still succeeds
+    while the extraction copy and/or the restore copy can be made to fail.
+    """
+    return (
+        "#!/usr/bin/env bash\n"
+        'src=""\n'
+        'for arg in "$@"; do\n'
+        '  case "$arg" in -*) continue ;; esac\n'
+        '  src="$arg"\n'
+        "  break\n"
+        "done\n"
+        f'case "$src" in\n  {patterns}) exit 1 ;;\nesac\n'
+        f'exec {_real_cp()!r} "$@"\n'
+    )
+
+
 def _make_shim(directory: Path, name: str, body: str) -> Path:
+    """Write an executable shim and return the DIRECTORY to put on PATH."""
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / name
     path.write_text(body, encoding="utf-8", newline="\n")
     path.chmod(0o755)
-    return path
+    return directory
 
 
 def _python_for_bash() -> str:
@@ -810,30 +831,26 @@ def test_ac_025_live_head_change_before_not_needed_fails_closed(sandbox):
         "#!/usr/bin/env bash\n"
         f"REAL_GIT={real_git!r}\n"
         f"REPO={sandbox.repo.as_posix()!r}\n"
-        f"GATE={(sandbox.root / 'git-drift-count').as_posix()!r}\n"
-        "count=0\n"
-        'if [[ -f "$GATE" ]]; then count=$(cat "$GATE"); fi\n'
-        'if [[ "$1" == "-C" && "$3" == "rev-parse" && "$4" == "HEAD" ]]; then\n'
-        "  count=$((count + 1))\n"
-        '  printf "%s" "$count" > "$GATE"\n'
-        "  if [[ \"$count\" -eq 2 ]]; then\n"
-        '    command "$REAL_GIT" -C "$REPO" -c user.email=d@e.f -c user.name=d '
+        f"GATE={(sandbox.root / 'git-drift-gate').as_posix()!r}\n"
+        'if [[ "$*" == *"rev-parse HEAD"* ]]; then\n'
+        '  if [[ -f "$GATE" ]]; then\n'
+        '    "$REAL_GIT" -C "$REPO" -c user.email=d@e.f -c user.name=d '
         "commit -q --allow-empty -m drift\n"
         "  fi\n"
+        '  : > "$GATE"\n'
         "fi\n"
         'exec "$REAL_GIT" "$@"\n',
     )
-    # The sandbox runs git as `git -C <repo>`, so the shim sees -C at $1.
     env = sandbox.env()
     env["PATH"] = str(shim) + os.pathsep + env["PATH"]
     proc = sandbox.run(sha, env=env)
     _skip_on_fork(proc)
     combined = proc.stdout + proc.stderr
-    assert proc.returncode == 72
+    assert proc.returncode == 72, combined
     assert "OPIP_CONTROLLER_BOOTSTRAP_STATUS=FAILED" in combined
     assert "NOT_NEEDED" not in combined
     assert sandbox.installed_bytes() == installed_before
-    assert (sandbox.root / "git-drift-count").is_file()
+    assert (sandbox.root / "git-drift-gate").is_file()
 
 
 # ---------------------------------------------------------------------------
@@ -867,9 +884,7 @@ def test_ac_025_installation_failure_reports_verified_restore(sandbox):
     shim = _make_shim(
         sandbox.root / "shim-cp-target",
         "cp",
-        "#!/usr/bin/env bash\n"
-        'case "${1:-}" in *ohm-deploy.target) exit 1 ;; esac\n'
-        f'exec {_real_cp()!r} "$@"\n',
+        _cp_shim_body("*ohm-deploy.target"),
     )
     env = sandbox.env()
     env["PATH"] = str(shim) + os.pathsep + env["PATH"]
@@ -888,9 +903,7 @@ def test_ac_025_installation_and_restore_failure_reports_unproven(sandbox):
     shim = _make_shim(
         sandbox.root / "shim-cp-both",
         "cp",
-        "#!/usr/bin/env bash\n"
-        'case "${1:-}" in *ohm-deploy.target|*controller-bootstrap-previous) exit 1 ;; esac\n'
-        f'exec {_real_cp()!r} "$@"\n',
+        _cp_shim_body("*ohm-deploy.target|*controller-bootstrap-previous"),
     )
     env = sandbox.env()
     env["PATH"] = str(shim) + os.pathsep + env["PATH"]
