@@ -1314,21 +1314,176 @@ rollback() {
   echo "rollback health and paper checks passed" >&2
   exit "$rc"
 }
-trap rollback ERR
+# Candidate-version read-only protection preflight.
+# Uses the already-running core image only for its installed dependencies.
+# Candidate Python is bind-mounted read-only over /app/app. Production data is
+# bind-mounted read-only. The container publishes no ports, is removed on exit,
+# and is not a compose service replacement. Classification stays in
+# app.jobs.preflight_protection_health, which calls the existing read-only
+# protection report. This function prints markers and returns 0 only when that
+# report is ready. It does not stop, build, or recreate production services.
+run_protection_preflight() {
+  local image receipt rc=0 raw status state coverage suspended codes reason
+  image="$(docker inspect --format '{{.Image}}' ohm-trade-agent 2>/dev/null || true)"
+  receipt="$STATE_DIR/protection-preflight.json"
+  install -d -m 0755 "$STATE_DIR"
+  : > "$receipt"
+  chmod 0600 "$receipt"
+  rc=1
+  if [[ -n "$image" && -f "$APP_ROOT/.env" ]]; then
+    set +e
+    docker run --rm \
+      --read-only \
+      --tmpfs /tmp:rw,nosuid,size=32m \
+      --pids-limit 64 \
+      --memory 384m \
+      --env-file "$APP_ROOT/.env" \
+      -e PYTHONDONTWRITEBYTECODE=1 \
+      -v "$APP_ROOT/app:/app/app:ro" \
+      -v "$APP_ROOT/data:/app/data:ro" \
+      "$image" \
+      python -m app.jobs.preflight_protection_health \
+        --candidate-sha "$TARGET_SHA" \
+        --release-profile EVIDENCE_SHADOW \
+      > "$receipt"
+    rc=$?
+    set -e
+  fi
+  raw="$("$PYTHON_BIN" - "$receipt" "$TARGET_SHA" "$rc" <<'PY'
+import json, sys
+path, expected_sha, raw_rc = sys.argv[1], sys.argv[2], sys.argv[3]
+limit = 65536
 
-# Stop paper workers during the build/recreate window. Their dry-run state is
-# bind-mounted and survives the stop, while roughly two worker RSS footprints
-# are released during the deployment's highest transient-memory phase.
-stop_paper_stack
+def fail(message):
+    print("FAIL")
+    print("UNAVAILABLE")
+    print("false")
+    print("true")
+    print("UNAVAILABLE")
+    print(message)
 
+try:
+    rc_value = int(raw_rc)
+except ValueError:
+    fail("protection preflight did not return a readable decision")
+else:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = handle.read(limit + 1)
+    except OSError:
+        fail("protection preflight did not return a readable decision")
+    else:
+        if len(payload) > limit or not payload.strip():
+            fail("protection preflight did not return a readable decision")
+        else:
+            try:
+                doc = json.loads(payload)
+            except json.JSONDecodeError:
+                fail("protection preflight did not return a readable decision")
+            else:
+                protection = doc.get("protection") if isinstance(doc, dict) else None
+                if not isinstance(protection, dict):
+                    fail("protection preflight did not return a readable decision")
+                else:
+                    ready = (
+                        rc_value == 0
+                        and doc.get("schema_version") == 1
+                        and doc.get("read_only") is True
+                        and doc.get("candidate_sha") == expected_sha
+                        and doc.get("release_profile") == "EVIDENCE_SHADOW"
+                        and protection.get("state") == "HEALTHY"
+                        and protection.get("admissions_suspended") is False
+                        and protection.get("coverage_complete") is True
+                        and protection.get("reason_codes") == ["PROTECTION_PROVEN"]
+                        and isinstance(doc.get("verdict"), dict)
+                        and doc["verdict"].get("ready") is True
+                    )
+                    state = str(protection.get("state") or "UNAVAILABLE")
+                    coverage = "true" if protection.get("coverage_complete") is True else "false"
+                    suspended = "false" if protection.get("admissions_suspended") is False else "true"
+                    codes = protection.get("reason_codes")
+                    if not isinstance(codes, list) or not codes:
+                        codes = ["UNAVAILABLE"]
+                    reason = protection.get("resolution_reason") or ""
+                    verdict = doc.get("verdict")
+                    if not reason and isinstance(verdict, dict):
+                        reason = verdict.get("reason") or ""
+                    reason = "".join(
+                        ch if ch.isalnum() or ch in " .,:/_+-" else " "
+                        for ch in str(reason)
+                    )
+                    reason = " ".join(reason.split())[:240] or "protection is not HEALTHY"
+                    print("PASS" if ready else "FAIL")
+                    print(state)
+                    print(coverage)
+                    print(suspended)
+                    print(",".join(str(code) for code in codes))
+                    print(reason)
+PY
+)" || raw=$'FAIL\nUNAVAILABLE\nfalse\ntrue\nUNAVAILABLE\nprotection preflight did not return a readable decision'
+  status="$(printf '%s\n' "$raw" | sed -n '1p')"
+  state="$(printf '%s\n' "$raw" | sed -n '2p')"
+  coverage="$(printf '%s\n' "$raw" | sed -n '3p')"
+  suspended="$(printf '%s\n' "$raw" | sed -n '4p')"
+  codes="$(printf '%s\n' "$raw" | sed -n '5p')"
+  reason="$(printf '%s\n' "$raw" | sed -n '6p')"
+  if [[ "$status" != "PASS" ]]; then
+    status="FAIL"
+  fi
+  echo "OPIP_PROTECTION_PREFLIGHT=$status"
+  echo "OPIP_PROTECTION_PREFLIGHT_STATE=${state:-UNAVAILABLE}"
+  echo "OPIP_PROTECTION_PREFLIGHT_COVERAGE_COMPLETE=${coverage:-false}"
+  echo "OPIP_PROTECTION_PREFLIGHT_ADMISSIONS_SUSPENDED=${suspended:-true}"
+  echo "OPIP_PROTECTION_PREFLIGHT_REASON_CODES=${codes:-UNAVAILABLE}"
+  echo "OPIP_PROTECTION_PREFLIGHT_RESOLUTION_REASON=${reason:-protection preflight did not return a readable decision}"
+  echo "OPIP_PROTECTION_PREFLIGHT_JSON=$receipt"
+  if [[ "$status" == "PASS" ]]; then
+    return 0
+  fi
+  echo "OPIP_CORE_DEPLOY_STATUS=NOT_STARTED"
+  echo "OPIP_PRODUCTION_MUTATION=NOT_STARTED"
+  echo "OPIP_ROLLBACK_REQUIRED=false"
+  echo "OPIP_SAFE_BASELINE_UNCHANGED=true"
+  echo "OPIP_LEARNING_EXPORT_STATUS=NOT_STARTED"
+  echo "OPIP_LEARNING_READINESS=NOT_APPLICABLE"
+  echo "PROTECTION PREFLIGHT BLOCKED"
+  echo "production_mutation_started=false"
+  echo "rollback_required=false"
+  echo "safe_baseline_unchanged=true"
+  return 77
+}
+
+# AC-024 candidate checkout precedes protection preflight.
+# The running core image does not mount application code (compose mounts data
+# only), and installed cron executes the image plus /etc/cron.d copies. This
+# checkout therefore does not change the running service, scheduler, writer, or
+# release profile. It only makes the candidate tree available to the preflight.
+# The host runs the already-installed /usr/local/sbin/ohm-deploy. This boundary
+# is what that installed controller executes once this revision is the controller.
 "${GIT[@]}" checkout -f main
 "${GIT[@]}" reset --hard "$TARGET_SHA"
 
 cd "$APP_ROOT"
 [[ "$("${GIT[@]}" rev-parse HEAD)" == "$TARGET_SHA" ]] || {
-  echo "checked-out repository SHA changed before build" >&2
-  false
+  echo "checked-out repository SHA changed before protection preflight" >&2
+  exit 66
 }
+
+# Read-only protection boundary. A refusal exits before the rollback trap is
+# installed and before every production mutation below. No rollback is required
+# because the running release has not been changed.
+if ! run_protection_preflight; then
+  exit 77
+fi
+
+trap rollback ERR
+
+# Stop paper workers during the build/recreate window. Their dry-run state is
+# bind-mounted and survives the stop, while roughly two worker RSS footprints
+# are released during the deployment's highest transient-memory phase.
+# This is the first production-runtime mutation on the success path.
+stop_paper_stack
+
 docker compose build --build-arg "OPIP_RELEASE_SHA=$TARGET_SHA" \
   opip-canonical-writer ohm-trade-agent
 # Writer and core are independent services. Build/start both; validate each
