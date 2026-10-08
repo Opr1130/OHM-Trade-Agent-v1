@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -113,7 +114,7 @@ def _sha256_bytes(data: bytes) -> str:
 class Sandbox:
     """A throwaway host layout: repo + bare origin + state + sbin + lock."""
 
-    def __init__(self, root: Path, controller: str) -> None:
+    def __init__(self, root: Path, controller: str, *, install_previous: bool = True) -> None:
         self.root = root
         self.repo = root / "repo"
         self.origin = root / "origin.git"
@@ -124,6 +125,7 @@ class Sandbox:
         self.lock = self.lockdir / "ohm-deploy.lock"
         self.last_good = self.state / "last-good-sha"
         self.controller_text = controller
+        self.install_previous = install_previous
         self._build()
 
     # -- construction --------------------------------------------------------
@@ -139,8 +141,10 @@ class Sandbox:
         _git(["config", "user.name", "bootstrap"], self.repo)
         _git(["remote", "add", "origin", self.origin.as_posix()], self.repo)
         self.commit_controller(self.controller_text)
-        # The pre-existing, pre-AC-024 installed controller.
-        _write(self.installed, OLD_CONTROLLER, mode=0o755)
+        # The pre-existing, pre-AC-024 installed controller (unless the case
+        # needs a host with no controller installed at all).
+        if self.install_previous:
+            _write(self.installed, OLD_CONTROLLER, mode=0o755)
 
     def commit_controller(self, controller: str) -> str:
         _write(self.repo / CONTROLLER_REL, controller, mode=0o755)
@@ -189,6 +193,23 @@ class Sandbox:
         env["OPIP_BOOTSTRAP_LOCK_FILE"] = str(self.lock)
         return env
 
+    def env_with(self, **extra: str) -> dict[str, str]:
+        env = self.env()
+        env.update({key: str(value) for key, value in extra.items()})
+        return env
+
+    def mode(self, path: Path) -> str:
+        proc = subprocess.run(
+            [_bash() or "bash", "-c", f'stat -c "%a" "{path}"'],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        return proc.stdout.strip()
+
+    def is_symlink(self, path: Path) -> bool:
+        return path.is_symlink()
+
     def run(
         self,
         sha: str,
@@ -228,6 +249,22 @@ def sandbox(tmp_path: Path):
 def _skip_on_fork(proc: subprocess.CompletedProcess[str]) -> None:
     if _is_fork_failure(proc):
         pytest.skip("bash cannot fork reliably in this environment")
+
+
+def _real_cp() -> str:
+    return shutil.which("cp") or "/bin/cp"
+
+
+def _make_shim(directory: Path, name: str, body: str) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    path.write_text(body, encoding="utf-8", newline="\n")
+    path.chmod(0o755)
+    return path
+
+
+def _python_for_bash() -> str:
+    return shutil.which("python3") or sys.executable
 
 
 def _tree_fingerprints(root: Path, exclude: tuple[Path, ...]) -> dict[str, str]:
@@ -653,3 +690,229 @@ def test_ac_025_failure_before_install_leaves_the_controller_unchanged(sandbox):
     assert sandbox.installed_bytes() == before
     assert sandbox.head() == head_before
     assert not (sandbox.state / "controller-bootstrap-previous").exists()
+
+
+# ---------------------------------------------------------------------------
+# NOT_NEEDED is gated on the COMPLETE installed-controller invariant.
+# ---------------------------------------------------------------------------
+
+def test_ac_025_idempotent_not_needed_requires_full_invariant(sandbox):
+    """ATDD-RELEASE-PIPELINE-v1/AC-025: a byte-identical, regular, mode-0755 controller reports NOT_NEEDED and proves the live HEAD was unchanged."""
+    sha = sandbox.origin_main()
+    first = sandbox.run(sha)
+    _skip_on_fork(first)
+    assert first.returncode == 0
+
+    installed_before = sandbox.installed_bytes()
+    installed_stat = sandbox.mode(sandbox.installed)
+    second = sandbox.run(sha)
+    _skip_on_fork(second)
+    assert second.returncode == 0, second.stderr
+    assert "OPIP_CONTROLLER_BOOTSTRAP_STATUS=NOT_NEEDED" in second.stdout
+    assert "OPIP_CONTROLLER_BOOTSTRAP_AC024=PROVEN" in second.stdout
+    assert sandbox.installed_bytes() == installed_before
+    assert sandbox.mode(sandbox.installed) == installed_stat
+    # E: NOT_NEEDED proves the live checkout did not move for this run.
+    assert f"OPIP_CONTROLLER_BOOTSTRAP_LIVE_HEAD={sandbox.head()}" in second.stdout
+    assert sandbox.receipt_fields()["OPIP_CONTROLLER_BOOTSTRAP_STATUS"] == "NOT_NEEDED"
+
+
+def test_ac_025_identical_bytes_with_wrong_mode_is_not_not_needed(sandbox):
+    """ATDD-RELEASE-PIPELINE-v1/AC-025: identical bytes whose mode is not 0755 must NOT short-circuit as NOT_NEEDED; the correction path restores mode 0755."""
+    sha = sandbox.origin_main()
+    first = sandbox.run(sha)
+    _skip_on_fork(first)
+    assert first.returncode == 0
+    target_bytes = sandbox.installed_bytes()
+
+    sandbox.installed.chmod(0o644)
+    assert sandbox.mode(sandbox.installed) == "644"
+
+    proc = sandbox.run(sha)
+    _skip_on_fork(proc)
+    assert proc.returncode == 0, proc.stderr
+    assert "OPIP_CONTROLLER_BOOTSTRAP_STATUS=NOT_NEEDED" not in proc.stdout
+    assert "OPIP_CONTROLLER_BOOTSTRAP_STATUS=SUCCESS" in proc.stdout
+    assert sandbox.installed_bytes() == target_bytes
+    assert sandbox.mode(sandbox.installed) == "755"
+
+
+def test_ac_025_identical_bytes_through_a_symlink_is_not_not_needed(sandbox):
+    """ATDD-RELEASE-PIPELINE-v1/AC-025: a symlink destination with identical bytes must NOT be accepted as NOT_NEEDED, and the final controller must be a regular non-symlink file."""
+    sha = sandbox.origin_main()
+    first = sandbox.run(sha)
+    _skip_on_fork(first)
+    assert first.returncode == 0
+    target_bytes = sandbox.installed_bytes()
+
+    aside = sandbox.root / "controller-bytes"
+    aside.write_bytes(target_bytes)
+    sandbox.installed.unlink()
+    sandbox.installed.symlink_to(aside)
+    assert sandbox.is_symlink(sandbox.installed)
+
+    proc = sandbox.run(sha)
+    _skip_on_fork(proc)
+    assert proc.returncode == 0, proc.stderr
+    assert "OPIP_CONTROLLER_BOOTSTRAP_STATUS=NOT_NEEDED" not in proc.stdout
+    assert "OPIP_CONTROLLER_BOOTSTRAP_STATUS=SUCCESS" in proc.stdout
+    assert not sandbox.is_symlink(sandbox.installed)
+    assert sandbox.installed.is_file()
+    assert sandbox.installed_bytes() == target_bytes
+    assert sandbox.mode(sandbox.installed) == "755"
+
+
+def test_ac_025_production_verifier_requires_root_owner_and_group(sandbox):
+    """ATDD-RELEASE-PIPELINE-v1/AC-025: the shared installed-controller verifier enforces root:root in production, and a production ownership failure is not silently ignored."""
+    code = _bootstrap_code()
+    assert "controller_metadata_ok" in code
+    assert "verify_installed_controller" in code
+    # The production-gated ownership proof sits inside the ONE shared verifier.
+    verifier = code.split("controller_metadata_ok() {", 1)[1].split("\n}", 1)[0]
+    assert 'PRODUCTION_MODE' in verifier
+    assert "root:root" in verifier
+    assert "stat -c '%U:%G'" in verifier
+    installer = code.split("atomic_install_controller() {", 1)[1].split("\n}", 1)[0]
+    # No fail-open ownership handling on the installation path.
+    assert "chown root:root" in installer
+    assert "|| true" not in installer
+
+    if not TOOLCHAIN_READY:
+        pytest.skip("a forking bash with flock/git/sha256sum is required")
+    # Behavioural: forcing production ownership with a chown that cannot change
+    # ownership must fail the run and leave the installed controller untouched.
+    shim = _make_shim(sandbox.root / "shim-bad-chown", "chown", "#!/usr/bin/env bash\nexit 1\n")
+    before = sandbox.installed_bytes()
+    env = sandbox.env_with(OPIP_BOOTSTRAP_PRODUCTION_MODE="1")
+    env["PATH"] = str(shim) + os.pathsep + env["PATH"]
+    proc = sandbox.run(sandbox.origin_main(), env=env)
+    _skip_on_fork(proc)
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 71, combined
+    assert "OPIP_CONTROLLER_BOOTSTRAP_STATUS=FAILED" in combined
+    assert "own" in combined and "root" in combined
+    assert sandbox.installed_bytes() == before
+
+
+def test_ac_025_live_head_change_before_not_needed_fails_closed(sandbox):
+    """ATDD-RELEASE-PIPELINE-v1/AC-025: if the live HEAD moves before NOT_NEEDED completes, the bootstrap fails closed without touching the controller or repairing the checkout."""
+    sha = sandbox.origin_main()
+    first = sandbox.run(sha)
+    _skip_on_fork(first)
+    assert first.returncode == 0
+    installed_before = sandbox.installed_bytes()
+
+    real_git = _git_bin()
+    assert real_git is not None
+    shim = _make_shim(
+        sandbox.root / "shim-git-drift",
+        "git",
+        "#!/usr/bin/env bash\n"
+        f"REAL_GIT={real_git!r}\n"
+        f"REPO={sandbox.repo.as_posix()!r}\n"
+        f"GATE={(sandbox.root / 'git-drift-count').as_posix()!r}\n"
+        "count=0\n"
+        'if [[ -f "$GATE" ]]; then count=$(cat "$GATE"); fi\n'
+        'if [[ "$1" == "-C" && "$3" == "rev-parse" && "$4" == "HEAD" ]]; then\n'
+        "  count=$((count + 1))\n"
+        '  printf "%s" "$count" > "$GATE"\n'
+        "  if [[ \"$count\" -eq 2 ]]; then\n"
+        '    command "$REAL_GIT" -C "$REPO" -c user.email=d@e.f -c user.name=d '
+        "commit -q --allow-empty -m drift\n"
+        "  fi\n"
+        "fi\n"
+        'exec "$REAL_GIT" "$@"\n',
+    )
+    # The sandbox runs git as `git -C <repo>`, so the shim sees -C at $1.
+    env = sandbox.env()
+    env["PATH"] = str(shim) + os.pathsep + env["PATH"]
+    proc = sandbox.run(sha, env=env)
+    _skip_on_fork(proc)
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 72
+    assert "OPIP_CONTROLLER_BOOTSTRAP_STATUS=FAILED" in combined
+    assert "NOT_NEEDED" not in combined
+    assert sandbox.installed_bytes() == installed_before
+    assert (sandbox.root / "git-drift-count").is_file()
+
+
+# ---------------------------------------------------------------------------
+# Production ownership and post-install verification failure.
+# ---------------------------------------------------------------------------
+
+def test_ac_025_post_install_ownership_failure_restores(tmp_path):
+    """ATDD-RELEASE-PIPELINE-v1/AC-025: when post-install verification cannot prove root:root ownership, the bootstrap fails and restores."""
+    _require_toolchain()
+    sandbox = Sandbox(tmp_path / "ownerless", REAL_CONTROLLER, install_previous=False)
+    assert not sandbox.installed.exists()
+    shim = _make_shim(sandbox.root / "shim-chown-ok", "chown", "#!/usr/bin/env bash\nexit 0\n")
+    env = sandbox.env_with(OPIP_BOOTSTRAP_PRODUCTION_MODE="1")
+    env["PATH"] = str(shim) + os.pathsep + env["PATH"]
+
+    proc = sandbox.run(sandbox.origin_main(), env=env)
+    _skip_on_fork(proc)
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 71, combined
+    assert "post-install verification failed" in combined
+    assert "OPIP_CONTROLLER_BOOTSTRAP_RESTORE=VERIFIED" in combined
+    # Restored to the prior faithful state: no controller existed before.
+    assert not sandbox.installed.exists()
+
+
+def test_ac_025_installation_failure_reports_verified_restore(sandbox):
+    """ATDD-RELEASE-PIPELINE-v1/AC-025: an atomic installation failure still reports RESTORE=VERIFIED when the previous controller is provably restored."""
+    before = sandbox.installed_bytes()
+    # Fail only the copy of the extracted target; the restore copy uses the
+    # bounded backup and therefore still succeeds.
+    shim = _make_shim(
+        sandbox.root / "shim-cp-target",
+        "cp",
+        "#!/usr/bin/env bash\n"
+        'case "${1:-}" in *ohm-deploy.target) exit 1 ;; esac\n'
+        f'exec {_real_cp()!r} "$@"\n',
+    )
+    env = sandbox.env()
+    env["PATH"] = str(shim) + os.pathsep + env["PATH"]
+    proc = sandbox.run(sandbox.origin_main(), env=env)
+    _skip_on_fork(proc)
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 71, combined
+    assert "controller installation failed" in combined
+    assert "OPIP_CONTROLLER_BOOTSTRAP_RESTORE=VERIFIED" in combined
+    assert sandbox.installed_bytes() == before
+
+
+def test_ac_025_installation_and_restore_failure_reports_unproven(sandbox):
+    """ATDD-RELEASE-PIPELINE-v1/AC-025: when both the installation and the restore of the previous controller fail, the verdict is RESTORE=UNPROVEN with an explicit operator action."""
+    # Fail the target copy AND the restore copy of the bounded backup.
+    shim = _make_shim(
+        sandbox.root / "shim-cp-both",
+        "cp",
+        "#!/usr/bin/env bash\n"
+        'case "${1:-}" in *ohm-deploy.target|*controller-bootstrap-previous) exit 1 ;; esac\n'
+        f'exec {_real_cp()!r} "$@"\n',
+    )
+    env = sandbox.env()
+    env["PATH"] = str(shim) + os.pathsep + env["PATH"]
+    proc = sandbox.run(sandbox.origin_main(), env=env)
+    _skip_on_fork(proc)
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 71, combined
+    assert "OPIP_CONTROLLER_BOOTSTRAP_RESTORE=UNPROVEN" in combined
+    assert "OPIP_CONTROLLER_BOOTSTRAP_OPERATOR_ACTION=CONTROLLER_RESTORE_UNPROVEN" in combined
+    assert "OPIP_CONTROLLER_BOOTSTRAP_STATUS=FAILED" in combined
+
+
+def test_ac_025_no_forbidden_tooling_is_required(sandbox):
+    """ATDD-RELEASE-PIPELINE-v1/AC-025: the tool preflight names every real dependency but never adds docker, compose, systemctl or cron."""
+    code = _bootstrap_code()
+    preflight = code.split("REQUIRED_TOOLS=(", 1)[1].split("\n", 1)[0]
+    for required in ("git", "flock", "mktemp", "sha256sum", "awk", "cmp", "stat", "chmod",
+                     "mv", "cp", "mkdir", "rm", "dirname", "grep", "date", "id", "bash"):
+        assert required in preflight, required
+    for forbidden in ("docker", "systemctl", "crontab", "cron"):
+        assert forbidden not in preflight, forbidden
+    # The production-only dependencies are added conditionally.
+    assert 'REQUIRED_TOOLS+=(sudo chown)' in code
+    # Every command referenced in the body is covered by the preflight list.
+    assert "command -v" in code

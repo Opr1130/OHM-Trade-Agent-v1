@@ -296,9 +296,9 @@ THEN:
 
 (b) the target controller passes shell syntax validation and proves the AC-024 pre-mutation protection-preflight contract before installation;
 
-(c) only /usr/local/sbin/ohm-deploy is atomically replaced, as root:root mode 0755, and its bytes and SHA-256 are proven identical to the exact target controller;
+(c) only /usr/local/sbin/ohm-deploy is atomically replaced, as root:root mode 0755, and its bytes and SHA-256 are proven identical to the exact target controller; an already-installed controller is reported NOT_NEEDED only when it satisfies the COMPLETE installed-controller invariant (regular non-symlink file, exact bytes, valid shell syntax, all AC-024 signatures, mode exactly 0755 and, in production, owner and group exactly root:root), which one shared verifier enforces for both the idempotence decision and post-install verification;
 
-(d) any argument, resolution, validation growth or post-install verification failure fails closed and leaves or restores the previous installed controller, and no partially verified controller is left installed;
+(d) any argument, resolution, validation, installation or post-install verification failure fails closed and leaves or restores the previous installed controller, and no partially verified controller is left installed; every failure at or after installation reports the restoration verdict as `OPIP_CONTROLLER_BOOTSTRAP_RESTORE=VERIFIED` or `=UNPROVEN` with an explicit operator action, and a production ownership requirement is proven rather than silently waived;
 
 (e) services, containers, writer, scheduler, cron, last-good-sha, SAFE_BASELINE, the SSH gateway, sudoers, credentials, protection state, incident state, lifecycle state, exchange state, Paper-v2, Committee, TARGET_PAPER and funded/live/order authority remain unchanged;
 
@@ -523,6 +523,15 @@ AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_recei
 AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_next_deploy_controller_has_the_ac024_preflight
 AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_post_install_failure_restores_the_previous_controller
 AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_failure_before_install_leaves_the_controller_unchanged
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_idempotent_not_needed_requires_full_invariant
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_identical_bytes_with_wrong_mode_is_not_not_needed
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_identical_bytes_through_a_symlink_is_not_not_needed
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_production_verifier_requires_root_owner_and_group
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_live_head_change_before_not_needed_fails_closed
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_post_install_ownership_failure_restores
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_installation_failure_reports_verified_restore
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_installation_and_restore_failure_reports_unproven
+AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_no_forbidden_tooling_is_required
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/services/release_profiles.py
