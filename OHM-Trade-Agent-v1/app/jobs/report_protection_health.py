@@ -81,9 +81,8 @@ def _read_only_resolver() -> KrakenExposureResolver:
     )
 
 
-def build_report() -> dict[str, Any]:
-    """Resolve the live exposure and derive the protection decision, read-only."""
-    incidents_healthy = protection_incidents_healthy()
+def _resolve_report(incidents_healthy: bool | None) -> dict[str, Any]:
+    """Derive the protection decision from ONE supplied incident verdict."""
     try:
         resolution = _read_only_resolver().resolve()
     except Exception as exc:  # noqa: BLE001 - an unreadable exposure is not healthy
@@ -99,6 +98,24 @@ def build_report() -> dict[str, Any]:
     resolution_reason = getattr(resolution, "reason", "")
     if resolution_reason:
         report["resolution_reason"] = resolution_reason
+    return report
+
+
+def build_report_with_incidents() -> tuple[dict[str, Any], bool | None]:
+    """Resolve the exposure once and return ``(report, incidents_healthy)``.
+
+    The incident store is observed exactly once, so a caller that also needs the
+    raw verdict cannot cause a second, possibly different, observation. This is
+    the shared read-only seam used by both the live report and the release
+    preflight; it evaluates no protection logic of its own.
+    """
+    incidents_healthy = protection_incidents_healthy()
+    return _resolve_report(incidents_healthy), incidents_healthy
+
+
+def build_report() -> dict[str, Any]:
+    """Resolve the live exposure and derive the protection decision, read-only."""
+    report, _ = build_report_with_incidents()
     return report
 
 

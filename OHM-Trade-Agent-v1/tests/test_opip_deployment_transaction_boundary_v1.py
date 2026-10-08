@@ -400,7 +400,11 @@ def _classify(
         'printf "POSTCOMMIT_HEALTH=%s\\nTRANSITION_ELIGIBLE=%s\\n"'
         ' "${POSTCOMMIT_HEALTH:-}" "${TRANSITION_ELIGIBLE:-}"\n'
         'printf "PREFLIGHT_STATUS=%s\\nSAFE_BASELINE_ROLLBACK=%s\\n"'
-        ' "${PREFLIGHT_STATUS:-}" "${SAFE_BASELINE_ROLLBACK:-}"\n',
+        ' "${PREFLIGHT_STATUS:-}" "${SAFE_BASELINE_ROLLBACK:-}"\n'
+        'printf "PREFLIGHT_UNMANAGED=%s\\nPREFLIGHT_UNCERTAIN=%s\\n"'
+        ' "${PREFLIGHT_UNMANAGED:-}" "${PREFLIGHT_UNCERTAIN:-}"\n'
+        'printf "PREFLIGHT_SILENT=%s\\nPREFLIGHT_INCIDENT=%s\\n"'
+        ' "${PREFLIGHT_SILENT:-}" "${PREFLIGHT_INCIDENT:-}"\n',
         encoding="utf-8",
     )
     import subprocess
