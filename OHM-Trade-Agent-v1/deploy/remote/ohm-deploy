@@ -1316,10 +1316,260 @@ rollback() {
 }
 trap rollback ERR
 
-# Stop paper workers during the build/recreate window. Their dry-run state is
-# bind-mounted and survives the stop, while roughly two worker RSS footprints
-# are released during the deployment's highest transient-memory phase.
-stop_paper_stack
+# Candidate-version read-only protection preflight (AC-024).
+#
+# Bootstrap limitation: the host executes the already-installed
+# /usr/local/sbin/ohm-deploy for a given deploy, not this revision's copy. The
+# prior receipt showed OPIP_DEPLOY_CONTROLLER_BOOTSTRAP=NOT_NEEDED with SHA
+# 6cfcd474, so the FIRST deploy after AC-024 merges can still run a controller
+# that predates this boundary. This function protects the transaction only once
+# this revision is the installed controller; it never claims to protect a run it
+# did not execute.
+#
+# Materializes the approved candidate SHA into a temporary detached worktree so
+# the LIVE repository checkout -- the tree production cron runs `docker compose`
+# from -- is never changed while the preflight runs, even if a future candidate
+# revision would change docker-compose.yml. Candidate Python executes in a
+# one-shot container built from the already-running core image; only the
+# candidate app tree and the current production data are bind-mounted read-only.
+# No compose service is replaced, no scheduler entry changes, no service stops,
+# and no last-good SHA is written. Classification stays in
+# app.jobs.preflight_protection_health, which calls the existing read-only
+# protection report. The temporary candidate tree is removed before this
+# function returns, on both PASS and FAIL.
+run_protection_preflight() {
+  local image receipt rc=0 raw status state coverage suspended codes reason
+  local unmanaged uncertain silent incidents
+  local candidate_root="$STATE_DIR/protection-candidate"
+  local candidate_app=""
+  image="$(docker inspect --format '{{.Image}}' ohm-trade-agent 2>/dev/null || true)"
+  receipt="$STATE_DIR/protection-preflight.json"
+  install -d -m 0755 "$STATE_DIR"
+  : > "$receipt"
+  chmod 0600 "$receipt"
+
+  # Bounded candidate materialization. The fixed path is a single directory
+  # owned by the repository owner; deploy holds the deploy lock, so there is no
+  # concurrency. Any leftover tree or worktree registration from an interrupted
+  # run is removed first, then `git worktree add --detach` checks out exactly
+  # TARGET_SHA without touching the live worktree's HEAD or files.
+  "${GIT[@]}" worktree remove --force "$candidate_root" >/dev/null 2>&1 || true
+  rm -rf "$candidate_root"
+  "${GIT[@]}" worktree prune 2>/dev/null || true
+  if mkdir -p "$candidate_root" && chown "$REPO_OWNER" "$candidate_root" 2>/dev/null; then
+    if ! "${GIT[@]}" worktree add --detach "$candidate_root" "$TARGET_SHA" >/dev/null 2>&1; then
+      rm -rf "$candidate_root"
+    fi
+  fi
+  candidate_app="$candidate_root/OHM-Trade-Agent-v1/app"
+
+  rc=1
+  if [[ -d "$candidate_app" && -n "$image" && -f "$APP_ROOT/.env" ]]; then
+    # Capture the container exit code on BOTH outcomes. A bare
+    # `docker run ... || rc=$?` never assigns on success, which would leave rc=1
+    # and misclassify a genuinely HEALTHY preflight as FAIL.
+    if docker run --rm \
+      --read-only \
+      --tmpfs /tmp:rw,nosuid,size=32m \
+      --pids-limit 64 \
+      --memory 384m \
+      --env-file "$APP_ROOT/.env" \
+      -e PYTHONDONTWRITEBYTECODE=1 \
+      -v "$candidate_app:/app/app:ro" \
+      -v "$APP_ROOT/data:/app/data:ro" \
+      "$image" \
+      python -m app.jobs.preflight_protection_health \
+        --candidate-sha "$TARGET_SHA" \
+        --release-profile EVIDENCE_SHADOW \
+      > "$receipt"; then
+      rc=0
+    else
+      rc=$?
+    fi
+  fi
+
+  raw="$("$PYTHON_BIN" - "$receipt" "$TARGET_SHA" "$rc" <<'PY'
+import json, re, sys
+path, expected_sha, raw_rc = sys.argv[1], sys.argv[2], sys.argv[3]
+limit = 65536
+symbol = re.compile(r"^[A-Za-z0-9._/-]{1,24}$")
+
+
+def bound(joined):
+    if len(joined) > 400:
+        joined = joined[:400].rstrip(".,/-_")
+    return joined or "NONE"
+
+
+def marker(values):
+    cleaned = []
+    for value in values or ():
+        text = str(value if isinstance(value, str) else "").strip()
+        if symbol.fullmatch(text) and text not in cleaned:
+            cleaned.append(text)
+    if not cleaned:
+        return "NONE"
+    return bound(",".join(cleaned[:20]))
+
+
+def prefer(value, fallback):
+    if isinstance(value, str):
+        if value.strip() == "NONE":
+            return "NONE"
+        parts = [p for p in value.strip().split(",") if symbol.fullmatch(p)]
+        if parts:
+            return bound(",".join(parts[:20]))
+    return fallback
+
+
+def incident(value):
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    return "UNPROVEN"
+
+
+def fail(message):
+    for line in ("FAIL", "UNAVAILABLE", "false", "true", "UNAVAILABLE", message,
+                 "NONE", "NONE", "NONE", "UNPROVEN"):
+        print(line)
+
+
+try:
+    rc_value = int(raw_rc)
+except ValueError:
+    fail("protection preflight did not return a readable decision")
+else:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = handle.read(limit + 1)
+    except OSError:
+        fail("protection preflight did not return a readable decision")
+    else:
+        if len(payload) > limit or not payload.strip():
+            fail("protection preflight did not return a readable decision")
+        else:
+            try:
+                doc = json.loads(payload)
+            except json.JSONDecodeError:
+                fail("protection preflight did not return a readable decision")
+            else:
+                protection = doc.get("protection") if isinstance(doc, dict) else None
+                if not isinstance(protection, dict):
+                    fail("protection preflight did not return a readable decision")
+                else:
+                    ready = (
+                        rc_value == 0
+                        and doc.get("schema_version") == 1
+                        and doc.get("read_only") is True
+                        and doc.get("candidate_sha") == expected_sha
+                        and doc.get("release_profile") == "EVIDENCE_SHADOW"
+                        and protection.get("state") == "HEALTHY"
+                        and protection.get("admissions_suspended") is False
+                        and protection.get("coverage_complete") is True
+                        and protection.get("reason_codes") == ["PROTECTION_PROVEN"]
+                        and isinstance(doc.get("verdict"), dict)
+                        and doc["verdict"].get("ready") is True
+                    )
+                    state = str(protection.get("state") or "UNAVAILABLE")
+                    coverage = "true" if protection.get("coverage_complete") is True else "false"
+                    suspended = "false" if protection.get("admissions_suspended") is False else "true"
+                    codes = protection.get("reason_codes")
+                    if not isinstance(codes, list) or not codes:
+                        codes = ["UNAVAILABLE"]
+                    reason = protection.get("resolution_reason") or ""
+                    verdict = doc.get("verdict")
+                    if not reason and isinstance(verdict, dict):
+                        reason = verdict.get("reason") or ""
+                    reason = "".join(
+                        ch if ch.isalnum() or ch in " .,:/_+-" else " "
+                        for ch in str(reason)
+                    )
+                    reason = " ".join(reason.split())[:240] or "protection is not HEALTHY"
+                    markers = doc.get("markers")
+                    if not isinstance(markers, dict):
+                        markers = {}
+                    incidents = doc.get("incidents")
+                    health = incidents.get("health") if isinstance(incidents, dict) else None
+                    incident_health = prefer(markers.get("incident_health"), incident(health))
+                    print("PASS" if ready else "FAIL")
+                    print(state)
+                    print(coverage)
+                    print(suspended)
+                    print(",".join(str(code) for code in codes))
+                    print(reason)
+                    print(prefer(markers.get("unmanaged_exposures"), marker(protection.get("unmanaged_exposures"))))
+                    print(prefer(markers.get("uncertain_exposures"), marker(protection.get("uncertain_exposures"))))
+                    print(prefer(markers.get("silent_holdings"), marker(protection.get("silent_holdings"))))
+                    print(incident_health)
+PY
+)" || raw=$'FAIL\nUNAVAILABLE\nfalse\ntrue\nUNAVAILABLE\nprotection preflight did not return a readable decision\nNONE\nNONE\nNONE\nUNPROVEN'
+
+  status="$(printf '%s\n' "$raw" | sed -n '1p')"
+  state="$(printf '%s\n' "$raw" | sed -n '2p')"
+  coverage="$(printf '%s\n' "$raw" | sed -n '3p')"
+  suspended="$(printf '%s\n' "$raw" | sed -n '4p')"
+  codes="$(printf '%s\n' "$raw" | sed -n '5p')"
+  reason="$(printf '%s\n' "$raw" | sed -n '6p')"
+  unmanaged="$(printf '%s\n' "$raw" | sed -n '7p')"
+  uncertain="$(printf '%s\n' "$raw" | sed -n '8p')"
+  silent="$(printf '%s\n' "$raw" | sed -n '9p')"
+  incidents="$(printf '%s\n' "$raw" | sed -n '10p')"
+  if [[ "$status" != "PASS" ]]; then
+    status="FAIL"
+  fi
+
+  # Remove the temporary candidate tree BEFORE returning, on PASS and FAIL, so
+  # the live repository HEAD is untouched in both outcomes.
+  "${GIT[@]}" worktree remove --force "$candidate_root" >/dev/null 2>&1 || true
+  rm -rf "$candidate_root"
+  "${GIT[@]}" worktree prune 2>/dev/null || true
+
+  echo "OPIP_PROTECTION_PREFLIGHT=$status"
+  echo "OPIP_PROTECTION_PREFLIGHT_STATE=${state:-UNAVAILABLE}"
+  echo "OPIP_PROTECTION_PREFLIGHT_COVERAGE_COMPLETE=${coverage:-false}"
+  echo "OPIP_PROTECTION_PREFLIGHT_ADMISSIONS_SUSPENDED=${suspended:-true}"
+  echo "OPIP_PROTECTION_PREFLIGHT_REASON_CODES=${codes:-UNAVAILABLE}"
+  echo "OPIP_PROTECTION_PREFLIGHT_RESOLUTION_REASON=${reason:-protection preflight did not return a readable decision}"
+  echo "OPIP_PROTECTION_PREFLIGHT_UNMANAGED_EXPOSURES=${unmanaged:-NONE}"
+  echo "OPIP_PROTECTION_PREFLIGHT_UNCERTAIN_EXPOSURES=${uncertain:-NONE}"
+  echo "OPIP_PROTECTION_PREFLIGHT_SILENT_HOLDINGS=${silent:-NONE}"
+  echo "OPIP_PROTECTION_PREFLIGHT_INCIDENT_HEALTH=${incidents:-UNPROVEN}"
+  echo "OPIP_PROTECTION_PREFLIGHT_JSON=$receipt"
+  if [[ "$status" == "PASS" ]]; then
+    return 0
+  fi
+  echo "OPIP_CORE_DEPLOY_STATUS=NOT_STARTED"
+  echo "OPIP_PRODUCTION_MUTATION=NOT_STARTED"
+  echo "OPIP_ROLLBACK_REQUIRED=false"
+  echo "OPIP_SAFE_BASELINE_UNCHANGED=true"
+  echo "OPIP_LEARNING_EXPORT_STATUS=NOT_STARTED"
+  echo "OPIP_LEARNING_READINESS=NOT_APPLICABLE"
+  echo "PROTECTION PREFLIGHT BLOCKED"
+  echo "production_mutation_started=false"
+  echo "rollback_required=false"
+  echo "safe_baseline_unchanged=true"
+  return 77
+}
+
+# AC-024 read-only protection boundary.
+#
+# The live checkout is left EXACTLY as-is while run_protection_preflight()
+# materializes TARGET_SHA into its own temporary tree. Only after a PASS does
+# this controller check out the candidate SHA, install the rollback trap, and
+# continue to the existing first runtime mutation (stop_paper_stack). A refusal
+# exits 77 before the trap is installed and before any production mutation, and
+# disposes of the pre-deploy scheduler snapshot so the next deploy still sees
+# exactly one transaction.
+if ! run_protection_preflight; then
+  # The refusal is not a command failure: disarm the trap first so the
+  # cleanup below can never be interpreted as a post-mutation failure.
+  trap - ERR
+  cleanup_snapshot || true
+  echo "OPIP_PROTECTION_PREFLIGHT_ABORT=REFUSED_BEFORE_MUTATION" >&2
+  exit 77
+fi
 
 "${GIT[@]}" checkout -f main
 "${GIT[@]}" reset --hard "$TARGET_SHA"
@@ -1329,6 +1579,13 @@ cd "$APP_ROOT"
   echo "checked-out repository SHA changed before build" >&2
   false
 }
+
+# Stop paper workers during the build/recreate window. Their dry-run state is
+# bind-mounted and survives the stop, while roughly two worker RSS footprints
+# are released during the deployment's highest transient-memory phase.
+# This is the first production-runtime mutation on the success path.
+stop_paper_stack
+
 docker compose build --build-arg "OPIP_RELEASE_SHA=$TARGET_SHA" \
   opip-canonical-writer ohm-trade-agent
 # Writer and core are independent services. Build/start both; validate each

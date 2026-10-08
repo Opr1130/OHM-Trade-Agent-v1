@@ -398,7 +398,13 @@ def _classify(
         'printf "CORE_STATUS=%s\\nLEARNING_EXPORT_STATUS=%s\\nLEARNING_READINESS=%s\\n"'
         ' "${CORE_STATUS:-}" "${LEARNING_EXPORT_STATUS:-}" "${LEARNING_READINESS:-}"\n'
         'printf "POSTCOMMIT_HEALTH=%s\\nTRANSITION_ELIGIBLE=%s\\n"'
-        ' "${POSTCOMMIT_HEALTH:-}" "${TRANSITION_ELIGIBLE:-}"\n',
+        ' "${POSTCOMMIT_HEALTH:-}" "${TRANSITION_ELIGIBLE:-}"\n'
+        'printf "PREFLIGHT_STATUS=%s\\nSAFE_BASELINE_ROLLBACK=%s\\n"'
+        ' "${PREFLIGHT_STATUS:-}" "${SAFE_BASELINE_ROLLBACK:-}"\n'
+        'printf "PREFLIGHT_UNMANAGED=%s\\nPREFLIGHT_UNCERTAIN=%s\\n"'
+        ' "${PREFLIGHT_UNMANAGED:-}" "${PREFLIGHT_UNCERTAIN:-}"\n'
+        'printf "PREFLIGHT_SILENT=%s\\nPREFLIGHT_INCIDENT=%s\\n"'
+        ' "${PREFLIGHT_SILENT:-}" "${PREFLIGHT_INCIDENT:-}"\n',
         encoding="utf-8",
     )
     import subprocess

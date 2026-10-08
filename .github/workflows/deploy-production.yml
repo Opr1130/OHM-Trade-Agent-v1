@@ -274,6 +274,17 @@ jobs:
             UNIFIED_CYCLE_COMPLETED_AT="$(grep -oE 'OPIP_UNIFIED_CYCLE_COMPLETED_AT=[^[:space:]]+' "$log" | tail -n 1 | cut -d= -f2)"
             GENESIS_STATUS="$(grep -oE 'OPIP_PAPER_REGISTRY_GENESIS_STATUS=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
             GENESIS_REASON="$(grep -oE 'OPIP_PAPER_REGISTRY_GENESIS_REASON=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
+            PREFLIGHT_STATUS="$(grep -oE 'OPIP_PROTECTION_PREFLIGHT=(PASS|FAIL)' "$log" | tail -n 1 | cut -d= -f2)"
+            PREFLIGHT_STATE="$(grep -oE 'OPIP_PROTECTION_PREFLIGHT_STATE=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
+            PREFLIGHT_COVERAGE="$(grep -oE 'OPIP_PROTECTION_PREFLIGHT_COVERAGE_COMPLETE=(true|false)' "$log" | tail -n 1 | cut -d= -f2)"
+            PREFLIGHT_ADMISSIONS="$(grep -oE 'OPIP_PROTECTION_PREFLIGHT_ADMISSIONS_SUSPENDED=(true|false)' "$log" | tail -n 1 | cut -d= -f2)"
+            PREFLIGHT_CODES="$(grep -oE 'OPIP_PROTECTION_PREFLIGHT_REASON_CODES=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2-)"
+            PREFLIGHT_REASON="$(grep -E 'OPIP_PROTECTION_PREFLIGHT_RESOLUTION_REASON=' "$log" | tail -n 1 | cut -d= -f2-)"
+            PREFLIGHT_UNMANAGED="$(grep -oE 'OPIP_PROTECTION_PREFLIGHT_UNMANAGED_EXPOSURES=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
+            PREFLIGHT_UNCERTAIN="$(grep -oE 'OPIP_PROTECTION_PREFLIGHT_UNCERTAIN_EXPOSURES=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
+            PREFLIGHT_SILENT="$(grep -oE 'OPIP_PROTECTION_PREFLIGHT_SILENT_HOLDINGS=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
+            PREFLIGHT_INCIDENT="$(grep -oE 'OPIP_PROTECTION_PREFLIGHT_INCIDENT_HEALTH=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
+            PRODUCTION_MUTATION="$(grep -oE 'OPIP_PRODUCTION_MUTATION=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
             if grep -q 'OPIP_CORE_DEPLOY_STATUS=' "$log"; then
               CORE_MARKER="PRESENT"
             else
@@ -399,6 +410,17 @@ jobs:
               else
                 RESULT="CORE DEPLOYED - $parts"
               fi
+            elif [[ "$PREFLIGHT_STATUS" == "FAIL" ]] \
+              && ! grep -Fxq 'OPIP_SAFE_BASELINE_ROLLBACK=SUCCESS' "$log"; then
+              # Pre-mutation refusal. Production was not changed, so this is not
+              # a rollback and not a failed activation.
+              RESULT="PROTECTION PREFLIGHT BLOCKED"
+              HEALTH="NOT STARTED"
+              ROLLBACK="NOT REQUIRED"
+              SAFE_BASELINE_ROLLBACK="NOT_REQUIRED"
+              CORE_STATUS="NOT_STARTED"
+              LEARNING_EXPORT_STATUS="NOT_STARTED"
+              LEARNING_READINESS="NOT_APPLICABLE"
             elif grep -q 'rollback health and paper checks passed' "$log" \
               && grep -Fxq 'OPIP_SAFE_BASELINE_ROLLBACK=SUCCESS' "$log"; then
               RESULT="ROLLED BACK"
@@ -482,6 +504,17 @@ jobs:
           echo "genesis_status=${GENESIS_STATUS:-UNKNOWN}" >> "$GITHUB_OUTPUT"
           echo "genesis_reason=${GENESIS_REASON:-UNKNOWN}" >> "$GITHUB_OUTPUT"
           echo "transition_retry=$TRANSITION_RETRY" >> "$GITHUB_OUTPUT"
+          echo "protection_preflight=${PREFLIGHT_STATUS:-UNPROVEN}" >> "$GITHUB_OUTPUT"
+          echo "protection_preflight_state=${PREFLIGHT_STATE:-UNPROVEN}" >> "$GITHUB_OUTPUT"
+          echo "protection_preflight_coverage=${PREFLIGHT_COVERAGE:-UNPROVEN}" >> "$GITHUB_OUTPUT"
+          echo "protection_preflight_admissions_suspended=${PREFLIGHT_ADMISSIONS:-UNPROVEN}" >> "$GITHUB_OUTPUT"
+          echo "protection_preflight_reason_codes=${PREFLIGHT_CODES:-UNPROVEN}" >> "$GITHUB_OUTPUT"
+          echo "protection_preflight_resolution_reason=${PREFLIGHT_REASON:-UNPROVEN}" >> "$GITHUB_OUTPUT"
+          echo "protection_preflight_unmanaged_exposures=${PREFLIGHT_UNMANAGED:-NONE}" >> "$GITHUB_OUTPUT"
+          echo "protection_preflight_uncertain_exposures=${PREFLIGHT_UNCERTAIN:-NONE}" >> "$GITHUB_OUTPUT"
+          echo "protection_preflight_silent_holdings=${PREFLIGHT_SILENT:-NONE}" >> "$GITHUB_OUTPUT"
+          echo "protection_preflight_incident_health=${PREFLIGHT_INCIDENT:-UNPROVEN}" >> "$GITHUB_OUTPUT"
+          echo "production_mutation=${PRODUCTION_MUTATION:-UNPROVEN}" >> "$GITHUB_OUTPUT"
           exit 0
 
       - name: Publish deployment receipt to approval issue
@@ -523,6 +556,17 @@ jobs:
           GENESIS_STATUS: ${{ steps.production_deploy.outputs.genesis_status }}
           GENESIS_REASON: ${{ steps.production_deploy.outputs.genesis_reason }}
           TRANSITION_RETRY: ${{ steps.production_deploy.outputs.transition_retry }}
+          PROTECTION_PREFLIGHT: ${{ steps.production_deploy.outputs.protection_preflight }}
+          PROTECTION_PREFLIGHT_STATE: ${{ steps.production_deploy.outputs.protection_preflight_state }}
+          PROTECTION_PREFLIGHT_COVERAGE: ${{ steps.production_deploy.outputs.protection_preflight_coverage }}
+          PROTECTION_PREFLIGHT_ADMISSIONS_SUSPENDED: ${{ steps.production_deploy.outputs.protection_preflight_admissions_suspended }}
+          PROTECTION_PREFLIGHT_REASON_CODES: ${{ steps.production_deploy.outputs.protection_preflight_reason_codes }}
+          PROTECTION_PREFLIGHT_RESOLUTION_REASON: ${{ steps.production_deploy.outputs.protection_preflight_resolution_reason }}
+          PROTECTION_PREFLIGHT_UNMANAGED_EXPOSURES: ${{ steps.production_deploy.outputs.protection_preflight_unmanaged_exposures }}
+          PROTECTION_PREFLIGHT_UNCERTAIN_EXPOSURES: ${{ steps.production_deploy.outputs.protection_preflight_uncertain_exposures }}
+          PROTECTION_PREFLIGHT_SILENT_HOLDINGS: ${{ steps.production_deploy.outputs.protection_preflight_silent_holdings }}
+          PROTECTION_PREFLIGHT_INCIDENT_HEALTH: ${{ steps.production_deploy.outputs.protection_preflight_incident_health }}
+          PRODUCTION_MUTATION: ${{ steps.production_deploy.outputs.production_mutation }}
         run: |
           set -euo pipefail
           RESULT="${DEPLOY_RESULT:-${SSH_CONFIG_RESULT:-FAILED BEFORE SSH}}"
@@ -576,6 +620,17 @@ jobs:
           POSTCOMMIT_HEALTH=${POSTCOMMIT_HEALTH:-UNKNOWN}
           PAPER_REGISTRY_GENESIS=${GENESIS_STATUS:-UNKNOWN}
           TRANSITION_RETRY=${TRANSITION_RETRY:-NO}
+          PROTECTION_PREFLIGHT=${PROTECTION_PREFLIGHT:-UNPROVEN}
+          PROTECTION_PREFLIGHT_STATE=${PROTECTION_PREFLIGHT_STATE:-UNPROVEN}
+          PROTECTION_COVERAGE_COMPLETE=${PROTECTION_PREFLIGHT_COVERAGE:-UNPROVEN}
+          PROTECTION_ADMISSIONS_SUSPENDED=${PROTECTION_PREFLIGHT_ADMISSIONS_SUSPENDED:-UNPROVEN}
+          PROTECTION_REASON_CODES=${PROTECTION_PREFLIGHT_REASON_CODES:-UNPROVEN}
+          PROTECTION_RESOLUTION_REASON=${PROTECTION_PREFLIGHT_RESOLUTION_REASON:-UNPROVEN}
+          PROTECTION_UNMANAGED_EXPOSURES=${PROTECTION_PREFLIGHT_UNMANAGED_EXPOSURES:-NONE}
+          PROTECTION_UNCERTAIN_EXPOSURES=${PROTECTION_PREFLIGHT_UNCERTAIN_EXPOSURES:-NONE}
+          PROTECTION_SILENT_HOLDINGS=${PROTECTION_PREFLIGHT_SILENT_HOLDINGS:-NONE}
+          PROTECTION_INCIDENT_HEALTH=${PROTECTION_PREFLIGHT_INCIDENT_HEALTH:-UNPROVEN}
+          PRODUCTION_MUTATION=${PRODUCTION_MUTATION:-UNPROVEN}
           DEPLOY_EXIT_CODE=$RC
           WORKFLOW_RUN=$RUN_URL
           EOF
@@ -594,6 +649,20 @@ jobs:
             RESULT="${{ steps.ssh_config.outputs.result }}"
           fi
           echo "Production deployment gate: ${RESULT:-FAILED BEFORE SSH}" >&2
+          if [[ "$RESULT" == "PROTECTION PREFLIGHT BLOCKED" ]]; then
+            echo "Core deployment: NOT STARTED" >&2
+            echo "Production mutation: NO" >&2
+            echo "Rollback: NOT REQUIRED" >&2
+            echo "Protection state: ${{ steps.production_deploy.outputs.protection_preflight_state }}" >&2
+            echo "Coverage complete: ${{ steps.production_deploy.outputs.protection_preflight_coverage }}" >&2
+            echo "Reason codes: ${{ steps.production_deploy.outputs.protection_preflight_reason_codes }}" >&2
+            echo "Resolution reason: ${{ steps.production_deploy.outputs.protection_preflight_resolution_reason }}" >&2
+            echo "Unmanaged exposures: ${{ steps.production_deploy.outputs.protection_preflight_unmanaged_exposures }}" >&2
+            echo "Uncertain exposures: ${{ steps.production_deploy.outputs.protection_preflight_uncertain_exposures }}" >&2
+            echo "Silent holdings: ${{ steps.production_deploy.outputs.protection_preflight_silent_holdings }}" >&2
+            echo "Incident health: ${{ steps.production_deploy.outputs.protection_preflight_incident_health }}" >&2
+            echo "Learning export: NOT STARTED" >&2
+          fi
           echo "Core deployment: ${{ steps.production_deploy.outputs.core_status || 'UNKNOWN' }}" >&2
           echo "Learning export: ${{ steps.production_deploy.outputs.learning_export_status || 'UNKNOWN' }}" >&2
           echo "Learning readiness: ${{ steps.production_deploy.outputs.learning_readiness || 'UNKNOWN' }}" >&2

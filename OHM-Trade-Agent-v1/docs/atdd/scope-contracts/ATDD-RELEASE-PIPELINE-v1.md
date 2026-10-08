@@ -261,6 +261,29 @@ THEN:
 
 (e) protection-health classification, incident checks, admissions suspension, authentication handling and the absence of any exchange mutation path are unchanged, and no Paper-v2, Committee, funded/live/exchange/order or TARGET_PAPER authority is introduced.
 
+AC-024:
+GIVEN:
+an owner-approved EVIDENCE_SHADOW release candidate whose exact SHA and CI/profile gates are qualified, and production remains on its existing SAFE_BASELINE release
+
+WHEN:
+the production deploy controller reaches the protection-readiness boundary before any production runtime/scheduler/writer activation or other mutable release action
+
+THEN:
+(a) candidate-version read-only protection health is evaluated against live production exposure and incident evidence using the existing non-mutating resolver and incident seams, from the approved candidate code materialized into a temporary detached tree while the live repository checkout remains unchanged;
+
+(b) the preflight reports state, coverage completeness, admissions suspension, reason codes, unmanaged/uncertain/silent exposure summaries and the existing resolver diagnostic without creating trading/exchange/incident/lifecycle authority, and emits bounded sanitized receipt markers for the unmanaged, uncertain and silent exposure symbols and the incident-health verdict so a blocked owner can see the exact blockers without another deployment or an interactive remote shell;
+
+(c) only HEALTHY / complete / non-suspended protection may cross the mutable release boundary, and the live repository checkout is changed to the candidate SHA only after that PASS;
+
+(d) any incomplete coverage, unmanaged exposure, uncertain exposure, open/unproven incident or otherwise non-HEALTHY protection refuses the release before mutation, reports PRE-MUTATION PROTECTION PREFLIGHT BLOCKED, requires no rollback, and leaves the live checkout, services, scheduler and last-good SHA unchanged;
+
+(e) the forced-command gateway remains exactly deploy <sha> and diagnose-learning, with no shell passthrough or new remote command;
+
+(f) existing fail-closed protection, runtime verification, scheduler, Feature Bus, Paper-v2, Committee, TARGET_PAPER, funded/live/order/exchange authority and genuine post-mutation rollback semantics remain unchanged.
+
+HISTORICAL BOOTSTRAP LIMITATION (AC-024 is not retroactive over the installed controller):
+The host executes the already-installed `/usr/local/sbin/ohm-deploy` for a given deploy, not the candidate revision's copy. The prior deployment receipt showed `OPIP_DEPLOY_CONTROLLER_BOOTSTRAP=NOT_NEEDED` and `OPIP_DEPLOY_CONTROLLER_BOOTSTRAP_SHA=6cfcd47405216b35fcff039c659663d2af4fc2c4`, so the first deploy after AC-024 merges may still run a controller that predates this boundary. AC-024 governs the transaction only once this revision is the installed controller; it makes no claim about that first bootstrap execution, and no manual controller install is introduced. This is documented so the boundary is never reported as protecting a run it did not execute.
+
 EXPLICITLY OUT OF SCOPE:
 - Activating TARGET_PAPER, Paper-v2, the Committee, or any funded/live/exchange/order authority
 - Deleting, rewriting or rescoping the historical ATDD increments that recorded the Feature Bus `off`
@@ -441,6 +464,23 @@ AC-022 -> tests/test_release_runtime_verifier.py::test_non_protection_posture_fa
 AC-023 -> tests/test_kraken_balance_identity_v1.py::test_ac_023_documented_balance_identities_map_to_underlying
 AC-023 -> tests/test_kraken_balance_identity_v1.py::test_ac_023_decorated_balance_prices_on_the_underlying_usd_pair
 AC-023 -> tests/test_kraken_balance_identity_v1.py::test_ac_023_unknown_decoration_stays_unpriced_and_coverage_incomplete
+AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_healthy_preflight_is_ready
+AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_non_healthy_protection_is_not_ready
+AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_incident_health_consistent_with_classification
+AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_one_incident_observation_drives_report_and_marker
+AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_preflight_uses_the_existing_read_only_report
+AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_marker_fields_are_bounded_and_sanitized
+AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_candidate_code_comes_from_a_temporary_target_sha_tree
+AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_live_checkout_is_unchanged_until_preflight_pass
+AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_preflight_refusal_precedes_every_mutation
+AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_preflight_block_does_not_claim_rollback
+AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_markers_are_wired_through_the_receipt
+AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_ssh_gateway_keeps_exactly_two_commands
+AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_unknown_decoration_class_stays_a_coverage_block
+AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_docker_exit_code_capture_is_explicit
+AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_shell_path_preflight_uses_the_docker_exit_code
+AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_workflow_distinguishes_preflight_block_from_rollback
+AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_successful_release_classification_is_unchanged
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/services/release_profiles.py
@@ -576,6 +616,12 @@ AC-023 -> OHM-Trade-Agent-v1/app/exchanges/kraken_identity.py
 AC-023 -> OHM-Trade-Agent-v1/app/services/kraken_exposure_resolver.py
 AC-023 -> OHM-Trade-Agent-v1/tests/test_kraken_balance_identity_v1.py
 AC-023 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
+AC-024 -> OHM-Trade-Agent-v1/app/jobs/preflight_protection_health.py
+AC-024 -> OHM-Trade-Agent-v1/app/jobs/report_protection_health.py
+AC-024 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
+AC-024 -> .github/workflows/deploy-production.yml
+AC-024 -> OHM-Trade-Agent-v1/tests/test_release_protection_preflight_v1.py
+AC-024 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
 
 DEFERRED DISCOVERIES:
 - `TARGET_PAPER` remains BLOCKED. Activating it (Paper-v2) requires the ATDD-R4-B2 AC-011 comparator evidence, F11 protection READY, legacy drain READY and explicit OWNER approval, and is a separate OWNER increment; this contract does not authorize it.
