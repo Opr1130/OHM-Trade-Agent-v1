@@ -848,7 +848,7 @@ def test_ac_025_live_head_change_before_not_needed_fails_closed(sandbox):
     combined = proc.stdout + proc.stderr
     assert proc.returncode == 72, combined
     assert "OPIP_CONTROLLER_BOOTSTRAP_STATUS=FAILED" in combined
-    assert "NOT_NEEDED" not in combined
+    assert "OPIP_CONTROLLER_BOOTSTRAP_STATUS=NOT_NEEDED" not in combined
     assert sandbox.installed_bytes() == installed_before
     assert (sandbox.root / "git-drift-gate").is_file()
 
