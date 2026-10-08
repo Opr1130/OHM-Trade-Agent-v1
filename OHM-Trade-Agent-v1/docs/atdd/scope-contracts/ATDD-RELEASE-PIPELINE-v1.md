@@ -225,6 +225,24 @@ THEN:
 
 (g) no timeout, verifier, F5, cadence, scheduler, deploy, writer-budget, materialization-reserve, release-profile, Paper-v2, Committee, funded/live/exchange/order or other authority change is introduced.
 
+AC-022:
+GIVEN:
+an EVIDENCE_SHADOW runtime-verification posture failure where the read-only Kraken exposure resolver completed but could not prove complete exposure coverage
+
+WHEN:
+the protection-health report and runtime failure receipt are produced
+
+THEN:
+(a) the read-only protection report preserves a non-empty resolver diagnostic as `resolution_reason` without changing the deterministic protection decision, so incomplete coverage remains `UNAVAILABLE`, admissions remain suspended and `EXPOSURE_COVERAGE_INCOMPLETE` remains present;
+
+(b) a protection-posture failure carries that diagnostic into the release runtime receipt as the single-line machine-readable `OPIP_RELEASE_RUNTIME_PROTECTION_REASON`, with ASCII control-character runs replaced by one space while ordinary printable text is preserved;
+
+(c) the diagnostic is observation-only: it is not an authority input, does not participate in HEALTHY/UNSAFE/UNAVAILABLE classification, does not change qualification or rollback semantics, and emits no raw balances, account identifiers, credentials, secrets or arbitrary account payloads;
+
+(d) non-protection posture failures such as release-mode mismatch or target-spine mismatch do not fabricate `OPIP_RELEASE_RUNTIME_PROTECTION_REASON`;
+
+(e) existing fail-closed protection, evidence counters, runtime-verifier bounds, release profiles, scheduler, Paper-v2, Committee, funded/live/exchange/order authority and rollback semantics are unchanged.
+
 EXPLICITLY OUT OF SCOPE:
 - Activating TARGET_PAPER, Paper-v2, the Committee, or any funded/live/exchange/order authority
 - Deleting, rewriting or rescoping the historical ATDD increments that recorded the Feature Bus `off`
@@ -399,6 +417,9 @@ AC-020 -> tests/test_opip_feature_bus_pr3_integrity.py::test_source_recent_water
 AC-020 -> tests/test_opip_feature_bus_pr3_integrity.py::test_stale_restored_checkpoint_records_a_gap_restart_not_a_cold_start
 AC-020 -> tests/test_opip_r4_b2_shadow_capture.py::test_ac_020_default_composition_bounds_stale_restored_watermark
 AC-020 -> tests/test_opip_r4_b2_shadow_capture.py::test_ac_020_bounded_restart_stays_admissible_after_setup_delay
+AC-022 -> tests/test_opip_f11_precutover_protection.py::test_report_exposes_incomplete_resolution_reason_without_changing_gate
+AC-022 -> tests/test_release_runtime_verifier.py::test_posture_failure_receipt_is_actionable
+AC-022 -> tests/test_release_runtime_verifier.py::test_non_protection_posture_failure_does_not_emit_protection_reason
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/services/release_profiles.py
@@ -525,6 +546,11 @@ AC-020 -> OHM-Trade-Agent-v1/app/opip/market/source.py
 AC-020 -> OHM-Trade-Agent-v1/tests/test_opip_feature_bus_pr3_integrity.py
 AC-020 -> OHM-Trade-Agent-v1/tests/test_opip_r4_b2_shadow_capture.py
 AC-020 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
+AC-022 -> OHM-Trade-Agent-v1/app/jobs/report_protection_health.py
+AC-022 -> OHM-Trade-Agent-v1/app/services/release_runtime_verifier.py
+AC-022 -> OHM-Trade-Agent-v1/tests/test_opip_f11_precutover_protection.py
+AC-022 -> OHM-Trade-Agent-v1/tests/test_release_runtime_verifier.py
+AC-022 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
 
 DEFERRED DISCOVERIES:
 - `TARGET_PAPER` remains BLOCKED. Activating it (Paper-v2) requires the ATDD-R4-B2 AC-011 comparator evidence, F11 protection READY, legacy drain READY and explicit OWNER approval, and is a separate OWNER increment; this contract does not authorize it.

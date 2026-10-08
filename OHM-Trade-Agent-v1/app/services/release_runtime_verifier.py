@@ -125,11 +125,42 @@ class ReleaseRuntimeVerificationTimeout(TimeoutError):
             self.stage = stage
 
 
+class ReleaseRuntimePostureError(ValueError):
+    """Fresh evidence was proven but the live runtime posture was not.
+
+    Carries the proven evidence counters, a stable stage and the deterministic
+    reason codes so a posture failure never collapses into an anonymous
+    ``ValueError`` with ``OBSERVED_EVIDENCE=NONE``.
+    """
+
+    stage = "LIVE_POSTURE"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason_codes: Sequence[str] = (),
+        evidence: Mapping[str, Any] | None = None,
+        protection_reason: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason_codes = tuple(str(code) for code in reason_codes)
+        self.evidence: dict[str, Any] = dict(evidence or {})
+        self.protection_reason = (
+            str(protection_reason) if protection_reason not in (None, "") else None
+        )
+
+
 def _receipt_value(value: Any) -> str:
     """Render a receipt value deterministically (JSON-style booleans)."""
     if isinstance(value, bool):
         return "true" if value else "false"
     return str(value)
+
+
+def _single_line_receipt_text(value: Any) -> str:
+    """Sanitize diagnostic text for a deterministic single-line receipt."""
+    return re.sub(r"[\x00-\x1f\x7f]+", " ", str(value)).strip()
 
 
 def _aware_utc(value: str, *, name: str) -> datetime:
@@ -255,7 +286,7 @@ def _verify_live_posture(profile_name: str) -> dict[str, Any]:
     expected = profile["allowed_modes"]
     observed = {key: os.environ.get(key, "") for key in REQUIRED_MODES}
     if any(observed[key] != expected[key] for key in REQUIRED_MODES):
-        raise ValueError("runtime modes do not match the allowlisted profile")
+        raise ReleaseRuntimePostureError("runtime modes do not match the allowlisted profile")
 
     from app.services import target_spine_cycle
     from app.core.config import get_settings
@@ -275,13 +306,23 @@ def _verify_live_posture(profile_name: str) -> dict[str, Any]:
         or summary.errors != 0
         or summary.reason != expected_reason
     ):
-        raise ValueError("target spine is not a recorded inert no-op for the release profile")
+        raise ReleaseRuntimePostureError(
+            "target spine is not a recorded inert no-op for the release profile",
+            reason_codes=(str(summary.reason or "NONE"), f"MODE={summary.mode}"),
+        )
 
     from app.jobs.report_protection_health import build_report
 
     protection = build_report()
     if protection.get("state") != "HEALTHY" or protection.get("admissions_suspended") is not False:
-        raise ValueError("read-only protection health is not HEALTHY")
+        raise ReleaseRuntimePostureError(
+            "read-only protection health is not HEALTHY",
+            reason_codes=(
+                str(protection.get("state")),
+                *(str(code) for code in protection.get("reason_codes") or ()),
+            ),
+            protection_reason=protection.get("resolution_reason"),
+        )
     return {
         "profile": profile_name,
         "modes": observed,
@@ -348,7 +389,11 @@ def verify_release_runtime(
             now=now,
         )
         if evidence_passed:
-            posture = _verify_live_posture(profile_name)
+            try:
+                posture = _verify_live_posture(profile_name)
+            except ReleaseRuntimePostureError as exc:
+                exc.evidence = dict(evidence_report)
+                raise
             return {
                 "status": "PASS",
                 "sha": expected_sha,
@@ -384,6 +429,15 @@ def _emit_failure_diagnostics(exc: BaseException) -> None:
     stage = getattr(exc, "stage", None)
     if isinstance(stage, str) and stage:
         print(f"OPIP_RELEASE_RUNTIME_FAILURE_STAGE={stage}")
+    if isinstance(exc, ReleaseRuntimePostureError):
+        print(f"OPIP_RELEASE_RUNTIME_FAILURE_REASON={exc}")
+        if exc.reason_codes:
+            print(f"OPIP_RELEASE_RUNTIME_FAILURE_CODES={','.join(exc.reason_codes)}")
+        if exc.protection_reason:
+            print(
+                "OPIP_RELEASE_RUNTIME_PROTECTION_REASON="
+                f"{_single_line_receipt_text(exc.protection_reason)}"
+            )
     attempts = getattr(exc, "attempts", None)
     if isinstance(attempts, int) and not isinstance(attempts, bool):
         print(f"OPIP_RELEASE_RUNTIME_ATTEMPTS={attempts}")

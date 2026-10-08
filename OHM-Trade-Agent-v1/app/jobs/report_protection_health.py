@@ -91,11 +91,15 @@ def build_report() -> dict[str, Any]:
             (), coverage_complete=False, incidents_healthy=incidents_healthy
         ).to_dict() | {"resolution_error": f"{type(exc).__name__}: {exc}"}
 
-    return evaluate_protection_health(
+    report = evaluate_protection_health(
         resolution.exposures,
         coverage_complete=bool(resolution.coverage_complete),
         incidents_healthy=incidents_healthy,
     ).to_dict()
+    resolution_reason = getattr(resolution, "reason", "")
+    if resolution_reason:
+        report["resolution_reason"] = resolution_reason
+    return report
 
 
 def main() -> None:
