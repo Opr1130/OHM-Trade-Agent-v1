@@ -62,6 +62,10 @@ fail() {
   local code="$1" status="$2"
   shift 2
   echo "bootstrap-deploy-controller-only: $*" >&2
+  # Failure markers go to stderr so a refused run can never be mistaken for a
+  # successful one on stdout, and are echoed here so the console shows the same
+  # bounded status the receipt records.
+  echo "OPIP_CONTROLLER_BOOTSTRAP_STATUS=$status" >&2
   emit_receipt "$status"
   exit "$code"
 }
@@ -120,8 +124,8 @@ mkdir -p "$STATE_DIR"
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
   echo "another deployment or bootstrap already holds $LOCK_FILE" >&2
-  echo "OPIP_CONTROLLER_BOOTSTRAP_STATUS=FAILED"
-  echo "OPIP_CONTROLLER_BOOTSTRAP_REASON=LOCK_HELD"
+  echo "OPIP_CONTROLLER_BOOTSTRAP_STATUS=FAILED" >&2
+  echo "OPIP_CONTROLLER_BOOTSTRAP_REASON=LOCK_HELD" >&2
   exit 75
 fi
 
@@ -131,8 +135,8 @@ ACTIVE_TRANSACTIONS=("$STATE_DIR"/scheduler-before.*)
 if [[ "${#ACTIVE_TRANSACTIONS[@]}" -gt 0 ]]; then
   echo "active deploy transaction present: ${ACTIVE_TRANSACTIONS[*]}" >&2
   echo "operator recovery is required; refusing to mutate the controller" >&2
-  echo "OPIP_CONTROLLER_BOOTSTRAP_STATUS=FAILED"
-  echo "OPIP_CONTROLLER_BOOTSTRAP_REASON=ACTIVE_DEPLOY_TRANSACTION"
+  echo "OPIP_CONTROLLER_BOOTSTRAP_STATUS=FAILED" >&2
+  echo "OPIP_CONTROLLER_BOOTSTRAP_REASON=ACTIVE_DEPLOY_TRANSACTION" >&2
   exit 76
 fi
 
@@ -158,7 +162,7 @@ REMOTE_MAIN_SHA="$("${GIT[@]}" rev-parse origin/main)"
 if [[ "$TARGET_SHA" != "$REMOTE_MAIN_SHA" ]]; then
   echo "refusing: target is not current origin/main" >&2
   echo "target=$TARGET_SHA origin/main=$REMOTE_MAIN_SHA" >&2
-  echo "OPIP_CONTROLLER_BOOTSTRAP_REMOTE_MAIN=$REMOTE_MAIN_SHA"
+  echo "OPIP_CONTROLLER_BOOTSTRAP_REMOTE_MAIN=$REMOTE_MAIN_SHA" >&2
   fail 65 FAILED "target SHA does not match origin/main"
 fi
 

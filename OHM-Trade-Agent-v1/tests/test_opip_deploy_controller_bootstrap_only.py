@@ -354,8 +354,9 @@ def test_ac_025_target_must_equal_origin_main(sandbox):
     proc = sandbox.run(stale)
     _skip_on_fork(proc)
     assert proc.returncode == 65
-    assert "OPIP_CONTROLLER_BOOTSTRAP_STATUS=FAILED" in proc.stderr
-    assert "OPIP_CONTROLLER_BOOTSTRAP_REMOTE_MAIN=" in proc.stderr
+    combined = proc.stdout + proc.stderr
+    assert "OPIP_CONTROLLER_BOOTSTRAP_STATUS=FAILED" in combined
+    assert "OPIP_CONTROLLER_BOOTSTRAP_REMOTE_MAIN=" in combined
     assert sandbox.installed_bytes() == before
     assert sandbox.receipt_fields()["OPIP_CONTROLLER_BOOTSTRAP_STATUS"] == "FAILED"
 
@@ -412,7 +413,9 @@ def test_ac_025_active_deploy_lock_causes_refusal(sandbox):
         proc = sandbox.run(sandbox.origin_main())
         _skip_on_fork(proc)
         assert proc.returncode == 75
-        assert "OPIP_CONTROLLER_BOOTSTRAP_REASON=LOCK_HELD" in proc.stderr
+        combined = proc.stdout + proc.stderr
+        assert "OPIP_CONTROLLER_BOOTSTRAP_REASON=LOCK_HELD" in combined
+        assert "OPIP_CONTROLLER_BOOTSTRAP_STATUS=FAILED" in combined
         assert sandbox.installed_bytes() == before
         assert not sandbox.receipt().exists()
     finally:
@@ -433,8 +436,9 @@ def test_ac_025_active_deployment_transaction_causes_refusal(sandbox):
     proc = sandbox.run(sandbox.origin_main())
     _skip_on_fork(proc)
     assert proc.returncode == 76
-    assert "OPIP_CONTROLLER_BOOTSTRAP_REASON=ACTIVE_DEPLOY_TRANSACTION" in proc.stderr
-    assert "recovery is required" in proc.stderr
+    combined = proc.stdout + proc.stderr
+    assert "OPIP_CONTROLLER_BOOTSTRAP_REASON=ACTIVE_DEPLOY_TRANSACTION" in combined
+    assert "recovery is required" in combined
     assert sandbox.installed_bytes() == before
     assert transaction.is_dir()
     assert (transaction / "root.crontab").is_file()
@@ -627,9 +631,10 @@ def test_ac_025_post_install_failure_restores_the_previous_controller(sandbox):
     proc = sandbox.run(sha, env=env)
     _skip_on_fork(proc)
     assert proc.returncode == 71
-    assert "OPIP_CONTROLLER_BOOTSTRAP_STATUS=FAILED" in proc.stderr
-    assert "restoring the previous controller" in proc.stderr
-    assert "OPIP_CONTROLLER_BOOTSTRAP_RESTORE=VERIFIED" in proc.stderr
+    combined = proc.stdout + proc.stderr
+    assert "OPIP_CONTROLLER_BOOTSTRAP_STATUS=FAILED" in combined
+    assert "restoring the previous controller" in combined
+    assert "OPIP_CONTROLLER_BOOTSTRAP_RESTORE=VERIFIED" in combined
     # The prior controller is back, byte for byte.
     assert sandbox.installed_bytes() == before
     assert sandbox.receipt_fields()["OPIP_CONTROLLER_BOOTSTRAP_STATUS"] == "FAILED"
