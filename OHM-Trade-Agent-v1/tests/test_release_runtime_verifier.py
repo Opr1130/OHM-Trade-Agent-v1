@@ -181,7 +181,7 @@ def test_posture_failure_receipt_is_actionable(capsys):
         "read-only protection health is not HEALTHY",
         reason_codes=("UNAVAILABLE", "EXPOSURE_COVERAGE_INCOMPLETE"),
         evidence={"feature_snapshot_count": 4, "consecutive_60s_snapshots": True},
-        protection_reason="active trade registry unavailable:\\nread failed\\x00",
+        protection_reason="active trade registry unavailable:\nread failed\x00",
     )
 
     release_runtime_verifier._emit_failure_diagnostics(error)
