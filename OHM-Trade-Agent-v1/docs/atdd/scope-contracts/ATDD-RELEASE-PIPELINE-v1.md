@@ -477,6 +477,8 @@ AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_preflight_b
 AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_markers_are_wired_through_the_receipt
 AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_ssh_gateway_keeps_exactly_two_commands
 AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_unknown_decoration_class_stays_a_coverage_block
+AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_docker_exit_code_capture_is_explicit
+AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_shell_path_preflight_uses_the_docker_exit_code
 AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_workflow_distinguishes_preflight_block_from_rollback
 AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_successful_release_classification_is_unchanged
 

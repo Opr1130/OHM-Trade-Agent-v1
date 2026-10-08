@@ -1365,7 +1365,10 @@ run_protection_preflight() {
 
   rc=1
   if [[ -d "$candidate_app" && -n "$image" && -f "$APP_ROOT/.env" ]]; then
-    docker run --rm \
+    # Capture the container exit code on BOTH outcomes. A bare
+    # `docker run ... || rc=$?` never assigns on success, which would leave rc=1
+    # and misclassify a genuinely HEALTHY preflight as FAIL.
+    if docker run --rm \
       --read-only \
       --tmpfs /tmp:rw,nosuid,size=32m \
       --pids-limit 64 \
@@ -1378,7 +1381,11 @@ run_protection_preflight() {
       python -m app.jobs.preflight_protection_health \
         --candidate-sha "$TARGET_SHA" \
         --release-profile EVIDENCE_SHADOW \
-      > "$receipt" || rc=$?
+      > "$receipt"; then
+      rc=0
+    else
+      rc=$?
+    fi
   fi
 
   raw="$("$PYTHON_BIN" - "$receipt" "$TARGET_SHA" "$rc" <<'PY'

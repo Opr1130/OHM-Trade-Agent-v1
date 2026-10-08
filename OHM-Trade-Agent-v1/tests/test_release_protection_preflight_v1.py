@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import types
 from pathlib import Path
+import shutil
+import sys
 
 import pytest
 
@@ -25,6 +27,11 @@ from tests.test_opip_deployment_transaction_boundary_v1 import (
     RELEASE_SHA,
     _classify,
     requires_bash,
+)
+from tests.test_opip_canonical_single_writer_feasibility_v1 import (
+    _bash,
+    _is_fork_failure,
+    _run_bash_script,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -496,3 +503,215 @@ def test_ac_024_successful_release_classification_is_unchanged(tmp_path):
     assert fields["GATE"] == "PASS"
     assert fields["PREFLIGHT_STATUS"] == "PASS"
     assert RELEASE_SHA
+
+
+# ---------------------------------------------------------------------------
+# Shell-path regressions for the preflight exit-code capture.
+#
+# The Python builder tests above cannot catch a bash-level defect inside
+# run_protection_preflight itself, so these execute REAL extracted bash.
+# ---------------------------------------------------------------------------
+
+
+def _refusal_block() -> str:
+    start = DEPLOY.index("if ! run_protection_preflight; then")
+    end = DEPLOY.index("\nfi\n", start) + len("\nfi\n")
+    return DEPLOY[start:end]
+
+
+def _docker_rc_capture_block() -> str:
+    """The real rc-capture block of run_protection_preflight, verbatim."""
+    body = _function_body()
+    start = body.index("  rc=1\n")
+    end = body.index("\n  fi\n", start) + len("\n  fi\n")
+    return body[start:end]
+
+
+def _python_for_bash() -> str:
+    return shutil.which("python3") or sys.executable
+
+
+@pytest.mark.acceptance
+def test_ac_024_docker_exit_code_capture_is_explicit(tmp_path):
+    """ATDD-RELEASE-PIPELINE-v1/AC-024: the preflight captures the container exit code explicitly on success and failure, so a zero exit yields rc=0 instead of the stale rc=1 that would misclassify a HEALTHY preflight as FAIL."""
+    block = _docker_rc_capture_block()
+    code = _without_comments(block)
+    assert "if docker run" in block
+    assert "|| rc=$?" not in code
+    assert "rc=$?" in code
+    assert "rc=0" in code
+
+    if _bash() is None:
+        pytest.skip("bash is not available in this environment")
+
+    # Directories come from Python so the script below contains NO external
+    # command and therefore needs no fork at all.
+    (tmp_path / "app").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "app-root").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "app-root" / ".env").write_text("", encoding="utf-8")
+
+    script = "\n".join(
+        [
+            "set -Eeuo pipefail",
+            f"root={tmp_path.as_posix()!r}",
+            'candidate_app="$root/app"',
+            'APP_ROOT="$root/app-root"',
+            "image=sha256:fake",
+            f"TARGET_SHA={SHA!r}",
+            'receipt="$root/receipt.json"',
+            "PAYLOAD='PROTECTION_PROVEN'",
+            "DOCKER_RC=0",
+            'docker() { printf "%s" "$PAYLOAD" ; return "$DOCKER_RC" ; }',
+            block,
+            # read/printf are builtins, so this stays fork-free: the capture
+            # block must run even where bash cannot fork.
+            'FIRST=""',
+            'IFS= read -r FIRST < "$receipt" || true',
+            'printf "RC=%s FIRST=%s\\n" "$rc" "$FIRST"',
+            "",
+        ]
+    )
+    path = tmp_path / "capture.sh"
+    import subprocess
+
+    for docker_rc in (0, 7):
+        path.write_text(
+            script.replace("DOCKER_RC=0", f"DOCKER_RC={docker_rc}"), encoding="utf-8"
+        )
+        proc = subprocess.run(
+            [_bash(), str(path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=60,
+        )
+        if _is_fork_failure(proc):
+            pytest.skip("bash cannot fork reliably in this environment")
+        assert proc.returncode == 0, proc.stderr
+        assert f"RC={docker_rc}" in proc.stdout, proc.stdout + proc.stderr
+        assert "FIRST=PROTECTION_PROVEN" in proc.stdout, proc.stdout
+
+
+def _preflight_harness(tmp: Path, *, docker_rc: int, payload: str | None):
+    """Run the real function with a stub docker that writes ``payload``.
+
+    ``payload=None`` simulates a container that exits without writing a receipt.
+    Every other external effect is stubbed and recorded, so this measures only the
+    preflight's own exit-code handling and the real refusal control flow.
+    """
+    state = tmp / "state"
+    app_root = tmp / "app"
+    (app_root / "data").mkdir(parents=True, exist_ok=True)
+    (app_root / ".env").write_text("", encoding="utf-8")
+    fixture = tmp / "receipt-fixture.json"
+    fixture.write_text(payload if payload is not None else "", encoding="utf-8")
+    log = tmp / "calls.log"
+    candidate_app = state / "protection-candidate" / "OHM-Trade-Agent-v1" / "app"
+
+    script = "\n".join(
+        [
+            "set -Eeuo pipefail",
+            f"TARGET_SHA={SHA!r}",
+            f"STATE_DIR={state.as_posix()!r}",
+            f"APP_ROOT={app_root.as_posix()!r}",
+            "REPO_OWNER=owner",
+            f"PYTHON_BIN={_python_for_bash()!r}",
+            f"LOG={log.as_posix()!r}",
+            f"FAKE_RECEIPT_JSON={fixture.as_posix()!r}",
+            f"FAKE_CANDIDATE_APP={candidate_app.as_posix()!r}",
+            f"FAKE_DOCKER_RC={int(docker_rc)}",
+            "GIT=(git)",
+            ': > "$LOG"',
+            'git() { printf "git %s\\n" "$*" >>"$LOG"; '
+            'case "$*" in *"worktree add"*) mkdir -p "$FAKE_CANDIDATE_APP" ;; esac; '
+            "return 0; }",
+            # chown is host-specific inside a sandbox; production uses the real
+            # one. The invariant under test is the exit-code capture.
+            "chown() { return 0; }",
+            'cleanup_snapshot() { printf "cleanup_snapshot\\n" >>"$LOG"; }',
+            "docker() {",
+            '  printf "docker %s\\n" "$*" >>"$LOG"',
+            '  case "$*" in',
+            '    inspect*) printf "%s\\n" "sha256:fake" ; return 0 ;;',
+            '    run*) cat "$FAKE_RECEIPT_JSON" ; return "$FAKE_DOCKER_RC" ;;',
+            "  esac",
+            "  return 0",
+            "}",
+            "run_protection_preflight() {" + _function_body(),
+            # Return code of the real function, captured without errexit.
+            "set +e",
+            "run_protection_preflight",
+            "FUNC_RET=$?",
+            "set -e",
+            'printf "FUNC_RET=%s\\n" "$FUNC_RET"',
+            # The REAL pre-mutation refusal block. On FAIL it must exit 77 and
+            # never reach the marker below.
+            _refusal_block(),
+            'echo "MUTATION_REACHED"',
+            "",
+        ]
+    )
+    return _run_bash_script(script, str(tmp), name="preflight.sh", timeout=120)
+
+
+def _healthy_payload() -> str:
+    import json
+
+    document = _document(_report())
+    assert document["verdict"]["ready"] is True
+    return json.dumps(document)
+
+
+def _blocked_payload() -> str:
+    import json
+
+    document = _document(
+        _report(
+            state="UNAVAILABLE",
+            admissions_suspended=True,
+            coverage_complete=False,
+            reason_codes=["EXPOSURE_COVERAGE_INCOMPLETE"],
+            resolution_reason="pricing unavailable for held assets: ADA.Z",
+            unmanaged_exposures=["ADA.Z"],
+        )
+    )
+    assert document["verdict"]["ready"] is False
+    return json.dumps(document)
+
+
+@pytest.mark.acceptance
+def test_ac_024_shell_path_preflight_uses_the_docker_exit_code(tmp_path):
+    """ATDD-RELEASE-PIPELINE-v1/AC-024: the real run_protection_preflight captures the container exit code on success and failure, so a HEALTHY preflight returns 0 and emits PASS while a nonzero container exit still refuses before mutation."""
+    if _bash() is None:
+        pytest.skip("bash is not available in this environment")
+
+    cases = [
+        ("healthy_rc0", 0, _healthy_payload(), 0, "PASS"),
+        ("healthy_doc_but_rc_nonzero", 3, _healthy_payload(), 77, "FAIL"),
+        ("blocked_doc_rc76", 76, _blocked_payload(), 77, "FAIL"),
+        ("empty_receipt_rc0", 0, None, 77, "FAIL"),
+    ]
+    for name, docker_rc, payload, expected_rc, expected_status in cases:
+        case_dir = tmp_path / name
+        case_dir.mkdir(parents=True, exist_ok=True)
+        proc = _preflight_harness(case_dir, docker_rc=docker_rc, payload=payload)
+        if _is_fork_failure(proc):
+            pytest.skip("bash cannot fork reliably in this environment")
+        combined = proc.stdout + proc.stderr
+        assert f"OPIP_PROTECTION_PREFLIGHT={expected_status}" in proc.stdout, combined
+        assert f"FUNC_RET={expected_rc}" in proc.stdout, combined
+        assert proc.returncode == expected_rc, combined
+        if expected_status == "PASS":
+            # A genuine HEALTHY preflight must not be misclassified, and the
+            # release continues past the boundary.
+            assert "PROTECTION PREFLIGHT BLOCKED" not in combined
+            assert "MUTATION_REACHED" in proc.stdout
+        else:
+            assert "OPIP_PROTECTION_PREFLIGHT_ABORT=REFUSED_BEFORE_MUTATION" in proc.stderr
+            assert "production_mutation_started=false" in proc.stdout
+            assert "OPIP_PRODUCTION_MUTATION=NOT_STARTED" in proc.stdout
+            assert "OPIP_SAFE_BASELINE_UNCHANGED=true" in proc.stdout
+            assert "MUTATION_REACHED" not in proc.stdout
+            assert "cleanup_snapshot" in (case_dir / "calls.log").read_text(
+                encoding="utf-8"
+            )
