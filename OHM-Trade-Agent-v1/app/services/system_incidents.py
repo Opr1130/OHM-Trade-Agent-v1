@@ -337,6 +337,33 @@ MONITOR_OWNED_SCOPES: frozenset[str] = frozenset(
     }
 )
 
+#: The canonical coverage-owned recovery mapping: the scopes whose recovery is
+#: proven by *coverage* evidence (complete held-position pricing / verification)
+#: rather than by a fresh provider probe. This is the single source of truth for
+#: "which scope is closed by which coverage authority", consumed by both the
+#: active-trade monitor's recovery sweep and the profile-scoped readiness
+#: decision. ``KRAKEN:RATE_LIMIT`` is deliberately absent: complete coverage says
+#: nothing about whether Kraken is still throttling.
+COVERAGE_RECOVERY_AUTHORITY_BY_SCOPE: dict[str, RecoveryAuthority] = {
+    SystemIncidentScope.KRAKEN_HELD_ASSET_PRICING.value: RecoveryAuthority.PRICING_COVERAGE,
+    SystemIncidentScope.KRAKEN_POSITION_VERIFICATION.value: RecoveryAuthority.POSITION_COVERAGE,
+}
+
+
+def coverage_recovery_authority(
+    scope: SystemIncidentScope | str,
+) -> RecoveryAuthority | None:
+    """Return the coverage authority that closes ``scope``, or ``None``.
+
+    ``None`` means the scope is not coverage-owned, so coverage evidence can
+    never close it. Callers must treat ``None`` as "not recoverable by coverage"
+    rather than as a default authority.
+    """
+
+    return COVERAGE_RECOVERY_AUTHORITY_BY_SCOPE.get(
+        str(getattr(scope, "value", scope))
+    )
+
 
 @dataclass(frozen=True)
 class IncidentDecision:

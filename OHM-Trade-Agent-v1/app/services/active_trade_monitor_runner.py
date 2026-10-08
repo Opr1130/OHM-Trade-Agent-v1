@@ -32,6 +32,7 @@ from app.services.system_incidents import (
     ACTION_NOTIFY_ESCALATION,
     ACTION_NOTIFY_OPEN,
     ACTION_NOTIFY_RECOVERY,
+    COVERAGE_RECOVERY_AUTHORITY_BY_SCOPE,
     IncidentDecision,
     RecoveryAuthority,
     SystemIncidentScope,
@@ -408,14 +409,15 @@ def _attempt_connectivity_recovery(
 #: Scope-matched recovery evidence for coverage-shaped scopes. Held-position
 #: coverage is only valid evidence for the scopes it actually proves healthy.
 #:
-#: ``KRAKEN:RATE_LIMIT`` is deliberately absent: complete held-position coverage
-#: says nothing about whether Kraken is still throttling, so it must never close
-#: a rate-limit incident. Rate limiting is recovered only by
+#: The mapping itself is owned by :mod:`app.services.system_incidents` so the
+#: monitor and the profile-scoped readiness decision cannot drift. ``KRAKEN:RATE_LIMIT``
+#: is deliberately absent there: complete held-position coverage says nothing
+#: about whether Kraken is still throttling, so it must never close a rate-limit
+#: incident. Rate limiting is recovered only by
 #: :func:`_attempt_rate_limit_recovery`, on fresh provider evidence.
-_COVERAGE_EVIDENCE_BY_SCOPE: dict[str, RecoveryAuthority] = {
-    SystemIncidentScope.KRAKEN_HELD_ASSET_PRICING.value: RecoveryAuthority.PRICING_COVERAGE,
-    SystemIncidentScope.KRAKEN_POSITION_VERIFICATION.value: RecoveryAuthority.POSITION_COVERAGE,
-}
+_COVERAGE_EVIDENCE_BY_SCOPE: dict[str, RecoveryAuthority] = (
+    COVERAGE_RECOVERY_AUTHORITY_BY_SCOPE
+)
 
 
 def _attempt_rate_limit_recovery(
