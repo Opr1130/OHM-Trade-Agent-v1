@@ -243,6 +243,24 @@ THEN:
 
 (e) existing fail-closed protection, evidence counters, runtime-verifier bounds, release profiles, scheduler, Paper-v2, Committee, funded/live/exchange/order authority and rollback semantics are unchanged.
 
+AC-023:
+GIVEN:
+an EVIDENCE_SHADOW live-posture failure where read-only protection health was not HEALTHY because Kraken balance identities ADA.S, ETH2.S, SEI.B, SUI.B and TAO.B could not be priced, while the evidence plane itself had already produced fresh Feature Bus snapshots and matching F5 evidence
+
+WHEN:
+the read-only exposure resolver observes a non-zero Kraken balance whose asset code is a documented balance extension or the ETH2 staking receipt
+
+THEN:
+(a) a documented balance extension (.S staked, .M opt-in rewards, .B yield-bearing/Earn, .F Kraken Rewards, .P parachain, .T tokenized) maps to its base asset, and the ETH2/ETH2.S staking receipt maps to ETH, using that underlying asset's preferred USD/USDT/USDC pair and computing notional as quantity times the observed price;
+
+(b) the mapping is explicit and evidence-backed (Kraken's published balance-extension contract and the public pair catalog) and is applied only to balance identities, not to generic pair parsing;
+
+(c) an unrecognized decorated form is not stripped or guessed, stays unpriced, and still produces EXPOSURE_COVERAGE_INCOMPLETE with admissions suspended;
+
+(d) a priced holding with no matching lifecycle trade remains VERIFIED_UNMANAGED and still produces UNMANAGED_EXPOSURE_REQUIRES_REVIEW;
+
+(e) protection-health classification, incident checks, admissions suspension, authentication handling and the absence of any exchange mutation path are unchanged, and no Paper-v2, Committee, funded/live/exchange/order or TARGET_PAPER authority is introduced.
+
 EXPLICITLY OUT OF SCOPE:
 - Activating TARGET_PAPER, Paper-v2, the Committee, or any funded/live/exchange/order authority
 - Deleting, rewriting or rescoping the historical ATDD increments that recorded the Feature Bus `off`
@@ -420,6 +438,9 @@ AC-020 -> tests/test_opip_r4_b2_shadow_capture.py::test_ac_020_bounded_restart_s
 AC-022 -> tests/test_opip_f11_precutover_protection.py::test_report_exposes_incomplete_resolution_reason_without_changing_gate
 AC-022 -> tests/test_release_runtime_verifier.py::test_posture_failure_receipt_is_actionable
 AC-022 -> tests/test_release_runtime_verifier.py::test_non_protection_posture_failure_does_not_emit_protection_reason
+AC-023 -> tests/test_kraken_balance_identity_v1.py::test_ac_023_documented_balance_identities_map_to_underlying
+AC-023 -> tests/test_kraken_balance_identity_v1.py::test_ac_023_decorated_balance_prices_on_the_underlying_usd_pair
+AC-023 -> tests/test_kraken_balance_identity_v1.py::test_ac_023_unknown_decoration_stays_unpriced_and_coverage_incomplete
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/services/release_profiles.py
@@ -551,6 +572,10 @@ AC-022 -> OHM-Trade-Agent-v1/app/services/release_runtime_verifier.py
 AC-022 -> OHM-Trade-Agent-v1/tests/test_opip_f11_precutover_protection.py
 AC-022 -> OHM-Trade-Agent-v1/tests/test_release_runtime_verifier.py
 AC-022 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
+AC-023 -> OHM-Trade-Agent-v1/app/exchanges/kraken_identity.py
+AC-023 -> OHM-Trade-Agent-v1/app/services/kraken_exposure_resolver.py
+AC-023 -> OHM-Trade-Agent-v1/tests/test_kraken_balance_identity_v1.py
+AC-023 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
 
 DEFERRED DISCOVERIES:
 - `TARGET_PAPER` remains BLOCKED. Activating it (Paper-v2) requires the ATDD-R4-B2 AC-011 comparator evidence, F11 protection READY, legacy drain READY and explicit OWNER approval, and is a separate OWNER increment; this contract does not authorize it.

@@ -105,6 +105,43 @@ def canonicalize_asset(asset: str | None) -> str:
     return _ASSET_ALIASES.get(value, value)
 
 
+# Kraken balance/ledger extensions. They are read-only balance identities, not
+# trading symbols. Official Balance/Ledgers docs say to transact using the base
+# asset (the code with the extension removed). Support documents .S as on-chain
+# staked, .M as opt-in rewards, and .P as parachain-bonded. The Balance API
+# documents .B as yield-bearing/Earn balances (same family as .S/.M), .F as
+# automatic Kraken Rewards, and .T as tokenized balances.
+_BALANCE_EXTENSIONS: tuple[str, ...] = (".B", ".F", ".M", ".P", ".S", ".T")
+
+# ETH2 and ETH2.S are Kraken's staking-receipt identities for ETH. Kraken's
+# product definition states they are the same asset as ETH, and the public
+# AssetPairs catalog exposes no ETH2 quote while ETHUSD is online. This alias
+# is explicit and balance-only; it does not change pair parsing.
+_BALANCE_RECEIPT_UNDERLYING: dict[str, str] = {"ETH2": "ETH"}
+
+
+def balance_underlying_asset(asset: str | None) -> str:
+    """Spot asset used to price a Kraken balance identity.
+
+    A documented balance extension maps to its base asset. ``ETH2`` receipts
+    map to ``ETH``. An unrecognized dotted form is returned unchanged so the
+    caller keeps it unpriced and fails closed. Pair parsing is not affected.
+    """
+    value = _clean(asset)
+    if not value:
+        return ""
+    for extension in _BALANCE_EXTENSIONS:
+        if value.endswith(extension) and len(value) > len(extension):
+            base = value[: -len(extension)]
+            if "." in base or not base:
+                return value
+            base = canonicalize_asset(base)
+            return _BALANCE_RECEIPT_UNDERLYING.get(base, base)
+    if value in _BALANCE_RECEIPT_UNDERLYING:
+        return _BALANCE_RECEIPT_UNDERLYING[value]
+    return canonicalize_asset(value)
+
+
 def _legacy_quote_can_split(raw_quote: str, raw_base: str) -> bool:
     """Require evidence before interpreting a leading-Z quote as legacy.
 

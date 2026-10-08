@@ -7,6 +7,7 @@ from typing import Any, Callable
 
 from app.exchanges.kraken import KrakenClient
 from app.exchanges.kraken_identity import (
+    balance_underlying_asset,
     canonicalize_asset,
     canonicalize_pair,
     split_canonical_pair,
@@ -384,7 +385,7 @@ class KrakenExposureResolver:
         canonical_balances: dict[str, float] = {}
         account_state_gaps: list[str] = []
         for raw_asset, raw_quantity in balances.items():
-            asset = canonicalize_asset(raw_asset)
+            asset = balance_underlying_asset(raw_asset)
             if not asset:
                 account_state_gaps.append(
                     f"unrecognized balance asset {raw_asset!r}"
