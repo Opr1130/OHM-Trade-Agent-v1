@@ -555,6 +555,7 @@ def test_case_b_core_and_learning_both_succeed(tmp_path):
 
 
 @requires_bash
+@pytest.mark.acceptance
 def test_ac_026_workflow_gate_requires_explicit_shadow_readiness(tmp_path):
     """ATDD-RELEASE-PIPELINE-v1/AC-026: the EVIDENCE_SHADOW core is proven only from an explicit READY runtime readiness marker; a BLOCKED or absent readiness fails closed even when strict F11 is HEALTHY."""
     ready = "\n".join(
@@ -581,6 +582,7 @@ def test_ac_026_workflow_gate_requires_explicit_shadow_readiness(tmp_path):
     assert absent_fields["RESULT"] != "SUCCESS"
 
 
+@pytest.mark.acceptance
 def test_ac_026_workflow_keeps_owner_manual_exact_sha_controls():
     """ATDD-RELEASE-PIPELINE-v1/AC-026: the workflow keeps its owner/manual/exact-SHA controls and gains no new trigger or permission."""
     text = WORKFLOW.read_text(encoding="utf-8")

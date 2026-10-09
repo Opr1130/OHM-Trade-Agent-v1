@@ -281,6 +281,8 @@ THEN:
 
 (f) existing fail-closed protection, runtime verification, scheduler, Feature Bus, Paper-v2, Committee, TARGET_PAPER, funded/live/order/exchange authority and genuine post-mutation rollback semantics remain unchanged.
 
+BOUNDED SUPERSESSION BY AC-026 (release-decision only): for the qualified EVIDENCE_SHADOW profile, clause (c)'s "only HEALTHY / complete / non-suspended protection may cross the mutable release boundary" is superseded by AC-026(c)'s explicit EVIDENCE_SHADOW readiness verdict. Every other part of AC-024 remains in force -- the read-only preflight, the bounded sanitized markers, the pre-mutation refusal, the untouched checkout and the preserved strict F11 fields -- and clause (c)/(d) remain exactly true for every non-EVIDENCE_SHADOW profile and for strict F11. Strict protection semantics are unchanged and no safety requirement is relaxed.
+
 HISTORICAL BOOTSTRAP LIMITATION (AC-024 is not retroactive over the installed controller):
 The host executes the already-installed `/usr/local/sbin/ohm-deploy` for a given deploy, not the candidate revision's copy. The prior deployment receipt showed `OPIP_DEPLOY_CONTROLLER_BOOTSTRAP=NOT_NEEDED` and `OPIP_DEPLOY_CONTROLLER_BOOTSTRAP_SHA=6cfcd47405216b35fcff039c659663d2af4fc2c4`, so the first deploy after AC-024 merges may still run a controller that predates this boundary. AC-024 governs the transaction only once this revision is the installed controller; it makes no claim about that first bootstrap execution, and no manual controller install is introduced. This is documented so the boundary is never reported as protecting a run it did not execute. AC-025 is the explicit operational resolution of this limitation.
 
@@ -529,7 +531,7 @@ AC-023 -> tests/test_kraken_balance_identity_v1.py::test_ac_023_documented_balan
 AC-023 -> tests/test_kraken_balance_identity_v1.py::test_ac_023_decorated_balance_prices_on_the_underlying_usd_pair
 AC-023 -> tests/test_kraken_balance_identity_v1.py::test_ac_023_unknown_decoration_stays_unpriced_and_coverage_incomplete
 AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_healthy_preflight_is_ready
-AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_non_healthy_protection_is_not_ready
+AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_non_ready_protection_is_refused
 AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_incident_health_consistent_with_classification
 AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_one_incident_observation_drives_report_and_marker
 AC-024 -> tests/test_release_protection_preflight_v1.py::test_ac_024_preflight_uses_the_existing_read_only_report
@@ -606,15 +608,6 @@ AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_controller_
 AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_controller_readiness_does_not_require_strict_f11
 AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_controller_markers_are_wired_through_the_receipt
 AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_workflow_gates_runtime_on_explicit_readiness
-AC-026 -> tests/test_opip_ac026_evidence_shadow_readiness.py::test_unmanaged_only_with_complete_coverage_is_ready
-AC-026 -> tests/test_opip_ac026_evidence_shadow_readiness.py::test_pricing_incident_candidate_recoverable_with_proven_predicate
-AC-026 -> tests/test_opip_ac026_evidence_shadow_readiness.py::test_pricing_incident_with_unproven_current_degradation_blocks
-AC-026 -> tests/test_opip_ac026_evidence_shadow_readiness.py::test_non_coverage_incidents_block
-AC-026 -> tests/test_opip_ac026_evidence_shadow_readiness.py::test_unknown_incident_blocks
-AC-026 -> tests/test_opip_ac026_evidence_shadow_readiness.py::test_incident_without_scope_is_malformed
-AC-026 -> tests/test_opip_ac026_evidence_shadow_readiness.py::test_unreadable_incident_evidence_blocks_and_is_never_empty
-AC-026 -> tests/test_opip_ac026_evidence_shadow_readiness.py::test_decision_performs_no_mutation
-AC-026 -> tests/test_opip_ac026_evidence_shadow_readiness.py::test_strict_f11_still_blocks_unmanaged_only
 AC-026 -> tests/test_release_runtime_verifier.py::test_ac_026_runtime_verifier_accepts_advisory_strict_f11
 AC-026 -> tests/test_release_runtime_verifier.py::test_ac_026_runtime_verifier_accepts_candidate_recoverable_incidents
 AC-026 -> tests/test_release_runtime_verifier.py::test_ac_026_runtime_verifier_blocks_real_current_blockers
@@ -623,8 +616,6 @@ AC-026 -> tests/test_release_runtime_verifier.py::test_ac_026_runtime_verifier_k
 AC-026 -> tests/test_release_runtime_verifier.py::test_ac_026_runtime_verifier_pass_receipt_emits_readiness_and_strict_state
 AC-026 -> tests/test_opip_deployment_transaction_boundary_v1.py::test_ac_026_workflow_gate_requires_explicit_shadow_readiness
 AC-026 -> tests/test_opip_deployment_transaction_boundary_v1.py::test_ac_026_workflow_keeps_owner_manual_exact_sha_controls
-AC-026 -> tests/test_opip_f11_precutover_protection.py::test_ac_002_one_mutating_authority_and_read_only_evaluator
-AC-026 -> tests/test_opip_f11_precutover_protection.py::test_ac_005_report_is_read_only_and_authority_free
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/services/release_profiles.py
@@ -770,6 +761,7 @@ AC-025 -> OHM-Trade-Agent-v1/deploy/remote/bootstrap-deploy-controller-only.sh
 AC-025 -> OHM-Trade-Agent-v1/tests/test_opip_deploy_controller_bootstrap_only.py
 AC-025 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
 AC-026 -> OHM-Trade-Agent-v1/app/services/system_incidents.py
+AC-026 -> OHM-Trade-Agent-v1/app/services/active_trade_monitor_runner.py
 AC-026 -> OHM-Trade-Agent-v1/app/services/kraken_exposure_resolver.py
 AC-026 -> OHM-Trade-Agent-v1/app/services/evidence_shadow_readiness.py
 AC-026 -> OHM-Trade-Agent-v1/app/jobs/report_protection_health.py
