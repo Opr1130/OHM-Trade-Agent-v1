@@ -8,6 +8,9 @@ call Kraken and do not mutate a registry.
 
 from __future__ import annotations
 
+import json
+import re
+import subprocess
 import types
 from pathlib import Path
 import shutil
@@ -1116,6 +1119,289 @@ def test_ac_026_marker_formatters_are_bounded_and_sanitized():
     assert encoded.count(",") <= 19
     assert len(encoded) <= 400
     assert " " not in encoded
+
+
+# ---------------------------------------------------------------------------
+# AC-026 Phase 4: the deploy controller's receipt parser consumes the explicit
+# readiness verdict. These run the REAL embedded parser (the same Python the
+# controller feeds the preflight receipt to) without requiring bash, so the
+# fail-closed readiness contract is exercised on every platform.
+# ---------------------------------------------------------------------------
+
+_RECEIPT_FIELDS = (
+    "status",
+    "state",
+    "coverage",
+    "suspended",
+    "codes",
+    "reason",
+    "unmanaged",
+    "uncertain",
+    "silent",
+    "incident_health",
+    "shadow_readiness",
+    "shadow_blocking",
+    "shadow_advisory",
+    "shadow_unmanaged",
+    "shadow_candidate",
+    "shadow_blocking_incidents",
+    "strict_f11_state",
+)
+
+
+def _receipt_parser_source() -> str:
+    blocks = re.findall(r"<<'PY'\n(.*?)\nPY\n", DEPLOY, re.S)
+    matching = [block for block in blocks if "def prefer(" in block]
+    assert len(matching) == 1, "expected exactly one receipt-parser heredoc"
+    return matching[0]
+
+
+def _run_receipt_parser(tmp_path, document, *, rc=0, candidate_sha=SHA):
+    parser = tmp_path / "receipt_parser.py"
+    parser.write_text(_receipt_parser_source(), encoding="utf-8")
+    receipt = tmp_path / "receipt.json"
+    if isinstance(document, str):
+        receipt.write_text(document, encoding="utf-8")
+    else:
+        receipt.write_text(json.dumps(document), encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(parser), str(receipt), candidate_sha, str(rc)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    assert proc.returncode == 0, proc.stderr
+    lines = proc.stdout.splitlines()
+    assert len(lines) == 17, lines
+    return dict(zip(_RECEIPT_FIELDS, lines))
+
+
+def _receipt_document(
+    *,
+    readiness="READY",
+    strict_state="HEALTHY",
+    strict_codes=(),
+    coverage=True,
+    unmanaged=(),
+    shadow_ready=None,
+    verdict_ready=None,
+    include_shadow=True,
+    shadow_blocking=(),
+    shadow_advisory=(),
+    shadow_unmanaged=(),
+    shadow_candidate=(),
+    shadow_blocking_incidents=(),
+    incident_health=True,
+    release_profile="EVIDENCE_SHADOW",
+):
+    if shadow_ready is None:
+        shadow_ready = readiness == "READY"
+    if verdict_ready is None:
+        verdict_ready = shadow_ready
+    codes = list(strict_codes) or ["PROTECTION_PROVEN"]
+    markers = {
+        "strict_f11_state": strict_state,
+        "evidence_shadow_readiness": readiness,
+        "evidence_shadow_blocking_reason_codes": ",".join(shadow_blocking) or "NONE",
+        "evidence_shadow_advisory_reason_codes": ",".join(shadow_advisory) or "NONE",
+        "evidence_shadow_unmanaged_exposures": ",".join(shadow_unmanaged) or "NONE",
+        "evidence_shadow_candidate_recoverable_incidents": ",".join(shadow_candidate) or "NONE",
+        "evidence_shadow_blocking_incidents": ",".join(shadow_blocking_incidents) or "NONE",
+        "unmanaged_exposures": ",".join(unmanaged) or "NONE",
+        "uncertain_exposures": "NONE",
+        "silent_holdings": "NONE",
+        "incident_health": "true" if incident_health else "false",
+    }
+    document = {
+        "schema_version": 1,
+        "read_only": True,
+        "candidate_sha": SHA,
+        "release_profile": release_profile,
+        "protection": {
+            "state": strict_state,
+            "admissions_suspended": strict_state != "HEALTHY",
+            "coverage_complete": coverage,
+            "reason_codes": codes,
+            "unmanaged_exposures": list(unmanaged),
+            "uncertain_exposures": [],
+            "silent_holdings": [],
+        },
+        "strict_f11": {
+            "state": strict_state,
+            "healthy": strict_state == "HEALTHY",
+            "admissions_suspended": strict_state != "HEALTHY",
+            "coverage_complete": coverage,
+            "reason_codes": codes,
+        },
+        "incidents": {"health": incident_health},
+        "markers": markers,
+        "verdict": {"ready": verdict_ready, "reason": "test"},
+    }
+    if include_shadow:
+        document["evidence_shadow"] = {
+            "state": readiness,
+            "ready": shadow_ready,
+            "blocking_reason_codes": list(shadow_blocking),
+            "advisory_reason_codes": list(shadow_advisory),
+            "unmanaged_exposures": list(shadow_unmanaged),
+            "candidate_recoverable_incidents": list(shadow_candidate),
+            "blocking_incidents": list(shadow_blocking_incidents),
+            "coverage_complete": coverage,
+        }
+    return document
+
+
+@pytest.mark.acceptance
+def test_ac_026_controller_accepts_explicit_readiness_with_advisory_strict_f11(tmp_path):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: the controller PASSES an explicit EVIDENCE_SHADOW READY verdict even though strict F11 stays non-HEALTHY for an advisory unmanaged holding, and preserves the strict F11 markers."""
+    document = _receipt_document(
+        readiness="READY",
+        strict_state="UNSAFE",
+        strict_codes=("UNMANAGED_EXPOSURE_REQUIRES_REVIEW",),
+        unmanaged=("XBTUSD",),
+        shadow_unmanaged=("XBTUSD",),
+        shadow_advisory=("UNMANAGED_EXPOSURE",),
+    )
+    fields = _run_receipt_parser(tmp_path, document)
+    assert fields["status"] == "PASS"
+    # Strict F11 remains visible and is not turned into HEALTHY.
+    assert fields["strict_f11_state"] == "UNSAFE"
+    assert fields["state"] == "UNSAFE"
+    assert fields["codes"] == "UNMANAGED_EXPOSURE_REQUIRES_REVIEW"
+    assert fields["unmanaged"] == "XBTUSD"
+    assert fields["incident_health"] == "true"
+    # The explicit AC-026 verdict drives the decision.
+    assert fields["shadow_readiness"] == "READY"
+    assert fields["shadow_unmanaged"] == "XBTUSD"
+
+
+@pytest.mark.acceptance
+def test_ac_026_controller_rejects_blocked_readiness(tmp_path):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: a BLOCKED readiness verdict refuses even when strict F11 is HEALTHY."""
+    document = _receipt_document(
+        readiness="BLOCKED",
+        strict_state="HEALTHY",
+        shadow_blocking=("EXPOSURE_COVERAGE_INCOMPLETE",),
+        coverage=False,
+        shadow_ready=False,
+    )
+    fields = _run_receipt_parser(tmp_path, document)
+    assert fields["status"] == "FAIL"
+    assert fields["shadow_readiness"] == "BLOCKED"
+
+
+@pytest.mark.acceptance
+def test_ac_026_controller_rejects_missing_readiness(tmp_path):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: a receipt with no readiness object refuses; absence of a failure marker is never readiness proof."""
+    document = _receipt_document(include_shadow=False, strict_state="HEALTHY")
+    fields = _run_receipt_parser(tmp_path, document)
+    assert fields["status"] == "FAIL"
+    assert fields["shadow_readiness"] == "UNPROVEN"
+
+
+@pytest.mark.acceptance
+def test_ac_026_controller_rejects_unknown_readiness(tmp_path):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: an unknown readiness state refuses."""
+    document = _receipt_document(readiness="PROBABLY_FINE", strict_state="HEALTHY", shadow_ready=True)
+    fields = _run_receipt_parser(tmp_path, document)
+    assert fields["status"] == "FAIL"
+    assert fields["shadow_readiness"] == "UNPROVEN"
+
+
+@pytest.mark.acceptance
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        # verdict.ready true but the readiness object says not ready
+        {"readiness": "BLOCKED", "shadow_ready": False, "verdict_ready": True, "strict_state": "HEALTHY"},
+        # readiness object says ready but its state is not READY
+        {"readiness": "BLOCKED", "shadow_ready": True, "verdict_ready": True, "strict_state": "HEALTHY"},
+        # readiness says READY but the verdict refuses
+        {"readiness": "READY", "shadow_ready": True, "verdict_ready": False, "strict_state": "HEALTHY"},
+    ],
+)
+def test_ac_026_controller_rejects_contradictory_state(tmp_path, overrides):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: contradictory receipt state fails closed."""
+    fields = _run_receipt_parser(tmp_path, _receipt_document(**overrides))
+    assert fields["status"] == "FAIL"
+
+
+@pytest.mark.acceptance
+def test_ac_026_controller_rejects_malformed_receipt(tmp_path):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: a malformed receipt refuses and yields bounded defaults."""
+    fields = _run_receipt_parser(tmp_path, "{ not valid json")
+    assert fields["status"] == "FAIL"
+    assert fields["shadow_readiness"] == "UNPROVEN"
+    assert fields["strict_f11_state"] == "UNAVAILABLE"
+
+
+@pytest.mark.acceptance
+def test_ac_026_controller_ac026_markers_are_bounded(tmp_path):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: the AC-026 receipt markers drop non-token values and stay bounded in count and length."""
+    hostile = "free form incident reason text"
+    long_ids = [f"SYSTEM_HEALTH:KRAKEN:SCOPE_{i}" for i in range(40)]
+    document = _receipt_document(
+        readiness="READY",
+        strict_state="UNSAFE",
+        unmanaged=("NOT A SYMBOL", "XBTUSD"),
+        shadow_unmanaged=("NOT A SYMBOL", "XBTUSD"),
+        shadow_candidate=(hostile, *long_ids),
+        shadow_blocking=("bad code", "PRICING_GAP"),
+    )
+    fields = _run_receipt_parser(tmp_path, document)
+    assert fields["status"] == "PASS"
+    # Non-token values are dropped; kept values are bounded.
+    assert fields["unmanaged"] == "XBTUSD"
+    assert fields["shadow_unmanaged"] == "XBTUSD"
+    assert fields["shadow_blocking"] == "PRICING_GAP"
+    assert hostile not in fields["shadow_candidate"]
+    assert fields["shadow_candidate"].count(",") <= 19
+    assert len(fields["shadow_candidate"]) <= 400
+    assert " " not in fields["shadow_candidate"]
+
+
+@pytest.mark.acceptance
+def test_ac_026_controller_readiness_does_not_require_strict_f11():
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: the controller's readiness computation no longer requires strict F11 HEALTHY; it requires an explicit READY verdict."""
+    source = _receipt_parser_source()
+    assert 'protection.get("state") == "HEALTHY"' not in source
+    assert "shadow.get(\"ready\") is True" in source
+    assert 'shadow_readiness == "READY"' in source
+    assert 'doc.get("release_profile") == "EVIDENCE_SHADOW"' in source
+
+
+@pytest.mark.acceptance
+def test_ac_026_controller_markers_are_wired_through_the_receipt():
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: the AC-026 preflight markers are emitted by the controller and consumed by the workflow."""
+    for name in (
+        "STRICT_F11_STATE",
+        "EVIDENCE_SHADOW_READINESS",
+        "EVIDENCE_SHADOW_BLOCKING_REASON_CODES",
+        "EVIDENCE_SHADOW_ADVISORY_REASON_CODES",
+        "EVIDENCE_SHADOW_UNMANAGED_EXPOSURES",
+        "EVIDENCE_SHADOW_CANDIDATE_RECOVERABLE_INCIDENTS",
+        "EVIDENCE_SHADOW_BLOCKING_INCIDENTS",
+    ):
+        assert f"OPIP_PROTECTION_PREFLIGHT_{name}=" in DEPLOY
+        assert f"OPIP_PROTECTION_PREFLIGHT_{name}=" in _function_body()
+    for output in (
+        "protection_preflight_strict_f11_state=",
+        "protection_preflight_evidence_shadow_readiness=",
+        "protection_preflight_evidence_shadow_blocking_reason_codes=",
+        "protection_preflight_evidence_shadow_advisory_reason_codes=",
+        "protection_preflight_evidence_shadow_unmanaged_exposures=",
+        "protection_preflight_evidence_shadow_candidate_recoverable_incidents=",
+        "protection_preflight_evidence_shadow_blocking_incidents=",
+    ):
+        assert output in WORKFLOW
+
+
+@pytest.mark.acceptance
+def test_ac_026_workflow_gates_runtime_on_explicit_readiness():
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: the workflow PROVEN verdict requires the explicit runtime readiness marker, not strict F11 HEALTHY."""
+    assert '[[ "$RUNTIME_SHADOW_READINESS" == "READY" ]]' in WORKFLOW
+    assert '[[ "$RUNTIME_PROTECTION" == "HEALTHY" ]]' not in WORKFLOW
+    assert "OPIP_RELEASE_SHADOW_READINESS" in WORKFLOW
 
 
 @requires_bash

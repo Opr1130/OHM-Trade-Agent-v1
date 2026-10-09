@@ -308,6 +308,46 @@ THEN:
 
 (h) path overrides for the repository root, state directory, destination controller and lock are inert unless the explicit OPIP_DEPLOY_TEST_SEAMS=1 seam is enabled, so production can never be redirected by an ambient environment variable.
 
+AC-026:
+GIVEN:
+an owner-approved EVIDENCE_SHADOW release candidate whose strict F11 protection decision is legitimately non-HEALTHY ONLY because of AC-026 advisory conditions (an external/pre-registry VERIFIED_UNMANAGED holding, or a durable coverage-owned incident whose exact canonical current recovery predicate is proven), while every genuine current blocker remains absent
+
+WHEN:
+the release-control path evaluates the candidate preflight, the post-mutation runtime verification, and the workflow receipt
+
+THEN:
+(a) strict F11 protection semantics are UNCHANGED and profile-agnostic: `evaluate_protection_health` is not modified, a VERIFIED_UNMANAGED holding remains a strict concern, an unresolved durable protection incident remains a strict concern, and no release-profile value ever reaches strict F11
+
+(b) TARGET_PAPER still requires strict F11 HEALTHY: the runtime verifier keeps the strict gate for every non-EVIDENCE_SHADOW profile, and TARGET_PAPER remains BLOCKED
+
+(c) EVIDENCE_SHADOW uses a SEPARATE deployment readiness decision: the release decision for the qualified EVIDENCE_SHADOW profile is the explicit AC-026 readiness verdict, NOT strict F11 health
+
+(d) a VERIFIED_UNMANAGED exposure remains visible and is advisory only to EVIDENCE_SHADOW readiness: it is never reclassified, whitelisted or filtered, it keeps its status, and it remains a strict F11 blocker; the shadow decision only changes ITS EFFECT on the shadow verdict
+
+(e) only canonical coverage-owned scopes may be candidate-recoverable: the set is exactly the scopes the canonical `system_incidents.coverage_recovery_authority` resolves (KRAKEN:HELD_ASSET_PRICING -> PRICING_COVERAGE, KRAKEN:POSITION_VERIFICATION -> POSITION_COVERAGE); no second mapping is introduced in the controller, runtime verifier, workflow or tests
+
+(f) the candidate-recoverable predicate is exact and same-cycle: canonical recovery authority exists AND candidate `coverage_complete` is exactly True AND the SAME scope is proven NOT degraded in the SAME current candidate observation (`ExposureResolution.degraded_scopes`, derived from the observation's own structured coverage facts); incident age, id, count, free-text reason parsing, caller-supplied booleans, unconditional empty sets, durable incident presence/absence and the mere absence of an exception are never evidence of current health
+
+(g) a durable incident stays UNRESOLVED for strict F11 until normal runtime recovery legitimately closes it; candidate recoverability is a classification only and never makes strict incident health true
+
+(h) the preflight performs NO incident recovery and no write: it calls no recovery/close/mutation path, writes no incident/active-trade/lifecycle/reservation/exchange state, and evaluates its decision read-only from one exposure resolution and one durable-incident read
+
+(i) auth, connectivity, public-read, rate-limit, unknown, malformed, unreadable and otherwise unproven conditions remain BLOCKING for both strict F11 and EVIDENCE_SHADOW readiness; an unreadable incident store is never treated as an empty incident set
+
+(j) a preflight refusal stays BEFORE production mutation: it reports `OPIP_CORE_DEPLOY_STATUS=NOT_STARTED`, `OPIP_PRODUCTION_MUTATION=NOT_STARTED`, `OPIP_ROLLBACK_REQUIRED=false` and `OPIP_SAFE_BASELINE_UNCHANGED=true`, and requires no rollback
+
+(k) the deploy controller consumes the explicit readiness verdict: for EVIDENCE_SHADOW the receipt parser accepts ONLY a well-formed AC-026 readiness object whose state is READY and whose `ready` is exactly True and agrees with the receipt verdict; a missing, malformed, unknown, non-READY or contradictory readiness fails closed; strict F11 state and reasons are preserved for observability and are not the gate
+
+(l) the runtime verifier uses the SAME canonical AC-026 semantics (the shared read-only composition, not a re-derived algorithm) so a legitimate shadow-ready deployment whose strict F11 remains non-HEALTHY only for advisory conditions does NOT roll back post-mutation, while every genuine current blocker (coverage incomplete, uncertain exposure, silent managed holding, invalid geometry, current pricing degradation, current position/account verification degradation, auth/connectivity/read failure, rate-limit failure, unknown/malformed/unreadable incident, unproven current scope) continues to fail runtime verification and use the existing post-mutation rollback semantics; strict F11 remains visible in the runtime receipt
+
+(m) the deployment workflow proves the EVIDENCE_SHADOW core only from the explicit runtime readiness marker (`OPIP_RELEASE_SHADOW_READINESS=READY`), never from strict F11 `HEALTHY` and never from the absence of a failure marker; the manual/owner-controlled production deploy, exact-main-SHA qualification, architecture/security/profile gates, candidate preflight before mutation, runtime verification, rollback behavior, last-good semantics and the forced-command SSH gateway are unchanged and no trigger or permission is widened
+
+(n) no authority is widened anywhere in this increment: Paper-v2 stays OFF, the Committee stays OFF, funded/live/order/exchange authority stays absent, the legacy path remains the sole new-entry authority, and TARGET_PAPER remains BLOCKED
+
+NO-THIRD-TRUTH BOUNDARY (AC-026): the sole current coverage-degradation truth is `ExposureResolution.degraded_scopes` -> the canonical `system_incidents.coverage_degraded_scopes()` helper -> the exact recovery predicate in `evaluate_evidence_shadow_readiness`. The controller parses verdicts rather than inferring market health, the runtime verifier consumes the canonical readiness composition rather than rebuilding scope semantics, and the workflow classifies receipt markers. The active-trade monitor's own free-text recovery guard is left untouched.
+
+HISTORICAL BOOTSTRAP LIMITATION (AC-026 is not retroactive over the installed controller): as with AC-024, the host executes the already-installed `/usr/local/sbin/ohm-deploy` for a given deploy. The first deploy after this increment may still run a controller that predates the AC-026 receipt readiness contract; AC-026 governs the transaction only once this revision is the installed controller. No manual controller install is introduced by this increment.
+
 EXPLICITLY OUT OF SCOPE:
 - Activating TARGET_PAPER, Paper-v2, the Committee, or any funded/live/exchange/order authority
 - Deleting, rewriting or rescoping the historical ATDD increments that recorded the Feature Bus `off`
@@ -532,6 +572,59 @@ AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_post_
 AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_installation_failure_reports_verified_restore
 AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_installation_and_restore_failure_reports_unproven
 AC-025 -> tests/test_opip_deploy_controller_bootstrap_only.py::test_ac_025_no_forbidden_tooling_is_required
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_unmanaged_only_shadow_case
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_production_shaped_case_is_shadow_ready_but_strict_non_healthy
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_held_asset_pricing_currently_degraded_blocks
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_position_verification_currently_degraded_blocks
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_current_scope_status_unproven_fails_closed
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_coverage_incomplete_fails_closed
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_uncertain_exposure_fails_closed
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_silent_managed_holding_fails_closed
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_invalid_managed_geometry_fails_closed
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_non_coverage_incidents_fail_closed
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_unknown_incident_fails_closed
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_malformed_incident_fails_closed
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_unreadable_incident_store_is_never_empty
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_strict_incident_health_is_not_forgiven
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_preflight_does_not_mutate_the_incident_store
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_no_lifecycle_or_trade_write_path_is_invoked
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_single_resolver_and_single_incident_read_per_decision
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_same_observation_drives_strict_and_shadow
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_candidate_sha_and_profile_are_still_validated
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_refusal_exit_contract_is_unchanged
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_legacy_report_and_markers_still_mean_strict_protection
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_ac024_marker_names_are_not_repurposed
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_coverage_degraded_scopes_are_same_cycle_structured
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_marker_formatters_are_bounded_and_sanitized
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_controller_accepts_explicit_readiness_with_advisory_strict_f11
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_controller_rejects_blocked_readiness
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_controller_rejects_missing_readiness
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_controller_rejects_unknown_readiness
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_controller_rejects_contradictory_state
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_controller_rejects_malformed_receipt
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_controller_ac026_markers_are_bounded
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_controller_readiness_does_not_require_strict_f11
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_controller_markers_are_wired_through_the_receipt
+AC-026 -> tests/test_release_protection_preflight_v1.py::test_ac_026_workflow_gates_runtime_on_explicit_readiness
+AC-026 -> tests/test_opip_ac026_evidence_shadow_readiness.py::test_unmanaged_only_with_complete_coverage_is_ready
+AC-026 -> tests/test_opip_ac026_evidence_shadow_readiness.py::test_pricing_incident_candidate_recoverable_with_proven_predicate
+AC-026 -> tests/test_opip_ac026_evidence_shadow_readiness.py::test_pricing_incident_with_unproven_current_degradation_blocks
+AC-026 -> tests/test_opip_ac026_evidence_shadow_readiness.py::test_non_coverage_incidents_block
+AC-026 -> tests/test_opip_ac026_evidence_shadow_readiness.py::test_unknown_incident_blocks
+AC-026 -> tests/test_opip_ac026_evidence_shadow_readiness.py::test_incident_without_scope_is_malformed
+AC-026 -> tests/test_opip_ac026_evidence_shadow_readiness.py::test_unreadable_incident_evidence_blocks_and_is_never_empty
+AC-026 -> tests/test_opip_ac026_evidence_shadow_readiness.py::test_decision_performs_no_mutation
+AC-026 -> tests/test_opip_ac026_evidence_shadow_readiness.py::test_strict_f11_still_blocks_unmanaged_only
+AC-026 -> tests/test_release_runtime_verifier.py::test_ac_026_runtime_verifier_accepts_advisory_strict_f11
+AC-026 -> tests/test_release_runtime_verifier.py::test_ac_026_runtime_verifier_accepts_candidate_recoverable_incidents
+AC-026 -> tests/test_release_runtime_verifier.py::test_ac_026_runtime_verifier_blocks_real_current_blockers
+AC-026 -> tests/test_release_runtime_verifier.py::test_ac_026_runtime_verifier_blocks_unreadable_incident_evidence
+AC-026 -> tests/test_release_runtime_verifier.py::test_ac_026_runtime_verifier_keeps_strict_gate_for_non_shadow_profiles
+AC-026 -> tests/test_release_runtime_verifier.py::test_ac_026_runtime_verifier_pass_receipt_emits_readiness_and_strict_state
+AC-026 -> tests/test_opip_deployment_transaction_boundary_v1.py::test_ac_026_workflow_gate_requires_explicit_shadow_readiness
+AC-026 -> tests/test_opip_deployment_transaction_boundary_v1.py::test_ac_026_workflow_keeps_owner_manual_exact_sha_controls
+AC-026 -> tests/test_opip_f11_precutover_protection.py::test_ac_002_one_mutating_authority_and_read_only_evaluator
+AC-026 -> tests/test_opip_f11_precutover_protection.py::test_ac_005_report_is_read_only_and_authority_free
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/services/release_profiles.py
@@ -676,6 +769,20 @@ AC-024 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.
 AC-025 -> OHM-Trade-Agent-v1/deploy/remote/bootstrap-deploy-controller-only.sh
 AC-025 -> OHM-Trade-Agent-v1/tests/test_opip_deploy_controller_bootstrap_only.py
 AC-025 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
+AC-026 -> OHM-Trade-Agent-v1/app/services/system_incidents.py
+AC-026 -> OHM-Trade-Agent-v1/app/services/kraken_exposure_resolver.py
+AC-026 -> OHM-Trade-Agent-v1/app/services/evidence_shadow_readiness.py
+AC-026 -> OHM-Trade-Agent-v1/app/jobs/report_protection_health.py
+AC-026 -> OHM-Trade-Agent-v1/app/jobs/preflight_protection_health.py
+AC-026 -> OHM-Trade-Agent-v1/app/services/release_runtime_verifier.py
+AC-026 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
+AC-026 -> .github/workflows/deploy-production.yml
+AC-026 -> OHM-Trade-Agent-v1/tests/test_opip_ac026_evidence_shadow_readiness.py
+AC-026 -> OHM-Trade-Agent-v1/tests/test_release_protection_preflight_v1.py
+AC-026 -> OHM-Trade-Agent-v1/tests/test_release_runtime_verifier.py
+AC-026 -> OHM-Trade-Agent-v1/tests/test_opip_deployment_transaction_boundary_v1.py
+AC-026 -> OHM-Trade-Agent-v1/tests/test_opip_f11_precutover_protection.py
+AC-026 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
 
 DEFERRED DISCOVERIES:
 - `TARGET_PAPER` remains BLOCKED. Activating it (Paper-v2) requires the ATDD-R4-B2 AC-011 comparator evidence, F11 protection READY, legacy drain READY and explicit OWNER approval, and is a separate OWNER increment; this contract does not authorize it.

@@ -428,6 +428,8 @@ RELEASE_RUNTIME_OK_LOG = "\n".join(
         "OPIP_RELEASE_EVIDENCE_CAPTURE=PASS",
         "OPIP_RELEASE_PROFILE=EVIDENCE_SHADOW",
         "OPIP_RELEASE_PROTECTION=HEALTHY",
+        "OPIP_RELEASE_PROTECTION_READY=true",
+        "OPIP_RELEASE_SHADOW_READINESS=READY",
         "OPIP_RELEASE_TARGET_AUTHORITY=ABSENT",
         "OPIP_RELEASE_SCHEDULER=UNIQUE_BOUNDED",
         "OPIP_UNIFIED_CYCLE=HEALTHY",
@@ -550,6 +552,46 @@ def test_case_b_core_and_learning_both_succeed(tmp_path):
     assert fields["HEALTH"] == "OK"
     assert fields["ROLLBACK"] == "NO"
     assert fields["GATE"] == "PASS"
+
+
+@requires_bash
+def test_ac_026_workflow_gate_requires_explicit_shadow_readiness(tmp_path):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: the EVIDENCE_SHADOW core is proven only from an explicit READY runtime readiness marker; a BLOCKED or absent readiness fails closed even when strict F11 is HEALTHY."""
+    ready = "\n".join(
+        [
+            CORE_OK_LOG,
+            "OPIP_LEARNING_EXPORT_STATUS=SUCCESS",
+            "OPIP_LEARNING_READINESS=READY",
+            "O'Pip deployment succeeded",
+            "sha=" + RELEASE_SHA,
+        ]
+    )
+    assert _classify(tmp_path, ready, rc=0)["GATE"] == "PASS"
+
+    blocked = ready.replace(
+        "OPIP_RELEASE_SHADOW_READINESS=READY", "OPIP_RELEASE_SHADOW_READINESS=BLOCKED"
+    )
+    blocked_fields = _classify(tmp_path, blocked, rc=0)
+    assert blocked_fields["GATE"] == "FAIL"
+    assert blocked_fields["RESULT"] != "SUCCESS"
+
+    absent = ready.replace("OPIP_RELEASE_SHADOW_READINESS=READY\n", "")
+    absent_fields = _classify(tmp_path, absent, rc=0)
+    assert absent_fields["GATE"] == "FAIL"
+    assert absent_fields["RESULT"] != "SUCCESS"
+
+
+def test_ac_026_workflow_keeps_owner_manual_exact_sha_controls():
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: the workflow keeps its owner/manual/exact-SHA controls and gains no new trigger or permission."""
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert "workflow_dispatch" in text
+    assert "issue_comment" in text
+    assert "github.event.comment.user.login == github.repository_owner" in text
+    assert "github.event.comment.author_association == 'OWNER'" in text
+    assert "OPIP_RELEASE_PROFILE" in text
+    # The readiness gate is explicit and cannot be satisfied by a strict marker.
+    assert '[[ "$RUNTIME_SHADOW_READINESS" == "READY" ]]' in text
+    assert '[[ "$RUNTIME_PROTECTION" == "HEALTHY" ]]' not in text
 
 
 @requires_bash

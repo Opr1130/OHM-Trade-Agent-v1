@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+import sys
 
 import pytest
 
@@ -209,3 +210,238 @@ def test_non_protection_posture_failure_does_not_emit_protection_reason(capsys):
     out = capsys.readouterr().out
     assert "OPIP_RELEASE_RUNTIME_FAILURE_STAGE=LIVE_POSTURE" in out
     assert "OPIP_RELEASE_RUNTIME_PROTECTION_REASON=" not in out
+
+
+# ---------------------------------------------------------------------------
+# AC-026 Phase 4: runtime verification uses the canonical AC-026 readiness
+# composition, so an advisory strict-F11 blocker never causes a false
+# post-mutation rollback while every genuine current blocker still fails.
+# ---------------------------------------------------------------------------
+
+
+def _unmanaged_exposure(symbol="XBTUSD"):
+    return SimpleNamespace(status="VERIFIED_UNMANAGED", symbol=symbol, trade=None)
+
+
+def _set_modes(monkeypatch, profile="EVIDENCE_SHADOW"):
+    from app.services.release_profiles import resolve_release_profile
+
+    for key, value in resolve_release_profile(profile)["allowed_modes"].items():
+        monkeypatch.setenv(key, value)
+
+
+def _stub_spine_and_settings(monkeypatch, *, mode, reason):
+    import app.services.target_spine_cycle as spine
+
+    monkeypatch.setattr(
+        spine,
+        "run_target_spine_cycle",
+        lambda settings: SimpleNamespace(
+            mode=mode, inert=True, handoffs_built=0, errors=0, reason=reason
+        ),
+    )
+    monkeypatch.setattr("app.core.config.get_settings", lambda: SimpleNamespace())
+
+
+def _stub_observation(monkeypatch, *, strict_state, strict_codes, shadow):
+    import app.jobs.report_protection_health as reporter
+
+    observation = SimpleNamespace(
+        report={
+            "state": strict_state,
+            "admissions_suspended": strict_state != "HEALTHY",
+            "coverage_complete": True,
+            "reason_codes": list(strict_codes),
+        },
+        incidents_healthy=True,
+        shadow=shadow,
+    )
+    monkeypatch.setattr(reporter, "build_observation", lambda: observation)
+
+
+def _incident(scope):
+    return {"scope": scope, "incident_key": f"SYSTEM_HEALTH:{scope}"}
+
+
+def test_ac_026_runtime_verifier_accepts_advisory_strict_f11(monkeypatch):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: a legitimate shadow deployment whose strict F11 stays non-HEALTHY only for an advisory unmanaged holding PASSES runtime verification; strict F11 stays visible but is not the gate."""
+    import app.services.target_spine_cycle as spine
+    from app.services.evidence_shadow_readiness import evaluate_evidence_shadow_readiness
+
+    _set_modes(monkeypatch)
+    _stub_spine_and_settings(monkeypatch, mode="shadow", reason=spine.REASON_NO_SNAPSHOT_SOURCE)
+    shadow = evaluate_evidence_shadow_readiness([_unmanaged_exposure()], coverage_complete=True)
+    assert shadow.ready is True
+    _stub_observation(
+        monkeypatch,
+        strict_state="UNSAFE",
+        strict_codes=("UNMANAGED_EXPOSURE_REQUIRES_REVIEW",),
+        shadow=shadow,
+    )
+    posture = release_runtime_verifier._verify_live_posture("EVIDENCE_SHADOW")
+    assert posture["shadow_readiness"] == "READY"
+    assert posture["protection"] == "UNSAFE"
+    assert posture["protection_ready"] is False
+    assert posture["target_authority"] == "ABSENT"
+
+
+def test_ac_026_runtime_verifier_accepts_candidate_recoverable_incidents(monkeypatch):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: durable coverage incidents whose canonical current predicate is proven keep strict F11 non-HEALTHY but do not block EVIDENCE_SHADOW runtime verification."""
+    import app.services.target_spine_cycle as spine
+    from app.services.evidence_shadow_readiness import evaluate_evidence_shadow_readiness
+    from app.services.system_incidents import SystemIncidentScope
+
+    _set_modes(monkeypatch)
+    _stub_spine_and_settings(monkeypatch, mode="shadow", reason=spine.REASON_NO_SNAPSHOT_SOURCE)
+    pricing = SystemIncidentScope.KRAKEN_HELD_ASSET_PRICING.value
+    position = SystemIncidentScope.KRAKEN_POSITION_VERIFICATION.value
+    shadow = evaluate_evidence_shadow_readiness(
+        [],
+        coverage_complete=True,
+        open_incidents=[_incident(pricing), _incident(position)],
+        current_degraded_scopes=frozenset(),
+    )
+    assert shadow.ready is True
+    _stub_observation(
+        monkeypatch,
+        strict_state="UNAVAILABLE",
+        strict_codes=("PROTECTION_INCIDENT_OPEN",),
+        shadow=shadow,
+    )
+    posture = release_runtime_verifier._verify_live_posture("EVIDENCE_SHADOW")
+    assert posture["shadow_readiness"] == "READY"
+    assert posture["protection"] == "UNAVAILABLE"
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        # current pricing degradation (coverage incomplete + relevant incident)
+        lambda: (
+            [],
+            False,
+            [_incident("KRAKEN:HELD_ASSET_PRICING")],
+            frozenset({"KRAKEN:HELD_ASSET_PRICING"}),
+        ),
+        # current position/account verification degradation
+        lambda: (
+            [],
+            True,
+            [_incident("KRAKEN:POSITION_VERIFICATION")],
+            frozenset({"KRAKEN:POSITION_VERIFICATION"}),
+        ),
+        # auth failure
+        lambda: ([], True, [_incident("KRAKEN:READ_ONLY_AUTH")], frozenset()),
+        # connectivity
+        lambda: ([], True, [_incident("KRAKEN:PUBLIC_CONNECTIVITY")], frozenset()),
+        # rate limit
+        lambda: ([], True, [_incident("KRAKEN:RATE_LIMIT")], frozenset()),
+        # unknown incident
+        lambda: ([], True, [_incident("SOMETHING:ELSE")], frozenset()),
+        # malformed incident
+        lambda: ([], True, [{"incident_key": "SYSTEM_HEALTH:?:"}], frozenset()),
+    ],
+)
+def test_ac_026_runtime_verifier_blocks_real_current_blockers(monkeypatch, build):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: every genuine current blocker fails runtime verification after mutation."""
+    import app.services.target_spine_cycle as spine
+    from app.services.evidence_shadow_readiness import evaluate_evidence_shadow_readiness
+
+    _set_modes(monkeypatch)
+    _stub_spine_and_settings(monkeypatch, mode="shadow", reason=spine.REASON_NO_SNAPSHOT_SOURCE)
+    exposures, coverage, incidents, degraded = build()
+    shadow = evaluate_evidence_shadow_readiness(
+        exposures,
+        coverage_complete=coverage,
+        open_incidents=incidents,
+        current_degraded_scopes=degraded,
+    )
+    assert shadow.ready is False
+    _stub_observation(
+        monkeypatch,
+        strict_state="HEALTHY",
+        strict_codes=("PROTECTION_PROVEN",),
+        shadow=shadow,
+    )
+    with pytest.raises(release_runtime_verifier.ReleaseRuntimePostureError):
+        release_runtime_verifier._verify_live_posture("EVIDENCE_SHADOW")
+
+
+def test_ac_026_runtime_verifier_blocks_unreadable_incident_evidence(monkeypatch):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: unreadable incident evidence fails runtime verification and is never treated as no incident."""
+    import app.services.target_spine_cycle as spine
+    from app.services.evidence_shadow_readiness import evaluate_evidence_shadow_readiness
+    from app.services.evidence_shadow_readiness import BLOCK_INCIDENT_UNREADABLE
+
+    _set_modes(monkeypatch)
+    _stub_spine_and_settings(monkeypatch, mode="shadow", reason=spine.REASON_NO_SNAPSHOT_SOURCE)
+    shadow = evaluate_evidence_shadow_readiness(
+        [], coverage_complete=True, open_incidents=None
+    )
+    assert shadow.ready is False
+    _stub_observation(
+        monkeypatch,
+        strict_state="HEALTHY",
+        strict_codes=("PROTECTION_PROVEN",),
+        shadow=shadow,
+    )
+    with pytest.raises(release_runtime_verifier.ReleaseRuntimePostureError) as excinfo:
+        release_runtime_verifier._verify_live_posture("EVIDENCE_SHADOW")
+    assert BLOCK_INCIDENT_UNREADABLE in excinfo.value.reason_codes
+
+
+def test_ac_026_runtime_verifier_keeps_strict_gate_for_non_shadow_profiles(monkeypatch):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: non-EVIDENCE_SHADOW profiles keep strict F11 as the gate, so shadow readiness never loosens another profile."""
+    import app.services.target_spine_cycle as spine
+    from app.services.evidence_shadow_readiness import evaluate_evidence_shadow_readiness
+
+    _set_modes(monkeypatch, "SAFE_BASELINE")
+    _stub_spine_and_settings(monkeypatch, mode="off", reason=spine.REASON_MODE_OFF)
+    shadow = evaluate_evidence_shadow_readiness([_unmanaged_exposure()], coverage_complete=True)
+    assert shadow.ready is True
+    _stub_observation(
+        monkeypatch,
+        strict_state="UNSAFE",
+        strict_codes=("UNMANAGED_EXPOSURE_REQUIRES_REVIEW",),
+        shadow=shadow,
+    )
+    with pytest.raises(release_runtime_verifier.ReleaseRuntimePostureError, match="not HEALTHY"):
+        release_runtime_verifier._verify_live_posture("SAFE_BASELINE")
+
+
+def test_ac_026_runtime_verifier_pass_receipt_emits_readiness_and_strict_state(monkeypatch, capsys):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: the PASS receipt emits the explicit readiness verdict and the preserved strict F11 state, and the workflow gates on the former."""
+    result = {
+        "status": "PASS",
+        "sha": "a" * 40,
+        "verified_at": "2026-01-01T00:00:00Z",
+        "evidence": {"evidence_capture": "PASS"},
+        "profile": "EVIDENCE_SHADOW",
+        "protection": "UNSAFE",
+        "protection_ready": False,
+        "shadow_readiness": "READY",
+        "shadow_blocking_reason_codes": [],
+        "target_authority": "ABSENT",
+    }
+    monkeypatch.setattr(
+        release_runtime_verifier, "verify_release_runtime", lambda **kwargs: result
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "verifier",
+            "--expected-sha",
+            "a" * 40,
+            "--baseline-json",
+            "{}",
+            "--ready-after",
+            "2026-01-01T00:00:00Z",
+        ],
+    )
+    release_runtime_verifier.main()
+    out = capsys.readouterr().out
+    assert "OPIP_RELEASE_SHADOW_READINESS=READY" in out
+    assert "OPIP_RELEASE_PROTECTION=UNSAFE" in out
+    assert "OPIP_RELEASE_PROTECTION_READY=false" in out
+    assert "OPIP_RELEASE_TARGET_AUTHORITY=ABSENT" in out
