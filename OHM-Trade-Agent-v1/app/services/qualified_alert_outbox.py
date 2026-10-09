@@ -222,11 +222,10 @@ def _record_malformed_outbox(
     row: dict | None,
     reason: str,
 ) -> bool:
-    """Audit malformed delivery state and retire its waiting lifecycle.
+    """Audit malformed delivery state without terminalizing a waiting trade.
 
-    The outbox row is safe to delete only after the pending lifecycle is known
-    to be non-waiting. Audit failure is observable but does not block the
-    lifecycle transition; lifecycle/registry failure keeps the row retryable.
+    A still-waiting setup stays retryable. An already-missing or already
+    non-waiting lifecycle may retire the orphan delivery row.
     """
     payload = row if isinstance(row, dict) else {}
     try:
@@ -258,6 +257,18 @@ def _record_malformed_outbox(
             f"{type(exc).__name__}: {exc}",
         )
 
+    try:
+        lifecycle = get_pending_setup_record(trade_id)
+    except Exception as exc:
+        print(
+            "O'Pip malformed-outbox lifecycle lookup failed:",
+            f"trade_id={trade_id}",
+            f"{type(exc).__name__}: {exc}",
+        )
+        return False
+    status = str((lifecycle or {}).get("status") or "")
+    if lifecycle is not None and status == "waiting":
+        return False
     return _terminalization_confirmed(trade_id, "delivery_malformed")
 
 
@@ -332,76 +343,8 @@ def _retry_one(
                 leverage=leverage,
                 trade_id=trade_id,
             )
-        except ReconciliationTrackingDisabled:
-            # Never destroy the durable recovery record before the intended
-            # terminal lifecycle transition is confirmed.
-            if not _terminalization_confirmed(trade_id, "tracking_disabled"):
-                _release(trade_id, lease_token)
-                record_telegram_suppression(
-                    identity=str(
-                        row.get("identity")
-                        or f"QUALIFIED_OPPORTUNITY:{trade_id}"
-                    ),
-                    alert_family="QUALIFIED_OPPORTUNITY",
-                    event_type=action or "ACTION",
-                    fingerprint=str(row.get("fingerprint") or ""),
-                    reason="RECONCILIATION_NOT_APPLY_TERMINALIZATION_PENDING",
-                    symbol=plan.symbol,
-                    journey_id=row.get("journey_id"),
-                    signal_id=row.get("signal_id"),
-                    trade_id=trade_id,
-                )
-                return "TRACKING_PENDING"
-            _remove(trade_id, token=lease_token)
-            record_telegram_suppression(
-                identity=str(row.get("identity") or f"QUALIFIED_OPPORTUNITY:{trade_id}"),
-                alert_family="QUALIFIED_OPPORTUNITY",
-                event_type=action or "ACTION",
-                fingerprint=str(row.get("fingerprint") or ""),
-                reason="RECONCILIATION_NOT_APPLY_TERMINAL",
-                symbol=plan.symbol,
-                journey_id=row.get("journey_id"),
-                signal_id=row.get("signal_id"),
-                trade_id=trade_id,
-            )
-            return "SUPPRESSED"
-        except ReconciliationIdentityMismatch as exc:
-            try:
-                transitioned = terminalize_pending_setup(
-                    trade_id,
-                    "tracking_failed",
-                )
-                lifecycle_after = get_pending_setup_record(trade_id)
-                lifecycle_after_status = str(
-                    (lifecycle_after or {}).get("status") or ""
-                )
-            except Exception as transition_exc:
-                transitioned = False
-                lifecycle_after_status = "waiting"
-                print(
-                    "O'Pip reconciliation-mismatch terminalization failed:",
-                    f"trade_id={trade_id}",
-                    f"{type(transition_exc).__name__}: {transition_exc}",
-                )
-
-            if transitioned or lifecycle_after_status != "waiting":
-                _remove(trade_id, token=lease_token)
-                record_telegram_suppression(
-                    identity=str(
-                        row.get("identity")
-                        or f"QUALIFIED_OPPORTUNITY:{trade_id}"
-                    ),
-                    alert_family="QUALIFIED_OPPORTUNITY",
-                    event_type=action or "ACTION",
-                    fingerprint=str(row.get("fingerprint") or ""),
-                    reason="TRACKING_IDENTITY_MISMATCH_TERMINAL",
-                    symbol=plan.symbol,
-                    journey_id=row.get("journey_id"),
-                    signal_id=row.get("signal_id"),
-                    trade_id=trade_id,
-                )
-                return "SUPPRESSED"
-
+        except (ReconciliationTrackingDisabled, ReconciliationIdentityMismatch) as exc:
+            # Tracking failure stays retryable. It does not terminalize the trade.
             _release(trade_id, lease_token)
             record_telegram_suppression(
                 identity=str(
@@ -411,10 +354,7 @@ def _retry_one(
                 alert_family="QUALIFIED_OPPORTUNITY",
                 event_type=action or "ACTION",
                 fingerprint=str(row.get("fingerprint") or ""),
-                reason=(
-                    "TRACKING_IDENTITY_MISMATCH_TERMINALIZATION_PENDING:"
-                    f"{type(exc).__name__}"
-                ),
+                reason=f"TRACKING_FAILURE_RETRYABLE:{type(exc).__name__}",
                 symbol=plan.symbol,
                 journey_id=row.get("journey_id"),
                 signal_id=row.get("signal_id"),

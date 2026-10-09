@@ -358,6 +358,11 @@ def test_malformed_outbox_records_audit_and_terminalizes(monkeypatch):
         "_remove",
         lambda trade_id, token=None: removed.append((trade_id, token)) or True,
     )
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "_release",
+        lambda trade_id, token: True,
+    )
 
     status = qualified_alert_outbox._retry_one(
         "Q-AUDIT-BAD",
@@ -365,9 +370,9 @@ def test_malformed_outbox_records_audit_and_terminalizes(monkeypatch):
         chat_id="chat",
     )
 
-    assert status == "MALFORMED"
-    assert terminalized == [("Q-AUDIT-BAD", "delivery_malformed")]
-    assert removed == [("Q-AUDIT-BAD", "lease")]
+    assert status == "MALFORMED_PENDING"
+    assert terminalized == []
+    assert removed == []
     assert audits[0]["reason"].startswith("OUTBOX_MALFORMED:")
 
 
@@ -471,6 +476,11 @@ def test_reconciliation_identity_mismatch_terminalizes_outbox(monkeypatch):
     )
     monkeypatch.setattr(
         qualified_alert_outbox,
+        "_release",
+        lambda trade_id, token: True,
+    )
+    monkeypatch.setattr(
+        qualified_alert_outbox,
         "record_telegram_suppression",
         lambda **kwargs: suppressions.append(kwargs),
     )
@@ -481,10 +491,10 @@ def test_reconciliation_identity_mismatch_terminalizes_outbox(monkeypatch):
         chat_id="chat",
     )
 
-    assert status == "SUPPRESSED"
-    assert terminalized == [("Q-MISMATCH", "tracking_failed")]
-    assert removed == [("Q-MISMATCH", "lease")]
-    assert suppressions[-1]["reason"] == "TRACKING_IDENTITY_MISMATCH_TERMINAL"
+    assert status == "TRACKING_PENDING"
+    assert terminalized == []
+    assert removed == []
+    assert suppressions[-1]["reason"] == "TRACKING_FAILURE_RETRYABLE:ReconciliationIdentityMismatch"
 
 
 def test_non_numeric_outbox_leverage_is_malformed_and_removed(monkeypatch):
@@ -800,6 +810,11 @@ def test_outbox_terminally_suppresses_disabled_reconciliation(monkeypatch):
     )
     monkeypatch.setattr(
         qualified_alert_outbox,
+        "_release",
+        lambda trade_id, token: True,
+    )
+    monkeypatch.setattr(
+        qualified_alert_outbox,
         "record_telegram_suppression",
         lambda **kwargs: suppressions.append(kwargs),
     )
@@ -810,10 +825,10 @@ def test_outbox_terminally_suppresses_disabled_reconciliation(monkeypatch):
         chat_id="chat",
     )
 
-    assert status == "SUPPRESSED"
-    assert terminalized == [("Q-DISABLED", "tracking_disabled")]
-    assert removed == [("Q-DISABLED", "lease")]
-    assert suppressions[0]["reason"] == "RECONCILIATION_NOT_APPLY_TERMINAL"
+    assert status == "TRACKING_PENDING"
+    assert terminalized == []
+    assert removed == []
+    assert suppressions[0]["reason"] == "TRACKING_FAILURE_RETRYABLE:ReconciliationTrackingDisabled"
 
 
 # --- Finding 3: outbox recovery record durability -----------------------
@@ -917,8 +932,8 @@ def test_outbox_removes_row_once_retry_confirms_terminalization(monkeypatch):
     assert removed == []
 
     second = qualified_alert_outbox._retry_one("Q-DUR", bot_token="token", chat_id="chat")
-    assert second == "SUPPRESSED"
-    assert removed == [("Q-DUR", "lease")]
+    assert second == "TRACKING_PENDING"
+    assert removed == []
 
 
 def test_outbox_terminalization_retry_is_idempotent(monkeypatch):
@@ -948,17 +963,21 @@ def test_outbox_terminalization_retry_is_idempotent(monkeypatch):
         lambda trade_id, token=None: removed.append((trade_id, token)) or True,
     )
     monkeypatch.setattr(
+        qualified_alert_outbox,
+        "_release",
+        lambda trade_id, token: True,
+    )
+    monkeypatch.setattr(
         qualified_alert_outbox, "record_telegram_suppression", lambda **kwargs: None
     )
 
     for _ in range(3):
         status = qualified_alert_outbox._retry_one("Q-DUR", bot_token="token", chat_id="chat")
-        assert status == "SUPPRESSED"
+        assert status == "TRACKING_PENDING"
 
-    # Every repeated drain terminalizes/removes without creating duplicate
-    # lifecycle transitions or notifications beyond one per retry.
-    assert terminalize_calls == [("Q-DUR", "tracking_disabled")] * 3
-    assert removed == [("Q-DUR", "lease")] * 3
+    # Tracking failure stays retryable and does not terminalize the trade.
+    assert terminalize_calls == []
+    assert removed == []
 
 
 def test_monitor_state_load_failure_never_overwrites_other_symbol_state(monkeypatch):
