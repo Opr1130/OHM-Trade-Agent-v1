@@ -22,11 +22,13 @@ from app.services.pending_setup_registry import (
     PendingSetup,
     add_pending_setup,
     get_pending_setup_by_trade_id,
-    get_pending_setup_record,
-    terminalize_pending_setup,
+    get_pending_setups,
 )
 from app.services.price_movement_radar import attach_actionable_plan
-from app.services.qualified_alert_outbox import queue_qualified_alert
+from app.services.qualified_alert_outbox import (
+    queue_qualified_alert,
+    queued_alert_fingerprint,
+)
 from app.services.qualified_trade_tracking import (
     ReconciliationIdentityMismatch,
     ReconciliationTrackingDisabled,
@@ -110,21 +112,124 @@ def _round_price(value: float) -> str:
     return f"{float(value):.6g}"
 
 
+# Versioned material geometry. Timestamps, ranks and heuristic scores are
+# intentionally absent so they cannot mint a new fingerprint.
+MATERIAL_FINGERPRINT_VERSION = "r4-geometry-v1"
+
+
 def _alert_state_key(candidate: dict[str, Any], plan: EntryExitPlan) -> str:
     action = _action_type(plan) or "SILENT"
     direction = str(candidate.get("direction") or plan.direction or "LONG").upper()
     return ":".join(
         [
+            MATERIAL_FINGERPRINT_VERSION,
             direction,
             action,
             plan.risk_level,
             _round_price(plan.entry_low),
             _round_price(plan.entry_high),
+            _round_price(plan.chase_limit),
             _round_price(plan.stop_price),
             _round_price(plan.target_1),
             _round_price(plan.target_2),
         ]
     )
+
+
+def _exact_price(value: float) -> str:
+    text = format(float(value), "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _primary_reasons(candidate: dict[str, Any], plan: EntryExitPlan) -> list[str]:
+    blocked = ("whale", "sentiment", "order flow", "probability")
+    lines: list[str] = []
+    for raw in (plan.reason, candidate.get("reason")):
+        for part in str(raw or "").replace(";", "\n").splitlines():
+            text = " ".join(part.split()).strip(" -")
+            if not text:
+                continue
+            lowered = text.lower()
+            if any(token in lowered for token in blocked):
+                continue
+            if text not in lines:
+                lines.append(text)
+            if len(lines) == 4:
+                return lines
+    return lines
+
+
+def format_primary_new_trade_alert(
+    candidate: dict[str, Any],
+    plan: EntryExitPlan,
+) -> str:
+    """Decision-first primary body. No expected-move percentages and no fake probability."""
+    action = _action_type(plan)
+    direction = str(candidate.get("direction") or plan.direction or "LONG").upper()
+    if action == "ENTER_NOW":
+        disposition = "ENTER NOW"
+    elif action == "PLACE_LIMIT":
+        disposition = "SET LIMIT ENTRY"
+    else:
+        raise ValueError("Cannot format non-actionable trade plan")
+    base_asset = str(candidate.get("underlying_asset") or plan.symbol)
+    primary_pair = str(candidate.get("primary_pair") or plan.symbol)
+    asset_text = display_asset_text(
+        plan.symbol,
+        base_asset=base_asset,
+        pair=primary_pair,
+    )
+    pair_text = primary_pair or plan.symbol
+    lines = [
+        f"{disposition} — {asset_text}",
+        f"Ticker: {base_asset}",
+        f"Pair: {pair_text}",
+        f"Direction: {direction}",
+    ]
+    reference = None
+    for key in ("reference_price", "price", "last_price"):
+        raw = candidate.get(key)
+        try:
+            number = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if number == number:
+            reference = number
+            break
+    if reference is not None:
+        lines.append(f"Reference price: {_exact_price(reference)}")
+    lines.extend(
+        [
+            f"Entry zone: {_exact_price(plan.entry_low)} - {_exact_price(plan.entry_high)}",
+            f"Target: {_exact_price(plan.target_2)}",
+            f"Invalidation: {_exact_price(plan.stop_price)}",
+        ]
+    )
+    chase = _exact_price(plan.chase_limit)
+    chase_label = "Do not chase below" if direction == "SHORT" else "Do not chase above"
+    lines.append(f"{chase_label}: {chase}")
+    reasons = _primary_reasons(candidate, plan)
+    if reasons:
+        lines.append("Reasons:")
+        lines.extend(f"- {reason}" for reason in reasons[:4])
+    confidence = candidate.get("confidence")
+    try:
+        score = int(confidence)
+    except (TypeError, ValueError):
+        score = None
+    if score is not None and 0 <= score <= 100 and not isinstance(confidence, bool):
+        lines.append(f"Setup score: {score}/100 (heuristic, not probability)")
+    identity_bits = [
+        f"trade_id={candidate.get('trade_id') or ''}",
+        f"journey_id={candidate.get('journey_id') or ''}",
+        f"signal_id={candidate.get('signal_id') or ''}",
+    ]
+    if candidate.get("opportunity_rank") is not None:
+        identity_bits.append(f"rank={candidate.get('opportunity_rank')}")
+    lines.append("Trace: " + " ".join(identity_bits))
+    return "\n".join(lines)
 
 
 def format_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan, summary: str) -> str:
@@ -316,12 +421,36 @@ def _register_reconciliation_intent(
     )
 
 
+def _waiting_setup_for_plan(
+    plan: EntryExitPlan,
+    *,
+    direction: str,
+) -> PendingSetup | None:
+    """Reuse one waiting lifecycle when the geometry has not changed."""
+    for setup in get_pending_setups():
+        if (
+            setup.symbol == plan.symbol
+            and str(setup.direction or "LONG").upper() == direction
+            and setup.entry_low == plan.entry_low
+            and setup.entry_high == plan.entry_high
+            and setup.chase_limit == plan.chase_limit
+            and setup.stop_price == plan.stop_price
+            and setup.target_1 == plan.target_1
+            and setup.target_2 == plan.target_2
+            and setup.risk_level == plan.risk_level
+        ):
+            return setup
+    return None
+
+
 def send_trade_plan(
     candidate: dict[str, Any],
     plan: EntryExitPlan,
     summary: str,
     bot_token: str,
     chat_id: str,
+    *,
+    notify: bool = True,
 ) -> bool:
     action = _action_type(plan)
     direction = str(candidate.get("direction") or plan.direction or "LONG").upper()
@@ -340,19 +469,7 @@ def send_trade_plan(
             trade_id=candidate.get("trade_id"),
         )
         return False
-    if not should_send_trade_plan(candidate, plan):
-        record_telegram_suppression(
-            identity=identity,
-            alert_family="QUALIFIED_OPPORTUNITY",
-            event_type=action,
-            fingerprint=initial_fingerprint,
-            reason="DEDUP_OR_NOTIFICATION_POLICY",
-            symbol=plan.symbol,
-            journey_id=candidate.get("journey_id"),
-            signal_id=candidate.get("signal_id"),
-            trade_id=candidate.get("trade_id"),
-        )
-        return False
+    candidate["notification_attempted"] = False
     if candidate.get("action_gate_evaluated") is not True:
         record_telegram_not_eligible(
             identity=identity,
@@ -390,12 +507,15 @@ def send_trade_plan(
         candidate["price_movement"] = movement
 
     leverage = float(candidate.get("margin_leverage") or (2.0 if direction == "SHORT" else 1.0))
-    message = format_trade_plan(candidate=candidate, plan=plan, summary=summary)
 
     # A materially new plan must receive a new immutable lifecycle id. Never
     # reuse another waiting setup merely because the symbol is the same.
     trade_id = str(candidate.get("trade_id") or "")
     setup = get_pending_setup_by_trade_id(trade_id) if trade_id else None
+    if setup is None and not trade_id:
+        setup = _waiting_setup_for_plan(plan, direction=direction)
+        if setup is not None:
+            trade_id = setup.trade_id
     if setup is None:
         setup = add_pending_setup(
             PendingSetup(
@@ -424,8 +544,31 @@ def send_trade_plan(
         plan=plan,
         action=action,
     )
+    message = format_primary_new_trade_alert(candidate=candidate, plan=plan)
+    candidate["alert_detail"] = format_trade_plan(
+        candidate=candidate,
+        plan=plan,
+        summary=summary,
+    )
     key = _alert_state_key(candidate, plan)
     identity = f"QUALIFIED_OPPORTUNITY:{trade_id or plan.symbol}"
+    already_queued = queued_alert_fingerprint(trade_id) == key
+
+    def _queue_tracking_notification(queue_reason: str) -> None:
+        if not notify or already_queued or not should_send_trade_plan(candidate, plan):
+            return
+        queue_qualified_alert(
+            trade_id=trade_id,
+            message=message,
+            candidate=candidate,
+            plan=plan,
+            action=action,
+            direction=direction,
+            identity=identity,
+            fingerprint=key,
+            reason=queue_reason,
+        )
+        candidate["notification_attempted"] = True
 
     if candidate.get("economic_qualified") is True:
         if not trade_id:
@@ -439,116 +582,24 @@ def send_trade_plan(
                 leverage=leverage,
                 trade_id=trade_id,
             )
-        except ReconciliationTrackingDisabled:
-            transitioned = False
-            lifecycle_after_status = "waiting"
+        except (ReconciliationTrackingDisabled, ReconciliationIdentityMismatch) as exc:
+            # Tracking failure is transport/operational state. It must not
+            # terminalize a still-waiting qualified setup.
+            reason = f"TRACKING_FAILURE_RETRYABLE:{type(exc).__name__}"
             try:
-                transitioned = terminalize_pending_setup(
-                    trade_id,
-                    "tracking_disabled",
-                )
-                lifecycle_after = get_pending_setup_record(trade_id)
-                lifecycle_after_status = str(
-                    (lifecycle_after or {}).get("status") or ""
-                )
-            except Exception as transition_exc:
+                _queue_tracking_notification(reason)
+            except Exception as queue_exc:
                 print(
-                    "O'Pip tracking-disabled terminalization failed:",
+                    "O'Pip tracking-failure queueing failed:",
                     f"trade_id={trade_id}",
-                    f"{type(transition_exc).__name__}: {transition_exc}",
+                    f"{type(queue_exc).__name__}: {queue_exc}",
                 )
-
-            terminal = bool(transitioned) or lifecycle_after_status != "waiting"
-            if not terminal:
-                # The lifecycle is still waiting, so a durable recovery record
-                # must exist before this decision is dropped.
-                try:
-                    queue_qualified_alert(
-                        trade_id=trade_id,
-                        message=message,
-                        candidate=candidate,
-                        plan=plan,
-                        action=action,
-                        direction=direction,
-                        identity=identity,
-                        fingerprint=key,
-                        reason="RECONCILIATION_NOT_APPLY_TERMINALIZATION_PENDING",
-                    )
-                except Exception as queue_exc:
-                    print(
-                        "O'Pip terminalization-pending queueing failed:",
-                        f"trade_id={trade_id}",
-                        f"{type(queue_exc).__name__}: {queue_exc}",
-                    )
-
             record_telegram_suppression(
                 identity=identity,
                 alert_family="QUALIFIED_OPPORTUNITY",
                 event_type=action,
                 fingerprint=key,
-                reason=(
-                    "RECONCILIATION_NOT_APPLY_TERMINAL"
-                    if terminal
-                    else "RECONCILIATION_NOT_APPLY_TERMINALIZATION_PENDING"
-                ),
-                symbol=plan.symbol,
-                journey_id=candidate.get("journey_id"),
-                signal_id=candidate.get("signal_id"),
-                trade_id=trade_id,
-            )
-            return False
-        except ReconciliationIdentityMismatch as exc:
-            transitioned = False
-            lifecycle_after_status = "waiting"
-            try:
-                transitioned = terminalize_pending_setup(
-                    trade_id,
-                    "tracking_failed",
-                )
-                lifecycle_after = get_pending_setup_record(trade_id)
-                lifecycle_after_status = str(
-                    (lifecycle_after or {}).get("status") or ""
-                )
-            except Exception as transition_exc:
-                print(
-                    "O'Pip reconciliation-mismatch terminalization failed:",
-                    f"trade_id={trade_id}",
-                    f"{type(transition_exc).__name__}: {transition_exc}",
-                )
-
-            if not transitioned and lifecycle_after_status == "waiting":
-                try:
-                    queue_qualified_alert(
-                        trade_id=trade_id,
-                        message=message,
-                        candidate=candidate,
-                        plan=plan,
-                        action=action,
-                        direction=direction,
-                        identity=identity,
-                        fingerprint=key,
-                        reason=(
-                            "TRACKING_IDENTITY_MISMATCH_TERMINALIZATION_PENDING:"
-                            f"{type(exc).__name__}"
-                        ),
-                    )
-                except Exception as queue_exc:
-                    print(
-                        "O'Pip terminalization-pending queueing failed:",
-                        f"trade_id={trade_id}",
-                        f"{type(queue_exc).__name__}: {queue_exc}",
-                    )
-
-            record_telegram_suppression(
-                identity=identity,
-                alert_family="QUALIFIED_OPPORTUNITY",
-                event_type=action,
-                fingerprint=key,
-                reason=(
-                    "TRACKING_IDENTITY_MISMATCH_TERMINAL"
-                    if transitioned or lifecycle_after_status != "waiting"
-                    else "TRACKING_IDENTITY_MISMATCH_TERMINALIZATION_PENDING"
-                ),
+                reason=reason,
                 symbol=plan.symbol,
                 journey_id=candidate.get("journey_id"),
                 signal_id=candidate.get("signal_id"),
@@ -557,17 +608,7 @@ def send_trade_plan(
             return False
         except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
             try:
-                queue_qualified_alert(
-                    trade_id=trade_id,
-                    message=message,
-                    candidate=candidate,
-                    plan=plan,
-                    action=action,
-                    direction=direction,
-                    identity=identity,
-                    fingerprint=key,
-                    reason=f"TRACKING_PENDING:{type(exc).__name__}",
-                )
+                _queue_tracking_notification(f"TRACKING_PENDING:{type(exc).__name__}")
             except Exception as queue_exc:
                 print(
                     "O'Pip qualified alert queueing failed:",
@@ -587,6 +628,22 @@ def send_trade_plan(
                 )
             # Tracking failure is operational/transport state, not rejection.
             return False
+
+    if not notify or already_queued:
+        return False
+    if not should_send_trade_plan(candidate, plan):
+        record_telegram_suppression(
+            identity=identity,
+            alert_family="QUALIFIED_OPPORTUNITY",
+            event_type=action,
+            fingerprint=key,
+            reason="DEDUP_OR_NOTIFICATION_POLICY",
+            symbol=plan.symbol,
+            journey_id=candidate.get("journey_id"),
+            signal_id=candidate.get("signal_id"),
+            trade_id=trade_id,
+        )
+        return False
 
     accepted_message_id = accepted_delivery_message_id(
         identity=identity,
@@ -623,6 +680,7 @@ def send_trade_plan(
         )
         return False
 
+    candidate["notification_attempted"] = True
     delivered = False
     settled = False
     delivery_reason = "DELIVERY_PENDING"

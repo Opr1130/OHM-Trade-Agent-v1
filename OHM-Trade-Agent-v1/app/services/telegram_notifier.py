@@ -11,30 +11,14 @@ from app.services.asset_display_identity import display_market_label
 logger = logging.getLogger(__name__)
 
 
-def _price_pct(target: float, reference: float, side: str) -> float:
-    if reference <= 0:
-        return 0.0
-    if side.upper() == "SHORT":
-        return max(0.0, (1.0 - target / reference) * 100.0)
-    return max(0.0, (target / reference - 1.0) * 100.0)
-
-
 def format_trade_alert(signal: TradingSignal, decision: SignalDecision) -> str:
-    side = signal.side.upper()
-    potential = _price_pct(float(signal.target_price), float(signal.price), side)
-    downside = _price_pct(float(signal.stop_price), float(signal.price), "SHORT" if side == "LONG" else "LONG")
     confidence = float(decision.final_score)
-    risk_pct = max(10.0, min(90.0, 100.0 - confidence + downside * 2.0))
     reason = " ".join(str(decision.summary or "Qualified trade setup").split())[:140]
     return (
-        f"🚨 TRADE — {display_market_label(decision.symbol)}\n"
-        f"Potential: +{potential:.1f}%\n"
-        f"Confidence*: {confidence:.0f}%\n"
-        f"Risk*: {risk_pct:.0f}%\n"
-        f"Downside to stop: {downside:.1f}%\n"
-        f"Reason: {reason}\n"
+        f"🚨 TRADE — {display_market_label(decision.symbol or signal.symbol)}\n"
         f"Action: {decision.action.upper()}\n"
-        "*Heuristic score, not probability."
+        f"Setup score: {confidence:.0f}/100 (heuristic, not probability)\n"
+        f"Reason: {reason}\n"
     )
 
 
@@ -68,8 +52,7 @@ def _compact_legacy_chief(message: str) -> str:
         return message
 
     market = _line_value(message, "Market") or _line_value(message, "Asset") or "UNKNOWN"
-    direction = (_line_value(message, "Direction") or "LONG").upper()
-    confidence = _number(_line_value(message, "AI Confidence")) or 0.0
+    confidence = _number(_line_value(message, "AI Confidence")) or _number(_line_value(message, "Setup Score")) or 0.0
     risk_label = (_line_value(message, "Risk") or "UNKNOWN").upper()
     entry_zone = _line_value(message, "Entry Zone")
     chase = _line_value(message, "Do Not Chase Above") or _line_value(message, "Do Not Chase Below")
@@ -78,30 +61,6 @@ def _compact_legacy_chief(message: str) -> str:
     target2 = _number(_line_value(message, "Target 2"))
     capital = _number(_line_value(message, "Recommended Capital"))
     net_edge = _number(_line_value(message, "Projected Net Edge"))
-
-    entry_ref = None
-    if entry_zone:
-        nums = re.findall(r"\d+(?:\.\d+)?", entry_zone.replace(",", ""))
-        if nums:
-            vals = [float(item) for item in nums[:2]]
-            entry_ref = sum(vals) / len(vals)
-
-    low = high = 0.0
-    downside = 0.0
-    if entry_ref and entry_ref > 0:
-        potential = [
-            _price_pct(value, entry_ref, direction)
-            for value in (target1, target2)
-            if value is not None
-        ]
-        if potential:
-            low, high = min(potential), max(potential)
-        if stop is not None:
-            downside = (
-                max(0.0, (stop / entry_ref - 1.0) * 100.0)
-                if direction == "SHORT"
-                else max(0.0, (1.0 - stop / entry_ref) * 100.0)
-            )
 
     lines = message.splitlines()
     reason = "Qualified trade setup"
@@ -135,12 +94,12 @@ def _compact_legacy_chief(message: str) -> str:
         f"Action: {action}\n"
         f"Entry: {entry_text}\n"
         f"Do not chase: {chase_text}\n"
-        f"Stop: {stop_text} | Downside: {downside:.1f}%\n"
-        f"T1 / T2: {target_text} | Potential: +{low:.1f}% to +{high:.1f}%\n"
+        f"Stop: {stop_text}\n"
+        f"T1 / T2: {target_text}\n"
         f"{economic}"
-        f"Confidence*: {confidence:.0f}% | Risk: {risk_label}\n"
+        f"Setup score: {confidence:.0f}/100 (heuristic, not probability) | Risk: {risk_label}\n"
         f"Why now: {reason}\n"
-        "*Heuristic confidence, not probability; human approval remains required."
+        "Human approval remains required."
     )
 
 

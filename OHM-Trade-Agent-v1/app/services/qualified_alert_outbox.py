@@ -106,6 +106,27 @@ def queue_qualified_alert(
         save_json_atomic(OUTBOX_FILE, rows)
 
 
+def queued_alert_fingerprint(trade_id: str) -> str | None:
+    """Return the fingerprint already waiting for this trade, if any.
+
+    The outbox is the durable retry record. Callers use it so the same
+    trade and material fingerprint cannot open a second queue attempt.
+    """
+    key = str(trade_id or "").strip()
+    if not key:
+        return None
+    try:
+        with registry_lock(_lock_file()):
+            rows = load_json(OUTBOX_FILE)
+    except (OSError, TimeoutError, RegistryIOError):
+        return None
+    row = rows.get(key)
+    if not isinstance(row, dict):
+        return None
+    fingerprint = str(row.get("fingerprint") or "")
+    return fingerprint or None
+
+
 def _claim(trade_id: str, *, now: datetime | None = None) -> tuple[str, dict] | None:
     current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     with registry_lock(_lock_file()):
@@ -222,11 +243,10 @@ def _record_malformed_outbox(
     row: dict | None,
     reason: str,
 ) -> bool:
-    """Audit malformed delivery state and retire its waiting lifecycle.
+    """Audit malformed delivery state without terminalizing a waiting trade.
 
-    The outbox row is safe to delete only after the pending lifecycle is known
-    to be non-waiting. Audit failure is observable but does not block the
-    lifecycle transition; lifecycle/registry failure keeps the row retryable.
+    A still-waiting setup stays retryable. An already-missing or already
+    non-waiting lifecycle may retire the orphan delivery row.
     """
     payload = row if isinstance(row, dict) else {}
     try:
@@ -258,6 +278,18 @@ def _record_malformed_outbox(
             f"{type(exc).__name__}: {exc}",
         )
 
+    try:
+        lifecycle = get_pending_setup_record(trade_id)
+    except Exception as exc:
+        print(
+            "O'Pip malformed-outbox lifecycle lookup failed:",
+            f"trade_id={trade_id}",
+            f"{type(exc).__name__}: {exc}",
+        )
+        return False
+    status = str((lifecycle or {}).get("status") or "")
+    if lifecycle is not None and status == "waiting":
+        return False
     return _terminalization_confirmed(trade_id, "delivery_malformed")
 
 
@@ -332,76 +364,8 @@ def _retry_one(
                 leverage=leverage,
                 trade_id=trade_id,
             )
-        except ReconciliationTrackingDisabled:
-            # Never destroy the durable recovery record before the intended
-            # terminal lifecycle transition is confirmed.
-            if not _terminalization_confirmed(trade_id, "tracking_disabled"):
-                _release(trade_id, lease_token)
-                record_telegram_suppression(
-                    identity=str(
-                        row.get("identity")
-                        or f"QUALIFIED_OPPORTUNITY:{trade_id}"
-                    ),
-                    alert_family="QUALIFIED_OPPORTUNITY",
-                    event_type=action or "ACTION",
-                    fingerprint=str(row.get("fingerprint") or ""),
-                    reason="RECONCILIATION_NOT_APPLY_TERMINALIZATION_PENDING",
-                    symbol=plan.symbol,
-                    journey_id=row.get("journey_id"),
-                    signal_id=row.get("signal_id"),
-                    trade_id=trade_id,
-                )
-                return "TRACKING_PENDING"
-            _remove(trade_id, token=lease_token)
-            record_telegram_suppression(
-                identity=str(row.get("identity") or f"QUALIFIED_OPPORTUNITY:{trade_id}"),
-                alert_family="QUALIFIED_OPPORTUNITY",
-                event_type=action or "ACTION",
-                fingerprint=str(row.get("fingerprint") or ""),
-                reason="RECONCILIATION_NOT_APPLY_TERMINAL",
-                symbol=plan.symbol,
-                journey_id=row.get("journey_id"),
-                signal_id=row.get("signal_id"),
-                trade_id=trade_id,
-            )
-            return "SUPPRESSED"
-        except ReconciliationIdentityMismatch as exc:
-            try:
-                transitioned = terminalize_pending_setup(
-                    trade_id,
-                    "tracking_failed",
-                )
-                lifecycle_after = get_pending_setup_record(trade_id)
-                lifecycle_after_status = str(
-                    (lifecycle_after or {}).get("status") or ""
-                )
-            except Exception as transition_exc:
-                transitioned = False
-                lifecycle_after_status = "waiting"
-                print(
-                    "O'Pip reconciliation-mismatch terminalization failed:",
-                    f"trade_id={trade_id}",
-                    f"{type(transition_exc).__name__}: {transition_exc}",
-                )
-
-            if transitioned or lifecycle_after_status != "waiting":
-                _remove(trade_id, token=lease_token)
-                record_telegram_suppression(
-                    identity=str(
-                        row.get("identity")
-                        or f"QUALIFIED_OPPORTUNITY:{trade_id}"
-                    ),
-                    alert_family="QUALIFIED_OPPORTUNITY",
-                    event_type=action or "ACTION",
-                    fingerprint=str(row.get("fingerprint") or ""),
-                    reason="TRACKING_IDENTITY_MISMATCH_TERMINAL",
-                    symbol=plan.symbol,
-                    journey_id=row.get("journey_id"),
-                    signal_id=row.get("signal_id"),
-                    trade_id=trade_id,
-                )
-                return "SUPPRESSED"
-
+        except (ReconciliationTrackingDisabled, ReconciliationIdentityMismatch) as exc:
+            # Tracking failure stays retryable. It does not terminalize the trade.
             _release(trade_id, lease_token)
             record_telegram_suppression(
                 identity=str(
@@ -411,10 +375,7 @@ def _retry_one(
                 alert_family="QUALIFIED_OPPORTUNITY",
                 event_type=action or "ACTION",
                 fingerprint=str(row.get("fingerprint") or ""),
-                reason=(
-                    "TRACKING_IDENTITY_MISMATCH_TERMINALIZATION_PENDING:"
-                    f"{type(exc).__name__}"
-                ),
+                reason=f"TRACKING_FAILURE_RETRYABLE:{type(exc).__name__}",
                 symbol=plan.symbol,
                 journey_id=row.get("journey_id"),
                 signal_id=row.get("signal_id"),
@@ -447,7 +408,7 @@ def _retry_one(
     )
     if accepted is not None:
         _remove(trade_id, token=lease_token)
-        return "DELIVERED"
+        return "ALREADY_DELIVERED"
 
     policy_identity = str(row.get("policy_identity") or f"{direction}:{plan.symbol}")
     reservation = reserve_emit(
@@ -462,7 +423,7 @@ def _retry_one(
             fingerprint=fingerprint,
         ):
             _remove(trade_id, token=lease_token)
-            return "DELIVERED"
+            return "ALREADY_DELIVERED"
         _release(trade_id, lease_token)
         return "POLICY_PENDING"
 
@@ -517,12 +478,27 @@ def _retry_one(
             )
 
 
+def _new_trade_retry_bound(explicit: int | None) -> int:
+    """Bound one recovery run with the operational NEW TRADE window setting."""
+    if explicit is None:
+        from app.core.config import Settings
+
+        explicit = Settings.model_fields["new_trade_alert_max_per_window"].default
+    return max(1, int(explicit))
+
+
 def retry_qualified_alerts(
     *,
     bot_token: str,
     chat_id: str,
+    max_new_trade_retries: int | None = None,
 ) -> tuple[int, int]:
-    """Retry operationally blocked qualified alerts without rescanning markets."""
+    """Retry operationally blocked qualified alerts without rescanning markets.
+
+    At most ``new_trade_alert_max_per_window`` NEW TRADE rows are attempted
+    per call, in durable insertion order. Rows past that bound stay pending.
+    """
+    cap = _new_trade_retry_bound(max_new_trade_retries)
     try:
         with registry_lock(_lock_file()):
             rows = load_json(OUTBOX_FILE)
@@ -531,7 +507,11 @@ def retry_qualified_alerts(
 
     delivered = 0
     pending = 0
+    attempted = 0
     for trade_id, row in list(rows.items()):
+        if attempted >= cap:
+            pending += 1
+            continue
         if not isinstance(row, dict):
             retired = _record_malformed_outbox(
                 trade_id=str(trade_id),
@@ -558,6 +538,8 @@ def retry_qualified_alerts(
         except Exception:
             pending += 1
             continue
+        if status in {"DELIVERED", "SEND_FAILED"}:
+            attempted += 1
         if status == "DELIVERED":
             delivered += 1
         elif status not in {
@@ -565,6 +547,7 @@ def retry_qualified_alerts(
             "SUPPRESSED",
             "MALFORMED",
             "BUSY_OR_MISSING",
+            "ALREADY_DELIVERED",
         }:
             pending += 1
     return delivered, pending

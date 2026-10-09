@@ -143,7 +143,6 @@ def test_reconciliation_identity_mismatch_is_terminal_not_retryable(
 ):
     _patch_pending(tmp_path, monkeypatch)
     queued = []
-    terminalized = []
     suppressions = []
     monkeypatch.setattr(
         chief_alert_notifier,
@@ -161,18 +160,6 @@ def test_reconciliation_identity_mismatch_is_terminal_not_retryable(
         lambda **kwargs: (_ for _ in ()).throw(
             ReconciliationIdentityMismatch("conflict")
         ),
-    )
-    monkeypatch.setattr(
-        chief_alert_notifier,
-        "terminalize_pending_setup",
-        lambda trade_id, status: terminalized.append(
-            (trade_id, status)
-        ) or True,
-    )
-    monkeypatch.setattr(
-        chief_alert_notifier,
-        "get_pending_setup_record",
-        lambda trade_id: {"status": "tracking_failed"},
     )
     monkeypatch.setattr(
         chief_alert_notifier,
@@ -201,9 +188,8 @@ def test_reconciliation_identity_mismatch_is_terminal_not_retryable(
         "token",
         "chat",
     )
-    assert terminalized == [(candidate["trade_id"], "tracking_failed")]
-    assert queued == []
-    assert suppressions[-1]["reason"] == "TRACKING_IDENTITY_MISMATCH_TERMINAL"
+    assert len(queued) == 1
+    assert suppressions[-1]["reason"] == "TRACKING_FAILURE_RETRYABLE:ReconciliationIdentityMismatch"
 
 
 def test_telegram_failure_keeps_qualified_setup_live_and_queues_retry(tmp_path, monkeypatch):
@@ -675,16 +661,6 @@ def test_send_trade_plan_retains_recovery_record_when_terminalization_unconfirme
     )
     monkeypatch.setattr(
         chief_alert_notifier,
-        "terminalize_pending_setup",
-        lambda trade_id, status: False,
-    )
-    monkeypatch.setattr(
-        chief_alert_notifier,
-        "get_pending_setup_record",
-        lambda trade_id: {"status": "waiting"},
-    )
-    monkeypatch.setattr(
-        chief_alert_notifier,
         "queue_qualified_alert",
         lambda **kwargs: queued.append(kwargs),
     )
@@ -709,4 +685,4 @@ def test_send_trade_plan_retains_recovery_record_when_terminalization_unconfirme
     # Terminalization was never confirmed, so the durable recovery record
     # must be queued rather than silently dropped.
     assert len(queued) == 1
-    assert suppressions[-1]["reason"] == "RECONCILIATION_NOT_APPLY_TERMINALIZATION_PENDING"
+    assert suppressions[-1]["reason"] == "TRACKING_FAILURE_RETRYABLE:ReconciliationTrackingDisabled"

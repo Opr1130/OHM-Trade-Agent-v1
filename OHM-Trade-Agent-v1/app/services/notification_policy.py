@@ -27,6 +27,106 @@ CRITICAL_EVENTS = {
     "POSITION_WARNING",
     "ACTIONABLE_TRADE",
 }
+# NEW TRADE stays inside CRITICAL_EVENTS so lifecycle fail-open and the generic
+# noncritical attention budget are unchanged for protection alerts. Material
+# fingerprint changes may re-alert inside the cooldown window; an unchanged
+# fingerprint never repeats.
+NEW_TRADE_EVENT = "ACTIONABLE_TRADE"
+NOTIFICATION_POLICY_VERSION = "r4-alert-quality-v1"
+
+
+def _blocked_by_cooldown(
+    *,
+    event_type: str,
+    previous: dict,
+    fingerprint: str,
+    last_at: datetime | None,
+    now: datetime,
+    cooldown_seconds: int,
+) -> bool:
+    if last_at is None:
+        return False
+    if (now - last_at).total_seconds() >= cooldown_seconds:
+        return False
+    if event_type == NEW_TRADE_EVENT:
+        prior = str(previous.get("fingerprint") or "")
+        if prior and prior != fingerprint:
+            return False
+        return True
+    return event_type not in CRITICAL_EVENTS
+
+
+def select_new_trade_window(
+    rows: list[dict],
+    *,
+    max_per_window: int,
+    min_quality_score: float,
+) -> tuple[list[dict], list[dict]]:
+    """Classify notification quality without spending delivery capacity.
+
+    Input order is the authoritative rank order. This function does not sort,
+    rescore, or mutate the caller's rows. Missing quality evidence is not
+    eligible to notify. The per-window cap is not applied here: already
+    delivered or cooldown-suppressed ranks must not consume NEW TRADE slots.
+    The scan counts actual delivery attempts after dedupe.
+    """
+    del max_per_window
+    eligible: list[dict] = []
+    suppressed: list[dict] = []
+    floor = float(min_quality_score)
+    for row in rows:
+        reason = notification_quality_suppression_reason(
+            row.get("quality_score"),
+            min_quality_score=floor,
+        )
+        if reason is None:
+            eligible.append(row)
+            continue
+        suppressed.append({**row, "notification_suppression_reason": reason})
+    return eligible, suppressed
+
+
+def notification_quality_suppression_reason(
+    quality_score,
+    *,
+    min_quality_score: float,
+) -> str | None:
+    """Return a notification-only reason, or None when the score may be sent."""
+    try:
+        numeric = float(quality_score)
+    except (TypeError, ValueError):
+        numeric = None
+    if numeric is None or numeric != numeric:
+        return f"NOTIFICATION_QUALITY_UNAVAILABLE:{NOTIFICATION_POLICY_VERSION}"
+    if numeric < float(min_quality_score):
+        return f"NOTIFICATION_QUALITY_THRESHOLD:{NOTIFICATION_POLICY_VERSION}"
+    return None
+
+
+def new_trade_volume_suppression_reason(max_per_window: int) -> str:
+    cap = max(1, int(max_per_window))
+    return f"NEW_TRADE_VOLUME_BUDGET:{NOTIFICATION_POLICY_VERSION}:{cap}"
+
+
+def new_trade_delivery_slot_open(attempts: int, max_per_window: int) -> bool:
+    """True while accepted NEW TRADE delivery attempts are still under the cap."""
+    return int(attempts) < max(1, int(max_per_window))
+
+
+def authorize_new_trade_notification(
+    *,
+    quality_reason: str | None,
+    delivery_attempts: int,
+    max_per_window: int,
+) -> tuple[bool, str | None]:
+    """Decide Telegram eligibility without changing rank order or lifecycle."""
+    notify = quality_reason is None and new_trade_delivery_slot_open(
+        delivery_attempts,
+        max_per_window,
+    )
+    if quality_reason is None and not notify:
+        return False, new_trade_volume_suppression_reason(max_per_window)
+    return notify, quality_reason
 
 
 def _now() -> datetime:
@@ -67,9 +167,15 @@ def should_emit(
             if previous.get("fingerprint") == fingerprint:
                 return False
             last_at = _parse(previous.get("sent_at"))
-            if event_type not in CRITICAL_EVENTS and last_at is not None:
-                if (now - last_at).total_seconds() < cooldown_seconds:
-                    return False
+            if _blocked_by_cooldown(
+                event_type=event_type,
+                previous=previous if isinstance(previous, dict) else {},
+                fingerprint=fingerprint,
+                last_at=last_at,
+                now=now,
+                cooldown_seconds=cooldown_seconds,
+            ):
+                return False
     except (OSError, TimeoutError, RegistryIOError):
         # Lifecycle-critical alerts remain fail-open; ordinary attention cards
         # fail closed so a broken state registry cannot bypass flood controls.
@@ -167,9 +273,15 @@ def reserve_emit(
                 return None
 
             last_at = _parse(previous.get("sent_at"))
-            if event_type not in CRITICAL_EVENTS and last_at is not None:
-                if (now - last_at).total_seconds() < cooldown_seconds:
-                    return None
+            if _blocked_by_cooldown(
+                event_type=event_type,
+                previous=previous,
+                fingerprint=fingerprint,
+                last_at=last_at,
+                now=now,
+                cooldown_seconds=cooldown_seconds,
+            ):
+                return None
 
             lease_until = _parse(previous.get("reservation_expires_at"))
             if (

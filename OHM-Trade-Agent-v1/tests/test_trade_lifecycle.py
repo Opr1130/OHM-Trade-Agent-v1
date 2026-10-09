@@ -668,8 +668,8 @@ def test_generic_tradingview_webhook_has_no_confirmation_buttons(monkeypatch):
     sent = {}
     monkeypatch.setattr(
         routes,
-        "send_tracked_telegram",
-        lambda *args, **kwargs: sent.update(kwargs) or SimpleNamespace(delivered=True, message_id=106),
+        "record_telegram_not_eligible",
+        lambda **kwargs: sent.update(kwargs),
     )
     signal = TradingSignal(
         symbol="BTC/USD",
@@ -685,4 +685,5 @@ def test_generic_tradingview_webhook_has_no_confirmation_buttons(monkeypatch):
     )
     decision = routes.tradingview_webhook(signal, "secret-secret")
     assert decision.action == "alert"
+    assert sent["reason"] == "SCORE_ONLY_NOT_AUTHORITATIVE_SELECTION"
     assert "reply_markup" not in sent

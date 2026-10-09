@@ -21,8 +21,7 @@ from app.services.order_intent_registry import (
 from app.services.risk import build_risk_plan
 from app.services.scoring import score_signal
 from app.services.secret_auth import secret_matches
-from app.services.telegram_notifier import format_trade_alert
-from app.services.telegram_delivery import send_tracked_telegram
+from app.services.telegram_delivery import record_telegram_not_eligible
 from app.services.tradingview_inbox import TradingViewInboxFullError, enqueue, record_rejection
 
 
@@ -272,15 +271,13 @@ def tradingview_webhook(signal: TradingSignal, x_webhook_secret: str | None = He
     append_signal(signal, decision)
 
     if decision.action == "alert" and settings.telegram_enabled and settings.telegram_bot_token and settings.telegram_chat_id:
-        message = format_trade_alert(signal, decision)
-        send_tracked_telegram(
-            bot_token=settings.telegram_bot_token,
-            chat_id=settings.telegram_chat_id,
-            message=message,
+        # A local score is not an authoritative selected candidate.
+        record_telegram_not_eligible(
             identity=f"TRADING_SIGNAL:{decision.symbol}",
             alert_family="TRADING_SIGNAL",
             event_type="ALERT",
             fingerprint=f"{decision.final_score}:{signal.price}:{signal.target_price}:{signal.stop_price}",
+            reason="SCORE_ONLY_NOT_AUTHORITATIVE_SELECTION",
             symbol=decision.symbol,
         )
     return decision
