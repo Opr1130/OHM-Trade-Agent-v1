@@ -1340,6 +1340,8 @@ trap rollback ERR
 run_protection_preflight() {
   local image receipt rc=0 raw status state coverage suspended codes reason
   local unmanaged uncertain silent incidents
+  local shadow_readiness shadow_blocking shadow_advisory shadow_unmanaged
+  local shadow_candidate shadow_blocking_incidents strict_f11_state
   local candidate_root="$STATE_DIR/protection-candidate"
   local candidate_app=""
   image="$(docker inspect --format '{{.Image}}' ohm-trade-agent 2>/dev/null || true)"
@@ -1393,11 +1395,13 @@ import json, re, sys
 path, expected_sha, raw_rc = sys.argv[1], sys.argv[2], sys.argv[3]
 limit = 65536
 symbol = re.compile(r"^[A-Za-z0-9._/-]{1,24}$")
+code = re.compile(r"^[A-Z0-9_]{1,64}$")
+identity = re.compile(r"^[A-Za-z0-9._:/-]{1,96}$")
 
 
 def bound(joined):
     if len(joined) > 400:
-        joined = joined[:400].rstrip(".,/-_")
+        joined = joined[:400].rstrip(".,/-_:")
     return joined or "NONE"
 
 
@@ -1422,6 +1426,31 @@ def prefer(value, fallback):
     return fallback
 
 
+def tokens(value, fallback="NONE"):
+    if isinstance(value, str):
+        if value.strip() == "NONE":
+            return "NONE"
+        parts = [p for p in value.strip().split(",") if code.fullmatch(p)]
+        if parts:
+            return bound(",".join(parts[:20]))
+    return fallback
+
+
+def identities(value, fallback="NONE"):
+    if isinstance(value, str):
+        if value.strip() == "NONE":
+            return "NONE"
+        parts = [p for p in value.strip().split(",") if identity.fullmatch(p)]
+        if parts:
+            return bound(",".join(parts[:20]))
+    return fallback
+
+
+def state_token(value, fallback):
+    text = str(value or "").strip()
+    return text if code.fullmatch(text) else fallback
+
+
 def incident(value):
     if value is True:
         return "true"
@@ -1432,7 +1461,8 @@ def incident(value):
 
 def fail(message):
     for line in ("FAIL", "UNAVAILABLE", "false", "true", "UNAVAILABLE", message,
-                 "NONE", "NONE", "NONE", "UNPROVEN"):
+                 "NONE", "NONE", "NONE", "UNPROVEN", "UNPROVEN", "NONE", "NONE",
+                 "NONE", "NONE", "NONE", "UNAVAILABLE"):
         print(line)
 
 
@@ -1459,18 +1489,31 @@ else:
                 if not isinstance(protection, dict):
                     fail("protection preflight did not return a readable decision")
                 else:
+                    shadow = doc.get("evidence_shadow")
+                    if not isinstance(shadow, dict):
+                        shadow = {}
+                    shadow_state = str(shadow.get("state") or "")
+                    shadow_readiness = (
+                        shadow_state
+                        if shadow_state in ("READY", "BLOCKED")
+                        else "UNPROVEN"
+                    )
+                    # AC-026: for the EVIDENCE_SHADOW profile the release decision
+                    # is the explicit readiness verdict, NOT strict F11. The
+                    # verdict must be well formed, state READY, and agree with the
+                    # explicit readiness object; a missing, malformed, unknown or
+                    # contradictory readiness fails closed. Strict F11 fields are
+                    # still parsed below and stay observable.
                     ready = (
                         rc_value == 0
                         and doc.get("schema_version") == 1
                         and doc.get("read_only") is True
                         and doc.get("candidate_sha") == expected_sha
                         and doc.get("release_profile") == "EVIDENCE_SHADOW"
-                        and protection.get("state") == "HEALTHY"
-                        and protection.get("admissions_suspended") is False
-                        and protection.get("coverage_complete") is True
-                        and protection.get("reason_codes") == ["PROTECTION_PROVEN"]
                         and isinstance(doc.get("verdict"), dict)
                         and doc["verdict"].get("ready") is True
+                        and shadow.get("ready") is True
+                        and shadow_readiness == "READY"
                     )
                     state = str(protection.get("state") or "UNAVAILABLE")
                     coverage = "true" if protection.get("coverage_complete") is True else "false"
@@ -1486,13 +1529,14 @@ else:
                         ch if ch.isalnum() or ch in " .,:/_+-" else " "
                         for ch in str(reason)
                     )
-                    reason = " ".join(reason.split())[:240] or "protection is not HEALTHY"
+                    reason = " ".join(reason.split())[:240] or "EVIDENCE_SHADOW readiness is not READY"
                     markers = doc.get("markers")
                     if not isinstance(markers, dict):
                         markers = {}
                     incidents = doc.get("incidents")
                     health = incidents.get("health") if isinstance(incidents, dict) else None
                     incident_health = prefer(markers.get("incident_health"), incident(health))
+                    strict_f11_state = state_token(markers.get("strict_f11_state"), state)
                     print("PASS" if ready else "FAIL")
                     print(state)
                     print(coverage)
@@ -1503,8 +1547,15 @@ else:
                     print(prefer(markers.get("uncertain_exposures"), marker(protection.get("uncertain_exposures"))))
                     print(prefer(markers.get("silent_holdings"), marker(protection.get("silent_holdings"))))
                     print(incident_health)
+                    print(shadow_readiness)
+                    print(tokens(markers.get("evidence_shadow_blocking_reason_codes")))
+                    print(tokens(markers.get("evidence_shadow_advisory_reason_codes")))
+                    print(prefer(markers.get("evidence_shadow_unmanaged_exposures"), "NONE"))
+                    print(identities(markers.get("evidence_shadow_candidate_recoverable_incidents")))
+                    print(identities(markers.get("evidence_shadow_blocking_incidents")))
+                    print(strict_f11_state)
 PY
-)" || raw=$'FAIL\nUNAVAILABLE\nfalse\ntrue\nUNAVAILABLE\nprotection preflight did not return a readable decision\nNONE\nNONE\nNONE\nUNPROVEN'
+)" || raw=$'FAIL\nUNAVAILABLE\nfalse\ntrue\nUNAVAILABLE\nprotection preflight did not return a readable decision\nNONE\nNONE\nNONE\nUNPROVEN\nUNPROVEN\nNONE\nNONE\nNONE\nNONE\nNONE\nUNAVAILABLE'
 
   status="$(printf '%s\n' "$raw" | sed -n '1p')"
   state="$(printf '%s\n' "$raw" | sed -n '2p')"
@@ -1516,6 +1567,13 @@ PY
   uncertain="$(printf '%s\n' "$raw" | sed -n '8p')"
   silent="$(printf '%s\n' "$raw" | sed -n '9p')"
   incidents="$(printf '%s\n' "$raw" | sed -n '10p')"
+  shadow_readiness="$(printf '%s\n' "$raw" | sed -n '11p')"
+  shadow_blocking="$(printf '%s\n' "$raw" | sed -n '12p')"
+  shadow_advisory="$(printf '%s\n' "$raw" | sed -n '13p')"
+  shadow_unmanaged="$(printf '%s\n' "$raw" | sed -n '14p')"
+  shadow_candidate="$(printf '%s\n' "$raw" | sed -n '15p')"
+  shadow_blocking_incidents="$(printf '%s\n' "$raw" | sed -n '16p')"
+  strict_f11_state="$(printf '%s\n' "$raw" | sed -n '17p')"
   if [[ "$status" != "PASS" ]]; then
     status="FAIL"
   fi
@@ -1536,6 +1594,13 @@ PY
   echo "OPIP_PROTECTION_PREFLIGHT_UNCERTAIN_EXPOSURES=${uncertain:-NONE}"
   echo "OPIP_PROTECTION_PREFLIGHT_SILENT_HOLDINGS=${silent:-NONE}"
   echo "OPIP_PROTECTION_PREFLIGHT_INCIDENT_HEALTH=${incidents:-UNPROVEN}"
+  echo "OPIP_PROTECTION_PREFLIGHT_STRICT_F11_STATE=${strict_f11_state:-UNAVAILABLE}"
+  echo "OPIP_PROTECTION_PREFLIGHT_EVIDENCE_SHADOW_READINESS=${shadow_readiness:-UNPROVEN}"
+  echo "OPIP_PROTECTION_PREFLIGHT_EVIDENCE_SHADOW_BLOCKING_REASON_CODES=${shadow_blocking:-NONE}"
+  echo "OPIP_PROTECTION_PREFLIGHT_EVIDENCE_SHADOW_ADVISORY_REASON_CODES=${shadow_advisory:-NONE}"
+  echo "OPIP_PROTECTION_PREFLIGHT_EVIDENCE_SHADOW_UNMANAGED_EXPOSURES=${shadow_unmanaged:-NONE}"
+  echo "OPIP_PROTECTION_PREFLIGHT_EVIDENCE_SHADOW_CANDIDATE_RECOVERABLE_INCIDENTS=${shadow_candidate:-NONE}"
+  echo "OPIP_PROTECTION_PREFLIGHT_EVIDENCE_SHADOW_BLOCKING_INCIDENTS=${shadow_blocking_incidents:-NONE}"
   echo "OPIP_PROTECTION_PREFLIGHT_JSON=$receipt"
   if [[ "$status" == "PASS" ]]; then
     return 0

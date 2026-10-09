@@ -337,6 +337,62 @@ MONITOR_OWNED_SCOPES: frozenset[str] = frozenset(
     }
 )
 
+#: The canonical coverage-owned recovery mapping: the scopes whose recovery is
+#: proven by *coverage* evidence (complete held-position pricing / verification)
+#: rather than by a fresh provider probe. This is the single source of truth for
+#: "which scope is closed by which coverage authority", consumed by both the
+#: active-trade monitor's recovery sweep and the profile-scoped readiness
+#: decision. ``KRAKEN:RATE_LIMIT`` is deliberately absent: complete coverage says
+#: nothing about whether Kraken is still throttling.
+COVERAGE_RECOVERY_AUTHORITY_BY_SCOPE: dict[str, RecoveryAuthority] = {
+    SystemIncidentScope.KRAKEN_HELD_ASSET_PRICING.value: RecoveryAuthority.PRICING_COVERAGE,
+    SystemIncidentScope.KRAKEN_POSITION_VERIFICATION.value: RecoveryAuthority.POSITION_COVERAGE,
+}
+
+
+def coverage_recovery_authority(
+    scope: SystemIncidentScope | str,
+) -> RecoveryAuthority | None:
+    """Return the coverage authority that closes ``scope``, or ``None``.
+
+    ``None`` means the scope is not coverage-owned, so coverage evidence can
+    never close it. Callers must treat ``None`` as "not recoverable by coverage"
+    rather than as a default authority.
+    """
+
+    return COVERAGE_RECOVERY_AUTHORITY_BY_SCOPE.get(
+        str(getattr(scope, "value", scope))
+    )
+
+
+def coverage_degraded_scopes(
+    *,
+    pricing_unavailable: bool,
+    position_verification_unavailable: bool,
+) -> frozenset[str]:
+    """Canonical coverage-owned scopes proven degraded by ONE observation.
+
+    This is the degradation companion of
+    :data:`COVERAGE_RECOVERY_AUTHORITY_BY_SCOPE`. It names the *same* canonical
+    scope identities -- derived from :class:`SystemIncidentScope` rather than a
+    second hand-written list -- so a caller holding structured same-cycle
+    coverage facts can report exactly which coverage-owned scopes this cycle
+    observed failing. It is deliberately *not* a recovery mapping: proving a
+    scope degraded never closes, recovers or mutates an incident.
+
+    Neither flag can ever name a non-coverage scope (connectivity, auth, rate
+    limit), and an unproven observation is expressed by the caller as ``None``
+    rather than by an empty result, so "not observed" is never confused with
+    "proven healthy".
+    """
+
+    scopes: set[str] = set()
+    if pricing_unavailable:
+        scopes.add(SystemIncidentScope.KRAKEN_HELD_ASSET_PRICING.value)
+    if position_verification_unavailable:
+        scopes.add(SystemIncidentScope.KRAKEN_POSITION_VERIFICATION.value)
+    return frozenset(scopes)
+
 
 @dataclass(frozen=True)
 class IncidentDecision:

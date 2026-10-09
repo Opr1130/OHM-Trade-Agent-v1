@@ -311,10 +311,38 @@ def _verify_live_posture(profile_name: str) -> dict[str, Any]:
             reason_codes=(str(summary.reason or "NONE"), f"MODE={summary.mode}"),
         )
 
-    from app.jobs.report_protection_health import build_report
+    from app.jobs.report_protection_health import build_observation
 
-    protection = build_report()
-    if protection.get("state") != "HEALTHY" or protection.get("admissions_suspended") is not False:
+    # ONE read-only observation yields BOTH the strict F11 report and the AC-026
+    # EVIDENCE_SHADOW readiness projection, so the runtime verifier cannot
+    # reconstruct a second, divergent readiness result.
+    observation = build_observation()
+    protection = observation.report
+    shadow = observation.shadow
+    strict_healthy = (
+        protection.get("state") == "HEALTHY"
+        and protection.get("admissions_suspended") is False
+    )
+
+    if profile_name == "EVIDENCE_SHADOW":
+        # AC-026: for the EVIDENCE_SHADOW profile the release gate is the explicit
+        # readiness decision, NOT strict F11. A durable coverage incident whose
+        # canonical current predicate is proven, or an external VERIFIED_UNMANAGED
+        # holding, keeps strict F11 non-HEALTHY but is advisory for this profile,
+        # so it must never cause a false post-mutation rollback. Every genuine
+        # current blocker is still encoded in the readiness blockers and fails.
+        if not shadow.ready:
+            raise ReleaseRuntimePostureError(
+                "EVIDENCE_SHADOW readiness is BLOCKED at runtime",
+                reason_codes=(
+                    shadow.state,
+                    *(str(code) for code in shadow.blocking_reason_codes),
+                ),
+                protection_reason=protection.get("resolution_reason"),
+            )
+    elif not strict_healthy:
+        # Non-EVIDENCE_SHADOW profiles (for example TARGET_PAPER) keep strict F11
+        # as the gate; strict protection semantics are unchanged for them.
         raise ReleaseRuntimePostureError(
             "read-only protection health is not HEALTHY",
             reason_codes=(
@@ -326,7 +354,12 @@ def _verify_live_posture(profile_name: str) -> dict[str, Any]:
     return {
         "profile": profile_name,
         "modes": observed,
-        "protection": "HEALTHY",
+        # Strict F11 state is preserved for observability; for EVIDENCE_SHADOW it
+        # is reported, not enforced.
+        "protection": str(protection.get("state") or "UNAVAILABLE"),
+        "protection_ready": strict_healthy,
+        "shadow_readiness": shadow.state,
+        "shadow_blocking_reason_codes": list(shadow.blocking_reason_codes),
         "target_authority": "ABSENT",
     }
 
@@ -488,6 +521,13 @@ def main() -> None:
     print(f"OPIP_RELEASE_PROFILE={result['profile']}")
     print(f"OPIP_RELEASE_EVIDENCE_CAPTURE={result['evidence'].get('evidence_capture', 'PASS')}")
     print(f"OPIP_RELEASE_PROTECTION={result['protection']}")
+    print(f"OPIP_RELEASE_PROTECTION_READY={_receipt_value(result['protection_ready'])}")
+    print(f"OPIP_RELEASE_SHADOW_READINESS={result['shadow_readiness']}")
+    if result.get("shadow_blocking_reason_codes"):
+        print(
+            "OPIP_RELEASE_SHADOW_BLOCKING_REASON_CODES="
+            + ",".join(str(code) for code in result["shadow_blocking_reason_codes"])
+        )
     print(f"OPIP_RELEASE_TARGET_AUTHORITY={result['target_authority']}")
     for key, value in sorted(result["evidence"].items()):
         print(f"OPIP_RELEASE_{key.upper()}={_receipt_value(value)}")

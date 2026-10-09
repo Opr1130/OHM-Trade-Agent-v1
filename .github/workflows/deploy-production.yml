@@ -268,6 +268,9 @@ jobs:
             EVIDENCE_CAPTURE="$(grep -oE 'OPIP_RELEASE_EVIDENCE_CAPTURE=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
             DEPLOYED_PROFILE="$(grep -oE 'OPIP_RELEASE_PROFILE=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
             RUNTIME_PROTECTION="$(grep -oE 'OPIP_RELEASE_PROTECTION=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
+            RUNTIME_PROTECTION_READY="$(grep -oE 'OPIP_RELEASE_PROTECTION_READY=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
+            RUNTIME_SHADOW_READINESS="$(grep -oE 'OPIP_RELEASE_SHADOW_READINESS=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
+            RUNTIME_SHADOW_BLOCKING="$(grep -oE 'OPIP_RELEASE_SHADOW_BLOCKING_REASON_CODES=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
             TARGET_AUTHORITY="$(grep -oE 'OPIP_RELEASE_TARGET_AUTHORITY=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
             RELEASE_SCHEDULER="$(grep -oE 'OPIP_RELEASE_SCHEDULER=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
             UNIFIED_CYCLE="$(grep -oE 'OPIP_UNIFIED_CYCLE=HEALTHY' "$log" | tail -n 1 | cut -d= -f2)"
@@ -284,6 +287,13 @@ jobs:
             PREFLIGHT_UNCERTAIN="$(grep -oE 'OPIP_PROTECTION_PREFLIGHT_UNCERTAIN_EXPOSURES=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
             PREFLIGHT_SILENT="$(grep -oE 'OPIP_PROTECTION_PREFLIGHT_SILENT_HOLDINGS=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
             PREFLIGHT_INCIDENT="$(grep -oE 'OPIP_PROTECTION_PREFLIGHT_INCIDENT_HEALTH=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
+            PREFLIGHT_STRICT_STATE="$(grep -oE 'OPIP_PROTECTION_PREFLIGHT_STRICT_F11_STATE=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
+            PREFLIGHT_SHADOW_READINESS="$(grep -oE 'OPIP_PROTECTION_PREFLIGHT_EVIDENCE_SHADOW_READINESS=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
+            PREFLIGHT_SHADOW_BLOCKING="$(grep -oE 'OPIP_PROTECTION_PREFLIGHT_EVIDENCE_SHADOW_BLOCKING_REASON_CODES=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
+            PREFLIGHT_SHADOW_ADVISORY="$(grep -oE 'OPIP_PROTECTION_PREFLIGHT_EVIDENCE_SHADOW_ADVISORY_REASON_CODES=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
+            PREFLIGHT_SHADOW_UNMANAGED="$(grep -oE 'OPIP_PROTECTION_PREFLIGHT_EVIDENCE_SHADOW_UNMANAGED_EXPOSURES=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
+            PREFLIGHT_SHADOW_CANDIDATE="$(grep -oE 'OPIP_PROTECTION_PREFLIGHT_EVIDENCE_SHADOW_CANDIDATE_RECOVERABLE_INCIDENTS=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
+            PREFLIGHT_SHADOW_BLOCKING_INCIDENTS="$(grep -oE 'OPIP_PROTECTION_PREFLIGHT_EVIDENCE_SHADOW_BLOCKING_INCIDENTS=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
             PRODUCTION_MUTATION="$(grep -oE 'OPIP_PRODUCTION_MUTATION=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
             if grep -q 'OPIP_CORE_DEPLOY_STATUS=' "$log"; then
               CORE_MARKER="PRESENT"
@@ -316,12 +326,18 @@ jobs:
                   # marker). The unified-cycle observation is still parsed and
                   # reported in the receipt, but it is never required to be
                   # HEALTHY and is never fabricated.
+                  # The EVIDENCE_SHADOW release gate is the explicit AC-026
+                  # readiness verdict (OPIP_RELEASE_SHADOW_READINESS=READY),
+                  # NOT strict F11 health. Strict F11 remains visible through
+                  # OPIP_RELEASE_PROTECTION but an advisory strict blocker must
+                  # never mark a legitimately shadow-ready release as unproven.
+                  # A missing or non-READY readiness marker fails closed.
                   if [[ "$RUNTIME_VERIFICATION" == "PASS" ]] \
                     && grep -Fxq "OPIP_RELEASE_RUNTIME_SHA=$TARGET_SHA" "$log" \
                     && [[ "$DEPLOYED_PROFILE" == "$APPROVED_PROFILE" ]] \
                     && [[ "$APPROVED_PROFILE" == "EVIDENCE_SHADOW" ]] \
                     && [[ "$EVIDENCE_CAPTURE" == "PASS" ]] \
-                    && [[ "$RUNTIME_PROTECTION" == "HEALTHY" ]] \
+                    && [[ "$RUNTIME_SHADOW_READINESS" == "READY" ]] \
                     && [[ "$TARGET_AUTHORITY" == "ABSENT" ]] \
                     && [[ "$RELEASE_SCHEDULER" == "UNIQUE_BOUNDED" ]]; then
                     core_verdict="PROVEN"
@@ -496,6 +512,9 @@ jobs:
           echo "evidence_capture=${EVIDENCE_CAPTURE:-UNPROVEN}" >> "$GITHUB_OUTPUT"
           echo "deployed_profile=${DEPLOYED_PROFILE:-UNPROVEN}" >> "$GITHUB_OUTPUT"
           echo "runtime_protection=${RUNTIME_PROTECTION:-UNPROVEN}" >> "$GITHUB_OUTPUT"
+          echo "runtime_protection_ready=${RUNTIME_PROTECTION_READY:-UNPROVEN}" >> "$GITHUB_OUTPUT"
+          echo "runtime_shadow_readiness=${RUNTIME_SHADOW_READINESS:-UNPROVEN}" >> "$GITHUB_OUTPUT"
+          echo "runtime_shadow_blocking_reason_codes=${RUNTIME_SHADOW_BLOCKING:-NONE}" >> "$GITHUB_OUTPUT"
           echo "target_authority=${TARGET_AUTHORITY:-UNPROVEN}" >> "$GITHUB_OUTPUT"
           echo "release_scheduler=${RELEASE_SCHEDULER:-UNPROVEN}" >> "$GITHUB_OUTPUT"
           echo "unified_cycle=${UNIFIED_CYCLE:-UNPROVEN}" >> "$GITHUB_OUTPUT"
@@ -514,6 +533,13 @@ jobs:
           echo "protection_preflight_uncertain_exposures=${PREFLIGHT_UNCERTAIN:-NONE}" >> "$GITHUB_OUTPUT"
           echo "protection_preflight_silent_holdings=${PREFLIGHT_SILENT:-NONE}" >> "$GITHUB_OUTPUT"
           echo "protection_preflight_incident_health=${PREFLIGHT_INCIDENT:-UNPROVEN}" >> "$GITHUB_OUTPUT"
+          echo "protection_preflight_strict_f11_state=${PREFLIGHT_STRICT_STATE:-UNPROVEN}" >> "$GITHUB_OUTPUT"
+          echo "protection_preflight_evidence_shadow_readiness=${PREFLIGHT_SHADOW_READINESS:-UNPROVEN}" >> "$GITHUB_OUTPUT"
+          echo "protection_preflight_evidence_shadow_blocking_reason_codes=${PREFLIGHT_SHADOW_BLOCKING:-NONE}" >> "$GITHUB_OUTPUT"
+          echo "protection_preflight_evidence_shadow_advisory_reason_codes=${PREFLIGHT_SHADOW_ADVISORY:-NONE}" >> "$GITHUB_OUTPUT"
+          echo "protection_preflight_evidence_shadow_unmanaged_exposures=${PREFLIGHT_SHADOW_UNMANAGED:-NONE}" >> "$GITHUB_OUTPUT"
+          echo "protection_preflight_evidence_shadow_candidate_recoverable_incidents=${PREFLIGHT_SHADOW_CANDIDATE:-NONE}" >> "$GITHUB_OUTPUT"
+          echo "protection_preflight_evidence_shadow_blocking_incidents=${PREFLIGHT_SHADOW_BLOCKING_INCIDENTS:-NONE}" >> "$GITHUB_OUTPUT"
           echo "production_mutation=${PRODUCTION_MUTATION:-UNPROVEN}" >> "$GITHUB_OUTPUT"
           exit 0
 
@@ -548,6 +574,9 @@ jobs:
           EVIDENCE_CAPTURE: ${{ steps.production_deploy.outputs.evidence_capture }}
           DEPLOYED_PROFILE: ${{ steps.production_deploy.outputs.deployed_profile }}
           RUNTIME_PROTECTION: ${{ steps.production_deploy.outputs.runtime_protection }}
+          RUNTIME_PROTECTION_READY: ${{ steps.production_deploy.outputs.runtime_protection_ready }}
+          RUNTIME_SHADOW_READINESS: ${{ steps.production_deploy.outputs.runtime_shadow_readiness }}
+          RUNTIME_SHADOW_BLOCKING_REASON_CODES: ${{ steps.production_deploy.outputs.runtime_shadow_blocking_reason_codes }}
           TARGET_AUTHORITY: ${{ steps.production_deploy.outputs.target_authority }}
           RELEASE_SCHEDULER: ${{ steps.production_deploy.outputs.release_scheduler }}
           UNIFIED_CYCLE: ${{ steps.production_deploy.outputs.unified_cycle }}
@@ -566,6 +595,13 @@ jobs:
           PROTECTION_PREFLIGHT_UNCERTAIN_EXPOSURES: ${{ steps.production_deploy.outputs.protection_preflight_uncertain_exposures }}
           PROTECTION_PREFLIGHT_SILENT_HOLDINGS: ${{ steps.production_deploy.outputs.protection_preflight_silent_holdings }}
           PROTECTION_PREFLIGHT_INCIDENT_HEALTH: ${{ steps.production_deploy.outputs.protection_preflight_incident_health }}
+          PROTECTION_PREFLIGHT_STRICT_F11_STATE: ${{ steps.production_deploy.outputs.protection_preflight_strict_f11_state }}
+          PROTECTION_PREFLIGHT_EVIDENCE_SHADOW_READINESS: ${{ steps.production_deploy.outputs.protection_preflight_evidence_shadow_readiness }}
+          PROTECTION_PREFLIGHT_EVIDENCE_SHADOW_BLOCKING_REASON_CODES: ${{ steps.production_deploy.outputs.protection_preflight_evidence_shadow_blocking_reason_codes }}
+          PROTECTION_PREFLIGHT_EVIDENCE_SHADOW_ADVISORY_REASON_CODES: ${{ steps.production_deploy.outputs.protection_preflight_evidence_shadow_advisory_reason_codes }}
+          PROTECTION_PREFLIGHT_EVIDENCE_SHADOW_UNMANAGED_EXPOSURES: ${{ steps.production_deploy.outputs.protection_preflight_evidence_shadow_unmanaged_exposures }}
+          PROTECTION_PREFLIGHT_EVIDENCE_SHADOW_CANDIDATE_RECOVERABLE_INCIDENTS: ${{ steps.production_deploy.outputs.protection_preflight_evidence_shadow_candidate_recoverable_incidents }}
+          PROTECTION_PREFLIGHT_EVIDENCE_SHADOW_BLOCKING_INCIDENTS: ${{ steps.production_deploy.outputs.protection_preflight_evidence_shadow_blocking_incidents }}
           PRODUCTION_MUTATION: ${{ steps.production_deploy.outputs.production_mutation }}
         run: |
           set -euo pipefail
@@ -596,6 +632,9 @@ jobs:
           ATDD_SCOPE=${EXACT_CI_RESULT:-UNPROVEN}
           SECURITY=${EXACT_CI_RESULT:-UNPROVEN}
           PROTECTION=${RUNTIME_PROTECTION:-UNVERIFIED}
+          PROTECTION_READY=${RUNTIME_PROTECTION_READY:-UNVERIFIED}
+          SHADOW_READINESS=${RUNTIME_SHADOW_READINESS:-UNVERIFIED}
+          SHADOW_BLOCKING_REASON_CODES=${RUNTIME_SHADOW_BLOCKING_REASON_CODES:-NONE}
           PROTECTION_POSTURE=${PROTECTION:-UNVERIFIED}
           FEATURE_BUS=${FEATURE_BUS:-UNPROVEN}
           CANONICAL_WRITER=${CANONICAL_WRITER:-UNPROVEN}
@@ -630,6 +669,13 @@ jobs:
           PROTECTION_UNCERTAIN_EXPOSURES=${PROTECTION_PREFLIGHT_UNCERTAIN_EXPOSURES:-NONE}
           PROTECTION_SILENT_HOLDINGS=${PROTECTION_PREFLIGHT_SILENT_HOLDINGS:-NONE}
           PROTECTION_INCIDENT_HEALTH=${PROTECTION_PREFLIGHT_INCIDENT_HEALTH:-UNPROVEN}
+          PROTECTION_STRICT_F11_STATE=${PROTECTION_PREFLIGHT_STRICT_F11_STATE:-UNPROVEN}
+          PROTECTION_EVIDENCE_SHADOW_READINESS=${PROTECTION_PREFLIGHT_EVIDENCE_SHADOW_READINESS:-UNPROVEN}
+          PROTECTION_EVIDENCE_SHADOW_BLOCKING_REASON_CODES=${PROTECTION_PREFLIGHT_EVIDENCE_SHADOW_BLOCKING_REASON_CODES:-NONE}
+          PROTECTION_EVIDENCE_SHADOW_ADVISORY_REASON_CODES=${PROTECTION_PREFLIGHT_EVIDENCE_SHADOW_ADVISORY_REASON_CODES:-NONE}
+          PROTECTION_EVIDENCE_SHADOW_UNMANAGED_EXPOSURES=${PROTECTION_PREFLIGHT_EVIDENCE_SHADOW_UNMANAGED_EXPOSURES:-NONE}
+          PROTECTION_EVIDENCE_SHADOW_CANDIDATE_RECOVERABLE_INCIDENTS=${PROTECTION_PREFLIGHT_EVIDENCE_SHADOW_CANDIDATE_RECOVERABLE_INCIDENTS:-NONE}
+          PROTECTION_EVIDENCE_SHADOW_BLOCKING_INCIDENTS=${PROTECTION_PREFLIGHT_EVIDENCE_SHADOW_BLOCKING_INCIDENTS:-NONE}
           PRODUCTION_MUTATION=${PRODUCTION_MUTATION:-UNPROVEN}
           DEPLOY_EXIT_CODE=$RC
           WORKFLOW_RUN=$RUN_URL
@@ -661,6 +707,13 @@ jobs:
             echo "Uncertain exposures: ${{ steps.production_deploy.outputs.protection_preflight_uncertain_exposures }}" >&2
             echo "Silent holdings: ${{ steps.production_deploy.outputs.protection_preflight_silent_holdings }}" >&2
             echo "Incident health: ${{ steps.production_deploy.outputs.protection_preflight_incident_health }}" >&2
+            echo "Strict F11 state: ${{ steps.production_deploy.outputs.protection_preflight_strict_f11_state }}" >&2
+            echo "EVIDENCE_SHADOW readiness: ${{ steps.production_deploy.outputs.protection_preflight_evidence_shadow_readiness }}" >&2
+            echo "EVIDENCE_SHADOW blocking reason codes: ${{ steps.production_deploy.outputs.protection_preflight_evidence_shadow_blocking_reason_codes }}" >&2
+            echo "EVIDENCE_SHADOW advisory reason codes: ${{ steps.production_deploy.outputs.protection_preflight_evidence_shadow_advisory_reason_codes }}" >&2
+            echo "EVIDENCE_SHADOW unmanaged exposures: ${{ steps.production_deploy.outputs.protection_preflight_evidence_shadow_unmanaged_exposures }}" >&2
+            echo "EVIDENCE_SHADOW candidate-recoverable incidents: ${{ steps.production_deploy.outputs.protection_preflight_evidence_shadow_candidate_recoverable_incidents }}" >&2
+            echo "EVIDENCE_SHADOW blocking incidents: ${{ steps.production_deploy.outputs.protection_preflight_evidence_shadow_blocking_incidents }}" >&2
             echo "Learning export: NOT STARTED" >&2
           fi
           echo "Core deployment: ${{ steps.production_deploy.outputs.core_status || 'UNKNOWN' }}" >&2
