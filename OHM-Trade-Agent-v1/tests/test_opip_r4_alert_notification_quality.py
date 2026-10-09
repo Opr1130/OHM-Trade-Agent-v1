@@ -18,6 +18,7 @@ from app.services import (
     trade_outcome_registry,
 )
 from app.services.entry_exit_advisor import EntryExitPlan
+from app.services.pending_setup_registry import PendingSetup
 from app.services.registry_io import load_json
 from app.services.telegram_delivery import record_telegram_suppression
 
@@ -509,3 +510,174 @@ def test_notification_settings_do_not_change_paper_routing_input():
     assert [row["symbol"] for row in low_cap] == ["AAA", "BBB", "CCC"]
     assert [row["symbol"] for row in high_cap] == ["AAA"]
     assert rows[0]["rank"] == 1
+
+
+def _outbox_rows():
+    with qualified_alert_outbox.registry_lock(qualified_alert_outbox._lock_file()):
+        return load_json(qualified_alert_outbox.OUTBOX_FILE)
+
+
+def test_same_queued_fingerprint_does_not_consume_another_slot(tmp_path, monkeypatch):
+    """ATDD-R4-alert-notification-quality-gate/AC-002: a durable retry is not queued again."""
+    _isolate_lifecycle(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        chief_alert_notifier,
+        "_register_reconciliation_intent",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("tracking unavailable")),
+    )
+    first = _candidate("AAA", 90)
+    chief_alert_notifier.send_trade_plan(
+        first,
+        _plan(symbol="AAA"),
+        "summary",
+        "token",
+        "chat",
+    )
+    assert first.get("notification_attempted") is True
+    saved = _outbox_rows()
+    assert len(saved) == 1
+    trade_id = first["trade_id"]
+    original = dict(saved[trade_id])
+
+    again = _candidate("AAA", 90)
+    again["trade_id"] = trade_id
+    chief_alert_notifier.send_trade_plan(
+        again,
+        _plan(symbol="AAA"),
+        "summary",
+        "token",
+        "chat",
+    )
+    assert again.get("notification_attempted") is False
+    replayed = _outbox_rows()
+    assert list(replayed) == [trade_id]
+    assert replayed[trade_id] == original
+
+
+def test_queued_unchanged_rank_leaves_the_slot_for_the_next_rank(tmp_path, monkeypatch):
+    """ATDD-R4-alert-notification-quality-gate/AC-002: a queued rank-1 leaves cap=1 for rank-2."""
+    _isolate_lifecycle(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        chief_alert_notifier,
+        "_register_reconciliation_intent",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("tracking unavailable")),
+    )
+    queued = _candidate("OLD", 99)
+    chief_alert_notifier.send_trade_plan(
+        queued,
+        _plan(symbol="OLD"),
+        "summary",
+        "token",
+        "chat",
+    )
+    assert queued.get("notification_attempted") is True
+    monkeypatch.setattr(
+        chief_alert_notifier,
+        "_register_reconciliation_intent",
+        lambda **kwargs: None,
+    )
+    rank1 = _candidate("OLD", 99)
+    rank1["trade_id"] = queued["trade_id"]
+    rank2 = _candidate("NEW", 70)
+    sent, attempts = _send_ranked(
+        [rank1, rank2],
+        cap=1,
+        floor=0,
+        monkeypatch=monkeypatch,
+    )
+    assert rank1.get("notification_attempted") is False
+    assert attempts == 1
+    assert len(sent) == 1
+    fresh = next(
+        setup for setup in pending_setup_registry.get_pending_setups() if setup.symbol == "NEW"
+    )
+    assert f"trade_id={fresh.trade_id}" in sent[0]
+    assert queued["trade_id"] in _outbox_rows()
+
+
+def _seed_retry_row(trade_id: str, symbol: str) -> None:
+    pending_setup_registry.add_pending_setup(
+        PendingSetup(
+            symbol=symbol,
+            entry_low=99.0,
+            entry_high=100.0,
+            chase_limit=101.0,
+            stop_price=95.0,
+            target_1=110.0,
+            target_2=115.0,
+            risk_level="low",
+            confidence=88,
+            trade_id=trade_id,
+        )
+    )
+    qualified_alert_outbox.queue_qualified_alert(
+        trade_id=trade_id,
+        message=f"trade_id={trade_id}",
+        candidate={"economic_qualified": False},
+        plan=_plan(symbol=symbol),
+        action="ENTER_NOW",
+        direction="LONG",
+        identity=f"QUALIFIED_OPPORTUNITY:{trade_id}",
+        fingerprint=f"fp-{trade_id}",
+        reason="DELIVERY_PENDING",
+    )
+
+
+def _patch_retry_delivery(monkeypatch):
+    delivered = []
+
+    def _send(**kwargs):
+        delivered.append(kwargs["trade_id"])
+        return SimpleNamespace(delivered=True, message_id=len(delivered))
+
+    monkeypatch.setattr(qualified_alert_outbox, "accepted_delivery_message_id", lambda **kwargs: None)
+    monkeypatch.setattr(qualified_alert_outbox, "reserve_emit", lambda **kwargs: "reserve")
+    monkeypatch.setattr(qualified_alert_outbox, "confirm_emit", lambda **kwargs: True)
+    monkeypatch.setattr(qualified_alert_outbox, "send_tracked_telegram", _send)
+    return delivered
+
+
+def test_recovery_delivers_no_more_than_the_configured_bound(tmp_path, monkeypatch):
+    """ATDD-R4-alert-notification-quality-gate/AC-002: one recovery run is bounded."""
+    _isolate_lifecycle(tmp_path, monkeypatch)
+    for trade_id, symbol in (("Q-1", "AAA"), ("Q-2", "BBB"), ("Q-3", "CCC"), ("Q-4", "DDD")):
+        _seed_retry_row(trade_id, symbol)
+    delivered_ids = _patch_retry_delivery(monkeypatch)
+    delivered, pending = qualified_alert_outbox.retry_qualified_alerts(
+        bot_token="token",
+        chat_id="chat",
+        max_new_trade_retries=2,
+    )
+    assert delivered == 2
+    assert delivered_ids == ["Q-1", "Q-2"]
+    assert pending == 2
+    remaining = _outbox_rows()
+    assert list(remaining) == ["Q-3", "Q-4"]
+    assert remaining["Q-3"]["reason"] == "DELIVERY_PENDING"
+    assert remaining["Q-4"]["reason"] == "DELIVERY_PENDING"
+
+
+def test_recovery_bound_leaves_later_rows_pending_for_the_next_run(tmp_path, monkeypatch):
+    """ATDD-R4-alert-notification-quality-gate/AC-002: unattempted retries stay eligible."""
+    _isolate_lifecycle(tmp_path, monkeypatch)
+    for trade_id, symbol in (("Q-1", "AAA"), ("Q-2", "BBB"), ("Q-3", "CCC")):
+        _seed_retry_row(trade_id, symbol)
+    delivered_ids = _patch_retry_delivery(monkeypatch)
+    first_delivered, first_pending = qualified_alert_outbox.retry_qualified_alerts(
+        bot_token="token",
+        chat_id="chat",
+        max_new_trade_retries=1,
+    )
+    assert first_delivered == 1
+    assert first_pending == 2
+    assert list(_outbox_rows()) == ["Q-2", "Q-3"]
+    second_delivered, second_pending = qualified_alert_outbox.retry_qualified_alerts(
+        bot_token="token",
+        chat_id="chat",
+        max_new_trade_retries=1,
+    )
+    assert second_delivered == 1
+    assert second_pending == 1
+    assert delivered_ids == ["Q-1", "Q-2"]
+    assert list(_outbox_rows()) == ["Q-3"]
+    assert pending_setup_registry.get_pending_setup_by_trade_id("Q-3") is not None

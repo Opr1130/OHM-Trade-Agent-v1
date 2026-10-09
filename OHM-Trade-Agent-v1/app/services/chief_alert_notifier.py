@@ -25,7 +25,10 @@ from app.services.pending_setup_registry import (
     get_pending_setups,
 )
 from app.services.price_movement_radar import attach_actionable_plan
-from app.services.qualified_alert_outbox import queue_qualified_alert
+from app.services.qualified_alert_outbox import (
+    queue_qualified_alert,
+    queued_alert_fingerprint,
+)
 from app.services.qualified_trade_tracking import (
     ReconciliationIdentityMismatch,
     ReconciliationTrackingDisabled,
@@ -549,9 +552,10 @@ def send_trade_plan(
     )
     key = _alert_state_key(candidate, plan)
     identity = f"QUALIFIED_OPPORTUNITY:{trade_id or plan.symbol}"
+    already_queued = queued_alert_fingerprint(trade_id) == key
 
     def _queue_tracking_notification(queue_reason: str) -> None:
-        if not notify or not should_send_trade_plan(candidate, plan):
+        if not notify or already_queued or not should_send_trade_plan(candidate, plan):
             return
         queue_qualified_alert(
             trade_id=trade_id,
@@ -625,7 +629,7 @@ def send_trade_plan(
             # Tracking failure is operational/transport state, not rejection.
             return False
 
-    if not notify:
+    if not notify or already_queued:
         return False
     if not should_send_trade_plan(candidate, plan):
         record_telegram_suppression(

@@ -185,6 +185,9 @@ def _run_qualified_alert_retry_fail_open(*, settings) -> None:
         delivered, pending = retry_qualified_alerts(
             bot_token=bot_token,
             chat_id=chat_id,
+            max_new_trade_retries=int(
+                getattr(settings, "new_trade_alert_max_per_window", 3)
+            ),
         )
     except Exception as exc:
         print(

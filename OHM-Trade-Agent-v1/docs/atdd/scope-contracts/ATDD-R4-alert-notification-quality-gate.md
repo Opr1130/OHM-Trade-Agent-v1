@@ -114,6 +114,10 @@ AC-002 -> tests/test_opip_r4_alert_notification_quality.py::test_new_trade_windo
 AC-002 -> tests/test_opip_r4_alert_notification_quality.py::test_duplicate_ranks_do_not_consume_new_trade_slots
 AC-002 -> tests/test_opip_r4_alert_notification_quality.py::test_new_trade_delivery_never_exceeds_configured_cap
 AC-002 -> tests/test_opip_r4_alert_notification_quality.py::test_tracking_failure_queue_counts_toward_the_cap
+AC-002 -> tests/test_opip_r4_alert_notification_quality.py::test_same_queued_fingerprint_does_not_consume_another_slot
+AC-002 -> tests/test_opip_r4_alert_notification_quality.py::test_queued_unchanged_rank_leaves_the_slot_for_the_next_rank
+AC-002 -> tests/test_opip_r4_alert_notification_quality.py::test_recovery_delivers_no_more_than_the_configured_bound
+AC-002 -> tests/test_opip_r4_alert_notification_quality.py::test_recovery_bound_leaves_later_rows_pending_for_the_next_run
 AC-003 -> tests/test_opip_r4_alert_notification_quality.py::test_notification_threshold_does_not_change_rank_or_score
 AC-004 -> tests/test_opip_r4_alert_notification_quality.py::test_fingerprint_dedupe_cooldown_and_material_change
 AC-005 -> tests/test_opip_r4_alert_notification_quality.py::test_tracking_failure_does_not_terminalize_trade
@@ -136,6 +140,9 @@ AC-001 -> OHM-Trade-Agent-v1/app/jobs/scan_opportunities.py
 AC-001 -> OHM-Trade-Agent-v1/tests/test_trade_lifecycle.py
 AC-001 -> OHM-Trade-Agent-v1/tests/test_opip_r4_alert_notification_quality.py
 AC-002 -> OHM-Trade-Agent-v1/app/services/notification_policy.py
+AC-002 -> OHM-Trade-Agent-v1/app/services/qualified_alert_outbox.py
+AC-002 -> OHM-Trade-Agent-v1/app/services/chief_alert_notifier.py
+AC-002 -> OHM-Trade-Agent-v1/app/jobs/run_cycle.py
 AC-002 -> OHM-Trade-Agent-v1/app/core/config.py
 AC-002 -> OHM-Trade-Agent-v1/tests/test_opip_r4_alert_notification_quality.py
 AC-003 -> OHM-Trade-Agent-v1/app/services/notification_policy.py

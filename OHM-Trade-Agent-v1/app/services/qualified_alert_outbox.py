@@ -106,6 +106,27 @@ def queue_qualified_alert(
         save_json_atomic(OUTBOX_FILE, rows)
 
 
+def queued_alert_fingerprint(trade_id: str) -> str | None:
+    """Return the fingerprint already waiting for this trade, if any.
+
+    The outbox is the durable retry record. Callers use it so the same
+    trade and material fingerprint cannot open a second queue attempt.
+    """
+    key = str(trade_id or "").strip()
+    if not key:
+        return None
+    try:
+        with registry_lock(_lock_file()):
+            rows = load_json(OUTBOX_FILE)
+    except (OSError, TimeoutError, RegistryIOError):
+        return None
+    row = rows.get(key)
+    if not isinstance(row, dict):
+        return None
+    fingerprint = str(row.get("fingerprint") or "")
+    return fingerprint or None
+
+
 def _claim(trade_id: str, *, now: datetime | None = None) -> tuple[str, dict] | None:
     current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     with registry_lock(_lock_file()):
@@ -457,12 +478,27 @@ def _retry_one(
             )
 
 
+def _new_trade_retry_bound(explicit: int | None) -> int:
+    """Bound one recovery run with the operational NEW TRADE window setting."""
+    if explicit is None:
+        from app.core.config import Settings
+
+        explicit = Settings.model_fields["new_trade_alert_max_per_window"].default
+    return max(1, int(explicit))
+
+
 def retry_qualified_alerts(
     *,
     bot_token: str,
     chat_id: str,
+    max_new_trade_retries: int | None = None,
 ) -> tuple[int, int]:
-    """Retry operationally blocked qualified alerts without rescanning markets."""
+    """Retry operationally blocked qualified alerts without rescanning markets.
+
+    At most ``new_trade_alert_max_per_window`` NEW TRADE rows are attempted
+    per call, in durable insertion order. Rows past that bound stay pending.
+    """
+    cap = _new_trade_retry_bound(max_new_trade_retries)
     try:
         with registry_lock(_lock_file()):
             rows = load_json(OUTBOX_FILE)
@@ -471,7 +507,11 @@ def retry_qualified_alerts(
 
     delivered = 0
     pending = 0
+    attempted = 0
     for trade_id, row in list(rows.items()):
+        if attempted >= cap:
+            pending += 1
+            continue
         if not isinstance(row, dict):
             retired = _record_malformed_outbox(
                 trade_id=str(trade_id),
@@ -496,8 +536,10 @@ def retry_qualified_alerts(
                 chat_id=chat_id,
             )
         except Exception:
+            attempted += 1
             pending += 1
             continue
+        attempted += 1
         if status == "DELIVERED":
             delivered += 1
         elif status not in {
