@@ -62,55 +62,71 @@ def select_new_trade_window(
     max_per_window: int,
     min_quality_score: float,
 ) -> tuple[list[dict], list[dict]]:
-    """Choose notification slots from an already-ranked authoritative window.
+    """Classify notification quality without spending delivery capacity.
 
     Input order is the authoritative rank order. This function does not sort,
     rescore, or mutate the caller's rows. Missing quality evidence is not
-    treated as eligible. Rows past the bound stay in the returned suppressed
-    list so learning can still see them.
+    eligible to notify. The per-window cap is not applied here: already
+    delivered or cooldown-suppressed ranks must not consume NEW TRADE slots.
+    The scan counts actual delivery attempts after dedupe.
     """
+    del max_per_window
     eligible: list[dict] = []
     suppressed: list[dict] = []
     floor = float(min_quality_score)
     for row in rows:
-        score = row.get("quality_score")
-        try:
-            numeric = float(score)
-        except (TypeError, ValueError):
-            numeric = None
-        if numeric is None or numeric != numeric:
-            suppressed.append(
-                {
-                    **row,
-                    "notification_suppression_reason": (
-                        f"NOTIFICATION_QUALITY_UNAVAILABLE:{NOTIFICATION_POLICY_VERSION}"
-                    ),
-                }
-            )
-            continue
-        if numeric < floor:
-            suppressed.append(
-                {
-                    **row,
-                    "notification_suppression_reason": (
-                        f"NOTIFICATION_QUALITY_THRESHOLD:{NOTIFICATION_POLICY_VERSION}"
-                    ),
-                }
-            )
-            continue
-        eligible.append(row)
-    cap = max(1, int(max_per_window))
-    chosen = eligible[:cap]
-    for row in eligible[cap:]:
-        suppressed.append(
-            {
-                **row,
-                "notification_suppression_reason": (
-                    f"NEW_TRADE_VOLUME_BUDGET:{NOTIFICATION_POLICY_VERSION}:{cap}"
-                ),
-            }
+        reason = notification_quality_suppression_reason(
+            row.get("quality_score"),
+            min_quality_score=floor,
         )
-    return chosen, suppressed
+        if reason is None:
+            eligible.append(row)
+            continue
+        suppressed.append({**row, "notification_suppression_reason": reason})
+    return eligible, suppressed
+
+
+def notification_quality_suppression_reason(
+    quality_score,
+    *,
+    min_quality_score: float,
+) -> str | None:
+    """Return a notification-only reason, or None when the score may be sent."""
+    try:
+        numeric = float(quality_score)
+    except (TypeError, ValueError):
+        numeric = None
+    if numeric is None or numeric != numeric:
+        return f"NOTIFICATION_QUALITY_UNAVAILABLE:{NOTIFICATION_POLICY_VERSION}"
+    if numeric < float(min_quality_score):
+        return f"NOTIFICATION_QUALITY_THRESHOLD:{NOTIFICATION_POLICY_VERSION}"
+    return None
+
+
+def new_trade_volume_suppression_reason(max_per_window: int) -> str:
+    cap = max(1, int(max_per_window))
+    return f"NEW_TRADE_VOLUME_BUDGET:{NOTIFICATION_POLICY_VERSION}:{cap}"
+
+
+def new_trade_delivery_slot_open(attempts: int, max_per_window: int) -> bool:
+    """True while accepted NEW TRADE delivery attempts are still under the cap."""
+    return int(attempts) < max(1, int(max_per_window))
+
+
+def authorize_new_trade_notification(
+    *,
+    quality_reason: str | None,
+    delivery_attempts: int,
+    max_per_window: int,
+) -> tuple[bool, str | None]:
+    """Decide Telegram eligibility without changing rank order or lifecycle."""
+    notify = quality_reason is None and new_trade_delivery_slot_open(
+        delivery_attempts,
+        max_per_window,
+    )
+    if quality_reason is None and not notify:
+        return False, new_trade_volume_suppression_reason(max_per_window)
+    return notify, quality_reason
 
 
 def _now() -> datetime:

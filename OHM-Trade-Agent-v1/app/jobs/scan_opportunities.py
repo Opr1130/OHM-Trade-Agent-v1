@@ -47,7 +47,10 @@ from app.services.canonical_episode_capture import (
     canonical_episode_id,
 )
 from app.services.chief_alert_notifier import _alert_state_key, send_trade_plan
-from app.services.notification_policy import select_new_trade_window
+from app.services.notification_policy import (
+    authorize_new_trade_notification,
+    select_new_trade_window,
+)
 from app.services.telegram_delivery import record_telegram_suppression
 from app.services.chief_analyst import (
     SHORT_MARGIN_COST_RESERVE_PCT,
@@ -2197,7 +2200,7 @@ def main():
                 "ranked": ranked,
             }
         )
-    chosen_notifications, suppressed_notifications = select_new_trade_window(
+    _chosen_notifications, suppressed_notifications = select_new_trade_window(
         notification_window,
         max_per_window=int(
             getattr(settings, "new_trade_alert_max_per_window", 3)
@@ -2206,33 +2209,14 @@ def main():
             getattr(settings, "notification_quality_min_score", 0)
         ),
     )
-    chosen_notification_ids = {id(row["ranked"]) for row in chosen_notifications}
-    for row in suppressed_notifications:
-        ranked = row["ranked"]
-        opportunity = ranked.opportunity
-        alert = opportunity.alert
-        plan = opportunity.plan
-        reason = str(row.get("notification_suppression_reason") or "SUPPRESSED")
-        alert["notification_disposition"] = reason
-        try:
-            record_telegram_suppression(
-                identity=(
-                    f"QUALIFIED_OPPORTUNITY:{alert.get('trade_id') or plan.symbol}"
-                ),
-                alert_family="QUALIFIED_OPPORTUNITY",
-                event_type="NEW_TRADE",
-                fingerprint=_alert_state_key(alert, plan),
-                reason=reason,
-                symbol=plan.symbol,
-                journey_id=alert.get("journey_id"),
-                signal_id=alert.get("signal_id"),
-                trade_id=alert.get("trade_id"),
-            )
-        except Exception as exc:
-            print(
-                "O'Pip new-trade suppression audit failed:",
-                f"{type(exc).__name__}: {exc}",
-            )
+    quality_blocked = {
+        id(row["ranked"]): str(
+            row.get("notification_suppression_reason") or "SUPPRESSED"
+        )
+        for row in suppressed_notifications
+    }
+    delivery_attempts = 0
+    delivery_cap = int(getattr(settings, "new_trade_alert_max_per_window", 3))
 
     for ranked in ranked_opportunities:
         opportunity = ranked.opportunity
@@ -2250,19 +2234,45 @@ def main():
             profit_rank_score=ranked.profit_ranking.total_score,
         )
 
-        if id(ranked) not in chosen_notification_ids:
-            continue
-
+        notify, reason = authorize_new_trade_notification(
+            quality_reason=quality_blocked.get(id(ranked)),
+            delivery_attempts=delivery_attempts,
+            max_per_window=delivery_cap,
+        )
         if send_trade_plan(
             candidate=alert,
             plan=plan,
             summary=review.get("summary", ""),
             bot_token=settings.telegram_bot_token,
             chat_id=settings.telegram_chat_id,
+            notify=notify,
         ):
             sent += 1
             if not plan.valid_now:
                 pending_saved += 1
+        if alert.get("notification_attempted"):
+            delivery_attempts += 1
+        if reason is not None:
+            alert["notification_disposition"] = reason
+            try:
+                record_telegram_suppression(
+                    identity=(
+                        f"QUALIFIED_OPPORTUNITY:{alert.get('trade_id') or plan.symbol}"
+                    ),
+                    alert_family="QUALIFIED_OPPORTUNITY",
+                    event_type="NEW_TRADE",
+                    fingerprint=_alert_state_key(alert, plan),
+                    reason=reason,
+                    symbol=plan.symbol,
+                    journey_id=alert.get("journey_id"),
+                    signal_id=alert.get("signal_id"),
+                    trade_id=alert.get("trade_id"),
+                )
+            except Exception as exc:
+                print(
+                    "O'Pip new-trade suppression audit failed:",
+                    f"{type(exc).__name__}: {exc}",
+                )
 
     print("")
     print("===== OHM HIGH-CONVICTION SUMMARY =====")

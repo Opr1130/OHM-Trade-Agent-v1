@@ -4,13 +4,21 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from app.api import routes
 from app.jobs import scan_opportunities
-from app.services import chief_alert_notifier, notification_policy
+from app.services import (
+    chief_alert_notifier,
+    notification_policy,
+    pending_setup_registry,
+    qualified_alert_outbox,
+    trade_outcome_registry,
+)
 from app.services.entry_exit_advisor import EntryExitPlan
+from app.services.registry_io import load_json
 from app.services.telegram_delivery import record_telegram_suppression
 
 
@@ -67,10 +75,12 @@ def test_new_trade_window_is_ranked_and_bounded():
         max_per_window=2,
         min_quality_score=0,
     )
-    assert [row["symbol"] for row in chosen] == ["AAA", "BBB"]
-    assert [row["rank"] for row in chosen] == [1, 2]
-    assert any(row["symbol"] == "CCC" for row in suppressed)
-    assert any("NEW_TRADE_VOLUME_BUDGET" in row["notification_suppression_reason"] for row in suppressed)
+    assert [row["symbol"] for row in chosen] == ["AAA", "BBB", "CCC"]
+    assert [row["rank"] for row in chosen] == [1, 2, 3]
+    assert [row["symbol"] for row in suppressed] == ["DDD"]
+    assert "NOTIFICATION_QUALITY_UNAVAILABLE" in suppressed[0]["notification_suppression_reason"]
+    assert notification_policy.new_trade_delivery_slot_open(1, 2)
+    assert not notification_policy.new_trade_delivery_slot_open(2, 2)
     emergency = Path(APP / "app" / "services" / "emergency_alert_notifier.py").read_text(encoding="utf-8")
     assert "select_new_trade_window" not in emergency
 
@@ -200,7 +210,9 @@ def test_notification_policy_does_not_rebuild_qualification():
     assert len(chosen) + len(suppressed) == 4
     scan = Path(scan_opportunities.__file__).read_text(encoding="utf-8")
     assert "_route_paper_v2_opportunities(\n                ranked_opportunities," in scan
-    assert "chosen_notification_ids" in scan
+    assert "_publish_freqtrade_paper_opportunities(\n            ranked_opportunities," in scan
+    assert "chosen_notification_ids" not in scan
+    assert "authorize_new_trade_notification" in scan
 
 
 def test_suppressed_candidate_remains_auditable(tmp_path):
@@ -209,7 +221,7 @@ def test_suppressed_candidate_remains_auditable(tmp_path):
     _chosen, suppressed = notification_policy.select_new_trade_window(
         rows,
         max_per_window=1,
-        min_quality_score=0,
+        min_quality_score=85,
     )
     assert any(row["symbol"] == "BBB" for row in suppressed)
     event_file = tmp_path / "events.jsonl"
@@ -254,3 +266,197 @@ def test_protection_alerts_are_outside_the_new_trade_budget(tmp_path, monkeypatc
     assert "select_new_trade_window" not in Path(
         APP / "app" / "services" / "trade_monitor_notifier.py"
     ).read_text(encoding="utf-8")
+
+
+def _isolate_lifecycle(tmp_path, monkeypatch):
+    monkeypatch.setattr(pending_setup_registry, "PENDING_FILE", tmp_path / "pending.json")
+    monkeypatch.setattr(trade_outcome_registry, "OUTCOME_FILE", tmp_path / "outcomes.json")
+    monkeypatch.setattr(qualified_alert_outbox, "OUTBOX_FILE", tmp_path / "outbox.json")
+    monkeypatch.setattr(chief_alert_notifier, "STATE_FILE", tmp_path / "alert_state.json")
+    monkeypatch.setattr(chief_alert_notifier, "STATE_LOCK_FILE", tmp_path / ".alert_state.lock")
+    monkeypatch.setattr(notification_policy, "STATE_FILE", tmp_path / "notification.json")
+    monkeypatch.setattr(notification_policy, "LOCK_FILE", tmp_path / ".notification.lock")
+    tracked = []
+    monkeypatch.setattr(
+        chief_alert_notifier,
+        "_register_reconciliation_intent",
+        lambda **kwargs: tracked.append(kwargs["trade_id"]),
+    )
+    return tracked
+
+
+def _candidate(symbol: str, score: float) -> dict:
+    return {
+        "symbol": symbol,
+        "confidence": 88,
+        "decision": "alert",
+        "economic_qualified": True,
+        "action_gate_evaluated": True,
+        "action_gate_allowed": True,
+        "profit_rank_score": score,
+        "direction": "LONG",
+        "underlying_asset": symbol,
+        "primary_pair": symbol,
+        "reference_price": 100.0,
+    }
+
+
+def _send_ranked(candidates, *, cap: float, floor: float, monkeypatch):
+    sent_messages = []
+
+    def _send(**kwargs):
+        sent_messages.append(kwargs["message"])
+        return SimpleNamespace(delivered=True, message_id="m-1")
+
+    monkeypatch.setattr(chief_alert_notifier, "send_tracked_telegram", _send)
+    attempts = 0
+    for candidate in candidates:
+        quality_reason = notification_policy.notification_quality_suppression_reason(
+            candidate["profit_rank_score"],
+            min_quality_score=floor,
+        )
+        notify, _reason = notification_policy.authorize_new_trade_notification(
+            quality_reason=quality_reason,
+            delivery_attempts=attempts,
+            max_per_window=int(cap),
+        )
+        chief_alert_notifier.send_trade_plan(
+            candidate,
+            _plan(symbol=candidate["symbol"]),
+            "summary",
+            "token",
+            "chat",
+            notify=notify,
+        )
+        if candidate.get("notification_attempted"):
+            attempts += 1
+    return sent_messages, attempts
+
+
+def test_threshold_suppression_keeps_lifecycle(tmp_path, monkeypatch):
+    """ATDD-R4-alert-notification-quality-gate/AC-007: a quality-floor skip still records the trade."""
+    tracked = _isolate_lifecycle(tmp_path, monkeypatch)
+    candidate = _candidate("LOW", 10)
+    sent, attempts = _send_ranked([candidate], cap=3, floor=80, monkeypatch=monkeypatch)
+    waiting = pending_setup_registry.get_pending_setups()
+    assert len(waiting) == 1
+    assert waiting[0].symbol == "LOW"
+    outcomes = load_json(trade_outcome_registry.OUTCOME_FILE)
+    assert any(row.get("trade_id") == waiting[0].trade_id for row in outcomes.values())
+    assert tracked == [waiting[0].trade_id]
+    assert sent == []
+    assert attempts == 0
+
+
+def test_volume_cap_suppression_keeps_lifecycle(tmp_path, monkeypatch):
+    """ATDD-R4-alert-notification-quality-gate/AC-007: a window-cap skip still records the trade."""
+    tracked = _isolate_lifecycle(tmp_path, monkeypatch)
+    candidates = [_candidate("AAA", 90), _candidate("BBB", 80)]
+    sent, attempts = _send_ranked(candidates, cap=1, floor=0, monkeypatch=monkeypatch)
+    waiting = pending_setup_registry.get_pending_setups()
+    assert {setup.symbol for setup in waiting} == {"AAA", "BBB"}
+    outcomes = load_json(trade_outcome_registry.OUTCOME_FILE)
+    recorded = {row.get("trade_id") for row in outcomes.values()}
+    assert recorded == {setup.trade_id for setup in waiting}
+    assert set(tracked) == recorded
+    assert len(sent) == 1
+    assert attempts == 1
+
+
+def test_duplicate_ranks_do_not_consume_new_trade_slots(tmp_path, monkeypatch):
+    """ATDD-R4-alert-notification-quality-gate/AC-002: cooldown duplicates leave the slot for the next rank."""
+    _isolate_lifecycle(tmp_path, monkeypatch)
+    fresh = {"FRESH"}
+
+    def _should_send(candidate, plan):
+        return plan.symbol in fresh
+
+    monkeypatch.setattr(chief_alert_notifier, "should_send_trade_plan", _should_send)
+    candidates = [
+        _candidate("OLD1", 99),
+        _candidate("OLD2", 98),
+        _candidate("OLD3", 97),
+        _candidate("FRESH", 70),
+    ]
+    sent, attempts = _send_ranked(candidates, cap=1, floor=0, monkeypatch=monkeypatch)
+    assert attempts == 1
+    assert len(sent) == 1
+    assert "trade_id=" in sent[0]
+    fresh_setup = next(
+        setup for setup in pending_setup_registry.get_pending_setups() if setup.symbol == "FRESH"
+    )
+    assert f"trade_id={fresh_setup.trade_id}" in sent[0]
+    assert {setup.symbol for setup in pending_setup_registry.get_pending_setups()} == {
+        "OLD1",
+        "OLD2",
+        "OLD3",
+        "FRESH",
+    }
+
+
+def test_new_trade_delivery_never_exceeds_configured_cap(tmp_path, monkeypatch):
+    """ATDD-R4-alert-notification-quality-gate/AC-002: only real delivery attempts spend the cap."""
+    _isolate_lifecycle(tmp_path, monkeypatch)
+    candidates = [_candidate(symbol, 90 - index) for index, symbol in enumerate(["A", "B", "C", "D", "E"])]
+    sent, attempts = _send_ranked(candidates, cap=2, floor=0, monkeypatch=monkeypatch)
+    assert attempts == 2
+    assert len(sent) == 2
+    assert len(pending_setup_registry.get_pending_setups()) == 5
+
+
+def test_delivered_primary_message_contains_generated_trade_id(tmp_path, monkeypatch):
+    """ATDD-R4-alert-notification-quality-gate/AC-006: the sent body uses the assigned trade id."""
+    _isolate_lifecycle(tmp_path, monkeypatch)
+    candidate = _candidate("SOL", 90)
+    sent, _attempts = _send_ranked([candidate], cap=1, floor=0, monkeypatch=monkeypatch)
+    trade_id = pending_setup_registry.get_pending_setups()[0].trade_id
+    assert sent[0].count(f"trade_id={trade_id}") == 1
+    assert candidate["trade_id"] == trade_id
+
+
+def test_queued_outbox_message_contains_same_trade_id(tmp_path, monkeypatch):
+    """ATDD-R4-alert-notification-quality-gate/AC-006: the retry body uses that same trade id."""
+    _isolate_lifecycle(tmp_path, monkeypatch)
+
+    def _fail(**kwargs):
+        return SimpleNamespace(delivered=False, message_id=None)
+
+    monkeypatch.setattr(chief_alert_notifier, "send_tracked_telegram", _fail)
+    candidate = _candidate("SOL", 90)
+    chief_alert_notifier.send_trade_plan(
+        candidate,
+        _plan(symbol="SOL"),
+        "summary",
+        "token",
+        "chat",
+    )
+    trade_id = candidate["trade_id"]
+    with qualified_alert_outbox.registry_lock(qualified_alert_outbox._lock_file()):
+        rows = load_json(qualified_alert_outbox.OUTBOX_FILE)
+    assert trade_id in rows
+    assert f"trade_id={trade_id}" in rows[trade_id]["message"]
+
+
+def test_notification_settings_do_not_change_paper_routing_input():
+    """ATDD-R4-alert-notification-quality-gate/AC-007: threshold and cap do not narrow paper input."""
+    scan = Path(scan_opportunities.__file__).read_text(encoding="utf-8")
+    paper_at = scan.index("_route_paper_v2_opportunities(\n                ranked_opportunities,")
+    alert_at = scan.index("notify, reason = authorize_new_trade_notification(")
+    assert alert_at < paper_at
+    paper_block = scan[paper_at:]
+    assert "notification_quality_min_score" not in paper_block
+    assert "new_trade_alert_max_per_window" not in paper_block
+    rows = _rows()
+    low_cap, _low_suppressed = notification_policy.select_new_trade_window(
+        rows,
+        max_per_window=1,
+        min_quality_score=0,
+    )
+    high_cap, _high_suppressed = notification_policy.select_new_trade_window(
+        rows,
+        max_per_window=20,
+        min_quality_score=90,
+    )
+    assert [row["symbol"] for row in low_cap] == ["AAA", "BBB", "CCC"]
+    assert [row["symbol"] for row in high_cap] == ["AAA"]
+    assert rows[0]["rank"] == 1

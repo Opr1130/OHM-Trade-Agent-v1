@@ -22,6 +22,7 @@ from app.services.pending_setup_registry import (
     PendingSetup,
     add_pending_setup,
     get_pending_setup_by_trade_id,
+    get_pending_setups,
 )
 from app.services.price_movement_radar import attach_actionable_plan
 from app.services.qualified_alert_outbox import queue_qualified_alert
@@ -417,12 +418,36 @@ def _register_reconciliation_intent(
     )
 
 
+def _waiting_setup_for_plan(
+    plan: EntryExitPlan,
+    *,
+    direction: str,
+) -> PendingSetup | None:
+    """Reuse one waiting lifecycle when the geometry has not changed."""
+    for setup in get_pending_setups():
+        if (
+            setup.symbol == plan.symbol
+            and str(setup.direction or "LONG").upper() == direction
+            and setup.entry_low == plan.entry_low
+            and setup.entry_high == plan.entry_high
+            and setup.chase_limit == plan.chase_limit
+            and setup.stop_price == plan.stop_price
+            and setup.target_1 == plan.target_1
+            and setup.target_2 == plan.target_2
+            and setup.risk_level == plan.risk_level
+        ):
+            return setup
+    return None
+
+
 def send_trade_plan(
     candidate: dict[str, Any],
     plan: EntryExitPlan,
     summary: str,
     bot_token: str,
     chat_id: str,
+    *,
+    notify: bool = True,
 ) -> bool:
     action = _action_type(plan)
     direction = str(candidate.get("direction") or plan.direction or "LONG").upper()
@@ -441,19 +466,7 @@ def send_trade_plan(
             trade_id=candidate.get("trade_id"),
         )
         return False
-    if not should_send_trade_plan(candidate, plan):
-        record_telegram_suppression(
-            identity=identity,
-            alert_family="QUALIFIED_OPPORTUNITY",
-            event_type=action,
-            fingerprint=initial_fingerprint,
-            reason="DEDUP_OR_NOTIFICATION_POLICY",
-            symbol=plan.symbol,
-            journey_id=candidate.get("journey_id"),
-            signal_id=candidate.get("signal_id"),
-            trade_id=candidate.get("trade_id"),
-        )
-        return False
+    candidate["notification_attempted"] = False
     if candidate.get("action_gate_evaluated") is not True:
         record_telegram_not_eligible(
             identity=identity,
@@ -491,17 +504,15 @@ def send_trade_plan(
         candidate["price_movement"] = movement
 
     leverage = float(candidate.get("margin_leverage") or (2.0 if direction == "SHORT" else 1.0))
-    message = format_primary_new_trade_alert(candidate=candidate, plan=plan)
-    candidate["alert_detail"] = format_trade_plan(
-        candidate=candidate,
-        plan=plan,
-        summary=summary,
-    )
 
     # A materially new plan must receive a new immutable lifecycle id. Never
     # reuse another waiting setup merely because the symbol is the same.
     trade_id = str(candidate.get("trade_id") or "")
     setup = get_pending_setup_by_trade_id(trade_id) if trade_id else None
+    if setup is None and not trade_id:
+        setup = _waiting_setup_for_plan(plan, direction=direction)
+        if setup is not None:
+            trade_id = setup.trade_id
     if setup is None:
         setup = add_pending_setup(
             PendingSetup(
@@ -530,6 +541,12 @@ def send_trade_plan(
         plan=plan,
         action=action,
     )
+    message = format_primary_new_trade_alert(candidate=candidate, plan=plan)
+    candidate["alert_detail"] = format_trade_plan(
+        candidate=candidate,
+        plan=plan,
+        summary=summary,
+    )
     key = _alert_state_key(candidate, plan)
     identity = f"QUALIFIED_OPPORTUNITY:{trade_id or plan.symbol}"
 
@@ -550,17 +567,18 @@ def send_trade_plan(
             # terminalize a still-waiting qualified setup.
             reason = f"TRACKING_FAILURE_RETRYABLE:{type(exc).__name__}"
             try:
-                queue_qualified_alert(
-                    trade_id=trade_id,
-                    message=message,
-                    candidate=candidate,
-                    plan=plan,
-                    action=action,
-                    direction=direction,
-                    identity=identity,
-                    fingerprint=key,
-                    reason=reason,
-                )
+                if notify:
+                    queue_qualified_alert(
+                        trade_id=trade_id,
+                        message=message,
+                        candidate=candidate,
+                        plan=plan,
+                        action=action,
+                        direction=direction,
+                        identity=identity,
+                        fingerprint=key,
+                        reason=reason,
+                    )
             except Exception as queue_exc:
                 print(
                     "O'Pip tracking-failure queueing failed:",
@@ -581,17 +599,18 @@ def send_trade_plan(
             return False
         except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
             try:
-                queue_qualified_alert(
-                    trade_id=trade_id,
-                    message=message,
-                    candidate=candidate,
-                    plan=plan,
-                    action=action,
-                    direction=direction,
-                    identity=identity,
-                    fingerprint=key,
-                    reason=f"TRACKING_PENDING:{type(exc).__name__}",
-                )
+                if notify:
+                    queue_qualified_alert(
+                        trade_id=trade_id,
+                        message=message,
+                        candidate=candidate,
+                        plan=plan,
+                        action=action,
+                        direction=direction,
+                        identity=identity,
+                        fingerprint=key,
+                        reason=f"TRACKING_PENDING:{type(exc).__name__}",
+                    )
             except Exception as queue_exc:
                 print(
                     "O'Pip qualified alert queueing failed:",
@@ -611,6 +630,22 @@ def send_trade_plan(
                 )
             # Tracking failure is operational/transport state, not rejection.
             return False
+
+    if not notify:
+        return False
+    if not should_send_trade_plan(candidate, plan):
+        record_telegram_suppression(
+            identity=identity,
+            alert_family="QUALIFIED_OPPORTUNITY",
+            event_type=action,
+            fingerprint=key,
+            reason="DEDUP_OR_NOTIFICATION_POLICY",
+            symbol=plan.symbol,
+            journey_id=candidate.get("journey_id"),
+            signal_id=candidate.get("signal_id"),
+            trade_id=trade_id,
+        )
+        return False
 
     accepted_message_id = accepted_delivery_message_id(
         identity=identity,
@@ -647,6 +682,7 @@ def send_trade_plan(
         )
         return False
 
+    candidate["notification_attempted"] = True
     delivered = False
     settled = False
     delivery_reason = "DELIVERY_PENDING"
