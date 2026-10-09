@@ -550,6 +550,22 @@ def send_trade_plan(
     key = _alert_state_key(candidate, plan)
     identity = f"QUALIFIED_OPPORTUNITY:{trade_id or plan.symbol}"
 
+    def _queue_tracking_notification(queue_reason: str) -> None:
+        if not notify or not should_send_trade_plan(candidate, plan):
+            return
+        queue_qualified_alert(
+            trade_id=trade_id,
+            message=message,
+            candidate=candidate,
+            plan=plan,
+            action=action,
+            direction=direction,
+            identity=identity,
+            fingerprint=key,
+            reason=queue_reason,
+        )
+        candidate["notification_attempted"] = True
+
     if candidate.get("economic_qualified") is True:
         if not trade_id:
             return False
@@ -567,18 +583,7 @@ def send_trade_plan(
             # terminalize a still-waiting qualified setup.
             reason = f"TRACKING_FAILURE_RETRYABLE:{type(exc).__name__}"
             try:
-                if notify:
-                    queue_qualified_alert(
-                        trade_id=trade_id,
-                        message=message,
-                        candidate=candidate,
-                        plan=plan,
-                        action=action,
-                        direction=direction,
-                        identity=identity,
-                        fingerprint=key,
-                        reason=reason,
-                    )
+                _queue_tracking_notification(reason)
             except Exception as queue_exc:
                 print(
                     "O'Pip tracking-failure queueing failed:",
@@ -599,18 +604,7 @@ def send_trade_plan(
             return False
         except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
             try:
-                if notify:
-                    queue_qualified_alert(
-                        trade_id=trade_id,
-                        message=message,
-                        candidate=candidate,
-                        plan=plan,
-                        action=action,
-                        direction=direction,
-                        identity=identity,
-                        fingerprint=key,
-                        reason=f"TRACKING_PENDING:{type(exc).__name__}",
-                    )
+                _queue_tracking_notification(f"TRACKING_PENDING:{type(exc).__name__}")
             except Exception as queue_exc:
                 print(
                     "O'Pip qualified alert queueing failed:",

@@ -394,6 +394,55 @@ def test_duplicate_ranks_do_not_consume_new_trade_slots(tmp_path, monkeypatch):
     }
 
 
+def test_tracking_failure_queue_counts_toward_the_cap(tmp_path, monkeypatch):
+    """ATDD-R4-alert-notification-quality-gate/AC-002: a queued tracking retry spends one NEW TRADE slot."""
+    calls = {"n": 0}
+
+    def _tracking(**kwargs):
+        calls["n"] += 1
+        if kwargs["candidate"]["symbol"] == "AAA":
+            raise RuntimeError("tracking unavailable")
+
+    monkeypatch.setattr(chief_alert_notifier, "_register_reconciliation_intent", _tracking)
+    _isolate_lifecycle(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        chief_alert_notifier,
+        "_register_reconciliation_intent",
+        _tracking,
+    )
+    sent, attempts = _send_ranked(
+        [_candidate("AAA", 90), _candidate("BBB", 80)],
+        cap=1,
+        floor=0,
+        monkeypatch=monkeypatch,
+    )
+    with qualified_alert_outbox.registry_lock(qualified_alert_outbox._lock_file()):
+        rows = load_json(qualified_alert_outbox.OUTBOX_FILE)
+    assert attempts == 1
+    assert sent == []
+    assert len(rows) == 1
+    assert {setup.symbol for setup in pending_setup_registry.get_pending_setups()} == {"AAA", "BBB"}
+
+    monkeypatch.setattr(chief_alert_notifier, "should_send_trade_plan", lambda *args: False)
+    monkeypatch.setattr(
+        chief_alert_notifier,
+        "_register_reconciliation_intent",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("tracking unavailable")),
+    )
+    duplicate = _candidate("OLD", 99)
+    chief_alert_notifier.send_trade_plan(
+        duplicate,
+        _plan(symbol="OLD"),
+        "summary",
+        "token",
+        "chat",
+    )
+    with qualified_alert_outbox.registry_lock(qualified_alert_outbox._lock_file()):
+        rows = load_json(qualified_alert_outbox.OUTBOX_FILE)
+    assert len(rows) == 1
+    assert duplicate.get("notification_attempted") is False
+
+
 def test_new_trade_delivery_never_exceeds_configured_cap(tmp_path, monkeypatch):
     """ATDD-R4-alert-notification-quality-gate/AC-002: only real delivery attempts spend the cap."""
     _isolate_lifecycle(tmp_path, monkeypatch)

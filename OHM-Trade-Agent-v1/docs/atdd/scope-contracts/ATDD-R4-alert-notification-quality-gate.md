@@ -113,6 +113,7 @@ AC-001 -> tests/test_opip_r4_alert_notification_quality.py::test_score_only_path
 AC-002 -> tests/test_opip_r4_alert_notification_quality.py::test_new_trade_window_is_ranked_and_bounded
 AC-002 -> tests/test_opip_r4_alert_notification_quality.py::test_duplicate_ranks_do_not_consume_new_trade_slots
 AC-002 -> tests/test_opip_r4_alert_notification_quality.py::test_new_trade_delivery_never_exceeds_configured_cap
+AC-002 -> tests/test_opip_r4_alert_notification_quality.py::test_tracking_failure_queue_counts_toward_the_cap
 AC-003 -> tests/test_opip_r4_alert_notification_quality.py::test_notification_threshold_does_not_change_rank_or_score
 AC-004 -> tests/test_opip_r4_alert_notification_quality.py::test_fingerprint_dedupe_cooldown_and_material_change
 AC-005 -> tests/test_opip_r4_alert_notification_quality.py::test_tracking_failure_does_not_terminalize_trade
