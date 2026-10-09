@@ -21,6 +21,7 @@ from app.services.evidence_shadow_readiness import (
     BLOCK_GEOMETRY_INVALID,
     BLOCK_INCIDENT_OPEN,
     BLOCK_INCIDENT_UNKNOWN,
+    BLOCK_INCIDENT_UNREADABLE,
     BLOCK_POSITION_VERIFICATION_GAP,
     BLOCK_PRICING_GAP,
     BLOCK_SILENT_HOLDING,
@@ -255,6 +256,20 @@ def test_incident_without_scope_is_malformed():
     )
     assert result.ready is False
     assert BLOCK_EVIDENCE_MALFORMED in result.blocking_reason_codes
+
+
+# 11b. unreadable incident evidence is never an empty incident set
+def test_unreadable_incident_evidence_blocks_and_is_never_empty():
+    result = evaluate_evidence_shadow_readiness(
+        [],
+        coverage_complete=True,
+        open_incidents=None,
+    )
+    assert result.ready is False
+    assert result.state == STATE_BLOCKED
+    assert BLOCK_INCIDENT_UNREADABLE in result.blocking_reason_codes
+    assert BLOCK_INCIDENT_OPEN not in result.blocking_reason_codes
+    assert BLOCK_EVIDENCE_MALFORMED not in result.blocking_reason_codes
 
 
 # 12. decision performs no mutation

@@ -19,10 +19,29 @@ from app.jobs import preflight_protection_health as preflight
 from app.jobs.preflight_protection_health import (
     build_preflight_document,
     format_incident_health,
+    format_marker_codes,
+    format_marker_incidents,
     format_marker_symbols,
 )
-from app.jobs.report_protection_health import build_report as _build_report
-from app.services.protection_health import evaluate_protection_health
+from app.jobs.report_protection_health import (
+    ProtectionObservation,
+    build_report as _build_report,
+)
+from app.services.evidence_shadow_readiness import (
+    ADVISORY_CANDIDATE_RECOVERABLE_INCIDENT,
+    BLOCK_COVERAGE_INCOMPLETE,
+    BLOCK_INCIDENT_UNREADABLE,
+    STATE_BLOCKED,
+    STATE_READY,
+    evaluate_evidence_shadow_readiness,
+)
+from app.services.protection_health import (
+    REASON_UNMANAGED_EXPOSURE,
+    STATE_HEALTHY,
+    STATE_UNAVAILABLE,
+    STATE_UNSAFE,
+    evaluate_protection_health,
+)
 from tests.test_opip_deployment_transaction_boundary_v1 import (
     RELEASE_SHA,
     _classify,
@@ -73,14 +92,126 @@ def _report(**overrides):
     return report
 
 
-def _document(report, incidents=True):
-    return build_preflight_document(
-        report,
+def _shadow(
+    *,
+    exposures=(),
+    coverage_complete=True,
+    open_incidents=(),
+    degraded_scopes=frozenset(),
+):
+    return evaluate_evidence_shadow_readiness(
+        exposures,
+        coverage_complete=coverage_complete,
+        open_incidents=open_incidents,
+        current_degraded_scopes=degraded_scopes,
+    )
+
+
+def _observation(report, incidents=True, *, shadow=None):
+    """Build a coherent observation for a synthetic strict report.
+
+    When no explicit shadow result is supplied, derive a plausible one from the
+    report's coverage and the supplied incident verdict, so a legacy strict-field
+    assertion also exercises the AC-026 verdict projection.
+    """
+    if shadow is None:
+        if report.get("coverage_complete") is not True:
+            shadow = _shadow(coverage_complete=False)
+        elif incidents is not True:
+            shadow = _shadow(open_incidents=None)
+        else:
+            shadow = _shadow(coverage_complete=True)
+    return ProtectionObservation(
+        report=report,
         incidents_healthy=incidents,
+        shadow=shadow,
+    )
+
+
+def _document(report, incidents=True, *, shadow=None):
+    return build_preflight_document(
+        _observation(report, incidents, shadow=shadow),
         candidate_sha=SHA,
         release_profile="EVIDENCE_SHADOW",
         checked_at_utc=WHEN,
     )
+
+
+def _managed(symbol, *, stop=95.0, entry=100.0, direction="LONG"):
+    return types.SimpleNamespace(
+        status="VERIFIED_MANAGED",
+        symbol=symbol,
+        trade=types.SimpleNamespace(
+            direction=direction, entry_price=entry, stop_price=stop
+        ),
+    )
+
+
+def _unmanaged(symbol):
+    return types.SimpleNamespace(status="VERIFIED_UNMANAGED", symbol=symbol, trade=None)
+
+
+def _degraded(symbol):
+    return types.SimpleNamespace(status="DEGRADED", symbol=symbol, trade=None)
+
+
+def _incident_row(scope, state="OPEN"):
+    return {"scope": scope, "state": state, "incident_key": f"SYSTEM_HEALTH:{scope}"}
+
+
+def _run_preflight(
+    monkeypatch,
+    *,
+    exposures=(),
+    coverage_complete=True,
+    degraded_scopes=frozenset(),
+    incidents=None,
+    resolver_error=None,
+    candidate_sha=SHA,
+    release_profile="EVIDENCE_SHADOW",
+):
+    """Run the real composition with an injected observation, read-only.
+
+    Counts are recorded so a test can assert one resolver call and one incident
+    read per decision.
+    """
+    import app.jobs.report_protection_health as reporter
+
+    calls = {"resolver": 0, "incident_reads": 0}
+
+    if resolver_error is not None:
+        def _resolve():
+            raise RuntimeError(resolver_error)
+    else:
+        resolution = types.SimpleNamespace(
+            exposures=tuple(exposures),
+            coverage_complete=coverage_complete,
+            reason="",
+            degraded_scopes=degraded_scopes,
+        )
+
+        def _resolve():
+            calls["resolver"] += 1
+            return resolution
+
+    monkeypatch.setattr(
+        reporter,
+        "_read_only_resolver",
+        lambda: types.SimpleNamespace(resolve=_resolve),
+    )
+
+    payload = incidents if incidents is not None else {"incidents": {}}
+
+    def _read_incidents(path):
+        calls["incident_reads"] += 1
+        return payload
+
+    monkeypatch.setattr(reporter, "read_json_without_quarantine", _read_incidents)
+
+    document = preflight.evaluate_preflight(
+        candidate_sha=candidate_sha, release_profile=release_profile
+    )
+    return document, calls
 
 
 def _without_comments(text: str) -> str:
@@ -111,11 +242,16 @@ def _boundary_code() -> str:
 
 @pytest.mark.acceptance
 def test_ac_024_healthy_preflight_is_ready():
-    """ATDD-RELEASE-PIPELINE-v1/AC-024: only a HEALTHY complete non-suspended protection decision is ready to cross the mutable release boundary."""
+    """ATDD-RELEASE-PIPELINE-v1/AC-024: a HEALTHY complete non-suspended strict protection decision with READY EVIDENCE_SHADOW readiness is ready to cross the mutable release boundary."""
     document = _document(_report())
     assert document["read_only"] is True
     assert document["verdict"]["ready"] is True
     assert document["protection"]["reason_codes"] == ["PROTECTION_PROVEN"]
+    assert document["strict_f11"]["state"] == STATE_HEALTHY
+    assert document["strict_f11"]["healthy"] is True
+    assert document["evidence_shadow"]["state"] == STATE_READY
+    assert document["markers"]["strict_f11_state"] == "HEALTHY"
+    assert document["markers"]["evidence_shadow_readiness"] == "READY"
     assert document["incidents"]["open_incident_count"] is None
     assert document["incidents"]["open_incidents"] is None
     assert document["markers"]["incident_health"] == "true"
@@ -123,7 +259,7 @@ def test_ac_024_healthy_preflight_is_ready():
 
 @pytest.mark.acceptance
 @pytest.mark.parametrize(
-    ("report", "incidents", "code", "expected_health"),
+    ("report", "incidents", "shadow", "code", "expected_health"),
     [
         (
             _report(
@@ -135,18 +271,8 @@ def test_ac_024_healthy_preflight_is_ready():
                 unmanaged_exposures=["ADA.Z"],
             ),
             True,
+            _shadow(coverage_complete=False),
             "EXPOSURE_COVERAGE_INCOMPLETE",
-            "true",
-        ),
-        (
-            _report(
-                state="UNSAFE",
-                admissions_suspended=True,
-                reason_codes=["UNMANAGED_EXPOSURE_REQUIRES_REVIEW"],
-                unmanaged_exposures=["ADAUSD"],
-            ),
-            True,
-            "UNMANAGED_EXPOSURE_REQUIRES_REVIEW",
             "true",
         ),
         (
@@ -156,6 +282,7 @@ def test_ac_024_healthy_preflight_is_ready():
                 reason_codes=["PROTECTION_INCIDENT_OPEN"],
             ),
             False,
+            _shadow(open_incidents=None),
             "PROTECTION_INCIDENT_OPEN",
             "false",
         ),
@@ -167,6 +294,7 @@ def test_ac_024_healthy_preflight_is_ready():
                 reason_codes=["UNAVAILABLE"],
             ),
             None,
+            _shadow(coverage_complete=False, open_incidents=None),
             "UNAVAILABLE",
             "UNPROVEN",
         ),
@@ -178,17 +306,19 @@ def test_ac_024_healthy_preflight_is_ready():
                 silent_holdings=["BTCUSD"],
             ),
             True,
+            _shadow(exposures=[_managed("BTCUSD", stop=0.0)]),
             "SILENT_HOLDING_UNPROTECTED_EXPOSURE",
             "true",
         ),
     ],
 )
-def test_ac_024_non_healthy_protection_is_not_ready(
-    report, incidents, code, expected_health
+def test_ac_024_non_ready_protection_is_refused(
+    report, incidents, shadow, code, expected_health
 ):
-    """ATDD-RELEASE-PIPELINE-v1/AC-024: incomplete coverage, unmanaged exposure, an open incident, UNAVAILABLE and UNSAFE all refuse before mutation, and the incident verdict is carried through."""
-    document = _document(report, incidents)
+    """ATDD-RELEASE-PIPELINE-v1/AC-024: incomplete coverage, an open/unproven incident and a silent managed holding all refuse before mutation, and the strict incident verdict is carried through unchanged."""
+    document = _document(report, incidents, shadow=shadow)
     assert document["verdict"]["ready"] is False
+    assert document["evidence_shadow"]["state"] == STATE_BLOCKED
     assert code in document["protection"]["reason_codes"]
     assert document["protection"]["admissions_suspended"] is True
     assert document["incidents"]["health"] is incidents
@@ -225,27 +355,17 @@ def test_ac_024_incident_health_consistent_with_classification(
 @pytest.mark.acceptance
 def test_ac_024_one_incident_observation_drives_report_and_marker(monkeypatch):
     """ATDD-RELEASE-PIPELINE-v1/AC-024: the preflight observes the incident store exactly once and reuses that verdict for both protection classification and the incident-health marker."""
-    import app.jobs.report_protection_health as reporter
-
-    calls = {"count": 0}
-
-    class FakeResolution:
-        exposures: tuple = ()
-        coverage_complete = True
-        reason = ""
-
-    def fake_incidents():
-        calls["count"] += 1
-        return False
-
-    monkeypatch.setattr(reporter, "protection_incidents_healthy", fake_incidents)
-    monkeypatch.setattr(
-        reporter, "_read_only_resolver", lambda: types.SimpleNamespace(resolve=FakeResolution)
+    document, calls = _run_preflight(
+        monkeypatch,
+        exposures=[_managed("XBTUSD")],
+        incidents={
+            "incidents": {
+                "KRAKEN:RATE_LIMIT": _incident_row("KRAKEN:RATE_LIMIT"),
+            }
+        },
     )
-    document = preflight.evaluate_preflight(
-        candidate_sha=SHA, release_profile="EVIDENCE_SHADOW"
-    )
-    assert calls["count"] == 1
+    assert calls["incident_reads"] == 1
+    assert calls["resolver"] == 1
     assert document["incidents"]["health"] is False
     assert "PROTECTION_INCIDENT_OPEN" in document["protection"]["reason_codes"]
     assert document["markers"]["incident_health"] == "false"
@@ -253,10 +373,11 @@ def test_ac_024_one_incident_observation_drives_report_and_marker(monkeypatch):
 
 @pytest.mark.acceptance
 def test_ac_024_preflight_uses_the_existing_read_only_report():
-    """ATDD-RELEASE-PIPELINE-v1/AC-024: candidate preflight calls the shared non-mutating protection report, observes incidents once, and never recovers, repairs, or trades."""
-    assert "build_report_with_incidents()" in PREFLIGHT
+    """ATDD-RELEASE-PIPELINE-v1/AC-024: candidate preflight calls the shared non-mutating protection observation, observes incidents once, and never recovers, repairs, or trades."""
+    assert "build_observation()" in PREFLIGHT
     assert "protection_incidents_healthy" not in PREFLIGHT
     assert "build_report_with_incidents" in REPORT
+    assert "build_observation" in REPORT
     assert "read_active_trades_without_mutation" in REPORT
     assert "minimum_unmanaged_notional_usd=0.0" in REPORT
     assert "minimum_unmanaged_notional_usd" not in PREFLIGHT
@@ -428,6 +549,573 @@ def test_ac_024_unknown_decoration_class_stays_a_coverage_block():
     assert "UNMANAGED_EXPOSURE" in preflight.diagnostic_classes(
         document["protection"]
     )
+
+
+# ---------------------------------------------------------------------------
+# AC-026: EVIDENCE_SHADOW readiness drives the release decision, while strict
+# F11 stays unchanged. Every case below runs the REAL read-only composition with
+# an injected observation, so it exercises the same one-resolver/one-incident
+# composition the deploy preflight uses.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.acceptance
+def test_ac_026_unmanaged_only_shadow_case(monkeypatch):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: a complete fresh observation with only a VERIFIED_UNMANAGED external holding keeps strict F11 non-HEALTHY and suspended, yet EVIDENCE_SHADOW is READY and the preflight PASSES."""
+    document, calls = _run_preflight(
+        monkeypatch,
+        exposures=[_unmanaged("XBTUSD")],
+        coverage_complete=True,
+    )
+    assert calls["resolver"] == 1
+    assert calls["incident_reads"] == 1
+    # Strict F11 unchanged.
+    assert document["strict_f11"]["state"] == STATE_UNSAFE
+    assert document["strict_f11"]["healthy"] is False
+    assert document["protection"]["admissions_suspended"] is True
+    assert REASON_UNMANAGED_EXPOSURE in document["protection"]["reason_codes"]
+    assert document["markers"]["unmanaged_exposures"] == "XBTUSD"
+    # Shadow readiness is a different decision.
+    assert document["evidence_shadow"]["state"] == STATE_READY
+    assert document["evidence_shadow"]["ready"] is True
+    assert document["evidence_shadow"]["unmanaged_exposures"] == ["XBTUSD"]
+    assert document["evidence_shadow"]["blocking_reason_codes"] == []
+    assert document["markers"]["evidence_shadow_readiness"] == "READY"
+    assert document["markers"]["evidence_shadow_unmanaged_exposures"] == "XBTUSD"
+    assert document["verdict"]["ready"] is True
+
+
+@pytest.mark.acceptance
+def test_ac_026_production_shaped_case_is_shadow_ready_but_strict_non_healthy(monkeypatch):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: VERIFIED_UNMANAGED holdings plus durable HELD_ASSET_PRICING and POSITION_VERIFICATION incidents whose current candidate predicate is proven leave strict F11 non-HEALTHY but make EVIDENCE_SHADOW READY, with both incidents visible as candidate-recoverable."""
+    pricing = "KRAKEN:HELD_ASSET_PRICING"
+    position = "KRAKEN:POSITION_VERIFICATION"
+    document, calls = _run_preflight(
+        monkeypatch,
+        exposures=[_unmanaged("XBTUSD")],
+        coverage_complete=True,
+        degraded_scopes=frozenset(),
+        incidents={
+            "incidents": {
+                "SYSTEM_HEALTH:" + pricing: _incident_row(pricing),
+                "SYSTEM_HEALTH:" + position: _incident_row(position),
+            }
+        },
+    )
+    assert calls["resolver"] == 1
+    assert calls["incident_reads"] == 1
+    # Strict F11: the durable incidents remain unresolved strict concerns.
+    assert document["strict_f11"]["state"] == STATE_UNAVAILABLE
+    assert document["strict_f11"]["healthy"] is False
+    assert document["incidents"]["health"] is False
+    assert "PROTECTION_INCIDENT_OPEN" in document["protection"]["reason_codes"]
+    assert REASON_UNMANAGED_EXPOSURE in document["protection"]["reason_codes"]
+    # Shadow: candidate-recoverable, not "recovered".
+    shadow = document["evidence_shadow"]
+    assert shadow["state"] == STATE_READY
+    assert shadow["candidate_recoverable_incidents"] == [
+        f"SYSTEM_HEALTH:{pricing}",
+        f"SYSTEM_HEALTH:{position}",
+    ]
+    assert shadow["advisory_reason_codes"] == [
+        ADVISORY_CANDIDATE_RECOVERABLE_INCIDENT,
+        "UNMANAGED_EXPOSURE",
+    ]
+    assert shadow["blocking_incidents"] == []
+    assert document["markers"]["evidence_shadow_candidate_recoverable_incidents"] == (
+        f"SYSTEM_HEALTH:{pricing},SYSTEM_HEALTH:{position}"
+    )
+    assert document["markers"]["evidence_shadow_blocking_reason_codes"] == "NONE"
+    assert document["verdict"]["ready"] is True
+
+
+@pytest.mark.acceptance
+def test_ac_026_held_asset_pricing_currently_degraded_blocks(monkeypatch):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: a current held-asset pricing degradation keeps EVIDENCE_SHADOW BLOCKED and refuses the preflight, even when a pricing incident exists."""
+    pricing = "KRAKEN:HELD_ASSET_PRICING"
+    document, _ = _run_preflight(
+        monkeypatch,
+        exposures=[_unmanaged("DOGE")],
+        coverage_complete=False,
+        degraded_scopes=frozenset({pricing}),
+        incidents={"incidents": {"SYSTEM_HEALTH:" + pricing: _incident_row(pricing)}},
+    )
+    assert document["evidence_shadow"]["state"] == STATE_BLOCKED
+    assert BLOCK_COVERAGE_INCOMPLETE in document["evidence_shadow"]["blocking_reason_codes"]
+    assert "PRICING_GAP" in document["evidence_shadow"]["blocking_reason_codes"]
+    assert document["evidence_shadow"]["candidate_recoverable_incidents"] == []
+    assert document["verdict"]["ready"] is False
+
+
+@pytest.mark.acceptance
+def test_ac_026_position_verification_currently_degraded_blocks(monkeypatch):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: a current position-verification degradation keeps EVIDENCE_SHADOW BLOCKED and refuses the preflight."""
+    position = "KRAKEN:POSITION_VERIFICATION"
+    document, _ = _run_preflight(
+        monkeypatch,
+        exposures=[_managed("XBTUSD")],
+        coverage_complete=True,
+        degraded_scopes=frozenset({position}),
+        incidents={"incidents": {"SYSTEM_HEALTH:" + position: _incident_row(position)}},
+    )
+    assert document["evidence_shadow"]["state"] == STATE_BLOCKED
+    assert "POSITION_VERIFICATION_GAP" in document["evidence_shadow"]["blocking_reason_codes"]
+    assert document["evidence_shadow"]["blocking_incidents"] == [
+        f"SYSTEM_HEALTH:{position}"
+    ]
+    assert document["verdict"]["ready"] is False
+
+
+@pytest.mark.acceptance
+def test_ac_026_current_scope_status_unproven_fails_closed(monkeypatch):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: an existing coverage incident with missing/unproven same-cycle scope evidence stays blocking."""
+    pricing = "KRAKEN:HELD_ASSET_PRICING"
+    document, _ = _run_preflight(
+        monkeypatch,
+        exposures=[],
+        coverage_complete=True,
+        degraded_scopes=None,
+        incidents={"incidents": {"SYSTEM_HEALTH:" + pricing: _incident_row(pricing)}},
+    )
+    assert document["evidence_shadow"]["state"] == STATE_BLOCKED
+    assert "PRICING_GAP" in document["evidence_shadow"]["blocking_reason_codes"]
+    assert document["evidence_shadow"]["candidate_recoverable_incidents"] == []
+    assert document["verdict"]["ready"] is False
+
+
+@pytest.mark.acceptance
+def test_ac_026_coverage_incomplete_fails_closed(monkeypatch):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: incomplete coverage blocks EVIDENCE_SHADOW."""
+    document, _ = _run_preflight(monkeypatch, coverage_complete=False)
+    assert document["evidence_shadow"]["state"] == STATE_BLOCKED
+    assert BLOCK_COVERAGE_INCOMPLETE in document["evidence_shadow"]["blocking_reason_codes"]
+    assert document["verdict"]["ready"] is False
+
+
+@pytest.mark.acceptance
+def test_ac_026_uncertain_exposure_fails_closed(monkeypatch):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: an uncertain exposure blocks EVIDENCE_SHADOW."""
+    document, _ = _run_preflight(monkeypatch, exposures=[_degraded("XBTUSD")])
+    assert document["evidence_shadow"]["state"] == STATE_BLOCKED
+    assert "EXPOSURE_UNCERTAIN" in document["evidence_shadow"]["blocking_reason_codes"]
+    assert document["evidence_shadow"]["uncertain_exposures"] == ["XBTUSD"]
+    assert document["verdict"]["ready"] is False
+
+
+@pytest.mark.acceptance
+def test_ac_026_silent_managed_holding_fails_closed(monkeypatch):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: a silent managed holding blocks EVIDENCE_SHADOW."""
+    document, _ = _run_preflight(
+        monkeypatch, exposures=[_managed("XBTUSD", stop=0.0)]
+    )
+    assert document["evidence_shadow"]["state"] == STATE_BLOCKED
+    assert "SILENT_HOLDING" in document["evidence_shadow"]["blocking_reason_codes"]
+    assert document["evidence_shadow"]["silent_holdings"] == ["XBTUSD"]
+    assert document["verdict"]["ready"] is False
+
+
+@pytest.mark.acceptance
+def test_ac_026_invalid_managed_geometry_fails_closed(monkeypatch):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: an invalid managed protection geometry blocks EVIDENCE_SHADOW."""
+    document, _ = _run_preflight(
+        monkeypatch, exposures=[_managed("XBTUSD", entry=100.0, stop=105.0)]
+    )
+    assert document["evidence_shadow"]["state"] == STATE_BLOCKED
+    assert "GEOMETRY_INVALID" in document["evidence_shadow"]["blocking_reason_codes"]
+    assert document["evidence_shadow"]["geometry_invalid_exposures"] == ["XBTUSD"]
+    assert document["verdict"]["ready"] is False
+
+
+@pytest.mark.acceptance
+@pytest.mark.parametrize(
+    "scope",
+    [
+        "KRAKEN:READ_ONLY_AUTH",
+        "KRAKEN:PUBLIC_CONNECTIVITY",
+        "KRAKEN:READ_ONLY_CONNECTIVITY",
+        "KRAKEN:RATE_LIMIT",
+    ],
+)
+def test_ac_026_non_coverage_incidents_fail_closed(monkeypatch, scope):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: an auth, connectivity or rate-limit incident is a known non-coverage blocker, never candidate-recoverable."""
+    document, _ = _run_preflight(
+        monkeypatch,
+        exposures=[_managed("XBTUSD")],
+        coverage_complete=True,
+        incidents={"incidents": {"SYSTEM_HEALTH:" + scope: _incident_row(scope)}},
+    )
+    assert document["evidence_shadow"]["state"] == STATE_BLOCKED
+    assert "INCIDENT_OPEN" in document["evidence_shadow"]["blocking_reason_codes"]
+    assert "INCIDENT_UNKNOWN" not in document["evidence_shadow"]["blocking_reason_codes"]
+    assert document["evidence_shadow"]["candidate_recoverable_incidents"] == []
+    assert document["verdict"]["ready"] is False
+
+
+@pytest.mark.acceptance
+def test_ac_026_unknown_incident_fails_closed(monkeypatch):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: an unrecognized incident scope blocks with INCIDENT_UNKNOWN."""
+    document, _ = _run_preflight(
+        monkeypatch,
+        exposures=[],
+        coverage_complete=True,
+        incidents={"incidents": {"SYSTEM_HEALTH:SOMETHING:ELSE": _incident_row("SOMETHING:ELSE")}},
+    )
+    assert document["evidence_shadow"]["state"] == STATE_BLOCKED
+    assert "INCIDENT_UNKNOWN" in document["evidence_shadow"]["blocking_reason_codes"]
+    assert document["verdict"]["ready"] is False
+
+
+@pytest.mark.acceptance
+def test_ac_026_malformed_incident_fails_closed(monkeypatch):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: an incident record with no scope is malformed evidence and blocks; it is never treated as 'no incident'."""
+    document, _ = _run_preflight(
+        monkeypatch,
+        exposures=[],
+        coverage_complete=True,
+        incidents={"incidents": {"SYSTEM_HEALTH:?:": {"incident_key": "SYSTEM_HEALTH:?:"}}},
+    )
+    assert document["evidence_shadow"]["state"] == STATE_BLOCKED
+    assert "EVIDENCE_MALFORMED" in document["evidence_shadow"]["blocking_reason_codes"]
+    assert document["verdict"]["ready"] is False
+
+
+@pytest.mark.acceptance
+def test_ac_026_unreadable_incident_store_is_never_empty(monkeypatch):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: an unreadable durable incident store blocks EVIDENCE_SHADOW and is never interpreted as an empty incident set."""
+    import app.jobs.report_protection_health as reporter
+    from app.services.registry_io import RegistryIOError
+
+    def _unreadable(path):
+        raise RegistryIOError("incident store unreadable")
+
+    monkeypatch.setattr(reporter, "read_json_without_quarantine", _unreadable)
+    monkeypatch.setattr(
+        reporter,
+        "_read_only_resolver",
+        lambda: types.SimpleNamespace(
+            resolve=lambda: types.SimpleNamespace(
+                exposures=(), coverage_complete=True, reason="", degraded_scopes=frozenset()
+            )
+        ),
+    )
+    document = preflight.evaluate_preflight(
+        candidate_sha=SHA, release_profile="EVIDENCE_SHADOW"
+    )
+    assert document["evidence_shadow"]["state"] == STATE_BLOCKED
+    assert BLOCK_INCIDENT_UNREADABLE in document["evidence_shadow"]["blocking_reason_codes"]
+    assert document["incidents"]["health"] is None
+    assert document["verdict"]["ready"] is False
+
+
+@pytest.mark.acceptance
+def test_ac_026_strict_incident_health_is_not_forgiven(monkeypatch):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: candidate recoverability never makes strict incident health true while the durable incident remains unresolved."""
+    pricing = "KRAKEN:HELD_ASSET_PRICING"
+    document, _ = _run_preflight(
+        monkeypatch,
+        exposures=[],
+        coverage_complete=True,
+        degraded_scopes=frozenset(),
+        incidents={"incidents": {"SYSTEM_HEALTH:" + pricing: _incident_row(pricing)}},
+    )
+    # Shadow forgives for readiness purposes...
+    assert document["evidence_shadow"]["state"] == STATE_READY
+    assert document["evidence_shadow"]["candidate_recoverable_incidents"] == [
+        f"SYSTEM_HEALTH:{pricing}"
+    ]
+    # ...but strict F11 incident health is still false and its reason is present.
+    assert document["incidents"]["health"] is False
+    assert document["strict_f11"]["healthy"] is False
+    assert "PROTECTION_INCIDENT_OPEN" in document["protection"]["reason_codes"]
+    assert document["markers"]["incident_health"] == "false"
+
+
+@pytest.mark.acceptance
+def test_ac_026_preflight_does_not_mutate_the_incident_store(monkeypatch, tmp_path):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: a preflight decision leaves the durable incident bytes unchanged and never calls a recovery/write path."""
+    import app.jobs.report_protection_health as reporter
+    from app.services import system_incidents
+
+    state_file = tmp_path / "system_incidents.json"
+    original = (
+        '{"schema_version": 2, "incidents": {"SYSTEM_HEALTH:KRAKEN:HELD_ASSET_PRICING": '
+        '{"scope": "KRAKEN:HELD_ASSET_PRICING", "state": "OPEN", "incident_key": '
+        '"SYSTEM_HEALTH:KRAKEN:HELD_ASSET_PRICING"}}, "archive": {}}'
+    )
+    state_file.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(system_incidents, "STATE_FILE", state_file)
+    monkeypatch.setattr(
+        system_incidents,
+        "observe_recovery",
+        lambda **kwargs: pytest.fail("preflight must never recover an incident"),
+    )
+    monkeypatch.setattr(
+        reporter,
+        "_read_only_resolver",
+        lambda: types.SimpleNamespace(
+            resolve=lambda: types.SimpleNamespace(
+                exposures=(), coverage_complete=True, reason="", degraded_scopes=frozenset()
+            )
+        ),
+    )
+    document = preflight.evaluate_preflight(
+        candidate_sha=SHA, release_profile="EVIDENCE_SHADOW"
+    )
+    assert document["verdict"]["ready"] is True
+    assert state_file.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.acceptance
+def test_ac_026_no_lifecycle_or_trade_write_path_is_invoked(monkeypatch):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: the preflight calls exactly one non-mutating resolver and performs no lifecycle/trade write."""
+    import app.jobs.report_protection_health as reporter
+    import app.services.active_trade_registry as registry
+
+    called = {"resolver": 0}
+
+    original_resolver = reporter._read_only_resolver
+
+    def _counting_resolver():
+        called["resolver"] += 1
+        return original_resolver()
+
+    monkeypatch.setattr(reporter, "_read_only_resolver", _counting_resolver)
+    monkeypatch.setattr(
+        reporter, "read_json_without_quarantine", lambda path: {"incidents": {}}
+    )
+    for name in ("close_trade", "update_trade_remaining_quantity", "mark_order_filled"):
+        if hasattr(registry, name):
+            monkeypatch.setattr(
+                registry, name, lambda *a, **k: pytest.fail(f"{name} must not be called")
+            )
+    preflight.evaluate_preflight(candidate_sha=SHA, release_profile="EVIDENCE_SHADOW")
+    assert called["resolver"] == 1
+
+
+@pytest.mark.acceptance
+def test_ac_026_single_resolver_and_single_incident_read_per_decision(monkeypatch):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: one exposure resolution and one durable-incident read feed both strict F11 and shadow readiness."""
+    _, calls = _run_preflight(
+        monkeypatch, exposures=[_unmanaged("XBTUSD")], coverage_complete=True
+    )
+    assert calls["resolver"] == 1
+    assert calls["incident_reads"] == 1
+
+
+@pytest.mark.acceptance
+def test_ac_026_same_observation_drives_strict_and_shadow(monkeypatch):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: strict F11 and shadow readiness consume the SAME captured exposure observation, so an unmanaged holding is simultaneously strict-non-healthy and shadow-advisory."""
+    document, calls = _run_preflight(
+        monkeypatch, exposures=[_unmanaged("ADAUSD")], coverage_complete=True
+    )
+    assert calls["resolver"] == 1
+    assert document["protection"]["unmanaged_exposures"] == ["ADAUSD"]
+    assert document["evidence_shadow"]["unmanaged_exposures"] == ["ADAUSD"]
+    assert document["strict_f11"]["healthy"] is False
+    assert document["evidence_shadow"]["ready"] is True
+
+
+@pytest.mark.acceptance
+def test_ac_026_candidate_sha_and_profile_are_still_validated(monkeypatch):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: an invalid candidate SHA or a non-qualified profile refuses even when shadow readiness is READY."""
+    ready_doc, _ = _run_preflight(
+        monkeypatch, exposures=[_unmanaged("XBTUSD")], coverage_complete=True
+    )
+    assert ready_doc["verdict"]["ready"] is True
+
+    bad_sha, _ = _run_preflight(
+        monkeypatch,
+        exposures=[_unmanaged("XBTUSD")],
+        coverage_complete=True,
+        candidate_sha="not-a-sha",
+    )
+    assert bad_sha["verdict"]["ready"] is False
+
+    bad_profile, _ = _run_preflight(
+        monkeypatch,
+        exposures=[_unmanaged("XBTUSD")],
+        coverage_complete=True,
+        release_profile="SAFE_BASELINE",
+    )
+    assert bad_profile["verdict"]["ready"] is False
+
+
+@pytest.mark.acceptance
+def test_ac_026_refusal_exit_contract_is_unchanged(monkeypatch, capsys):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: the preflight CLI still exits 76 when blocked and 0 only when READY."""
+    from app.jobs.report_protection_health import ProtectionObservation
+
+    ready = ProtectionObservation(
+        report=_report(),
+        incidents_healthy=True,
+        shadow=_shadow(),
+    )
+    blocked = ProtectionObservation(
+        report=_report(
+            state="UNAVAILABLE",
+            admissions_suspended=True,
+            coverage_complete=False,
+            reason_codes=["EXPOSURE_COVERAGE_INCOMPLETE"],
+        ),
+        incidents_healthy=True,
+        shadow=_shadow(coverage_complete=False),
+    )
+
+    monkeypatch.setattr(preflight, "build_observation", lambda: ready)
+    assert preflight.main(["--candidate-sha", SHA, "--release-profile", "EVIDENCE_SHADOW"]) == 0
+    capsys.readouterr()
+
+    monkeypatch.setattr(preflight, "build_observation", lambda: blocked)
+    assert preflight.main(["--candidate-sha", SHA, "--release-profile", "EVIDENCE_SHADOW"]) == 76
+
+
+@pytest.mark.acceptance
+def test_ac_026_legacy_report_and_markers_still_mean_strict_protection(monkeypatch):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: the legacy report/marker surface is preserved and still means strict protection health, with the AC-026 projection added alongside."""
+    import app.jobs.report_protection_health as reporter
+
+    monkeypatch.setattr(
+        reporter,
+        "_read_only_resolver",
+        lambda: types.SimpleNamespace(
+            resolve=lambda: types.SimpleNamespace(
+                exposures=(_unmanaged("ADAUSD"),),
+                coverage_complete=True,
+                reason="held balance without lifecycle context",
+                degraded_scopes=frozenset(),
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        reporter, "read_json_without_quarantine", lambda path: {"incidents": {}}
+    )
+    report, incidents_healthy = reporter.build_report_with_incidents()
+    assert incidents_healthy is True
+    # Existing strict F11 fields keep their meaning.
+    assert report["state"] == STATE_UNSAFE
+    assert report["admissions_suspended"] is True
+    assert REASON_UNMANAGED_EXPOSURE in report["reason_codes"]
+    # The AC-026 projection is added alongside, never in place of, strict fields.
+    assert report["evidence_shadow"]["state"] == STATE_READY
+    assert report["evidence_shadow"]["ready"] is True
+
+
+@pytest.mark.acceptance
+def test_ac_026_ac024_marker_names_are_not_repurposed():
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: the legacy JSON marker keys are unchanged in meaning, and the AC-026 markers are additional."""
+    document = _document(_report())
+    for legacy in (
+        "unmanaged_exposures",
+        "uncertain_exposures",
+        "silent_holdings",
+        "incident_health",
+    ):
+        assert legacy in document["markers"]
+    for added in (
+        "strict_f11_state",
+        "strict_f11_reason_codes",
+        "evidence_shadow_readiness",
+        "evidence_shadow_blocking_reason_codes",
+        "evidence_shadow_advisory_reason_codes",
+        "evidence_shadow_unmanaged_exposures",
+        "evidence_shadow_candidate_recoverable_incidents",
+        "evidence_shadow_blocking_incidents",
+    ):
+        assert added in document["markers"]
+    assert document["markers"]["strict_f11_state"] == "HEALTHY"
+    assert document["markers"]["strict_f11_reason_codes"] == "PROTECTION_PROVEN"
+
+
+@pytest.mark.acceptance
+def test_ac_026_coverage_degraded_scopes_are_same_cycle_structured(monkeypatch):
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: same-cycle degradation evidence is derived from this observation's structured coverage facts (never the durable incident store or free text), and complete coverage provably implies an empty degraded set."""
+    import app.services.kraken_exposure_resolver as ker
+    from app.services.system_incidents import (
+        SystemIncidentScope,
+        coverage_degraded_scopes,
+    )
+
+    pricing = SystemIncidentScope.KRAKEN_HELD_ASSET_PRICING.value
+    position = SystemIncidentScope.KRAKEN_POSITION_VERIFICATION.value
+
+    assert coverage_degraded_scopes(
+        pricing_unavailable=False, position_verification_unavailable=False
+    ) == frozenset()
+    assert coverage_degraded_scopes(
+        pricing_unavailable=True, position_verification_unavailable=False
+    ) == frozenset({pricing})
+    assert coverage_degraded_scopes(
+        pricing_unavailable=False, position_verification_unavailable=True
+    ) == frozenset({position})
+    assert coverage_degraded_scopes(
+        pricing_unavailable=True, position_verification_unavailable=True
+    ) == frozenset({pricing, position})
+
+    class _Private:
+        enabled = True
+
+        def assert_read_only(self):
+            return types.SimpleNamespace(name="ro")
+
+        def get_open_positions(self):
+            return {}
+
+    class _PrivateSol(_Private):
+        def get_balance(self):
+            return {"SOL": 1.0}
+
+    class _PrivateSolDoge(_Private):
+        def get_balance(self):
+            return {"SOL": 1.0, "DOGE": 2.0}
+
+    monkeypatch.setattr(ker, "_pair_catalog", lambda client: {"SOL": "SOLUSD"})
+    monkeypatch.setattr(ker, "_minimum_unmanaged_notional_usd", lambda: 25.0)
+
+    # DOGE has no catalog pair -> unpriced -> HELD_ASSET_PRICING is proven degraded.
+    monkeypatch.setattr(
+        ker,
+        "_ticker_notionals",
+        lambda client, *, quantities, pairs_by_asset: {
+            asset: (100.0 if asset == "SOL" else None) for asset in quantities
+        },
+    )
+    degraded = ker.KrakenExposureResolver(
+        private_client=_PrivateSolDoge(), public_client=object(), trade_loader=lambda: []
+    ).resolve()
+    assert degraded.coverage_complete is False
+    assert degraded.degraded_scopes == frozenset({pricing})
+
+    # Every balance is priced -> complete coverage -> provably empty degraded set.
+    monkeypatch.setattr(
+        ker,
+        "_ticker_notionals",
+        lambda client, *, quantities, pairs_by_asset: {
+            asset: 100.0 for asset in quantities
+        },
+    )
+    complete = ker.KrakenExposureResolver(
+        private_client=_PrivateSol(), public_client=object(), trade_loader=lambda: []
+    ).resolve()
+    assert complete.coverage_complete is True
+    assert complete.degraded_scopes == frozenset()
+
+
+@pytest.mark.acceptance
+def test_ac_026_marker_formatters_are_bounded_and_sanitized():
+    """ATDD-RELEASE-PIPELINE-v1/AC-026: the AC-026 receipt markers are deterministic, bounded, sorted, NONE when empty, and drop anything that is not a bounded token/identity/code."""
+    assert format_marker_codes(None) == "NONE"
+    assert format_marker_codes([]) == "NONE"
+    assert format_marker_codes(["B_CODE", "A_CODE", "B_CODE"]) == "A_CODE,B_CODE"
+    assert format_marker_codes(["lower", "HAS SPACE", "OK_CODE"]) == "OK_CODE"
+    assert format_marker_incidents(None) == "NONE"
+    assert format_marker_incidents(
+        ["SYSTEM_HEALTH:KRAKEN:POSITION_VERIFICATION", "SYSTEM_HEALTH:KRAKEN:HELD_ASSET_PRICING"]
+    ) == "SYSTEM_HEALTH:KRAKEN:HELD_ASSET_PRICING,SYSTEM_HEALTH:KRAKEN:POSITION_VERIFICATION"
+    assert format_marker_incidents(["free form incident reason text"]) == "NONE"
+    encoded = format_marker_codes([f"CODE_{i}" for i in range(50)])
+    assert encoded.count(",") <= 19
+    assert len(encoded) <= 400
+    assert " " not in encoded
 
 
 @requires_bash

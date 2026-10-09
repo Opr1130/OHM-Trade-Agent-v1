@@ -365,6 +365,35 @@ def coverage_recovery_authority(
     )
 
 
+def coverage_degraded_scopes(
+    *,
+    pricing_unavailable: bool,
+    position_verification_unavailable: bool,
+) -> frozenset[str]:
+    """Canonical coverage-owned scopes proven degraded by ONE observation.
+
+    This is the degradation companion of
+    :data:`COVERAGE_RECOVERY_AUTHORITY_BY_SCOPE`. It names the *same* canonical
+    scope identities -- derived from :class:`SystemIncidentScope` rather than a
+    second hand-written list -- so a caller holding structured same-cycle
+    coverage facts can report exactly which coverage-owned scopes this cycle
+    observed failing. It is deliberately *not* a recovery mapping: proving a
+    scope degraded never closes, recovers or mutates an incident.
+
+    Neither flag can ever name a non-coverage scope (connectivity, auth, rate
+    limit), and an unproven observation is expressed by the caller as ``None``
+    rather than by an empty result, so "not observed" is never confused with
+    "proven healthy".
+    """
+
+    scopes: set[str] = set()
+    if pricing_unavailable:
+        scopes.add(SystemIncidentScope.KRAKEN_HELD_ASSET_PRICING.value)
+    if position_verification_unavailable:
+        scopes.add(SystemIncidentScope.KRAKEN_POSITION_VERIFICATION.value)
+    return frozenset(scopes)
+
+
 @dataclass(frozen=True)
 class IncidentDecision:
     """What the caller should do about one observation or recovery cycle."""

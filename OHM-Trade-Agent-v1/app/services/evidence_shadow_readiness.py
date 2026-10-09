@@ -69,6 +69,9 @@ BLOCK_EVIDENCE_MALFORMED = "EVIDENCE_MALFORMED"
 BLOCK_INCIDENT_OPEN = "INCIDENT_OPEN"
 BLOCK_INCIDENT_UNKNOWN = "INCIDENT_UNKNOWN"
 BLOCK_INCIDENT_UNPROVEN = "INCIDENT_UNPROVEN"
+#: The durable incident store could not be read/proven at all. This is distinct
+#: from "no incident": an unreadable store is never an empty incident set.
+BLOCK_INCIDENT_UNREADABLE = "INCIDENT_UNREADABLE"
 
 #: Advisory reason codes. These are visible but do not withhold activation.
 ADVISORY_UNMANAGED_EXPOSURE = "UNMANAGED_EXPOSURE"
@@ -196,7 +199,7 @@ def evaluate_evidence_shadow_readiness(
     exposures: Sequence[Any] = (),
     *,
     coverage_complete: bool | None = None,
-    open_incidents: Sequence[Any] = (),
+    open_incidents: Sequence[Any] | None = (),
     current_degraded_scopes: Collection[str] | None = None,
 ) -> EvidenceShadowReadiness:
     """Decide whether the EVIDENCE_SHADOW profile may be activated.
@@ -204,9 +207,11 @@ def evaluate_evidence_shadow_readiness(
     ``exposures`` are ``ResolvedExposure``-shaped (``status``, ``symbol``,
     ``trade``). ``coverage_complete`` is the caller's coverage verdict; only
     ``True`` proves coverage. ``open_incidents`` are incident-shaped objects or
-    mappings carrying a ``scope``. ``current_degraded_scopes`` is the *proven*
-    set of scopes degraded in the current candidate observation; ``None`` means
-    that evidence is unproven and any coverage-owned incident stays blocking.
+    mappings carrying a ``scope``; ``None`` means the durable incident evidence
+    could not be read/proven, which blocks (it is never treated as an empty
+    incident set). ``current_degraded_scopes`` is the *proven* set of scopes
+    degraded in the current candidate observation; ``None`` means that evidence
+    is unproven and any coverage-owned incident stays blocking.
 
     Fails closed: anything not provably healthy blocks activation. A known
     external ``VERIFIED_UNMANAGED`` holding is advisory only -- it stays visible
@@ -256,7 +261,11 @@ def evaluate_evidence_shadow_readiness(
 
     candidate_recoverable: list[str] = []
     blocking_incidents: list[str] = []
-    for incident in open_incidents:
+    if open_incidents is None:
+        # The durable incident evidence could not be read/proven. That is not
+        # "no incident": block rather than decide on absent evidence.
+        blocking.append(BLOCK_INCIDENT_UNREADABLE)
+    for incident in open_incidents or ():
         scope = _scope_of(incident)
         key = _incident_key_of(incident) or scope
         if not scope:
@@ -314,6 +323,7 @@ __all__ = [
     "BLOCK_INCIDENT_OPEN",
     "BLOCK_INCIDENT_UNKNOWN",
     "BLOCK_INCIDENT_UNPROVEN",
+    "BLOCK_INCIDENT_UNREADABLE",
     "BLOCK_POSITION_VERIFICATION_GAP",
     "BLOCK_PRICING_GAP",
     "BLOCK_SILENT_HOLDING",

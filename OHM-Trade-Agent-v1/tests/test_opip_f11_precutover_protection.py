@@ -311,7 +311,11 @@ def test_ac_005_report_is_read_only_and_authority_free(monkeypatch):
     monkeypatch.setattr(
         report, "_read_only_resolver", lambda: SimpleNamespace(resolve=lambda: resolution)
     )
-    monkeypatch.setattr(report, "protection_incidents_healthy", lambda: True)
+    monkeypatch.setattr(
+        report,
+        "read_incident_projection",
+        lambda: report.IncidentProjection(health=True, open_incidents=()),
+    )
     payload = report.build_report()
     assert payload["state"] == ph.STATE_HEALTHY
     assert "resolution_reason" not in payload
@@ -332,7 +336,11 @@ def test_ac_005_report_is_read_only_and_authority_free(monkeypatch):
     monkeypatch.setattr(
         report, "_read_only_resolver", lambda: SimpleNamespace(resolve=lambda: resolution)
     )
-    monkeypatch.setattr(report, "protection_incidents_healthy", lambda: None)
+    monkeypatch.setattr(
+        report,
+        "read_incident_projection",
+        lambda: report.IncidentProjection(health=None, open_incidents=None),
+    )
     unproven = report.build_report()
     assert unproven["state"] == ph.STATE_UNAVAILABLE
     assert ph.REASON_INCIDENTS_UNPROVEN in unproven["reason_codes"]
@@ -351,7 +359,11 @@ def test_report_exposes_incomplete_resolution_reason_without_changing_gate(monke
     monkeypatch.setattr(
         report, "_read_only_resolver", lambda: SimpleNamespace(resolve=lambda: resolution)
     )
-    monkeypatch.setattr(report, "protection_incidents_healthy", lambda: True)
+    monkeypatch.setattr(
+        report,
+        "read_incident_projection",
+        lambda: report.IncidentProjection(health=True, open_incidents=()),
+    )
 
     payload = report.build_report()
 
@@ -590,7 +602,11 @@ def test_ac_010_cli_stdout_is_one_json_document(monkeypatch):
     monkeypatch.setattr(
         report, "_read_only_resolver", lambda: SimpleNamespace(resolve=lambda: resolution)
     )
-    monkeypatch.setattr(report, "protection_incidents_healthy", lambda: True)
+    monkeypatch.setattr(
+        report,
+        "read_incident_projection",
+        lambda: report.IncidentProjection(health=True, open_incidents=()),
+    )
 
     out, err = io.StringIO(), io.StringIO()
     with redirect_stdout(out), redirect_stderr(err):

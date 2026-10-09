@@ -15,6 +15,7 @@ from app.exchanges.kraken_identity import (
 from app.exchanges.kraken_private import KrakenPrivateClient
 from app.services.active_trade_registry import ActiveTrade, get_active_trades
 from app.services.kraken_position_verification import verify_trade_against_snapshot
+from app.services.system_incidents import coverage_degraded_scopes
 
 
 CASH_LIKE_ASSETS = {
@@ -39,6 +40,14 @@ class ExposureResolution:
     exposures: tuple[ResolvedExposure, ...]
     coverage_complete: bool
     reason: str = ""
+    #: Coverage-owned scopes this *same* observation proved degraded, using the
+    #: canonical :func:`system_incidents.coverage_degraded_scopes` identities.
+    #: ``None`` means the observation could not classify them (unproven), so a
+    #: caller must fail closed rather than assume "no scope is degraded". A
+    #: frozenset is the proven set, possibly empty. It is derived only from this
+    #: cycle's structured coverage facts -- never from durable incident state,
+    #: free text, timestamps or counts.
+    degraded_scopes: frozenset[str] | None = None
 
 
 TradeLoader = Callable[[], list[ActiveTrade]]
@@ -538,4 +547,17 @@ class KrakenExposureResolver:
                 and not managed_resolution_gaps
             ),
             reason="; ".join(reasons),
+            # Same-cycle provenance: these scopes were proven degraded by *this*
+            # observation's structured facts (unpriced held assets; unresolved
+            # account state or managed lifecycle verification). ``coverage_complete``
+            # is the conjunction of registry/pair-catalog availability and the
+            # absence of these gaps, so when coverage is complete this set is
+            # provably empty -- the equivalence is explicit here rather than
+            # assumed by a caller.
+            degraded_scopes=coverage_degraded_scopes(
+                pricing_unavailable=bool(unpriced_assets),
+                position_verification_unavailable=bool(
+                    account_state_gaps or managed_resolution_gaps
+                ),
+            ),
         )
