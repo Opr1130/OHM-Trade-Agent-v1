@@ -118,6 +118,7 @@ AC-002 -> tests/test_opip_r4_alert_notification_quality.py::test_same_queued_fin
 AC-002 -> tests/test_opip_r4_alert_notification_quality.py::test_queued_unchanged_rank_leaves_the_slot_for_the_next_rank
 AC-002 -> tests/test_opip_r4_alert_notification_quality.py::test_recovery_delivers_no_more_than_the_configured_bound
 AC-002 -> tests/test_opip_r4_alert_notification_quality.py::test_recovery_bound_leaves_later_rows_pending_for_the_next_run
+AC-002 -> tests/test_opip_r4_alert_notification_quality.py::test_stuck_tracking_row_does_not_block_a_later_recovery
 AC-003 -> tests/test_opip_r4_alert_notification_quality.py::test_notification_threshold_does_not_change_rank_or_score
 AC-004 -> tests/test_opip_r4_alert_notification_quality.py::test_fingerprint_dedupe_cooldown_and_material_change
 AC-005 -> tests/test_opip_r4_alert_notification_quality.py::test_tracking_failure_does_not_terminalize_trade

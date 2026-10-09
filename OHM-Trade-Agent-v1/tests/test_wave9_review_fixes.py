@@ -762,7 +762,7 @@ def test_outbox_removes_already_confirmed_policy_emission(monkeypatch):
         chat_id="chat",
     )
 
-    assert status == "DELIVERED"
+    assert status == "ALREADY_DELIVERED"
     assert removed == [("Q-CONFIRMED", "lease")]
 
 

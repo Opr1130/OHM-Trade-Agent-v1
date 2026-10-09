@@ -681,3 +681,40 @@ def test_recovery_bound_leaves_later_rows_pending_for_the_next_run(tmp_path, mon
     assert delivered_ids == ["Q-1", "Q-2"]
     assert list(_outbox_rows()) == ["Q-3"]
     assert pending_setup_registry.get_pending_setup_by_trade_id("Q-3") is not None
+
+
+def test_stuck_tracking_row_does_not_block_a_later_recovery(tmp_path, monkeypatch):
+    """ATDD-R4-alert-notification-quality-gate/AC-002: a no-send retry does not spend the bound."""
+    _isolate_lifecycle(tmp_path, monkeypatch)
+    _seed_retry_row("Q-1", "AAA")
+    qualified_alert_outbox.queue_qualified_alert(
+        trade_id="Q-1",
+        message="trade_id=Q-1",
+        candidate={"economic_qualified": True},
+        plan=_plan(symbol="AAA"),
+        action="ENTER_NOW",
+        direction="LONG",
+        identity="QUALIFIED_OPPORTUNITY:Q-1",
+        fingerprint="fp-Q-1",
+        reason="TRACKING_PENDING:RuntimeError",
+    )
+    _seed_retry_row("Q-2", "BBB")
+    _seed_retry_row("Q-3", "CCC")
+
+    def _tracking(**kwargs):
+        if kwargs["trade_id"] == "Q-1":
+            raise RuntimeError("tracking stuck")
+
+    monkeypatch.setattr(qualified_alert_outbox, "register_reconciliation_intent", _tracking)
+    delivered_ids = _patch_retry_delivery(monkeypatch)
+    delivered, pending = qualified_alert_outbox.retry_qualified_alerts(
+        bot_token="token",
+        chat_id="chat",
+        max_new_trade_retries=1,
+    )
+    assert delivered == 1
+    assert delivered_ids == ["Q-2"]
+    assert "Q-1" in _outbox_rows()
+    assert "Q-3" in _outbox_rows()
+    assert "Q-2" not in _outbox_rows()
+    assert pending == 2

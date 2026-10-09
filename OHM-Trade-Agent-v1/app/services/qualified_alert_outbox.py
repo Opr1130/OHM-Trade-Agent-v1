@@ -408,7 +408,7 @@ def _retry_one(
     )
     if accepted is not None:
         _remove(trade_id, token=lease_token)
-        return "DELIVERED"
+        return "ALREADY_DELIVERED"
 
     policy_identity = str(row.get("policy_identity") or f"{direction}:{plan.symbol}")
     reservation = reserve_emit(
@@ -423,7 +423,7 @@ def _retry_one(
             fingerprint=fingerprint,
         ):
             _remove(trade_id, token=lease_token)
-            return "DELIVERED"
+            return "ALREADY_DELIVERED"
         _release(trade_id, lease_token)
         return "POLICY_PENDING"
 
@@ -536,10 +536,10 @@ def retry_qualified_alerts(
                 chat_id=chat_id,
             )
         except Exception:
-            attempted += 1
             pending += 1
             continue
-        attempted += 1
+        if status in {"DELIVERED", "SEND_FAILED"}:
+            attempted += 1
         if status == "DELIVERED":
             delivered += 1
         elif status not in {
@@ -547,6 +547,7 @@ def retry_qualified_alerts(
             "SUPPRESSED",
             "MALFORMED",
             "BUSY_OR_MISSING",
+            "ALREADY_DELIVERED",
         }:
             pending += 1
     return delivered, pending
