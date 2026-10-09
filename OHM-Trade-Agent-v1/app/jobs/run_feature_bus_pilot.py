@@ -130,11 +130,10 @@ def restore_pilot_continuity_batch(
 
     Production/default continuity restoration. Unlike
     :func:`restore_pilot_continuity` (which preserves the historical
-    single-instrument injected-callback seam), this path scans the canonical
-    checkpoint event family ONCE and the market-observation event family ONCE
-    for the WHOLE requested instrument batch, then reconstructs per-instrument
-    state/ledger/watermark. That removes the repeated full-history amplification
-    implicated by the restore_continuity production overrun.
+    single-instrument injected-callback seam), this path reads the requested
+    instruments' latest checkpoints once and their in-horizon observations once,
+    then reconstructs per-instrument state/ledger/watermark. Unrelated canonical
+    history is not fetched.
 
     ``deadline_monotonic`` (optional) bounds every durable read; it MUST be
     expressed in the same clock domain as ``clock``. A deadline expiry is NOT
@@ -144,7 +143,8 @@ def restore_pilot_continuity_batch(
 
     ``observer`` (optional) receives bounded attribution as
     ``observer(stage, seconds)`` for ``checkpoint_restore``,
-    ``revision_ledger_restore`` and ``continuity_restore_total``. It is
+    ``revision_ledger_restore`` and ``continuity_restore_total``. When the
+    observer accepts keyword details, ``rows_returned`` is included. It is
     observability only: it grants no authority and changes no evidence content.
     """
     tick = clock or monotonic
@@ -154,7 +154,17 @@ def restore_pilot_continuity_batch(
         deadline_kwargs["deadline_monotonic"] = deadline_monotonic
         deadline_kwargs["clock"] = clock
 
+    def _observe(stage: str, seconds: float, **details: Any) -> None:
+        if observer is None:
+            return
+        try:
+            observer(stage, seconds, **details)
+        except TypeError:
+            observer(stage, seconds)
+
     instrument_version_ids = [v.instrument_version_id for v in versions]
+    checkpoint_stats: dict[str, int] = {}
+    ledger_stats: dict[str, int] = {}
 
     # Failure-path timing attribution: each phase's timing is emitted whether the
     # phase succeeds OR raises, so the phase that actually exceeded the setup
@@ -167,11 +177,15 @@ def restore_pilot_continuity_batch(
         try:
             restored_states = load_states_batch(
                 instrument_version_ids,
+                stats=checkpoint_stats,
                 **deadline_kwargs,
             )
         finally:
-            if observer is not None:
-                observer("checkpoint_restore", tick() - checkpoint_started)
+            _observe(
+                "checkpoint_restore",
+                tick() - checkpoint_started,
+                rows_returned=checkpoint_stats.get("rows_returned"),
+            )
 
         # Derive each instrument's interval/since window from its OWN restored
         # state, exactly as the historical single-instrument path did.
@@ -204,14 +218,24 @@ def restore_pilot_continuity_batch(
                 instrument_version_ids,
                 interval_seconds_by_instrument=interval_seconds_by_instrument,
                 since_interval_epoch_by_instrument=since_interval_epoch_by_instrument,
+                stats=ledger_stats,
                 **deadline_kwargs,
             )
         finally:
-            if observer is not None:
-                observer("revision_ledger_restore", tick() - ledger_started)
+            _observe(
+                "revision_ledger_restore",
+                tick() - ledger_started,
+                rows_returned=ledger_stats.get("rows_returned"),
+            )
     finally:
-        if observer is not None:
-            observer("continuity_restore_total", tick() - started)
+        returned = checkpoint_stats.get("rows_returned", 0) + ledger_stats.get(
+            "rows_returned", 0
+        )
+        _observe(
+            "continuity_restore_total",
+            tick() - started,
+            rows_returned=returned,
+        )
     return restored_states, restored_ledgers, source_watermarks
 
 

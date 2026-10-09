@@ -318,6 +318,16 @@ def test_ac_018_checkpoint_batch_malformed_evidence_matches_single_loader(tmp_pa
     )
     conn.commit()
     conn.close()
+    # The batch read seeks the requested instrument, so the family-wide non-object
+    # row above is not its failure. The requested instrument's own tip is still
+    # fail-closed.
+    _insert_event(
+        db,
+        event_id="EV:requested-bad",
+        event_type=FEATURE_CHECKPOINT_RECORDED,
+        payload=_checkpoint_payload(version.instrument_version_id, feature_version=""),
+        local_sequence=2,
+    )
 
     with pytest.raises(checkpoint_module.CheckpointIntegrityError):
         checkpoint_module.load_latest_checkpoint_payload(
@@ -362,6 +372,15 @@ def test_ac_018_checkpoint_preserves_canonical_validation_precedence(tmp_path):
     )
     conn.commit()
     conn.close()
+    # Latest tip for the requested instrument is itself an identity failure.
+    # The batch read does not scan the earlier unrelated rows.
+    _insert_event(
+        db,
+        event_id="EV:requested-bad",
+        event_type=FEATURE_CHECKPOINT_RECORDED,
+        payload=_checkpoint_payload(version.instrument_version_id, feature_version=""),
+        local_sequence=3,
+    )
 
     with pytest.raises(checkpoint_module.CheckpointIntegrityError) as single_exc:
         checkpoint_module.load_latest_checkpoint_payload(
@@ -472,10 +491,9 @@ def test_ac_018_revision_ledger_batch_restores_multiple_instruments_in_one_scan(
 def test_ac_018_revision_ledger_batch_decodes_each_row_once(tmp_path, monkeypatch):
     """ATDD-RELEASE-PIPELINE-v1/AC-018: the batch loader JSON-decodes each canonical MARKET_OBSERVATION_RECORDED row exactly ONCE for the whole batch, regardless of how many instruments are requested.
 
-    This is the structural proof that the batch path is O(canonical rows), not
-    O(requested_instruments * canonical rows): the historical per-instrument
-    reconstruction looped the full row set once per requested instrument, so the
-    decode count would have been requested_instruments * canonical_rows.
+    The batch read decodes only the requested instruments' rows, once each.
+    Unrelated history is not decoded. The count stays below one full-history
+    decode per requested instrument, which is the amplification this path removed.
     """
     db = _make_db(tmp_path)
     versions = [_instrument(i) for i in range(4)]
@@ -522,9 +540,7 @@ def test_ac_018_revision_ledger_batch_decodes_each_row_once(tmp_path, monkeypatc
         db_path=db,
     )
     assert set(batch) == {version.instrument_version_id for version in versions}
-    # Every canonical row decoded exactly once for the whole batch -- NOT once
-    # per requested instrument.
-    assert decode_calls["count"] == canonical_rows
+    assert decode_calls["count"] == len(versions)
     assert decode_calls["count"] < len(versions) * canonical_rows
 
 
@@ -582,11 +598,11 @@ def test_ac_018_checkpoint_batch_deadline_during_post_scan_selection(
         _checkpoint_payload(v1.instrument_version_id),
     ]
 
-    def _stub_scan(*, db_path, deadline_monotonic, clock):
+    def _stub_scan(**kwargs):
         return list(payloads)
 
     monkeypatch.setattr(
-        checkpoint_module, "_scan_checkpoint_payloads", _stub_scan
+        checkpoint_module, "_scan_latest_checkpoint_payloads", _stub_scan
     )
 
     # Allow the first selection iteration, then expire on the next one.
@@ -721,6 +737,17 @@ def test_ac_018_revision_ledger_batch_malformed_evidence_matches_single_loader(t
     )
     conn.commit()
     conn.close()
+    bad_observation = _observation_payload(
+        version.instrument_version_id, epoch=1_700_000_000
+    )
+    del bad_observation["source_event_time"]
+    _insert_event(
+        db,
+        event_id="EV:requested-bad",
+        event_type=MARKET_OBSERVATION_RECORDED,
+        payload=bad_observation,
+        local_sequence=2,
+    )
 
     with pytest.raises(ledger_module.RevisionLedgerIntegrityError):
         ledger_module.load_revision_ledger(

@@ -96,6 +96,21 @@ CREATE INDEX IF NOT EXISTS idx_events_event_type
 CREATE INDEX IF NOT EXISTS idx_events_paper_trade
     ON events(json_extract(payload_json, '$.paper_trade_id'))
     WHERE json_extract(payload_json, '$.paper_trade_id') IS NOT NULL;
+
+-- Additive continuity-restore index. Instrument identity lives in the payload,
+-- so a batch restore that filters ``instrument_version_id`` in Python has to
+-- decode every historical row of the event family. This index lets the
+-- read-only batch queries seek the requested instruments. ``IF NOT EXISTS``
+-- and no table or column change: an existing database gains the index on the
+-- next writer schema initialisation. Read-only continuity restore does not
+-- create it.
+CREATE INDEX IF NOT EXISTS idx_events_type_instrument_order
+    ON events(
+        event_type,
+        json_extract(payload_json, '$.instrument_version_id'),
+        history_epoch,
+        local_sequence
+    );
 """
 
 

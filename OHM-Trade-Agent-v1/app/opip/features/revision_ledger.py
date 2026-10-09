@@ -635,6 +635,111 @@ def load_revision_ledger(
     )
 
 
+def _scan_observation_rows_for_instruments(
+    *,
+    instrument_version_ids: Sequence[str],
+    lower_interval_epoch: int | None,
+    db_path: Path | None,
+    deadline_monotonic: float | None,
+    clock: Callable[[], float] | None,
+    stats: dict[str, int] | None = None,
+) -> list[Any]:
+    """Read observation rows for the requested instruments only.
+
+    One indexed read. Unrelated instruments are not fetched. When every
+    requested instrument has a restored horizon, rows with a parseable source
+    time before the earliest horizon are not fetched. Rows with a missing or
+    unparseable source time are still returned so reconstruction can fail
+    closed instead of hiding them. The single-instrument loader keeps the
+    full-family scan.
+    """
+    from app.opip.canonical.schema import connect
+
+    requested = list(dict.fromkeys(str(item) for item in instrument_version_ids))
+    if not requested:
+        if stats is not None:
+            stats["rows_returned"] = 0
+        return []
+    if db_path is None:
+        from app.opip.canonical.paths import db_path as default_db_path
+
+        db_path = default_db_path()
+    target = Path(db_path)
+    if not target.exists():
+        if stats is not None:
+            stats["rows_returned"] = 0
+        return []
+    tick = clock or monotonic
+    if deadline_monotonic is not None and tick() >= deadline_monotonic:
+        raise RevisionLedgerDeadlineExceeded(
+            "revision ledger read deadline already elapsed before query"
+        )
+    placeholders = ", ".join("?" for _ in requested)
+    horizon_sql = ""
+    params: list[Any] = [MARKET_OBSERVATION_RECORDED, *requested]
+    if lower_interval_epoch is not None:
+        horizon_sql = """
+          AND (
+            json_extract(payload_json, '$.source_event_time') IS NULL
+            OR CAST(
+                strftime(
+                    '%s',
+                    replace(json_extract(payload_json, '$.source_event_time'), 'Z', '')
+                ) AS INTEGER
+            ) IS NULL
+            OR CAST(
+                strftime(
+                    '%s',
+                    replace(json_extract(payload_json, '$.source_event_time'), 'Z', '')
+                ) AS INTEGER
+            ) >= ?
+          )
+        """
+        params.append(int(lower_interval_epoch))
+    conn = connect(target, read_only=True)
+    deadline_triggered = False
+
+    def _progress_handler() -> int:
+        nonlocal deadline_triggered
+        if deadline_monotonic is not None and tick() >= deadline_monotonic:
+            deadline_triggered = True
+            return 1
+        return 0
+
+    try:
+        if deadline_monotonic is not None:
+            conn.set_progress_handler(_progress_handler, _SQLITE_DEADLINE_PROGRESS_OPS)
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT payload_json, history_epoch, local_sequence
+                FROM events
+                WHERE event_type = ?
+                  AND json_extract(payload_json, '$.instrument_version_id')
+                      IN ({placeholders})
+                  {horizon_sql}
+                ORDER BY history_epoch ASC, local_sequence ASC
+                """,
+                params,
+            ).fetchall()
+        except sqlite3.DatabaseError as exc:
+            if deadline_triggered:
+                raise RevisionLedgerDeadlineExceeded(
+                    "revision ledger read deadline exceeded during query"
+                ) from exc
+            raise
+    finally:
+        if deadline_monotonic is not None:
+            try:
+                conn.set_progress_handler(None, 0)
+            except sqlite3.Error:
+                pass
+        conn.close()
+    if stats is not None:
+        stats["rows_returned"] = len(rows)
+    return list(rows)
+
+
 def load_revision_ledgers_batch(
     instrument_version_ids: Sequence[str],
     *,
@@ -643,18 +748,20 @@ def load_revision_ledgers_batch(
     db_path: Path | None = None,
     deadline_monotonic: float | None = None,
     clock: Callable[[], float] | None = None,
+    stats: dict[str, int] | None = None,
 ) -> dict[str, RevisionLedger]:
-    """Rebuild per-instrument ledgers from ONE market-observation scan.
+    """Rebuild per-instrument ledgers from ONE bounded market-observation read.
 
-    Scans MARKET_OBSERVATION_RECORDED exactly once for the whole batch and
-    reconstructs each requested instrument's ledger from that single ordered
-    scan. Per-instrument ``interval_seconds`` and ``since_interval_epoch`` are
-    REQUIRED because the caller derives them independently from each
-    instrument's restored state.
+    Reads MARKET_OBSERVATION_RECORDED once for the requested instruments and,
+    when every instrument has a restored horizon, only from the earliest of
+    those horizons forward. Per-instrument ``interval_seconds`` and
+    ``since_interval_epoch`` are REQUIRED because the caller derives them
+    independently from each instrument's restored state.
 
-    The per-instrument validation/filter order is IDENTICAL to
-    :func:`load_revision_ledger`. No partial mapping is ever returned: an
-    integrity or deadline failure raises before the caller sees any result.
+    Requested-instrument validation order matches :func:`load_revision_ledger`.
+    Unrelated instruments are not read. No partial mapping is ever returned:
+    an integrity or deadline failure raises before the caller sees any result.
+    ``stats['rows_returned']`` counts rows fetched for this batch when provided.
     """
     requested = list(dict.fromkeys(str(item) for item in instrument_version_ids))
     if not requested:
@@ -686,10 +793,22 @@ def load_revision_ledgers_batch(
             f"missing {missing_since!r}"
         )
     tick = clock or monotonic
-    rows = _scan_observation_rows(
+    horizons = [
+        since_interval_epoch_by_instrument[instrument_version_id]
+        for instrument_version_id in requested
+    ]
+    lower_interval_epoch = (
+        None
+        if any(horizon is None for horizon in horizons)
+        else min(int(horizon) for horizon in horizons if horizon is not None)
+    )
+    rows = _scan_observation_rows_for_instruments(
+        instrument_version_ids=requested,
+        lower_interval_epoch=lower_interval_epoch,
         db_path=db_path,
         deadline_monotonic=deadline_monotonic,
         clock=clock,
+        stats=stats,
     )
     return _reconstruct_ledgers_batch(
         rows,
