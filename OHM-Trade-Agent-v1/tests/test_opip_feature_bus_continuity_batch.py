@@ -191,9 +191,10 @@ class _CountingConnection:
 
     def execute(self, sql, params=()):
         if "FROM events" in sql and "WHERE event_type" in sql:
-            event_type = params[0] if params else None
-            if event_type is not None:
-                self._counts[str(event_type)] = self._counts.get(str(event_type), 0) + 1
+            for param in params:
+                if param in (FEATURE_CHECKPOINT_RECORDED, MARKET_OBSERVATION_RECORDED):
+                    self._counts[str(param)] = self._counts.get(str(param), 0) + 1
+                    break
         return self._inner.execute(sql, params)
 
     def set_progress_handler(self, *args, **kwargs):

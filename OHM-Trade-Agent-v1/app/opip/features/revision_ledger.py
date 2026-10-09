@@ -635,6 +635,54 @@ def load_revision_ledger(
     )
 
 
+def observation_batch_sql(instrument_count: int, *, horizon: bool) -> str:
+    """Actual batch observation SQL.
+
+    With a horizon, canonical UTC rows are a range seek on
+    ``idx_events_observation_utc_epoch`` and every non-canonical source time
+    is read from ``idx_events_observation_noncanonical_time`` so Python can
+    fail closed. Without a horizon the requested instruments' rows are read
+    in commit order.
+    """
+    if instrument_count < 1:
+        raise ValueError("instrument_count must be positive")
+    from app.opip.canonical.schema import (
+        OBSERVATION_CANONICAL_UTC_PREDICATE,
+        OBSERVATION_UTC_EPOCH_EXPR,
+    )
+
+    if not horizon:
+        placeholders = ", ".join("?" for _ in range(instrument_count))
+        return (
+            "SELECT payload_json, history_epoch, local_sequence FROM events "
+            "WHERE event_type = ? AND "
+            "json_extract(payload_json, '$.instrument_version_id') "
+            f"IN ({placeholders}) "
+            "ORDER BY history_epoch ASC, local_sequence ASC"
+        )
+    canonical = (
+        "SELECT payload_json, history_epoch, local_sequence FROM events "
+        "WHERE event_type = ? "
+        "AND json_extract(payload_json, '$.instrument_version_id') = ? "
+        f"AND {OBSERVATION_CANONICAL_UTC_PREDICATE} "
+        f"AND {OBSERVATION_UTC_EPOCH_EXPR} >= ?"
+    )
+    noncanonical = (
+        "SELECT payload_json, history_epoch, local_sequence FROM events "
+        "WHERE event_type = ? "
+        "AND json_extract(payload_json, '$.instrument_version_id') = ? "
+        f"AND NOT ({OBSERVATION_CANONICAL_UTC_PREDICATE})"
+    )
+    arms = []
+    for _ in range(instrument_count):
+        arms.append(canonical)
+        arms.append(noncanonical)
+    return (
+        " UNION ALL ".join(arms)
+        + " ORDER BY history_epoch ASC, local_sequence ASC"
+    )
+
+
 def _scan_observation_rows_for_instruments(
     *,
     instrument_version_ids: Sequence[str],
@@ -646,12 +694,11 @@ def _scan_observation_rows_for_instruments(
 ) -> list[Any]:
     """Read observation rows for the requested instruments only.
 
-    One indexed read. Unrelated instruments are not fetched. When every
-    requested instrument has a restored horizon, rows with a parseable source
-    time before the earliest horizon are not fetched. Rows with a missing or
-    unparseable source time are still returned so reconstruction can fail
-    closed instead of hiding them. The single-instrument loader keeps the
-    full-family scan.
+    One indexed read. Unrelated instruments are not fetched. When a restored
+    horizon is supplied, only canonical UTC rows at or after that horizon are
+    pruned in SQL. Every other source time for a requested instrument is
+    returned so reconstruction can fail closed. The single-instrument loader
+    keeps the full-family scan.
     """
     from app.opip.canonical.schema import connect
 
@@ -674,52 +721,43 @@ def _scan_observation_rows_for_instruments(
         raise RevisionLedgerDeadlineExceeded(
             "revision ledger read deadline already elapsed before query"
         )
-    placeholders = ", ".join("?" for _ in requested)
-    horizon_sql = ""
-    params: list[Any] = [MARKET_OBSERVATION_RECORDED, *requested]
-    if lower_interval_epoch is not None:
-        horizon_sql = """
-          AND (
-            json_extract(payload_json, '$.source_event_time') IS NULL
-            OR CAST(
-                strftime(
-                    '%s',
-                    replace(json_extract(payload_json, '$.source_event_time'), 'Z', '')
-                ) AS INTEGER
-            ) IS NULL
-            OR CAST(
-                strftime(
-                    '%s',
-                    replace(json_extract(payload_json, '$.source_event_time'), 'Z', '')
-                ) AS INTEGER
-            ) >= ?
-          )
-        """
-        params.append(int(lower_interval_epoch))
+    horizon = lower_interval_epoch is not None
+    params: list[Any] = []
+    if horizon:
+        for instrument_version_id in requested:
+            params.extend(
+                (
+                    MARKET_OBSERVATION_RECORDED,
+                    instrument_version_id,
+                    int(lower_interval_epoch),
+                    MARKET_OBSERVATION_RECORDED,
+                    instrument_version_id,
+                )
+            )
+    else:
+        params = [MARKET_OBSERVATION_RECORDED, *requested]
+    measure = bool(stats and stats.get("measure_vm_steps"))
     conn = connect(target, read_only=True)
     deadline_triggered = False
 
     def _progress_handler() -> int:
         nonlocal deadline_triggered
+        if stats is not None and measure:
+            stats["vm_steps"] = int(stats.get("vm_steps", 0)) + 1
         if deadline_monotonic is not None and tick() >= deadline_monotonic:
             deadline_triggered = True
             return 1
         return 0
 
     try:
-        if deadline_monotonic is not None:
-            conn.set_progress_handler(_progress_handler, _SQLITE_DEADLINE_PROGRESS_OPS)
+        if deadline_monotonic is not None or measure:
+            conn.set_progress_handler(
+                _progress_handler,
+                1 if measure else _SQLITE_DEADLINE_PROGRESS_OPS,
+            )
         try:
             rows = conn.execute(
-                f"""
-                SELECT payload_json, history_epoch, local_sequence
-                FROM events
-                WHERE event_type = ?
-                  AND json_extract(payload_json, '$.instrument_version_id')
-                      IN ({placeholders})
-                  {horizon_sql}
-                ORDER BY history_epoch ASC, local_sequence ASC
-                """,
+                observation_batch_sql(len(requested), horizon=horizon),
                 params,
             ).fetchall()
         except sqlite3.DatabaseError as exc:
@@ -729,7 +767,7 @@ def _scan_observation_rows_for_instruments(
                 ) from exc
             raise
     finally:
-        if deadline_monotonic is not None:
+        if deadline_monotonic is not None or measure:
             try:
                 conn.set_progress_handler(None, 0)
             except sqlite3.Error:

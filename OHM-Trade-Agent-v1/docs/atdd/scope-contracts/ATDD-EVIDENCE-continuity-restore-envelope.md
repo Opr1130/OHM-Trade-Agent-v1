@@ -53,11 +53,43 @@ each event family is queried once
 
 AC-006:
 GIVEN:
-the additive instrument order index and the Feature Bus budget constants
+the additive continuity indexes and the Feature Bus budget constants
 WHEN:
-a bounded observation read is planned
+the actual checkpoint and horizon observation statements are planned
 THEN:
-the plan uses that index and the 45, 50, 15, and 10 second budgets are unchanged
+those plans seek the continuity indexes and the 45, 50, 15, and 10 second budgets are unchanged
+
+AC-007:
+GIVEN:
+an older valid matching checkpoint and a newer requested-instrument checkpoint whose feature_version is not a string
+WHEN:
+batch continuity restores that instrument for the current feature version
+THEN:
+restoration raises CheckpointIntegrityError and does not restore the older state
+
+AC-008:
+GIVEN:
+a requested instrument with a valid in-horizon observation and a pre-horizon source_event_time that is numeric, naive, offset, or malformed
+WHEN:
+the single-instrument and batch ledger loaders restore that instrument
+THEN:
+both raise RevisionLedgerIntegrityError
+
+AC-009:
+GIVEN:
+the same eight requested instruments at a shallow history depth and at a deep history depth
+WHEN:
+the production checkpoint and horizon ledger queries run
+THEN:
+SQLite VM steps do not grow linearly with that requested-instrument history
+
+AC-010:
+GIVEN:
+the canonical writer healthcheck start period and a realistically scaled events table
+WHEN:
+the exact continuity index statements are created, including over a non-JSON payload
+THEN:
+the scaled build finishes inside that start period and the malformed payload fails the index build
 
 EXPLICITLY OUT OF SCOPE:
 - Deploying this change or merging it
@@ -79,6 +111,10 @@ AC-003 -> tests/test_opip_continuity_restore_envelope.py::test_restored_watermar
 AC-004 -> tests/test_opip_continuity_restore_envelope.py::test_deadline_expiry_fails_closed_before_acquisition
 AC-005 -> tests/test_opip_continuity_restore_envelope.py::test_batch_restore_issues_one_query_per_family
 AC-006 -> tests/test_opip_continuity_restore_envelope.py::test_batch_queries_use_the_instrument_index_and_budgets_stay_fixed
+AC-007 -> tests/test_opip_continuity_restore_envelope.py::test_malformed_newest_feature_version_does_not_restore_older_checkpoint
+AC-008 -> tests/test_opip_continuity_restore_envelope.py::test_noncanonical_pre_horizon_source_time_fails_closed
+AC-009 -> tests/test_opip_continuity_restore_envelope.py::test_requested_instrument_history_depth_does_not_scale_vm_steps
+AC-010 -> tests/test_opip_continuity_restore_envelope.py::test_index_build_uses_the_ddl_and_stays_inside_writer_start
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/opip/canonical/schema.py
@@ -104,6 +140,15 @@ AC-006 -> OHM-Trade-Agent-v1/app/jobs/capture_feature_bus_shadow.py
 AC-006 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
 AC-006 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-EVIDENCE-continuity-restore-envelope.md
 AC-006 -> OHM-Trade-Agent-v1/tests/test_opip_continuity_restore_envelope.py
+AC-007 -> OHM-Trade-Agent-v1/app/opip/features/checkpoint_store.py
+AC-007 -> OHM-Trade-Agent-v1/tests/test_opip_continuity_restore_envelope.py
+AC-008 -> OHM-Trade-Agent-v1/app/opip/features/revision_ledger.py
+AC-008 -> OHM-Trade-Agent-v1/tests/test_opip_continuity_restore_envelope.py
+AC-009 -> OHM-Trade-Agent-v1/app/opip/features/checkpoint_store.py
+AC-009 -> OHM-Trade-Agent-v1/app/opip/features/revision_ledger.py
+AC-009 -> OHM-Trade-Agent-v1/tests/test_opip_continuity_restore_envelope.py
+AC-010 -> OHM-Trade-Agent-v1/app/opip/canonical/schema.py
+AC-010 -> OHM-Trade-Agent-v1/tests/test_opip_continuity_restore_envelope.py
 
 DEFERRED DISCOVERIES:
 - The first writer schema open builds the new index. That one-time build is outside the read-only restore, and a database that has not been opened by the writer yet still filters in SQL but cannot seek.
