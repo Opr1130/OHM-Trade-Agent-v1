@@ -46,7 +46,9 @@ from app.services.canonical_episode_capture import (
     canonical_cohort_id,
     canonical_episode_id,
 )
-from app.services.chief_alert_notifier import send_trade_plan
+from app.services.chief_alert_notifier import _alert_state_key, send_trade_plan
+from app.services.notification_policy import select_new_trade_window
+from app.services.telegram_delivery import record_telegram_suppression
 from app.services.chief_analyst import (
     SHORT_MARGIN_COST_RESERVE_PCT,
     SHORT_MAX_ACCOUNT_RISK_AT_STOP_PCT,
@@ -2183,11 +2185,59 @@ def main():
         protection_sweep is not None and protection_sweep.new_admissions_allowed
     )
 
+    notification_window = []
+    for ranked in ranked_opportunities:
+        alert = ranked.opportunity.alert
+        alert["opportunity_rank"] = ranked.rank
+        alert["profit_rank_score"] = ranked.profit_ranking.total_score
+        notification_window.append(
+            {
+                "rank": ranked.rank,
+                "quality_score": alert.get("profit_rank_score"),
+                "ranked": ranked,
+            }
+        )
+    chosen_notifications, suppressed_notifications = select_new_trade_window(
+        notification_window,
+        max_per_window=int(
+            getattr(settings, "new_trade_alert_max_per_window", 3)
+        ),
+        min_quality_score=float(
+            getattr(settings, "notification_quality_min_score", 0)
+        ),
+    )
+    chosen_notification_ids = {id(row["ranked"]) for row in chosen_notifications}
+    for row in suppressed_notifications:
+        ranked = row["ranked"]
+        opportunity = ranked.opportunity
+        alert = opportunity.alert
+        plan = opportunity.plan
+        reason = str(row.get("notification_suppression_reason") or "SUPPRESSED")
+        alert["notification_disposition"] = reason
+        try:
+            record_telegram_suppression(
+                identity=(
+                    f"QUALIFIED_OPPORTUNITY:{alert.get('trade_id') or plan.symbol}"
+                ),
+                alert_family="QUALIFIED_OPPORTUNITY",
+                event_type="NEW_TRADE",
+                fingerprint=_alert_state_key(alert, plan),
+                reason=reason,
+                symbol=plan.symbol,
+                journey_id=alert.get("journey_id"),
+                signal_id=alert.get("signal_id"),
+                trade_id=alert.get("trade_id"),
+            )
+        except Exception as exc:
+            print(
+                "O'Pip new-trade suppression audit failed:",
+                f"{type(exc).__name__}: {exc}",
+            )
+
     for ranked in ranked_opportunities:
         opportunity = ranked.opportunity
         alert = opportunity.alert
         plan = opportunity.plan
-        direction = opportunity.snapshot.trade_direction
         alert["opportunity_rank"] = ranked.rank
         alert["profit_rank_score"] = ranked.profit_ranking.total_score
 
@@ -2199,6 +2249,9 @@ def main():
             source="qualified_profit_rank",
             profit_rank_score=ranked.profit_ranking.total_score,
         )
+
+        if id(ranked) not in chosen_notification_ids:
+            continue
 
         if send_trade_plan(
             candidate=alert,

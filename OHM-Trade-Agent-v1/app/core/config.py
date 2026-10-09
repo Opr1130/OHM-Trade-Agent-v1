@@ -183,6 +183,13 @@ class Settings(BaseSettings):
     )
 
     min_alert_score: int = Field(default=80, ge=0, le=100)
+    # Notification-only interrupt floor. Compared with the already-computed
+    # authoritative profit-rank quality score. It does not change detector,
+    # rank, selection, portfolio, or trading truth. 0 disables the extra floor.
+    notification_quality_min_score: float = Field(default=0, ge=0, le=100)
+    # Operational NEW TRADE delivery bound per decision window. Not an
+    # architecture constant. Protection and lifecycle alerts do not consume it.
+    new_trade_alert_max_per_window: int = Field(default=3, ge=1, le=20)
     account_equity: float = Field(default=10_000, gt=0)
     risk_per_trade_pct: float = Field(default=0.35, gt=0, le=1)
     max_daily_loss_pct: float = Field(default=1.0, gt=0, le=5)

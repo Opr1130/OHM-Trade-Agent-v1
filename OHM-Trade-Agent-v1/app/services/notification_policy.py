@@ -27,6 +27,90 @@ CRITICAL_EVENTS = {
     "POSITION_WARNING",
     "ACTIONABLE_TRADE",
 }
+# NEW TRADE stays inside CRITICAL_EVENTS so lifecycle fail-open and the generic
+# noncritical attention budget are unchanged for protection alerts. Material
+# fingerprint changes may re-alert inside the cooldown window; an unchanged
+# fingerprint never repeats.
+NEW_TRADE_EVENT = "ACTIONABLE_TRADE"
+NOTIFICATION_POLICY_VERSION = "r4-alert-quality-v1"
+
+
+def _blocked_by_cooldown(
+    *,
+    event_type: str,
+    previous: dict,
+    fingerprint: str,
+    last_at: datetime | None,
+    now: datetime,
+    cooldown_seconds: int,
+) -> bool:
+    if last_at is None:
+        return False
+    if (now - last_at).total_seconds() >= cooldown_seconds:
+        return False
+    if event_type == NEW_TRADE_EVENT:
+        prior = str(previous.get("fingerprint") or "")
+        if prior and prior != fingerprint:
+            return False
+        return True
+    return event_type not in CRITICAL_EVENTS
+
+
+def select_new_trade_window(
+    rows: list[dict],
+    *,
+    max_per_window: int,
+    min_quality_score: float,
+) -> tuple[list[dict], list[dict]]:
+    """Choose notification slots from an already-ranked authoritative window.
+
+    Input order is the authoritative rank order. This function does not sort,
+    rescore, or mutate the caller's rows. Missing quality evidence is not
+    treated as eligible. Rows past the bound stay in the returned suppressed
+    list so learning can still see them.
+    """
+    eligible: list[dict] = []
+    suppressed: list[dict] = []
+    floor = float(min_quality_score)
+    for row in rows:
+        score = row.get("quality_score")
+        try:
+            numeric = float(score)
+        except (TypeError, ValueError):
+            numeric = None
+        if numeric is None or numeric != numeric:
+            suppressed.append(
+                {
+                    **row,
+                    "notification_suppression_reason": (
+                        f"NOTIFICATION_QUALITY_UNAVAILABLE:{NOTIFICATION_POLICY_VERSION}"
+                    ),
+                }
+            )
+            continue
+        if numeric < floor:
+            suppressed.append(
+                {
+                    **row,
+                    "notification_suppression_reason": (
+                        f"NOTIFICATION_QUALITY_THRESHOLD:{NOTIFICATION_POLICY_VERSION}"
+                    ),
+                }
+            )
+            continue
+        eligible.append(row)
+    cap = max(1, int(max_per_window))
+    chosen = eligible[:cap]
+    for row in eligible[cap:]:
+        suppressed.append(
+            {
+                **row,
+                "notification_suppression_reason": (
+                    f"NEW_TRADE_VOLUME_BUDGET:{NOTIFICATION_POLICY_VERSION}:{cap}"
+                ),
+            }
+        )
+    return chosen, suppressed
 
 
 def _now() -> datetime:
@@ -67,9 +151,15 @@ def should_emit(
             if previous.get("fingerprint") == fingerprint:
                 return False
             last_at = _parse(previous.get("sent_at"))
-            if event_type not in CRITICAL_EVENTS and last_at is not None:
-                if (now - last_at).total_seconds() < cooldown_seconds:
-                    return False
+            if _blocked_by_cooldown(
+                event_type=event_type,
+                previous=previous if isinstance(previous, dict) else {},
+                fingerprint=fingerprint,
+                last_at=last_at,
+                now=now,
+                cooldown_seconds=cooldown_seconds,
+            ):
+                return False
     except (OSError, TimeoutError, RegistryIOError):
         # Lifecycle-critical alerts remain fail-open; ordinary attention cards
         # fail closed so a broken state registry cannot bypass flood controls.
@@ -167,9 +257,15 @@ def reserve_emit(
                 return None
 
             last_at = _parse(previous.get("sent_at"))
-            if event_type not in CRITICAL_EVENTS and last_at is not None:
-                if (now - last_at).total_seconds() < cooldown_seconds:
-                    return None
+            if _blocked_by_cooldown(
+                event_type=event_type,
+                previous=previous,
+                fingerprint=fingerprint,
+                last_at=last_at,
+                now=now,
+                cooldown_seconds=cooldown_seconds,
+            ):
+                return None
 
             lease_until = _parse(previous.get("reservation_expires_at"))
             if (
