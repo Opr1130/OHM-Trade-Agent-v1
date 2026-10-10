@@ -8,7 +8,11 @@ Reconciled code baseline (R4-B2 status reconciliation, 2026-10-03): `a808e84ffc2
 
 The superseded status values recorded at the earlier baseline `facf8e36` are preserved as history in each row below; a corrected value never erases what was previously recorded.
 
-Architecture source: v1.4.3 DOCX pinned in `docs/architecture/v1.4.3/SOURCE.md`.
+Architecture source: v1.5.0 DOCX pinned in `docs/architecture/v1.5.0/SOURCE.md`, with the v1.4.4 amendment pinned in `docs/architecture/v1.4.4/SOURCE.md` and the owner feature-priority tracker stored beside the v1.5.0 package.
+
+Architecture source (previous, preserved as history): v1.4.3 DOCX pinned in `docs/architecture/v1.4.3/SOURCE.md`. Its bytes and pin are unchanged.
+
+Architecture source adoption baseline (R5-0 architecture source adoption, 2026-10-10): `8b3cc2712432ca21007be4db0667301d48b89d97`.
 
 Runtime observations are summarized here and detailed in `OPIP_RUNTIME_TRUTH_2026-09-28.md`, with `OPIP_RUNTIME_TRUTH_2026-09-27.md` preserved as the preceding historical observation. Code status is from the current reconciled baseline unless a row says otherwise. A green test is not production proof. The reconciliation updates status only where evidence changed; it does not convert absence of evidence into completion.
 
@@ -31,7 +35,7 @@ Status values: `IMPLEMENTED_VERIFIED`, `IMPLEMENTED_NOT_ACTIVE`, `IMPLEMENTED_AW
 | CUTOVER_GATE | Feature-bus shadow parity accepted and consumers enumerated |
 | RETIREMENT_CANDIDATE | No. The observation fact remains. The JSONL writer is the retirement candidate after canonical capture. |
 | DELETE_GATE | Named stop time, archive, consumer census, rollback |
-| BLOCKERS | Feature bus pinned off |
+| BLOCKERS | The Feature Bus is `shadow` (owner-authorized `EVIDENCE_SHADOW`, non-authoritative; `run_cycle` does not call it). The earlier recorded value "Feature bus pinned off" is preserved as history. |
 | NOTES | Missing evidence must stay unknown. |
 
 ## F2 — Shared Feature Bus
@@ -52,7 +56,7 @@ Status values: `IMPLEMENTED_VERIFIED`, `IMPLEMENTED_NOT_ACTIVE`, `IMPLEMENTED_AW
 | CUTOVER_GATE | Shadow parity/replay evidence against legacy indicators (now supplied by R2), then a separate owner decision to remove the compose pin. No cutover occurred. |
 | RETIREMENT_CANDIDATE | Legacy technical feature calculations, after cutover |
 | DELETE_GATE | Consumer census of scorer callers, archive of parity fixtures, rollback to the pinned-off compose |
-| BLOCKERS | Not scheduled. Explicitly pinned off so a stale `.env` cannot enable it when the writer is shadow. |
+| BLOCKERS | Not scheduled. The core-service `OPIP_FEATURE_BUS_MODE` is `shadow` under the owner-authorized `EVIDENCE_SHADOW` release profile, so a stale `.env` cannot enable, widen, or silently disable capture; `run_cycle` still does not call the Feature Bus, so the bus owns no decision authority. The earlier recorded value "Explicitly pinned off so a stale .env cannot enable it when the writer is shadow" is preserved as history. |
 | NOTES | `replay.py` prepares detector replay input and does not evaluate a detector. The accepted R2 evidence does not grant the Feature Bus any production runtime authority, and `run_cycle` still does not call it. |
 
 ## F3 — Stateful Detector Runtime / IGNITION
@@ -72,7 +76,7 @@ Status values: `IMPLEMENTED_VERIFIED`, `IMPLEMENTED_NOT_ACTIVE`, `IMPLEMENTED_AW
 | CUTOVER_GATE | Deterministic replay of snapshot + prior state + evaluation_time, shadow only, after Feature Bus evidence exists |
 | RETIREMENT_CANDIDATE | Explosion phase classifier, after the detector owns transitions |
 | DELETE_GATE | No deletion until the detector is the live claim source and consumers have moved |
-| BLOCKERS | Feature Bus is off, and the detector module (`app/opip/detectors/ignition.py`) is shadow-only with no runtime authority and no Feature Bus snapshot source. The earlier "Feature Bus is off. No detector module." is preserved as history at baseline `facf8e36`. |
+| BLOCKERS | The Feature Bus is `shadow` and the detector has no live snapshot source (`run_cycle` does not call the bus), so the detector module (`app/opip/detectors/ignition.py`) stays shadow-only with no runtime authority. The target spine is composed in `shadow` on every unified cycle and, because no snapshot source is supplied, each pass is a recorded non-authoritative no-op rather than a disabled gate. The earlier "Feature Bus is off. No detector module." is preserved as history at baseline `facf8e36`. |
 | NOTES | Do not treat the phase string as the v1.4.3 detector. |
 
 ## F4 — Opportunity Lifecycle

@@ -9,7 +9,7 @@ This mechanism is subordinate to approved architecture. It does not replace arch
 ```text
 OWNER directives / OWNER-approved rulings
         ↓
-Attached canonical architecture (v1.4.3 while that package is the OWNER source)
+Attached canonical architecture (v1.5.0 while that package is the OWNER source)
         ↓
 Checked-in v1.2 architecture contracts and their invariant tests
         ↓
@@ -18,7 +18,7 @@ Approved ATDD scope contract for the current increment
 Implementation
 ```
 
-Checked-in baseline: `docs/architecture/v1.2/`. The attached architecture package is `OPIP_Profit_Intelligence_Architecture_v1_4_3.docx` (22 September 2026). It is not copied into this repository by this increment.
+Checked-in baseline: `docs/architecture/v1.2/` for clause-level history. The current attached architecture package is `OPIP_Profit_Intelligence_Architecture_v1_5_0.docx` (9 October 2026), copied into this repository at `docs/architecture/v1.5.0/` with its paragraph extraction, `SOURCE.md` identity pin and the owner feature-priority tracker. The v1.4.4 amendment (4 October 2026) and the baselined v1.4.3 body (22 September 2026) are retained at `docs/architecture/v1.4.4/` and `docs/architecture/v1.4.3/`. The earlier statement that the package "is not copied into this repository by this increment" described the R0/R1 increment at that time; it is preserved as history, and adoption of the source bytes remains documentary only.
 
 ## Where a contract lives
 

@@ -6,7 +6,9 @@ Historical reconciled baseline (superseded 2026-10-03): `facf8e369e1251697bf9799
 
 Reconciled code baseline (R4-B2 status reconciliation, 2026-10-03): `a808e84ffc2fea4912cfa5592927d1afe2956568`
 
-Architecture: v1.4.3, 22 September 2026. See `docs/architecture/v1.4.3/SOURCE.md`.
+Architecture source adoption baseline (R5-0 architecture source adoption, 2026-10-10): `8b3cc2712432ca21007be4db0667301d48b89d97`
+
+Architecture: v1.5.0, 9 October 2026 (Continuous Multi-Horizon Capital Intelligence), with the v1.4.4 amendment of 4 October 2026 and the v1.4.3 body of 22 September 2026 retained as history. See `docs/architecture/v1.5.0/SOURCE.md`. The earlier statement "Architecture: v1.4.3, 22 September 2026." is preserved as history.
 
 This roadmap does not authorize implementation, activation, merge, or deploy. It records the phase order; each phase starts only after owner review.
 
@@ -16,7 +18,7 @@ The live cycle is `app.jobs.run_cycle` → protection → `scan_opportunities` �
 
 The identity of the *live* paper authority is not fully observed. The Freqtrade dry-run containers are healthy and the code routes to them when Paper v2 is not requested, but the live `OPIP_PAPER_V2_MODE` value and Paper v1 `control.json` are unobserved. Treat the live paper authority as `UNKNOWN_NEEDS_EVIDENCE` until those values are actually observed; do not select an engine from defaults and container health.
 
-The v1.4.3 spine is FeatureSnapshot → IGNITION detector → opportunity lifecycle → feasibility → forecast → constrained portfolio selection → realistic paper. Status update (R4-B2 status reconciliation, 2026-10-03): the F3-F7 spine is now implemented as shadow / dormant modules (#287-#300) with no production runtime authority; the earlier statement "F3 and F6 are missing" is preserved as history at baseline `facf8e36`. The Feature Bus that F3 requires is implemented and pinned off, and its R2 shadow parity/replay evidence is accepted.
+The v1.4.3 spine is FeatureSnapshot → IGNITION detector → opportunity lifecycle → feasibility → forecast → constrained portfolio selection → realistic paper. Status update (R4-B2 status reconciliation, 2026-10-03): the F3-F7 spine is now implemented as shadow / dormant modules (#287-#300) with no production runtime authority; the earlier statement "F3 and F6 are missing" is preserved as history at baseline `facf8e36`. The Feature Bus that F3 requires is implemented and its R2 shadow parity/replay evidence is accepted; its core-service mode is `shadow` under the owner-authorized `EVIDENCE_SHADOW` release profile (`ATDD-RELEASE-PIPELINE-v1`), which superseded the earlier composed `off` pin, and `run_cycle` still does not call it, so the bus owns no decision authority. The earlier statement "The Feature Bus that F3 requires is implemented and pinned off" is preserved as history.
 
 Paper v2 is implemented and inactive. Turning it on now would paper the legacy selector. The Committee package is present, shadow-only, and has no path into `run_cycle`. Its last activation proof had an inactive timer and zero role results, on a SHA older than this core. Dashboard surfaces do not share one semantic model and cannot show detector, forecast, or Committee facts that the runtime does not emit.
 
@@ -67,7 +69,9 @@ Cutover stays blocked until all of these are true:
 
 Paper v2 protection today runs inside the scan, not on the one-minute protection slot. R4 must show protection still runs when discovery is down before Paper v1 or Freqtrade can be retired as the paper engine.
 
-### R5 — Outcome consolidation and the v1.4.3 dashboard
+### R5-LEGACY-OUTCOMES-COCKPIT — Outcome consolidation and the v1.4.3 dashboard
+
+Preserved tracking alias from the adopted v1.5.0 delivery sequence (section 14): R5 now means Continuous Multi-Horizon Capital Intelligence (R5-0 contracts, R5-A Market Eye, R5-B Horizons, R5-C Capital, R5-D portfolio and rotation, R5-E autonomous paper, R5-F learning). This older outcome-consolidation and cockpit milestone is retained as `R5-LEGACY-OUTCOMES-COCKPIT`; its F9 consolidation work is a prerequisite for trustworthy R5-C/E/F and its F10 work accompanies each evidence increment. R6 Committee shadow proof and R7 governed retirement remain separate retained obligations. Neither R5-0's owner assignment nor the record, horizon, accounting and performance-budget freezes named in the adopted section 14, nor R5-A to R5-F, is approved by the architecture source adoption.
 
 Do not add another outcome engine. Name one writer per fact. Keep Phase3C, discovery outcomes, the trade-outcome journal, Opportunity Accountability, and Profit Intelligence as projections until each fact has one owner.
 
@@ -96,11 +100,11 @@ Core `facf8e36` was deployed on 2026-09-28 (run `36473910247`). The last success
 
 A matching `/deploy-learning` for `facf8e36` is an owner control-plane action. It is required before learning capture is expected to be healthy. It does not replace R3.
 
-## Current implementation focus (updated 2026-10-03)
+## Current implementation focus (updated 2026-10-10)
 
-R3 is implemented as shadow / dormant modules (see above). The active increment is `ATDD-R4-B2-controlled-paper-activation`; Slice 3B adds the prospective F6 evidence contract and its canonical label projection. The R4 Paper-v2 cutover stays OWNER-gated and evidence-blocked: the disposition is `REAL_EVIDENCE_MATURATION_REQUIRED` for the calibrated forecast, and `SAFETY_OR_AUTHORITY_BLOCK` for the SHADOW enablement and the cutover switch.
+R3 is implemented as shadow / dormant modules (see above). The release-pipeline increment (`ATDD-RELEASE-PIPELINE-v1`) and the continuity-restore envelope increment (`ATDD-EVIDENCE-continuity-restore-envelope`) are merged. The active increment is `ATDD-R5-0-architecture-source-adoption`: it adopts the v1.5.0 and v1.4.4 architecture sources, re-baselines these truth documents, and moves the ATDD pointer. It is documentation and governance only. The earlier statement "The active increment is `ATDD-R4-B2-controlled-paper-activation`; Slice 3B adds the prospective F6 evidence contract and its canonical label projection." is preserved as history. The R4 Paper-v2 cutover stays OWNER-gated and evidence-blocked: the disposition is `REAL_EVIDENCE_MATURATION_REQUIRED` for the calibrated forecast, and `SAFETY_OR_AUTHORITY_BLOCK` for the SHADOW enablement and the cutover switch.
 
-Do not start a later phase, enable Paper v2, enable the Committee timer, activate the Feature Bus, or redesign the dashboard without an explicit owner decision.
+Do not start a later phase, enable Paper v2, enable the Committee timer, widen the Feature Bus beyond its owner-authorized `shadow` posture, or redesign the dashboard without an explicit owner decision.
 
 ## Signal Quality v2 disposition
 

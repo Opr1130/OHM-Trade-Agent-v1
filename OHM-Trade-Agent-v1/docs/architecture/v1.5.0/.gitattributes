@@ -1,0 +1,7 @@
+# The owner feature-priority tracker is adopted as a byte copy of the owner
+# file, so its line endings are part of the pinned identity in SOURCE.md.
+# Marking these two files non-text keeps git from normalising them on add or
+# checkout, which is what keeps their SHA256 equal to the owner files' on
+# every platform.
+OPIP_Feature_Priorities_v1_5_0.md -text
+OPIP_Feature_Priorities_v1_5_0.csv -text
