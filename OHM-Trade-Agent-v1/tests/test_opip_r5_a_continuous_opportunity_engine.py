@@ -1972,6 +1972,23 @@ def test_ac_009_position_requires_structural_evidence_not_ignition_alone():
     )
     assert thin_liquidity.abstention_reason is AbstentionReason.MISSING_LIQUIDITY_SUPPORT
 
+    # Claimed milestones without real structural support must not count: this
+    # case is refused by the structural gate alone, not by the milestone count.
+    unsupported_structure = classify_horizon(
+        thesis_evidence(
+            expected_holding_seconds=2_000_000,
+            detector_support=True,
+            structural_support=False,
+            structural_milestones=4,
+            liquidity_support=True,
+        ),
+        policy,
+    )
+    assert unsupported_structure.abstention_reason is (
+        AbstentionReason.INSUFFICIENT_STRUCTURAL_EVIDENCE
+    )
+    assert unsupported_structure.expected_holding_seconds_min is None
+
     gap_policy = HorizonPolicy(
         policy_version=HORIZON_ENGINEERING_SCENARIO_POLICY_VERSION,
         holding_bounds_seconds={
