@@ -91,6 +91,22 @@ the exact continuity index statements are created, including over a non-JSON pay
 THEN:
 the scaled build finishes inside that start period and the malformed payload fails the index build
 
+AC-011:
+GIVEN:
+an older matching checkpoint, a newer whitespace-only feature_version, and a newest different non-empty feature version
+WHEN:
+single-instrument and batch continuity restore the requested feature version
+THEN:
+both raise CheckpointIntegrityError and do not restore the older match
+
+AC-012:
+GIVEN:
+a valid in-horizon observation and a pre-horizon source time that is an impossible UTC date or a real leap day
+WHEN:
+the single-instrument and batch ledger loaders restore that instrument
+THEN:
+impossible dates raise RevisionLedgerIntegrityError and the leap day keeps normal horizon semantics
+
 EXPLICITLY OUT OF SCOPE:
 - Deploying this change or merging it
 - TARGET_PAPER, Paper-v2, committee, or funded authority
@@ -115,6 +131,9 @@ AC-007 -> tests/test_opip_continuity_restore_envelope.py::test_malformed_newest_
 AC-008 -> tests/test_opip_continuity_restore_envelope.py::test_noncanonical_pre_horizon_source_time_fails_closed
 AC-009 -> tests/test_opip_continuity_restore_envelope.py::test_requested_instrument_history_depth_does_not_scale_vm_steps
 AC-010 -> tests/test_opip_continuity_restore_envelope.py::test_index_build_uses_the_ddl_and_stays_inside_writer_start
+AC-011 -> tests/test_opip_continuity_restore_envelope.py::test_whitespace_feature_version_under_a_different_tip_fails_closed
+AC-012 -> tests/test_opip_continuity_restore_envelope.py::test_impossible_canonical_shaped_utc_date_fails_closed
+AC-012 -> tests/test_opip_continuity_restore_envelope.py::test_valid_leap_day_stays_on_the_horizon_seek
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/opip/canonical/schema.py
@@ -149,6 +168,11 @@ AC-009 -> OHM-Trade-Agent-v1/app/opip/features/revision_ledger.py
 AC-009 -> OHM-Trade-Agent-v1/tests/test_opip_continuity_restore_envelope.py
 AC-010 -> OHM-Trade-Agent-v1/app/opip/canonical/schema.py
 AC-010 -> OHM-Trade-Agent-v1/tests/test_opip_continuity_restore_envelope.py
+AC-011 -> OHM-Trade-Agent-v1/app/opip/features/checkpoint_store.py
+AC-011 -> OHM-Trade-Agent-v1/tests/test_opip_continuity_restore_envelope.py
+AC-012 -> OHM-Trade-Agent-v1/app/opip/canonical/schema.py
+AC-012 -> OHM-Trade-Agent-v1/app/opip/features/revision_ledger.py
+AC-012 -> OHM-Trade-Agent-v1/tests/test_opip_continuity_restore_envelope.py
 
 DEFERRED DISCOVERIES:
 - The first writer schema open builds the new index. That one-time build is outside the read-only restore, and a database that has not been opened by the writer yet still filters in SQL but cannot seek.

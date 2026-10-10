@@ -367,6 +367,126 @@ def test_malformed_newest_feature_version_does_not_restore_older_checkpoint(tmp_
         )
 
 
+def test_whitespace_feature_version_under_a_different_tip_fails_closed(tmp_path):
+    """ATDD-EVIDENCE-continuity-restore-envelope/AC-011: whitespace-only feature_version fails closed instead of restoring an older match."""
+    db = _make_db(tmp_path)
+    version = _instrument(0)
+    _insert_event(
+        db,
+        event_id="EV:older",
+        event_type=FEATURE_CHECKPOINT_RECORDED,
+        payload=_checkpoint_payload(version.instrument_version_id),
+        local_sequence=1,
+    )
+    blank = _checkpoint_payload(version.instrument_version_id, local_sequence=2)
+    blank["feature_version"] = "   "
+    _insert_event(
+        db,
+        event_id="EV:blank",
+        event_type=FEATURE_CHECKPOINT_RECORDED,
+        payload=blank,
+        local_sequence=2,
+    )
+    other = _checkpoint_payload(version.instrument_version_id, local_sequence=3)
+    other["feature_version"] = "opip-features-other"
+    _insert_event(
+        db,
+        event_id="EV:other",
+        event_type=FEATURE_CHECKPOINT_RECORDED,
+        payload=other,
+        local_sequence=3,
+    )
+    with pytest.raises(checkpoint_module.CheckpointIntegrityError):
+        checkpoint_module.load_latest_checkpoint_payload(
+            version.instrument_version_id, db_path=db, feature_version=FEATURE_VERSION
+        )
+    with pytest.raises(checkpoint_module.CheckpointIntegrityError):
+        checkpoint_module.load_latest_checkpoint_payloads_batch(
+            [version.instrument_version_id],
+            db_path=db,
+            feature_version=FEATURE_VERSION,
+        )
+
+
+@pytest.mark.parametrize(
+    "source_event_time",
+    ["2021-02-30T00:00:00Z", "2021-02-29T00:00:00Z"],
+)
+def test_impossible_canonical_shaped_utc_date_fails_closed(tmp_path, source_event_time):
+    """ATDD-EVIDENCE-continuity-restore-envelope/AC-012: an impossible UTC date is not horizon-pruned."""
+    db = _make_db(tmp_path)
+    version = _instrument(0)
+    bad = _observation_payload(version.instrument_version_id, epoch=HORIZON - 86_400)
+    bad["source_event_time"] = source_event_time
+    _insert_event(
+        db,
+        event_id="EV:bad",
+        event_type=MARKET_OBSERVATION_RECORDED,
+        payload=bad,
+        local_sequence=1,
+    )
+    _insert_event(
+        db,
+        event_id="EV:good",
+        event_type=MARKET_OBSERVATION_RECORDED,
+        payload=_observation_payload(version.instrument_version_id, epoch=HORIZON),
+        local_sequence=2,
+    )
+    with pytest.raises(ledger_module.RevisionLedgerIntegrityError):
+        ledger_module.load_revision_ledger(
+            version.instrument_version_id,
+            interval_seconds=60,
+            since_interval_epoch=HORIZON,
+            db_path=db,
+        )
+    with pytest.raises(ledger_module.RevisionLedgerIntegrityError):
+        ledger_module.load_revision_ledgers_batch(
+            [version.instrument_version_id],
+            interval_seconds_by_instrument={version.instrument_version_id: 60},
+            since_interval_epoch_by_instrument={version.instrument_version_id: HORIZON},
+            db_path=db,
+        )
+
+
+def test_valid_leap_day_stays_on_the_horizon_seek(tmp_path):
+    """ATDD-EVIDENCE-continuity-restore-envelope/AC-012: a real leap-day timestamp keeps normal horizon semantics."""
+    db = _make_db(tmp_path)
+    version = _instrument(0)
+    leap = _observation_payload(version.instrument_version_id, epoch=HORIZON - 86_400)
+    leap["source_event_time"] = "2020-02-29T00:00:00Z"
+    _insert_event(
+        db,
+        event_id="EV:leap",
+        event_type=MARKET_OBSERVATION_RECORDED,
+        payload=leap,
+        local_sequence=1,
+    )
+    _insert_event(
+        db,
+        event_id="EV:good",
+        event_type=MARKET_OBSERVATION_RECORDED,
+        payload=_observation_payload(version.instrument_version_id, epoch=HORIZON),
+        local_sequence=2,
+    )
+    single = ledger_module.load_revision_ledger(
+        version.instrument_version_id,
+        interval_seconds=60,
+        since_interval_epoch=HORIZON,
+        db_path=db,
+    )
+    stats: dict[str, int] = {}
+    batch = ledger_module.load_revision_ledgers_batch(
+        [version.instrument_version_id],
+        interval_seconds_by_instrument={version.instrument_version_id: 60},
+        since_interval_epoch_by_instrument={version.instrument_version_id: HORIZON},
+        db_path=db,
+        stats=stats,
+    )
+    assert set(single.entries) == {HORIZON}
+    assert set(batch[version.instrument_version_id].entries) == {HORIZON}
+    assert stats["rows_returned"] == 1
+
+
 @pytest.mark.parametrize(
     "source_event_time",
     [123, "2020-01-01T00:00:00", "2020-01-01T00:00:00+05:00", "not-a-timestamp"],

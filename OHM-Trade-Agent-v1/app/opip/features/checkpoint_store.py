@@ -295,10 +295,11 @@ def latest_checkpoint_batch_sql(instrument_count: int) -> str:
 
 
 def _matching_or_malformed_checkpoint_sql(instrument_count: int) -> str:
-    """Latest row that matches the requested version or is not version text.
+    """Latest row that matches the requested version or is not a usable version.
 
     Used only after the absolute latest row was a different non-empty version
-    string. A non-text or blank version newer than the match still fails closed.
+    string. A non-text version, or text that is blank after the same trim as
+    Python ``str.strip`` for ASCII whitespace, still fails closed.
     """
     arm = (
         "SELECT ? AS instrument_version_id, ("
@@ -309,7 +310,8 @@ def _matching_or_malformed_checkpoint_sql(instrument_count: int) -> str:
         "json_type(payload_json, '$.feature_version') IS NULL "
         "OR json_type(payload_json, '$.feature_version') != 'text' "
         "OR json_extract(payload_json, '$.feature_version') = ? "
-        "OR json_extract(payload_json, '$.feature_version') = ''"
+        "OR trim(json_extract(payload_json, '$.feature_version'), "
+        "char(9) || char(10) || char(11) || char(12) || char(13) || ' ') = ''"
         ") "
         "ORDER BY history_epoch DESC, local_sequence DESC LIMIT 1"
         ") AS payload_json"

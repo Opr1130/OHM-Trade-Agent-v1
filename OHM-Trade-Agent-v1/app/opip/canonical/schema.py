@@ -13,19 +13,35 @@ from app.opip.canonical.paths import SCHEMA_VERSION
 #: observation horizon index and by the batch ledger read. A value is indexed
 #: only when the predicate below is true, so naive, offset, numeric, and
 #: malformed times are not treated as pruneable epochs.
+_OBSERVATION_UTC_TEXT = "json_extract(payload_json, '$.source_event_time')"
+_OBSERVATION_UTC_NAIVE = f"replace({_OBSERVATION_UTC_TEXT}, 'Z', '')"
 OBSERVATION_UTC_EPOCH_EXPR = (
-    "CAST(strftime('%s', replace("
-    "json_extract(payload_json, '$.source_event_time'), 'Z', '')) AS INTEGER)"
+    f"CAST(strftime('%s', {_OBSERVATION_UTC_NAIVE}) AS INTEGER)"
+)
+#: Clock text SQLite emits after parsing. Impossible dates such as
+#: ``2021-02-30`` normalize to a different calendar day, so this does not
+#: equal the original and the row stays noncanonical for Python validation.
+_OBSERVATION_UTC_CLOCK = (
+    f"strftime('%Y-%m-%dT%H:%M:%S', {_OBSERVATION_UTC_NAIVE}) || 'Z'"
+)
+_OBSERVATION_UTC_CLOCK_INPUT = (
+    "CASE WHEN instr("
+    f"{_OBSERVATION_UTC_TEXT}, '.') = 0 THEN {_OBSERVATION_UTC_TEXT} "
+    "ELSE substr("
+    f"{_OBSERVATION_UTC_TEXT}, 1, instr({_OBSERVATION_UTC_TEXT}, '.') - 1) "
+    "|| 'Z' END"
 )
 OBSERVATION_CANONICAL_UTC_PREDICATE = (
-    "json_type(payload_json, '$.source_event_time') = 'text' AND ("
-    "json_extract(payload_json, '$.source_event_time') "
+    f"json_type(payload_json, '$.source_event_time') = 'text' AND ("
+    f"{_OBSERVATION_UTC_TEXT} "
     "GLOB '????-??-??T??:??:??Z' OR "
-    "json_extract(payload_json, '$.source_event_time') "
+    f"{_OBSERVATION_UTC_TEXT} "
     "GLOB '????-??-??T??:??:??.???Z' OR "
-    "json_extract(payload_json, '$.source_event_time') "
+    f"{_OBSERVATION_UTC_TEXT} "
     "GLOB '????-??-??T??:??:??.??????Z'"
-    f") AND {OBSERVATION_UTC_EPOCH_EXPR} IS NOT NULL"
+    f") AND {OBSERVATION_UTC_EPOCH_EXPR} IS NOT NULL "
+    f"AND {_OBSERVATION_UTC_CLOCK} = {_OBSERVATION_UTC_CLOCK_INPUT} "
+    f"AND strftime('%H', {_OBSERVATION_UTC_NAIVE}) < '24'"
 )
 INDEX_EVENTS_TYPE_INSTRUMENT_ORDER = (
     "CREATE INDEX IF NOT EXISTS idx_events_type_instrument_order "
