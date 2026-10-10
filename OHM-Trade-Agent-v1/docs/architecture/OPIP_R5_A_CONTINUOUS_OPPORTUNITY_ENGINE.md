@@ -142,15 +142,38 @@ remain, and acceptance test
 `test_ac_010_the_r3_isolation_allowlists_were_widened_without_weakening_them`
 re-proves that both suites kept them.
 
-## Verification performed for this increment
+## Verification performed for this increment (final head)
 
 - Focused acceptance suite: `tests/test_opip_r5_a_continuous_opportunity_engine.py`
   (15 criteria, 81 test cases) passes.
-- ATDD scope gate: `python tests/atdd_scope.py --increment ATDD-R5-A-continuous-opportunity-engine --git-base origin/main`.
-- Repository contract suites that this increment could affect: ATDD scope control,
-  R5-0 conformance, release profiles and Compose literal checks.
-- Static checks: `python -m compileall -q app`, plus the import, purity, clock and
-  authority scans asserted inside the acceptance suite itself.
+- ATDD scope gate, CI-exact form:
+  `python tests/atdd_scope.py --increment ATDD-R5-A-continuous-opportunity-engine --git-base origin/main`
+  -> `PASS`.
+- Repo-wide acceptance suite: `python -m pytest -m acceptance -q` ->
+  **979 passed, 73 skipped, 0 failed**.
+- Regression suites spanning the touched families all pass: R3 F3 ignition, R3 F4
+  lifecycle and persistence, R3 F5/F6/F7, feature bus PR3, streaming
+  runtime/shadow/safety, release profiles, the module-scanning safety suites,
+  R5-0 conformance and ATDD scope control.
+- `python -m compileall -q app` -> clean.
+- Release architecture gate: `ARCHITECTURE_GATE=PASS`,
+  `PROFILE=EVIDENCE_SHADOW`, `PAPER_V2=OFF`, `FUNDED_AUTHORITY=ABSENT`,
+  `PROTECTION=INDEPENDENT`.
+- Adversarial mutation probe on five critical invariants (one-step attention
+  progression, late-arrival blocking, the horizon structural gate, the engine
+  snapshot cut-off check and coordinator priority ordering): 5 detected, 0
+  survivors. The first probe found the horizon structural gate under-covered
+  because the milestone-count gate refused the same fixture for a different
+  reason; the POSITION test now also covers claimed milestones without real
+  structural support, and that mutation is detected.
+- CI on this exact head: `test` pass, `atdd scope` pass, `release architecture
+  gate` pass, `release security gate (Bandit)` pass, `semgrep/ci` pass,
+  `gitleaks` pass. The advisory `ruff`/`bandit`/`pip-audit` job still fails with
+  **86 pre-existing repo-wide findings, none of them in the new modules**, and
+  the external `CircleCI` check still fails because the project has no
+  `.circleci/config.yml`; both fail identically on `main` and neither is a
+  required gate for this increment.
+
 
 ## Remaining risks and honest limits
 
