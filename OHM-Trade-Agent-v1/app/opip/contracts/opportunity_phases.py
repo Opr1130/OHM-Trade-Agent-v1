@@ -30,8 +30,6 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
 from types import MappingProxyType
-from typing import Any
-
 from app.opip.contracts.detector import DetectorClaim
 from app.opip.contracts.opportunity import (
     OPPORTUNITY_EPISODE_SCHEMA_VERSION,
