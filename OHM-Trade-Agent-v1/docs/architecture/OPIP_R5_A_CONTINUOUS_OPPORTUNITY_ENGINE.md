@@ -278,6 +278,12 @@ unwired slice.
 
 ## Verification performed for this increment (final head)
 
+Exact-SHA traceability: the review fixes recorded in this document are commit
+`d48fd0deb34adbc8459bc5644d1a45b813065838` ("R5-A: reconcile the load accounting
+and prove restart recovery is replay-only"). This evidence record is its direct
+child and carries no code change; the pull request records the exact branch head
+SHA after both commits.
+
 - Focused acceptance suite: `tests/test_opip_r5_a_continuous_opportunity_engine.py`
   (15 criteria, 93 test cases) passes. The increment added 12 cases in this review:
   three accounting regressions, one restart-durability regression and one labelled
