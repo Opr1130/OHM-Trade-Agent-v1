@@ -167,6 +167,17 @@ AUTHORIZED_PATHS = frozenset(
         # runtime path may import the F4 lifecycle.
         APP_ROOT / "app" / "opip" / "contracts" / "opportunity_persistence.py",
         APP_ROOT / "app" / "opip" / "canonical" / "models.py",
+        # The separately OWNER-approved R5-A Continuous Opportunity Engine
+        # increment (ATDD-R5-A-continuous-opportunity-engine) maps its logical
+        # phases onto the existing F4 enums and opens the canonical episode for a
+        # frozen F3 claim. This widens the allow-list by exactly those two
+        # authorized consumers, and only for the vocabulary-mention scan below.
+        # No assertion below is removed or relaxed: the Compose literal, the
+        # forbidden import roots, the run-cycle isolation checks and the
+        # authority-token checks all still hold, and no other runtime path may
+        # import the F4 lifecycle.
+        APP_ROOT / "app" / "opip" / "contracts" / "opportunity_phases.py",
+        APP_ROOT / "app" / "opip" / "events" / "opportunity_engine.py",
     )
 )
 
