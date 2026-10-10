@@ -9,7 +9,69 @@ from typing import Any
 
 from app.opip.canonical.paths import SCHEMA_VERSION
 
-DDL = """
+#: Epoch of a canonical UTC ``source_event_time`` (``...Z``). Used by the
+#: observation horizon index and by the batch ledger read. A value is indexed
+#: only when the predicate below is true, so naive, offset, numeric, and
+#: malformed times are not treated as pruneable epochs.
+_OBSERVATION_UTC_TEXT = "json_extract(payload_json, '$.source_event_time')"
+_OBSERVATION_UTC_NAIVE = f"replace({_OBSERVATION_UTC_TEXT}, 'Z', '')"
+OBSERVATION_UTC_EPOCH_EXPR = (
+    f"CAST(strftime('%s', {_OBSERVATION_UTC_NAIVE}) AS INTEGER)"
+)
+#: Clock text SQLite emits after parsing. Impossible dates such as
+#: ``2021-02-30`` normalize to a different calendar day, so this does not
+#: equal the original and the row stays noncanonical for Python validation.
+_OBSERVATION_UTC_CLOCK = (
+    f"strftime('%Y-%m-%dT%H:%M:%S', {_OBSERVATION_UTC_NAIVE}) || 'Z'"
+)
+_OBSERVATION_UTC_CLOCK_INPUT = (
+    "CASE WHEN instr("
+    f"{_OBSERVATION_UTC_TEXT}, '.') = 0 THEN {_OBSERVATION_UTC_TEXT} "
+    "ELSE substr("
+    f"{_OBSERVATION_UTC_TEXT}, 1, instr({_OBSERVATION_UTC_TEXT}, '.') - 1) "
+    "|| 'Z' END"
+)
+OBSERVATION_CANONICAL_UTC_PREDICATE = (
+    f"json_type(payload_json, '$.source_event_time') = 'text' AND ("
+    f"{_OBSERVATION_UTC_TEXT} "
+    "GLOB '????-??-??T??:??:??Z' OR "
+    f"{_OBSERVATION_UTC_TEXT} "
+    "GLOB '????-??-??T??:??:??.???Z' OR "
+    f"{_OBSERVATION_UTC_TEXT} "
+    "GLOB '????-??-??T??:??:??.??????Z'"
+    f") AND {OBSERVATION_UTC_EPOCH_EXPR} IS NOT NULL "
+    f"AND {_OBSERVATION_UTC_CLOCK} = {_OBSERVATION_UTC_CLOCK_INPUT} "
+    f"AND strftime('%H', {_OBSERVATION_UTC_NAIVE}) < '24'"
+)
+INDEX_EVENTS_TYPE_INSTRUMENT_ORDER = (
+    "CREATE INDEX IF NOT EXISTS idx_events_type_instrument_order "
+    "ON events ("
+    "event_type, "
+    "json_extract(payload_json, '$.instrument_version_id'), "
+    "history_epoch, "
+    "local_sequence)"
+)
+INDEX_EVENTS_OBSERVATION_UTC_EPOCH = (
+    "CREATE INDEX IF NOT EXISTS idx_events_observation_utc_epoch "
+    "ON events ("
+    "event_type, "
+    "json_extract(payload_json, '$.instrument_version_id'), "
+    f"{OBSERVATION_UTC_EPOCH_EXPR}) "
+    "WHERE event_type = 'market.observation.recorded' AND "
+    f"{OBSERVATION_CANONICAL_UTC_PREDICATE}"
+)
+INDEX_EVENTS_OBSERVATION_NONCANONICAL_TIME = (
+    "CREATE INDEX IF NOT EXISTS idx_events_observation_noncanonical_time "
+    "ON events ("
+    "event_type, "
+    "json_extract(payload_json, '$.instrument_version_id'), "
+    "history_epoch, "
+    "local_sequence) "
+    "WHERE event_type = 'market.observation.recorded' AND NOT ("
+    f"{OBSERVATION_CANONICAL_UTC_PREDICATE})"
+)
+
+DDL = f"""
 CREATE TABLE IF NOT EXISTS meta (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     schema_version INTEGER NOT NULL,
@@ -96,6 +158,22 @@ CREATE INDEX IF NOT EXISTS idx_events_event_type
 CREATE INDEX IF NOT EXISTS idx_events_paper_trade
     ON events(json_extract(payload_json, '$.paper_trade_id'))
     WHERE json_extract(payload_json, '$.paper_trade_id') IS NOT NULL;
+
+-- Additive continuity-restore indexes. Instrument identity lives in the
+-- payload. ``IF NOT EXISTS`` and no table or column change: an existing
+-- database gains the indexes on the next writer schema initialisation.
+-- Read-only continuity restore does not create them.
+--
+-- ``idx_events_type_instrument_order`` seeks the latest checkpoint for one
+-- instrument. ``idx_events_observation_utc_epoch`` seeks canonical UTC
+-- observations at or after a restored horizon. Rows whose source time is not
+-- canonical UTC stay in ``idx_events_observation_noncanonical_time`` so the
+-- ledger read can still fail closed on them.
+{INDEX_EVENTS_TYPE_INSTRUMENT_ORDER};
+
+{INDEX_EVENTS_OBSERVATION_UTC_EPOCH};
+
+{INDEX_EVENTS_OBSERVATION_NONCANONICAL_TIME};
 """
 
 

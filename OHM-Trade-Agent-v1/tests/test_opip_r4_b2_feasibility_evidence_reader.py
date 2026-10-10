@@ -342,6 +342,9 @@ def test_ac_019_non_json_committed_row_is_rejected_without_aborting_batch(canoni
         # expression index; drop it to simulate a store/replica where that guard is
         # absent, then poison one row with non-JSON text.
         connection.execute("DROP INDEX IF EXISTS idx_events_paper_trade")
+        connection.execute("DROP INDEX IF EXISTS idx_events_type_instrument_order")
+        connection.execute("DROP INDEX IF EXISTS idx_events_observation_utc_epoch")
+        connection.execute("DROP INDEX IF EXISTS idx_events_observation_noncanonical_time")
         row = connection.execute(
             "SELECT event_id FROM events WHERE event_type = ? "
             "ORDER BY history_epoch ASC, local_sequence ASC LIMIT 1",

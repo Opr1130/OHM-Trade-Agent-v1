@@ -275,6 +275,226 @@ def load_latest_checkpoint_payload(
     )
 
 
+def latest_checkpoint_batch_sql(instrument_count: int) -> str:
+    """One statement: an index seek of the latest checkpoint per instrument.
+
+    No ``feature_version`` predicate. A malformed tip stays visible so Python
+    can fail closed instead of restoring an older matching checkpoint.
+    """
+    if instrument_count < 1:
+        raise ValueError("instrument_count must be positive")
+    arm = (
+        "SELECT ? AS instrument_version_id, ("
+        "SELECT payload_json FROM events "
+        "WHERE event_type = ? "
+        "AND json_extract(payload_json, '$.instrument_version_id') = ? "
+        "ORDER BY history_epoch DESC, local_sequence DESC LIMIT 1"
+        ") AS payload_json"
+    )
+    return " UNION ALL ".join(arm for _ in range(instrument_count))
+
+
+def _matching_or_malformed_checkpoint_sql(instrument_count: int) -> str:
+    """Latest row that matches the requested version or is not a usable version.
+
+    Used only after the absolute latest row was a different non-empty version
+    string. A non-text version, or text that is blank after the same trim as
+    Python ``str.strip`` for ASCII whitespace, still fails closed.
+    """
+    arm = (
+        "SELECT ? AS instrument_version_id, ("
+        "SELECT payload_json FROM events "
+        "WHERE event_type = ? "
+        "AND json_extract(payload_json, '$.instrument_version_id') = ? "
+        "AND ("
+        "json_type(payload_json, '$.feature_version') IS NULL "
+        "OR json_type(payload_json, '$.feature_version') != 'text' "
+        "OR json_extract(payload_json, '$.feature_version') = ? "
+        "OR trim(json_extract(payload_json, '$.feature_version'), "
+        "char(9) || char(10) || char(11) || char(12) || char(13) || ' ') = ''"
+        ") "
+        "ORDER BY history_epoch DESC, local_sequence DESC LIMIT 1"
+        ") AS payload_json"
+    )
+    return " UNION ALL ".join(arm for _ in range(instrument_count))
+
+
+def _validated_checkpoint_payload(raw: str) -> dict[str, Any]:
+    payload = json.loads(str(raw))
+    if not isinstance(payload, dict):
+        raise CheckpointIntegrityError(
+            "committed feature checkpoint payload_json did not decode to "
+            f"a JSON object (got {type(payload).__name__}); refusing to "
+            "silently skip malformed canonical evidence"
+        )
+    payload_instrument_id = payload.get("instrument_version_id")
+    payload_feature_version = payload.get("feature_version")
+    if (
+        not isinstance(payload_instrument_id, str)
+        or not payload_instrument_id.strip()
+        or not isinstance(payload_feature_version, str)
+        or not payload_feature_version.strip()
+    ):
+        raise CheckpointIntegrityError(
+            "committed feature checkpoint must declare non-empty string "
+            "instrument_version_id and feature_version"
+        )
+    return payload
+
+
+def _scan_latest_checkpoint_payloads(
+    *,
+    instrument_version_ids: Sequence[str],
+    feature_version: str | None,
+    db_path: Path | None,
+    deadline_monotonic: float | None,
+    clock: Callable[[], float] | None,
+    stats: dict[str, int] | None = None,
+) -> list[dict[str, Any]]:
+    """Return the latest validated checkpoint payload for each requested instrument.
+
+    One indexed statement seeks the latest committed row per instrument. That
+    tip is validated before any older row can be restored. A different
+    non-empty version string is skipped, and the next matching-or-malformed
+    candidate is sought, so a feature-version bump still cold-starts when no
+    matching checkpoint exists. The single-instrument loader keeps the
+    full-family scan.
+    """
+    from app.opip.canonical.schema import connect
+
+    requested = list(dict.fromkeys(str(item) for item in instrument_version_ids))
+    if not requested:
+        if stats is not None:
+            stats["rows_returned"] = 0
+        return []
+    if db_path is None:
+        from app.opip.canonical.paths import db_path as default_db_path
+
+        db_path = default_db_path()
+    target = Path(db_path)
+    if not target.exists():
+        if stats is not None:
+            stats["rows_returned"] = 0
+        return []
+    tick = clock or monotonic
+    if deadline_monotonic is not None and tick() >= deadline_monotonic:
+        raise CheckpointDeadlineExceeded(
+            "checkpoint read deadline already elapsed before query"
+        )
+    params: list[Any] = []
+    for instrument_version_id in requested:
+        params.extend(
+            (instrument_version_id, FEATURE_CHECKPOINT_RECORDED, instrument_version_id)
+        )
+    rows = _execute_checkpoint_query(
+        target,
+        latest_checkpoint_batch_sql(len(requested)),
+        params,
+        deadline_monotonic=deadline_monotonic,
+        tick=tick,
+        stats=stats,
+    )
+    payloads: list[dict[str, Any]] = []
+    deferred: list[str] = []
+    returned = 0
+    for row in rows:
+        if deadline_monotonic is not None and tick() >= deadline_monotonic:
+            raise CheckpointDeadlineExceeded(
+                "checkpoint read deadline exceeded during row processing"
+            )
+        raw = row["payload_json"]
+        if raw is None:
+            continue
+        returned += 1
+        payload = _validated_checkpoint_payload(str(raw))
+        if (
+            feature_version is not None
+            and payload.get("feature_version") != feature_version
+        ):
+            deferred.append(str(payload["instrument_version_id"]))
+            continue
+        payloads.append(payload)
+    if deferred:
+        fallback_params: list[Any] = []
+        for instrument_version_id in deferred:
+            fallback_params.extend(
+                (
+                    instrument_version_id,
+                    FEATURE_CHECKPOINT_RECORDED,
+                    instrument_version_id,
+                    feature_version,
+                )
+            )
+        fallback_rows = _execute_checkpoint_query(
+            target,
+            _matching_or_malformed_checkpoint_sql(len(deferred)),
+            fallback_params,
+            deadline_monotonic=deadline_monotonic,
+            tick=tick,
+            stats=stats,
+        )
+        for row in fallback_rows:
+            if deadline_monotonic is not None and tick() >= deadline_monotonic:
+                raise CheckpointDeadlineExceeded(
+                    "checkpoint read deadline exceeded during row processing"
+                )
+            raw = row["payload_json"]
+            if raw is None:
+                continue
+            returned += 1
+            payloads.append(_validated_checkpoint_payload(str(raw)))
+    if stats is not None:
+        stats["rows_returned"] = returned
+    return payloads
+
+
+def _execute_checkpoint_query(
+    target: Path,
+    sql: str,
+    params: Sequence[Any],
+    *,
+    deadline_monotonic: float | None,
+    tick: Callable[[], float],
+    stats: dict[str, int] | None,
+) -> list[Any]:
+    from app.opip.canonical.schema import connect
+
+    measure = bool(stats and stats.get("measure_vm_steps"))
+    conn = connect(target, read_only=True)
+    deadline_triggered = False
+
+    def _progress_handler() -> int:
+        nonlocal deadline_triggered
+        if stats is not None and measure:
+            stats["vm_steps"] = int(stats.get("vm_steps", 0)) + 1
+        if deadline_monotonic is not None and tick() >= deadline_monotonic:
+            deadline_triggered = True
+            return 1
+        return 0
+
+    try:
+        if deadline_monotonic is not None or measure:
+            conn.set_progress_handler(
+                _progress_handler,
+                1 if measure else _SQLITE_DEADLINE_PROGRESS_OPS,
+            )
+        try:
+            return list(conn.execute(sql, params).fetchall())
+        except sqlite3.DatabaseError as exc:
+            if deadline_triggered:
+                raise CheckpointDeadlineExceeded(
+                    "checkpoint read deadline exceeded during query"
+                ) from exc
+            raise
+    finally:
+        if deadline_monotonic is not None or measure:
+            try:
+                conn.set_progress_handler(None, 0)
+            except sqlite3.Error:
+                pass
+        conn.close()
+
+
 def load_latest_checkpoint_payloads_batch(
     instrument_version_ids: Sequence[str],
     db_path: Path | None = None,
@@ -282,31 +502,33 @@ def load_latest_checkpoint_payloads_batch(
     feature_version: str | None = None,
     deadline_monotonic: float | None = None,
     clock: Callable[[], float] | None = None,
+    stats: dict[str, int] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Latest committed checkpoint per requested instrument, in ONE scan.
+    """Latest committed checkpoint per requested instrument, in ONE bounded read.
 
-    Scans FEATURE_CHECKPOINT_RECORDED exactly once for the whole batch and
-    reconstructs each requested instrument's latest payload from that single
-    ordered scan. The per-instrument validation/filter order is IDENTICAL to
-    :func:`load_latest_checkpoint_payload`: identity/version validation happens
-    before the target filter, so a malformed payload for an unrelated instrument
-    still fails closed.
-
-    The returned mapping contains an entry ONLY for instruments that have a
-    matching committed checkpoint; a requested instrument with no checkpoint is
-    simply absent (mirroring the single-instrument ``None`` return).
+    Seeks the latest FEATURE_CHECKPOINT_RECORDED row for each requested
+    instrument. Unrelated instruments are not fetched. The latest row for a
+    requested instrument is still validated in commit order across the batch,
+    so a malformed tip fails closed. A requested instrument with no matching
+    checkpoint is absent (mirroring the single-instrument ``None`` return).
 
     ``deadline_monotonic``/``clock`` follow the same absolute-deadline contract
     as the single-instrument loader. No partial mapping is ever returned: an
     integrity or deadline failure raises before the caller sees any result.
+    ``stats['rows_returned']`` counts rows fetched for this batch when provided.
     """
     requested = list(dict.fromkeys(str(item) for item in instrument_version_ids))
     if not requested:
+        if stats is not None:
+            stats["rows_returned"] = 0
         return {}
-    payloads = _scan_checkpoint_payloads(
+    payloads = _scan_latest_checkpoint_payloads(
+        instrument_version_ids=requested,
+        feature_version=feature_version,
         db_path=db_path,
         deadline_monotonic=deadline_monotonic,
         clock=clock,
+        stats=stats,
     )
     tick = clock or monotonic
     # O(1) target membership: a set is built ONCE for the whole batch so the
@@ -373,14 +595,15 @@ def load_rolling_states_batch(
     feature_version: str | None = None,
     deadline_monotonic: float | None = None,
     clock: Callable[[], float] | None = None,
+    stats: dict[str, int] | None = None,
 ) -> dict[str, RollingState]:
-    """Resume RollingState per requested instrument from ONE checkpoint scan.
+    """Resume RollingState per requested instrument from ONE bounded read.
 
-    Batch analogue of :func:`load_rolling_state`: scans
-    FEATURE_CHECKPOINT_RECORDED once and reconstructs each requested
-    instrument's RollingState. Instruments with no matching committed checkpoint
-    are absent from the returned mapping (mirroring the single-instrument
-    ``None`` return). No partial mapping is ever returned on failure.
+    Batch analogue of :func:`load_rolling_state`: reads the latest
+    FEATURE_CHECKPOINT_RECORDED row for each requested instrument and
+    reconstructs that RollingState. Instruments with no matching committed
+    checkpoint are absent (mirroring the single-instrument ``None`` return).
+    No partial mapping is ever returned on failure.
     """
     from app.opip.features.engine import FEATURE_VERSION
 
@@ -391,6 +614,7 @@ def load_rolling_states_batch(
         feature_version=required_version,
         deadline_monotonic=deadline_monotonic,
         clock=clock,
+        stats=stats,
     )
     return {
         instrument_version_id: from_checkpoint(checkpoint_from_payload(payload))

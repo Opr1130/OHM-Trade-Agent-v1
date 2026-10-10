@@ -466,10 +466,15 @@ def capture_feature_bus_shadow(
                 versions,
                 deadline_monotonic=setup_deadline,
                 clock=tick,
-                observer=lambda stage, seconds: emit_capture_marker(
+                observer=lambda stage, seconds, **details: emit_capture_marker(
                     "continuity_phase",
                     continuity_stage=stage,
                     phase_seconds=round(seconds, 3),
+                    **{
+                        key: value
+                        for key, value in details.items()
+                        if value is not None
+                    },
                 ),
             )
     market_client = None
