@@ -16,6 +16,30 @@ Nothing here adds a worker, a second scheduler, a database or an async runtime.
 This is a deterministic, in-process request ledger: every instant is supplied by
 the caller, duplicates converge, and a repeat completion cannot produce a second
 detector transition.
+
+Accounting is explicit and fails closed. Two disjoint populations are reported:
+
+* **submission outcomes** - exactly one per `submit` call, so
+  `submitted == admitted + coalesced + refused_backpressure + rejected_stale`;
+* **backlog releases** - exactly one per admitted request that left the queue, so
+  `admitted == backlog + served_from_queue + expired + evicted_backpressure +
+  terminal_failures_from_queue`.
+
+Back-pressure work is split into `refused_backpressure` (a submission that was
+never admitted) and `evicted_backpressure` (already-admitted work expelled to make
+room for a higher priority). An eviction is **not** a submission outcome, so
+`submitted == admitted + dropped_backpressure` does not hold and must not be
+asserted: adding the eviction to the refusal count double-books the evicted
+request. `CoordinatorTelemetry` refuses to be constructed unless both populations
+reconcile exactly.
+
+Durability posture: this ledger is in-process only. It holds no store, no file, no
+database and no canonical-writer client. What survives a crash is the evidence the
+caller persisted plus the deterministic identities recomputed from it; duplicate
+suppression across a process boundary therefore depends on the canonical writer's
+identity-keyed dedupe, which this module neither implements nor calls. A durable
+request or episode ledger remains an explicit unresolved owner decision (`OQ-04`
+and the open durable-ledger item) and is deliberately not invented here.
 """
 
 from __future__ import annotations
@@ -358,20 +382,161 @@ class SubmissionOutcome:
             raise CoordinatorContractError("a submission reason is required")
 
 
+#: Fields that must be non-negative integers on a telemetry record.
+INTEGER_COUNTER_FIELDS: tuple[str, ...] = (
+    "submitted",
+    "admitted",
+    "coalesced",
+    "dropped_backpressure",
+    "refused_backpressure",
+    "evicted_backpressure",
+    "preempted",
+    "rejected_stale",
+    "expired",
+    "served",
+    "served_unmatched",
+    "retried",
+    "terminal_failures",
+    "terminal_failures_unmatched",
+    "max_backlog",
+    "backlog",
+    "protected_slots_used",
+)
+
+
+@dataclass(frozen=True)
+class RequestAccounting:
+    """The two disjoint accounting populations of one coordinator.
+
+    A submission and a backlog release are different events, so they are
+    reconciled as two populations rather than one:
+
+    * **submission outcomes** - exactly one per ``submit`` call
+      (`submitted == admitted + coalesced + refused_backpressure + rejected_stale`);
+    * **backlog releases** - exactly one per admitted request that left the queue
+      (`admitted == backlog + served_from_queue + expired + evicted_backpressure +
+      terminal_failures_from_queue`).
+
+    ``shed_total`` sums the *two* back-pressure populations. It is deliberately not
+    part of the submission partition, because an eviction removes work that an
+    earlier submission already had admitted: adding it to a refusal count
+    double-books that request, so ``submitted == admitted + shed_total`` is expected
+    to be false whenever at least one eviction occurred.
+    """
+
+    submitted: int = 0
+    admitted: int = 0
+    coalesced: int = 0
+    refused_backpressure: int = 0
+    rejected_stale: int = 0
+    backlog: int = 0
+    served: int = 0
+    served_unmatched: int = 0
+    expired: int = 0
+    evicted_backpressure: int = 0
+    terminal_failures: int = 0
+    terminal_failures_unmatched: int = 0
+
+    @property
+    def served_from_queue(self) -> int:
+        """Completions of a request this coordinator actually queued."""
+
+        return self.served - self.served_unmatched
+
+    @property
+    def terminal_failures_from_queue(self) -> int:
+        """Terminal failures of a request this coordinator actually queued."""
+
+        return self.terminal_failures - self.terminal_failures_unmatched
+
+    @property
+    def submission_outcome_total(self) -> int:
+        return (
+            self.admitted
+            + self.coalesced
+            + self.refused_backpressure
+            + self.rejected_stale
+        )
+
+    @property
+    def release_event_total(self) -> int:
+        return (
+            self.backlog
+            + self.served_from_queue
+            + self.expired
+            + self.evicted_backpressure
+            + self.terminal_failures_from_queue
+        )
+
+    @property
+    def shed_total(self) -> int:
+        return self.refused_backpressure + self.evicted_backpressure
+
+    @property
+    def reconciles(self) -> bool:
+        return (
+            self.submission_outcome_total == self.submitted
+            and self.release_event_total == self.admitted
+            and min(
+                self.served_from_queue,
+                self.terminal_failures_from_queue,
+                self.served_unmatched,
+                self.terminal_failures_unmatched,
+            )
+            >= 0
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "submitted": self.submitted,
+            "submission_outcomes": {
+                "admitted": self.admitted,
+                "coalesced": self.coalesced,
+                "refused_backpressure": self.refused_backpressure,
+                "rejected_stale": self.rejected_stale,
+                "total": self.submission_outcome_total,
+            },
+            "backlog_releases": {
+                "backlog": self.backlog,
+                "served_from_queue": self.served_from_queue,
+                "served_unmatched": self.served_unmatched,
+                "expired": self.expired,
+                "evicted_backpressure": self.evicted_backpressure,
+                "terminal_failures_from_queue": self.terminal_failures_from_queue,
+                "terminal_failures_unmatched": self.terminal_failures_unmatched,
+                "total": self.release_event_total,
+            },
+            "shed_total": self.shed_total,
+            "reconciles": self.reconciles,
+        }
+
+
+
 @dataclass(frozen=True)
 class CoordinatorTelemetry:
-    """Bounded-work telemetry for one coordinator."""
+    """Bounded-work telemetry for one coordinator.
+
+    ``dropped_backpressure`` is the *sum* of ``refused_backpressure`` (submissions
+    refused at admission time) and ``evicted_backpressure`` (already-admitted work
+    expelled to make room for a higher-priority request). The two are reported
+    separately, because only the first is a submission outcome and mixing them
+    makes the counts fail to reconcile.
+    """
 
     submitted: int = 0
     admitted: int = 0
     coalesced: int = 0
     dropped_backpressure: int = 0
+    refused_backpressure: int = 0
+    evicted_backpressure: int = 0
     preempted: int = 0
     rejected_stale: int = 0
     expired: int = 0
     served: int = 0
+    served_unmatched: int = 0
     retried: int = 0
     terminal_failures: int = 0
+    terminal_failures_unmatched: int = 0
     max_backlog: int = 0
     backlog: int = 0
     by_priority: Mapping[str, int] = field(
@@ -382,6 +547,62 @@ class CoordinatorTelemetry:
     def __post_init__(self) -> None:
         if not isinstance(self.by_priority, Mapping):
             raise CoordinatorContractError("by_priority must be a mapping")
+        for name in INTEGER_COUNTER_FIELDS:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise CoordinatorContractError(f"{name} must be an integer")
+            if value < 0:
+                raise CoordinatorContractError(f"{name} must not be negative")
+        if self.dropped_backpressure != (
+            self.refused_backpressure + self.evicted_backpressure
+        ):
+            raise CoordinatorContractError(
+                "shed work must partition into refused submissions and evicted "
+                "admitted work"
+            )
+        if self.served_unmatched > self.served:
+            raise CoordinatorContractError("served_unmatched cannot exceed served")
+        if self.terminal_failures_unmatched > self.terminal_failures:
+            raise CoordinatorContractError(
+                "terminal_failures_unmatched cannot exceed terminal_failures"
+            )
+        accounting = self.accounting()
+        if accounting.submission_outcome_total != self.submitted:
+            raise CoordinatorContractError(
+                "every submission must end in exactly one submission outcome: "
+                "submitted must equal admitted + coalesced + refused_backpressure "
+                "+ rejected_stale"
+            )
+        if accounting.release_event_total != self.admitted:
+            raise CoordinatorContractError(
+                "every admitted request must leave the queue exactly once: admitted "
+                "must equal backlog + served_from_queue + expired + "
+                "evicted_backpressure + terminal_failures_from_queue"
+            )
+
+    def accounting(self) -> RequestAccounting:
+        """The reconciled, explicitly disjoint view of this telemetry."""
+
+        return RequestAccounting(
+            submitted=self.submitted,
+            admitted=self.admitted,
+            coalesced=self.coalesced,
+            refused_backpressure=self.refused_backpressure,
+            rejected_stale=self.rejected_stale,
+            backlog=self.backlog,
+            served=self.served,
+            served_unmatched=self.served_unmatched,
+            expired=self.expired,
+            evicted_backpressure=self.evicted_backpressure,
+            terminal_failures=self.terminal_failures,
+            terminal_failures_unmatched=self.terminal_failures_unmatched,
+        )
+
+    @property
+    def reconciles(self) -> bool:
+        """Always True: a record that does not reconcile cannot be constructed."""
+
+        return self.accounting().reconciles
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -389,12 +610,16 @@ class CoordinatorTelemetry:
             "admitted": self.admitted,
             "coalesced": self.coalesced,
             "dropped_backpressure": self.dropped_backpressure,
+            "refused_backpressure": self.refused_backpressure,
+            "evicted_backpressure": self.evicted_backpressure,
             "preempted": self.preempted,
             "rejected_stale": self.rejected_stale,
             "expired": self.expired,
             "served": self.served,
+            "served_unmatched": self.served_unmatched,
             "retried": self.retried,
             "terminal_failures": self.terminal_failures,
+            "terminal_failures_unmatched": self.terminal_failures_unmatched,
             "max_backlog": self.max_backlog,
             "backlog": self.backlog,
             "by_priority": dict(self.by_priority),
@@ -463,7 +688,9 @@ class UnifiedEvaluationCoordinator:
                 self._queued.pop(request_id, None)
                 self._admitted_at.pop(request_id, None)
                 self._order.remove(request_id)
-                self._counts[RequestDisposition.DROPPED_BACKPRESSURE.value] += 1
+                # An eviction releases work that a prior submission had already
+                # admitted, so it is counted separately from an admission refusal.
+                self._counts["EVICTED_BACKPRESSURE"] += 1
                 return True
         return False
 
@@ -523,7 +750,7 @@ class UnifiedEvaluationCoordinator:
         if request.priority is WorkPriority.OPTIONAL_AI and (
             not self._limits.optional_ai_admitted
         ):
-            self._counts[RequestDisposition.DROPPED_BACKPRESSURE.value] += 1
+            self._counts["REFUSED_BACKPRESSURE"] += 1
             return SubmissionOutcome(
                 disposition=RequestDisposition.DROPPED_BACKPRESSURE,
                 evaluation_identity=identity,
@@ -532,7 +759,7 @@ class UnifiedEvaluationCoordinator:
             )
         if len(self._queued) >= self._limits.queue_capacity:
             if request.priority in SHEDDABLE_PRIORITIES:
-                self._counts[RequestDisposition.DROPPED_BACKPRESSURE.value] += 1
+                self._counts["REFUSED_BACKPRESSURE"] += 1
                 return SubmissionOutcome(
                     disposition=RequestDisposition.DROPPED_BACKPRESSURE,
                     evaluation_identity=identity,
@@ -540,7 +767,7 @@ class UnifiedEvaluationCoordinator:
                     reason="queue capacity is saturated; discovery is shed visibly",
                 )
             if not self._shed_discovery():
-                self._counts[RequestDisposition.DROPPED_BACKPRESSURE.value] += 1
+                self._counts["REFUSED_BACKPRESSURE"] += 1
                 return SubmissionOutcome(
                     disposition=RequestDisposition.DROPPED_BACKPRESSURE,
                     evaluation_identity=identity,
@@ -649,6 +876,7 @@ class UnifiedEvaluationCoordinator:
             # queue is rebuilt; that is still exactly one transition.
             self._served.add(token)
             self._counts[RequestDisposition.SERVED.value] += 1
+            self._counts["SERVED_UNMATCHED"] += 1
             return True
         request = self._queued.pop(request_id)
         self._admitted_at.pop(request_id, None)
@@ -683,6 +911,7 @@ class UnifiedEvaluationCoordinator:
         if request_id is None:
             self._terminal[token] = detail
             self._counts[RequestDisposition.TERMINAL_FAILURE.value] += 1
+            self._counts["TERMINAL_UNMATCHED"] += 1
             return RequestDisposition.TERMINAL_FAILURE
         request = self._queued[request_id]
         attempts = request.attempts + 1
@@ -722,17 +951,23 @@ class UnifiedEvaluationCoordinator:
 
     def telemetry(self) -> CoordinatorTelemetry:
         counts = self._counts
+        refused = counts["REFUSED_BACKPRESSURE"]
+        evicted = counts["EVICTED_BACKPRESSURE"]
         return CoordinatorTelemetry(
             submitted=counts["SUBMITTED"],
             admitted=counts[RequestDisposition.ADMITTED.value],
             coalesced=counts[RequestDisposition.COALESCED.value],
-            dropped_backpressure=counts[RequestDisposition.DROPPED_BACKPRESSURE.value],
+            dropped_backpressure=refused + evicted,
+            refused_backpressure=refused,
+            evicted_backpressure=evicted,
             preempted=counts["PREEMPTED"],
             rejected_stale=counts[RequestDisposition.REJECTED_STALE.value],
             expired=counts[RequestDisposition.EXPIRED.value],
             served=counts[RequestDisposition.SERVED.value],
+            served_unmatched=counts["SERVED_UNMATCHED"],
             retried=counts[RequestDisposition.RETRY_SCHEDULED.value],
             terminal_failures=counts[RequestDisposition.TERMINAL_FAILURE.value],
+            terminal_failures_unmatched=counts["TERMINAL_UNMATCHED"],
             max_backlog=self._max_backlog,
             backlog=len(self._queued),
             by_priority=MappingProxyType(dict(self._by_priority)),
@@ -751,10 +986,12 @@ __all__ = [
     "EvaluationPath",
     "EvaluationRequest",
     "IDENTITY_PREFIX",
+    "INTEGER_COUNTER_FIELDS",
     "OWNER_INPUT_STATUS",
     "PRIORITY_RANK",
     "REQUEST_ID_PREFIX",
     "RESERVED_PRIORITIES",
+    "RequestAccounting",
     "RequestDisposition",
     "SHEDDABLE_PRIORITIES",
     "SubmissionOutcome",

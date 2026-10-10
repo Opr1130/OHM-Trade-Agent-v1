@@ -280,7 +280,8 @@ class ContinuousOpportunityEngine:
             "attention_evaluations": 0,
             "requests_submitted": 0,
             "requests_coalesced": 0,
-            "requests_shed": 0,
+            "requests_refused": 0,
+            "requests_evicted": 0,
             "evaluations_served": 0,
             "claims_emitted": 0,
             "episodes_opened": 0,
@@ -406,12 +407,23 @@ class ContinuousOpportunityEngine:
                 policy_version=self._attention_policy.policy_version,
                 attention_trigger_id=trigger.trigger_id,
             )
+            evicted_before = self._coordinator.telemetry().evicted_backpressure
             submission = self._coordinator.submit(request, evaluation_time=instant)
+            # An eviction of already-admitted work is a backlog release, not a
+            # submission outcome, so it is counted in its own population instead of
+            # being added to the refusal count.
+            self._counts["requests_evicted"] += (
+                self._coordinator.telemetry().evicted_backpressure - evicted_before
+            )
             self._counts["requests_submitted"] += 1
             if submission.disposition.value == "COALESCED":
                 self._counts["requests_coalesced"] += 1
             elif submission.disposition.value == "DROPPED_BACKPRESSURE":
-                self._counts["requests_shed"] += 1
+                # A refused submission was never admitted. An eviction of already
+                # admitted work is not a submission outcome and is reported by the
+                # coordinator telemetry (`evicted_backpressure`) instead, so the two
+                # populations are never summed here.
+                self._counts["requests_refused"] += 1
         return AttentionCycle(
             coverage=coverage,
             transition=transition,

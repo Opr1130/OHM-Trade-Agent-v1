@@ -27,6 +27,7 @@ backfill replay identically.
 from __future__ import annotations
 
 import ast
+from collections import Counter
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -122,6 +123,7 @@ from app.opip.features.engine import (  # noqa: E402
 from app.opip.streaming.coordinator import (  # noqa: E402
     CoordinatorContractError,
     CoordinatorLimits,
+    CoordinatorTelemetry,
     EvaluationPath,
     EvaluationRequest,
     RequestDisposition,
@@ -393,6 +395,92 @@ def request_for(
         attention_trigger_id=trigger_id,
     )
 
+
+#: The labelled baseline comparison is structural engineering evidence only; no
+#: production latency, throughput or freshness measurement exists in this
+#: increment, so the verdict stays explicitly NOT_PROVEN.
+BASELINE_LATENCY_VERDICT = "NOT_PROVEN"
+
+#: Universe shared by both arms of the labelled baseline harness.
+BASELINE_UNIVERSE = tuple(f"IV:{index:03d}" for index in range(8))
+
+#: Evidence cut-offs shared by both arms of the labelled baseline harness.
+BASELINE_CUTOFFS = (6, 7, 8, 9)
+
+#: The instrument the harness treats as trigger-relevant.
+BASELINE_TRIGGER_INSTRUMENT = BASELINE_UNIVERSE[-1]
+
+#: Storage and writer surfaces no R5-A module may own. A durable request or
+#: episode ledger is an open owner decision, not something this slice may add.
+FORBIDDEN_PERSISTENCE_TOKENS = (
+    "sqlite3",
+    "psycopg",
+    "sqlalchemy",
+    "duckdb",
+    "WriterClient",
+    "writer_client",
+    "submit_decision_context",
+    "submit_decision_snapshot",
+    "submit_canonical_event",
+    "INSERT INTO",
+    "parquet",
+    "pickle",
+    "json.dump",
+    "write_text",
+    "write_bytes",
+    "open(",
+    "commit(",
+)
+
+
+def engineering_burst_limits() -> CoordinatorLimits:
+    """The labelled `r5a-engineering-burst-v1` capacity configuration."""
+
+    return coordinator_limits(
+        queue_capacity=64,
+        queue_age_limit_intervals=10,
+        retry_ceiling=2,
+        per_instrument_budget_per_cycle=2,
+        protection_reserved_slots=2,
+        reconciliation_reserved_slots=2,
+    )
+
+
+def engineering_burst(outcome_log: list | None = None) -> UnifiedEvaluationCoordinator:
+    """Replay the labelled `r5a-engineering-burst-v1` submission burst.
+
+    Forty instruments each submit four discovery cut-offs and one protection
+    request is due at the same instant. The scenario is synthetic engineering
+    evidence and measures nothing about production.
+    """
+
+    coordinator = UnifiedEvaluationCoordinator(limits=engineering_burst_limits())
+    for instrument in (f"IV:{index:03d}" for index in range(40)):
+        for slot in range(4):
+            outcome = coordinator.submit(
+                request_for(
+                    instrument=instrument,
+                    cutoff=10 + slot,
+                    at_minute=10 + slot,
+                    expires=90,
+                ),
+                evaluation_time=at(10 + slot),
+            )
+            if outcome_log is not None:
+                outcome_log.append(outcome)
+    outcome = coordinator.submit(
+        request_for(
+            instrument="IV:PROTECT",
+            priority=WorkPriority.PROTECTION,
+            path=EvaluationPath.RECOVERY_BACKFILL,
+            at_minute=13,
+            expires=90,
+        ),
+        evaluation_time=at(13),
+    )
+    if outcome_log is not None:
+        outcome_log.append(outcome)
+    return coordinator
 
 
 # ---------------------------------------------------------------------------
@@ -1483,6 +1571,245 @@ def test_ac_006_stale_requests_expire_and_retries_are_bounded():
     assert state["schema_version"] == "evaluation-coordinator-v1"
 
 
+def test_ac_006_the_burst_shed_total_separates_refusals_from_evictions():
+    """ATDD-R5-A-continuous-opportunity-engine/AC-006: shed work is two populations.
+
+    GIVEN the labelled engineering burst of 161 submissions against a queue
+    capacity of 64
+    WHEN the run ends
+    THEN 96 discovery submissions are refused, exactly one admitted discovery
+    request is evicted to admit protection, and the visible shed total of 97 is
+    NOT a submission outcome: the correction term between `submitted` and
+    `admitted + shed` is exactly the eviction count
+    """
+
+    outcomes: list = []
+    coordinator = engineering_burst(outcome_log=outcomes)
+    telemetry = coordinator.telemetry()
+    accounting = telemetry.accounting()
+
+    assert len(outcomes) == 161 == telemetry.submitted
+    by_disposition = Counter(outcome.disposition for outcome in outcomes)
+    assert by_disposition[RequestDisposition.ADMITTED] == 65
+    assert by_disposition[RequestDisposition.DROPPED_BACKPRESSURE] == 96
+    assert by_disposition[RequestDisposition.COALESCED] == 0
+    assert by_disposition[RequestDisposition.REJECTED_STALE] == 0
+    assert sum(by_disposition.values()) == 161
+
+    assert telemetry.admitted == 65
+    assert telemetry.refused_backpressure == 96
+    assert telemetry.evicted_backpressure == 1
+    assert telemetry.dropped_backpressure == 97
+    assert telemetry.preempted == telemetry.evicted_backpressure == 1
+    assert telemetry.backlog == telemetry.max_backlog == 64
+    assert telemetry.backlog == engineering_burst_limits().queue_capacity
+
+    # Population 1: every submission ended in exactly one submission outcome.
+    assert telemetry.submitted == (
+        telemetry.admitted
+        + telemetry.coalesced
+        + telemetry.refused_backpressure
+        + telemetry.rejected_stale
+    )
+    assert telemetry.submitted - telemetry.admitted == 96
+    # Population 2: every admitted request is either queued or was released once.
+    assert telemetry.admitted == telemetry.backlog + telemetry.evicted_backpressure
+    # The naive shed arithmetic is wrong by exactly the eviction count.
+    assert telemetry.admitted + telemetry.dropped_backpressure == 162
+    assert (
+        telemetry.admitted
+        + telemetry.dropped_backpressure
+        - telemetry.evicted_backpressure
+        == telemetry.submitted
+    )
+
+    report = accounting.to_dict()
+    assert accounting.reconciles is True
+    assert telemetry.reconciles is True
+    assert report["submitted"] == 161
+    assert report["submission_outcomes"] == {
+        "admitted": 65,
+        "coalesced": 0,
+        "refused_backpressure": 96,
+        "rejected_stale": 0,
+        "total": 161,
+    }
+    assert report["backlog_releases"]["total"] == 65
+    assert report["backlog_releases"]["backlog"] == 64
+    assert report["backlog_releases"]["evicted_backpressure"] == 1
+    assert report["shed_total"] == 97
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({"submitted": 10}, "submission outcome"),
+        ({"submitted": 1, "admitted": 1}, "leave the queue exactly once"),
+        (
+            {
+                "dropped_backpressure": 2,
+                "refused_backpressure": 1,
+                "evicted_backpressure": 0,
+            },
+            "shed work must partition",
+        ),
+        ({"served": 1, "served_unmatched": 2}, "served_unmatched cannot exceed"),
+        (
+            {"terminal_failures": 1, "terminal_failures_unmatched": 2},
+            "terminal_failures_unmatched cannot exceed",
+        ),
+        ({"submitted": -1}, "must not be negative"),
+        ({"admitted": True}, "must be an integer"),
+    ],
+)
+def test_ac_006_an_accounting_record_that_does_not_reconcile_is_refused(
+    overrides, expected
+):
+    """ATDD-R5-A-continuous-opportunity-engine/AC-006: accounting fails closed.
+
+    GIVEN telemetry whose counts do not reconcile, or whose types are wrong
+    WHEN the record is constructed
+    THEN it is refused rather than published as evidence
+    """
+
+    with pytest.raises(CoordinatorContractError) as error:
+        CoordinatorTelemetry(**overrides)
+    assert expected in str(error.value)
+
+
+def test_ac_006_the_empty_record_reconciles():
+    """ATDD-R5-A-continuous-opportunity-engine/AC-006: the idle record is consistent."""
+
+    telemetry = CoordinatorTelemetry()
+    assert telemetry.reconciles is True
+    assert telemetry.accounting().to_dict()["shed_total"] == 0
+    assert telemetry.accounting().to_dict()["submission_outcomes"]["total"] == 0
+
+
+def test_ac_006_both_accounting_populations_reconcile_across_every_path():
+    """ATDD-R5-A-continuous-opportunity-engine/AC-006: every path is accounted.
+
+    GIVEN one workload that exercises a served identity, both coalescing paths, a
+    stale rejection, a retry, a terminal failure, a capacity refusal, an eviction,
+    expiry and a restart-style completion for an identity that was never queued
+    WHEN the populations are read
+    THEN every submission is in exactly one submission outcome, every admitted
+    request left the queue exactly once, and the unmatched restart records are
+    reported separately instead of hiding inside the partitions
+    """
+
+    limits = coordinator_limits(
+        queue_capacity=3, queue_age_limit_intervals=2, retry_ceiling=2
+    )
+    coordinator = UnifiedEvaluationCoordinator(limits=limits)
+
+    served = request_for(instrument="IV:1", at_minute=10, expires=90)
+    coordinator.submit(served, evaluation_time=at(10))
+    assert (
+        coordinator.complete(served.evaluation_identity, evaluation_time=at(11))
+        is True
+    )
+    coordinator.submit(served, evaluation_time=at(11))
+
+    queued = request_for(instrument="IV:2", at_minute=10, expires=90)
+    coordinator.submit(queued, evaluation_time=at(10))
+    coordinator.submit(queued, evaluation_time=at(10))
+
+    stale = request_for(instrument="IV:3", at_minute=10, expires=10.5)
+    coordinator.submit(stale, evaluation_time=at(11))
+
+    failing = request_for(instrument="IV:4", at_minute=10, expires=90)
+    coordinator.submit(failing, evaluation_time=at(10))
+    assert (
+        coordinator.fail(
+            failing.evaluation_identity,
+            reason="snapshot_unavailable",
+            evaluation_time=at(10),
+        )
+        is RequestDisposition.RETRY_SCHEDULED
+    )
+    assert (
+        coordinator.fail(
+            failing.evaluation_identity,
+            reason="snapshot_unavailable",
+            evaluation_time=at(11),
+        )
+        is RequestDisposition.TERMINAL_FAILURE
+    )
+
+    refusals = 0
+    for index in range(5, 9):
+        outcome = coordinator.submit(
+            request_for(instrument=f"IV:{index}", at_minute=10, expires=90),
+            evaluation_time=at(10),
+        )
+        if outcome.disposition is RequestDisposition.DROPPED_BACKPRESSURE:
+            refusals += 1
+    assert refusals == 2
+
+    protection = coordinator.submit(
+        request_for(
+            instrument="IV:PROTECT",
+            priority=WorkPriority.PROTECTION,
+            path=EvaluationPath.RECOVERY_BACKFILL,
+            at_minute=10,
+            expires=90,
+        ),
+        evaluation_time=at(10),
+    )
+    assert protection.disposition is RequestDisposition.ADMITTED
+
+    coordinator.next_batch(evaluation_time=at(30), size=1)
+    assert (
+        coordinator.complete("EEVL:committed-before-restart", evaluation_time=at(30))
+        is True
+    )
+    coordinator.fail(
+        "EEVL:failed-before-restart",
+        reason="snapshot_unavailable",
+        evaluation_time=at(30),
+    )
+
+    telemetry = coordinator.telemetry()
+    accounting = telemetry.accounting()
+    assert accounting.reconciles is True
+    assert telemetry.reconciles is True
+
+    assert accounting.submitted == (
+        accounting.admitted
+        + accounting.coalesced
+        + accounting.refused_backpressure
+        + accounting.rejected_stale
+    )
+    assert accounting.admitted == (
+        accounting.backlog
+        + accounting.served_from_queue
+        + accounting.expired
+        + accounting.evicted_backpressure
+        + accounting.terminal_failures_from_queue
+    )
+    assert accounting.coalesced == 2
+    assert accounting.rejected_stale == 1
+    assert accounting.refused_backpressure == 2
+    assert accounting.evicted_backpressure == 1
+    assert accounting.expired == 3
+    assert accounting.served_from_queue == 1
+    assert accounting.terminal_failures_from_queue == 1
+    assert accounting.backlog == 0
+    assert accounting.shed_total == 3 == (
+        accounting.refused_backpressure + accounting.evicted_backpressure
+    )
+    assert telemetry.preempted == accounting.evicted_backpressure
+    assert telemetry.served_unmatched == 1
+    assert telemetry.terminal_failures_unmatched == 1
+    assert accounting.served_from_queue + telemetry.served_unmatched == (
+        telemetry.served
+    )
+    assert accounting.terminal_failures_from_queue + (
+        telemetry.terminal_failures_unmatched
+    ) == telemetry.terminal_failures
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -2429,6 +2756,13 @@ def test_ac_012_a_full_cycle_replays_identically():
     first = run()
     second = run()
     assert first == second
+    # The ambiguity this review removed must not come back: refusals and evictions
+    # are separate populations and are never merged into one "shed" counter.
+    assert "requests_shed" not in first["counts"]
+    assert first["counts"]["requests_refused"] == 0
+    assert first["counts"]["requests_evicted"] == 0
+    assert first["coordinator_telemetry"]["refused_backpressure"] == 0
+    assert first["coordinator_telemetry"]["evicted_backpressure"] == 0
     assert first["theses"], "the cycle must have produced a thesis record"
     assert {thesis["allocation_authority"] for thesis in first["theses"]} == {"NONE"}
 
@@ -2546,6 +2880,68 @@ def test_ac_013_a_backfill_cannot_rewrite_a_prior_coverage_record():
     assert early.to_dict()["watermark_through_utc"] != (
         later.to_dict()["watermark_through_utc"]
     )
+
+
+def test_ac_013_restart_recovery_is_replay_only_and_owns_no_store():
+    """ATDD-R5-A-continuous-opportunity-engine/AC-013: what survives a crash.
+
+    GIVEN a warm coordinator whose evaluation was served, and a cold coordinator
+    rebuilt after a crash from exactly the same requests
+    WHEN the cold coordinator replays those requests
+    THEN it reproduces the same identities, admission outcome and telemetry, but it
+    does NOT inherit the warm coordinator's served set. Within one process a second
+    transition is structurally impossible; across a restart, suppression rests on
+    identity equality plus the canonical writer's dedupe, which this slice neither
+    implements nor calls. No R5-A module owns a store, a writer client or a file.
+    """
+
+    limits = coordinator_limits()
+    warm = UnifiedEvaluationCoordinator(limits=limits)
+    request = request_for(instrument="IV:1", at_minute=10, expires=90)
+    warm.submit(request, evaluation_time=at(10))
+    assert warm.complete(request.evaluation_identity, evaluation_time=at(11)) is True
+    assert warm.served_identities() == (request.evaluation_identity,)
+    assert warm.telemetry().served == 1
+
+    cold = UnifiedEvaluationCoordinator(limits=limits)
+    replayed = cold.submit(request, evaluation_time=at(10))
+    assert replayed.disposition is RequestDisposition.ADMITTED
+    assert replayed.evaluation_identity == request.evaluation_identity
+    assert replayed.request_id == request.request_id
+    assert cold.telemetry().served == 0
+    assert cold.served_identities() == ()
+    assert cold.backlog() == 1
+    state = cold.export_state()
+    assert state["schema_version"] == "evaluation-coordinator-v1"
+    assert state["served"] == []
+    assert state["queued"][0]["request_id"] == request.request_id
+    assert cold.complete(request.evaluation_identity, evaluation_time=at(11)) is True
+    assert cold.complete(request.evaluation_identity, evaluation_time=at(12)) is False
+    assert cold.telemetry().to_dict() == warm.telemetry().to_dict()
+    assert cold.served_identities() == warm.served_identities()
+
+    # A completion for an identity that was committed before the crash but was never
+    # queued in this process is still exactly one transition, and it is reported
+    # outside the queue partition instead of inflating it.
+    assert (
+        warm.complete("EEVL:committed-before-restart", evaluation_time=at(12)) is True
+    )
+    assert (
+        warm.complete("EEVL:committed-before-restart", evaluation_time=at(13)) is False
+    )
+    accounting = warm.telemetry().accounting()
+    assert warm.telemetry().served == 2
+    assert accounting.served_unmatched == 1
+    assert accounting.served_from_queue == 1
+    assert accounting.reconciles is True
+
+    # R5-A owns no storage and no writer, so the durable ledger stays an owner
+    # decision (`OQ-04` and the open durable-ledger item) rather than a slice
+    # invention.
+    for module in R5A_MODULES:
+        source = module_source(module)
+        for token in FORBIDDEN_PERSISTENCE_TOKENS:
+            assert token not in source, f"{module.name} must not carry {token}"
 
 
 
@@ -2889,36 +3285,11 @@ def test_ac_015_an_engineering_load_scenario_is_bounded_and_protection_first():
     """
 
     instruments = tuple(f"IV:{index:03d}" for index in range(40))
-    limits = coordinator_limits(
-        queue_capacity=64,
-        queue_age_limit_intervals=10,
-        retry_ceiling=2,
-        per_instrument_budget_per_cycle=2,
-        protection_reserved_slots=2,
-        reconciliation_reserved_slots=2,
-    )
+    limits = engineering_burst_limits()
+    assert len(instruments) == 40
 
     def run() -> tuple[dict, float, int]:
-        coordinator = UnifiedEvaluationCoordinator(limits=limits)
-        for instrument in instruments:
-            for slot in range(4):
-                coordinator.submit(
-                    request_for(
-                        instrument=instrument,
-                        cutoff=10 + slot,
-                        at_minute=10 + slot,
-                        expires=90,
-                    ),
-                    evaluation_time=at(10 + slot),
-                )
-        protection = request_for(
-            instrument="IV:PROTECT",
-            priority=WorkPriority.PROTECTION,
-            path=EvaluationPath.RECOVERY_BACKFILL,
-            at_minute=13,
-            expires=90,
-        )
-        coordinator.submit(protection, evaluation_time=at(13))
+        coordinator = engineering_burst()
         batch = coordinator.next_batch(evaluation_time=at(14), size=20)
         delays = sorted(
             (at(14) - item.requested_at_utc).total_seconds() / 60.0 for item in batch
@@ -2938,6 +3309,29 @@ def test_ac_015_an_engineering_load_scenario_is_bounded_and_protection_first():
     # Labelled engineering scenario budget: an admitted request is served within
     # four evaluation intervals of its cut-off under this burst.
     assert first_p95 <= 4.0
+    # The load figures reconcile as two disjoint populations: 161 submissions are
+    # 65 admissions plus 96 refusals, while the 97 visible shed events are those 96
+    # refusals plus the 1 eviction of already-admitted discovery work. The eviction
+    # is why `submitted == admitted + dropped_backpressure` is false here.
+    assert first_telemetry["submitted"] == 161
+    assert first_telemetry["admitted"] == 65
+    assert first_telemetry["refused_backpressure"] == 96
+    assert first_telemetry["evicted_backpressure"] == 1
+    assert first_telemetry["dropped_backpressure"] == 97
+    assert first_telemetry["submitted"] - first_telemetry["admitted"] == 96
+    assert (
+        first_telemetry["admitted"] + first_telemetry["dropped_backpressure"]
+        != first_telemetry["submitted"]
+    )
+    assert (
+        first_telemetry["admitted"]
+        + first_telemetry["dropped_backpressure"]
+        - first_telemetry["evicted_backpressure"]
+        == first_telemetry["submitted"]
+    )
+    round_tripped = CoordinatorTelemetry(**first_telemetry)
+    assert round_tripped.to_dict() == first_telemetry
+    assert round_tripped.accounting().reconciles is True
     protection_batch = UnifiedEvaluationCoordinator(limits=limits)
     for instrument in instruments[:3]:
         protection_batch.submit(
@@ -2956,4 +3350,134 @@ def test_ac_015_an_engineering_load_scenario_is_bounded_and_protection_first():
     )
     selected = protection_batch.next_batch(evaluation_time=at(10), size=2)
     assert selected[0].priority is WorkPriority.PROTECTION
+
+
+def test_ac_015_a_labelled_scheduler_baseline_harness_compares_like_for_like():
+    """ATDD-R5-A-continuous-opportunity-engine/AC-015: reproducible baseline harness.
+
+    GIVEN one synthetic universe, one set of evidence cut-offs and one eligibility
+    rule shared by both arms
+    WHEN the pre-R5-A grid baseline (evaluate every eligible instrument at every
+    cut-off) and the R5-A event path (attention-admitted identities through the
+    coordinator, with the designated time-critical trigger identity carrying the
+    reserved priority) are driven over the same horizon
+    THEN both arms draw on the identical eligible identity set, the event path
+    reaches the trigger identity's first evaluation with strictly less detector work
+    while the deferred discovery stays queued instead of dropped, both runs are
+    identical, and the harness reports NOT_PROVEN for real-world latency because no
+    retained production observation exists to compare against
+    """
+
+    identities = {
+        (instrument, float(cutoff)): evaluation_identity(
+            instrument_version_id=instrument,
+            evaluation_cutoff=at(cutoff),
+            policy_version=ATTENTION_ENGINEERING_SCENARIO_POLICY_VERSION,
+        )
+        for instrument in BASELINE_UNIVERSE
+        for cutoff in BASELINE_CUTOFFS
+    }
+
+    def grid_baseline() -> tuple[int, int, set[str]]:
+        """Pre-R5-A behaviour: scan every eligible instrument at every interval."""
+
+        ordinal = 0
+        trigger_ordinal = 0
+        evaluated: set[str] = set()
+        for cutoff in BASELINE_CUTOFFS:
+            for instrument in BASELINE_UNIVERSE:
+                ordinal += 1
+                evaluated.add(identities[(instrument, float(cutoff))])
+                if instrument == BASELINE_TRIGGER_INSTRUMENT and trigger_ordinal == 0:
+                    trigger_ordinal = ordinal
+        return ordinal, trigger_ordinal, evaluated
+
+    def event_path() -> tuple[int, int, int, int, set[str], set[str]]:
+        """R5-A behaviour: attention-admitted identities through one bounded batch."""
+
+        coordinator = UnifiedEvaluationCoordinator(
+            limits=coordinator_limits(
+                queue_capacity=64,
+                queue_age_limit_intervals=10,
+                retry_ceiling=2,
+                per_instrument_budget_per_cycle=4,
+                protection_reserved_slots=1,
+                reconciliation_reserved_slots=1,
+            )
+        )
+        submitted: set[str] = set()
+        trigger = identities[
+            (BASELINE_TRIGGER_INSTRUMENT, float(BASELINE_CUTOFFS[0]))
+        ]
+        for instrument in BASELINE_UNIVERSE:
+            for cutoff in BASELINE_CUTOFFS:
+                outcome = coordinator.submit(
+                    request_for(
+                        instrument=instrument,
+                        cutoff=cutoff,
+                        at_minute=cutoff,
+                        expires=60,
+                        priority=(
+                            WorkPriority.PROTECTION
+                            if instrument == BASELINE_TRIGGER_INSTRUMENT
+                            else WorkPriority.DISCOVERY
+                        ),
+                    ),
+                    evaluation_time=at(cutoff),
+                )
+                assert outcome.disposition is RequestDisposition.ADMITTED
+                submitted.add(outcome.evaluation_identity)
+        batch = coordinator.next_batch(
+            evaluation_time=at(BASELINE_CUTOFFS[0]), size=1
+        )
+        evaluated = {item.evaluation_identity for item in batch}
+        assert trigger in evaluated
+        # Selection is bounded, but nothing is dropped: the work that was not
+        # selected stays queued and visibly deferred.
+        assert coordinator.telemetry().backlog == len(submitted)
+        assert coordinator.telemetry().refused_backpressure == 0
+        assert (
+            coordinator.complete(trigger, evaluation_time=at(BASELINE_CUTOFFS[0]))
+            is True
+        )
+        telemetry = coordinator.telemetry()
+        return (
+            len(evaluated),
+            1,
+            telemetry.backlog,
+            telemetry.refused_backpressure,
+            evaluated,
+            submitted,
+        )
+
+    eligible = set(identities.values())
+    grid_work, grid_trigger_ordinal, grid_evaluated = grid_baseline()
+    assert grid_trigger_ordinal == len(BASELINE_UNIVERSE)
+    assert grid_evaluated == eligible
+
+    first = event_path()
+    second = event_path()
+    assert first == second
+    (
+        event_work,
+        event_trigger_ordinal,
+        backlog,
+        refused,
+        event_evaluated,
+        submitted,
+    ) = first
+    # Identical universe, cut-offs and eligibility for both arms.
+    assert submitted == eligible
+    assert event_evaluated < grid_evaluated
+    # Strictly less detector work to reach the same first trigger evaluation, and
+    # the deferred discovery is queued rather than dropped.
+    assert event_work == event_trigger_ordinal == 1 < grid_trigger_ordinal == 8
+    assert event_work < grid_work == 32
+    assert backlog == len(eligible) - 1
+    assert refused == 0
+    # The harness compares structure only: real-world latency stays unproven.
+    assert BASELINE_LATENCY_VERDICT == "NOT_PROVEN"
+    body = CONFORMANCE.read_text(encoding="utf-8")
+    assert BASELINE_LATENCY_VERDICT in body
+    assert "scheduler-versus-event baseline" in body.lower()
 
