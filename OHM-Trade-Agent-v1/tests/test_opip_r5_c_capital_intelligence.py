@@ -43,7 +43,6 @@ environment read. Every instant and every amount is explicit.
 from __future__ import annotations
 
 import ast
-from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -57,13 +56,14 @@ APP_ROOT = Path(__file__).resolve().parents[1]
 if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
 
-from app.opip.contracts import portfolio as portfolio_module  # noqa: E402
 from app.opip.contracts.portfolio import (  # noqa: E402
     PortfolioContractError,
     PortfolioDirection,
     PortfolioReservation,
     PortfolioReservationPlan,
+    ReservationReleaseReason,
     assert_reservation_plan_current,
+    release_reservation,
 )
 from app.services import capital_rotation_intelligence as capital_module  # noqa: E402
 from app.services.release_profiles import (  # noqa: E402
@@ -96,6 +96,8 @@ from app.services.capital_rotation_intelligence import (  # noqa: E402
     CAPITAL_LIABILITIES_SUPPORTED,
     CAPITAL_RECEIVABLES_SUPPORTED,
     CAPITAL_RECOMPUTE_CASH_LAWS,
+    CAPITAL_RESERVATION_DURABILITY_DEPENDENCY,
+    CAPITAL_RESERVATION_DURABILITY_STATUS,
     CAPITAL_RETURN_PER_HOUR_QUANTUM,
     CAPITAL_SECONDS_PER_HOUR,
     CAPITAL_SNAPSHOT_ID_PREFIX,
@@ -136,8 +138,6 @@ from app.services.capital_rotation_intelligence import (  # noqa: E402
     CapitalRecomputeTrigger,
     CapitalSnapshot,
     CapitalSourceWatermark,
-    CapitalTimeEfficiencyAggregate,
-    CapitalTimeEfficiencyCohort,
     CapitalTimeEfficiencyStatus,
     CashPartitionLedger,
     SleeveUsage,
@@ -392,6 +392,30 @@ def fee_state(fees: str = "0.00", sequence: int = 7):
     )
 
 
+def declared_usage(
+    risk: str = "900.00",
+    concentration: str = "900.00",
+    liquidity: str = "900.00",
+) -> tuple[CapitalLimitUsage, ...]:
+    """Declare every limit family a scenario configures a cap for.
+
+    A configured cap whose own usage row is missing abstains rather than being
+    charged with another family's usage, so every scenario that means to exercise
+    the bound arithmetic declares the usage it is measured against - including an
+    explicit ``"0.00"``, which is declared evidence rather than missing evidence.
+    """
+
+    return (
+        CapitalLimitUsage(kind=CapitalLimitKind.RISK, used_capital=risk, as_of=T0),
+        CapitalLimitUsage(
+            kind=CapitalLimitKind.CONCENTRATION, used_capital=concentration, as_of=T0
+        ),
+        CapitalLimitUsage(
+            kind=CapitalLimitKind.LIQUIDITY, used_capital=liquidity, as_of=T0
+        ),
+    )
+
+
 def successor(
     previous: CapitalSnapshot,
     *,
@@ -531,9 +555,12 @@ def test_ac_003_each_trigger_obeys_its_declared_cash_law() -> None:
     THEN a partition move preserves the total, a fee may only decrease it with a
     declared fee movement and a newer watermark, a mark preserves the partitions,
     and only a reconciled successor may declare reconciliation
+
+    Each declared law is exercised on its own book: one book has exactly one
+    lawful successor of a version, so a scenario that asserts a lawful recompute
+    declares the book it belongs to.
     """
 
-    previous = snapshot()
     assert (
         CAPITAL_RECOMPUTE_CASH_LAWS[CapitalRecomputeTrigger.RESERVATION]
         is CapitalCashLaw.PRESERVE_TOTAL
@@ -547,34 +574,38 @@ def test_ac_003_each_trigger_obeys_its_declared_cash_law() -> None:
         is CapitalCashLaw.PRESERVE_PARTITIONS
     )
 
+    reservation_base = snapshot(account="PAPER-LEDGER-R5C-LAW-RESERVATION")
     moved = successor(
-        previous,
+        reservation_base,
         trigger=CapitalRecomputeTrigger.RESERVATION,
         cash_ledger=cash(free="9000.00", reserves="1000.00", safety="500.00"),
     )
-    assert_snapshot_recomputes_from(previous, moved, trigger=CapitalRecomputeTrigger.RESERVATION)
-    assert moved.cash.cash_total == previous.cash.cash_total
+    assert_snapshot_recomputes_from(
+        reservation_base, moved, trigger=CapitalRecomputeTrigger.RESERVATION
+    )
+    assert moved.cash.cash_total == reservation_base.cash.cash_total
     inflated = successor(
-        previous,
+        reservation_base,
         trigger=CapitalRecomputeTrigger.RESERVATION,
         cash_ledger=cash(free="9000.00", reserves="1000.00", safety="600.00"),
     )
     with pytest.raises(CapitalIntelligenceError, match="cash total"):
         assert_snapshot_recomputes_from(
-            previous, inflated, trigger=CapitalRecomputeTrigger.RESERVATION
+            reservation_base, inflated, trigger=CapitalRecomputeTrigger.RESERVATION
         )
 
+    fee_base = snapshot(account="PAPER-LEDGER-R5C-LAW-FEE")
     charged = successor(
-        previous,
+        fee_base,
         trigger=CapitalRecomputeTrigger.FEE,
         cash_ledger=cash(free="9990.00", safety="500.00"),
         fee_state=fee_state(fees="10.00", sequence=8),
         source_watermark=watermark(8),
     )
-    assert_snapshot_recomputes_from(previous, charged, trigger=CapitalRecomputeTrigger.FEE)
+    assert_snapshot_recomputes_from(fee_base, charged, trigger=CapitalRecomputeTrigger.FEE)
     assert charged.cash.cash_total == Decimal("10490.00")
     undeclared_fee = successor(
-        previous,
+        fee_base,
         trigger=CapitalRecomputeTrigger.FEE,
         cash_ledger=cash(free="9990.00", safety="500.00"),
         fee_state=fee_state(fees="0.00", sequence=8),
@@ -582,38 +613,39 @@ def test_ac_003_each_trigger_obeys_its_declared_cash_law() -> None:
     )
     with pytest.raises(CapitalIntelligenceError, match="fee"):
         assert_snapshot_recomputes_from(
-            previous, undeclared_fee, trigger=CapitalRecomputeTrigger.FEE
+            fee_base, undeclared_fee, trigger=CapitalRecomputeTrigger.FEE
         )
     credited = successor(
-        previous,
+        fee_base,
         trigger=CapitalRecomputeTrigger.FEE,
         cash_ledger=cash(free="10000.00", blocked="10.00", safety="500.00"),
         fee_state=fee_state(fees="10.00", sequence=8),
         source_watermark=watermark(8),
     )
     with pytest.raises(CapitalIntelligenceError, match="cash total"):
-        assert_snapshot_recomputes_from(previous, credited, trigger=CapitalRecomputeTrigger.FEE)
+        assert_snapshot_recomputes_from(fee_base, credited, trigger=CapitalRecomputeTrigger.FEE)
     rewound = successor(
-        previous,
+        fee_base,
         trigger=CapitalRecomputeTrigger.FEE,
         cash_ledger=cash(free="9990.00", safety="500.00"),
         fee_state=fee_state(fees="10.00", sequence=6),
         source_watermark=watermark(6),
     )
     with pytest.raises(CapitalIntelligenceError, match="watermark"):
-        assert_snapshot_recomputes_from(previous, rewound, trigger=CapitalRecomputeTrigger.FEE)
+        assert_snapshot_recomputes_from(fee_base, rewound, trigger=CapitalRecomputeTrigger.FEE)
     mismatched = successor(
-        previous,
+        fee_base,
         trigger=CapitalRecomputeTrigger.FEE,
         cash_ledger=cash(free="9995.00", safety="500.00"),
         fee_state=fee_state(fees="10.00", sequence=8),
         source_watermark=watermark(8),
     )
     with pytest.raises(CapitalIntelligenceError, match="fee"):
-        assert_snapshot_recomputes_from(previous, mismatched, trigger=CapitalRecomputeTrigger.FEE)
+        assert_snapshot_recomputes_from(fee_base, mismatched, trigger=CapitalRecomputeTrigger.FEE)
 
+    mark_base = snapshot(account="PAPER-LEDGER-R5C-LAW-MARK")
     remarked = successor(
-        previous,
+        mark_base,
         trigger=CapitalRecomputeTrigger.MARK,
         positions=(position(marked="3600.00", marked_at=at(60)),),
         marks=CapitalMarkState(
@@ -621,27 +653,28 @@ def test_ac_003_each_trigger_obeys_its_declared_cash_law() -> None:
         ),
         source_watermark=watermark(8),
     )
-    assert_snapshot_recomputes_from(previous, remarked, trigger=CapitalRecomputeTrigger.MARK)
-    assert remarked.cash.to_dict() == previous.cash.to_dict()
+    assert_snapshot_recomputes_from(mark_base, remarked, trigger=CapitalRecomputeTrigger.MARK)
+    assert remarked.cash.to_dict() == mark_base.cash.to_dict()
     with pytest.raises(CapitalIntelligenceError, match="mark"):
         assert_snapshot_recomputes_from(
-            previous,
-            successor(previous, trigger=CapitalRecomputeTrigger.MARK),
+            mark_base,
+            successor(mark_base, trigger=CapitalRecomputeTrigger.MARK),
             trigger=CapitalRecomputeTrigger.MARK,
         )
     with pytest.raises(CapitalIntelligenceError, match="partition"):
         assert_snapshot_recomputes_from(
-            previous,
+            mark_base,
             successor(
-                previous,
+                mark_base,
                 trigger=CapitalRecomputeTrigger.MARK,
                 cash_ledger=cash(free="9000.00", reserves="1000.00", safety="500.00"),
             ),
             trigger=CapitalRecomputeTrigger.MARK,
         )
 
+    reconciliation_base = snapshot(account="PAPER-LEDGER-R5C-LAW-RECONCILIATION")
     reconciled = successor(
-        previous,
+        reconciliation_base,
         trigger=CapitalRecomputeTrigger.RECONCILIATION,
         reconciliation=CapitalReconciliation(
             status=CapitalReconciliationStatus.RECONCILED,
@@ -652,10 +685,10 @@ def test_ac_003_each_trigger_obeys_its_declared_cash_law() -> None:
         source_watermark=watermark(8),
     )
     assert_snapshot_recomputes_from(
-        previous, reconciled, trigger=CapitalRecomputeTrigger.RECONCILIATION
+        reconciliation_base, reconciled, trigger=CapitalRecomputeTrigger.RECONCILIATION
     )
     unreconciled = successor(
-        previous,
+        reconciliation_base,
         trigger=CapitalRecomputeTrigger.RECONCILIATION,
         reconciliation=CapitalReconciliation(
             status=CapitalReconciliationStatus.NOT_PERFORMED,
@@ -667,7 +700,7 @@ def test_ac_003_each_trigger_obeys_its_declared_cash_law() -> None:
     )
     with pytest.raises(CapitalIntelligenceError, match="reconcil"):
         assert_snapshot_recomputes_from(
-            previous, unreconciled, trigger=CapitalRecomputeTrigger.RECONCILIATION
+            reconciliation_base, unreconciled, trigger=CapitalRecomputeTrigger.RECONCILIATION
         )
 
 
@@ -687,7 +720,8 @@ def test_ac_004_deployable_capital_is_the_tightest_declared_bound() -> None:
     """
 
     policy_record = policy()
-    view = evaluate_deployable_capital(snapshot(), policy=policy_record, at_time=at(60))
+    usage_declared = snapshot(limit_usage=declared_usage())
+    view = evaluate_deployable_capital(usage_declared, policy=policy_record, at_time=at(60))
     assert view.status is CapitalDeployableStatus.AVAILABLE
     assert view.abstention_reason is None
     assert view.deployable_capital == Decimal("100.00")
@@ -697,7 +731,7 @@ def test_ac_004_deployable_capital_is_the_tightest_declared_bound() -> None:
     assert view.currency == CURRENCY
     assert view.account == ACCOUNT
     assert view.policy_version == policy_record.policy_version
-    assert view.snapshot_id == snapshot().snapshot_id
+    assert view.snapshot_id == usage_declared.snapshot_id
     assert view.evaluated_at == at(60)
     assert view.authoritative is False
     assert view.to_dict()["deployable_capital"] == "100.00"
@@ -729,14 +763,16 @@ def test_ac_004_free_cash_is_a_hard_ceiling() -> None:
     THEN free cash binds, and a tie is resolved by the declared bound precedence
     """
 
-    poor = snapshot(cash_ledger=cash(free="50.00", safety="500.00"))
+    poor = snapshot(
+        cash_ledger=cash(free="50.00", safety="500.00"), limit_usage=declared_usage()
+    )
     view = evaluate_deployable_capital(poor, policy=policy(), at_time=at(60))
     assert view.status is CapitalDeployableStatus.AVAILABLE
     assert view.deployable_capital == Decimal("50.00")
     assert view.binding_bound is CapitalBound.FREE_CASH
     tied = snapshot(
         cash_ledger=cash(free="100.00", safety="500.00"),
-        limit_usage=(CapitalLimitUsage(kind=CapitalLimitKind.RISK, used_capital="900.00", as_of=T0),),
+        limit_usage=declared_usage(),
     )
     tied_view = evaluate_deployable_capital(tied, policy=policy(), at_time=at(60))
     assert tied_view.bounds[CapitalBound.FREE_CASH] == Decimal("100.00")
@@ -755,7 +791,8 @@ def test_ac_004_a_sleeve_limit_can_bind_independently() -> None:
     """
 
     full = snapshot(
-        sleeve_usage=(SleeveUsage(sleeve="TACTICAL", used_capital="5000.00", as_of=T0),)
+        sleeve_usage=(SleeveUsage(sleeve="TACTICAL", used_capital="5000.00", as_of=T0),),
+        limit_usage=declared_usage(),
     )
     view = evaluate_deployable_capital(full, policy=policy(), at_time=at(60))
     assert view.status is CapitalDeployableStatus.AVAILABLE
@@ -767,7 +804,8 @@ def test_ac_004_a_sleeve_limit_can_bind_independently() -> None:
         sleeve_usage=(
             SleeveUsage(sleeve="TACTICAL", used_capital="3000.00", as_of=T0),
             SleeveUsage(sleeve="CORE", used_capital="150.00", as_of=T0),
-        )
+        ),
+        limit_usage=declared_usage(),
     )
     two_view = evaluate_deployable_capital(
         two_sleeves,
@@ -779,7 +817,8 @@ def test_ac_004_a_sleeve_limit_can_bind_independently() -> None:
     assert two_view.binding_sleeve == "CORE"
     assert two_view.deployable_capital == Decimal("50.00")
     undeclared_sleeve = snapshot(
-        sleeve_usage=(SleeveUsage(sleeve="CORE", used_capital="100.00", as_of=T0),)
+        sleeve_usage=(SleeveUsage(sleeve="CORE", used_capital="100.00", as_of=T0),),
+        limit_usage=declared_usage(),
     )
     undeclared_view = evaluate_deployable_capital(
         undeclared_sleeve, policy=policy(), at_time=at(60)
@@ -808,7 +847,9 @@ def test_ac_004_a_missing_cap_abstains_instead_of_being_unlimited() -> None:
     assert view.binding_bound is None
     assert view.bounds == {}
     no_sleeve_limit = policy(sleeve_limits={})
-    sleeve_view = evaluate_deployable_capital(snapshot(), policy=no_sleeve_limit, at_time=at(60))
+    sleeve_view = evaluate_deployable_capital(
+        snapshot(limit_usage=declared_usage()), policy=no_sleeve_limit, at_time=at(60)
+    )
     assert sleeve_view.status is CapitalDeployableStatus.ABSTAINED
     assert sleeve_view.abstention_reason is CapitalDeployableAbstentionReason.SLEEVE_LIMIT_NOT_CONFIGURED
     assert sleeve_view.missing_policy_inputs == ("TACTICAL",)
@@ -840,18 +881,16 @@ def test_ac_004_bounds_are_exact_and_never_negative() -> None:
             CapitalLimitKind.LIQUIDITY: "4000.00",
         }
     )
-    view = evaluate_deployable_capital(snapshot(), policy=over, at_time=at(60))
+    view = evaluate_deployable_capital(
+        snapshot(limit_usage=declared_usage()), policy=over, at_time=at(60)
+    )
     assert view.status is CapitalDeployableStatus.AVAILABLE
     assert view.bounds[CapitalBound.RISK] == Decimal("0.00")
     assert view.over_limit_bounds == (CapitalBound.RISK,)
     assert view.deployable_capital == Decimal("0.00")
     assert view.binding_bound is CapitalBound.RISK
     near = snapshot(
-        limit_usage=(
-            CapitalLimitUsage(
-                kind=CapitalLimitKind.RISK, used_capital="999.99", as_of=T0
-            ),
-        ),
+        limit_usage=declared_usage(risk="999.99"),
         sleeve_usage=(SleeveUsage(sleeve="TACTICAL", used_capital="2999.99", as_of=T0),),
     )
     near_view = evaluate_deployable_capital(near, policy=policy(), at_time=at(60))
@@ -861,6 +900,79 @@ def test_ac_004_bounds_are_exact_and_never_negative() -> None:
     assert near_view.deployable_capital == Decimal("0.01")
     assert near_view.binding_bound is CapitalBound.RISK
     assert near_view.over_limit_bounds == ()
+
+
+def test_ac_004_a_capped_limit_without_declared_usage_abstains() -> None:
+    """ATDD-R5-C-capital-intelligence/AC-004: a cap is not its own usage.
+
+    GIVEN a policy that configures a cap for a limit family, and snapshots that
+    declare no usage for it, no usage at all, another family's usage or an
+    explicit zero
+    WHEN deployable capital is evaluated
+    THEN the configured cap without its own usage row abstains and names the
+    missing row rather than being charged with another family's usage or read as
+    the whole cap, while an explicitly declared zero is evidence and not a gap
+    """
+
+    missing_one = snapshot(limit_usage=declared_usage(liquidity="0.00")[:2])
+    one_view = evaluate_deployable_capital(missing_one, policy=policy(), at_time=at(60))
+    assert one_view.status is CapitalDeployableStatus.ABSTAINED
+    assert one_view.abstention_reason is CapitalDeployableAbstentionReason.LIMIT_USAGE_NOT_DECLARED
+    assert one_view.missing_policy_inputs == ("LIQUIDITY",)
+    assert one_view.deployable_capital is None
+    assert one_view.bounds == {}
+    assert one_view.binding_bound is None
+
+    no_usage = snapshot(limit_usage=())
+    none_view = evaluate_deployable_capital(no_usage, policy=policy(), at_time=at(60))
+    assert none_view.abstention_reason is CapitalDeployableAbstentionReason.LIMIT_USAGE_NOT_DECLARED
+    assert none_view.missing_policy_inputs == ("RISK", "CONCENTRATION", "LIQUIDITY")
+    assert none_view.deployable_capital is None
+
+    # Risk usage may never be charged to the concentration or liquidity bound: with
+    # only RISK declared, the other two named rows abstain instead of inheriting it.
+    cross_family = snapshot(
+        limit_usage=(CapitalLimitUsage(kind=CapitalLimitKind.RISK, used_capital="900.00", as_of=T0),)
+    )
+    cross_view = evaluate_deployable_capital(cross_family, policy=policy(), at_time=at(60))
+    assert cross_view.abstention_reason is CapitalDeployableAbstentionReason.LIMIT_USAGE_NOT_DECLARED
+    assert cross_view.missing_policy_inputs == ("CONCENTRATION", "LIQUIDITY")
+    assert cross_view.deployable_capital is None
+
+    # Declared zero usage is declared evidence: every capped family is measured and
+    # the caps themselves bind.
+    declared_zero = snapshot(
+        limit_usage=declared_usage(risk="0.00", concentration="0.00", liquidity="0.00")
+    )
+    zero_view = evaluate_deployable_capital(declared_zero, policy=policy(), at_time=at(60))
+    assert zero_view.status is CapitalDeployableStatus.AVAILABLE
+    assert zero_view.bounds[CapitalBound.RISK] == Decimal("1000.00")
+    assert zero_view.bounds[CapitalBound.CONCENTRATION] == Decimal("2500.00")
+    assert zero_view.bounds[CapitalBound.LIQUIDITY] == Decimal("4000.00")
+    assert zero_view.deployable_capital == Decimal("1000.00")
+    assert zero_view.binding_bound is CapitalBound.RISK
+    assert zero_view.over_limit_bounds == ()
+
+    # A partial policy declaration is evaluated exactly as declared: the one capped
+    # family that declares usage participates, and no uncapped family is invented.
+    partial = evaluate_deployable_capital(
+        snapshot(limit_usage=declared_usage()[:1]),
+        policy=policy(
+            limit_caps={CapitalLimitKind.RISK: "1000.00"},
+            sleeve_limits={"TACTICAL": "5000.00"},
+        ),
+        at_time=at(60),
+    )
+    assert partial.status is CapitalDeployableStatus.AVAILABLE
+    assert partial.bounds == {
+        CapitalBound.FREE_CASH: Decimal("10000.00"),
+        CapitalBound.RISK: Decimal("100.00"),
+        CapitalBound.SLEEVE: Decimal("2000.00"),
+    }
+    assert partial.deployable_capital == Decimal("100.00")
+
+    with pytest.raises(CapitalIntelligenceError, match="negative"):
+        CapitalLimitUsage(kind=CapitalLimitKind.RISK, used_capital="-1.00", as_of=T0)
 
 
 def policy(**overrides):
@@ -888,24 +1000,63 @@ def plan(
     symbol: str = "ETHUSDT",
     created_at: datetime | None = None,
     window: str = "PWIN:R5C:1",
+    expires_at: datetime | None = None,
+    second_candidate: str | None = None,
 ) -> PortfolioReservationPlan:
     created = created_at or T0
-    return PortfolioReservationPlan(
-        portfolio_version=version,
-        window_identity=window,
-        created_at=created,
-        reservations=(
+    expires = expires_at if expires_at is not None else created + timedelta(hours=1)
+    reservations = [
+        PortfolioReservation(
+            candidate_id=candidate,
+            symbol=symbol,
+            direction=PortfolioDirection.LONG,
+            reserved_capital=amount,
+            portfolio_version=version,
+            created_at=created,
+            expires_at=expires,
+        )
+    ]
+    if second_candidate is not None:
+        reservations.append(
             PortfolioReservation(
-                candidate_id=candidate,
-                symbol=symbol,
+                candidate_id=second_candidate,
+                symbol="BTCUSDT",
                 direction=PortfolioDirection.LONG,
                 reserved_capital=amount,
                 portfolio_version=version,
                 created_at=created,
-                expires_at=created + timedelta(hours=1),
-            ),
-        ),
+                expires_at=expires,
+            )
+        )
+    return PortfolioReservationPlan(
+        portfolio_version=version,
+        window_identity=window,
+        created_at=created,
+        reservations=tuple(reservations),
     )
+
+
+def book_policy(record: CapitalSnapshot, **overrides) -> CapitalDeployablePolicy:
+    """The engineering-scenario deployable policy bound to a snapshot's own book.
+
+    A commit scenario runs on its own account so witnesses cannot cross tests, so
+    the policy that sizes it is bound to that same account, engine and currency.
+    """
+
+    base: dict[str, object] = {
+        "account": record.account,
+        "environment": CapitalEnvironment.PAPER_LEDGER,
+        "engine": record.engine,
+        "currency": record.currency,
+        "limit_caps": {
+            CapitalLimitKind.RISK: "1000.00",
+            CapitalLimitKind.CONCENTRATION: "2500.00",
+            CapitalLimitKind.LIQUIDITY: "4000.00",
+        },
+        "sleeve_limits": {"TACTICAL": "5000.00"},
+    }
+    base.update(overrides)
+    return capital_deployable_engineering_scenario_policy(**base)  # type: ignore[arg-type]
 
 
 def check(
@@ -1337,7 +1488,8 @@ def test_ac_005_an_outlived_or_incomplete_snapshot_abstains() -> None:
     """
 
     expiring = snapshot(
-        freshness=CapitalFreshness(as_of=T0, validity_deadline=at(60), evidence_complete=True)
+        freshness=CapitalFreshness(as_of=T0, validity_deadline=at(60), evidence_complete=True),
+        limit_usage=declared_usage(),
     )
     at_deadline = check(expiring, at_time=at(60))
     assert at_deadline.status is CapitalDeployableStatus.AVAILABLE
@@ -1456,6 +1608,118 @@ def test_ac_005_the_declared_precedence_decides_and_publishes_nothing() -> None:
     assert payload["authoritative"] is False
 
 
+def test_ac_005_one_trust_table_gates_the_deployable_and_commit_seams() -> None:
+    """ATDD-R5-C-capital-intelligence/AC-005: one blocking table, both seams.
+
+    GIVEN the account-evidence conditions `CI-02` blocks on - an unsupported
+    accounting state, a stale watermark, a failed or skipped reconciliation, a
+    negative partition, missing fees, an outlived validity window and incomplete
+    evidence
+    WHEN deployable capital is evaluated and a reservation plan is committed
+    against the same record
+    THEN the deployable seam publishes its specific declared reason while the commit
+    seam refuses with its one declared untrusted disposition, so the commit path can
+    never consume capital the deployable seam would refuse to size, and trusted
+    evidence still commits
+    """
+
+    order = CAPITAL_DEPLOYABLE_ABSTENTION_PRECEDENCE
+    assert order.index(CapitalDeployableAbstentionReason.LIMIT_NOT_CONFIGURED) < order.index(
+        CapitalDeployableAbstentionReason.LIMIT_USAGE_NOT_DECLARED
+    )
+    assert order.index(CapitalDeployableAbstentionReason.LIMIT_USAGE_NOT_DECLARED) < order.index(
+        CapitalDeployableAbstentionReason.SLEEVE_LIMIT_NOT_CONFIGURED
+    )
+
+    cases = (
+        (
+            {"accounting_state": CapitalAccountingState.UNSUPPORTED},
+            CapitalDeployableAbstentionReason.UNSUPPORTED_ACCOUNTING_STATE,
+        ),
+        (
+            {"source_watermark": watermark(7, T0, True)},
+            CapitalDeployableAbstentionReason.ACCOUNT_STATE_STALE,
+        ),
+        (
+            {
+                "reconciliation": CapitalReconciliation(
+                    status=CapitalReconciliationStatus.FAILED,
+                    observed_at=T0,
+                    reference="RECON:1",
+                    variance="12.00",
+                )
+            },
+            CapitalDeployableAbstentionReason.FAILED_RECONCILIATION,
+        ),
+        (
+            {
+                "reconciliation": CapitalReconciliation(
+                    status=CapitalReconciliationStatus.NOT_PERFORMED,
+                    observed_at=T0,
+                    reference="RECON:1",
+                    variance=None,
+                )
+            },
+            CapitalDeployableAbstentionReason.RECONCILIATION_NOT_PERFORMED,
+        ),
+        (
+            {"cash_ledger": cash(free="-1.00", safety="500.00")},
+            CapitalDeployableAbstentionReason.UNRESOLVED_NEGATIVE_BALANCE,
+        ),
+        ({"fee_state": None}, CapitalDeployableAbstentionReason.MISSING_FEES),
+        (
+            {
+                "freshness": CapitalFreshness(
+                    as_of=T0, validity_deadline=at(900), evidence_complete=False
+                )
+            },
+            CapitalDeployableAbstentionReason.EVIDENCE_INCOMPLETE,
+        ),
+    )
+    for index, (overrides, expected) in enumerate(cases):
+        record = commit_fixture(f"PAPER-LEDGER-R5C-TRUST-{index}", **overrides)
+        view = evaluate_deployable_capital(record, policy=book_policy(record), at_time=at(60))
+        assert view.abstention_reason is expected, overrides
+        assert view.deployable_capital is None
+        refusal = commit_reservation(
+            record, plan=plan(version=record.portfolio_version), at_time=at(60)
+        )
+        assert refusal.status is CapitalCommitStatus.REJECTED, overrides
+        assert refusal.rejection is CapitalCommitRejection.ACCOUNT_STATE_UNTRUSTED, overrides
+        assert refusal.snapshot is None
+        assert refusal.committed_capital is None
+        assert refusal.commit_id.startswith(f"{CAPITAL_COMMIT_ID_PREFIX}:")
+
+    # The outlived window is the one condition the commit seam reports under its own
+    # declared token, because the observation instant is checked before the plan is
+    # read at all.
+    outlived = commit_fixture(
+        "PAPER-LEDGER-R5C-TRUST-OUTLIVED",
+        freshness=CapitalFreshness(as_of=T0, validity_deadline=at(30), evidence_complete=True),
+    )
+    assert (
+        evaluate_deployable_capital(outlived, policy=book_policy(outlived), at_time=at(60)).abstention_reason
+        is CapitalDeployableAbstentionReason.SNAPSHOT_OUTLIVED_VALIDITY
+    )
+    assert (
+        commit_reservation(outlived, plan=plan(version=VERSION), at_time=at(60)).rejection
+        is CapitalCommitRejection.SNAPSHOT_OUTLIVED_VALIDITY
+    )
+
+    trusted = commit_fixture(
+        "PAPER-LEDGER-R5C-TRUST-CONTROL", limit_usage=declared_usage()
+    )
+    assert (
+        evaluate_deployable_capital(trusted, policy=book_policy(trusted), at_time=at(60)).status
+        is CapitalDeployableStatus.AVAILABLE
+    )
+    control = commit_reservation(
+        trusted, plan=plan(version=trusted.portfolio_version), at_time=at(60)
+    )
+    assert control.status is CapitalCommitStatus.COMMITTED
+    assert control.snapshot is not None
+
+
 # ---------------------------------------------------------------------------
 # AC-006 Atomic compare-and-commit reservation (`CI-04`)
 # ---------------------------------------------------------------------------
@@ -1511,13 +1775,16 @@ def test_ac_006_a_plan_commits_atomically_against_the_version_it_was_built_for()
 
     state = to_portfolio_capital_state(record)
     assert state.portfolio_version == record.portfolio_version
-    assert state.available_capital == float(record.cash.free_cash)
+    # The frozen F7 owner types its capital base as a float, so this declared
+    # conversion is asserted against the fixture's declared literal
+    # (10 000.00 free cash) rather than by repeating the conversion.
+    assert state.available_capital == 10000.0
     assert state.currency == record.currency
     assert state.as_of == record.freshness.as_of
     assert state.capital_state_fingerprint.startswith("PCAP:")
     committed_state = to_portfolio_capital_state(successor)
     assert committed_state.portfolio_version == successor.portfolio_version
-    assert committed_state.available_capital == float(successor.cash.free_cash)
+    assert committed_state.available_capital == 9000.0
 
 
 def test_ac_006_a_rejected_attempt_changes_nothing_at_all() -> None:
@@ -1625,6 +1892,189 @@ def test_ac_006_a_live_book_or_an_undescribable_commit_is_refused() -> None:
         commit_reservation(funded, plan="PRSV:pasted", at_time=at(60))  # type: ignore[arg-type]
     with pytest.raises(CapitalIntelligenceError):
         commit_reservation("not-a-snapshot", plan=plan(version=VERSION), at_time=at(60))  # type: ignore[arg-type]
+
+
+def test_ac_006_a_plan_outside_its_declared_window_is_refused() -> None:
+    """ATDD-R5-C-capital-intelligence/AC-006: an approval window is enforced.
+
+    GIVEN a plan created in the future, a plan whose reservation window has closed
+    while the snapshot is still valid, a plan a release has partially consumed and a
+    plan carrying a version this increment never declared
+    WHEN each is committed
+    THEN the future plan is not yet valid, the closed and partially consumed plans
+    are expired rather than committed for less capital than they declare, the
+    undeclared plan version fails closed in the frozen owner, and a retry of an
+    already committed plan still replays even after its window closed
+    """
+
+    future_book = commit_fixture("PAPER-LEDGER-R5C-WINDOW-1")
+    early = commit_reservation(
+        future_book,
+        plan=plan(version=future_book.portfolio_version, created_at=at(120)),
+        at_time=at(60),
+    )
+    assert early.status is CapitalCommitStatus.REJECTED
+    assert early.rejection is CapitalCommitRejection.PLAN_NOT_YET_VALID
+    assert early.snapshot is None
+
+    # A plan created exactly at the commit instant is inside its window: the
+    # boundary itself is committable.
+    boundary = commit_reservation(
+        future_book,
+        plan=plan(
+            version=future_book.portfolio_version,
+            created_at=at(60),
+            candidate="PCAND:R5C:BOUNDARY",
+        ),
+        at_time=at(60),
+    )
+    assert boundary.status is CapitalCommitStatus.COMMITTED
+    assert boundary.applied_portfolio_version == future_book.portfolio_version
+    assert boundary.snapshot is not None
+    assert boundary.snapshot.cash.amount(CapitalPartition.FREE_CASH) == Decimal("9000.00")
+
+    closed_book = commit_fixture("PAPER-LEDGER-R5C-WINDOW-2")
+    closing_plan = plan(version=closed_book.portfolio_version, expires_at=at(600))
+    assert (
+        commit_reservation(closed_book, plan=closing_plan, at_time=at(599)).status
+        is CapitalCommitStatus.COMMITTED
+    )
+    expiring = commit_reservation(
+        closed_book,
+        plan=plan(
+            version=closed_book.portfolio_version,
+            expires_at=at(600),
+            candidate="PCAND:R5C:EXPIRED",
+        ),
+        at_time=at(600),
+    )
+    assert expiring.rejection is CapitalCommitRejection.PLAN_EXPIRED
+    assert expiring.snapshot is None
+    assert expiring.committed_capital is None
+
+    # A retry of the plan this process already committed still replays, even though
+    # its declared window has closed in the meantime: idempotency is not defeated by
+    # the clock and nothing is consumed twice.
+    replay = commit_reservation(closed_book, plan=closing_plan, at_time=at(700))
+    assert replay.status is CapitalCommitStatus.IDEMPOTENT_REPLAY
+    assert replay.snapshot is not None
+    assert replay.snapshot.cash.amount(CapitalPartition.FREE_CASH) == Decimal("9000.00")
+    assert replay.snapshot.cash.amount(CapitalPartition.ORDER_RESERVES) == Decimal("1000.00")
+
+    partial_book = commit_fixture("PAPER-LEDGER-R5C-WINDOW-3")
+    two_legs = plan(
+        version=partial_book.portfolio_version, second_candidate="PCAND:R5C:PARTIAL-B"
+    )
+    released = release_reservation(
+        two_legs,
+        candidate_id="PCAND:R5C:1",
+        reason=ReservationReleaseReason.CANCELLED,
+        at_time=at(60),
+    )
+    assert released.planned_capital == 1000.0
+    partial = commit_reservation(partial_book, plan=released, at_time=at(60))
+    assert partial.rejection is CapitalCommitRejection.PLAN_EXPIRED
+    assert partial.snapshot is None
+    whole = commit_reservation(partial_book, plan=two_legs, at_time=at(60))
+    assert whole.status is CapitalCommitStatus.COMMITTED
+    assert whole.committed_capital == Decimal("2000.00")
+
+    undeclared_book = commit_fixture("PAPER-LEDGER-R5C-WINDOW-4")
+    legs = plan(version=undeclared_book.portfolio_version).reservations
+    with pytest.raises(PortfolioContractError, match="plan_schema_version"):
+        PortfolioReservationPlan(
+            portfolio_version=undeclared_book.portfolio_version,
+            window_identity="PWIN:R5C:WINDOW-4",
+            created_at=T0,
+            reservations=legs,
+            plan_schema_version="portfolio-reservation-plan-v0",
+        )
+    with pytest.raises(PortfolioContractError, match="plan_id"):
+        PortfolioReservationPlan(
+            portfolio_version=undeclared_book.portfolio_version,
+            window_identity="PWIN:R5C:WINDOW-4",
+            created_at=T0,
+            reservations=legs,
+            plan_id="PRSV:forged",
+        )
+
+
+def test_ac_006_a_reservation_never_extends_the_snapshot_validity() -> None:
+    """ATDD-R5-C-capital-intelligence/AC-006: a reservation is not a re-observation.
+
+    GIVEN a snapshot whose account evidence was observed once with a declared
+    validity deadline
+    WHEN reservations are committed against it, chained, offered at the deadline and
+    read after it, and when the account is later genuinely re-observed
+    THEN the committed successor carries the same source evidence and the same
+    deadline, chained reservations cannot extend it, the deadline and any later read
+    fail closed, and only a real re-observation with its own declared window moves
+    the deadline
+    """
+
+    book = commit_fixture("PAPER-LEDGER-R5C-VALIDITY-1")
+    assert book.freshness.validity_deadline == at(900)
+    first = commit_reservation(book, plan=plan(version=book.portfolio_version), at_time=at(60))
+    assert first.status is CapitalCommitStatus.COMMITTED
+    reserved_snapshot = first.snapshot
+    assert reserved_snapshot is not None
+    assert reserved_snapshot.freshness.as_of == at(60)
+    assert reserved_snapshot.freshness.validity_deadline == book.freshness.validity_deadline
+    assert reserved_snapshot.source_watermark == book.source_watermark
+    assert reserved_snapshot.reconciliation == book.reconciliation
+    assert reserved_snapshot.marks == book.marks
+    assert reserved_snapshot.fee_state == book.fee_state
+
+    chained = commit_reservation(
+        reserved_snapshot,
+        plan=plan(version=reserved_snapshot.portfolio_version, candidate="PCAND:R5C:CHAINED"),
+        at_time=at(120),
+    )
+    assert chained.status is CapitalCommitStatus.COMMITTED
+    assert chained.snapshot is not None
+    assert chained.snapshot.freshness.validity_deadline == book.freshness.validity_deadline
+    assert chained.snapshot.source_watermark == book.source_watermark
+    assert (
+        evaluate_deployable_capital(
+            chained.snapshot, policy=book_policy(chained.snapshot), at_time=at(901)
+        ).abstention_reason
+        is CapitalDeployableAbstentionReason.SNAPSHOT_OUTLIVED_VALIDITY
+    )
+    at_deadline = commit_reservation(
+        chained.snapshot,
+        plan=plan(version=chained.snapshot.portfolio_version, candidate="PCAND:R5C:DEADLINE"),
+        at_time=at(900),
+    )
+    assert at_deadline.rejection is CapitalCommitRejection.SNAPSHOT_OUTLIVED_VALIDITY
+    assert at_deadline.snapshot is None
+
+    # Only a genuine re-observation moves the deadline: the fee recompute below
+    # declares a newer source watermark and its own window, and the refreshed record
+    # is deployable long after the original deadline had passed.
+    observed = commit_fixture("PAPER-LEDGER-R5C-VALIDITY-2")
+    committed = commit_reservation(
+        observed, plan=plan(version=observed.portfolio_version), at_time=at(60)
+    )
+    assert committed.snapshot is not None
+    refreshed = successor(
+        committed.snapshot,
+        trigger=CapitalRecomputeTrigger.FEE,
+        seconds=540,
+        cash_ledger=cash(free="8990.00", reserves="1000.00", safety="500.00"),
+        fee_state=fee_state(fees="10.00", sequence=8),
+        source_watermark=watermark(8, at(600)),
+        freshness=fresh(as_of=at(600), deadline_seconds=900),
+        limit_usage=declared_usage(),
+    )
+    assert_snapshot_recomputes_from(
+        committed.snapshot, refreshed, trigger=CapitalRecomputeTrigger.FEE
+    )
+    assert refreshed.freshness.validity_deadline == at(1500)
+    assert refreshed.source_watermark.ledger_sequence == 8
+    assert (
+        evaluate_deployable_capital(refreshed, policy=book_policy(refreshed), at_time=at(1000)).status
+        is CapitalDeployableStatus.AVAILABLE
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1752,6 +2202,205 @@ def test_ac_007_a_losing_racer_never_double_spends() -> None:
     assert replanned.snapshot.cash.amount(CapitalPartition.ORDER_RESERVES) == Decimal("1250.00")
 
 
+
+
+def test_ac_007_a_lawful_recompute_moves_the_tracked_current_version() -> None:
+    """ATDD-R5-C-capital-intelligence/AC-007: the book follows its real lineage.
+
+    GIVEN a committed reservation, a lawful reconciliation recompute of its
+    successor and the earlier version that recompute replaced
+    WHEN the next reservation is committed, and when a reservation is offered
+    against the replaced version
+    THEN the next reservation consumes the version that actually is current for the
+    book instead of being refused as stale, and the replaced version never becomes
+    current again
+    """
+
+    book = commit_fixture("PAPER-LEDGER-R5C-VERSION-CHAIN-1")
+    first = commit_reservation(book, plan=plan(version=book.portfolio_version), at_time=at(60))
+    assert first.status is CapitalCommitStatus.COMMITTED
+    assert first.successor_version == "pv-r5c-0001.0001"
+    reserved = first.snapshot
+    assert reserved is not None
+
+    reconciled = successor(
+        reserved,
+        trigger=CapitalRecomputeTrigger.RECONCILIATION,
+        reconciliation=CapitalReconciliation(
+            status=CapitalReconciliationStatus.RECONCILED,
+            observed_at=at(120),
+            reference="RECON:2",
+            variance="0.00",
+        ),
+        source_watermark=watermark(8, at(120)),
+        freshness=fresh(as_of=at(120)),
+        limit_usage=declared_usage(),
+    )
+    assert reconciled.portfolio_version == "pv-r5c-0001.0002"
+    assert_snapshot_recomputes_from(
+        reserved, reconciled, trigger=CapitalRecomputeTrigger.RECONCILIATION
+    )
+
+    second = commit_reservation(
+        reconciled,
+        plan=plan(version=reconciled.portfolio_version, candidate="PCAND:R5C:AFTER-RECON"),
+        at_time=at(180),
+    )
+    assert second.status is CapitalCommitStatus.COMMITTED
+    assert second.successor_version == "pv-r5c-0001.0003"
+    assert second.snapshot is not None
+    assert second.snapshot.cash.amount(CapitalPartition.FREE_CASH) == Decimal("8000.00")
+    assert second.snapshot.cash.amount(CapitalPartition.ORDER_RESERVES) == Decimal("2000.00")
+
+    replaced = commit_reservation(
+        reserved,
+        plan=plan(version=reserved.portfolio_version, candidate="PCAND:R5C:REPLACED"),
+        at_time=at(240),
+    )
+    assert replaced.status is CapitalCommitStatus.REJECTED
+    assert replaced.rejection is CapitalCommitRejection.STALE_EXPECTED_VERSION
+    assert replaced.snapshot is None
+
+
+def test_ac_007_a_competing_successor_is_refused_but_a_replay_is_not() -> None:
+    """ATDD-R5-C-capital-intelligence/AC-007: one version, one successor.
+
+    GIVEN a committed snapshot and two different lawful recomputes of it, plus an
+    unrelated book that uses the same version strings
+    WHEN both are asserted as that version's successor and when the identical
+    successor is asserted twice
+    THEN the first successor is the only one accepted for that book, the identical
+    replay is not treated as a fork, and the unrelated book is never refuted by a
+    similar version string
+    """
+
+    base = commit_fixture("PAPER-LEDGER-R5C-FORK-1")
+    first = successor(
+        base,
+        trigger=CapitalRecomputeTrigger.RECONCILIATION,
+        reconciliation=CapitalReconciliation(
+            status=CapitalReconciliationStatus.RECONCILED,
+            observed_at=at(60),
+            reference="RECON:2",
+            variance="0.00",
+        ),
+        source_watermark=watermark(8),
+        limit_usage=declared_usage(),
+    )
+    assert_snapshot_recomputes_from(base, first, trigger=CapitalRecomputeTrigger.RECONCILIATION)
+    # The identical successor replayed is the same claim, not a second one.
+    assert_snapshot_recomputes_from(base, first, trigger=CapitalRecomputeTrigger.RECONCILIATION)
+
+    competing = successor(
+        base,
+        trigger=CapitalRecomputeTrigger.RECONCILIATION,
+        reconciliation=CapitalReconciliation(
+            status=CapitalReconciliationStatus.RECONCILED,
+            observed_at=at(60),
+            reference="RECON:3",
+            variance="0.00",
+        ),
+        source_watermark=watermark(8),
+        limit_usage=declared_usage(),
+    )
+    assert competing.portfolio_version == first.portfolio_version
+    assert competing.snapshot_id != first.snapshot_id
+    with pytest.raises(CapitalIntelligenceError, match="unforked"):
+        assert_snapshot_recomputes_from(
+            base, competing, trigger=CapitalRecomputeTrigger.RECONCILIATION
+        )
+
+    other = commit_fixture("PAPER-LEDGER-R5C-FORK-2")
+    other_first = successor(
+        other,
+        trigger=CapitalRecomputeTrigger.RECONCILIATION,
+        reconciliation=CapitalReconciliation(
+            status=CapitalReconciliationStatus.RECONCILED,
+            observed_at=at(60),
+            reference="RECON:2",
+            variance="0.00",
+        ),
+        source_watermark=watermark(8),
+        limit_usage=declared_usage(),
+    )
+    assert other_first.portfolio_version == first.portfolio_version
+    assert other_first.snapshot_id != first.snapshot_id
+    assert_snapshot_recomputes_from(
+        other, other_first, trigger=CapitalRecomputeTrigger.RECONCILIATION
+    )
+
+
+def test_ac_007_the_witness_is_bounded_and_declares_its_retention_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ATDD-R5-C-capital-intelligence/AC-007: a bounded witness, honestly labelled.
+
+    GIVEN the process-scoped witness and a deliberately small retention cap
+    WHEN many records and many records of one version are witnessed, and when a
+    successor is asserted for a predecessor the cap has already evicted
+    THEN both witness buckets and the per-version bucket stay inside the cap, the
+    eviction removes the proof rather than corrupting anything, the tracked current
+    version never moves backwards, and the increment declares that retention window
+    instead of claiming durable, restart-safe ownership
+    """
+
+    assert CAPITAL_RESERVATION_DURABILITY_STATUS == "PROCESS_SCOPED_IN_MEMORY_WITNESS"
+    assert CAPITAL_RESERVATION_DURABILITY_DEPENDENCY == "R5-E"
+    assert "Restart, multi-worker and durable-ledger safety are explicitly NOT claimed" in r5c_source()
+
+    bounded_attribute = "_opip_r5_c_capital_witness_bounded_test"
+    monkeypatch.setattr(capital_module, "_CAPITAL_WITNESS_LIMIT", 4)
+    monkeypatch.setattr(capital_module, "_CAPITAL_WITNESS_ATTRIBUTE", bounded_attribute)
+    try:
+        holder = capital_module._capital_witness()
+        records = [snapshot(account="PAPER-LEDGER-R5C-BOUNDED")]
+        for _ in range(7):
+            records.append(successor(records[-1], trigger=CapitalRecomputeTrigger.APPROVAL))
+        assert len(holder["snapshots"]) <= 4
+        assert len(holder["versions"]) <= 4
+
+        assert_snapshot_recomputes_from(
+            records[6], records[7], trigger=CapitalRecomputeTrigger.APPROVAL
+        )
+        identity = (
+            records[7].account,
+            records[7].environment.value,
+            records[7].engine,
+            records[7].currency,
+        )
+        assert holder["current"][identity] == records[7].portfolio_version
+
+        # The base of the chain has been evicted, so its competing successor is
+        # accepted here: the proof is retained-window scoped, which is exactly why
+        # the increment declares the witness process-scoped and guards the
+        # capital-creating path with the tracked version, the trust gate and free
+        # cash as well. The evicted, older version never becomes current again.
+        late = successor(records[0], trigger=CapitalRecomputeTrigger.APPROVAL)
+        assert_snapshot_recomputes_from(
+            records[0], late, trigger=CapitalRecomputeTrigger.APPROVAL
+        )
+        assert late.portfolio_version != records[7].portfolio_version
+        assert holder["current"][identity] == records[7].portfolio_version
+
+        same_version = [
+            snapshot(
+                account="PAPER-LEDGER-R5C-BOUNDED-SAME",
+                cash_ledger=cash(free=f"{1000 + index}.00", safety="500.00"),
+            )
+            for index in range(6)
+        ]
+        key = (
+            same_version[-1].account,
+            same_version[-1].environment.value,
+            same_version[-1].engine,
+            same_version[-1].currency,
+            VERSION,
+        )
+        assert len(holder["versions"][key]) == 4
+        assert holder["versions"][key][-1] == same_version[-1].snapshot_id
+    finally:
+        if hasattr(sys, bounded_attribute):
+            delattr(sys, bounded_attribute)
 
 
 # ---------------------------------------------------------------------------
@@ -1889,23 +2538,91 @@ def test_ac_008_an_unresolvable_series_abstains_rather_than_guessing() -> None:
 def test_ac_008_the_cost_channel_is_measured_not_estimated() -> None:
     """ATDD-R5-C-capital-intelligence/AC-008: declared costs occupy capital too.
 
-    GIVEN a declared occupancy series whose cumulative fees and carry rise
+    GIVEN a declared occupancy series whose cumulative fees and carry are declared
     WHEN the series is measured
-    THEN the cost channel is integrated over the same preserved instants and
-    subtracted once, so the net occupancy is exactly the declared arithmetic
+    THEN the cumulative-cost channel is integrated over the same preserved instants
+    under the same declared endpoint policy, subtracted once, and measured the same
+    way however finely the same economic history was sampled, so a one-off cost is
+    never scaled by the interval it happened to be observed across
     """
 
-    series = (
-        capital_occupancy_point(at=T0, allocated_basis="2000.00"),
+    carried = (
+        capital_occupancy_point(
+            at=T0, allocated_basis="2000.00", cumulative_fees="5.00", cumulative_carry="3.00"
+        ),
         capital_occupancy_point(
             at=at(7200), allocated_basis="2000.00", cumulative_fees="5.00", cumulative_carry="3.00"
         ),
     )
-    measured = measure_capital_hours(series, policy=hours_policy())
+    measured = measure_capital_hours(carried, policy=hours_policy())
     assert measured.capital_hours == Decimal("4000.0000")
     assert measured.cost_capital_hours == Decimal("16.0000")
     assert measured.net_capital_hours == Decimal("3984.0000")
     assert measured.net_capital_hours == measured.capital_hours - measured.cost_capital_hours
+
+    stepped = (
+        capital_occupancy_point(
+            at=T0, allocated_basis="2000.00", cumulative_fees="5.00", cumulative_carry="3.00"
+        ),
+        capital_occupancy_point(
+            at=at(7200), allocated_basis="2000.00", cumulative_fees="8.00", cumulative_carry="4.00"
+        ),
+    )
+    from_start = measure_capital_hours(
+        stepped, policy=hours_policy(endpoint=CapitalHoursEndpointPolicy.STEP_START)
+    )
+    from_end = measure_capital_hours(
+        stepped, policy=hours_policy(endpoint=CapitalHoursEndpointPolicy.STEP_END)
+    )
+    assert from_start.cost_capital_hours == Decimal("16.0000")
+    assert from_end.cost_capital_hours == Decimal("24.0000")
+    assert from_start.hours_id != from_end.hours_id
+
+    # The same economic history, sampled more finely, measures the same cost: the
+    # channel is a step integral of the level carried through each interval, not a
+    # movement inside one interval scaled by its length.
+    finer = (
+        capital_occupancy_point(
+            at=T0, allocated_basis="2000.00", cumulative_fees="5.00", cumulative_carry="3.00"
+        ),
+        capital_occupancy_point(
+            at=at(3600), allocated_basis="2000.00", cumulative_fees="5.00", cumulative_carry="3.00"
+        ),
+        capital_occupancy_point(
+            at=at(7200), allocated_basis="2000.00", cumulative_fees="8.00", cumulative_carry="4.00"
+        ),
+    )
+    assert (
+        measure_capital_hours(finer, policy=hours_policy()).cost_capital_hours
+        == from_start.cost_capital_hours
+        == Decimal("16.0000")
+    )
+
+    # A one-off cost declared only at the end of a window is not multiplied by the
+    # length of that window: the same fee across one hour and across ten hours -
+    # or the same history sampled at any cadence - costs the same.
+    def one_off(hours: int) -> CapitalHoursMeasure:
+        return measure_capital_hours(
+            (
+                capital_occupancy_point(at=T0, allocated_basis="2000.00"),
+                capital_occupancy_point(
+                    at=at(hours * 3600), allocated_basis="2000.00", cumulative_fees="10.00"
+                ),
+            ),
+            policy=hours_policy(),
+        )
+
+    short, long = one_off(1), one_off(10)
+    assert short.cost_capital_hours == Decimal("0.0000")
+    assert short.cost_capital_hours == long.cost_capital_hours
+    assert short.net_capital_hours == short.capital_hours
+    assert long.net_capital_hours == long.capital_hours
+
+    duplicated = points((0, "1000.00"), (0, "1000.00"))
+    assert (
+        measure_capital_hours(duplicated, policy=hours_policy()).unavailable_reason
+        is CapitalHoursUnavailableReason.POINTS_NOT_MONOTONE
+    )
 
 
 def test_ac_008_off_grid_or_unusable_occupancy_values_are_refused() -> None:
@@ -2343,6 +3060,42 @@ def test_ac_011_every_record_declares_itself_non_authoritative() -> None:
             assert "credential" not in key
 
 
+def test_ac_011_the_increment_claims_no_durable_or_restart_safe_allocation() -> None:
+    """ATDD-R5-C-capital-intelligence/AC-011: the witness is not a store.
+
+    GIVEN every record this increment produces and the process-scoped reservation
+    witness
+    WHEN the declared durability status, the module source and a committed record are
+    inspected
+    THEN the increment declares its witness process-scoped and in-memory, names the
+    `R5-E` delivery that would own a canonical durable reservation record, states that
+    restart, multi-worker and durable-ledger safety are NOT claimed, and exposes no
+    persistence facility at all
+    """
+
+    assert CAPITAL_RESERVATION_DURABILITY_STATUS == "PROCESS_SCOPED_IN_MEMORY_WITNESS"
+    assert CAPITAL_RESERVATION_DURABILITY_DEPENDENCY == "R5-E"
+    source = r5c_source()
+    assert (
+        "Restart, multi-worker and durable-ledger safety are explicitly NOT claimed"
+        in source
+    )
+    assert "_CAPITAL_WITNESS_LIMIT" in source
+    for token in FORBIDDEN_PERSISTENCE_TOKENS:
+        assert token not in source, token
+
+    result = commit_reservation(
+        commit_fixture("PAPER-LEDGER-R5C-DURABILITY"),
+        plan=plan(version=VERSION),
+        at_time=at(60),
+    )
+    assert result.status is CapitalCommitStatus.COMMITTED
+    assert result.authoritative is False
+    assert result.snapshot is not None
+    assert result.snapshot.authoritative is False
+    assert result.to_dict()["authoritative"] is False
+
+
 # ---------------------------------------------------------------------------
 # AC-012 The increment, its declared vocabulary and its source are self-consistent
 # ---------------------------------------------------------------------------
@@ -2446,8 +3199,6 @@ def test_ac_012_the_declared_schema_versions_tokens_and_prefixes_are_exact() -> 
     )
     for name in capital_module.__all__:
         assert hasattr(capital_module, name), name
-
-
 
 
 def test_ac_012_the_module_holds_no_hidden_clock_randomness_or_environment_read() -> None:

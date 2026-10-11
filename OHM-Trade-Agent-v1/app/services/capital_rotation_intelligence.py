@@ -486,7 +486,10 @@ class CapitalDeployableAbstentionReason(str, Enum):
     """The closed abstention vocabulary of a deployable-capital evaluation.
 
     Missing evidence is never favourable evidence (`CI-02`), so every reason
-    here publishes no number instead of a conservative guess.
+    here publishes no number instead of a conservative guess. A configured cap
+    whose own usage row was never declared is its own reason for exactly that
+    rule: the missing row is named, never filled from another limit family and
+    never read as the whole cap.
     """
 
     IDENTITY_NOT_BOUND = "IDENTITY_NOT_BOUND"
@@ -504,6 +507,7 @@ class CapitalDeployableAbstentionReason(str, Enum):
     SNAPSHOT_OUTLIVED_VALIDITY = "SNAPSHOT_OUTLIVED_VALIDITY"
     EVIDENCE_INCOMPLETE = "EVIDENCE_INCOMPLETE"
     LIMIT_NOT_CONFIGURED = "LIMIT_NOT_CONFIGURED"
+    LIMIT_USAGE_NOT_DECLARED = "LIMIT_USAGE_NOT_DECLARED"
     SLEEVE_LIMIT_NOT_CONFIGURED = "SLEEVE_LIMIT_NOT_CONFIGURED"
 
 
@@ -516,10 +520,24 @@ class CapitalCommitStatus(str, Enum):
 
 
 class CapitalCommitRejection(str, Enum):
-    """Why a commit attempt was refused without changing the capital record."""
+    """Why a commit attempt was refused without changing the capital record.
+
+    The seam tests these in one declared order and publishes exactly one: the
+    declared reason must be a reservation, the book must be fundable, the
+    declared expected version must be the snapshot's own version, the observation
+    must lie strictly inside the snapshot's validity window, the plan must not
+    already be consumed, the frozen owner must find it current for that version,
+    its declared window must be open and whole, the account evidence must be
+    trusted (`_capital_trust_abstention`), the version this process tracks as
+    current for the book must be the one being committed, the amount must be
+    positive, and free cash must cover the reservation.
+    """
 
     STALE_EXPECTED_VERSION = "STALE_EXPECTED_VERSION"
     PLAN_ALREADY_CONSUMED = "PLAN_ALREADY_CONSUMED"
+    PLAN_NOT_YET_VALID = "PLAN_NOT_YET_VALID"
+    PLAN_EXPIRED = "PLAN_EXPIRED"
+    ACCOUNT_STATE_UNTRUSTED = "ACCOUNT_STATE_UNTRUSTED"
     NON_POSITIVE_AMOUNT = "NON_POSITIVE_AMOUNT"
     ENVIRONMENT_NOT_FUNDABLE = "ENVIRONMENT_NOT_FUNDABLE"
     INSUFFICIENT_FREE_CASH = "INSUFFICIENT_FREE_CASH"
@@ -618,6 +636,7 @@ CAPITAL_DEPLOYABLE_ABSTENTION_PRECEDENCE: tuple[
     CapitalDeployableAbstentionReason.SNAPSHOT_OUTLIVED_VALIDITY,
     CapitalDeployableAbstentionReason.EVIDENCE_INCOMPLETE,
     CapitalDeployableAbstentionReason.LIMIT_NOT_CONFIGURED,
+    CapitalDeployableAbstentionReason.LIMIT_USAGE_NOT_DECLARED,
     CapitalDeployableAbstentionReason.SLEEVE_LIMIT_NOT_CONFIGURED,
 )
 
@@ -1445,8 +1464,21 @@ class CashPartitionLedger:
 _CAPITAL_WITNESS_ATTRIBUTE = "_opip_r5_c_capital_witness_v1"
 
 #: The most records the in-process witness retains before it evicts the oldest.
-#: A bounded witness cannot grow into an unbounded store by accident.
+#: A bounded witness cannot grow into an unbounded store by accident. The bound
+#: is a *retention window* rather than a guarantee: once an entry has been
+#: evicted, the lineage claims that entry could have refuted are no longer
+#: refutable here, which is why this increment claims process-scoped reservation
+#: safety and never durable, restart-safe or multi-worker allocation.
 _CAPITAL_WITNESS_LIMIT = 4096
+
+#: What the reservation witness of this increment is, and what owning a durable
+#: reservation record therefore still needs. The witness is process-scoped and
+#: in-memory, so restart, multi-worker and durable-ledger safety are explicitly
+#: NOT claimed here; canonical persistent reservation ownership stays an
+#: `R5-E` delivery inside the existing F8 ownership, and a later increment that
+#: adds it must keep the compare-and-commit semantics proved in this one.
+CAPITAL_RESERVATION_DURABILITY_STATUS = "PROCESS_SCOPED_IN_MEMORY_WITNESS"
+CAPITAL_RESERVATION_DURABILITY_DEPENDENCY = "R5-E"
 
 
 def _capital_witness() -> dict[str, Any]:
@@ -1472,6 +1504,48 @@ def _remember(bucket: dict[str, Any], key: Any, value: Any) -> None:
     if key not in bucket and len(bucket) >= _CAPITAL_WITNESS_LIMIT:
         del bucket[next(iter(bucket))]
     bucket[key] = value
+
+
+def _identity_key(record: "CapitalSnapshot") -> tuple[str, str, str, str]:
+    """The declared capital identity every lineage claim is scoped to."""
+
+    return (
+        record.account,
+        record.environment.value,
+        record.engine,
+        record.currency,
+    )
+
+
+def _witness_version_key(record: "CapitalSnapshot", *, version: str) -> tuple[Any, ...]:
+    """The witness key of one portfolio version inside one capital identity.
+
+    Version strings are only meaningful inside the book that declared them, so
+    two unrelated books that happen to use similar version strings never refute
+    each other's lineage.
+    """
+
+    return (*_identity_key(record), version)
+
+
+def _version_is_ahead(candidate: str, current: str) -> bool:
+    """Whether ``candidate`` may replace ``current`` as the tracked version.
+
+    A version moves forward along one declared lineage, so an older version of
+    the same lineage never becomes current again. Two versions whose declared
+    form does not order them (a different lineage base, or a base this section
+    cannot index) are left to the caller's declaration.
+    """
+
+    if candidate == current:
+        return False
+    candidate_parts = _lineage_parts(candidate)
+    current_parts = _lineage_parts(current)
+    if candidate_parts is None or current_parts is None:
+        return True
+    if candidate_parts[0] != current_parts[0]:
+        return True
+    return candidate_parts[1] > current_parts[1]
 
 
 _LINEAGE_VERSION = re.compile(r"\A(?P<base>.*\.)(?P<index>\d{4})\Z")
@@ -1541,10 +1615,19 @@ def assert_portfolio_version_lineage(
 
 
 def _record_witness(record: "CapitalSnapshot") -> None:
-    """Witness one snapshot's lineage, identity and account facts."""
+    """Witness one snapshot's lineage, identity and account facts.
+
+    The version bucket is keyed by the declared capital identity, and both
+    buckets are written through the size-capped ``_remember``, so nothing here
+    can grow into an unbounded store. An accepted successor already recorded for
+    this snapshot survives a later reconstruction of the same record, so the
+    unforked-lineage proof is never silently forgotten while its entry is still
+    retained.
+    """
 
     holder = _capital_witness()
     facts = {
+        "identity": _identity_key(record),
         "portfolio_version": record.portfolio_version,
         "account": record.account,
         "environment": record.environment,
@@ -1554,33 +1637,101 @@ def _record_witness(record: "CapitalSnapshot") -> None:
         "cash": record.cash.to_dict(),
         "marks": (record.marks.marked_at, record.marks.marked_position_value),
     }
+    key = _witness_version_key(record, version=record.portfolio_version)
     with holder["lock"]:
+        recorded = holder["snapshots"].get(record.snapshot_id)
+        if isinstance(recorded, dict) and recorded.get("successor") is not None:
+            facts["successor"] = recorded["successor"]
         _remember(holder["snapshots"], record.snapshot_id, facts)
-        ids = holder["versions"].get(record.portfolio_version, ())
+        ids = holder["versions"].get(key, ())
         if record.snapshot_id not in ids:
-            holder["versions"][record.portfolio_version] = (*ids, record.snapshot_id)
+            _remember(
+                holder["versions"],
+                key,
+                (*ids, record.snapshot_id)[-_CAPITAL_WITNESS_LIMIT:],
+            )
+
+
+def _claim_witnessed_successor(
+    previous: "CapitalSnapshot", renewed: "CapitalSnapshot"
+) -> None:
+    """Claim ``renewed`` as the one witnessed successor of ``previous``.
+
+    `CI-03` moves a version forward by exactly one declared step, so one
+    predecessor has exactly one successor: a second, *different* record claiming
+    to be the successor of the same predecessor at the same version is refused
+    here, where the claim is made, instead of producing two competing records for
+    one version. The claim is scoped to the declared capital identity, so an
+    unrelated book is never refuted by a similar version string, and replaying
+    the identical successor is not a fork.
+
+    The proof is retained-window scoped, like the witness itself: once the
+    predecessor's entry has been evicted this process can no longer refute a
+    competing successor, which is why the witness declares itself process-scoped
+    and why the capital-creating path is separately guarded by the tracked
+    current version, the trust gate and free cash.
+    """
+
+    holder = _capital_witness()
+    with holder["lock"]:
+        facts = holder["snapshots"].get(previous.snapshot_id)
+        if not isinstance(facts, dict):
+            return
+        claimed = facts.get("successor")
+        if claimed is not None and claimed != renewed.snapshot_id:
+            raise CapitalIntelligenceError(
+                "portfolio version lineage is unforked: "
+                f"{previous.portfolio_version} already has the declared successor "
+                f"{claimed} for this capital identity, so {renewed.snapshot_id} may "
+                "not claim to be another one"
+            )
+        facts["successor"] = renewed.snapshot_id
+
+
+def _track_current_version(record: "CapitalSnapshot") -> None:
+    """Record ``record`` as the current version of its capital identity.
+
+    A lawful recompute - not only a reservation commit - moves the book forward,
+    so a later reservation consumes the version that actually is current for the
+    book instead of being refused as stale. The tracked version never moves
+    backwards, so an old version cannot become current again.
+    """
+
+    holder = _capital_witness()
+    with holder["lock"]:
+        key = _identity_key(record)
+        tracked = holder["current"].get(key)
+        if tracked is not None and not _version_is_ahead(
+            record.portfolio_version, tracked
+        ):
+            return
+        holder["current"][key] = record.portfolio_version
 
 
 def _predecessor_witness(record: "CapitalSnapshot") -> Mapping[str, Any] | None:
     """Return the witnessed facts of the declared predecessor, or refuse the claim.
 
     ``derived_from`` is a claim about another record, not decoration. When this
-    process has witnessed snapshots of the predecessor portfolio version but not
-    the id the record names, the claim is refused instead of being trusted.
+    process has witnessed snapshots of the predecessor portfolio version in *this
+    book* but not the id the record names, the claim is refused instead of being
+    trusted.
     """
 
     declared = record.derived_from
     if declared is None:
         return None
     holder = _capital_witness()
+    claimed_version = _predecessor_version(record.portfolio_version)
+    key = (
+        None
+        if claimed_version is None
+        else _witness_version_key(record, version=claimed_version)
+    )
     with holder["lock"]:
         witness = holder["snapshots"].get(declared)
         if witness is not None:
             return witness
-        claimed_version = _predecessor_version(record.portfolio_version)
-        witnessed_ids = (
-            () if claimed_version is None else holder["versions"].get(claimed_version, ())
-        )
+        witnessed_ids = () if key is None else holder["versions"].get(key, ())
     if witnessed_ids:
         raise CapitalIntelligenceError(
             "derived_from must reference the witnessed snapshot of the predecessor "
@@ -2062,7 +2213,10 @@ def assert_snapshot_recomputes_from(
     newer, and the cash book must obey the declared cash law of that reason. A
     recompute whose declared reason is reconciliation is additionally refused
     unless it is reconciled, because a recompute that says it reconciled and then
-    reports an unreconciled state has not done what it claims.
+    reports an unreconciled state has not done what it claims. A lawful recompute
+    is the *one* successor of its predecessor for this capital identity, so a
+    second, different record can never also claim that lineage, and asserting it
+    moves the version this process tracks as current for the book forward.
     """
 
     if not isinstance(previous, CapitalSnapshot) or not isinstance(
@@ -2154,6 +2308,8 @@ def assert_snapshot_recomputes_from(
         raise CapitalIntelligenceError(
             "a reconciliation recompute must report a reconciled capital state"
         )
+    _claim_witnessed_successor(previous, renewed)
+    _track_current_version(renewed)
 
 
 @dataclass(frozen=True)
@@ -2418,6 +2574,40 @@ class CapitalDeployableView:
         }
 
 
+def _capital_trust_abstention(
+    record: "CapitalSnapshot", *, evaluated_at: datetime
+) -> CapitalDeployableAbstentionReason | None:
+    """The first `CI-02` blocking condition of one snapshot, or ``None``.
+
+    Both the deployable seam and the reservation commit consult this one table in
+    this one order, so the commit path can never be laxer than the seam it
+    consumes from: an accounting state, watermark, reconciliation, balance, fee,
+    validity or evidence condition that blocks a deployable number blocks a
+    reservation against the same record too. A commit reports it as the single
+    declared ``ACCOUNT_STATE_UNTRUSTED`` disposition; the deployable seam reports
+    the specific reason, which is available to a caller for diagnosis.
+    """
+
+    reason = CapitalDeployableAbstentionReason
+    if record.accounting_state is CapitalAccountingState.UNSUPPORTED:
+        return reason.UNSUPPORTED_ACCOUNTING_STATE
+    if record.source_watermark.state_is_stale is not False:
+        return reason.ACCOUNT_STATE_STALE
+    if record.reconciliation.status is CapitalReconciliationStatus.FAILED:
+        return reason.FAILED_RECONCILIATION
+    if record.reconciliation.status is CapitalReconciliationStatus.NOT_PERFORMED:
+        return reason.RECONCILIATION_NOT_PERFORMED
+    if record.cash.has_negative_amount:
+        return reason.UNRESOLVED_NEGATIVE_BALANCE
+    if record.fee_state is None:
+        return reason.MISSING_FEES
+    if evaluated_at > record.freshness.validity_deadline:
+        return reason.SNAPSHOT_OUTLIVED_VALIDITY
+    if not record.freshness.evidence_complete:
+        return reason.EVIDENCE_INCOMPLETE
+    return None
+
+
 #: The bound each declared limit family is measured against. A limit family is
 #: never silently mapped onto another bound.
 _BOUND_FOR_LIMIT: Mapping[CapitalLimitKind, CapitalBound] = MappingProxyType(
@@ -2443,9 +2633,9 @@ def evaluate_deployable_capital(
     condition the clause lists as blocking - an unbound or mismatched identity, a
     stale account state, an unsupported accounting state, a failed or skipped
     reconciliation, an unresolved negative balance, missing fees, a currency
-    mismatch, an outlived validity limit, incomplete evidence, or a limit that has
-    usage but no configured cap - abstains in the declared precedence order and
-    publishes no number.
+    mismatch, an outlived validity limit, incomplete evidence, a limit that has
+    usage but no configured cap, or a configured cap whose own usage was never
+    declared - abstains in the declared precedence order and publishes no number.
     """
 
     if not isinstance(record, CapitalSnapshot):
@@ -2497,22 +2687,9 @@ def evaluate_deployable_capital(
         or policy.environment is not record.environment
     ):
         return abstain(reason.IDENTITY_MISMATCH)
-    if record.accounting_state is CapitalAccountingState.UNSUPPORTED:
-        return abstain(reason.UNSUPPORTED_ACCOUNTING_STATE)
-    if record.source_watermark.state_is_stale is not False:
-        return abstain(reason.ACCOUNT_STATE_STALE)
-    if record.reconciliation.status is CapitalReconciliationStatus.FAILED:
-        return abstain(reason.FAILED_RECONCILIATION)
-    if record.reconciliation.status is CapitalReconciliationStatus.NOT_PERFORMED:
-        return abstain(reason.RECONCILIATION_NOT_PERFORMED)
-    if record.cash.has_negative_amount:
-        return abstain(reason.UNRESOLVED_NEGATIVE_BALANCE)
-    if record.fee_state is None:
-        return abstain(reason.MISSING_FEES)
-    if evaluated_at > record.freshness.validity_deadline:
-        return abstain(reason.SNAPSHOT_OUTLIVED_VALIDITY)
-    if not record.freshness.evidence_complete:
-        return abstain(reason.EVIDENCE_INCOMPLETE)
+    blocking = _capital_trust_abstention(record, evaluated_at=evaluated_at)
+    if blocking is not None:
+        return abstain(blocking)
 
     usage = dict(record.declared_limit_usage)
     missing_limits = tuple(
@@ -2522,6 +2699,17 @@ def evaluate_deployable_capital(
     )
     if missing_limits:
         return abstain(reason.LIMIT_NOT_CONFIGURED, missing_limits)
+    missing_usage = tuple(
+        member.value
+        for member in CapitalLimitKind
+        if member in policy.limit_caps and member not in usage
+    )
+    if missing_usage:
+        # A configured cap whose own usage row was never declared is missing
+        # evidence, and missing evidence is never favourable evidence (`CI-02`):
+        # the bound abstains and names the row instead of charging another limit
+        # family with it, or reading the whole cap as deployable.
+        return abstain(reason.LIMIT_USAGE_NOT_DECLARED, missing_usage)
     sleeve_usage = dict(record.declared_sleeve_usage)
     missing_sleeves = tuple(
         name for name in sleeve_usage if name not in policy.sleeve_limits
@@ -2529,7 +2717,6 @@ def evaluate_deployable_capital(
     if missing_sleeves:
         return abstain(reason.SLEEVE_LIMIT_NOT_CONFIGURED, missing_sleeves)
 
-    aggregate_usage = sum(usage.values(), Decimal("0.00"))
     bounds: dict[CapitalBound, Decimal] = {
         CapitalBound.FREE_CASH: record.cash.free_cash
     }
@@ -2540,8 +2727,7 @@ def evaluate_deployable_capital(
             # Neither a declared cap nor declared usage: the bound is simply not
             # evaluated rather than assumed unlimited and published as a limit.
             continue
-        used = usage.get(member, aggregate_usage)
-        bound = cap - used
+        bound = cap - usage[member]
         if bound < 0:
             over.append(_BOUND_FOR_LIMIT[member])
             bound = Decimal("0.00")
@@ -2760,9 +2946,11 @@ def _reserved_successor(
     The committed capital *moves* between partitions: free cash falls by exactly
     the committed amount and order reserves rise by exactly the same amount, so
     the declared cash total is preserved (`PRESERVE_TOTAL`). Positions, marks,
-    fees, watermarks and reconciliation are carried, the validity window keeps its
-    declared duration from the new observation, and the risk and sleeve usage are
-    whatever the caller declared - nothing here invents a usage number.
+    fees, watermarks and reconciliation are carried, the validity deadline the
+    account evidence was observed under is carried *unchanged* - a reservation is
+    a movement of cash, not a re-observation of the account, so it may never
+    extend how long a snapshot may be read as current - and the risk and sleeve
+    usage are whatever the caller declared - nothing here invents a usage number.
     """
 
     partitions = dict(snapshot.cash.partitions)
@@ -2774,9 +2962,6 @@ def _reserved_successor(
     )
     ledger = CashPartitionLedger(
         partitions=partitions, cash_total=snapshot.cash.cash_total
-    )
-    declared_validity = (
-        snapshot.freshness.validity_deadline - snapshot.freshness.as_of
     )
     successor = CapitalSnapshot(
         portfolio_version=next_portfolio_version(
@@ -2801,7 +2986,7 @@ def _reserved_successor(
         reconciliation=snapshot.reconciliation,
         freshness=CapitalFreshness(
             as_of=at_time,
-            validity_deadline=at_time + declared_validity,
+            validity_deadline=snapshot.freshness.validity_deadline,
             evidence_complete=snapshot.freshness.evidence_complete,
         ),
         derived_from=snapshot.snapshot_id,
@@ -2817,6 +3002,33 @@ def _reserved_successor(
         snapshot, successor, trigger=CapitalRecomputeTrigger.RESERVATION
     )
     return successor
+
+
+def _plan_window_rejection(
+    plan: PortfolioReservationPlan, *, requested_at: datetime
+) -> CapitalCommitRejection | None:
+    """Why a plan may not be committed at ``requested_at``, or ``None``.
+
+    A plan is approval evidence bound to a declared instant and window: it may not
+    be committed before it was created, and every reservation in it must still be
+    active at the commit instant. A plan whose window has already closed, or one a
+    release has partially consumed, is a replanning input rather than a
+    committable plan, and committing it would silently move less capital than it
+    declares.
+
+    The check runs under the same witness lock and against the same version
+    boundary as the commit itself, so approval evidence cannot be validated
+    earlier against a version that has since moved on.
+    """
+
+    if plan.created_at > requested_at:
+        return CapitalCommitRejection.PLAN_NOT_YET_VALID
+    if not plan.reservations:
+        return CapitalCommitRejection.PLAN_EXPIRED
+    for reservation in plan.reservations:
+        if not reservation.is_active or reservation.expires_at <= requested_at:
+            return CapitalCommitRejection.PLAN_EXPIRED
+    return None
 
 
 def commit_reservation(
@@ -2840,10 +3052,37 @@ def commit_reservation(
     The whole compare-and-commit therefore runs under one lock and is
     all-or-nothing: the expected version is compared before anything moves, the
     plan must be current for that version (checked by the frozen owner's own
-    ``assert_reservation_plan_current``), sufficient free cash must be present,
-    and a rejection writes nothing at all. A replay of a plan this process already
-    committed returns the recorded successor rather than consuming the contested
-    capacity again.
+    ``assert_reservation_plan_current``), the plan's own declared window must be
+    open and whole, the account evidence must pass the same `CI-02` blocking table
+    the deployable seam consults, the version this process tracks as current for
+    the book must be the version being committed, sufficient free cash must be
+    present, and a rejection writes nothing at all. A replay of a plan this process
+    already committed returns the recorded successor rather than consuming the
+    contested capacity again.
+
+    The seam publishes exactly one declared rejection, in this order:
+
+    1. ``UNSUPPORTED_RECOMPUTE_TRIGGER`` - the declared reason is not a reservation.
+    2. ``ENVIRONMENT_NOT_FUNDABLE`` - no book but the paper ledger may be funded.
+    3. ``STALE_EXPECTED_VERSION`` - the declared expected version is not this record's.
+    4. ``SNAPSHOT_OUTLIVED_VALIDITY`` - the observation is not strictly inside the
+       snapshot's validity window (and the ``at_time <= as_of`` misuse raises).
+    5. ``PLAN_ALREADY_CONSUMED`` - this process consumed this plan at another version.
+    6. ``STALE_EXPECTED_VERSION`` - the frozen owner finds the plan stale for the
+       version being committed.
+    7. ``PLAN_NOT_YET_VALID`` / ``PLAN_EXPIRED`` - the plan's own window is not open
+       and whole at this instant.
+    8. ``ACCOUNT_STATE_UNTRUSTED`` - the account evidence is one the deployable seam
+       would refuse to publish a number for.
+    9. ``STALE_EXPECTED_VERSION`` - the tracked current version of the book is not
+       the version being committed.
+    10. ``NON_POSITIVE_AMOUNT`` - the plan declares no committable capital.
+    11. ``INSUFFICIENT_FREE_CASH`` - free cash does not cover the reservation.
+
+    Restart, multi-worker and durable-ledger safety are explicitly NOT claimed by
+    this increment: the reservation witness is process-scoped and in-memory, so
+    ``CAPITAL_RESERVATION_DURABILITY_STATUS`` is the honest status and canonical
+    persistent ownership stays the declared ``R5-E`` dependency.
     """
 
     if not isinstance(snapshot, CapitalSnapshot):
@@ -2897,23 +3136,16 @@ def commit_reservation(
     committed = _money_from_float(
         plan.planned_capital, field_name="plan.planned_capital"
     )
-    if committed <= 0:
-        return rejected(CapitalCommitRejection.NON_POSITIVE_AMOUNT)
     if requested_at <= snapshot.freshness.as_of:
         raise CapitalIntelligenceError(
             "a reservation commit must observe the account at an at_time strictly "
             "newer than the snapshot as_of"
         )
-    if requested_at > snapshot.freshness.validity_deadline:
+    if requested_at >= snapshot.freshness.validity_deadline:
         return rejected(CapitalCommitRejection.SNAPSHOT_OUTLIVED_VALIDITY)
 
     holder = _capital_witness()
-    identity_key = (
-        snapshot.account,
-        snapshot.environment.value,
-        snapshot.engine,
-        snapshot.currency,
-    )
+    identity_key = _identity_key(snapshot)
     with holder["lock"]:
         plan_key = (*identity_key, plan.plan_id)
         recorded = holder["plans"].get(plan_key)
@@ -2932,9 +3164,20 @@ def commit_reservation(
             )
         except PortfolioContractError:
             return rejected(CapitalCommitRejection.STALE_EXPECTED_VERSION)
+        window_rejection = _plan_window_rejection(plan, requested_at=requested_at)
+        if window_rejection is not None:
+            return rejected(window_rejection)
+        blocking = _capital_trust_abstention(snapshot, evaluated_at=requested_at)
+        if blocking is not None:
+            # The commit path may not be laxer than the deployable seam it consumes
+            # from: evidence that seam would refuse to publish a number for is not
+            # deployable capital, so it cannot be moved into order reserves here.
+            return rejected(CapitalCommitRejection.ACCOUNT_STATE_UNTRUSTED)
         current = holder["current"].get(identity_key)
         if current is not None and current != snapshot.portfolio_version:
             return rejected(CapitalCommitRejection.STALE_EXPECTED_VERSION)
+        if committed <= 0:
+            return rejected(CapitalCommitRejection.NON_POSITIVE_AMOUNT)
         if committed > snapshot.cash.free_cash:
             return rejected(CapitalCommitRejection.INSUFFICIENT_FREE_CASH)
         successor = _reserved_successor(
@@ -2976,7 +3219,6 @@ def commit_reservation(
         )
         holder["current"][identity_key] = successor.portfolio_version
         return result
-
 
 def to_portfolio_capital_state(
     snapshot: "CapitalSnapshot", *, as_of: datetime | None = None
@@ -3230,7 +3472,11 @@ class CapitalHoursMeasure:
     Capital-hours is "the time integral of K(t), expressed in currency-hours", so
     the integral is deterministic arithmetic over preserved instants and an
     explicitly declared endpoint policy, quantized once onto the declared
-    ``CAPITAL_HOURS_QUANTUM`` grid. Zero or unknown occupancy yields the declared
+    ``CAPITAL_HOURS_QUANTUM`` grid. ``cost_capital_hours`` is the same declared
+    step integral of the declared cumulative cost in currency-hours, and
+    ``net_capital_hours`` subtracts it once - a laboratory diagnostic whose
+    economic interpretation the owner has not ratified, published beside the
+    occupancy it was measured over. Zero or unknown occupancy yields the declared
     ``UNAVAILABLE`` status rather than a zero that could be averaged into a metric
     and quietly read as a real occupancy.
     """
@@ -3383,8 +3629,11 @@ def measure_capital_hours(
     each interval under the policy's *declared* endpoint policy, and it refuses to
     guess: no declared endpoint policy, a non-monotone series, a point before the
     declared start, a rewound cumulative cost series or a zero occupancy all yield
-    a named ``UNAVAILABLE`` measurement instead of a number. Nothing here reads a
-    clock, and no instant is invented.
+    a named ``UNAVAILABLE`` measurement instead of a number. The declared
+    cumulative cost is integrated over the same instants under the same endpoint
+    policy, so both channels are step integrals in currency-hours and neither
+    depends on how often the series was sampled. Nothing here reads a clock, and
+    no instant is invented.
     """
 
     if not isinstance(policy, CapitalHoursPolicy):
@@ -3442,9 +3691,16 @@ def measure_capital_hours(
         seconds = _hours_span_seconds(earlier, later)
         basis = earlier.allocated_basis if step_from_start else later.allocated_basis
         capital_total += (basis * seconds) / CAPITAL_SECONDS_PER_HOUR
-        cost_total += (
-            (later.cumulative_cost - earlier.cumulative_cost) * seconds
-        ) / CAPITAL_SECONDS_PER_HOUR
+        # The cost channel is the *same declared step integral* of the declared
+        # cumulative cost: the cost carried through the interval, resolved by the
+        # policy's endpoint just like the basis, so it is invariant to how finely
+        # the same economic history is sampled. Scaling the interval's cost
+        # movement by the interval's own length would instead double-count time and
+        # make the measurement depend on the sampling cadence.
+        cost_basis = (
+            earlier.cumulative_cost if step_from_start else later.cumulative_cost
+        )
+        cost_total += (cost_basis * seconds) / CAPITAL_SECONDS_PER_HOUR
     capital_hours = capital_total.quantize(
         CAPITAL_HOURS_QUANTUM, rounding=ROUND_HALF_UP
     )
@@ -3986,6 +4242,8 @@ __all__ = [
     "CAPITAL_LIABILITIES_SUPPORTED",
     "CAPITAL_RECEIVABLES_SUPPORTED",
     "CAPITAL_RECOMPUTE_CASH_LAWS",
+    "CAPITAL_RESERVATION_DURABILITY_DEPENDENCY",
+    "CAPITAL_RESERVATION_DURABILITY_STATUS",
     "CAPITAL_RETURN_PER_HOUR_QUANTUM",
     "CAPITAL_SECONDS_PER_HOUR",
     "CAPITAL_SNAPSHOT_ID_PREFIX",
