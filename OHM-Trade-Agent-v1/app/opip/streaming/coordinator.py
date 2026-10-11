@@ -511,7 +511,6 @@ class RequestAccounting:
         }
 
 
-
 @dataclass(frozen=True)
 class CoordinatorTelemetry:
     """Bounded-work telemetry for one coordinator.
