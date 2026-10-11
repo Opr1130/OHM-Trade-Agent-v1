@@ -85,6 +85,7 @@ from app.opip.contracts.thesis import (  # noqa: E402
     ThesisLifecycleState,
     classify_horizon,
     expire_thesis,
+    reclassify,
 )
 from app.services.release_profiles import (  # noqa: E402
     get_release_profiles,
@@ -318,6 +319,47 @@ def anchor_for(
     )
 
 
+def detached_anchor(
+    thesis: HorizonThesis,
+    *,
+    thesis_version: int | None = None,
+    episode_id: str | None = None,
+    decision_id: str | None = None,
+) -> FirstFillAnchor:
+    """A well formed anchor whose lineage differs from the given revision.
+
+    Every field is validated by the record's own constructor and the ``FFAN:``
+    identity is recomputed, so the probe is a self-consistent record that simply
+    describes another revision, another episode or another decision than the one
+    it is offered to.
+    """
+
+    version = thesis.thesis_version if thesis_version is None else thesis_version
+    episode = thesis.episode_id if episode_id is None else episode_id
+    decision = thesis.decision_id if decision_id is None else decision_id
+    return FirstFillAnchor(
+        anchor_id=first_fill_anchor_identity(
+            thesis_id=thesis.thesis_id,
+            thesis_version=version,
+            episode_id=episode,
+            decision_id=decision,
+            first_fill_at=at(20),
+        ),
+        anchor_schema_version=FIRST_FILL_ANCHOR_SCHEMA_VERSION,
+        thesis_id=thesis.thesis_id,
+        thesis_version=version,
+        episode_id=episode,
+        decision_id=decision,
+        first_fill_at=at(20),
+        receipt_at=at(20),
+        filled_quantity=0.5,
+        average_fill_price=100.0,
+        fill_count=1,
+        source_references=("FILL:1",),
+    )
+
+
+
 def module_imports(path: Path) -> set[str]:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     found: set[str] = set()
@@ -493,6 +535,67 @@ def test_ac_001_an_anchor_cannot_precede_the_revision_or_its_own_fill() -> None:
         anchor_for(expired)
 
 
+def test_ac_001_a_non_finite_quantity_or_price_is_refused() -> None:
+    """ATDD-R5-B-horizon-intelligence/AC-001: no non-finite number enters an anchor.
+
+    GIVEN a classified revision and non-finite or non-representable quantities and
+    prices
+    WHEN the first-fill anchor is recorded, or a later fill is accumulated
+    THEN each is refused instead of poisoning the accumulated quantity, the
+    weighted average price or any arithmetic derived from them
+    """
+
+    thesis = supported_thesis()
+    anchor = anchor_for(thesis)
+    for value in (float("nan"), float("inf"), float("-inf"), 10**400):
+        with pytest.raises(
+            HorizonLifecycleContractError, match="must be a finite number"
+        ):
+            build_first_fill_anchor(
+                thesis,
+                first_fill_at=at(20),
+                receipt_at=at(20),
+                filled_quantity=value,
+                average_fill_price=100.0,
+                source_reference="FILL:1",
+            )
+        with pytest.raises(
+            HorizonLifecycleContractError, match="must be a finite number"
+        ):
+            build_first_fill_anchor(
+                thesis,
+                first_fill_at=at(20),
+                receipt_at=at(20),
+                filled_quantity=0.5,
+                average_fill_price=value,
+                source_reference="FILL:1",
+            )
+        with pytest.raises(
+            HorizonLifecycleContractError, match="must be a finite number"
+        ):
+            record_additional_fill(
+                anchor,
+                filled_quantity_added=value,
+                average_fill_price=120.0,
+                fill_at=at(40),
+                receipt_at=at(45),
+                source_reference="FILL:2",
+            )
+        with pytest.raises(
+            HorizonLifecycleContractError, match="must be a finite number"
+        ):
+            record_additional_fill(
+                anchor,
+                filled_quantity_added=0.5,
+                average_fill_price=value,
+                fill_at=at(40),
+                receipt_at=at(45),
+                source_reference="FILL:2",
+            )
+    assert anchor.filled_quantity == 0.5
+    assert anchor.average_fill_price == 100.0
+
+
 # ---------------------------------------------------------------------------
 # AC-002 A later fill accumulates without restarting the holding clock
 # ---------------------------------------------------------------------------
@@ -653,6 +756,94 @@ def test_ac_002_the_holding_deadline_is_unchanged_by_a_later_fill() -> None:
     assert later.clock(ThesisClockName.HOLDING).started_from_anchor_id == (
         accumulated.anchor_id
     )
+
+
+def test_ac_002_a_fill_received_before_it_happened_is_refused() -> None:
+    """ATDD-R5-B-horizon-intelligence/AC-002: no fill is observed before it happens.
+
+    GIVEN a recorded anchor received at the twentieth minute
+    WHEN a later fill timestamped at the fiftieth minute is delivered with a
+    receipt that precedes its own fill instant
+    THEN it is refused rather than merged, so the anchor never records evidence
+    received before the event it describes, while an in-order delivery at the
+    fill instant is admitted
+    """
+
+    anchor = anchor_for(supported_thesis())
+    with pytest.raises(
+        HorizonLifecycleContractError, match="received before it happened"
+    ):
+        record_additional_fill(
+            anchor,
+            filled_quantity_added=0.5,
+            average_fill_price=120.0,
+            fill_at=at(50),
+            receipt_at=at(45),
+            source_reference="FILL:2",
+        )
+    with pytest.raises(
+        HorizonLifecycleContractError, match="received before it happened"
+    ):
+        record_additional_fill(
+            anchor,
+            filled_quantity_added=0.5,
+            average_fill_price=120.0,
+            fill_at=at(50),
+            receipt_at=at(49),
+            source_reference="FILL:2",
+        )
+    admitted = record_additional_fill(
+        anchor,
+        filled_quantity_added=0.5,
+        average_fill_price=120.0,
+        fill_at=at(50),
+        receipt_at=at(50),
+        source_reference="FILL:2",
+    )
+    assert admitted.fill_count == 2
+    assert admitted.receipt_at == at(50)
+
+
+def test_ac_002_a_duplicate_fill_delivery_is_refused_rather_than_double_counted() -> None:
+    """ATDD-R5-B-horizon-intelligence/AC-002: a fill is counted once.
+
+    GIVEN an anchor that accumulated a later fill under one evidence reference
+    WHEN the identical delivery is replayed against the accumulated record, while
+    a genuinely distinct fill at the same instant carries a new reference
+    THEN the redelivery is refused so quantity is never double counted, and the
+    distinct fill is still admitted
+    """
+
+    anchor = anchor_for(supported_thesis())
+    accumulated = record_additional_fill(
+        anchor,
+        filled_quantity_added=0.5,
+        average_fill_price=120.0,
+        fill_at=at(40),
+        receipt_at=at(45),
+        source_reference="FILL:2",
+    )
+    assert accumulated.fill_count == 2
+    assert accumulated.filled_quantity == 1.0
+    with pytest.raises(HorizonLifecycleContractError, match="duplicate delivery"):
+        record_additional_fill(
+            accumulated,
+            filled_quantity_added=0.5,
+            average_fill_price=120.0,
+            fill_at=at(40),
+            receipt_at=at(45),
+            source_reference="FILL:2",
+        )
+    distinct = record_additional_fill(
+        accumulated,
+        filled_quantity_added=0.5,
+        average_fill_price=120.0,
+        fill_at=at(40),
+        receipt_at=at(45),
+        source_reference="FILL:3",
+    )
+    assert distinct.fill_count == 3
+    assert distinct.filled_quantity == 1.5
 
 
 # ---------------------------------------------------------------------------
@@ -871,6 +1062,114 @@ def test_ac_003_a_clock_the_revision_cannot_support_is_refused_rather_than_defau
         require_clock_name(3, field_name="clock_name")
 
 
+def test_ac_003_the_qualification_clock_never_outlives_the_owner_budget() -> None:
+    """ATDD-R5-B-horizon-intelligence/AC-003: the budget is the clock's duration.
+
+    GIVEN an owner qualification budget and a declared entry window of exactly
+    that length that begins after the revision was classified
+    WHEN the qualification clock is derived
+    THEN the budget and the window do not agree about the clock this module
+    starts, so the lifecycle abstains with `POLICY_BAND_MISMATCH` and the strict
+    clock seam refuses, while a supported qualification clock's duration is
+    exactly the owner budget
+    """
+
+    late_start = classified_thesis(
+        evidence_overrides={"entry_window_start": at(20), "entry_window_end": at(80)}
+    )
+    assert late_start.entry_window_start == at(20)
+    assert late_start.entry_window_end == at(80)
+    assert (
+        int(
+            (
+                late_start.entry_window_end - late_start.entry_window_start
+            ).total_seconds()
+        )
+        == 3_600
+    )
+    abstained = observe(late_start, anchor=anchor_for(late_start))
+    assert abstained.abstention_reason is (
+        LifecycleAbstentionReason.POLICY_BAND_MISMATCH
+    )
+    assert abstained.clocks == ()
+    with pytest.raises(HorizonLifecycleContractError, match="POLICY_BAND_MISMATCH"):
+        start_clock(
+            late_start,
+            "QUALIFICATION",
+            policy=lifecycle_policy(),
+            receipt_at=at(30),
+        )
+    supported = start_clock(
+        supported_thesis(),
+        "QUALIFICATION",
+        policy=lifecycle_policy(),
+        receipt_at=at(30),
+    )
+    assert supported.expected_seconds == 3_600
+    assert supported.started_at == at(10)
+    assert supported.expires_at == at(70)
+
+
+def test_ac_003_the_strict_clock_seam_binds_its_anchor_to_the_revision_lineage() -> None:
+    """ATDD-R5-B-horizon-intelligence/AC-003: the strict seam shares the binding.
+
+    GIVEN a configured policy, a supported revision and well formed anchors that
+    describe another revision — another thesis, another revision number of the
+    same thesis, another episode and another decision of the same thesis
+    WHEN an anchored clock is started directly from each of them, and from the
+    revision's own anchor
+    THEN every foreign form is refused with the lineage rule the enclosing
+    lifecycle already applies and only the revision's own anchor starts the
+    clock, so the direct seam can never consume evidence of another revision
+    """
+
+    thesis = supported_thesis()
+    own = anchor_for(thesis)
+    foreign = anchor_for(
+        classified_thesis(evidence_overrides={"decision_id": "DEC:other"})
+    )
+    probes = (
+        foreign,
+        detached_anchor(thesis, thesis_version=thesis.thesis_version + 1),
+        detached_anchor(thesis, episode_id="OPEP:r5b-other"),
+        detached_anchor(thesis, decision_id="DEC:r5b-other"),
+    )
+    assert foreign.thesis_id != thesis.thesis_id
+    assert all(probe.anchor_id != own.anchor_id for probe in probes)
+    for clock_name in ("QUALIFICATION", "HOLDING", "INVALIDATION"):
+        for probe in probes:
+            with pytest.raises(
+                HorizonLifecycleContractError,
+                match="belong to the thesis revision it is bound to",
+            ):
+                start_clock(
+                    thesis,
+                    clock_name,
+                    policy=lifecycle_policy(),
+                    receipt_at=at(30),
+                    anchor=probe,
+                )
+        started = start_clock(
+            thesis,
+            clock_name,
+            policy=lifecycle_policy(),
+            receipt_at=at(30),
+            anchor=own,
+        )
+        assert started.started_from_anchor_id == (
+            None if clock_name == "QUALIFICATION" else own.anchor_id
+        )
+    assert observe(thesis, anchor=own).abstention_reason is (
+        LifecycleAbstentionReason.NONE
+    )
+    with pytest.raises(
+        HorizonLifecycleContractError,
+        match="belongs to the thesis revision that recorded it",
+    ):
+        observe(thesis, anchor=foreign)
+
+
+
 # ---------------------------------------------------------------------------
 # AC-004 Expiry is terminal and advancement observes one clock
 # ---------------------------------------------------------------------------
@@ -997,9 +1296,15 @@ def test_ac_004_a_clock_rejects_a_forged_deadline_or_expiry_instant() -> None:
         replace(holding, policy_version="nope")
     with pytest.raises(HorizonLifecycleContractError, match="unsupported token"):
         replace(holding, state="BOGUS")
-    late = replace(holding, state=ThesisClockState.EXPIRED, expired_at=at(1_470))
+    late = replace(
+        holding,
+        state=ThesisClockState.EXPIRED,
+        expired_at=at(1_470),
+        receipt_at=at(1_470),
+    )
     assert late.state is ThesisClockState.EXPIRED
     assert late.expired_at == at(1_470)
+    assert late.receipt_at == at(1_470)
 
 
 def test_ac_004_the_clock_state_vocabulary_is_closed() -> None:
@@ -1021,6 +1326,98 @@ def test_ac_004_the_clock_state_vocabulary_is_closed() -> None:
         ThesisClockState("PAUSED")
     for undeclared in ("PAUSED", "HELD", "RESUMED", "CANCELLED"):
         assert undeclared not in {state.value for state in ThesisClockState}
+
+
+def test_ac_004_a_lifecycle_expires_with_its_time_invalidation_not_its_holding_deadline() -> None:
+    """ATDD-R5-B-horizon-intelligence/AC-004: the R5-A F4 state stays canonical.
+
+    GIVEN a supported tactical revision whose time invalidation precedes its far
+    longer expected holding band
+    WHEN the lifecycle is observed between the invalidation deadline and the
+    holding deadline, and when the input revision is already recorded `EXPIRED`
+    THEN each observation reports `EXPIRED` while the holding clock and its
+    remaining time are still preserved, and an observation inside the band before
+    the invalidation stays `ACTIVE`
+    """
+
+    thesis = supported_thesis()
+    anchor = anchor_for(thesis)
+    assert thesis.time_invalidation == at(600)
+    running = observe(thesis, anchor=anchor, now=700, receipt=700)
+    holding = running.clock(ThesisClockName.HOLDING)
+    assert holding.state is ThesisClockState.RUNNING
+    assert holding.expires_at == at(1_460)
+    assert running.thesis_lifecycle_state is ThesisLifecycleState.EXPIRED
+    assert remaining_lifecycle_seconds(running, now=at(700)) == 45_600
+    already = expire_thesis(thesis, now=at(800))
+    assert already.lifecycle_state is ThesisLifecycleState.EXPIRED
+    recorded = observe(already, anchor=anchor, now=800, receipt=800)
+    assert recorded.thesis_lifecycle_state is ThesisLifecycleState.EXPIRED
+    assert recorded.thesis_lifecycle_state is already.lifecycle_state
+    in_band = observe(thesis, anchor=anchor)
+    assert in_band.thesis_lifecycle_state is ThesisLifecycleState.ACTIVE
+
+
+def test_ac_004_an_expired_clock_cannot_record_a_receipt_before_its_expiry() -> None:
+    """ATDD-R5-B-horizon-intelligence/AC-004: the expiry receipt is the floor.
+
+    GIVEN a running holding clock
+    WHEN it is reconstructed as expired with a receipt that precedes the expiry
+    instant it records
+    THEN the record is refused, so a deserialized clock can never claim to have
+    observed its own expiry before that expiry happened, while a receipt at the
+    expiry instant is accepted
+    """
+
+    thesis = supported_thesis()
+    holding = observe(thesis, anchor=anchor_for(thesis)).clock("HOLDING")
+    with pytest.raises(
+        HorizonLifecycleContractError,
+        match="received before the expiry it records",
+    ):
+        replace(
+            holding,
+            state=ThesisClockState.EXPIRED,
+            expired_at=at(1_470),
+            receipt_at=at(20),
+        )
+    with pytest.raises(
+        HorizonLifecycleContractError,
+        match="received before the expiry it records",
+    ):
+        replace(
+            holding,
+            state=ThesisClockState.EXPIRED,
+            expired_at=at(1_470),
+            receipt_at=at(1_469),
+        )
+    consistent = replace(
+        holding,
+        state=ThesisClockState.EXPIRED,
+        expired_at=at(1_470),
+        receipt_at=at(1_470),
+    )
+    assert consistent.expired_at == consistent.receipt_at == at(1_470)
+
+
+def test_ac_004_a_clock_receipt_cannot_move_backwards() -> None:
+    """ATDD-R5-B-horizon-intelligence/AC-004: re-observation is monotonic.
+
+    GIVEN a holding clock already observed with a receipt at the forty-fifth
+    minute
+    WHEN it is observed again at an earlier instant whose receipt precedes the
+    receipt the clock already records
+    THEN the re-observation is refused, so preserved clock evidence is never
+    rewound, while an unchanged receipt is still admitted
+    """
+
+    thesis = supported_thesis()
+    holding = observe(thesis, anchor=anchor_for(thesis)).clock("HOLDING")
+    advanced = advance_clock(holding, now=at(45), receipt_at=at(45))
+    assert advanced.receipt_at == at(45)
+    with pytest.raises(HorizonLifecycleContractError, match="received out of order"):
+        advance_clock(advanced, now=at(40), receipt_at=at(44))
+    assert advance_clock(advanced, now=at(45), receipt_at=at(45)).receipt_at == at(45)
 
 
 # ---------------------------------------------------------------------------
@@ -1239,6 +1636,143 @@ def test_ac_005_a_forged_lifecycle_identity_is_refused() -> None:
     other_revision = observe(foreign, anchor=anchor_for(foreign))
     assert other_revision.lifecycle_id != life.lifecycle_id
     assert other_revision.thesis_id == foreign.thesis_id
+
+
+def test_ac_005_a_clock_must_be_started_by_the_lifecycles_own_anchor() -> None:
+    """ATDD-R5-B-horizon-intelligence/AC-005: one anchor per lifecycle record.
+
+    GIVEN a supported lifecycle observation of one revision
+    WHEN it is reconstructed with a second first-fill anchor of the same revision
+    and its identity is recomputed so that it matches that anchor, while the
+    recorded clocks still start from the original anchor
+    THEN the record is refused, so no serialized lifecycle carries two
+    contradictory sources for its deadlines
+    """
+
+    thesis = supported_thesis()
+    anchor = anchor_for(thesis)
+    life = observe(thesis, anchor=anchor)
+    other = anchor_for(thesis, first_fill_minutes=25)
+    assert other.anchor_id != anchor.anchor_id
+    rebound_identity = horizon_lifecycle_identity(
+        lifecycle_schema_version=HORIZON_LIFECYCLE_SCHEMA_VERSION,
+        policy_version=HORIZON_LIFECYCLE_ENGINEERING_SCENARIO_POLICY_VERSION,
+        thesis_id=thesis.thesis_id,
+        thesis_version=thesis.thesis_version,
+        horizon_class=thesis.horizon_class,
+        anchor_id=other.anchor_id,
+    )
+    with pytest.raises(
+        HorizonLifecycleContractError,
+        match="started by the lifecycle's own first-fill anchor",
+    ):
+        replace(life, anchor=other, lifecycle_id=rebound_identity)
+    replayed = replace(life, anchor=anchor, lifecycle_id=life.lifecycle_id)
+    assert replayed.clocks == life.clocks
+    assert all(
+        clock.started_from_anchor_id == anchor.anchor_id
+        for clock in life.clocks
+        if clock.started_from_anchor_id is not None
+    )
+
+
+def test_ac_007_the_strict_clock_seam_requires_the_anchor_before_it_starts_a_clock() -> None:
+    """ATDD-R5-B-horizon-intelligence/AC-007: availability precedes consumption.
+
+    GIVEN a supported revision whose first fill is the twentieth minute and whose
+    anchor is received at the fortieth minute
+    WHEN each clock is started directly with a receipt that precedes that anchor
+    receipt
+    THEN each is refused instead of recording a clock receipt that precedes the
+    evidence it consumes, while a receipt at the anchor receipt is admitted and
+    the start instants stay those of preserved evidence
+    """
+
+    thesis = supported_thesis()
+    late = anchor_for(thesis, first_fill_minutes=20, receipt_minutes=40)
+    assert (late.first_fill_at, late.receipt_at) == (at(20), at(40))
+    expected_starts = {
+        "QUALIFICATION": thesis.classified_at,
+        "HOLDING": late.first_fill_at,
+        "INVALIDATION": late.first_fill_at,
+    }
+    for clock_name, expected_start in expected_starts.items():
+        with pytest.raises(
+            HorizonLifecycleContractError,
+            match="received before its first-fill anchor was received",
+        ):
+            start_clock(
+                thesis,
+                clock_name,
+                policy=lifecycle_policy(),
+                receipt_at=at(30),
+                anchor=late,
+            )
+        admitted = start_clock(
+            thesis,
+            clock_name,
+            policy=lifecycle_policy(),
+            receipt_at=at(40),
+            anchor=late,
+        )
+        assert admitted.started_at == expected_start
+        assert admitted.receipt_at == at(40)
+        assert admitted.expires_at == expected_start + timedelta(
+            seconds=admitted.expected_seconds
+        )
+        assert admitted.started_from_anchor_id == (
+            None if clock_name == "QUALIFICATION" else late.anchor_id
+        )
+    unanchored = start_clock(
+        thesis, "QUALIFICATION", policy=lifecycle_policy(), receipt_at=at(30)
+    )
+    assert unanchored.receipt_at == at(30)
+    assert unanchored.started_from_anchor_id is None
+
+
+
+def test_ac_005_a_reconstructed_lifecycle_keeps_one_applied_policy_token() -> None:
+    """ATDD-R5-B-horizon-intelligence/AC-005: one policy token per lifecycle.
+
+    GIVEN a supported lifecycle observed under the engineering-scenario token
+    WHEN a clock is reconstructed under the other declared lifecycle token with
+    its `TCLK:` identity recomputed while the lifecycle keeps its own token
+    THEN the reconstructed lifecycle is refused, so a clock can never be recorded
+    under a policy the observation it belongs to did not apply, while the
+    lifecycle's own clock set replays
+    """
+
+    thesis = supported_thesis()
+    anchor = anchor_for(thesis)
+    life = observe(thesis, anchor=anchor)
+    other_token = HORIZON_LIFECYCLE_POLICY_VERSION
+    assert other_token != life.policy_version
+    holding = life.clock("HOLDING")
+    rekeyed = replace(
+        holding,
+        policy_version=other_token,
+        clock_id=thesis_clock_identity(
+            thesis_id=holding.thesis_id,
+            clock_name=holding.clock_name,
+            policy_version=other_token,
+            started_at=holding.started_at,
+            expected_seconds=holding.expected_seconds,
+            started_from_anchor_id=holding.started_from_anchor_id,
+        ),
+    )
+    assert rekeyed.policy_version == other_token
+    assert rekeyed.clock_id != holding.clock_id
+    with pytest.raises(
+        HorizonLifecycleContractError,
+        match="observed under the lifecycle's applied policy version",
+    ):
+        replace(life, clocks=(life.clocks[0], rekeyed, life.clocks[2]))
+    replayed = replace(life, clocks=life.clocks)
+    assert [clock.policy_version for clock in replayed.clocks] == [
+        life.policy_version
+    ] * len(CLOCK_ORDER)
+    assert replayed.to_dict() == life.to_dict()
+
 
 
 # ---------------------------------------------------------------------------
@@ -1662,7 +2196,431 @@ def test_ac_007_naive_instants_and_foreign_anchors_are_refused() -> None:
         )
 
 
+def test_ac_007_no_abstention_or_observation_before_its_evidence_exists() -> None:
+    """ATDD-R5-B-horizon-intelligence/AC-007: availability precedes abstention.
+
+    GIVEN a revision classified at the tenth minute and a first-fill anchor whose
+    receipt is the fortieth minute
+    WHEN an unconfigured policy, a research-only class or an unbanded class is
+    evaluated before the revision existed, or a configured policy is evaluated
+    before the anchor was received
+    THEN each fails closed instead of producing an abstention or a supported
+    observation from evidence that was not yet available, while the same inputs
+    evaluated later abstain or are supported as declared
+    """
+
+    thesis = supported_thesis()
+    unconfigured = ThesisLifecyclePolicy()
+    with pytest.raises(
+        HorizonLifecycleContractError, match="before the revision was classified"
+    ):
+        observe(thesis, policy=unconfigured, now=5, receipt=5)
+    with pytest.raises(
+        HorizonLifecycleContractError, match="before the revision was classified"
+    ):
+        observe(unknown_thesis(), now=5, receipt=5)
+    with pytest.raises(
+        HorizonLifecycleContractError, match="before the revision was classified"
+    ):
+        observe(
+            position_thesis(),
+            anchor=anchor_for(position_thesis()),
+            policy=lifecycle_policy(
+                holding_budget_seconds={HorizonClass.TACTICAL: TACTICAL_BAND}
+            ),
+            now=5,
+            receipt=5,
+        )
+    late_anchor = anchor_for(thesis, first_fill_minutes=20, receipt_minutes=40)
+    assert late_anchor.receipt_at == at(40)
+    with pytest.raises(
+        HorizonLifecycleContractError,
+        match="before its first-fill anchor was received",
+    ):
+        observe(thesis, anchor=late_anchor, now=30, receipt=40)
+    with pytest.raises(
+        HorizonLifecycleContractError,
+        match="before its first-fill anchor was received",
+    ):
+        observe(thesis, anchor=late_anchor, policy=unconfigured, now=30, receipt=40)
+    assert observe(thesis, policy=unconfigured).abstention_reason is (
+        LifecycleAbstentionReason.POLICY_NOT_CONFIGURED
+    )
+    supported = observe(thesis, anchor=late_anchor, now=40, receipt=40)
+    assert supported.abstention_reason is LifecycleAbstentionReason.NONE
+    assert supported.anchor == late_anchor
+
+
+def test_ac_005_an_anchored_clock_must_carry_the_first_fill_anchor_it_started_from() -> None:
+    """ATDD-R5-B-horizon-intelligence/AC-005: an anchored clock names its source.
+
+    GIVEN a supported lifecycle whose anchored clocks name its first-fill anchor
+    WHEN a HOLDING or INVALIDATION clock is reconstructed without that anchor
+    identity and with its `TCLK:` identity recomputed so the record is internally
+    consistent
+    THEN the record is refused, so a self-consistent identity hash never
+    substitutes for the anchor relationship, while the untouched clock set
+    replays unchanged
+    """
+
+    thesis = supported_thesis()
+    anchor = anchor_for(thesis)
+    life = observe(thesis, anchor=anchor)
+    anchored = [
+        clock
+        for clock in life.clocks
+        if clock.clock_name is not ThesisClockName.QUALIFICATION
+    ]
+    assert [clock.clock_name for clock in anchored] == [
+        ThesisClockName.HOLDING,
+        ThesisClockName.INVALIDATION,
+    ]
+    assert all(clock.started_from_anchor_id == anchor.anchor_id for clock in anchored)
+    assert life.clock("QUALIFICATION").started_from_anchor_id is None
+    for clock in anchored:
+        orphan_id = thesis_clock_identity(
+            thesis_id=clock.thesis_id,
+            clock_name=clock.clock_name,
+            policy_version=clock.policy_version,
+            started_at=clock.started_at,
+            expected_seconds=clock.expected_seconds,
+            started_from_anchor_id=None,
+        )
+        assert orphan_id != clock.clock_id
+        with pytest.raises(
+            HorizonLifecycleContractError,
+            match="must record the first-fill anchor it started from",
+        ):
+            replace(clock, started_from_anchor_id=None, clock_id=orphan_id)
+    assert replace(life, clocks=life.clocks).to_dict() == life.to_dict()
+
+
+
+def test_ac_005_an_anchored_clock_starts_at_the_anchor_it_names() -> None:
+    """ATDD-R5-B-horizon-intelligence/AC-005: one preserved start instant.
+
+    GIVEN a supported lifecycle anchored at the twentieth minute whose anchored
+    clocks are both derived from that instant
+    WHEN a HOLDING or INVALIDATION clock is reconstructed to start at the
+    twenty-fifth minute with its deadline and `TCLK:` identity recomputed while
+    the lifecycle keeps its original anchor
+    THEN the reconstructed lifecycle is refused, so the anchor stays the single
+    source of the start instant, while the original record replays
+    """
+
+    thesis = supported_thesis()
+    anchor = anchor_for(thesis)
+    life = observe(thesis, anchor=anchor)
+    for clock_name in ("HOLDING", "INVALIDATION"):
+        clock = life.clock(clock_name)
+        assert clock.started_at == anchor.first_fill_at == at(20)
+        moved_start = at(25)
+        moved = replace(
+            clock,
+            started_at=moved_start,
+            expires_at=moved_start + timedelta(seconds=clock.expected_seconds),
+            clock_id=thesis_clock_identity(
+                thesis_id=clock.thesis_id,
+                clock_name=clock.clock_name,
+                policy_version=clock.policy_version,
+                started_at=moved_start,
+                expected_seconds=clock.expected_seconds,
+                started_from_anchor_id=clock.started_from_anchor_id,
+            ),
+        )
+        assert moved.started_at != anchor.first_fill_at
+        assert moved.started_from_anchor_id == anchor.anchor_id
+        index = CLOCK_ORDER.index(clock.clock_name)
+        clocks = (*life.clocks[:index], moved, *life.clocks[index + 1 :])
+        assert clocks != life.clocks
+        with pytest.raises(
+            HorizonLifecycleContractError,
+            match="must start at the lifecycle anchor's first-fill instant",
+        ):
+            replace(life, clocks=clocks)
+    replayed = replace(life, clocks=life.clocks)
+    assert [clock.to_dict() for clock in replayed.clocks] == [
+        clock.to_dict() for clock in life.clocks
+    ]
+    assert replayed.lifecycle_id == life.lifecycle_id
+
+
+
+def test_ac_005_a_reconstructed_lifecycle_cannot_predate_its_own_evidence() -> None:
+    """ATDD-R5-B-horizon-intelligence/AC-005: the evidence order is preserved.
+
+    GIVEN a supported lifecycle observed at the thirtieth minute whose anchor was
+    received at the twentieth minute and whose clocks were received at the
+    thirtieth minute
+    WHEN the record is reconstructed with an evaluation instant before the anchor
+    receipt, a receipt before the clock evidence it carries, or a qualification
+    clock that starts after the observation
+    THEN each is refused, so a self-consistent identity and clock set can never
+    make a point-in-time violation admissible, while the ordering that matches
+    the preserved evidence is admitted
+    """
+
+    thesis = supported_thesis()
+    anchor = anchor_for(thesis)
+    life = observe(thesis, anchor=anchor)
+    assert (life.evaluated_at, life.receipt_at) == (at(30), at(30))
+    assert (anchor.first_fill_at, anchor.receipt_at) == (at(20), at(20))
+    assert all(clock.receipt_at == at(30) for clock in life.clocks)
+    with pytest.raises(
+        HorizonLifecycleContractError,
+        match="observed before its first-fill anchor was received",
+    ):
+        replace(life, evaluated_at=at(15), receipt_at=at(15))
+    with pytest.raises(
+        HorizonLifecycleContractError,
+        match="received before the clock evidence it carries",
+    ):
+        replace(life, evaluated_at=at(25), receipt_at=at(25))
+    qualification = life.clock("QUALIFICATION")
+    late_start = at(40)
+    shifted = replace(
+        qualification,
+        started_at=late_start,
+        expires_at=late_start + timedelta(seconds=qualification.expected_seconds),
+        receipt_at=late_start,
+        clock_id=thesis_clock_identity(
+            thesis_id=qualification.thesis_id,
+            clock_name=qualification.clock_name,
+            policy_version=qualification.policy_version,
+            started_at=late_start,
+            expected_seconds=qualification.expected_seconds,
+            started_from_anchor_id=None,
+        ),
+    )
+    with pytest.raises(
+        HorizonLifecycleContractError,
+        match="observed before one of its clocks started",
+    ):
+        replace(
+            life,
+            clocks=(shifted, *life.clocks[1:]),
+            evaluated_at=at(30),
+            receipt_at=at(40),
+        )
+    earliest = replace(life, evaluated_at=at(20), receipt_at=at(30))
+    assert earliest.evaluated_at == anchor.receipt_at == at(20)
+    assert earliest.clock("HOLDING").started_at == at(20)
+    assert earliest.receipt_at == at(30)
+    replay = replace(life, clocks=life.clocks, evaluated_at=at(30), receipt_at=at(30))
+    assert replay.to_dict() == life.to_dict()
+
+
+
 # ---------------------------------------------------------------------------
+def test_ac_005_a_reconstructed_lifecycle_declares_its_anchor_revision() -> None:
+    """ATDD-R5-B-horizon-intelligence/AC-005: one revision number per record.
+
+    GIVEN a supported lifecycle of a revision-1 thesis and a supported lifecycle
+    of the linked revision-2 thesis of the same episode
+    WHEN a lifecycle is reconstructed as revision 2 while retaining the revision-1
+    anchor and its `HLFC:` identity is recomputed so the record stays internally
+    consistent, or an abstained lifecycle is reconstructed as revision 1 while
+    retaining the revision-2 anchor
+    THEN each is refused, so no serialized record claims a thesis revision its
+    anchor does not describe, while the revision-2 observation and the matching
+    revision number replay unchanged
+    """
+
+    first = supported_thesis()
+    first_anchor = anchor_for(first)
+    first_life = observe(first, anchor=first_anchor)
+    assert first_life.thesis_version == first_anchor.thesis_version == 1
+    second = reclassify(
+        first,
+        thesis_evidence(),
+        horizon_policy(),
+        new_decision_id="DEC:r5b-2",
+    )
+    assert (second.thesis_version, second.decision_id) == (2, "DEC:r5b-2")
+    assert second.thesis_id != first.thesis_id
+    second_anchor = anchor_for(second)
+    assert (second_anchor.thesis_id, second_anchor.thesis_version) == (
+        second.thesis_id,
+        2,
+    )
+    second_life = observe(second, anchor=second_anchor)
+    assert second_life.abstention_reason is LifecycleAbstentionReason.NONE
+    assert (second_life.thesis_id, second_life.thesis_version) == (
+        second.thesis_id,
+        2,
+    )
+    assert second_life.anchor == second_anchor
+    assert tuple(clock.thesis_id for clock in second_life.clocks) == (
+        second.thesis_id,
+    ) * len(CLOCK_ORDER)
+    replayed = replace(second_life, clocks=second_life.clocks)
+    assert replayed.to_dict() == second_life.to_dict()
+    promoted_id = horizon_lifecycle_identity(
+        lifecycle_schema_version=HORIZON_LIFECYCLE_SCHEMA_VERSION,
+        policy_version=first_life.policy_version,
+        thesis_id=first_life.thesis_id,
+        thesis_version=2,
+        horizon_class=first_life.horizon_class,
+        anchor_id=first_anchor.anchor_id,
+    )
+    assert promoted_id != first_life.lifecycle_id
+    with pytest.raises(
+        HorizonLifecycleContractError,
+        match="must declare the same thesis revision number",
+    ):
+        replace(first_life, thesis_version=2, lifecycle_id=promoted_id)
+    demoted_id = horizon_lifecycle_identity(
+        lifecycle_schema_version=HORIZON_LIFECYCLE_SCHEMA_VERSION,
+        policy_version=second_life.policy_version,
+        thesis_id=second_life.thesis_id,
+        thesis_version=1,
+        horizon_class=second_life.horizon_class,
+        anchor_id=second_anchor.anchor_id,
+    )
+    assert demoted_id != second_life.lifecycle_id
+    with pytest.raises(
+        HorizonLifecycleContractError,
+        match="must declare the same thesis revision number",
+    ):
+        replace(
+            second_life,
+            thesis_version=1,
+            clocks=(),
+            abstention_reason=LifecycleAbstentionReason.POLICY_NOT_CONFIGURED,
+            lifecycle_id=demoted_id,
+        )
+    replayed_second = replace(
+        second_life, thesis_version=2, clocks=second_life.clocks
+    )
+    assert replayed_second.to_dict() == second_life.to_dict()
+
+
+def test_ac_005_a_reconstructed_lifecycle_freezes_clock_state_at_the_deadline() -> None:
+    """ATDD-R5-B-horizon-intelligence/AC-005: state agrees with the deadline.
+
+    GIVEN a supported lifecycle whose qualification clock expires exactly at the
+    declared entry window end
+    WHEN it is reconstructed immediately before, exactly at and immediately after
+    that deadline with the clock's state, expiry instant and receipt rewritten so
+    its `TCLK:` identity is unchanged
+    THEN a clock recorded expired before its deadline and a clock still recorded
+    running at or after its deadline are refused, while the state that agrees with
+    the deadline is admitted and the untouched record replays
+    """
+
+    thesis = supported_thesis()
+    life = observe(thesis, anchor=anchor_for(thesis))
+    qualification = life.clock("QUALIFICATION")
+    assert qualification.state is ThesisClockState.RUNNING
+    assert qualification.receipt_at == at(30)
+    deadline = qualification.expires_at
+    assert deadline == thesis.entry_window_end == at(70)
+    before = deadline - timedelta(seconds=1)
+    after = deadline + timedelta(seconds=1)
+    rest = tuple(
+        clock
+        for clock in life.clocks
+        if clock.clock_name is not ThesisClockName.QUALIFICATION
+    )
+    assert [clock.clock_name for clock in rest] == [
+        ThesisClockName.HOLDING,
+        ThesisClockName.INVALIDATION,
+    ]
+    expired_early = replace(
+        qualification,
+        state=ThesisClockState.EXPIRED,
+        expired_at=deadline,
+        receipt_at=deadline,
+    )
+    assert expired_early.clock_id == qualification.clock_id
+    with pytest.raises(
+        HorizonLifecycleContractError,
+        match="cannot be recorded as expired before its deadline",
+    ):
+        replace(
+            life,
+            clocks=(expired_early, *rest),
+            evaluated_at=before,
+            receipt_at=at(2_000),
+        )
+    with pytest.raises(
+        HorizonLifecycleContractError,
+        match="cannot be recorded as running at or after its deadline",
+    ):
+        replace(life, evaluated_at=deadline, receipt_at=at(2_000))
+    with pytest.raises(
+        HorizonLifecycleContractError,
+        match="cannot be recorded as running at or after its deadline",
+    ):
+        replace(life, evaluated_at=after, receipt_at=at(2_000))
+    admitted = replace(
+        life,
+        clocks=(expired_early, *rest),
+        evaluated_at=after,
+        receipt_at=at(2_000),
+    )
+    assert admitted.clock("QUALIFICATION").state is ThesisClockState.EXPIRED
+    assert admitted.clock("QUALIFICATION").expired_at == deadline
+    assert admitted.clock("QUALIFICATION").clock_id == qualification.clock_id
+    assert admitted.evaluated_at == after
+    assert admitted.receipt_at == at(2_000)
+    assert admitted.clock("HOLDING").state is ThesisClockState.RUNNING
+    replayed = replace(life, clocks=life.clocks)
+    assert replayed.to_dict() == life.to_dict()
+
+
+def test_ac_007_a_reconstructed_lifecycle_cannot_carry_a_future_expiry() -> None:
+    """ATDD-R5-B-horizon-intelligence/AC-007: expiry evidence is point-in-time.
+
+    GIVEN a terminal lifecycle observed at the two-thousandth minute whose clocks
+    all record expiry observed at that instant, and a lifecycle observed at the
+    thirtieth minute whose clocks are still running
+    WHEN the terminal record is reconstructed as evaluated at the thirtieth minute
+    with its receipt retained at the two-thousandth minute, and reconstructed
+    again at an instant after every deadline while its clocks still record the
+    two-thousandth-minute expiry observation
+    THEN each is refused, so an as-of observation never carries an expiry from
+    after the instant it was evaluated, while a delayed receipt whose clock
+    evidence is preserved in the past and the terminal record itself are admitted
+    """
+
+    thesis = supported_thesis()
+    anchor = anchor_for(thesis)
+    early = observe(thesis, anchor=anchor)
+    assert all(clock.state is ThesisClockState.RUNNING for clock in early.clocks)
+    assert all(clock.expired_at is None for clock in early.clocks)
+    terminal = observe(thesis, anchor=anchor, now=2_000, receipt=2_000)
+    assert terminal.thesis_lifecycle_state is ThesisLifecycleState.EXPIRED
+    assert all(clock.state is ThesisClockState.EXPIRED for clock in terminal.clocks)
+    assert all(clock.expired_at == at(2_000) for clock in terminal.clocks)
+    assert [clock.expires_at for clock in terminal.clocks] == [
+        at(70),
+        at(1_460),
+        at(600),
+    ]
+    with pytest.raises(
+        HorizonLifecycleContractError,
+        match="cannot be recorded as expired before its deadline",
+    ):
+        replace(terminal, evaluated_at=at(30), receipt_at=at(2_000))
+    with pytest.raises(
+        HorizonLifecycleContractError,
+        match="expiry observation cannot postdate the lifecycle evaluation",
+    ):
+        replace(terminal, evaluated_at=at(1_500), receipt_at=at(2_000))
+    delayed = replace(early, receipt_at=at(2_000))
+    assert delayed.evaluated_at == at(30)
+    assert delayed.receipt_at == at(2_000)
+    assert delayed.receipt_at != delayed.evaluated_at
+    assert delayed.to_dict() == {
+        **early.to_dict(),
+        "receipt_at": "2026-10-11T21:20:00Z",
+    }
+    preserved = replace(terminal, clocks=terminal.clocks, evaluated_at=at(2_000))
+    assert preserved.to_dict() == terminal.to_dict()
+    assert all(clock.expired_at == preserved.evaluated_at for clock in preserved.clocks)
+
+
 # AC-008 One identity per revision, replayable and policy bound
 # ---------------------------------------------------------------------------
 
@@ -1699,9 +2657,10 @@ def test_ac_008_re_observing_reproduces_the_lifecycle_and_clock_identities() -> 
 def test_ac_008_an_identical_replay_is_identical_key_for_key() -> None:
     """ATDD-R5-B-horizon-intelligence/AC-008: identical inputs replay identically.
 
-    GIVEN the same revision, anchor and instants
-    WHEN the lifecycle is evaluated twice, and once more with an anchor that has
-    accumulated a later fill
+    GIVEN the same revision, anchor and instants, and an anchor that has
+    accumulated a later fill received at the observation instant
+    WHEN the lifecycle is evaluated twice, and once more with the accumulated
+    anchor
     THEN the two identical evaluations are equal key for key, and the accumulated
     anchor changes the recorded anchor only, never a clock
     """
@@ -1721,8 +2680,11 @@ def test_ac_008_an_identical_replay_is_identical_key_for_key() -> None:
         receipt_at=at(45),
         source_reference="FILL:2",
     )
-    plain = observe(thesis, anchor=anchor)
-    with_fill = observe(thesis, anchor=accumulated)
+    # Both observations are taken at the accumulated anchor's receipt instant:
+    # evidence received at the forty-fifth minute cannot determine an observation
+    # taken earlier, and the comparison still isolates the anchor payload.
+    plain = observe(thesis, anchor=anchor, now=45, receipt=45)
+    with_fill = observe(thesis, anchor=accumulated, now=45, receipt=45)
     assert plain.lifecycle_id == with_fill.lifecycle_id
     assert [clock.to_dict() for clock in with_fill.clocks] == [
         clock.to_dict() for clock in plain.clocks

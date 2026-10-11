@@ -29,6 +29,15 @@ Three boundaries are deliberate:
   number. A policy whose budgets are not supplied abstains with
   `POLICY_NOT_CONFIGURED` (or `MISSING_ENTRY_WINDOW` when only the qualification
   budget is absent) rather than defaulting, guessing or borrowing a value.
+* Both public seams share one validation authority. The strict clock seam
+  (`start_clock`) and the abstaining lifecycle seam (`evaluate_thesis_lifecycle`)
+  bind a supplied anchor to the same revision lineage and apply the same
+  availability ordering, and a reconstructed lifecycle re-derives every
+  cross-record relationship — the anchor a clock started from and its first-fill
+  instant, the revision number that anchor declares, the applied policy token, the
+  clock starts, the state of every clock at the instant the lifecycle was evaluated
+  and the expiry observations against that instant, and the observation and receipt
+  order — instead of trusting a self-consistent identity hash.
 
 This module carries no trading, admission, allocation, reservation or execution
 authority: a lifecycle observation is research-only evidence, and
@@ -37,6 +46,7 @@ authority: a lifecycle observation is research-only evidence, and
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -109,6 +119,12 @@ CLOCK_ORDER: tuple[ThesisClockName, ...] = (
     ThesisClockName.INVALIDATION,
 )
 
+#: The clock names whose start instant is the anchor's preserved first fill.
+_ANCHORED_CLOCK_NAMES: tuple[ThesisClockName, ...] = (
+    ThesisClockName.HOLDING,
+    ThesisClockName.INVALIDATION,
+)
+
 
 class ThesisClockState(str, Enum):
     """A clock is running or terminally expired. There is no pause or resume."""
@@ -165,9 +181,17 @@ def _require_positive_int(value: Any, *, field_name: str) -> int:
 def _require_positive_number(value: Any, *, field_name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise HorizonLifecycleContractError(f"{field_name} must be a number")
-    if value <= 0:
+    try:
+        number = float(value)
+    except OverflowError as exc:  # an integer too large to be represented
+        raise HorizonLifecycleContractError(
+            f"{field_name} must be a finite number"
+        ) from exc
+    if not math.isfinite(number):
+        raise HorizonLifecycleContractError(f"{field_name} must be a finite number")
+    if number <= 0:
         raise HorizonLifecycleContractError(f"{field_name} must be positive")
-    return float(value)
+    return number
 
 
 def require_clock_name(value: Any, *, field_name: str) -> ThesisClockName:
@@ -183,6 +207,36 @@ def require_clock_name(value: Any, *, field_name: str) -> ThesisClockName:
     raise HorizonLifecycleContractError(
         f"{field_name} must be a ThesisClockName token"
     )
+
+
+def _require_revision_bound_anchor(
+    thesis: HorizonThesis,
+    anchor: FirstFillAnchor | None,
+    *,
+    mismatch_message: str,
+) -> FirstFillAnchor | None:
+    """Bind a supplied anchor to the revision and lineage it actually describes.
+
+    Both public seams call this, so the strict clock seam can never consume an
+    anchor the abstaining lifecycle seam would refuse. ``thesis_id`` alone is not
+    the binding: the revision number, the episode and the decision are compared
+    too, because an anchor belongs to the revision that recorded it. The returned
+    record is the anchor the caller must use; ``mismatch_message`` keeps each
+    caller's declared wording while the comparison itself has one authority.
+    """
+
+    if anchor is None:
+        return None
+    if not isinstance(anchor, FirstFillAnchor):
+        raise HorizonLifecycleContractError("anchor must be a FirstFillAnchor")
+    if (
+        anchor.thesis_id != thesis.thesis_id
+        or anchor.thesis_version != thesis.thesis_version
+        or anchor.episode_id != thesis.episode_id
+        or anchor.decision_id != thesis.decision_id
+    ):
+        raise HorizonLifecycleContractError(mismatch_message)
+    return anchor
 
 
 # ---------------------------------------------------------------------------
@@ -413,7 +467,10 @@ def record_additional_fill(
 
     The returned record preserves ``anchor_id`` and ``first_fill_at`` exactly,
     so the holding deadline is unchanged by a later fill. A fill observed before
-    the anchor instant, or received out of order, is refused rather than merged.
+    the anchor instant, evidence received out of order or before the fill it
+    describes, and a fill redelivered under an evidence reference the anchor
+    already carries are all refused rather than merged, so accumulating fills can
+    never double count a delivery or record hindsight.
     """
 
     if not isinstance(anchor, FirstFillAnchor):
@@ -424,6 +481,7 @@ def record_additional_fill(
     price = _require_positive_number(average_fill_price, field_name="average_fill_price")
     instant = _require_utc(fill_at, field_name="fill_at")
     receipt = _require_utc(receipt_at, field_name="receipt_at")
+    reference = _require_text(source_reference, field_name="source_reference")
     if instant < anchor.first_fill_at:
         raise HorizonLifecycleContractError(
             "a later fill cannot precede the anchor instant"
@@ -432,7 +490,14 @@ def record_additional_fill(
         raise HorizonLifecycleContractError(
             "lifecycle evidence cannot be received out of order"
         )
-    reference = _require_text(source_reference, field_name="source_reference")
+    if receipt < instant:
+        raise HorizonLifecycleContractError(
+            "a fill cannot be received before it happened"
+        )
+    if reference in anchor.source_references:
+        raise HorizonLifecycleContractError(
+            "a fill is recorded once; a duplicate delivery is refused"
+        )
     total_quantity = anchor.filled_quantity + added
     weighted_price = (
         anchor.filled_quantity * anchor.average_fill_price + added * price
@@ -637,6 +702,11 @@ class ThesisLifecycleClock:
                 "started_from_anchor_id",
                 _require_text(anchor_id, field_name="started_from_anchor_id"),
             )
+        elif name in _ANCHORED_CLOCK_NAMES:
+            raise HorizonLifecycleContractError(
+                f"a {name.value} clock must record the first-fill anchor it "
+                "started from"
+            )
         if self.state is ThesisClockState.EXPIRED:
             if self.expired_at is None:
                 raise HorizonLifecycleContractError(
@@ -651,6 +721,10 @@ class ThesisLifecycleClock:
             if observed < expires:
                 raise HorizonLifecycleContractError(
                     "expiry cannot be observed before the deadline"
+                )
+            if receipt < observed:
+                raise HorizonLifecycleContractError(
+                    "clock evidence cannot be received before the expiry it records"
                 )
             object.__setattr__(self, "expired_at", observed)
         expected_id = thesis_clock_identity(
@@ -762,20 +836,22 @@ def _resolve_clock_requirements(
         budget = policy.qualification_budget_seconds
         if window_start is None or window_end is None or budget is None:
             return LifecycleAbstentionReason.MISSING_ENTRY_WINDOW, None
-        if int((window_end - window_start).total_seconds()) != budget:
-            return LifecycleAbstentionReason.POLICY_BAND_MISMATCH, None
         if window_end <= thesis.classified_at:
             raise HorizonLifecycleContractError(
                 "the declared entry window ends at or before the thesis "
                 "classification instant"
             )
+        expected_seconds = int(
+            (window_end - thesis.classified_at).total_seconds()
+        )
+        if (
+            int((window_end - window_start).total_seconds()) != budget
+            or expected_seconds != budget
+        ):
+            return LifecycleAbstentionReason.POLICY_BAND_MISMATCH, None
         return (
             None,
-            (
-                thesis.classified_at,
-                int((window_end - thesis.classified_at).total_seconds()),
-                None,
-            ),
+            (thesis.classified_at, expected_seconds, None),
         )
     if anchor is None:
         return LifecycleAbstentionReason.MISSING_FIRST_FILL_ANCHOR, None
@@ -821,14 +897,24 @@ def start_clock(
     The start instant is evidence (`classified_at` or the anchor's
     `first_fill_at`), never a clock read. A clock the policy and the revision
     cannot support is refused here rather than defaulted or guessed.
+
+    Any supplied anchor is bound to this revision's lineage, and it must already
+    have been received when the clock receipt is recorded, so this strict seam
+    consumes no evidence the abstaining lifecycle seam would refuse and never
+    derives a clock from an anchor that had not yet arrived.
     """
 
     if not isinstance(thesis, HorizonThesis):
         raise HorizonLifecycleContractError("thesis must be a HorizonThesis")
     if not isinstance(policy, ThesisLifecyclePolicy):
         raise HorizonLifecycleContractError("policy must be a ThesisLifecyclePolicy")
-    if anchor is not None and not isinstance(anchor, FirstFillAnchor):
-        raise HorizonLifecycleContractError("anchor must be a FirstFillAnchor")
+    anchor = _require_revision_bound_anchor(
+        thesis,
+        anchor,
+        mismatch_message=(
+            "an anchor must belong to the thesis revision it is bound to"
+        ),
+    )
     name = require_clock_name(clock_name, field_name="clock_name")
     reason, resolved = _resolve_clock_requirements(thesis, name, policy, anchor)
     if reason is not None or resolved is None:
@@ -840,6 +926,11 @@ def start_clock(
     if receipt < started_at:
         raise HorizonLifecycleContractError(
             "clock evidence cannot be received before the clock starts"
+        )
+    if anchor is not None and receipt < anchor.receipt_at:
+        raise HorizonLifecycleContractError(
+            "clock evidence cannot be received before its first-fill anchor was "
+            "received"
         )
     expires_at = started_at + timedelta(seconds=expected_seconds)
     return ThesisLifecycleClock(
@@ -871,9 +962,11 @@ def advance_clock(
     """Observe one clock at an explicit instant. Never resumes an expiry.
 
     Expiry is terminal: an already expired clock is refused rather than
-    restarted, and a clock cannot be observed before it started. ``now`` is
-    always supplied by the caller, so no wall-clock reading can enter lifecycle
-    evidence.
+    restarted, and a clock cannot be observed before it started. Observations of
+    one clock are monotonic: a receipt that precedes the receipt the clock
+    already records is refused, so re-observation can never rewind preserved
+    evidence. ``now`` is always supplied by the caller, so no wall-clock reading
+    can enter lifecycle evidence.
     """
 
     if not isinstance(clock, ThesisLifecycleClock):
@@ -891,6 +984,10 @@ def advance_clock(
     if receipt < instant:
         raise HorizonLifecycleContractError(
             "clock evidence cannot be received before the observation instant"
+        )
+    if receipt < clock.receipt_at:
+        raise HorizonLifecycleContractError(
+            "clock evidence cannot be received out of order"
         )
     expired = instant >= clock.expires_at
     return ThesisLifecycleClock(
@@ -920,9 +1017,22 @@ class HorizonThesisLifecycle:
 
     One lifecycle id is bound to the thesis revision and (when attached) to the
     first-fill anchor, so re-observing the same lifecycle at a later instant
-    reproduces the same ``HLFC:`` identity: only the clocks advance. An
-    abstention is recorded with no clocks, because a partially observed clock
-    set is not an admissible lifecycle observation.
+    reproduces the same ``HLFC:`` identity: only the clocks advance. Every
+    anchored clock must declare this lifecycle's own anchor, start at that
+    anchor's preserved first-fill instant and carry the lifecycle's applied policy
+    token, so a reconstructed record can never keep the start instants, band or
+    policy of another record, and a bound anchor must declare the same thesis
+    revision *number* this record claims, so a record can never be attributed to a
+    revision its anchor does not describe. A record is an as-of observation: every
+    clock's state must agree with its own deadline at the evaluation instant (no
+    clock expired before its deadline and none still running at or after it) and no
+    clock may record an expiry observed after the instant the record was evaluated.
+    The evaluation and receipt instants may not precede the anchor receipt, one of
+    the clock starts or the receipt of a clock the record carries; the receipt may
+    legitimately be later than the evaluation, because a delayed delivery does not
+    change what was observed. Identity hashes prove identity and never these
+    relationships. An abstention is recorded with no clocks, because a partially
+    observed clock set is not an admissible lifecycle observation.
     """
 
     lifecycle_id: str
@@ -1001,6 +1111,11 @@ class HorizonThesisLifecycle:
             raise HorizonLifecycleContractError(
                 "an anchor must belong to the thesis revision it is bound to"
             )
+        if anchor is not None and anchor.thesis_version != self.thesis_version:
+            raise HorizonLifecycleContractError(
+                "a lifecycle and its anchor must declare the same thesis revision "
+                "number"
+            )
         clocks = tuple(self.clocks)
         names: list[ThesisClockName] = []
         for clock in clocks:
@@ -1043,6 +1158,34 @@ class HorizonThesisLifecycle:
             raise HorizonLifecycleContractError(
                 "lifecycle_id is not the identity of the lifecycle it describes"
             )
+        if anchor is not None:
+            for clock in clocks:
+                started_from = clock.started_from_anchor_id
+                if started_from is not None and started_from != anchor.anchor_id:
+                    raise HorizonLifecycleContractError(
+                        "a clock must be started by the lifecycle's own "
+                        "first-fill anchor"
+                    )
+                if (
+                    started_from is not None
+                    and clock.started_at != anchor.first_fill_at
+                ):
+                    raise HorizonLifecycleContractError(
+                        "an anchored clock must start at the lifecycle anchor's "
+                        "first-fill instant"
+                    )
+        for clock in clocks:
+            if clock.policy_version != version:
+                raise HorizonLifecycleContractError(
+                    "a clock must be observed under the lifecycle's applied "
+                    "policy version"
+                )
+        _require_preserved_lifecycle_ordering(
+            anchor=anchor,
+            clocks=clocks,
+            evaluated_at=evaluated,
+            receipt_at=receipt,
+        )
 
     @property
     def authoritative(self) -> bool:
@@ -1139,6 +1282,85 @@ def horizon_lifecycle_identity(
     )
 
 
+def _require_observable_instant(
+    thesis: HorizonThesis,
+    anchor: FirstFillAnchor | None,
+    instant: datetime,
+) -> None:
+    """Fail closed when an observation predates the evidence it describes.
+
+    Both seams call this, so an abstention can never be recorded at an instant
+    before the revision existed or before the anchor it is bound to was
+    received. ``instant`` is already validated as explicit UTC.
+    """
+
+    if instant < thesis.classified_at:
+        raise HorizonLifecycleContractError(
+            "a lifecycle cannot be observed before the revision was classified"
+        )
+    if anchor is not None and instant < anchor.receipt_at:
+        raise HorizonLifecycleContractError(
+            "a lifecycle cannot be observed before its first-fill anchor was "
+            "received"
+        )
+
+
+def _require_preserved_lifecycle_ordering(
+    *,
+    anchor: FirstFillAnchor | None,
+    clocks: tuple[ThesisLifecycleClock, ...],
+    evaluated_at: datetime,
+    receipt_at: datetime,
+) -> None:
+    """Freeze the cross-record ordering and as-of state of a reconstruction.
+
+    A lifecycle is a reconstruction over preserved evidence, so its own instants
+    may not predate the evidence it carries: it cannot be evaluated before the
+    anchor it is bound to was received or before one of its clocks started, and
+    its receipt cannot precede the receipt of a clock it carries. It is also an
+    as-of observation, so the state of every clock must agree with that clock's own
+    deadline at the evaluated instant — no clock may be recorded expired before its
+    deadline, and none may still be recorded running at or after it — and no clock
+    may record an expiry observed after the instant the record was evaluated,
+    because a clock can only be observed as expired once its deadline has passed. A
+    receipt later than the evaluation is legitimate: a delayed delivery does not
+    change what was observed. The constructor holds no thesis, so these
+    relationships are expressed only against the preserved records: an identity
+    hash proves identity, never ordering or state. Both the supported and the
+    abstained reconstruction path call this, and every instant is already validated
+    as explicit UTC.
+    """
+
+    if anchor is not None and evaluated_at < anchor.receipt_at:
+        raise HorizonLifecycleContractError(
+            "a lifecycle cannot be observed before its first-fill anchor was "
+            "received"
+        )
+    for clock in clocks:
+        if evaluated_at < clock.started_at:
+            raise HorizonLifecycleContractError(
+                "a lifecycle cannot be observed before one of its clocks started"
+            )
+        expired_by_deadline = evaluated_at >= clock.expires_at
+        if clock.state is ThesisClockState.EXPIRED and not expired_by_deadline:
+            raise HorizonLifecycleContractError(
+                "a clock cannot be recorded as expired before its deadline"
+            )
+        if clock.state is ThesisClockState.RUNNING and expired_by_deadline:
+            raise HorizonLifecycleContractError(
+                "a clock cannot be recorded as running at or after its deadline"
+            )
+        if clock.expired_at is not None and clock.expired_at > evaluated_at:
+            raise HorizonLifecycleContractError(
+                "an expiry observation cannot postdate the lifecycle evaluation"
+            )
+        if receipt_at < clock.receipt_at:
+            raise HorizonLifecycleContractError(
+                "lifecycle evidence cannot be received before the clock evidence "
+                "it carries"
+            )
+
+
 def _abstained_lifecycle(
     thesis: HorizonThesis,
     policy: ThesisLifecyclePolicy,
@@ -1186,12 +1408,23 @@ def evaluate_thesis_lifecycle(
     This is the abstaining seam: evidence the policy and the revision cannot
     support produces a recorded `LifecycleAbstentionReason` rather than an
     exception, so a missing owner number or a missing invalidation is visible
-    evidence instead of a guess. Two conditions still fail closed as errors,
-    because they are point-in-time violations rather than missing evidence:
+    evidence instead of a guess. Temporal validity is judged before any
+    abstention, because a point-in-time violation is not missing evidence:
 
+    * evaluating before the revision was classified,
+    * evaluating before the first-fill anchor was received, so future-received
+      evidence can never determine a clock state,
     * evaluating before a clock could start (before `classified_at`, or before
       the first fill the holding clock is anchored to), and
-    * evidence received before the instant it describes.
+    * evidence received before the instant it describes, and
+    * consuming an anchor that belongs to another revision, another revision
+      number of the same thesis or another lineage of it, so the abstaining seam
+      and the strict clock seam share one anchor binding.
+
+    The lifecycle state mirrors the canonical R5-A F4 mapping: a revision is
+    `EXPIRED` once its time invalidation has passed (the `INVALIDATION` clock's
+    deadline) or once R5-A already recorded it `EXPIRED`, so a longer holding
+    band can never relabel an expired tactical thesis as active.
 
     The returned observation carries no authority: it is research-only evidence
     and every clock it holds is arithmetic on preserved instants.
@@ -1201,12 +1434,13 @@ def evaluate_thesis_lifecycle(
         raise HorizonLifecycleContractError("thesis must be a HorizonThesis")
     if not isinstance(policy, ThesisLifecyclePolicy):
         raise HorizonLifecycleContractError("policy must be a ThesisLifecyclePolicy")
-    if anchor is not None and not isinstance(anchor, FirstFillAnchor):
-        raise HorizonLifecycleContractError("anchor must be a FirstFillAnchor")
-    if anchor is not None and anchor.thesis_id != thesis.thesis_id:
-        raise HorizonLifecycleContractError(
+    anchor = _require_revision_bound_anchor(
+        thesis,
+        anchor,
+        mismatch_message=(
             "an anchor belongs to the thesis revision that recorded it"
-        )
+        ),
+    )
     instant = _require_utc(now, field_name="now")
     receipt = _require_utc(receipt_at, field_name="receipt_at")
     if receipt < instant:
@@ -1215,6 +1449,7 @@ def evaluate_thesis_lifecycle(
         )
 
     def _abstain(reason: LifecycleAbstentionReason) -> HorizonThesisLifecycle:
+        _require_observable_instant(thesis, anchor, instant)
         return _abstained_lifecycle(
             thesis,
             policy,
@@ -1250,9 +1485,12 @@ def evaluate_thesis_lifecycle(
                 receipt_at=receipt,
             )
         )
+    _require_observable_instant(thesis, anchor, instant)
+    invalidation = clocks[CLOCK_ORDER.index(ThesisClockName.INVALIDATION)]
     state = (
         ThesisLifecycleState.EXPIRED
-        if all(clock.state is ThesisClockState.EXPIRED for clock in clocks)
+        if thesis.lifecycle_state is ThesisLifecycleState.EXPIRED
+        or invalidation.state is ThesisClockState.EXPIRED
         else ThesisLifecycleState.ACTIVE
     )
     return HorizonThesisLifecycle(
@@ -1292,10 +1530,12 @@ def attach_first_fill(
 ) -> HorizonThesisLifecycle:
     """Attach the first-fill anchor and observe the lifecycle in one step.
 
-    ``receipt_at`` is the receipt instant of this observation and must be at or
-    after both ``first_fill_at`` and ``now``; it is recorded on the anchor and on
-    the lifecycle observation, so no caller can hand the two seams different
-    clocks.
+    ``receipt_at`` is the receipt instant of this observation: it is recorded on
+    the anchor and on the lifecycle observation, so no caller can hand the two
+    seams different clocks. It must be at or after ``first_fill_at``, and ``now``
+    may not precede it, because evidence received after the observation instant
+    cannot determine the observation. When ``previous`` is supplied, the receipt
+    may not precede the receipt the previous observation already recorded.
 
     The anchor of a thesis revision is recorded once. Re-attaching the same first
     fill is idempotent: the already recorded anchor is reused, so accumulated
@@ -1330,6 +1570,10 @@ def attach_first_fill(
             raise HorizonLifecycleContractError(
                 "the first-fill anchor of a thesis revision is recorded once and "
                 "never rewritten"
+            )
+        if incoming.receipt_at < previous.receipt_at:
+            raise HorizonLifecycleContractError(
+                "lifecycle evidence cannot be received out of order"
             )
         anchor = previous.anchor
     return evaluate_thesis_lifecycle(
