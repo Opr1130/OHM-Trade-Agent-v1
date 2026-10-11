@@ -2598,10 +2598,54 @@ def test_ac_008_the_cost_channel_is_measured_not_estimated() -> None:
         == Decimal("16.0000")
     )
 
-    # A one-off cost declared only at the end of a window is not multiplied by the
-    # length of that window: the same fee across one hour and across ten hours -
-    # or the same history sampled at any cadence - costs the same.
-    def one_off(hours: int) -> CapitalHoursMeasure:
+    # The endpoint policy is declared, and it decides where a sample lands relative
+    # to a step in *both* channels: the basis integral moves by the same declared
+    # rule as the cost integral once a point is placed before the step, so the
+    # dependence on sampling is a property of the declared policy and not of one
+    # channel.
+    stepping_basis = (
+        capital_occupancy_point(at=T0, allocated_basis="1000.00", cumulative_fees="5.00"),
+        capital_occupancy_point(
+            at=at(7200), allocated_basis="2000.00", cumulative_fees="12.00"
+        ),
+    )
+    stepping_basis_fine = (
+        capital_occupancy_point(at=T0, allocated_basis="1000.00", cumulative_fees="5.00"),
+        capital_occupancy_point(
+            at=at(3600), allocated_basis="1000.00", cumulative_fees="5.00"
+        ),
+        capital_occupancy_point(
+            at=at(7200), allocated_basis="2000.00", cumulative_fees="12.00"
+        ),
+    )
+    coarse_start = measure_capital_hours(
+        stepping_basis, policy=hours_policy(endpoint=CapitalHoursEndpointPolicy.STEP_START)
+    )
+    fine_start = measure_capital_hours(
+        stepping_basis_fine,
+        policy=hours_policy(endpoint=CapitalHoursEndpointPolicy.STEP_START),
+    )
+    assert coarse_start.capital_hours == fine_start.capital_hours == Decimal("2000.0000")
+    assert coarse_start.cost_capital_hours == fine_start.cost_capital_hours == Decimal("10.0000")
+
+    coarse_end = measure_capital_hours(
+        stepping_basis, policy=hours_policy(endpoint=CapitalHoursEndpointPolicy.STEP_END)
+    )
+    fine_end = measure_capital_hours(
+        stepping_basis_fine,
+        policy=hours_policy(endpoint=CapitalHoursEndpointPolicy.STEP_END),
+    )
+    assert coarse_end.capital_hours == Decimal("4000.0000")
+    assert fine_end.capital_hours == Decimal("3000.0000")
+    assert coarse_end.cost_capital_hours == Decimal("24.0000")
+    assert fine_end.cost_capital_hours == Decimal("17.0000")
+
+    # The same declared rule applies to a cost declared only at the end of the
+    # window: STEP_END integrates the end level over the declared span (a longer
+    # span means more currency-hours of carried cost), while STEP_START integrates
+    # the level carried in, which is zero for a cost that was never declared
+    # before it happened. Both are the declared policy, not a sampling artefact.
+    def one_off(hours: int, endpoint: CapitalHoursEndpointPolicy) -> CapitalHoursMeasure:
         return measure_capital_hours(
             (
                 capital_occupancy_point(at=T0, allocated_basis="2000.00"),
@@ -2609,14 +2653,18 @@ def test_ac_008_the_cost_channel_is_measured_not_estimated() -> None:
                     at=at(hours * 3600), allocated_basis="2000.00", cumulative_fees="10.00"
                 ),
             ),
-            policy=hours_policy(),
+            policy=hours_policy(endpoint=endpoint),
         )
 
-    short, long = one_off(1), one_off(10)
-    assert short.cost_capital_hours == Decimal("0.0000")
-    assert short.cost_capital_hours == long.cost_capital_hours
+    short = one_off(1, CapitalHoursEndpointPolicy.STEP_START)
+    long = one_off(10, CapitalHoursEndpointPolicy.STEP_START)
+    assert short.cost_capital_hours == long.cost_capital_hours == Decimal("0.0000")
     assert short.net_capital_hours == short.capital_hours
     assert long.net_capital_hours == long.capital_hours
+    assert one_off(1, CapitalHoursEndpointPolicy.STEP_END).cost_capital_hours == Decimal("10.0000")
+    assert one_off(10, CapitalHoursEndpointPolicy.STEP_END).cost_capital_hours == Decimal(
+        "100.0000"
+    )
 
     duplicated = points((0, "1000.00"), (0, "1000.00"))
     assert (

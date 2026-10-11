@@ -3630,10 +3630,15 @@ def measure_capital_hours(
     guess: no declared endpoint policy, a non-monotone series, a point before the
     declared start, a rewound cumulative cost series or a zero occupancy all yield
     a named ``UNAVAILABLE`` measurement instead of a number. The declared
-    cumulative cost is integrated over the same instants under the same endpoint
-    policy, so both channels are step integrals in currency-hours and neither
-    depends on how often the series was sampled. Nothing here reads a clock, and
-    no instant is invented.
+    cumulative cost is integrated over the same instants under the same declared
+    endpoint policy, so both channels are step integrals in currency-hours that
+    resolve an interval exactly as the caller declared. Under the declared
+    ``STEP_START`` policy the level carried through each interval is integrated, so
+    the measurement does not depend on how finely the same economic history was
+    sampled; under ``STEP_END`` the level at the end of each interval is
+    integrated, exactly as the basis channel does, so where a sample lands relative
+    to a step is a declared property of the endpoint policy rather than a defect of
+    one channel. Nothing here reads a clock, and no instant is invented.
     """
 
     if not isinstance(policy, CapitalHoursPolicy):
@@ -3692,11 +3697,12 @@ def measure_capital_hours(
         basis = earlier.allocated_basis if step_from_start else later.allocated_basis
         capital_total += (basis * seconds) / CAPITAL_SECONDS_PER_HOUR
         # The cost channel is the *same declared step integral* of the declared
-        # cumulative cost: the cost carried through the interval, resolved by the
-        # policy's endpoint just like the basis, so it is invariant to how finely
-        # the same economic history is sampled. Scaling the interval's cost
-        # movement by the interval's own length would instead double-count time and
-        # make the measurement depend on the sampling cadence.
+        # cumulative cost: the level the policy's endpoint resolves for the
+        # interval, exactly as the basis channel resolves its own interval, over
+        # the same span. Multiplying the interval's cost *movement* by the
+        # interval's own length would report a different quantity (a movement
+        # times a duration in currency-hours) and would not match the basis
+        # channel at all.
         cost_basis = (
             earlier.cumulative_cost if step_from_start else later.cumulative_cost
         )
