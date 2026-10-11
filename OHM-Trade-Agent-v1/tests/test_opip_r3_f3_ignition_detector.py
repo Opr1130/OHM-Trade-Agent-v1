@@ -268,7 +268,24 @@ IGNITION_SOURCE = IGNITION_PATH.read_text(encoding="utf-8")
 CONTRACT_SOURCE = CONTRACT_PATH.read_text(encoding="utf-8")
 
 NEW_MODULE_PATHS = frozenset(
-    str(path) for path in (IGNITION_PATH, CONTRACT_PATH, DETECTORS_INIT_PATH, CONTRACTS_INIT_PATH)
+    str(path)
+    for path in (
+        IGNITION_PATH,
+        CONTRACT_PATH,
+        DETECTORS_INIT_PATH,
+        CONTRACTS_INIT_PATH,
+        # The separately OWNER-approved R5-A Continuous Opportunity Engine
+        # increment (ATDD-R5-A-continuous-opportunity-engine) consumes the frozen
+        # F3 detector and its contract vocabulary: the composition engine calls
+        # `ignition.evaluate(...)` and the phase projection reads the F3 claim
+        # contract. This widens the exclusion set by exactly those two authorized
+        # consumers, and only for the vocabulary-mention scan below. No assertion
+        # below is removed or relaxed: the Compose literal, the forbidden import
+        # roots, the detector purity checks, the authority-token checks and the
+        # rule that no runtime path imports the detector all still hold.
+        APP_ROOT / "app" / "opip" / "events" / "opportunity_engine.py",
+        APP_ROOT / "app" / "opip" / "contracts" / "opportunity_phases.py",
+    )
 )
 
 FORBIDDEN_IMPORT_ROOTS = frozenset(
