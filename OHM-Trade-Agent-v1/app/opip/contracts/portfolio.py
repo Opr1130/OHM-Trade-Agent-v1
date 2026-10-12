@@ -3318,6 +3318,32 @@ def unratified_plan_constraints() -> PortfolioPlanConstraints:
     return PortfolioPlanConstraints()
 
 
+def _switch_turnover_charge(
+    *,
+    comparison: RotationComparison,
+    switched_capital_dollars: float | None,
+) -> float | None:
+    """The dollars one switch charges against the turnover budget, or ``None``.
+
+    ``RO-02``'s safeguard is a *turnover* budget: what it bounds is the capital a
+    switch moves, not merely the fee, spread and latency stack that switch pays.
+    The charge is therefore the capital the switch turns over, floored by that
+    switch's own round-trip cost so a declared capital can never record a switch
+    as though it were cheaper than the costs it already commits.
+
+    ``None`` means the capital is not established. An unestablished charge cannot
+    be bounded, so the branch that reads this fails closed instead of treating an
+    unknown capital as no turnover at all.
+    """
+
+    if switched_capital_dollars is None:
+        return None
+    capital = require_non_negative(
+        switched_capital_dollars, field_name="switched_capital_dollars"
+    )
+    return max(capital, comparison.replacement.round_trip_cost)
+
+
 def _switch_gate_evidence_reasons(
     *,
     window_identity: str,
@@ -3325,6 +3351,7 @@ def _switch_gate_evidence_reasons(
     comparison: Any = None,
     cooldown_reason: PortfolioPlanAbstentionReason | None = None,
     turn_over_committed_dollars: float = 0.0,
+    switched_capital_dollars: float | None = None,
 ) -> tuple[tuple[PortfolioPlanAbstentionReason, ...], float | None]:
     """The clock-free, history-free evidence branches of the switch gate (``RO-02``).
 
@@ -3334,6 +3361,14 @@ def _switch_gate_evidence_reasons(
     turnover budget and the treatment-adjusted advantage. ``PLAN_NOT_CURRENT`` and
     ``PLAN_EXPIRED`` are not reachable without a decision clock and stay with the
     decision-time gate, which remains the authority over the switch.
+
+    The turnover branch is charged in the capital the switch *turns over* rather
+    than in the round-trip cost alone: a switch that moves a large position for a
+    small fee is exactly the churn a turnover budget exists to bound. The charge is
+    the capital the switch moves - recorded by the plan's own declared ``ROTATE``
+    step, or declared by the caller for a switch the plan does not declare - and is
+    never below that switch's own round-trip cost. An unestablished capital cannot
+    be bounded and abstains with ``TURNOVER_BUDGET_EXHAUSTED``.
 
     *Every* satisfied branch is returned in the frozen
     ``PORTFOLIO_PLAN_ABSTENTION_PRECEDENCE`` order, so the caller reports the same
@@ -3364,7 +3399,10 @@ def _switch_gate_evidence_reasons(
     committed = require_non_negative(
         turn_over_committed_dollars, field_name="turn_over_committed_dollars"
     )
-    if committed + comparison.replacement.round_trip_cost > float(
+    charge = _switch_turnover_charge(
+        comparison=comparison, switched_capital_dollars=switched_capital_dollars
+    )
+    if charge is None or committed + charge > float(
         constraints.turnover_budget_dollars
     ):
         reasons.append(PortfolioPlanAbstentionReason.TURNOVER_BUDGET_EXHAUSTED)
@@ -3404,6 +3442,7 @@ def _evaluate_switch_gate(
     current_plan_id: str | None = None,
     seconds_since_last_switch: float | None = None,
     turn_over_committed_dollars: float = 0.0,
+    switched_capital_dollars: float | None = None,
 ) -> tuple[PortfolioPlanAbstentionReason | None, float | None]:
     """Read the closed abstention precedence of the switching decision (``RO-02``).
 
@@ -3416,6 +3455,14 @@ def _evaluate_switch_gate(
     treatment-adjusted one, read conservatively (the replacement's lower bound
     against the best competing upper bound) when ``OQ-05`` selects
     ``LOWER_BOUND``.
+
+    Freshness is required evidence rather than an optional refinement: an
+    evaluation that does not establish which revision is current cannot show that
+    the record it read is the current one, so an unestablished current revision
+    abstains with ``PLAN_NOT_CURRENT`` instead of being assumed to be live. The
+    turnover branch is charged in the capital the switch turns over, which is the
+    plan's own declared ``ROTATE`` step or the caller's declaration for a switch
+    the plan does not declare.
     """
 
     if not isinstance(constraints, PortfolioPlanConstraints):
@@ -3424,10 +3471,11 @@ def _evaluate_switch_gate(
         return PortfolioPlanAbstentionReason.POLICY_NOT_BOUND, None
     window = require_portfolio_text(window_identity, field_name="window_identity")
     identity = require_portfolio_text(plan_id, field_name="plan_id")
-    if current_plan_id is not None:
-        current = require_portfolio_text(current_plan_id, field_name="current_plan_id")
-        if current != identity:
-            return PortfolioPlanAbstentionReason.PLAN_NOT_CURRENT, None
+    if current_plan_id is None:
+        return PortfolioPlanAbstentionReason.PLAN_NOT_CURRENT, None
+    current = require_portfolio_text(current_plan_id, field_name="current_plan_id")
+    if current != identity:
+        return PortfolioPlanAbstentionReason.PLAN_NOT_CURRENT, None
     evaluated_at = require_portfolio_utc(now, field_name="now")
     expiry = require_portfolio_utc(plan_expiry, field_name="plan_expiry")
     if evaluated_at >= expiry:
@@ -3448,6 +3496,7 @@ def _evaluate_switch_gate(
         comparison=comparison,
         cooldown_reason=cooldown_reason,
         turn_over_committed_dollars=turn_over_committed_dollars,
+        switched_capital_dollars=switched_capital_dollars,
     )
     if reasons:
         return reasons[0], None
@@ -3682,7 +3731,7 @@ class PortfolioPlan:
                             "a ROTATE action must carry the common-window comparison that "
                             "proves the switch advantage"
                         )
-                    self._assert_static_switch_admission(action.alternative_id)
+                    self._assert_static_switch_admission(action)
             actions.append(action)
         declared = tuple(action.sequence for action in actions)
         if declared != tuple(range(1, len(actions) + 1)):
@@ -3691,27 +3740,30 @@ class PortfolioPlan:
             )
         return tuple(actions)
 
-    def _assert_static_switch_admission(self, alternative_id: str) -> None:
+    def _assert_static_switch_admission(self, action: PortfolioPlanAction) -> None:
         """The clock-free admission a declared ``ROTATE`` step must already satisfy.
 
         A plan declares what its own recorded evidence supports, so the requested
         switch must be the head of the plan's own observed eligible ranking, and
         every branch of the switch gate that the plan's own evidence *can* settle
         must already admit it: a ratified versioned policy, an available
-        common-window comparison bound to the plan's own legs, an uncertainty
-        treatment the recorded bands can be read under, and a treatment-adjusted
-        advantage at or above the ratified minimum.
+        common-window comparison bound to the plan's own legs, a turnover budget
+        the step's own declared capital still fits, an uncertainty treatment the
+        recorded bands can be read under, and a treatment-adjusted advantage at or
+        above the ratified minimum.
 
         Two branches deliberately stay with the decision-time gate because this
-        record cannot settle them: ``PLAN_EXPIRED`` needs a decision clock and
-        ``COOLDOWN_ACTIVE`` needs the switch history. This is a build-time
-        *necessary* condition, never an authorization, and the decision-time gate
-        remains the authority over the switch. The turnover branch is read here
-        with no prior turnover recorded, which is the most favourable case a switch
-        can face, so a plan whose own round trip already exceeds the whole budget
-        cannot be licensed by any history.
+        record cannot settle them: ``PLAN_EXPIRED`` needs a decision clock,
+        ``COOLDOWN_ACTIVE`` needs the switch history and ``PLAN_NOT_CURRENT`` needs
+        the current revision identity. This is a build-time *necessary* condition,
+        never an authorization, and the decision-time gate remains the authority
+        over the switch. The turnover branch is read here in the capital the step
+        itself declares and with no prior turnover recorded, which is the most
+        favourable case a switch can face, so a plan whose own declared capital
+        already exceeds the whole budget cannot be licensed by any history.
         """
 
+        alternative_id = action.alternative_id
         if alternative_id != self.best_observed_alternative_id:
             raise PortfolioContractError(
                 "a ROTATE action must name the best observed eligible alternative: a "
@@ -3722,6 +3774,7 @@ class PortfolioPlan:
             constraints=self.constraints,
             comparison=self.comparison_for_alternative(alternative_id),
             turn_over_committed_dollars=0.0,
+            switched_capital_dollars=action.capital_delta,
         )
         if reasons:
             raise PortfolioContractError(
@@ -3854,6 +3907,27 @@ class PortfolioPlan:
             return self.comparisons[0]
         return None
 
+    def _resolve_switch_capital(self, declared: float | None) -> float | None:
+        """The capital the switch under evaluation turns over, or ``None``.
+
+        The record's own statement of the capital a switch moves is the plan's
+        declared ``ROTATE`` step. A caller may declare the capital of a switch the
+        plan does not declare - the hold-shaped plan asked what a rotation *would*
+        turn over - and may never lower the plan's own recorded figure, because
+        understating the capital is how a switch could slip past a turnover budget.
+        ``None`` means the capital is unestablished, and the turnover branch fails
+        closed on it.
+        """
+
+        rotations = self.rotation_actions
+        if not rotations:
+            return declared
+        recorded = rotations[0].capital_delta
+        if declared is None:
+            return recorded
+        stated = require_non_negative(declared, field_name="switched_capital_dollars")
+        return max(recorded, stated)
+
     def switch_abstention_reason(
         self,
         *,
@@ -3862,12 +3936,15 @@ class PortfolioPlan:
         current_plan_id: str | None = None,
         seconds_since_last_switch: float | None = None,
         turn_over_committed_dollars: float = 0.0,
+        switched_capital_dollars: float | None = None,
     ) -> PortfolioPlanAbstentionReason | None:
         """The one governed abstention reason, or ``None`` when proven.
 
         ``None`` means the rotation advantage was proven under the ratified policy
         and its declared uncertainty treatment. Anything else is a specific,
-        recorded abstention reported in the frozen precedence order.
+        recorded abstention reported in the frozen precedence order. Freshness is
+        required evidence: an evaluation that does not name the current revision
+        abstains with ``PLAN_NOT_CURRENT`` rather than assuming this record is it.
         """
 
         reason, _ = _evaluate_switch_gate(
@@ -3880,6 +3957,9 @@ class PortfolioPlan:
             current_plan_id=current_plan_id,
             seconds_since_last_switch=seconds_since_last_switch,
             turn_over_committed_dollars=turn_over_committed_dollars,
+            switched_capital_dollars=self._resolve_switch_capital(
+                switched_capital_dollars
+            ),
         )
         return reason
 
@@ -3891,6 +3971,7 @@ class PortfolioPlan:
         current_plan_id: str | None = None,
         seconds_since_last_switch: float | None = None,
         turn_over_committed_dollars: float = 0.0,
+        switched_capital_dollars: float | None = None,
     ) -> RotationSwitchStatus:
         """Whether a discretionary rotation advantage was proven (``RO-02``)."""
 
@@ -3900,6 +3981,7 @@ class PortfolioPlan:
             current_plan_id=current_plan_id,
             seconds_since_last_switch=seconds_since_last_switch,
             turn_over_committed_dollars=turn_over_committed_dollars,
+            switched_capital_dollars=switched_capital_dollars,
         )
         if reason is None:
             return RotationSwitchStatus.ROTATION_ADVANTAGE_PROVEN
@@ -3913,6 +3995,7 @@ class PortfolioPlan:
         current_plan_id: str | None = None,
         seconds_since_last_switch: float | None = None,
         turn_over_committed_dollars: float = 0.0,
+        switched_capital_dollars: float | None = None,
     ) -> "RotationSwitchAssessment":
         """The durable, replayable outcome record of one switch evaluation."""
 
@@ -3923,6 +4006,7 @@ class PortfolioPlan:
             current_plan_id=current_plan_id,
             seconds_since_last_switch=seconds_since_last_switch,
             turn_over_committed_dollars=turn_over_committed_dollars,
+            switched_capital_dollars=switched_capital_dollars,
         )
 
     def _identity_payload(self) -> dict[str, Any]:
@@ -4172,6 +4256,7 @@ def assess_rotation_switch(
     current_plan_id: str | None = None,
     seconds_since_last_switch: float | None = None,
     turn_over_committed_dollars: float = 0.0,
+    switched_capital_dollars: float | None = None,
 ) -> RotationSwitchAssessment:
     """Evaluate the switch of one plan and record the governed outcome (``RO-02``).
 
@@ -4179,6 +4264,10 @@ def assess_rotation_switch(
     execution, and it cannot overrule a deterministic rejection. When the policy
     is not ratified the assessment abstains with ``POLICY_NOT_BOUND`` and records
     no advantage at all, so an unratified run cannot look like a licensed switch.
+    The capital the switch turns over is read from the plan's own declared
+    ``ROTATE`` step, so an evaluation can neither omit it nor report less turnover
+    than the record declares, and an evaluation that does not name the current
+    revision abstains with ``PLAN_NOT_CURRENT``.
     """
 
     if not isinstance(plan, PortfolioPlan):
@@ -4193,6 +4282,9 @@ def assess_rotation_switch(
         current_plan_id=current_plan_id,
         seconds_since_last_switch=seconds_since_last_switch,
         turn_over_committed_dollars=turn_over_committed_dollars,
+        switched_capital_dollars=plan._resolve_switch_capital(
+            switched_capital_dollars
+        ),
     )
     abstained = reason is not None
     return RotationSwitchAssessment(

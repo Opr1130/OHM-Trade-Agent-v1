@@ -259,7 +259,13 @@ CAP_VERSION = "pv-r5d-0001"
 #: A labelled engineering-scenario constraint set. These numbers are test
 #: fixtures, not an accepted policy: `OQ-05` still owns the real values.
 RATIFIED_SCENARIO_ADVANTAGE = 5.0
-RATIFIED_SCENARIO_TURNOVER_BUDGET = 50.0
+#: The capital the scenario's own rotation declares it turns over. The turnover
+#: budget is charged in capital moved, not in the round-trip cost alone, so the
+#: scenario budget must exceed the switch the scenario means to admit. A switch that
+#: declares no capital of its own is not priced as a round trip: it fails closed as
+#: unestablished, and the tests below prove both branches.
+RATIFIED_SCENARIO_SWITCH_CAPITAL = 121.0
+RATIFIED_SCENARIO_TURNOVER_BUDGET = 250.0
 
 # ---------------------------------------------------------------------------
 # Fixtures and helpers
@@ -1247,14 +1253,20 @@ def test_ac_002_a_rotate_step_must_be_admitted_by_the_plans_own_evidence() -> No
     )
     assert holding.is_rotation_plan is False
     assert (
-        holding.assess_rotation_switch(now=T0 + timedelta(hours=1)).abstention_reason
+        holding.assess_rotation_switch(
+            now=T0 + timedelta(hours=1),
+            current_plan_id=holding.plan_id,
+            switched_capital_dollars=RATIFIED_SCENARIO_SWITCH_CAPITAL,
+        ).abstention_reason
         is PortfolioPlanAbstentionReason.ADVANTAGE_BELOW_MINIMUM
     )
 
     admitted, _ = rotation_plan()
     assert admitted.is_rotation_plan is True
     assert (
-        admitted.assess_rotation_switch(now=T0 + timedelta(hours=1)).status
+        admitted.assess_rotation_switch(
+            now=T0 + timedelta(hours=1), current_plan_id=admitted.plan_id
+        ).status
         is RotationSwitchStatus.ROTATION_ADVANTAGE_PROVEN
     )
 
@@ -1381,7 +1393,12 @@ def test_ac_002_no_profit_target_or_trade_count_can_force_a_trade() -> None:
     )
     assert plan_record.is_rotation_plan is False
 
-    assessment = assess_rotation_switch(plan_record, now=T0 + timedelta(hours=1))
+    assessment = assess_rotation_switch(
+        plan_record,
+        now=T0 + timedelta(hours=1),
+        current_plan_id=plan_record.plan_id,
+        switched_capital_dollars=RATIFIED_SCENARIO_SWITCH_CAPITAL,
+    )
     assert assessment.status is RotationSwitchStatus.ABSTAINED
     assert (
         assessment.abstention_reason
@@ -1840,10 +1857,11 @@ def test_ac_005_an_unratified_policy_abstains_before_anything_numeric() -> None:
 def test_ac_005_a_stale_or_expired_plan_abstains() -> None:
     """ATDD-R5-D-portfolio-planning/AC-005: a superseded or expired plan cannot switch.
 
-    GIVEN a plan revision that is no longer current, or whose expiry has passed
+    GIVEN a plan revision that is superseded, unestablished or past its expiry
     WHEN the switch gate is evaluated
-    THEN it abstains with `PLAN_NOT_CURRENT` or `PLAN_EXPIRED`, and the current,
-    unexpired plan is still evaluated on its economics
+    THEN it abstains with `PLAN_NOT_CURRENT` or `PLAN_EXPIRED` instead of the plan
+    being assumed live, and the current, unexpired plan is still evaluated on its
+    economics
     """
 
     record, _ = rotation_plan()
@@ -1858,8 +1876,18 @@ def test_ac_005_a_stale_or_expired_plan_abstains() -> None:
     assert stale.advantage_dollars is None
 
     expired, _ = rotation_plan(expiry=T0 + timedelta(hours=1))
-    late = assess_rotation_switch(expired, now=T0 + timedelta(hours=2))
+    late = assess_rotation_switch(
+        expired, now=T0 + timedelta(hours=2), current_plan_id=expired.plan_id
+    )
     assert late.abstention_reason is PortfolioPlanAbstentionReason.PLAN_EXPIRED
+
+    # An unestablished current revision is not the same as a current one: a caller
+    # that cannot name the plan it believes is current gets the same fail-closed
+    # abstention a superseded revision gets, instead of the plan being assumed live.
+    unnamed = assess_rotation_switch(record, now=T0 + timedelta(hours=1))
+    assert unnamed.status is RotationSwitchStatus.ABSTAINED
+    assert unnamed.abstention_reason is PortfolioPlanAbstentionReason.PLAN_NOT_CURRENT
+    assert unnamed.advantage_dollars is None
 
     current = assess_rotation_switch(
         record, now=T0 + timedelta(hours=1), current_plan_id=record.plan_id
@@ -1893,6 +1921,7 @@ def test_ac_005_the_abstention_precedence_is_closed_and_ordered() -> None:
     expired_wins = assess_rotation_switch(
         long_cooldown,
         now=T0 + timedelta(hours=4),
+        current_plan_id=long_cooldown.plan_id,
         seconds_since_last_switch=0.0,
         turn_over_committed_dollars=10_000.0,
     )
@@ -1902,6 +1931,7 @@ def test_ac_005_the_abstention_precedence_is_closed_and_ordered() -> None:
     comparison_wins = assess_rotation_switch(
         no_comparison,
         now=T0 + timedelta(hours=1),
+        current_plan_id=no_comparison.plan_id,
         seconds_since_last_switch=0.0,
         turn_over_committed_dollars=10_000.0,
     )
@@ -1913,6 +1943,7 @@ def test_ac_005_the_abstention_precedence_is_closed_and_ordered() -> None:
     cooldown_wins = assess_rotation_switch(
         long_cooldown,
         now=T0 + timedelta(hours=1),
+        current_plan_id=long_cooldown.plan_id,
         seconds_since_last_switch=0.0,
         turn_over_committed_dollars=10_000.0,
     )
@@ -1920,12 +1951,17 @@ def test_ac_005_the_abstention_precedence_is_closed_and_ordered() -> None:
 
     # A ROTATE step may only be declared when the plan's own recorded evidence
     # already admits the switch, so the decision-time branches are proved on a plan
-    # that records the comparison and declares no switch.
+    # that records the comparison and declares no switch. A hypothetical switch
+    # carries no capital of its own, so the caller declares what it would turn over.
     turnover, _ = third_leg_plan(
         constraints=band_constraints(turnover_budget_dollars=1.0)
     )
     turnover_wins = assess_rotation_switch(
-        turnover, now=T0 + timedelta(hours=1), turn_over_committed_dollars=10_000.0
+        turnover,
+        now=T0 + timedelta(hours=1),
+        current_plan_id=turnover.plan_id,
+        turn_over_committed_dollars=10_000.0,
+        switched_capital_dollars=RATIFIED_SCENARIO_SWITCH_CAPITAL,
     )
     assert (
         turnover_wins.abstention_reason
@@ -1933,7 +1969,12 @@ def test_ac_005_the_abstention_precedence_is_closed_and_ordered() -> None:
     )
 
     band_plan, _ = third_leg_plan(constraints=band_constraints())
-    band_wins = assess_rotation_switch(band_plan, now=T0 + timedelta(hours=1))
+    band_wins = assess_rotation_switch(
+        band_plan,
+        now=T0 + timedelta(hours=1),
+        current_plan_id=band_plan.plan_id,
+        switched_capital_dollars=RATIFIED_SCENARIO_SWITCH_CAPITAL,
+    )
     assert (
         band_wins.abstention_reason
         is PortfolioPlanAbstentionReason.UNCERTAINTY_BAND_UNCLEAR
@@ -1951,7 +1992,9 @@ def test_ac_005_a_proven_advantage_records_the_policy_that_licensed_it() -> None
     """
 
     record, _ = rotation_plan()
-    assessment = assess_rotation_switch(record, now=T0 + timedelta(hours=1))
+    assessment = assess_rotation_switch(
+        record, now=T0 + timedelta(hours=1), current_plan_id=record.plan_id
+    )
     assert assessment.status is RotationSwitchStatus.ROTATION_ADVANTAGE_PROVEN
     assert assessment.abstention_reason is None
     assert assessment.advantage_dollars == 21.0
@@ -1993,7 +2036,10 @@ def test_ac_005_a_proven_advantage_records_the_policy_that_licensed_it() -> None
         constraints=band_constraints(),
     )
     conservative_assessment = assess_rotation_switch(
-        conservative, now=T0 + timedelta(hours=1)
+        conservative,
+        now=T0 + timedelta(hours=1),
+        current_plan_id=conservative.plan_id,
+        switched_capital_dollars=RATIFIED_SCENARIO_SWITCH_CAPITAL,
     )
     assert conservative_assessment.status is RotationSwitchStatus.ABSTAINED
     assert (
@@ -2008,7 +2054,9 @@ def test_ac_005_a_proven_advantage_records_the_policy_that_licensed_it() -> None
         comparisons=(banded_comparison,),
         constraints=scenario_constraints(),
     )
-    expected_assessment = assess_rotation_switch(expected, now=T0 + timedelta(hours=1))
+    expected_assessment = assess_rotation_switch(
+        expected, now=T0 + timedelta(hours=1), current_plan_id=expected.plan_id
+    )
     assert expected_assessment.status is RotationSwitchStatus.ROTATION_ADVANTAGE_PROVEN
     assert expected_assessment.advantage_dollars == 21.0
     assert expected_assessment.uncertainty_treatment is UncertaintyTreatment.EXPECTED
@@ -2039,7 +2087,9 @@ def test_ac_005_a_caller_cannot_substitute_a_more_favourable_comparison() -> Non
     )
 
     smuggled = record.assess_rotation_switch(
-        now=T0 + timedelta(hours=1), comparison=substituted
+        now=T0 + timedelta(hours=1),
+        current_plan_id=record.plan_id,
+        comparison=substituted,
     )
     assert smuggled.status is RotationSwitchStatus.ABSTAINED
     assert (
@@ -2049,10 +2099,134 @@ def test_ac_005_a_caller_cannot_substitute_a_more_favourable_comparison() -> Non
     assert smuggled.advantage_dollars is None
 
     owned = record.assess_rotation_switch(
-        now=T0 + timedelta(hours=1), comparison=recorded
+        now=T0 + timedelta(hours=1),
+        current_plan_id=record.plan_id,
+        comparison=recorded,
     )
     assert owned.status is RotationSwitchStatus.ROTATION_ADVANTAGE_PROVEN
     assert owned.advantage_dollars == 21.0
+
+
+def test_ac_005_the_turnover_budget_is_charged_in_the_capital_a_switch_moves() -> None:
+    """ATDD-R5-D-portfolio-planning/AC-005: the budget bounds capital, not fees.
+
+    GIVEN an admitted rotation whose declared capital and round-trip cost are both
+    known
+    WHEN the committed turnover and the switch's own capital are charged together
+    THEN the exhaustion boundary is the capital the switch moves: a caller cannot
+    understate it and buy the switch back, while a hypothetical switch that declares
+    less capital than the round trip it already commits cannot look cheaper than
+    those costs
+    """
+
+    record, recorded = rotation_plan()
+    capital = record.rotation_actions[0].capital_delta
+    round_trip = recorded.replacement.round_trip_cost
+    budget = float(record.constraints.turnover_budget_dollars)
+    assert capital == RATIFIED_SCENARIO_SWITCH_CAPITAL
+    assert 0.0 < round_trip < capital < budget
+
+    # The committed turnover that would still fit if only the round trip were
+    # charged exhausts the budget once the capital the switch moves is charged too.
+    committed = budget - capital + round_trip
+    exhausted = record.assess_rotation_switch(
+        now=T0 + timedelta(hours=1),
+        current_plan_id=record.plan_id,
+        turn_over_committed_dollars=committed,
+    )
+    assert exhausted.status is RotationSwitchStatus.ABSTAINED
+    assert (
+        exhausted.abstention_reason
+        is PortfolioPlanAbstentionReason.TURNOVER_BUDGET_EXHAUSTED
+    )
+    assert exhausted.advantage_dollars is None
+
+    # Declaring less capital than the plan's own rotation record states cannot buy
+    # the switch back: the plan's own declaration is the floor.
+    understated = record.assess_rotation_switch(
+        now=T0 + timedelta(hours=1),
+        current_plan_id=record.plan_id,
+        turn_over_committed_dollars=committed,
+        switched_capital_dollars=1.0,
+    )
+    assert (
+        understated.abstention_reason
+        is PortfolioPlanAbstentionReason.TURNOVER_BUDGET_EXHAUSTED
+    )
+
+    # The boundary is inclusive: turnover plus the declared capital up to the budget
+    # still admits the switch.
+    exact = record.assess_rotation_switch(
+        now=T0 + timedelta(hours=1),
+        current_plan_id=record.plan_id,
+        turn_over_committed_dollars=budget - capital,
+    )
+    assert exact.status is RotationSwitchStatus.ROTATION_ADVANTAGE_PROVEN
+    assert exact.advantage_dollars == 21.0
+
+    # A hypothetical switch the plan does not declare carries no capital of its own,
+    # so the caller declares it, and the round trip the switch already commits is the
+    # floor under that declaration.
+    hypothetical, hypothetical_comparison = third_leg_plan(
+        constraints=scenario_constraints(turnover_budget_dollars=round_trip / 2.0)
+    )
+    assert hypothetical_comparison.replacement.round_trip_cost == round_trip
+    assert hypothetical_comparison.expected_advantage_over_best_alternative == 21.0
+    floored = assess_rotation_switch(
+        hypothetical,
+        now=T0 + timedelta(hours=1),
+        current_plan_id=hypothetical.plan_id,
+        switched_capital_dollars=1.0,
+    )
+    assert (
+        floored.abstention_reason
+        is PortfolioPlanAbstentionReason.TURNOVER_BUDGET_EXHAUSTED
+    )
+
+    admitted, _ = third_leg_plan(
+        constraints=scenario_constraints(turnover_budget_dollars=round_trip)
+    )
+    admitted_assessment = assess_rotation_switch(
+        admitted,
+        now=T0 + timedelta(hours=1),
+        current_plan_id=admitted.plan_id,
+        switched_capital_dollars=1.0,
+    )
+    assert admitted_assessment.status is RotationSwitchStatus.ROTATION_ADVANTAGE_PROVEN
+    assert admitted_assessment.advantage_dollars == 21.0
+
+
+def test_ac_005_an_unestablished_switch_capital_abstains_instead_of_being_assumed() -> None:
+    """ATDD-R5-D-portfolio-planning/AC-005: unknown capital is not free capital.
+
+    GIVEN a plan that records no switch of its own
+    WHEN the gate is asked whether a hypothetical switch into the replacement would
+    be licensed, with no capital declared for it
+    THEN it abstains as `TURNOVER_BUDGET_EXHAUSTED` rather than pricing the
+    hypothetical switch at its round trip, while a declared capital is evaluated on
+    the declared figure
+    """
+
+    hypothetical, _ = third_leg_plan()
+
+    unknown = assess_rotation_switch(
+        hypothetical, now=T0 + timedelta(hours=1), current_plan_id=hypothetical.plan_id
+    )
+    assert unknown.status is RotationSwitchStatus.ABSTAINED
+    assert (
+        unknown.abstention_reason
+        is PortfolioPlanAbstentionReason.TURNOVER_BUDGET_EXHAUSTED
+    )
+    assert unknown.advantage_dollars is None
+
+    declared = assess_rotation_switch(
+        hypothetical,
+        now=T0 + timedelta(hours=1),
+        current_plan_id=hypothetical.plan_id,
+        switched_capital_dollars=RATIFIED_SCENARIO_SWITCH_CAPITAL,
+    )
+    assert declared.status is RotationSwitchStatus.ROTATION_ADVANTAGE_PROVEN
+    assert declared.advantage_dollars == 21.0
 
 
 def test_ac_005_the_discretionary_gate_never_delays_a_protective_exit() -> None:
@@ -2162,6 +2336,43 @@ def test_ac_006_the_linked_legs_obey_the_two_leg_laws() -> None:
         thesis(entry_policy="PFCST:ENTRY:9")
     with pytest.raises(RotationGroupContractError, match="rotation group's subject"):
         group(thesis_record=thesis_record_with_subject("POPT:R5D:OTHER"))
+
+
+def test_ac_006_a_committed_fill_is_committed_by_one_leg_only() -> None:
+    """ATDD-R5-D-portfolio-planning/AC-006: one fill, one leg, one move of capital.
+
+    GIVEN a rotation group whose two legs each reference the fills they committed
+    WHEN the exit's own committed fill is claimed by the entry leg as well, whether
+    the group is built directly or replayed from its durable payload
+    THEN the group is refused, because a fill is committed once and a payload that
+    books it twice counts one move of capital as two
+    """
+
+    record = group()
+    committed = [fill.fill_id for leg in record.legs for fill in leg.fills]
+    assert committed == ["PFILL:R5D:EXIT:1", "PFILL:R5D:ENTRY:1"]
+    assert len(set(committed)) == len(committed)
+
+    shared = "PFILL:R5D:SHARED:1"
+    ambiguous_exit = exit_leg(
+        fills=(RotationLegFill(fill_id=shared, quantity=6.0, price=10.0, fee=1.0),)
+    )
+    ambiguous_entry = entry_leg(
+        fills=(RotationLegFill(fill_id=shared, quantity=4.0, price=10.0, fee=0.5),)
+    )
+    with pytest.raises(RotationGroupContractError, match="both legs"):
+        group(exit_record=ambiguous_exit, entry_record=ambiguous_entry)
+
+    # The same forgery replayed from the durable payload is refused while the payload
+    # is rebuilt, before the re-linked fill can be reasoned about as evidence.
+    payload = dict(record.as_dict())
+    legs = [dict(leg) for leg in payload["legs"]]
+    legs[1]["fills"] = [
+        dict(legs[1]["fills"][0], fill_id=legs[0]["fills"][0]["fill_id"])
+    ]
+    payload["legs"] = legs
+    with pytest.raises(RotationGroupContractError, match="both legs"):
+        RotationGroup.from_dict(payload)
 
 
 def test_ac_006_a_partial_exit_funds_only_policy_allowed_entries() -> None:

@@ -1116,6 +1116,8 @@ class RotationGroup:
     The laws it enforces instead of trusting the writer:
 
     * both legs of one group share the group's subject, and a group has no third leg;
+    * no committed fill is counted twice: a fill id appears on at most one leg, so a
+      replayed payload cannot fund the entry with the exit's own committed fill;
     * an entry leg exists only with the thesis' declared entry policy forecast, so
       a partial exit funds policy-allowed entries only;
     * the committed proceeds equal what the exit leg's committed fills released and
@@ -1222,6 +1224,16 @@ class RotationGroup:
                     "a partial exit can only fund policy-allowed entries: the entry "
                     "leg must carry the thesis' declared entry policy forecast"
                 )
+        # A fill is committed by one side of one group. A payload that books the same
+        # committed fill against both legs counts one move of capital twice, and a
+        # replay that re-links an already committed fill to the other side is refused
+        # rather than trusted.
+        fill_ids = [fill.fill_id for leg in legs for fill in leg.fills]
+        if len(set(fill_ids)) != len(fill_ids):
+            raise RotationGroupContractError(
+                "a committed fill cannot appear on both legs of a rotation group: a "
+                "fill is committed once and may not be counted as two moves"
+            )
         object.__setattr__(self, "legs", legs)
 
         reasons = _rotation_sequence(self.reasons, field_name="reasons")

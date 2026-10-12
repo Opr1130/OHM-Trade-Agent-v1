@@ -63,7 +63,7 @@ the discretionary switching gate of `RO-02` and an owner policy that is still op
 WHEN:
 a switch is evaluated for a plan revision
 THEN:
-an unratified or unbound policy abstains with `POLICY_NOT_BOUND` before any numeric input is considered, a superseded or expired plan abstains with `PLAN_NOT_CURRENT` or `PLAN_EXPIRED`, the remaining gaps are reported in the frozen closed precedence (`CASH_COMPARISON_UNAVAILABLE`, `COOLDOWN_ACTIVE`, `TURNOVER_BUDGET_EXHAUSTED`, `UNCERTAINTY_BAND_UNCLEAR`, `ADVANTAGE_BELOW_MINIMUM`), only a comparison the plan itself recorded is evaluated so a caller cannot substitute more favourable economics, a proven advantage records the advantage together with the ratified minimum and uncertainty treatment that licensed it, and the discretionary gate never delays or weakens an independent F11 protective exit
+an unratified or unbound policy abstains with `POLICY_NOT_BOUND` before any numeric input is considered, a superseded, unestablished or expired plan abstains with `PLAN_NOT_CURRENT` or `PLAN_EXPIRED`, the remaining gaps are reported in the frozen closed precedence (`CASH_COMPARISON_UNAVAILABLE`, `COOLDOWN_ACTIVE`, `TURNOVER_BUDGET_EXHAUSTED`, `UNCERTAINTY_BAND_UNCLEAR`, `ADVANTAGE_BELOW_MINIMUM`), the turnover budget is charged in the capital the switch moves rather than in the round-trip cost alone so a caller cannot understate the capital a declared rotation turns over and a switch whose capital cannot be established abstains as `TURNOVER_BUDGET_EXHAUSTED` instead of being priced as if it moved nothing, only a comparison the plan itself recorded is evaluated so a caller cannot substitute more favourable economics, a proven advantage records the advantage together with the ratified minimum and uncertainty treatment that licensed it, and the discretionary gate never delays or weakens an independent F11 protective exit
 
 AC-006:
 GIVEN:
@@ -71,7 +71,7 @@ the linked-intent `RotationGroup` record of the frozen `SC-09` contract
 WHEN:
 a rotation group is recorded and reloaded
 THEN:
-its payload carries the eight frozen keys in order (`old position`, `replacement thesis`, `both-leg intent/fill IDs`, `committed proceeds`, `requalification decision`, `residual exposure`, `terminal state`, `reasons`), its identity is a content hash, its legs obey the two-leg laws (first leg exit, at most one entry leg, distinct intent ids, entry leg carrying the thesis' declared policy-allowed entry forecast, no third leg), the record is dormant and non-authoritative with `ROTATION_GROUP_RECORDING_ENABLED` `False`, and a partial exit funds only policy-allowed affordable entry while the residual old exposure is counted
+its payload carries the eight frozen keys in order (`old position`, `replacement thesis`, `both-leg intent/fill IDs`, `committed proceeds`, `requalification decision`, `residual exposure`, `terminal state`, `reasons`), its identity is a content hash, its legs obey the two-leg laws (first leg exit, at most one entry leg, distinct intent ids, no committed fill counted twice across the legs so a replayed payload cannot fund the entry with the exit's own fill, entry leg carrying the thesis' declared policy-allowed entry forecast, no third leg), the record is dormant and non-authoritative with `ROTATION_GROUP_RECORDING_ENABLED` `False`, and a partial exit funds only policy-allowed affordable entry while the residual old exposure is counted
 
 AC-007:
 GIVEN:
@@ -138,9 +138,12 @@ AC-004 -> tests/test_opip_r5_d_portfolio_planning.py::test_ac_004_the_exit_sprea
 AC-005 -> tests/test_opip_r5_d_portfolio_planning.py::test_ac_005_a_caller_cannot_substitute_a_more_favourable_comparison
 AC-005 -> tests/test_opip_r5_d_portfolio_planning.py::test_ac_005_a_proven_advantage_records_the_policy_that_licensed_it
 AC-005 -> tests/test_opip_r5_d_portfolio_planning.py::test_ac_005_a_stale_or_expired_plan_abstains
+AC-005 -> tests/test_opip_r5_d_portfolio_planning.py::test_ac_005_an_unestablished_switch_capital_abstains_instead_of_being_assumed
 AC-005 -> tests/test_opip_r5_d_portfolio_planning.py::test_ac_005_an_unratified_policy_abstains_before_anything_numeric
 AC-005 -> tests/test_opip_r5_d_portfolio_planning.py::test_ac_005_the_abstention_precedence_is_closed_and_ordered
 AC-005 -> tests/test_opip_r5_d_portfolio_planning.py::test_ac_005_the_discretionary_gate_never_delays_a_protective_exit
+AC-005 -> tests/test_opip_r5_d_portfolio_planning.py::test_ac_005_the_turnover_budget_is_charged_in_the_capital_a_switch_moves
+AC-006 -> tests/test_opip_r5_d_portfolio_planning.py::test_ac_006_a_committed_fill_is_committed_by_one_leg_only
 AC-006 -> tests/test_opip_r5_d_portfolio_planning.py::test_ac_006_a_partial_exit_funds_only_policy_allowed_entries
 AC-006 -> tests/test_opip_r5_d_portfolio_planning.py::test_ac_006_the_group_is_dormant_and_non_authoritative
 AC-006 -> tests/test_opip_r5_d_portfolio_planning.py::test_ac_006_the_group_payload_carries_the_frozen_keys_in_order
@@ -196,6 +199,7 @@ DEFERRED DISCOVERIES:
 - The entry-bound law bounds the entry leg by the proceeds committed to the entry and does not require equality: a commitment is an authorization, so an entry that committed less leaves an unspent remainder that the caller's own proceeds record reconciles. Whether an unspent remainder must be visibly re-released to cash is an `R5-E` execution-reconciliation question, not a `SC-09` record law.
 - The exit cost stack is enforced asymmetrically and deliberately: the exit fee is an exact carry, while spread, latency and attributable operating cost are floors, because the frozen `SC-08` alternative keys do not declare the entry-side split of the composed leg. Understatement is the falsification direction and is refused; an overstatement only makes the switch less attractive and can never license a switch the after-cost comparison does not support.
 - The R5-D fixture was corrected so its rotation commitment is cash-accurate: the entry leg's committed fills cost 40.00 of notional plus 0.50 of fee, so the entry commitment is 40.50 and 18.50 is released to cash. The previous 40.00 commitment could never have afforded the entry it funded, and the corresponding assertions were updated rather than the fee being deleted.
+- Review remediation of the round-5 financial-integrity findings on this increment is declared here as the same kind of declared correction, not as a tests-first claim: (1) the turnover budget is now charged in the capital a switch moves -- floored by the round trip the switch already commits -- instead of in the round-trip cost alone, and the plan's own declared rotation capital is the floor under any caller declaration, so a caller cannot understate the capital a declared rotation turns over; (2) a switch whose capital cannot be established (a plan that declares no switch, and a caller that declares no capital for the hypothetical switch) abstains as `TURNOVER_BUDGET_EXHAUSTED` rather than being priced as if it moved nothing: this is the **fail-closed placeholder** for the still-open `OQ-05`, which owns what a unit of turnover means, and a ratified policy may redefine it; (3) a caller that cannot name the current plan revision satisfies no freshness branch and abstains as `PLAN_NOT_CURRENT` instead of the plan being assumed live; (4) `RotationGroup` enforces the no-committed-fill-counted-twice law across both legs, so one fill id claimed by the exit and the entry leg is refused whether the group is built directly or replayed from its durable payload. Forecast-identity and candidate-panel wiring remains deferred to `R5-E`.
 
 UNAPPROVED SCOPE CHANGES:
 NONE
