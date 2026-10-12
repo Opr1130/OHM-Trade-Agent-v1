@@ -86,9 +86,15 @@ DECLARED_LIVE_MUTATOR_CALLERS = frozenset(
         "app/services/trade_cli.py",
     }
 )
+#: Owner-approved ratification for the R5-E capital-admission seam
+#: (`ATDD-R5-E-capital-admission-integration`): it is the one module that translates
+#: a planned reservation into exactly one `admit_paper_opportunity` call, so it is a
+#: *declared* target-domain mutator caller. The guard is not weakened: the caller set
+#: must still match this declaration exactly.
 DECLARED_TARGET_MUTATOR_CALLERS = frozenset(
     {
         "app/opip/canonical/server.py",
+        "app/services/capital_admission_integration.py",
         "app/services/paper_v2_execution.py",
         "app/services/paper_v2_protection_runtime.py",
     }
