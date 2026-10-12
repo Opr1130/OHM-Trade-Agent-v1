@@ -12,7 +12,13 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from app.opip.canonical.models import (
+    BOUND_RESERVATION_CONSTRAINTS,
+    RESERVATION_CONSTRAINTS,
+    UNBOUND_RESERVATION_CONSTRAINTS,
     PaperPortfolioState,
+    PaperReservationCapacity,
+    PaperReservationLedger,
+    PaperReservationRecord,
     PaperV2ActiveExposure,
     PaperV2ActiveExposures,
     PaperV2ExecutionState,
@@ -78,6 +84,7 @@ from app.opip.contracts.paper_v2_identity import (
 )
 from app.opip.contracts.paper_execution_runtime import (
     PAPER_ACTION_ARMED_STATES,
+    PAPER_CAPITAL_POLICY_VERSION,
     PAPER_DIRECTION_LONG,
     PAPER_ADMISSION_REQUEST_RECORDED,
     PAPER_DECISION_SNAPSHOT_RECORDED,
@@ -1081,6 +1088,284 @@ class CanonicalWriter:
             reserved_capital=float(reserved_capital),
             active_reservations=int(active_reservations),
         )
+
+    def paper_reservation_ledger(self, quote_currency: str) -> PaperReservationLedger:
+        """Read the canonical reservation lifecycle for one quote currency.
+
+        R5-E slice 2. This is the per-reservation projection the admission path
+        did not yet expose: who holds capital, how much, and on which committed
+        evidence the hold was released. It is a strict read. It delegates to the
+        existing ``_portfolio_state`` reservation authority and to the existing
+        release predicate - it reimplements neither - and it writes nothing: no
+        event, no idempotency row, no sequence, no watermark, no history epoch.
+
+        The ledger is evidence, not authorization. It cannot reserve, release or
+        widen capital, and it reports the canonical watermark it observed so two
+        reads at the same watermark are identical. Because the frozen capital
+        policy binds only equity and position count, the ledger declares the
+        remaining constraint set unbound rather than implying it was enforced.
+        """
+        problem = self._quote_currency_problem(quote_currency)
+        if problem is not None:
+            return PaperReservationLedger(
+                status="REJECTED",
+                error_code=problem[0],
+                detail=problem[1],
+            )
+        with self._lock:
+            try:
+                version, reserved_capital, active_reservations = self._portfolio_state(
+                    quote_currency
+                )
+                records = tuple(self._reservation_records(quote_currency))
+                watermark = self._reservation_watermark()
+            except (TypeError, ValueError) as exc:
+                return PaperReservationLedger(
+                    status="REJECTED",
+                    quote_currency=quote_currency,
+                    error_code="RESERVATION_LEDGER_UNAVAILABLE",
+                    detail=str(exc),
+                )
+            except sqlite3.Error as exc:
+                return PaperReservationLedger(
+                    status="RETRYABLE",
+                    quote_currency=quote_currency,
+                    error_code="SQLITE_ERROR",
+                    detail=str(exc),
+                )
+        return PaperReservationLedger(
+            status="OK",
+            quote_currency=quote_currency,
+            portfolio_version=int(version),
+            reserved_capital=float(reserved_capital),
+            active_reservations=int(active_reservations),
+            reservations=records,
+            history_epoch=watermark[0],
+            local_sequence=watermark[1],
+            bound_constraints=BOUND_RESERVATION_CONSTRAINTS,
+            unbound_constraints=UNBOUND_RESERVATION_CONSTRAINTS,
+            policy_binding_complete=False,
+        )
+
+    def _quote_currency_problem(self, quote_currency: str) -> tuple[str, str] | None:
+        """The existing canonical currency rules, reported as a problem tuple.
+
+        Canonical identity discipline: a padded or malformed currency is rejected
+        rather than silently normalized, so the caller cannot ask for one
+        portfolio and read another.
+        """
+        if (
+            not isinstance(quote_currency, str)
+            or not quote_currency
+            or quote_currency != quote_currency.strip()
+        ):
+            return (
+                "MALFORMED_QUOTE_CURRENCY",
+                "quote_currency must be a non-empty canonical string",
+            )
+        if quote_currency not in QUOTE_CURRENCIES:
+            return (
+                "UNSUPPORTED_QUOTE_CURRENCY",
+                f"unsupported quote_currency: {quote_currency!r}",
+            )
+        return None
+
+    def _reservation_watermark(self) -> tuple[int, int]:
+        """The canonical watermark a reservation read observed.
+
+        Reported so a ledger read is provably a point-in-time view of committed
+        evidence: two reads at the same watermark must be identical. When the
+        paper execution stream has no watermark yet the history epoch is still
+        reported with a sentinel sequence, so the answer is honest rather than
+        defaulted to a plausible number.
+        """
+        meta = self._conn.execute(_META_SEQUENCE_SQL).fetchone()
+        history_epoch = int(meta["history_epoch"]) if meta is not None else 0
+        row = self._conn.execute(
+            "SELECT history_epoch, local_sequence FROM watermarks WHERE stream = ?",
+            (PAPER_EXECUTION_STREAM,),
+        ).fetchone()
+        if row is None:
+            return history_epoch, -1
+        return int(row["history_epoch"]), int(row["local_sequence"])
+
+    def paper_reservation_capacity(
+        self,
+        quote_currency: str,
+        *,
+        constraint: str,
+    ) -> PaperReservationCapacity:
+        """Answer one capacity question, or abstain when it cannot be proven.
+
+        A constraint the frozen capital policy resolves (equity, position count)
+        is answered from committed state and the authoritative policy. A
+        constraint the policy does not resolve (risk, concentration, liquidity,
+        sleeve) abstains with ``POLICY_UNAVAILABLE`` and reports no figure at all,
+        because the alternative - reporting the untouched free cash, or reporting
+        nothing at all as if unlimited - would let an unresolved policy behave
+        like "no limit". Abstention is therefore the fail-closed answer, and it is
+        the same posture the owner decision requires until `OQ-05`/`OQ-06` freeze
+        a sleeve and risk policy.
+        """
+        problem = self._quote_currency_problem(quote_currency)
+        if problem is not None:
+            return PaperReservationCapacity(
+                status="REJECTED",
+                quote_currency=(
+                    quote_currency if isinstance(quote_currency, str) else None
+                ),
+                constraint=str(constraint or "") or None,
+                error_code=problem[0],
+                detail=problem[1],
+            )
+        name = str(constraint or "").strip().upper()
+        if name not in RESERVATION_CONSTRAINTS:
+            return PaperReservationCapacity(
+                status="REJECTED",
+                quote_currency=quote_currency,
+                constraint=name or None,
+                error_code="UNKNOWN_RESERVATION_CONSTRAINT",
+                detail=(
+                    "constraint must be one of "
+                    + ",".join(sorted(RESERVATION_CONSTRAINTS))
+                ),
+            )
+        if name in UNBOUND_RESERVATION_CONSTRAINTS:
+            return PaperReservationCapacity(
+                status="ABSTAINED",
+                quote_currency=quote_currency,
+                constraint=name,
+                remaining_capacity=None,
+                policy_binding_complete=False,
+                unbound_constraints=UNBOUND_RESERVATION_CONSTRAINTS,
+                error_code="POLICY_UNAVAILABLE",
+                detail=(
+                    "the frozen canonical capital policy binds "
+                    + ",".join(BOUND_RESERVATION_CONSTRAINTS)
+                    + f" and does not resolve {name}; no capacity is reported "
+                    "rather than an unlimited one"
+                ),
+            )
+        try:
+            policy = resolve_capital_policy(PAPER_CAPITAL_POLICY_VERSION)
+        except (TypeError, ValueError) as exc:
+            return PaperReservationCapacity(
+                status="ABSTAINED",
+                quote_currency=quote_currency,
+                constraint=name,
+                remaining_capacity=None,
+                error_code="POLICY_UNAVAILABLE",
+                detail=str(exc),
+            )
+        with self._lock:
+            try:
+                version, reserved_capital, active_reservations = self._portfolio_state(
+                    quote_currency
+                )
+                watermark = self._reservation_watermark()
+            except (TypeError, ValueError) as exc:
+                return PaperReservationCapacity(
+                    status="REJECTED",
+                    quote_currency=quote_currency,
+                    constraint=name,
+                    binding_policy_version=policy.policy_version,
+                    error_code="RESERVATION_LEDGER_UNAVAILABLE",
+                    detail=str(exc),
+                )
+            except sqlite3.Error as exc:
+                return PaperReservationCapacity(
+                    status="RETRYABLE",
+                    quote_currency=quote_currency,
+                    constraint=name,
+                    binding_policy_version=policy.policy_version,
+                    error_code="SQLITE_ERROR",
+                    detail=str(exc),
+                )
+        if name == "EQUITY":
+            remaining = float(policy.portfolio_equity_limit) - float(reserved_capital)
+        else:
+            remaining = float(policy.portfolio_position_limit - int(active_reservations))
+        return PaperReservationCapacity(
+            status="OK",
+            quote_currency=quote_currency,
+            constraint=name,
+            # Never negative: a violated policy is reported by the admission gate
+            # refusing, not by a negative remaining capacity.
+            remaining_capacity=max(0.0, remaining),
+            binding_policy_version=policy.policy_version,
+            policy_binding_complete=False,
+            unbound_constraints=UNBOUND_RESERVATION_CONSTRAINTS,
+            portfolio_version=int(version),
+            history_epoch=watermark[0],
+            local_sequence=watermark[1],
+        )
+
+    def _admitted_disposition_rows(
+        self, quote_currency: str
+    ) -> list[tuple[dict, int, int]]:
+        """Committed ADMITTED dispositions for one currency, with coordinates.
+
+        The same filter and the same order as ``_admitted_dispositions``, so the
+        reservation authority and this projection can never enumerate different
+        history, plus the canonical coordinates the ledger has to report. Every
+        row is fully validated, so corrupt evidence fails closed instead of being
+        reported as a reservation.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT payload_json, history_epoch, local_sequence
+            FROM events
+            WHERE event_type = ?
+              AND json_extract(payload_json, '$.disposition') = ?
+            ORDER BY history_epoch ASC, local_sequence ASC
+            """,
+            (
+                PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
+                QualifiedOpportunityDisposition.ADMITTED.value,
+            ),
+        ).fetchall()
+        admitted: list[tuple[dict, int, int]] = []
+        for row in rows:
+            try:
+                raw = json.loads(str(row["payload_json"]))
+            except json.JSONDecodeError as exc:
+                raise ValueError("persisted Paper v2 disposition is invalid JSON") from exc
+            payload = validate_paper_evidence_payload(
+                PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
+                raw,
+            )
+            if payload.get("quote_currency") != quote_currency:
+                continue
+            admitted.append(
+                (payload, int(row["history_epoch"]), int(row["local_sequence"]))
+            )
+        return admitted
+
+    def _reservation_records(self, quote_currency: str) -> list[PaperReservationRecord]:
+        """Every reservation in this currency, newest last, with its release basis."""
+        released = self._releasable_paper_trades(quote_currency)
+        records: list[PaperReservationRecord] = []
+        for payload, history_epoch, local_sequence in self._admitted_disposition_rows(
+            quote_currency
+        ):
+            paper_trade_id = str(payload["paper_trade_id"])
+            release_basis = released.get(paper_trade_id)
+            records.append(
+                PaperReservationRecord(
+                    reservation_id=str(payload["reservation_id"]),
+                    paper_trade_id=paper_trade_id,
+                    disposition_id=str(payload["disposition_id"]),
+                    quote_currency=str(payload["quote_currency"]),
+                    engine=str(payload.get("engine") or ""),
+                    amount=float(payload["requested_reservation_amount"]),
+                    state="RELEASED" if release_basis is not None else "ACTIVE",
+                    portfolio_version=int(payload["expected_portfolio_version"]),
+                    history_epoch=history_epoch,
+                    local_sequence=local_sequence,
+                    release_basis=release_basis,
+                )
+            )
+        return records
 
     def paper_v2_active_exposures(self) -> PaperV2ActiveExposures:
         """Read-only projection of every canonically active Paper-v2 exposure.
@@ -4466,9 +4751,16 @@ class CanonicalWriter:
                 "after terminal reconciliation"
             )
 
-    def _verified_paper_trade_ids(self, quote_currency: str) -> set[str]:
-        """Trades whose economics are FINAL_VERIFIED, so capacity may be released."""
-        verified: set[str] = set()
+    def _releasable_paper_trades(self, quote_currency: str) -> dict[str, str]:
+        """Releasable trades mapped to the canonical evidence that released them.
+
+        One release predicate, shared by the reservation projection and the
+        reservation ledger, so a reservation can never be reported released by one
+        reader and active by the other. The value is the canonical identity of the
+        terminal reconciliation record that justified the release, which is what
+        makes a release traceable rather than merely asserted.
+        """
+        released: dict[str, str] = {}
         # A zero-fill terminal trade is truthfully NO_POSITION (it never held one),
         # while a trade that held exposure and closed is FLAT. Both release capacity,
         # so both states must be accepted here - requiring FLAT alone left a failed
@@ -4486,18 +4778,24 @@ class CanonicalWriter:
                 # equality check on floats is unreliable by construction.
                 and abs(float(record["remaining_quantity"])) <= _QUANTITY_TOLERANCE
             ):
-                verified.add(str(record["paper_trade_id"]))
-        if not verified:
-            return verified
-        return {
-            trade_id
-            for trade_id in verified
-            if any(
-                item.get("paper_trade_id") == trade_id
-                and item.get("quote_currency") == quote_currency
-                for item in self._admitted_dispositions(quote_currency)
-            )
+                trade_id = str(record["paper_trade_id"])
+                basis = str(record.get("reconciliation_id") or trade_id)
+                released[trade_id] = f"{PAPER_RECONCILIATION_RECORDED}:{basis}"
+        if not released:
+            return {}
+        admitted_trade_ids = {
+            str(item.get("paper_trade_id"))
+            for item in self._admitted_dispositions(quote_currency)
         }
+        return {
+            trade_id: basis
+            for trade_id, basis in released.items()
+            if trade_id in admitted_trade_ids
+        }
+
+    def _verified_paper_trade_ids(self, quote_currency: str) -> set[str]:
+        """Trades whose economics are FINAL_VERIFIED, so capacity may be released."""
+        return set(self._releasable_paper_trades(quote_currency))
 
     def _validate_protection_plan(self, payload: Mapping[str, object]) -> None:
         """Immutable plans with strictly monotonic plan_seq within the trade."""
