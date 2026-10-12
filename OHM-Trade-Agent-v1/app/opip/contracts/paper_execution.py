@@ -1087,6 +1087,20 @@ class RotationResidualExposure:
         return cls(subject_ref=body["subject_ref"], quantity=body["quantity"])
 
 
+def _entry_cash_requirement(leg: RotationLegReference) -> float:
+    """What a leg's committed fills actually require in cash.
+
+    The requirement is the gross notional of every committed fill plus the fee
+    each fill charged: an entry buys its notional and pays its own fee on top of
+    it, so the cash an entry consumes is never less than the notional it acquired.
+    A leg that committed no fill requires nothing, and the total is summed with
+    ``math.fsum`` so a multi-fill entry is charged exactly once, without a
+    rounding drift that could hide a small overspend.
+    """
+
+    return math.fsum(fill.gross_notional + fill.fee for fill in leg.fills)
+
+
 @dataclass(frozen=True)
 class RotationGroup:
     """The durable linked-intent-group record of the frozen ``SC-09`` contract.
@@ -1106,6 +1120,8 @@ class RotationGroup:
       a partial exit funds policy-allowed entries only;
     * the committed proceeds equal what the exit leg's committed fills released and
       split exactly into what is committed to the entry and what is released to cash;
+    * the entry leg's committed fills can only consume the proceeds that were
+      actually committed to the entry, so a rotation can never invent capital;
     * the residual exposure equals the old position less what the exit actually
       committed;
     * the terminal state, the requalification decision and the recorded reasons
@@ -1378,6 +1394,21 @@ class RotationGroup:
                 "the residual exposure must equal the old position less what the "
                 "exit leg actually committed"
             )
+
+        # A rotation cannot invent capital. The entry leg's *committed* fills are
+        # measured against what was actually committed to the entry, so a group can
+        # never spend more on its replacement than the exit proceeds it allocated to
+        # it, however plausible its identities are. An entry that costs less than the
+        # commitment is not an overspend: the commitment is what was authorized and
+        # its unspent remainder is reconciled by the caller's own proceeds record.
+        if entry_leg is not None:
+            requirement = _entry_cash_requirement(entry_leg)
+            if requirement > committed_to_entry + ROTATION_RECONCILIATION_TOLERANCE:
+                raise RotationGroupContractError(
+                    "the entry leg's committed fills cost more than the proceeds "
+                    "committed to the entry; a rotation cannot spend capital it never "
+                    "committed"
+                )
 
         # Binding to the SC-08 decision this record documents, reusing the frozen
         # identity conventions instead of forking a second one.

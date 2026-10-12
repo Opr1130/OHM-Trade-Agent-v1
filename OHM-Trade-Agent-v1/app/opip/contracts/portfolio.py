@@ -2723,10 +2723,12 @@ class RotationComparison:
 
     The three legs share exactly one window identity and one subject, and they
     are compared under the same cost stack. Exit costs are counted once: the
-    composed ``EXIT_THEN_ENTER`` leg carries the exit leg's own exit fee, so
-    charging the round trip twice fails closed. The old position's acquisition
-    cost is retained for accounting only; a past acquisition cost is sunk and is
-    never a benefit or a cost of either leg.
+    composed ``EXIT_THEN_ENTER`` leg carries the exit leg's own exit fee exactly
+    and never understates the exit leg's spread, latency or attributable
+    operating cost, so a switch cannot be shown cheaper than the round trip it
+    actually pays and charging the round trip twice fails closed. The old
+    position's acquisition cost is retained for accounting only; a past
+    acquisition cost is sunk and is never a benefit or a cost of either leg.
     """
 
     window_identity: str
@@ -2772,9 +2774,11 @@ class RotationComparison:
             raise PortfolioContractError(
                 "the replacement leg must be the EXIT_THEN_ENTER alternative"
             )
-        if self.replacement.exit_fee != self.cash.exit_fee:
+        if not self.exit_costs_are_counted_once:
             raise PortfolioContractError(
-                "exit costs are counted once: the composed leg must carry the exit leg's fee"
+                "exit costs are counted once: the composed leg must carry the exit "
+                "leg's fee exactly and must never understate the exit leg's spread, "
+                "latency or attributable operating cost"
             )
         if self.acquisition_cost_for_accounting is not None:
             object.__setattr__(
@@ -2842,7 +2846,30 @@ class RotationComparison:
 
     @property
     def exit_costs_are_counted_once(self) -> bool:
-        return self.replacement.exit_fee == self.cash.exit_fee
+        """Whether the composed leg really carries the exit leg's exit costs once.
+
+        The exit fee is an exact carry: the composed leg charges the exit leg's
+        fee once and only once. The exit leg's spread, latency and attributable
+        operating cost are the *floor* of the composed leg's own, because a
+        replacement pays the exit it actually made and then pays its entry on top
+        of it. Understating any of them would make the switch look cheaper than
+        the round trip it pays, which is the falsification direction; a
+        deliberately higher figure only makes the switch less attractive and can
+        never license a switch the after-cost comparison does not support. A leg
+        without a declared operating cost is not a usable comparison at all.
+        """
+
+        cash = self.cash
+        replacement = self.replacement
+        if not (cash.has_operating_cost and replacement.has_operating_cost):
+            return False
+        return (
+            replacement.exit_fee == cash.exit_fee
+            and replacement.spread_cost >= cash.spread_cost
+            and replacement.latency_cost >= cash.latency_cost
+            and float(replacement.attributable_operating_cost)
+            >= float(cash.attributable_operating_cost)
+        )
 
     def _identity_payload(self) -> dict[str, Any]:
         return {
@@ -3291,6 +3318,81 @@ def unratified_plan_constraints() -> PortfolioPlanConstraints:
     return PortfolioPlanConstraints()
 
 
+def _switch_gate_evidence_reasons(
+    *,
+    window_identity: str,
+    constraints: PortfolioPlanConstraints,
+    comparison: Any = None,
+    cooldown_reason: PortfolioPlanAbstentionReason | None = None,
+    turn_over_committed_dollars: float = 0.0,
+) -> tuple[tuple[PortfolioPlanAbstentionReason, ...], float | None]:
+    """The clock-free, history-free evidence branches of the switch gate (``RO-02``).
+
+    Only the branches the *record itself* can settle are evaluated here: the
+    policy binding, the availability of the common-window comparison, the cooldown
+    verdict the caller established from its own clock and switch history, the
+    turnover budget and the treatment-adjusted advantage. ``PLAN_NOT_CURRENT`` and
+    ``PLAN_EXPIRED`` are not reachable without a decision clock and stay with the
+    decision-time gate, which remains the authority over the switch.
+
+    *Every* satisfied branch is returned in the frozen
+    ``PORTFOLIO_PLAN_ABSTENTION_PRECEDENCE`` order, so the caller reports the same
+    single reason the ratified precedence names and no caller can read a favourable
+    branch out of a losing one. The advantage is reported only when it is well
+    defined and no branch abstains: an advantage that cannot be computed is never
+    assumed, and an abstention never carries one.
+    """
+
+    if not isinstance(constraints, PortfolioPlanConstraints):
+        raise PortfolioContractError("constraints must be a PortfolioPlanConstraints")
+    if not constraints.is_ratified:
+        return (PortfolioPlanAbstentionReason.POLICY_NOT_BOUND,), None
+    window = require_portfolio_text(window_identity, field_name="window_identity")
+    comparison_available = (
+        isinstance(comparison, RotationComparison)
+        and comparison.window_identity == window
+        and comparison.exit_costs_are_counted_once
+        and comparison.hold.has_operating_cost
+        and comparison.cash.has_operating_cost
+        and comparison.replacement.has_operating_cost
+    )
+    if not comparison_available:
+        return (PortfolioPlanAbstentionReason.CASH_COMPARISON_UNAVAILABLE,), None
+    reasons: list[PortfolioPlanAbstentionReason] = []
+    if cooldown_reason is not None:
+        reasons.append(cooldown_reason)
+    committed = require_non_negative(
+        turn_over_committed_dollars, field_name="turn_over_committed_dollars"
+    )
+    if committed + comparison.replacement.round_trip_cost > float(
+        constraints.turnover_budget_dollars
+    ):
+        reasons.append(PortfolioPlanAbstentionReason.TURNOVER_BUDGET_EXHAUSTED)
+    treatment = constraints.uncertainty_treatment
+    has_bands = (
+        comparison.hold.has_uncertainty_band
+        and comparison.cash.has_uncertainty_band
+        and comparison.replacement.has_uncertainty_band
+    )
+    if treatment is UncertaintyTreatment.LOWER_BOUND and not has_bands:
+        reasons.append(PortfolioPlanAbstentionReason.UNCERTAINTY_BAND_UNCLEAR)
+    if treatment is UncertaintyTreatment.LOWER_BOUND and has_bands:
+        advantage = comparison.conservative_advantage_over_best_alternative
+    else:
+        advantage = comparison.expected_advantage_over_best_alternative
+    if advantage < float(constraints.min_switch_advantage_dollars):
+        reasons.append(PortfolioPlanAbstentionReason.ADVANTAGE_BELOW_MINIMUM)
+    ordered = tuple(
+        sorted(
+            reasons,
+            key=lambda reason: PORTFOLIO_PLAN_ABSTENTION_PRECEDENCE.index(reason.value),
+        )
+    )
+    if ordered:
+        return ordered, None
+    return (), advantage
+
+
 def _evaluate_switch_gate(
     *,
     window_identity: str,
@@ -3330,45 +3432,25 @@ def _evaluate_switch_gate(
     expiry = require_portfolio_utc(plan_expiry, field_name="plan_expiry")
     if evaluated_at >= expiry:
         return PortfolioPlanAbstentionReason.PLAN_EXPIRED, None
-    if not isinstance(comparison, RotationComparison):
-        return PortfolioPlanAbstentionReason.CASH_COMPARISON_UNAVAILABLE, None
-    if comparison.window_identity != window:
-        return PortfolioPlanAbstentionReason.CASH_COMPARISON_UNAVAILABLE, None
-    if not comparison.exit_costs_are_counted_once or not (
-        comparison.hold.has_operating_cost
-        and comparison.cash.has_operating_cost
-        and comparison.replacement.has_operating_cost
-    ):
-        return PortfolioPlanAbstentionReason.CASH_COMPARISON_UNAVAILABLE, None
+    cooldown_reason: PortfolioPlanAbstentionReason | None = None
     if constraints.cooldown_hours:
         if seconds_since_last_switch is None:
-            return PortfolioPlanAbstentionReason.COOLDOWN_ACTIVE, None
-        elapsed = require_non_negative(
-            seconds_since_last_switch, field_name="seconds_since_last_switch"
-        )
-        if elapsed < float(constraints.cooldown_hours) * 3600.0:
-            return PortfolioPlanAbstentionReason.COOLDOWN_ACTIVE, None
-    committed = require_non_negative(
-        turn_over_committed_dollars, field_name="turn_over_committed_dollars"
+            cooldown_reason = PortfolioPlanAbstentionReason.COOLDOWN_ACTIVE
+        else:
+            elapsed = require_non_negative(
+                seconds_since_last_switch, field_name="seconds_since_last_switch"
+            )
+            if elapsed < float(constraints.cooldown_hours) * 3600.0:
+                cooldown_reason = PortfolioPlanAbstentionReason.COOLDOWN_ACTIVE
+    reasons, advantage = _switch_gate_evidence_reasons(
+        window_identity=window,
+        constraints=constraints,
+        comparison=comparison,
+        cooldown_reason=cooldown_reason,
+        turn_over_committed_dollars=turn_over_committed_dollars,
     )
-    if committed + comparison.replacement.round_trip_cost > float(
-        constraints.turnover_budget_dollars
-    ):
-        return PortfolioPlanAbstentionReason.TURNOVER_BUDGET_EXHAUSTED, None
-    treatment = constraints.uncertainty_treatment
-    has_bands = (
-        comparison.hold.has_uncertainty_band
-        and comparison.cash.has_uncertainty_band
-        and comparison.replacement.has_uncertainty_band
-    )
-    if treatment is UncertaintyTreatment.LOWER_BOUND and not has_bands:
-        return PortfolioPlanAbstentionReason.UNCERTAINTY_BAND_UNCLEAR, None
-    if treatment is UncertaintyTreatment.LOWER_BOUND:
-        advantage = comparison.conservative_advantage_over_best_alternative
-    else:
-        advantage = comparison.expected_advantage_over_best_alternative
-    if advantage < float(constraints.min_switch_advantage_dollars):
-        return PortfolioPlanAbstentionReason.ADVANTAGE_BELOW_MINIMUM, None
+    if reasons:
+        return reasons[0], None
     return None, advantage
 
 
@@ -3525,6 +3607,7 @@ class PortfolioPlan:
         raw = self.comparisons
         if not isinstance(raw, (list, tuple)):
             raise PortfolioContractError("comparisons must be a list of comparisons")
+        by_id = {item.alternative_id: item for item in self.alternatives_including_cash}
         comparisons: list[RotationComparison] = []
         seen: set[str] = set()
         for comparison in raw:
@@ -3536,6 +3619,16 @@ class PortfolioPlan:
                 raise PortfolioContractError(
                     "a comparison must share the plan's own evaluation window"
                 )
+            for name in ("hold", "cash", "replacement"):
+                leg = getattr(comparison, name)
+                recorded = by_id.get(leg.alternative_id)
+                if recorded is None:
+                    raise PortfolioContractError(
+                        f"a comparison's {name} leg must be one of the alternatives "
+                        "this plan actually compared; a substituted or forged "
+                        "comparison fails closed. An alternative id is a content hash "
+                        "of the leg, so a matching id is a matching leg."
+                    )
             if comparison.comparison_id in seen:
                 raise PortfolioContractError("a comparison may only be recorded once")
             seen.add(comparison.comparison_id)
@@ -3589,6 +3682,7 @@ class PortfolioPlan:
                             "a ROTATE action must carry the common-window comparison that "
                             "proves the switch advantage"
                         )
+                    self._assert_static_switch_admission(action.alternative_id)
             actions.append(action)
         declared = tuple(action.sequence for action in actions)
         if declared != tuple(range(1, len(actions) + 1)):
@@ -3596,6 +3690,45 @@ class PortfolioPlan:
                 "action_sequence must be the consecutive declared step order"
             )
         return tuple(actions)
+
+    def _assert_static_switch_admission(self, alternative_id: str) -> None:
+        """The clock-free admission a declared ``ROTATE`` step must already satisfy.
+
+        A plan declares what its own recorded evidence supports, so the requested
+        switch must be the head of the plan's own observed eligible ranking, and
+        every branch of the switch gate that the plan's own evidence *can* settle
+        must already admit it: a ratified versioned policy, an available
+        common-window comparison bound to the plan's own legs, an uncertainty
+        treatment the recorded bands can be read under, and a treatment-adjusted
+        advantage at or above the ratified minimum.
+
+        Two branches deliberately stay with the decision-time gate because this
+        record cannot settle them: ``PLAN_EXPIRED`` needs a decision clock and
+        ``COOLDOWN_ACTIVE`` needs the switch history. This is a build-time
+        *necessary* condition, never an authorization, and the decision-time gate
+        remains the authority over the switch. The turnover branch is read here
+        with no prior turnover recorded, which is the most favourable case a switch
+        can face, so a plan whose own round trip already exceeds the whole budget
+        cannot be licensed by any history.
+        """
+
+        if alternative_id != self.best_observed_alternative_id:
+            raise PortfolioContractError(
+                "a ROTATE action must name the best observed eligible alternative: a "
+                "plan cannot claim a better alternative than the best one it compared"
+            )
+        reasons, _ = _switch_gate_evidence_reasons(
+            window_identity=self.window_identity,
+            constraints=self.constraints,
+            comparison=self.comparison_for_alternative(alternative_id),
+            turn_over_committed_dollars=0.0,
+        )
+        if reasons:
+            raise PortfolioContractError(
+                "a ROTATE action requires the switch gate to admit it, but the plan's "
+                f"own evidence abstains with {reasons[0].value}; a declared rotation "
+                "must be a proven advantage and not an abstention"
+            )
 
     def _freeze_rejections(self) -> tuple[PortfolioPlanRejection, ...]:
         raw = self.rejected_alternatives
@@ -3693,15 +3826,25 @@ class PortfolioPlan:
         return None
 
     def _default_comparison(self, comparison: Any) -> Any:
-        """The comparison under evaluation.
+        """The comparison under evaluation, always one this plan recorded.
 
-        The explicitly passed one wins; otherwise the comparison recorded for the
-        plan's own ``ROTATE`` step, otherwise a single recorded comparison. If
-        none can be identified the switch has no cash comparison and abstains.
+        A caller may only point at a comparison the plan already recorded: an
+        external comparison is matched by its content identity and the *recorded*
+        comparison is used, so a caller cannot substitute more favourable economics
+        for the plan's own evidence and the plan cannot be evaluated against a
+        comparison it never preregistered. Anything the plan did not record is not
+        used. Without an explicit pointer the comparison recorded for the plan's own
+        ``ROTATE`` step is used, then a single recorded comparison. If none can be
+        identified the switch has no cash comparison and abstains.
         """
 
         if comparison is not None:
-            return comparison
+            if not isinstance(comparison, RotationComparison):
+                return None
+            for recorded in self.comparisons:
+                if recorded.comparison_id == comparison.comparison_id:
+                    return recorded
+            return None
         rotations = self.rotation_actions
         if rotations and rotations[0].alternative_id is not None:
             found = self.comparison_for_alternative(rotations[0].alternative_id)

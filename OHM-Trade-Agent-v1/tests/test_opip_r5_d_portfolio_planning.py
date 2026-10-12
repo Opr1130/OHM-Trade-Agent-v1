@@ -12,15 +12,21 @@ inputs `OQ-05`/`OQ-06` and gates `G3`/`G5`:
   evaluation window;
 * the declared disposition vocabulary of `PP-02` (`HOLD_CASH`, `WAIT`,
   `HOLD_POSITION`, `NEW_ENTRY`, `REDUCE`, `EXIT`, `ROTATE`; `ADD` disabled) with
-  a per-disposition capital sign and a `ROTATE` action that needs a ratified
-  policy and the comparison that proves its advantage;
+  a per-disposition capital sign and a `ROTATE` action that is only declarable
+  when the plan's own recorded evidence already admits the switch: the action must
+  name the best observed eligible alternative, its comparison must be built from
+  the plan's own compared legs, and every gate branch the plan itself settles
+  (policy binding, comparison availability, turnover, uncertainty, advantage) must
+  already pass;
 * deterministic selection over the *observed* alternatives with recorded
   exclusions, so "best" is never a market-wide optimum and an exact tie prefers
   holding over churning (`PP-04`);
 * the matched common-window comparison of `HOLD`, `EXIT_TO_CASH` and
-  `EXIT_THEN_ENTER` where exit and entry costs are counted once, the past
-  acquisition cost is sunk and the conservative advantage reads the unfavourable
-  side of the declared band (`RO-01`);
+  `EXIT_THEN_ENTER` where the exit leg's own fee, spread, latency and attributable
+  operating cost are all counted once and none may be understated, the past
+  acquisition cost is sunk, the conservative advantage reads the unfavourable side
+  of the declared band and only the plan's own recorded comparison is evaluated
+  (`RO-01`);
 * the closed abstention precedence of the discretionary switch gate, where an
   unratified owner policy abstains with `POLICY_NOT_BOUND` before any numeric
   input and a proven advantage must record the policy that licensed it (`RO-02`);
@@ -801,12 +807,42 @@ def _resolve_binding(
     )
 
 
+def third_leg_plan(
+    *,
+    constraints: PortfolioPlanConstraints | None = None,
+    expiry: datetime | None = None,
+) -> tuple[PortfolioPlan, RotationComparison]:
+    """A plan that records the common-window comparison but declares no switch.
+
+    The plan carries the same three legs and the same preregistered comparison a
+    rotation would need while its declared step stays a hold. A `ROTATE` step may
+    only be declared when the plan's own recorded evidence already admits the
+    switch, so the *decision-time* gate branches are proved on a plan that
+    declares no switch at all.
+    """
+
+    cash_record = cash_leg()
+    hold_record = hold_leg()
+    replacement = replacement_leg(cash=cash_record)
+    record = comparison(hold=hold_record, cash=cash_record, replacement=replacement)
+    return (
+        plan(
+            alternatives=(hold_record, cash_record, replacement),
+            action=hold_action(),
+            comparisons=(record,),
+            constraints=constraints if constraints is not None else scenario_constraints(),
+            expiry=expiry,
+        ),
+        record,
+    )
+
+
 def group(
     *,
     plan_record: PortfolioPlan | None = None,
     comparison_record: RotationComparison | None = None,
     legs: tuple[RotationLegReference, ...] | None = None,
-    committed_to_entry: float = 40.0,
+    committed_to_entry: float = 40.5,
     residual: float = 4.0,
     terminal_state: RotationTerminalState = RotationTerminalState.ENTRY_COMMITTED,
     requalification: RotationRequalification | None = None,
@@ -817,7 +853,13 @@ def group(
     entry_record: RotationLegReference | None = None,
     with_entry: bool = True,
 ) -> RotationGroup:
-    """A committed partial rotation: 6 of 10 units exit, 40.00 of 59.00 re-enters."""
+    """A committed partial rotation: 6 of 10 units exit, 40.50 of 59.00 re-enters.
+
+    The entry leg's committed fills cost 40.00 of notional plus 0.50 of fee, so the
+    entry commitment is 40.50 and 18.50 is released to cash: the fixture is the
+    cash-accurate boundary of the entry it funds, not a rounded 40.00 commitment
+    that the entry could never have been afforded from.
+    """
 
     bound_plan, bound_comparison = _resolve_binding(plan_record, comparison_record)
     exit_fills = exit_record if exit_record is not None else exit_leg()
@@ -1124,8 +1166,19 @@ def test_ac_002_a_rotate_action_requires_a_proven_comparison_and_a_ratified_poli
 
     with pytest.raises(PortfolioContractError, match="compared"):
         plan(
-            alternatives=(hold_record, cash_record),
+            alternatives=legs,
             action=rotate_action("PALT:R5D:missing"),
+            comparisons=(record,),
+            constraints=scenario_constraints(),
+        )
+
+    # A comparison whose legs are not the plan's own compared alternatives cannot be
+    # attached to the plan at all; the substituted-comparison refusal is proved in
+    # `test_ac_002_a_substituted_comparison_cannot_license_a_rotate_step`.
+    with pytest.raises(PortfolioContractError, match="substituted or forged comparison"):
+        plan(
+            alternatives=(hold_record, cash_record),
+            action=rotate_action(replacement.alternative_id),
             comparisons=(record,),
             constraints=scenario_constraints(),
         )
@@ -1133,6 +1186,166 @@ def test_ac_002_a_rotate_action_requires_a_proven_comparison_and_a_ratified_poli
     proven_plan, _ = rotation_plan()
     assert proven_plan.is_rotation_plan is True
     assert proven_plan.rotation_actions[0].is_proven_rotation is True
+
+
+def test_ac_002_a_rotate_step_must_be_admitted_by_the_plans_own_evidence() -> None:
+    """ATDD-R5-D-portfolio-planning/AC-002: a declared switch is a proven advantage.
+
+    GIVEN a plan whose own recorded comparison leaves the switch gate abstaining
+    WHEN the plan declares a `ROTATE` step
+    THEN the plan revision is refused instead of being recorded as a rotation,
+    because a declared switch must already satisfy every gate branch the plan's own
+    evidence settles
+    """
+
+    cash_record = cash_leg()
+    hold_record = hold_leg(gross=118.0)
+    replacement = replacement_leg(cash=cash_record)
+    legs = (hold_record, cash_record, replacement)
+    record = comparison(hold=hold_record, cash=cash_record, replacement=replacement)
+
+    # The replacement *is* the observed best alternative (121.00 against 118.00 and
+    # 94.00), yet its 3.00 advantage is below the ratified scenario minimum of 5.00.
+    assert select_plan_alternative(legs) is replacement
+    assert record.expected_advantage_over_best_alternative == 3.0
+
+    with pytest.raises(PortfolioContractError, match="ADVANTAGE_BELOW_MINIMUM"):
+        plan(
+            alternatives=legs,
+            action=rotate_action(replacement.alternative_id, delta=121.0),
+            comparisons=(record,),
+            constraints=scenario_constraints(),
+        )
+
+    # The treatment declares the lower bound but no leg carries a band: the switch
+    # cannot be read, so it cannot be declared.
+    with pytest.raises(PortfolioContractError, match="UNCERTAINTY_BAND_UNCLEAR"):
+        plan(
+            alternatives=legs,
+            action=rotate_action(replacement.alternative_id, delta=121.0),
+            comparisons=(record,),
+            constraints=band_constraints(),
+        )
+
+    # The plan's own round trip alone busts the whole budget, and prior turnover is
+    # never negative, so no history could license this switch.
+    with pytest.raises(PortfolioContractError, match="TURNOVER_BUDGET_EXHAUSTED"):
+        plan(
+            alternatives=legs,
+            action=rotate_action(replacement.alternative_id, delta=121.0),
+            comparisons=(record,),
+            constraints=scenario_constraints(turnover_budget_dollars=1.0),
+        )
+
+    # The same evidence, recorded as a hold, is a legitimate plan: the refusal is
+    # about the declared action, not about the record.
+    holding = plan(
+        alternatives=legs,
+        action=hold_action(),
+        comparisons=(record,),
+        constraints=scenario_constraints(),
+    )
+    assert holding.is_rotation_plan is False
+    assert (
+        holding.assess_rotation_switch(now=T0 + timedelta(hours=1)).abstention_reason
+        is PortfolioPlanAbstentionReason.ADVANTAGE_BELOW_MINIMUM
+    )
+
+    admitted, _ = rotation_plan()
+    assert admitted.is_rotation_plan is True
+    assert (
+        admitted.assess_rotation_switch(now=T0 + timedelta(hours=1)).status
+        is RotationSwitchStatus.ROTATION_ADVANTAGE_PROVEN
+    )
+
+
+def test_ac_002_a_rotate_step_must_name_the_plans_best_observed_alternative() -> None:
+    """ATDD-R5-D-portfolio-planning/AC-002: the recorded ranking decides the switch.
+
+    GIVEN a plan whose own alternatives rank holding above the replacement
+    WHEN the declared step is a `ROTATE` into that replacement
+    THEN the plan is refused, so a plan can never act on an alternative its own
+    eligible-alternative ranking did not select
+    """
+
+    cash_record = cash_leg()
+    hold_record = hold_leg(gross=130.0)
+    replacement = replacement_leg(cash=cash_record)
+    legs = (hold_record, cash_record, replacement)
+    record = comparison(hold=hold_record, cash=cash_record, replacement=replacement)
+
+    assert hold_record.expected_net_dollars == 130.0
+    assert replacement.expected_net_dollars == 121.0
+    assert select_plan_alternative(legs) is hold_record
+
+    with pytest.raises(PortfolioContractError, match="best observed eligible alternative"):
+        plan(
+            alternatives=legs,
+            action=rotate_action(replacement.alternative_id, delta=121.0),
+            comparisons=(record,),
+            constraints=scenario_constraints(),
+        )
+
+    holding = plan(
+        alternatives=legs,
+        action=hold_action(),
+        comparisons=(record,),
+        constraints=scenario_constraints(),
+    )
+    assert holding.best_observed_alternative_id == hold_record.alternative_id
+    assert holding.is_rotation_plan is False
+
+
+def test_ac_002_a_substituted_comparison_cannot_license_a_rotate_step() -> None:
+    """ATDD-R5-D-portfolio-planning/AC-002: only the plan's own legs can prove it.
+
+    GIVEN a plan that compared its own `HOLD`, `EXIT_TO_CASH` and `EXIT_THEN_ENTER`
+    alternatives
+    WHEN a step is attached to a comparison carrying the same subject and window but
+    different, more favourable legs
+    THEN the substituted comparison is refused, whether or not the action names the
+    plan's own alternative, because those economics are not the plan's evidence
+    """
+
+    cash_record = cash_leg()
+    hold_record = hold_leg()
+    replacement = replacement_leg(cash=cash_record)
+    legs = (hold_record, cash_record, replacement)
+
+    generous_cash = cash_leg()
+    generous_replacement = replacement_leg(cash=generous_cash, entry_gross=5_000.0)
+    substituted = comparison(
+        hold=hold_leg(gross=10.0),
+        cash=generous_cash,
+        replacement=generous_replacement,
+    )
+    assert substituted.window_identity == WINDOW.window_identity
+
+    with pytest.raises(PortfolioContractError, match="substituted or forged comparison"):
+        plan(
+            alternatives=legs,
+            action=rotate_action(substituted.replacement.alternative_id),
+            comparisons=(substituted,),
+            constraints=scenario_constraints(),
+        )
+
+    with pytest.raises(PortfolioContractError, match="substituted or forged comparison"):
+        plan(
+            alternatives=legs,
+            action=rotate_action(replacement.alternative_id),
+            comparisons=(substituted,),
+            constraints=scenario_constraints(),
+        )
+
+    owned = comparison(hold=hold_record, cash=cash_record, replacement=replacement)
+    admitted = plan(
+        alternatives=legs,
+        action=rotate_action(replacement.alternative_id),
+        comparisons=(owned,),
+        constraints=scenario_constraints(),
+    )
+    assert admitted.is_rotation_plan is True
+    assert admitted.comparisons[0].comparison_id == owned.comparison_id
 
 
 def test_ac_002_no_profit_target_or_trade_count_can_force_a_trade() -> None:
@@ -1432,6 +1645,62 @@ def test_ac_004_exit_and_entry_costs_are_counted_once() -> None:
         alternative(PortfolioAlternativeKind.EXIT_TO_CASH, gross=100.0, entry_fee=1.0)
 
 
+def test_ac_004_the_exit_spread_latency_and_operating_cost_cannot_be_dropped() -> None:
+    """ATDD-R5-D-portfolio-planning/AC-004: the whole exit cost stack is counted once.
+
+    GIVEN an exit leg that pays a fee, a spread, a latency and an attributable
+    operating cost
+    WHEN a composed replacement understates any one of those exit costs
+    THEN the comparison is refused at the record boundary and on reload, so the
+    switch can never be compared on after-cost economics it never paid
+    """
+
+    cash_record = cash_leg(spread=1.0, latency=0.25, operating=0.5)
+    composed = replacement_leg(
+        cash=cash_record,
+        entry_spread=0.5,
+        entry_latency=0.25,
+        entry_operating=0.5,
+    )
+    assert composed.spread_cost == 1.5
+    assert composed.latency_cost == 0.5
+    assert composed.attributable_operating_cost == 1.0
+
+    counted_once = comparison(hold=hold_leg(), cash=cash_record, replacement=composed)
+    assert counted_once.exit_costs_are_counted_once is True
+    assert RotationComparison.from_dict(counted_once.to_dict()) == counted_once
+
+    def entry_leg_understating(**overrides: float) -> PortfolioAlternative:
+        fields: dict[str, float] = {
+            "spread_cost": composed.spread_cost,
+            "latency_cost": composed.latency_cost,
+            "attributable_operating_cost": float(composed.attributable_operating_cost),
+        }
+        fields.update(overrides)
+        return PortfolioAlternative(
+            kind=PortfolioAlternativeKind.EXIT_THEN_ENTER,
+            subject_ref=SUBJECT,
+            expected_gross_net=composed.expected_gross_net,
+            exit_fee=cash_record.exit_fee,
+            entry_fee=composed.entry_fee,
+            spread_cost=fields["spread_cost"],
+            latency_cost=fields["latency_cost"],
+            attributable_operating_cost=fields["attributable_operating_cost"],
+        )
+
+    dropped_spread = entry_leg_understating(spread_cost=0.0)
+    dropped_latency = entry_leg_understating(latency_cost=0.0)
+    dropped_operating = entry_leg_understating(attributable_operating_cost=0.0)
+    for understated in (dropped_spread, dropped_latency, dropped_operating):
+        with pytest.raises(PortfolioContractError, match="counted once"):
+            comparison(hold=hold_leg(), cash=cash_record, replacement=understated)
+
+    payload = counted_once.to_dict()
+    payload["replacement"] = dropped_spread.to_dict()
+    with pytest.raises(PortfolioContractError, match="counted once"):
+        RotationComparison.from_dict(payload)
+
+
 def test_ac_004_a_sunk_acquisition_cost_never_enters_the_comparison() -> None:
     """ATDD-R5-D-portfolio-planning/AC-004: a past cost is sunk, not an advantage.
 
@@ -1649,7 +1918,10 @@ def test_ac_005_the_abstention_precedence_is_closed_and_ordered() -> None:
     )
     assert cooldown_wins.abstention_reason is PortfolioPlanAbstentionReason.COOLDOWN_ACTIVE
 
-    turnover, _ = rotation_plan(
+    # A ROTATE step may only be declared when the plan's own recorded evidence
+    # already admits the switch, so the decision-time branches are proved on a plan
+    # that records the comparison and declares no switch.
+    turnover, _ = third_leg_plan(
         constraints=band_constraints(turnover_budget_dollars=1.0)
     )
     turnover_wins = assess_rotation_switch(
@@ -1660,7 +1932,7 @@ def test_ac_005_the_abstention_precedence_is_closed_and_ordered() -> None:
         is PortfolioPlanAbstentionReason.TURNOVER_BUDGET_EXHAUSTED
     )
 
-    band_plan, _ = rotation_plan(constraints=band_constraints())
+    band_plan, _ = third_leg_plan(constraints=band_constraints())
     band_wins = assess_rotation_switch(band_plan, now=T0 + timedelta(hours=1))
     assert (
         band_wins.abstention_reason
@@ -1716,7 +1988,7 @@ def test_ac_005_a_proven_advantage_records_the_policy_that_licensed_it() -> None
 
     conservative = plan(
         alternatives=banded_legs,
-        action=rotate_action(banded_replacement.alternative_id),
+        action=hold_action(),
         comparisons=(banded_comparison,),
         constraints=band_constraints(),
     )
@@ -1740,6 +2012,47 @@ def test_ac_005_a_proven_advantage_records_the_policy_that_licensed_it() -> None
     assert expected_assessment.status is RotationSwitchStatus.ROTATION_ADVANTAGE_PROVEN
     assert expected_assessment.advantage_dollars == 21.0
     assert expected_assessment.uncertainty_treatment is UncertaintyTreatment.EXPECTED
+
+
+def test_ac_005_a_caller_cannot_substitute_a_more_favourable_comparison() -> None:
+    """ATDD-R5-D-portfolio-planning/AC-005: the plan's own comparison decides.
+
+    GIVEN a plan whose recorded comparison proves a modest, admitted switch
+    WHEN a caller supplies a comparison the plan never recorded that carries much
+    more favourable replacement economics
+    THEN the plan's own recorded comparison is the one evaluated: the unrecorded
+    comparison abstains with `CASH_COMPARISON_UNAVAILABLE` instead of buying an
+    advantage the plan never preregistered, while the recorded comparison still
+    proves exactly the recorded advantage
+    """
+
+    record, recorded = rotation_plan()
+    assert record.comparisons == (recorded,)
+
+    generous_cash = cash_leg()
+    generous_replacement = replacement_leg(cash=generous_cash, entry_gross=5_000.0)
+    substituted = comparison(cash=generous_cash, replacement=generous_replacement)
+    assert substituted.comparison_id != recorded.comparison_id
+    assert (
+        substituted.expected_advantage_over_best_alternative
+        > recorded.expected_advantage_over_best_alternative
+    )
+
+    smuggled = record.assess_rotation_switch(
+        now=T0 + timedelta(hours=1), comparison=substituted
+    )
+    assert smuggled.status is RotationSwitchStatus.ABSTAINED
+    assert (
+        smuggled.abstention_reason
+        is PortfolioPlanAbstentionReason.CASH_COMPARISON_UNAVAILABLE
+    )
+    assert smuggled.advantage_dollars is None
+
+    owned = record.assess_rotation_switch(
+        now=T0 + timedelta(hours=1), comparison=recorded
+    )
+    assert owned.status is RotationSwitchStatus.ROTATION_ADVANTAGE_PROVEN
+    assert owned.advantage_dollars == 21.0
 
 
 def test_ac_005_the_discretionary_gate_never_delays_a_protective_exit() -> None:
@@ -1863,10 +2176,10 @@ def test_ac_006_a_partial_exit_funds_only_policy_allowed_entries() -> None:
     exit_record = exit_leg()
     assert exit_record.proceeds == 59.0
 
-    proceeds = commit_rotation_proceeds(exit_record, committed_to_entry=40.0)
+    proceeds = commit_rotation_proceeds(exit_record, committed_to_entry=40.5)
     assert proceeds.exit_proceeds == 59.0
-    assert proceeds.committed_to_entry == 40.0
-    assert proceeds.released_to_cash == 19.0
+    assert proceeds.committed_to_entry == 40.5
+    assert proceeds.released_to_cash == 18.5
 
     with pytest.raises(RotationGroupContractError, match="proceeds the exit actually committed"):
         commit_rotation_proceeds(exit_record, committed_to_entry=59.01)
@@ -1875,8 +2188,8 @@ def test_ac_006_a_partial_exit_funds_only_policy_allowed_entries() -> None:
 
     record = group()
     assert record.committed_proceeds.exit_proceeds == 59.0
-    assert record.committed_proceeds.committed_to_entry == 40.0
-    assert record.committed_proceeds.released_to_cash == 19.0
+    assert record.committed_proceeds.committed_to_entry == 40.5
+    assert record.committed_proceeds.released_to_cash == 18.5
     assert record.reuses_the_old_position is True
     assert record.residual_exposure.quantity == 4.0
 
@@ -1974,6 +2287,77 @@ def test_ac_007_partial_fills_reconcile_proceeds_and_residual_exposure() -> None
                 RotationGroupReason.PROCEEDS_RELEASED_TO_CASH,
             ),
         )
+
+
+def test_ac_007_an_entry_leg_cannot_spend_more_than_was_committed_to_it() -> None:
+    """ATDD-R5-D-portfolio-planning/AC-007: a rotation cannot invent capital.
+
+    GIVEN an exit that released 59.00 and an entry whose committed fills cost 40.50
+    of notional and fees
+    WHEN the proceeds committed to the entry are below, exactly at and above what
+    the entry actually committed
+    THEN a commitment below the entry's own measured cost is refused, the exact
+    boundary is admitted, and a multi-fill or partially filled entry is measured on
+    what it really committed
+    """
+
+    exit_record = exit_leg()
+    assert exit_record.proceeds == 59.0
+    assert entry_leg().fills[0].gross_notional + entry_leg().fills[0].fee == 40.5
+
+    with pytest.raises(RotationGroupContractError, match="cannot spend capital it never"):
+        group(committed_to_entry=40.0)
+
+    boundary = group(committed_to_entry=40.5)
+    assert boundary.committed_proceeds.committed_to_entry == 40.5
+    assert boundary.committed_proceeds.released_to_cash == 18.5
+    assert boundary.entry_leg is not None
+    assert boundary.entry_leg.filled_quantity == 4.0
+
+    generous = group(committed_to_entry=55.0)
+    assert generous.committed_proceeds.exit_proceeds == 59.0
+    assert generous.committed_proceeds.released_to_cash == 4.0
+
+    # A multi-fill entry is charged on the sum of what it committed, not on one fill:
+    # 20.50 + 20.50 = 41.00, so the 40.50 commitment no longer covers it.
+    split_entry = entry_leg(
+        fills=(
+            RotationLegFill(
+                fill_id="PFILL:R5D:ENTRY:1", quantity=2.0, price=10.0, fee=0.5
+            ),
+            RotationLegFill(
+                fill_id="PFILL:R5D:ENTRY:2", quantity=2.0, price=10.0, fee=0.5
+            ),
+        )
+    )
+    with pytest.raises(RotationGroupContractError, match="cannot spend capital it never"):
+        group(entry_record=split_entry, committed_to_entry=40.5)
+    multi = group(entry_record=split_entry, committed_to_entry=41.0)
+    assert multi.entry_leg is not None
+    assert multi.entry_leg.filled_quantity == 4.0
+
+    # A partially filled replacement that spent less than the commitment is not an
+    # overspend: the commitment is what was authorized, not a spending target.
+    partial = group(
+        entry_record=entry_leg(quantity=1.0), committed_to_entry=40.5
+    )
+    assert partial.committed_proceeds.committed_to_entry == 40.5
+
+    # An oversized replacement, however self-consistent its identities are, cannot be
+    # funded by the same committed proceeds.
+    with pytest.raises(RotationGroupContractError, match="cannot spend capital it never"):
+        group(entry_record=entry_leg(quantity=5.0), committed_to_entry=40.5)
+    with pytest.raises(RotationGroupContractError, match="cannot spend capital it never"):
+        group(entry_record=entry_leg(quantity=676.0), committed_to_entry=40.5)
+
+    forged = boundary.as_dict()
+    legs = [dict(leg) for leg in forged["legs"]]
+    entry = dict(legs[1])
+    entry["fills"] = [dict(entry["fills"][0], quantity=676.0)]
+    legs[1] = entry
+    forged["legs"] = legs
+    with pytest.raises(RotationGroupContractError, match="cannot spend capital it never"):
+        RotationGroup.from_dict(forged)
 
 
 def test_ac_007_a_failed_or_expired_second_leg_retains_its_costs_and_reason() -> None:
