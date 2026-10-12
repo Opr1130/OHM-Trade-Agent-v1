@@ -1209,6 +1209,15 @@ def test_ac_001_the_snapshot_round_trips_and_a_forgery_fails_closed() -> None:
         CapitalSnapshot.from_dict(missing)
 
 
+#: Modules owner-ratified as *readers* of the R5-C capital snapshot surface without
+#: owning a book. The R5-E capital-admission seam
+#: (`ATDD-R5-E-capital-admission-integration`) takes exactly one snapshot as its
+#: declared input, so it may name the record; it must still declare neither
+#: `CapitalSnapshot` nor `CashPartitionLedger`, and every other carrier remains a
+#: violation.
+DECLARED_SNAPSHOT_READERS = frozenset({"app/services/capital_admission_integration.py"})
+
+
 def test_ac_001_there_is_exactly_one_cash_book_in_the_application() -> None:
     """ATDD-R5-C-capital-intelligence/AC-001: extend the owner, add no second book.
 
@@ -1229,6 +1238,10 @@ def test_ac_001_there_is_exactly_one_cash_book_in_the_application() -> None:
         if relative == owner:
             assert "class CapitalSnapshot" in source
             assert "class CashPartitionLedger" in source
+            continue
+        if relative in DECLARED_SNAPSHOT_READERS:
+            assert "class CapitalSnapshot" not in source, relative
+            assert "class CashPartitionLedger" not in source, relative
             continue
         if "CapitalSnapshot" in source or "CashPartitionLedger" in source:
             carriers.append(relative)
@@ -2997,6 +3010,13 @@ def test_ac_011_the_module_carries_no_authority_storage_or_environment_surface()
             assert token not in asserted, (name, token)
 
 
+#: Modules owner-ratified as consumers of the R5-C capital record. The R5-E
+#: capital-admission seam (`ATDD-R5-E-capital-admission-integration`) is that first
+#: approved wiring: it reads one snapshot as its declared input, grants no authority,
+#: and no runtime root below may import the record's owner.
+DECLARED_RECORD_CONSUMERS = frozenset({"app/services/capital_admission_integration.py"})
+
+
 def test_ac_011_no_runtime_root_or_application_module_consumes_the_record() -> None:
     """ATDD-R5-C-capital-intelligence/AC-011: not wired into runtime.
 
@@ -3025,9 +3045,13 @@ def test_ac_011_no_runtime_root_or_application_module_consumes_the_record() -> N
     consumers = [
         path.relative_to(APP_ROOT).as_posix()
         for path in sorted((APP_ROOT / "app").rglob("*.py"))
-        if path != MODULE and "capital_rotation_intelligence" in module_source(path)
+        if path != MODULE
+        and "capital_rotation_intelligence" in module_source(path)
+        and path.relative_to(APP_ROOT).as_posix() not in DECLARED_RECORD_CONSUMERS
     ]
     assert consumers == []
+    for declared in sorted(DECLARED_RECORD_CONSUMERS):
+        assert (APP_ROOT / declared).is_file(), declared
 
 
 def test_ac_011_release_profile_and_paper_posture_are_unchanged() -> None:
