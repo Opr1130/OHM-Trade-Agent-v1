@@ -1056,8 +1056,11 @@ def test_ac_007_the_contract_pointer_and_parent_increment_are_self_consistent():
 
     contracts = load_scope_contracts(contract_dir)
     pointer = read_increment_pointer()
-    assert pointer == INCREMENT
+    # The pointer is deliberately movable orchestration state, so it is never
+    # pinned to this module's own increment identity: it must resolve to exactly
+    # one existing contract instead of being asserted equal to this one.
     assert len([c for c in contracts if c.increment == pointer]) == 1, pointer
+    assert any(c.increment == INCREMENT for c in contracts)
     # The parent increment this one closes is still a declared contract, so its
     # own pointer-based scope control and tests keep working.
     assert any(
