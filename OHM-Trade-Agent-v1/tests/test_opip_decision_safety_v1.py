@@ -31,6 +31,11 @@ from app.opip.decision.models import DecisionOutcome
 from app.opip.decision.observer import NullScanObserver, OPipScanObserver
 
 from tests.test_profit_ranking import _configure_pipeline
+from tests.ml_dependency_policy import (
+    RELEVANT_MANIFESTS,
+    manifest_file_violations,
+    package_import_violations,
+)
 
 
 OPIP_PACKAGE = Path("app/opip")
@@ -363,12 +368,20 @@ def test_opip_modules_reference_no_futures_surface():
 
 
 def test_no_ml_dependency_is_introduced():
-    source = _opip_source().lower()
-    for name in ("xgboost", "lightgbm", "shap", "sklearn", "scikit", "torch", "tensorflow"):
-        assert name not in source
-    requirements = Path("requirements.txt").read_text(encoding="utf-8").lower()
-    for name in ("xgboost", "lightgbm", "shap", "scikit-learn", "torch", "tensorflow"):
-        assert name not in requirements
+    """The ML prohibition is unchanged; the detection is now syntax-aware.
+
+    ``ATDD-ML-DEPENDENCY-POLICY-v1`` replaced this test's lowercased text scan,
+    which failed on the ordinary words "shape", "shaped" and "reshape" inside
+    `app/opip/contracts/paper_execution.py`, `app/opip/contracts/portfolio.py`
+    and `app/opip/learning/evaluation.py`. Imports are now read from the module
+    AST (static imports and the supported dynamic-import paths) and the declared
+    manifests are parsed as requirements, so an ML dependency and a declared ML
+    distribution are still caught while prose is not. Anything the policy cannot
+    prove fails closed.
+    """
+    assert package_import_violations(OPIP_PACKAGE) == ()
+    for name in RELEVANT_MANIFESTS:
+        assert manifest_file_violations(Path(name)) == ()
 
 
 def test_model_version_is_declared_but_unset():
