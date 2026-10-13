@@ -157,6 +157,22 @@ when the host resource limit is hit, not of the commit. Neither outcome is a ver
 the scripts, which is exactly why the guard exists. This session did not modify the test file,
 add a marker, add a skip, or otherwise suppress any failure.
 
+### The check surface on these commits (verified)
+
+Every automated check that actually ran on these commits was queried through the GitHub API, so
+the "no Linux CI" statement above is a measured fact and not an assumption:
+
+- `Semgrep` **succeeded** for `2cbb8f78` (run `38400824865`) and for the R5-F head `fd6fa7e2`.
+- Five review workflows — `deepseek-quant-review.yml`, `gemini-review.yml`,
+  `pr69-external-reviews.yml`, `pr69-external-reviews-manual.yml` and
+  `pr69-external-reviews-repository-dispatch.yml` — fail **identically at the R5-F head and at the
+  R6 head**. They are provider/dispatch configuration failures that reproduce independently of any
+  change in this stack, so they carry no verdict about the delivered increments.
+- No `pytest.yml` job (full suite, `atdd-scope` gate, architecture gate, security gate) and no
+  `deploy-*` job ran for any of these commits; the `deploy-*` workflows appear as `skipped` on the
+  PR check list.
+
+
 ### What remains, and the decision required
 
 - Environmental attribution is supported by a repo-independent reproduction plus an identical
@@ -453,7 +469,7 @@ for them.
 | --- | --- | --- |
 | The 14 host-runtime failures are environmental | the host's own MSYS shell | reproduced with no repository code: `bash -c 'echo probe-ok; /bin/true; echo after-fork-ok'` returns 254 with `fork: Resource temporarily unavailable`; five measured runs of the test file are tabulated above |
 | The increments did not modify the failing test file | git | `git diff main...HEAD -- tests/test_opip_committee_host_runtime_v1.py` is empty |
-| No Linux CI evidence exists for R5-F or R6 | `.github/workflows/pytest.yml` plus PR metadata | `pytest.yml` triggers only on `main`; `gh pr view 370/371` shows feature-branch bases; `gh pr checks` lists no pytest or `atdd-scope` job |
+| No Linux CI evidence exists for R5-F or R6 | `.github/workflows/pytest.yml` plus the GitHub API | `pytest.yml` triggers only on `main`; `gh pr view 370/371` shows feature-branch bases; `gh run list --commit` for `fd6fa7e2`, `7605b334` and `2cbb8f78` returns only `Semgrep` (success) and the five review workflows that fail at every commit of the stack; `gh pr checks` lists no pytest or `atdd-scope` job |
 | The F10 contract and its gaps | `docs/architecture/v1.5.0/ARCHITECTURE.md`, `v1.4.4/ARCHITECTURE.md`, `OPIP_CONFORMANCE_LEDGER.md`, `OPIP_R5_REQUIREMENTS_REGISTER.md`, `OPIP_RETIREMENT_LEDGER.md` | contract lines cited above; current-implementation rows read from this worktree at `7605b334` |
 | The R7 authorities, gates and rollback controls | `app/jobs/scan_opportunities.py`, `app/core/config.py`, `app/services/paper_v2_cutover_readiness.py`, `OPIP_RETIREMENT_LEDGER.md`, `docs/architecture/v1.2/CONSUMER_CENSUS.md` | symbols and constants read from this worktree; ledger rows quoted above |
 | R6 and R5-F still pass | the increments' acceptance tests | `python -m pytest tests/test_opip_r6_committee_shadow_review_readiness.py tests/test_opip_r5_f_prospective_outcome_integration.py -q` → `44 passed in 3.61s` |
