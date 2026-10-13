@@ -14,7 +14,7 @@ of an increment that has no evidence.
 | Increment | Status | Evidence |
 | --- | --- | --- |
 | ATDD-R5-F-prospective-outcome-integration | DELIVERED | draft stacked PR https://github.com/Opr1130/OHM-Trade-Agent-v1/pull/370, commit `fd6fa7e2911ce7cbc4b15ea22c1f5b7ef76efee4`, 26 acceptance tests |
-| ATDD-R6-committee-shadow-review-readiness | DELIVERED | this increment, `app/opip/committee/shadow_review.py` and its acceptance tests |
+| ATDD-R6-committee-shadow-review-readiness | DELIVERED | draft stacked PR https://github.com/Opr1130/OHM-Trade-Agent-v1/pull/371, commit `d4f4233341cec24185808473f5f533133e75cf41`, `app/opip/committee/shadow_review.py` and 18 acceptance tests |
 
 ## Outstanding
 
@@ -22,8 +22,8 @@ of an increment that has no evidence.
 | --- | --- | --- |
 | F10 dashboard parity | OUTSTANDING | none: no increment has been executed for the eight-page cockpit semantic model |
 | R7 governed retirement | OUTSTANDING | none: no legacy writer has been stopped or retired |
-| ATDD-R5-F-prospective-outcome-integration | AWAITING_REVIEW | the increment is delivered as a draft PR and is not merged |
-| ATDD-R6-committee-shadow-review-readiness | AWAITING_REVIEW | the increment is delivered as a draft PR and is not merged |
+| ATDD-R5-F-prospective-outcome-integration | AWAITING_REVIEW | delivered as draft PR https://github.com/Opr1130/OHM-Trade-Agent-v1/pull/370, not merged |
+| ATDD-R6-committee-shadow-review-readiness | AWAITING_REVIEW | delivered as draft PR https://github.com/Opr1130/OHM-Trade-Agent-v1/pull/371, not merged |
 
 ## What the delivered increments do and do not change
 
