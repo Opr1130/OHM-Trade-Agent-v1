@@ -3158,7 +3158,7 @@ def test_ac_009_release_profile_and_non_authority_posture_are_unchanged() -> Non
 
 
 def test_f007_the_frozen_payload_order_is_accepted_and_a_reorder_is_refused() -> None:
-    """AC-007: the durable payload must carry the frozen SC-09 keys in order."""
+    """ATDD-R5-D-portfolio-planning/AC-007: the durable payload must carry the frozen SC-09 keys in order."""
 
     record = group()
     payload = record.as_dict()
@@ -3181,7 +3181,7 @@ def test_f007_the_frozen_payload_order_is_accepted_and_a_reorder_is_refused() ->
 
 
 def test_f007_reordering_cannot_bypass_the_frozen_keys_or_identity() -> None:
-    """AC-007: a reorder neither hides a missing key nor forges an identity."""
+    """ATDD-R5-D-portfolio-planning/AC-007: a reorder neither hides a missing key nor forges an identity."""
 
     record = group()
     payload = record.as_dict()
@@ -3207,7 +3207,7 @@ def test_f007_reordering_cannot_bypass_the_frozen_keys_or_identity() -> None:
 
 
 def test_f007_reordering_preserves_existing_refusals() -> None:
-    """AC-007: the ordering guard does not displace the existing refusals."""
+    """ATDD-R5-D-portfolio-planning/AC-007: the ordering guard does not displace the existing refusals."""
 
     record = group()
     payload = dict(record.as_dict())
@@ -3235,7 +3235,7 @@ def _ac003_fixture():
 
 
 def test_f003_a_durable_plan_missing_a_passed_over_rejection_is_refused() -> None:
-    """AC-003: completeness is a durable-record invariant, not an optional call."""
+    """ATDD-R5-D-portfolio-planning/AC-003: completeness is a durable-record invariant, not an optional call."""
 
     legs, record, hold_record, cash_record, replacement = _ac003_fixture()
     incomplete = plan(
@@ -3257,7 +3257,7 @@ def test_f003_a_durable_plan_missing_a_passed_over_rejection_is_refused() -> Non
 
 
 def test_f003_an_invalid_rejection_cannot_be_loaded_as_a_durable_plan() -> None:
-    """AC-003: a complete record loads; duplicates, selected and uncompared stay refused."""
+    """ATDD-R5-D-portfolio-planning/AC-003: a complete record loads; duplicates, selected and uncompared stay refused."""
 
     legs, record, hold_record, cash_record, replacement = _ac003_fixture()
     complete = plan(

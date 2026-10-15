@@ -130,6 +130,8 @@ AC-003 -> tests/test_opip_r5_d_portfolio_planning.py::test_ac_003_a_plan_cannot_
 AC-003 -> tests/test_opip_r5_d_portfolio_planning.py::test_ac_003_an_exact_tie_prefers_holding_over_churning
 AC-003 -> tests/test_opip_r5_d_portfolio_planning.py::test_ac_003_best_means_best_among_the_observed_alternatives
 AC-003 -> tests/test_opip_r5_d_portfolio_planning.py::test_ac_003_every_passed_over_alternative_is_recorded_exactly_once
+AC-003 -> tests/test_opip_r5_d_portfolio_planning.py::test_f003_a_durable_plan_missing_a_passed_over_rejection_is_refused
+AC-003 -> tests/test_opip_r5_d_portfolio_planning.py::test_f003_an_invalid_rejection_cannot_be_loaded_as_a_durable_plan
 AC-004 -> tests/test_opip_r5_d_portfolio_planning.py::test_ac_004_a_sunk_acquisition_cost_never_enters_the_comparison
 AC-004 -> tests/test_opip_r5_d_portfolio_planning.py::test_ac_004_exit_and_entry_costs_are_counted_once
 AC-004 -> tests/test_opip_r5_d_portfolio_planning.py::test_ac_004_missing_evidence_refuses_instead_of_looking_favourable
@@ -153,6 +155,9 @@ AC-007 -> tests/test_opip_r5_d_portfolio_planning.py::test_ac_007_a_replayed_or_
 AC-007 -> tests/test_opip_r5_d_portfolio_planning.py::test_ac_007_a_state_that_claims_an_unrequalified_entry_is_refused
 AC-007 -> tests/test_opip_r5_d_portfolio_planning.py::test_ac_007_an_entry_leg_cannot_spend_more_than_was_committed_to_it
 AC-007 -> tests/test_opip_r5_d_portfolio_planning.py::test_ac_007_partial_fills_reconcile_proceeds_and_residual_exposure
+AC-007 -> tests/test_opip_r5_d_portfolio_planning.py::test_f007_the_frozen_payload_order_is_accepted_and_a_reorder_is_refused
+AC-007 -> tests/test_opip_r5_d_portfolio_planning.py::test_f007_reordering_cannot_bypass_the_frozen_keys_or_identity
+AC-007 -> tests/test_opip_r5_d_portfolio_planning.py::test_f007_reordering_preserves_existing_refusals
 AC-008 -> tests/test_opip_r5_d_portfolio_planning.py::test_ac_008_a_plan_cannot_consume_more_than_is_deployable
 AC-008 -> tests/test_opip_r5_d_portfolio_planning.py::test_ac_008_an_unratified_policy_fails_closed_and_records_the_dependency
 AC-008 -> tests/test_opip_r5_d_portfolio_planning.py::test_ac_008_the_commit_boundary_validates_identity_and_snapshot_version
