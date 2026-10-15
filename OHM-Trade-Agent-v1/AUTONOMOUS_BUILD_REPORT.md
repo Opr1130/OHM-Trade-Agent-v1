@@ -1,6 +1,6 @@
 # O'Pip autonomous build report
 
-Status: `IN PROGRESS - TWO INCREMENTS DELIVERED, TWO OWNER DECISION PACKAGES PREPARED`
+Status: `IN PROGRESS - FOUR INCREMENTS DELIVERED, TWO OWNER DECISION PACKAGES PREPARED, F10 PARITY STILL UNVERIFIED`
 Authority granted by this document: `NONE`
 
 This report records what the autonomous build mission actually delivered, with the
@@ -16,11 +16,16 @@ of an increment that has no evidence.
 | ATDD-R5-F-prospective-outcome-integration | DELIVERED | draft stacked PR https://github.com/Opr1130/OHM-Trade-Agent-v1/pull/370, commit `fd6fa7e2911ce7cbc4b15ea22c1f5b7ef76efee4`, 26 acceptance tests |
 | ATDD-R6-committee-shadow-review-readiness | DELIVERED | draft stacked PR https://github.com/Opr1130/OHM-Trade-Agent-v1/pull/371, commit `d4f4233341cec24185808473f5f533133e75cf41`, `app/opip/committee/shadow_review.py` and 18 acceptance tests |
 
+| ATDD-R5-F10-source-census | DELIVERED | draft stacked PR https://github.com/Opr1130/OHM-Trade-Agent-v1/pull/376, commit `4ddeaf26`, the frozen eight-page inventory, panel map, declared evidence gaps and the follower increment declaration |
+| ATDD-R5-F10-semantic-read-service | DELIVERED | draft stacked PR https://github.com/Opr1130/OHM-Trade-Agent-v1/pull/377, commit `16a61d476511ecc9de7ff73a14a55f6b5d0e27b0`, `app/opip/cockpit/semantic.py` and 11 acceptance tests; Linux CI green, mounting nothing |
+| ATDD-R5-F10-dashboard-parity-implementation (mission step F10-B, first slice) | DELIVERED | the page read model, the read router and the served read page for System Pulse, Discovery and Regime, and Decision Trace, plus 8 acceptance tests; branch, commit and CI recorded in the F10 delivery section below |
+
+
 ## Outstanding
 
 | Increment | Status | Evidence |
 | --- | --- | --- |
-| F10 dashboard parity | OUTSTANDING | none: no increment has been executed for the eight-page cockpit semantic model; a gap analysis is prepared below |
+| F10 dashboard parity | OUTSTANDING | the eight-page parity predicate is still `NOT_VERIFIED` with zero verified pages and the threshold policy is still `OWNER_DECISION_REQUIRED`; the source census, the semantic read service and the first page slice are recorded below, and none of them claims parity |
 | R7 governed retirement | OUTSTANDING | none: no legacy writer has been stopped or retired; a decision package is prepared below |
 | F10 and Telegram gap analysis | OWNER_DECISION_PACKAGE_PREPARED | prepared in this report only: no route, template, config key, alert family or numeric threshold added |
 | R7 retirement decision package | OWNER_DECISION_PACKAGE_PREPARED | prepared in this report only: nothing stopped, migrated, cut over or deleted |
@@ -50,10 +55,14 @@ of an increment that has no evidence.
   process rather than in a durable stream, and the attributable cost of provider
   attempts is not measured. The increment reports those gaps rather than
   smoothing them away.
-- `F10` and `R7` are unstarted. The roadmap keeps them as separate retained
-  obligations, and the architecture forbids starting a later phase, enabling
-  Paper v2, enabling the Committee timer or redesigning the dashboard without an
-  explicit owner decision.
+- `F10` has started but is **not** complete: the source census, the semantic read
+  service and the first page slice are delivered below, while the eight-page
+  parity predicate is still `NOT_VERIFIED`, no page is claimable, per-page
+  projection authority is still undecided and the parity thresholds are still
+  `OWNER_DECISION_REQUIRED`. `R7` is unstarted. The roadmap keeps the rest as
+  separate retained obligations, and the architecture forbids starting a later
+  phase, enabling Paper v2, enabling the Committee timer or redesigning the
+  dashboard without an explicit owner decision.
 - Windows-only full-suite failures observed while validating these increments
   reproduce at their parent commits and are not attributed to them. The 14
   `test_opip_committee_host_runtime_v1` failures were additionally reproduced
@@ -186,6 +195,42 @@ the "no Linux CI" statement above is a measured fact and not an assumption:
   `workflow_dispatch` to `pytest.yml` so a feature-branch head can be validated deliberately,
   or (c) provide a Linux host for the local run. Until one is chosen, the honest status is
   "environmental attribution supported locally; authoritative Linux confirmation outstanding".
+
+## F10 cockpit delivery record (verified on the authoritative Linux runner)
+
+F10 is in progress on its own stacked branch chain: source census, then the semantic
+read service, then the first page slice. Each row below is a delivery with its own
+scope contract, its own acceptance tests and its own CI result on an Ubuntu runner.
+No row here is a parity claim: the eight-page parity predicate stays `NOT_VERIFIED`
+with zero verified pages, per-page projection authority stays undecided, the
+threshold policy stays unratified, and the panel criteria the census plans for the
+page increment stay deferred rather than satisfied.
+
+| Increment | Deliverable | Draft stacked PR | Head commit | CI on that head |
+| --- | --- | --- | --- | --- |
+| `ATDD-R5-F10-source-census` | the frozen eight-page inventory, the panel map with each panel's planned criterion, the declared evidence gaps and the follower increment declaration | [#376](https://github.com/Opr1130/OHM-Trade-Agent-v1/pull/376) | `4ddeaf26` | recorded on PR #376; the census is read by the page increment's tests, not modified by them |
+| `ATDD-R5-F10-semantic-read-service` | one semantic read service (`app/opip/cockpit/semantic.py`) with its metric bindings, panel and page declarations, the typed filter vocabulary and its declared read routes; it mounts nothing (`MOUNTED is False`, `MOUNTED_PATHS == ()`); 11 acceptance tests | [#377](https://github.com/Opr1130/OHM-Trade-Agent-v1/pull/377) | `16a61d476511ecc9de7ff73a14a55f6b5d0e27b0` | `test` **pass** (7m14s): `8203 passed, 9 skipped`; `atdd scope` **pass**; `release architecture gate` **pass**; `release security gate (Bandit)` **pass**; `semgrep/ci` **pass** |
+| `ATDD-R5-F10-dashboard-parity-implementation` (mission step F10-B, first slice: System Pulse, Discovery and Regime, Decision Trace) | the page read model (`app/opip/cockpit/semantic_pages.py`), the read router that mounts the service's declared read routes (`app/api/cockpit_semantic.py`) and the served read page (`app/api/cockpit_semantic.html`); 8 acceptance tests | see the bookkeeping entry below | see the bookkeeping entry below | see the bookkeeping entry below |
+
+Operator journeys the first slice actually serves, all read-only over the same
+replica and behind the same fail-closed secret gate as the existing cockpit:
+
+1. `GET /api/cockpit/semantic/pages` — the page index with each page's served and
+   withheld panel counts, whose basis is declared as the service's own panel
+   dispositions rather than a recomputation.
+2. `GET /api/cockpit/semantic/pages/{page_id}` — one page reading for
+   `P1_SYSTEM_PULSE`, `P2_DISCOVERY_REGIME` or `P3_DECISION_TRACE`, carrying the
+   service's own state, reasons and claimability; a page outside the slice is refused
+   rather than half-rendered.
+3. `GET /api/cockpit/semantic/panels/{panel_id}` and the matching
+   `metrics/{metric_id}` and `facts/{fact_id}` readings — evidence drill-down that
+   keeps a withheld panel's producer reason and evidence gap and never substitutes a
+   zero for evidence this plane cannot produce.
+4. `GET /cockpit/f10` — the served read page over those routes, holding no browser
+   storage, no order control and no second read surface.
+
+A withheld panel is rendered as withheld with its reason, and an unreadable
+projection still renders every panel with null values instead of dropping the page.
 
 ## Prepared owner decision package — F10 eight-page dashboard and decision-first Telegram (NOT IMPLEMENTED)
 

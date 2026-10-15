@@ -36,12 +36,15 @@ the F10 parity predicate exists to prevent: the same fact stays available from
 :meth:`SemanticReadService.population`, but the page is not claimed.
 
 KEY LAW - DECLARATION IS NOT ACTIVATION.
-This module declares the read routes the service will expose and deliberately does
-not mount them. The analytics plane's mounted path set is pinned by an existing
-exposure contract, so widening the externally reachable surface is a deliberate,
-owner-visible change that must not be a side effect of implementing the service.
-``MOUNTED`` is ``False``, the declared paths are absent from both applications, and
-nothing under ``app/api/`` imports this module.
+This module declares the read routes the service exposes and deliberately does not mount
+them itself: ``MOUNTED`` is ``False``, ``MOUNTED_PATHS`` is empty, and this module
+imports no web framework. The declared routes are mounted by the F10 read router in
+``app/api/cockpit_semantic.py``, on the analytics plane, under the owner-approved
+increment named by ``FOLLOWER_INCREMENT``, because the analytics plane's mounted path
+set is pinned by an existing exposure contract: widening the externally reachable
+surface is a deliberate, owner-visible change that must never be a side effect of
+implementing the service. The mounting posture a read envelope publishes is therefore
+the mounting component's declaration, and this module makes no mounting claim of its own.
 
 Authority: none. Every method is a read over an injected projection. Nothing here
 writes, admits, protects, exits, notifies, promotes, releases or deploys, and no
@@ -136,8 +139,11 @@ PARITY_VERIFIED_PAGES = 0
 THRESHOLD_POLICY = "OWNER_DECISION_REQUIRED"
 RATIFIED_THRESHOLDS: tuple[str, ...] = ()
 
-#: Declaration without activation. The exposed mounted path set is pinned by
-#: ``tests/test_bc4_cockpit_ui_v1.py`` and ``tests/test_bc4_cockpit_exposure_v1.py``.
+#: Declaration without activation. This module mounts nothing. The exposed read surface
+#: is mounted by the read router in ``app/api/cockpit_semantic.py``, on the analytics
+#: plane, and its path set is pinned by ``tests/test_bc4_cockpit_ui_v1.py`` and
+#: ``tests/test_bc4_cockpit_exposure_v1.py``. ``FOLLOWER_INCREMENT`` names the
+#: owner-approved increment that authorized that widening.
 MOUNTED = False
 EXPOSURE_WIDENING_REQUIRES = "OWNER_DECISION: analytics read-surface widening"
 
@@ -1462,11 +1468,14 @@ CITED_GAPS: tuple[str, ...] = tuple(
 # The declared surface, and what is deliberately not mounted
 # --------------------------------------------------------------------------- #
 
-#: The routes the F10 API follower will mount. Declared here so the surface this
-#: service intends to expose is reviewable in one place, and deliberately **not**
-#: mounted: no file under ``app/api/`` imports this module, and the analytics plane's
-#: mounted path set is pinned by ``tests/test_bc4_cockpit_exposure_v1.py`` and
-#: ``tests/test_bc4_cockpit_ui_v1.py``. Widening that set is an owner-visible
+#: The routes the F10 read surface declares. Declared here so the surface this service
+#: intends to expose is reviewable in one place. This module itself still mounts nothing:
+#: ``MOUNTED`` is ``False`` and ``MOUNTED_PATHS`` is empty, and it holds no HTTP surface
+#: of its own. The declared routes are mounted by the read router
+#: ``app/api/cockpit_semantic.py`` under the owner-approved increment
+#: ``ATDD-R5-F10-dashboard-parity-implementation``, on the analytics plane, and the
+#: analytics plane's mounted path set is pinned by
+#: ``tests/test_bc4_cockpit_exposure_v1.py``. Widening that set is an owner-visible
 #: decision, never a side effect of declaring a route.
 DECLARED_ROUTES: tuple[str, ...] = (
     "GET /api/cockpit/semantic/pages",
@@ -2340,11 +2349,11 @@ class SemanticReadService:
     def contract(self) -> dict[str, Any]:
         """The declared service contract, as data.
 
-        This is what the F10 API follower mounts against and what an exposure review
-        reads: version pins, the declared (unmounted) routes, the typed filter
-        allowlist, the page requirements, every metric binding, and the preserved
-        parity and threshold state. It reports declarations only; it is not a health
-        check.
+        This is what the F10 read router mounts against and what an exposure review
+        reads: version pins, the declared routes (which this module does not mount
+        itself), the typed filter allowlist, the page requirements, every metric
+        binding, and the preserved parity and threshold state. It reports declarations
+        only; it is not a health check.
         """
         return {
             "service_version": SEMANTIC_SERVICE_VERSION,
