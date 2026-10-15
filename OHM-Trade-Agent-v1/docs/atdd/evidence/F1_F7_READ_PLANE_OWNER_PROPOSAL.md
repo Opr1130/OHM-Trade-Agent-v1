@@ -21,7 +21,7 @@ DECISION: M02-D1-EXPOSE-FEATURE-BUS-EVIDENCE | producer=app.opip.canonical.write
 DECISION: M02-D2-EXPOSE-F5-FEASIBILITY-EVIDENCE | producer=app.opip.fev_evidence_event (FEASIBILITY_EVIDENCE_RECORDED) | consumer=app.opip.cockpit.semantic.SemanticReadService | schema=new-declared-read-model-fact-and-grain-plus-frozen-panel-decision | failure=withhold-value-and-report-the-reason-never-a-zero | security=no-new-external-surface-and-no-new-route | migration=none-additive-declaration-over-existing-canonical-rows
 DECISION: M02-D3-NEW-CANONICAL-PRODUCERS-FOR-CANDIDATE-DECISION-FAMILIES | producer=to-be-named-single-canonical-writer-increment | consumer=app.opip.cockpit.semantic.SemanticReadService | schema=new-canonical-event-family-with-idempotency-key-and-watermark-stream | failure=fail-closed-on-writer-unavailability-never-a-synthetic-row | security=new-writer-responsibility-under-the-existing-single-writer-invariant | migration=backfill-of-existing-trading-host-file-wal-rows-or-an-explicit-exclusion
 DECISION: M02-D4-CLAIM-OBJECT-ON-THE-ENGINE-OUTCOME | producer=app.opip.events.opportunity_engine.ContinuousOpportunityEngine | consumer=the-F5-F6-F7-spine-lineage-binder | schema=additive-field-on-EvaluationOutcome | failure=refuse-to-build-a-lineage-without-a-committed-claim | security=no-authority-change | migration=none-no-existing-consumer-reads-the-field
-DECISION: M02-D5-POLICY-PARAMETERISED-EPISODE-IDENTITY | producer=app.opip.contracts.opportunity_phases.episode_from_claim | consumer=app.opip.opportunity_lifecycle.apply_claim-via-shared-derivation | schema=additive-optional-episode-schema-version-argument | failure=refuse-to-derive-an-identity-that-disagrees-with-the-ratified-policy | security=no-authority-change | migration=none-existing-callers-keep-the-module-default
+NOT-A-DECISION: M02-D5-F4-EPISODE-IDENTITY | outcome=examined-and-found-consistent | producer=app.opip.contracts.opportunity.OpportunityLifecyclePolicy | consumer=both-F4-entry-points | schema=policy-fails-closed-on-unratified-episode-schema-lifecycle-and-policy-versions | failure=refuses-an-unratified-policy-instead-of-forking-lineage | security=no-change-required | migration=none-this-mission-changes-nothing
 ```
 
 ## 1. The two different kinds of gap
@@ -101,24 +101,19 @@ committed-feature-snapshot read seam does not exist as a public API today;
 defining one that creates no second evidence history is required before a real
 production source is enabled."* This mission adds no such API.
 
-**4.2 F4 episode identity is not consistently policy-parameterised.** The two F4
-entry points derive the episode identity differently on their face:
+**4.2 F4 episode identity: examined, found consistent, no decision required.** The
+two F4 entry points derive the episode identity on their face differently:
 `app/opip/opportunity_lifecycle._create_episode` passes the caller's
 `policy.episode_schema_version` into `opportunity_episode_identity`, while
 `app/opip/contracts/opportunity_phases.episode_from_claim` omits it and takes the
-module default. Probed this mission: under the ratified policy the two agree
-exactly, so today there is one episode lineage and no live defect. The hazard is
-latent and precise: a lifecycle policy whose `episode_schema_version` differs from
-the module constant would produce two different episode identities for the same
-claim, from the same code, depending on which entry point ran - a silent fork of
-episode lineage between the engine path and the spine path.
-
-**Decision requested:** whether to make the two paths agree structurally, for
-example by letting `episode_from_claim` accept the caller's schema version
-alongside the deferral it already accepts. That is a change to a frozen F4
-contract, so this mission documents it and changes nothing. Until it is decided,
-`ATDD-R5-M02-pipeline-seam-integration` proves the agreement under the ratified
-policy and asserts the boundary rather than assuming it holds for every policy.
+module default. That reads like a fork and was briefly recorded as one. It is not
+one: `OpportunityLifecyclePolicy.__post_init__` refuses any unratified
+`episode_schema_version`, `lifecycle_version` or `policy_version`, so both paths
+resolve to the same ratified token by construction. A probe on one admissible
+IGNITION claim produced the identical `OPEP:084327d4571400a96c1bbe79fd0de0e5` from
+both paths with all twelve identity fields equal, and constructing a policy with
+`opportunity-episode-v2` raises rather than forking. **No decision is requested.**
+The agreement is asserted by test so it cannot silently reverse.
 
 ## 5. What this proposal is not
 

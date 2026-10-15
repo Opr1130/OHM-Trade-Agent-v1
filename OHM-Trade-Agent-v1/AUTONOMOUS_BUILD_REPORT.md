@@ -577,16 +577,21 @@ implements nothing and requests five decisions.
 | Decision and candidate evidence is not canonical | `app/opip/decision/store.py` | the store is an append-only JSONL WAL under `Path("/app/data/opip/qualification")`, matching the census's own `TRADING_HOST_FILE_WAL` gap rows |
 | Seven canonical event types exist and are undeclared on the read plane | `app/opip/contracts/events.py`, `app/opip/fev_evidence_event.py`, `app/opip/cockpit/semantic.py` | `FEATURE_BUS_EVENT_TYPES` equals the six declared types, `FEASIBILITY_EVIDENCE_RECORDED` is `"feasibility.evidence.recorded"`, and no declared read-plane fact names an observation, coverage, feasibility, detector or feature family |
 | The two F4 episode-opening paths agree today | an executed probe against the frozen F3 fixtures | both `apply_claim` and `episode_from_claim` produced `OPEP:084327d4571400a96c1bbe79fd0de0e5` for the same claim, and all twelve identity fields matched |
-| The two F4 paths are not structurally identical | `app/opip/opportunity_lifecycle.py`, `app/opip/contracts/opportunity_phases.py` | `_create_episode` passes `policy.episode_schema_version` into `opportunity_episode_identity`; `episode_from_claim` omits it and takes the module default. Agreement today is a property of the ratified policy, not of the code |
+| The two F4 episode-opening paths agree, and cannot fork | `app/opip/contracts/opportunity.py` | `OpportunityLifecyclePolicy.__post_init__` refuses any unratified `episode_schema_version`, `lifecycle_version` or `policy_version`; an executed probe produced `OPEP:084327d4571400a96c1bbe79fd0de0e5` from both `apply_claim` and `episode_from_claim` with all twelve identity fields equal, and `opportunity-episode-v2` raised `OpportunityContractError` |
 | The engine's outcome does not carry the claim object | `app/opip/events/opportunity_engine.py` | `EvaluationOutcome` declares `claim_id`, `episode`, `thesis` and `snapshot_id` but no `DetectorClaim` |
 | The audit is authorized and changed no application file | the `atdd-scope` gate and git | `python tests/atdd_scope.py` against the F10-G base returns `PASS`; the changed set is two evidence documents, one test module, the contract, the pointer and this report |
 
-One correction to an in-flight finding is recorded rather than hidden: an early
+Two corrections to in-flight findings are recorded rather than hidden. An early
 search for canonical event-type literals matched single-quoted strings only and
 returned one type, which would have supported a wrong conclusion that the
-canonical plane holds market observations alone. Re-running the search against the
-contract modules showed seven types across two streams, and the matrix and the
-proposal carry the corrected inventory.
+canonical plane holds market observations alone; re-reading the contract modules
+showed seven types across two streams, and the matrix and the proposal carry the
+corrected inventory. Separately, the two F4 episode-opening paths were briefly
+recorded as a latent identity fork; `OpportunityLifecyclePolicy` in fact refuses
+any unratified version token, so the agreement is a guarantee of fail-closed
+validation rather than a coincidence, and the corrected finding is stronger than
+the one it replaced. Neither correction was smoothed over: both are visible in the
+matrix, the proposal and the deferred discoveries.
 
 Nothing in this increment activated a mode, added a route or a fact, wrote a
 canonical row, transferred an authority, ratified a threshold or claimed parity.

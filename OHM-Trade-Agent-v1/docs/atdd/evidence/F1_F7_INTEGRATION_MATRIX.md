@@ -70,6 +70,7 @@ ROW: F1 | F1-ATTENTION-AND-WORK-ADMISSION | class=IMPLEMENTED_AND_VERIFIED | rep
 ROW: F2 | F2-INCREMENTAL-FEATURE-SNAPSHOT | class=IMPLEMENTED_NOT_INTEGRATED | repo=EXISTS | wiring=NO_PRODUCTION_SNAPSHOT_SOURCE | runtime=INERT | proof=NOT_PROVEN | owner=OHM-Trade-Agent-v1/app/opip/features/engine.py | entry=app.opip.contracts.features.FeatureSnapshot | evidence=OHM-Trade-Agent-v1/tests/test_opip_feature_bus_pr3_integrity.py
 ROW: F3 | F3-PURE-IGNITION-EVALUATION | class=IMPLEMENTED_AND_VERIFIED | repo=EXISTS | wiring=WIRED_INTO_DORMANT_ENGINE | runtime=INERT | proof=NOT_PROVEN | owner=OHM-Trade-Agent-v1/app/opip/detectors/ignition.py | entry=app.opip.detectors.ignition.evaluate | evidence=OHM-Trade-Agent-v1/tests/test_opip_r3_f3_ignition_detector.py
 ROW: F4 | F4-EPISODE-OPENING-AND-VALIDITY | class=IMPLEMENTED_AND_VERIFIED | repo=EXISTS | wiring=TWO_ENTRY_POINTS_CONSISTENT | runtime=INERT | proof=NOT_PROVEN | owner=OHM-Trade-Agent-v1/app/opip/opportunity_lifecycle.py | entry=app.opip.opportunity_lifecycle.apply_claim | evidence=OHM-Trade-Agent-v1/tests/test_opip_r3_f4_opportunity_lifecycle.py
+ROW: F4 | F4-EPISODE-IDENTITY-IS-PINNED-BY-THE-POLICY | class=IMPLEMENTED_AND_VERIFIED | repo=EXISTS | wiring=TWO_ENTRY_POINTS_CONSISTENT | runtime=INERT | proof=NOT_PROVEN | owner=OHM-Trade-Agent-v1/app/opip/contracts/opportunity.py | entry=app.opip.contracts.opportunity.OpportunityLifecyclePolicy | evidence=OHM-Trade-Agent-v1/tests/test_opip_r3_f4_opportunity_lifecycle.py
 ROW: F4 | F4-HORIZON-THESIS-CLASSIFICATION | class=IMPLEMENTED_AND_VERIFIED | repo=EXISTS | wiring=WIRED_INTO_DORMANT_ENGINE | runtime=INERT | proof=NOT_PROVEN | owner=OHM-Trade-Agent-v1/app/opip/contracts/horizon_lifecycle.py | entry=app.opip.contracts.thesis.classify_horizon | evidence=OHM-Trade-Agent-v1/tests/test_opip_r5_b_horizon_lifecycle.py
 ROW: F5 | F5-FEASIBILITY-VETO-AND-ABSTENTION | class=IMPLEMENTED_NOT_INTEGRATED | repo=EXISTS | wiring=NO_APP_RUNTIME_CALLER | runtime=INERT | proof=NOT_PROVEN | owner=OHM-Trade-Agent-v1/app/opip/feasibility.py | entry=app.opip.feasibility.evaluate_feasibility | evidence=OHM-Trade-Agent-v1/tests/test_opip_r3_f5_feasibility.py
 ROW: F5 | F5-CANONICAL-FEASIBILITY-EVIDENCE-CAPTURE | class=IMPLEMENTED_NOT_INTEGRATED | repo=EXISTS | wiring=WIRED_INTO_SCAN_JOB | runtime=ACTIVE_WHEN_SCAN_RUNS | proof=NOT_PROVEN | owner=OHM-Trade-Agent-v1/app/jobs/capture_feasibility_evidence_shadow.py | entry=app.opip.contracts.feasibility_evidence.feasibility_evidence_from_market_snapshot | evidence=OHM-Trade-Agent-v1/tests/test_opip_r4_b2_feasibility_evidence_reader.py
@@ -97,6 +98,32 @@ episode and one thesis come out of it. It does **not** move
 it does not move a single `F1`-`F7` row: no wiring changed, so no wiring claim may
 change.
 
+### 4.1 A finding this audit first recorded wrongly, and corrected
+
+While reading the two F4 episode-opening entry points it appeared that
+`app/opip/opportunity_lifecycle._create_episode` derived the episode identity from
+`policy.episode_schema_version` while
+`app/opip/contracts/opportunity_phases.episode_from_claim` omitted it and took the
+module default. That reads as a latent fork, and it was briefly recorded as one.
+
+It is not one. `OpportunityLifecyclePolicy` fails closed on all three of its
+version tokens: its `__post_init__` refuses any `episode_schema_version`,
+`lifecycle_version` or `policy_version` that is not the ratified one, so a
+lifecycle policy carrying an unratified schema version cannot be constructed at
+all. Both entry points therefore resolve to the same ratified token by
+construction. An executed probe confirms the consequence: for one admissible
+IGNITION claim the two paths produce the identical episode identity
+`OPEP:084327d4571400a96c1bbe79fd0de0e5` with all twelve recorded identity fields
+equal, and an attempt to build a policy with `opportunity-episode-v2` raises
+`OpportunityContractError` rather than forking anything.
+
+The corrected finding is the stronger one, and it is recorded as the row
+`F4-EPISODE-IDENTITY-IS-PINNED-BY-THE-POLICY`: consistency here is a guarantee of
+the policy's fail-closed validation, not a coincidence of the current constants.
+No owner decision is requested for it. The test in
+`ATDD-R5-M02-pipeline-seam-integration` asserts the guarantee - the agreement, the
+refusal and the identity - so the correction cannot silently reverse.
+
 ## 5. What this matrix refuses to say
 
 - It does not say any stage is production-proven. The `proof=` axis is
@@ -114,14 +141,14 @@ change.
 
 ```text
 TOTALS:
-  ROWS 19
-  IMPLEMENTED_AND_VERIFIED 6
+  ROWS 20
+  IMPLEMENTED_AND_VERIFIED 7
   IMPLEMENTED_NOT_INTEGRATED 7
   MISSING_CODE 1
   MISSING_CANONICAL_EVIDENCE 2
   BLOCKED_BY_OWNER_DECISION 2
   NOT_YET_TESTED 1
-  PROOF_NOT_PROVEN 19
+  PROOF_NOT_PROVEN 20
 ```
 
 Every one of the six classes is used, so no class is a decorative row in a
