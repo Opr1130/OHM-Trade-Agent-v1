@@ -20,7 +20,6 @@ rather than silently weakening it.
 ```text
 CLASSES:
   PROVEN
-  UNPROVEN
   BLOCKED_BY_OWNER_DECISION
 
 WORKSTREAMS:
@@ -29,16 +28,17 @@ WORKSTREAMS:
   C   F11 failure and independence (SC-11, SC-12)
 ```
 
-`PROVEN` requires a cited node. `UNPROVEN` means no test asserts it.
-`BLOCKED_BY_OWNER_DECISION` means the item depends on an unratified value, so no
-increment may prove it.
+`PROVEN` requires a cited node. `BLOCKED_BY_OWNER_DECISION` means the item depends
+on an unratified value or an approved layering change, so no increment may prove it
+on its own.
 
-A fourth value, `PARTIALLY_PROVEN`, was declared in this matrix's first revision and
-was removed by `ATDD-R5-M03-f11-failure-independence-matrix` once a closer reading of
-the existing harnesses showed the three items that used it were in fact fully
-proven. A vocabulary member with no members is decorative, which `AC-301` forbids,
-so the value was deleted rather than kept for appearance. The correction is recorded
-in section 8.
+Two further values were declared in earlier revisions and both were removed once the
+evidence no longer supported them. `PARTIALLY_PROVEN` was removed when a closer
+reading showed its three items were fully proven, and `UNPROVEN` was removed when
+`ATDD-R5-M03-paper-lifecycle-economic-invariants` proved the last item that used it. A
+vocabulary member with no members is decorative, which `AC-301` forbids, so both were
+deleted rather than kept for appearance. The corrections are recorded in sections 8
+and 10.
 
 ## 2. Workstream A - capital integrity
 
@@ -75,7 +75,7 @@ ITEM: B12 | risk-exit | workstream=B | class=PROVEN | contract=SC-11 | evidence=
 ITEM: B13 | rotation | workstream=B | class=BLOCKED_BY_OWNER_DECISION | contract=SC-09 | evidence=OHM-Trade-Agent-v1/tests/test_opip_r5_d_portfolio_planning.py::test_ac_005_an_unratified_policy_abstains_before_anything_numeric
 ITEM: B14 | pending-reconciliation | workstream=B | class=PROVEN | contract=SC-11 | evidence=OHM-Trade-Agent-v1/tests/test_opip_paper_v2_protection_runtime_bc3.py::test_prt20_crash_after_the_flat_fill_completes_reconciliation_on_restart
 ITEM: B15 | closed-position-with-supported-terminal-outcome | workstream=B | class=PROVEN | contract=SC-11 | evidence=OHM-Trade-Agent-v1/tests/test_opip_paper_v2_protection_runtime_bc3.py::test_prt22_final_verified_releases_capacity_exactly_once
-ITEM: B16 | economic-identity-after-every-transition | workstream=B | class=UNPROVEN | contract=SC-11 | evidence=OHM-Trade-Agent-v1/app/opip/contracts/paper_economics.py
+ITEM: B16 | economic-identity-after-every-transition | workstream=B | class=PROVEN | contract=SC-11 | evidence=OHM-Trade-Agent-v1/tests/test_opip_r5_m03_paper_economic_invariants.py::test_ac_320_every_fill_after_every_transition_matches_the_frozen_model
 ITEM: B17 | immutable-thesis-and-first-fill-clock | workstream=B | class=PROVEN | contract=SC-11 | evidence=OHM-Trade-Agent-v1/tests/test_opip_paper_v2_protection_runtime_bc3.py::test_prt14_time_after_partial_target_uses_the_original_expiry
 ```
 
@@ -106,23 +106,25 @@ ITEM: C17 | f11-transitive-import-closure-is-isolated | workstream=C | class=BLO
 ```text
 TOTALS:
   ITEMS 46
-  PROVEN 43
-  UNPROVEN 1
+  PROVEN 44
   BLOCKED_BY_OWNER_DECISION 2
   WORKSTREAM_A 12
   WORKSTREAM_B 17
   WORKSTREAM_C 17
 ```
 
-One `UNPROVEN` item and two owner-gated items remain. The single `UNPROVEN` item
-is the entire justification for the remaining follower increment, and no `PROVEN`
-item is re-proved by a later increment.
+No unproven item remains. Two items are owner-gated: `B13` rotation waits on `OQ-05`,
+and `C17` the protective authority's transitive import coupling waits on an approved
+layering change.
 
 ## 6. Follower increments and what each closes
 
 ```text
-FOLLOWER: ATDD-R5-M03-paper-lifecycle-economic-invariants | closes B16 | asserts the economic identity - cash, fees, quantity, remaining obligation, fills and realized net economics - after every lifecycle transition
+FOLLOWER: NONE | every non-owner-gated item in this matrix is now proven by a named acceptance test
 ```
+
+There is no remaining follower. This matrix closed the last item it opened, which is
+the outcome an audit should be able to report rather than a follower list that grows.
 
 ## 7. What this matrix refuses to say
 
@@ -169,7 +171,32 @@ Committee and AI entry point raising on every call, the scheduled production
 protection sweep still reads the venue, still triggers, still takes the full
 remaining exposure, and never consults the Committee.
 
-## 9. A coupling this mission found and did not hide
+## 10. The last item this audit opened, and how it closed
+
+`B16` was the only genuinely unproven item left after the F11 increment.
+`ATDD-R5-M03-paper-lifecycle-economic-invariants` closed it by driving the real
+production protection runtime through the whole lifecycle - entry fill, activation,
+a crossed stop, the exit fill, the flat reconciliation and final verification - and
+recomputing the canonical economic identity from the frozen registry after every
+step:
+
+- every committed fill's `fee_cost`, `slippage_cost`, `spread_cost` and
+  `other_supported_cost` equal `cost_components(quantity, price)` from the frozen
+  model, and every fill names the frozen economic model version rather than the live
+  settings;
+- entry quantity minus exit quantity equals the item's remaining obligation at every
+  step, never negative, reaching exactly zero only when flat;
+- every committed reconciliation states the signed notional gross, the summed cost of
+  the four components, and a net that is exactly gross minus cost, with the filled
+  and remaining quantities equal to the committed population;
+- a further sweep after final verification is a no-op that invents no fill and no
+  reconciliation, and the frozen registry refuses an unknown economic model version
+  rather than falling back to current settings.
+
+With that, every non-owner-gated item in this matrix is proven by a named acceptance
+test and there is no remaining follower increment.
+
+## 11. A coupling this mission found and did not hide
 
 Closing `C3` required walking the protective authority's **transitive** application
 import closure rather than only its direct imports, and that walk found something the

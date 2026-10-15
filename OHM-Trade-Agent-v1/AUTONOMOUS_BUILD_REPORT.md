@@ -688,6 +688,37 @@ writer, thresholds and versioning surfaces all depend on.
 No application module changed, no protection rule or precedence changed, no threshold
 was ratified, and nothing already proven was re-proved.
 
+## Mission 03 - portfolio execution and protection (economic invariants)
+
+Status: `LAST OPEN AUDIT ITEM CLOSED, NO FOLLOWER REMAINS, NO APPLICATION CODE CHANGED`
+
+The audit's final open item was `B16`: the economic identity had never been
+recomputed after every lifecycle transition. This increment closes it by driving the
+real protection runtime through entry fill, activation, a crossed stop, the exit
+fill, the flat reconciliation and final verification, and recomputing from the frozen
+registry after every step.
+
+| Claim | Source of truth | How it was verified |
+| --- | --- | --- |
+| No invented cost, at any transition | `app.opip.contracts.paper_economics` | every committed fill's fee, slippage, spread and other cost equal `cost_components(quantity, price)` for that fill's own quantity and price, and every fill names the frozen `PAPER_ECONOMIC_MODEL_VERSION` rather than the live settings |
+| The obligation is conserved | the runtime's own book | entry minus exit equals the item's remaining quantity after activation, after the trigger, after the exit fill and after final verification, never negative, reaching exactly zero only when flat |
+| Net is gross minus cost, exactly | `app/services/paper_v2_protection_runtime.py` | each committed reconciliation's gross is the signed notional sum, its recorded cost is the summed four components, and its net is exactly gross minus cost, with the filled and remaining quantities equal to the committed population |
+| A frozen model cannot drift | `paper_economics_for_version` | an unknown or empty economic model version raises `ValueError` rather than falling back to current settings, so a historical execution stays bound to the coefficients it ran under |
+| The terminal state invents nothing | the same traversal | a further sweep after final verification adds no fill and no reconciliation |
+
+The coefficients are **read at test time, not restated**: the test never hardcodes
+0.4% or 10 bps, so changing the frozen registry changes what the test demands instead
+of being silently absorbed.
+
+With this, every non-owner-gated item in the Mission 03 audit is proven by a named
+acceptance test, the audit's follower list is empty, and the two remaining owner-gated
+items are unchanged: `B13` rotation on `OQ-05`, and `C17` the protective authority's
+transitive import coupling.
+
+No application module changed, no coefficient changed, no runtime was activated, and
+no production figure is asserted anywhere.
+
+
 
 
 
