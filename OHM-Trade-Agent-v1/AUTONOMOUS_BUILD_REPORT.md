@@ -627,5 +627,36 @@ still passes neither a snapshot source nor a composition callable, so the target
 path stays inert and non-authoritative. Proving the in-process traversal did not
 wire it, activate it, or move any `F1`-`F7` row of the audit matrix.
 
+## Mission 03 - portfolio execution and protection (coverage audit)
+
+Status: `AUDIT DELIVERED, FIVE REAL GAPS NAMED, NO APPLICATION CODE CHANGED`
+
+Mission 03 asked for three workstreams to be verified: capital integrity (SC-06,
+SC-07, SC-08, SC-09), the isolated paper lifecycle (SC-08, SC-09, SC-11) and F11
+failure and independence (SC-11, SC-12). Before implementing anything, the
+repository was audited for what it already proves, because it proves a great deal:
+98 tests across R5-C/R5-D, 256 across the paper execution contract and B/C-1/B/C-2
+suites, 38 in the B/C-3 protection runtime alone, and 22 each across R5-E capital
+admission and R5-E independent protection.
+
+| Claim | Source of truth | How it was verified |
+| --- | --- | --- |
+| 45 mission items were assessed and 39 are already proven | `docs/atdd/evidence/R5_M03_CAPITAL_PAPER_PROTECTION_MATRIX.md` | every `PROVEN` item cites a named test node, and the acceptance test asserts the node still exists in the cited file |
+| Only five items need work | the matrix's gap set | three `UNPROVEN` (`B16` economic identity per transition, `C3` AI/Committee unavailability, `C5` dashboard outage), two `PARTIALLY_PROVEN` (`B8` early validation, `C1` market-feed outage), one `BLOCKED_BY_OWNER_DECISION` (`B13` rotation, `OQ-05`) |
+| Capital integrity is already proven end to end | R5-C and R5-E | exactly one cash book, deployed basis and marked value excluded from cash, sleeve limits binding independently, missing caps abstaining, atomic commit against the built-for version, restart replaying one reservation |
+| The paper lifecycle already represents all fifteen states | B/C-3 protection runtime and B/C-2 | `prt1` activation, `prt5` full exit and reconciliation, `prt7`/`prt11` partial targets, `prt13` time exit, `prt20`/`prt21` crash recovery, `prt22` final verification, `bc2` terminal no-fill and remainder reservation |
+| F11 independence is already asserted | R5-E and B/C-3 | the protection authority imports no other subsystem; a broken discovery and notification surface cannot stop an exit; an unavailable sweep withholds new authority and never falls back; exposure stays protected when the mode is off and when cutover readiness is unavailable |
+| Rotation is owner-gated, not an engineering gap | R5-D and SC-09 | the refusal path is proven (`an_unratified_policy_abstains_before_anything_numeric`) and no advantage, cooldown, requalification or turnover value is ratified |
+
+The audit is machine-asserted: `tests/test_opip_r5_m03_coverage_matrix.py` (8
+tests) parses the matrix, re-derives its totals, resolves every cited path and
+asserts every cited test node is still present. The totals check caught a real
+defect during authoring - a matrix row was lost to an editing anchor and the count
+disagreed - which is exactly the failure mode the check exists for.
+
+This increment changed no application module, activated no runtime, ratified no
+threshold and re-proved nothing that an existing named test already proves.
+
+
 
 
