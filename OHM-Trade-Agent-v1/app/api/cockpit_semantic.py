@@ -69,7 +69,11 @@ from app.opip.cockpit.semantic import (
     UnsupportedMetric,
     UnsupportedPage,
 )
-from app.opip.cockpit.semantic_pages import PageReadModel, UnsupportedSlicePage
+from app.opip.cockpit.semantic_pages import (
+    DELIVERED_PAGES,
+    PageReadModel,
+    UnsupportedSlicePage,
+)
 
 router = APIRouter()
 
@@ -132,8 +136,13 @@ def _service() -> SemanticReadService:
 
 
 def _read_model() -> PageReadModel:
-    """The page read model over a fresh service for this request."""
-    return PageReadModel(_service())
+    """The page read model over a fresh service for this request.
+
+    It serves the delivered page set: the F10-B slice plus the two pages whose facts this
+    plane can reach. The served set is declared by the read model rather than assembled
+    here, so the mounting surface and the served set cannot drift apart.
+    """
+    return PageReadModel(_service(), pages=DELIVERED_PAGES)
 
 
 def _refuse(exc: Exception) -> HTTPException:

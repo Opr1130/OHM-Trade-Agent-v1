@@ -211,6 +211,7 @@ page increment stay deferred rather than satisfied.
 | `ATDD-R5-F10-source-census` | the frozen eight-page inventory, the panel map with each panel's planned criterion, the declared evidence gaps and the follower increment declaration | [#376](https://github.com/Opr1130/OHM-Trade-Agent-v1/pull/376) | `4ddeaf26` | recorded on PR #376; the census is read by the page increment's tests, not modified by them |
 | `ATDD-R5-F10-semantic-read-service` | one semantic read service (`app/opip/cockpit/semantic.py`) with its metric bindings, panel and page declarations, the typed filter vocabulary and its declared read routes; it mounts nothing (`MOUNTED is False`, `MOUNTED_PATHS == ()`); 11 acceptance tests | [#377](https://github.com/Opr1130/OHM-Trade-Agent-v1/pull/377) | `16a61d476511ecc9de7ff73a14a55f6b5d0e27b0` | `test` **pass** (7m14s): `8203 passed, 9 skipped`; `atdd scope` **pass**; `release architecture gate` **pass**; `release security gate (Bandit)` **pass**; `semgrep/ci` **pass** |
 | `ATDD-R5-F10-dashboard-parity-implementation` (mission step F10-B, first slice: System Pulse, Discovery and Regime, Decision Trace) | the page read model (`app/opip/cockpit/semantic_pages.py`), the read router that mounts the service's declared read routes (`app/api/cockpit_semantic.py`) and the served read page (`app/api/cockpit_semantic.html`); 8 acceptance tests | [#378](https://github.com/Opr1130/OHM-Trade-Agent-v1/pull/378) | `c565194f9746d270a3589b462c9ca5265aa61fee` | `test` **pass** (6m28s): `8211 passed, 9 skipped`; `atdd scope` **pass**; `release architecture gate` **pass**; `release security gate (Bandit)` **pass**; `semgrep/ci` **pass** |
+| `ATDD-R5-F10-C-paper-portfolio-quality` (mission steps F10-C, pages P4 Paper Portfolio and P5 Quality and Missed Opportunity) | the delivered page set widened to the five pages this plane can reach (`DELIVERED_PAGES` in `app/opip/cockpit/semantic_pages.py`), the metric read the read model now selects for a registry metric, the required-quote-currency refusal with its registered reason, the withheld-section declarations of the two added pages, and the read router serving that delivered set over the routes the preceding increment mounted; 8 acceptance tests; scope contract `ATDD-R5-F10-C-paper-portfolio-quality.md` | stacked on [#378](https://github.com/Opr1130/OHM-Trade-Agent-v1/pull/378) | stacked base `19e3b3cef5623018a4d5870a322470067f314cbb` (the F10-B head); the Linux `test`, `atdd scope`, `release architecture gate`, `release security gate (Bandit)` and `semgrep/ci` results are recorded on this increment's own PR head, not in this report |
 
 Operator journeys the first slice actually serves, all read-only over the same
 replica and behind the same fail-closed secret gate as the existing cockpit:
@@ -231,6 +232,20 @@ replica and behind the same fail-closed secret gate as the existing cockpit:
 
 A withheld panel is rendered as withheld with its reason, and an unreadable
 projection still renders every panel with null values instead of dropping the page.
+
+Where the F10-C increment widens the served set, it widens pages rather than the
+surface: the two added pages are served by the same routes, behind the same
+fail-closed secret gate, over the same read-only replica, and no route, page asset
+or exposure pin changes. What those pages can and cannot publish is not a
+read-side choice: the Paper Portfolio page publishes the reconciled counts, realized
+net P&L, execution cost, realized drawdown and residual rows the replica holds, and
+it refuses a currency-scoped figure without its quote currency rather than assuming
+one or summing two; its cash, marked-equity and unrealized figures stay withheld
+because this plane holds no canonical cash ledger and no mark evidence. The Quality
+and Missed Opportunity page publishes only the realized net and unresolved count its
+registered facts support, and its four census-declared upstream panels stay withheld
+with the producer's own reason and registered gap. Both pages remain unclaimable and
+parity remains `NOT_VERIFIED` with zero verified pages.
 
 Bookkeeping note, read off the authoritative runner: the eight acceptance tests this
 slice adds took the same `pytest` job from `8203 passed, 9 skipped` on the parent head
