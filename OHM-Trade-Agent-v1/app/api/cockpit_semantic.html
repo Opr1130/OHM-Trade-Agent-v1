@@ -39,31 +39,76 @@
         border-radius: 4px; padding: .5rem; max-height: 22rem; overflow: auto; }
   .banner { border-left: 3px solid #f59e0b; padding: .4rem .7rem; background: #1c1a12; }
   #error { color: #fca5a5; }
+  /* Keyboard and assistive-technology affordances. Every control is a native control, so the
+     platform supplies activation and focus; what is added here is visibility of that focus and
+     labelling that does not depend on colour alone. */
+  a, button, input, select { outline-offset: 2px; }
+  :focus-visible { outline: 3px solid #93c5fd; outline-offset: 2px; }
+  .skip {
+    position: absolute; left: -9999px; top: 0; padding: .4rem .7rem;
+    background: #182231; border: 1px solid #3b82f6; border-radius: 4px;
+  }
+  .skip:focus { left: .5rem; top: .5rem; z-index: 10; }
+  .crumbs { display: flex; flex-wrap: wrap; gap: .35rem; align-items: center; margin: .5rem 0; }
+  .crumbs a { color: #93c5fd; }
+  .filters { border: 1px solid #26313f; border-radius: 6px; padding: .6rem .7rem; margin: .6rem 0; }
+  .filters fieldset { border: 0; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: .5rem; align-items: end; }
+  .filters label { display: flex; flex-direction: column; gap: .2rem; font-size: .8rem; color: #9fb0c6; }
+  .filters .or-note { color: #8c9bb0; font-size: .75rem; }
+  .presets { display: flex; flex-wrap: wrap; gap: .4rem; align-items: center; margin: .5rem 0; }
+  .sr-only {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+  }
+  .state-note { margin: .25rem 0 0; }
+  caption { text-align: left; color: #9fb0c6; padding: .2rem 0; }
+  /* Narrow screens: the layout reflows rather than scrolling sideways, and the tables keep
+     their relationships because their headers stay attached to their cells. */
+  @media (max-width: 720px) {
+    body { padding: .75rem .7rem 2rem; }
+    .row, .tabs, .filters fieldset, .presets { align-items: stretch; }
+    input, select, button { width: 100%; }
+    table, thead, tbody, th, td, tr { display: block; }
+    thead { position: absolute; left: -9999px; }
+    td { border: 0; border-bottom: 1px solid #223041; }
+    td::before { content: attr(data-label) ": "; color: #9fb0c6; }
+  }
 </style>
 </head>
 <body>
+<a class="skip" href="#main">Skip to the page content</a>
+<header>
 <h1>O'Pip F10 semantic dashboard</h1>
 <p class="sub">
   Read-only. Served by the analytics plane from the verified canonical replica. No page is
   claimed, no parity is verified, no threshold is ratified, and no value here can override a
   risk or execution gate.
 </p>
+</header>
 
 <div class="row">
   <label for="secret">Cockpit secret</label>
   <input id="secret" type="password" autocomplete="off" placeholder="OPIP_COCKPIT_SECRET" />
-  <button id="load">Load</button>
-  <span id="status" class="meta"></span>
+  <button id="load" type="button">Load</button>
+  <span id="status" class="meta" role="status" aria-live="polite"></span>
 </div>
 
 <p class="banner meta" id="posture">
   Authority, parity and threshold posture load with the page index.
 </p>
 
-<div class="tabs" id="tabs"></div>
-<div id="error"></div>
-<div id="page"></div>
-<div id="index"></div>
+<nav id="crumbs" class="crumbs" aria-label="Location"></nav>
+<div class="tabs" id="tabs" role="tablist" aria-label="Frozen pages"></div>
+
+<form id="filters" class="filters" role="search" aria-label="Typed filters"></form>
+
+<div class="presets" id="presets" role="group" aria-label="Analysis presets"></div>
+
+<div id="error" role="alert"></div>
+<main id="main" tabindex="-1">
+  <div id="page"></div>
+  <div id="index"></div>
+</main>
 
 <script>
 "use strict";
@@ -108,15 +153,17 @@ function renderWithheld(panel) {
     " | evidence gap: " + esc(panel.evidence_gap || "none") + "</div>";
 }
 
-function renderTable(rows, columns) {
-  let html = "<table><thead><tr>";
-  columns.forEach(function (column) { html += "<th>" + esc(column) + "</th>"; });
+function renderTable(rows, columns, caption) {
+  // A caption names the table for assistive technology, every header is a column header, and
+  // each cell carries its column name so a narrow-screen reflow keeps the relationship.
+  let html = "<table><caption>" + esc(caption || "Evidence rows") + "</caption><thead><tr>";
+  columns.forEach(function (column) { html += '<th scope="col">' + esc(column) + "</th>"; });
   html += "</tr></thead><tbody>";
   rows.forEach(function (row) {
     html += "<tr>";
     columns.forEach(function (column) {
       const value = row && typeof row === "object" ? row[column] : undefined;
-      html += "<td>" + esc(
+      html += '<td data-label="' + esc(column) + '">' + esc(
         value === null || value === undefined ? "-"
           : (typeof value === "object" ? JSON.stringify(value) : value)
       ) + "</td>";
@@ -181,6 +228,18 @@ function renderPanel(panel) {
   html += '<div class="meta">trust rule: ' + esc(panel.trust_rule) +
     " | drill target: " + esc(panel.drill_target) +
     " | facts: " + list(panel.facts) + "</div>";
+  // The evidence link the read model published, with the filters this reading was answered
+  // under: a real anchor, so it can be opened, copied, bookmarked or fetched.
+  if (panel.drill) {
+    html += '<div class="meta">open the evidence: <a href="' + esc(panel.drill.route) +
+      esc(queryString(panel.drill.query)) + '">' + esc(panel.drill.route) + "</a> (" +
+      esc(panel.drill.kind) + ", filters: " + esc(queryString(panel.drill.query) || " none") +
+      ")</div>";
+  }
+  if (panel.unresolved_filters && panel.unresolved_filters.length) {
+    html += '<div class="meta withheld">filter dimensions this panel declares but cannot ' +
+      "resolve on this plane: " + list(panel.unresolved_filters) + "</div>";
+  }
   html += panel.carries_value ? renderValue(panel) : renderWithheld(panel);
   if (panel.exclusions && panel.exclusions.length) {
     html += '<div class="meta">excluded: ' + list(panel.exclusions) + "</div>";
@@ -267,10 +326,174 @@ function renderTabs(data, active) {
   tabs.innerHTML = "";
   data.pages.forEach(function (entry) {
     const button = document.createElement("button");
+    button.type = "button";
     button.textContent = entry.adopted_name;
+    button.setAttribute("role", "tab");
+    // A tab that is current says so to assistive technology, not only by colour.
+    button.setAttribute("aria-selected", entry.page_id === active ? "true" : "false");
+    button.tabIndex = entry.page_id === active ? 0 : -1;
     if (entry.page_id === active) { button.className = "active"; }
     button.addEventListener("click", function () { selectPage(entry.page_id); });
+    // Left/right arrows move between tabs, which is what a tablist promises a keyboard.
+    button.addEventListener("keydown", function (event) {
+      if (event.key !== "ArrowRight" && event.key !== "ArrowLeft") { return; }
+      event.preventDefault();
+      const buttons = Array.prototype.slice.call(tabs.querySelectorAll("button"));
+      const step = event.key === "ArrowRight" ? 1 : buttons.length - 1;
+      buttons[(buttons.indexOf(button) + step) % buttons.length].focus();
+    });
     tabs.appendChild(button);
+  });
+}
+
+/* The operator's view state for the lifetime of the tab, and nothing more.
+
+   It is a plain variable: it is never written to local or session storage, a cookie or disk.
+   What the browser keeps is the non-secret part of the question -- the page and its filters --
+   in the address bar, so a view can be bookmarked and shared without carrying the credential
+   that protects the data. */
+let viewState = { pageId: null, filters: {} };
+
+function queryString(filters) {
+  const params = new URLSearchParams();
+  Object.keys(filters || {}).forEach(function (name) {
+    const value = filters[name];
+    if (Array.isArray(value)) {
+      value.forEach(function (member) { params.append(name, member); });
+    } else if (value !== null && value !== undefined && value !== "") {
+      params.append(name, value);
+    }
+  });
+  const rendered = params.toString();
+  return rendered ? "?" + rendered : "";
+}
+
+function filtersFromLocation() {
+  const params = new URLSearchParams(window.location.search);
+  const filters = {};
+  params.forEach(function (value, name) {
+    if (name === "page") { return; }
+    if (Object.prototype.hasOwnProperty.call(filters, name)) {
+      filters[name] = [].concat(filters[name], value);
+      return;
+    }
+    filters[name] = value;
+  });
+  return { pageId: params.get("page"), filters: filters };
+}
+
+function renderCrumbs(index, page) {
+  const crumbs = document.getElementById("crumbs");
+  let html = '<span class="meta">Location:</span> <a href="?">Page index</a>';
+  if (page) {
+    html += ' <span aria-hidden="true">/</span> <a href="?page=' +
+      esc(page.page_id) + esc(queryString(viewState.filters)).replace(/^\?/, "&amp;") + '">' +
+      esc(page.descriptor.adopted_name) + "</a>";
+    html += ' <span aria-hidden="true">/</span> <span>' + esc(page.page_id) + "</span>";
+  }
+  crumbs.innerHTML = html;
+  crumbs.setAttribute("aria-label", "Location: " + (page ? page.page_id : "page index"));
+}
+
+function renderFilters(index) {
+  // The controls are built from the catalog the read model published, so a dimension the
+  // service adds or removes appears or disappears with it and no control can offer a filter
+  // the service would refuse.
+  const form = document.getElementById("filters");
+  form.innerHTML = "";
+  const set = document.createElement("fieldset");
+  const legend = document.createElement("legend");
+  legend.textContent = "Typed filters (every stated dimension must hold)";
+  set.appendChild(legend);
+
+  (index.filters || []).forEach(function (entry) {
+    if (entry.dimension === "limit" || entry.dimension === "cursor") { return; }
+    const label = document.createElement("label");
+    label.textContent = entry.dimension + (entry.or_capable ? " (may be repeated)" : "");
+    label.setAttribute("for", "filter-" + entry.dimension);
+    let control;
+    if (entry.values) {
+      control = document.createElement("select");
+      control.multiple = Boolean(entry.or_capable);
+      const any = document.createElement("option");
+      any.value = "";
+      any.textContent = "(any)";
+      control.appendChild(any);
+      entry.values.forEach(function (value) {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = value;
+        control.appendChild(option);
+      });
+    } else {
+      control = document.createElement("input");
+      control.type = "text";
+      control.placeholder = entry.or_capable
+        ? "one value per line"
+        : (entry.value_kind === "INSTANT" ? "2026-05-01T00:00:00Z" : "");
+    }
+    control.id = "filter-" + entry.dimension;
+    control.name = entry.dimension;
+    label.appendChild(control);
+    set.appendChild(label);
+  });
+
+  const apply = document.createElement("button");
+  apply.type = "submit";
+  apply.textContent = "Apply filters";
+  set.appendChild(apply);
+  const clear = document.createElement("button");
+  clear.type = "button";
+  clear.textContent = "Clear";
+  clear.addEventListener("click", function () {
+    viewState.filters = {};
+    if (viewState.pageId) { selectPage(viewState.pageId); } else { load(); }
+  });
+  set.appendChild(clear);
+
+  const note = document.createElement("p");
+  note.className = "or-note";
+  note.textContent = "A dimension selected once must hold; a dimension with several values " +
+    "selects any of them. An unsupported or out-of-vocabulary value is refused, never ignored.";
+  set.appendChild(note);
+
+  form.appendChild(set);
+  form.onsubmit = function (event) {
+    event.preventDefault();
+    const gathered = {};
+    Array.prototype.slice.call(form.elements).forEach(function (element) {
+      if (!element.name) { return; }
+      const chosen = element.multiple
+        ? Array.prototype.slice.call(element.selectedOptions).map(function (o) { return o.value; })
+        : [element.value];
+      const values = chosen.filter(function (value) { return value !== ""; });
+      if (values.length === 1) { gathered[element.name] = values[0]; }
+      else if (values.length > 1) { gathered[element.name] = values; }
+    });
+    viewState.filters = gathered;
+    if (viewState.pageId) { selectPage(viewState.pageId); } else { load(); }
+  };
+}
+
+function renderPresets(index) {
+  const bar = document.getElementById("presets");
+  bar.innerHTML = '<span class="meta">Analysis presets:</span> ';
+  (index.presets || []).forEach(function (preset) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = preset.label;
+    button.title = preset.question;
+    button.addEventListener("click", function () {
+      // A preset is a question, not a result: following it loads the page under its filters
+      // and lets the panels report their own insufficiency.
+      viewState.filters = preset.filters || {};
+      selectPage(preset.page_id);
+    });
+    bar.appendChild(button);
+    const question = document.createElement("span");
+    question.className = "meta sr-only";
+    question.textContent = preset.question;
+    bar.appendChild(question);
   });
 }
 
@@ -292,22 +515,37 @@ function renderIndexInto(data) {
     " | counts-and-P&L reconciliation " + data.counts_and_pnl_reconciliation +
     " | " + mountingPosture(data);
   document.getElementById("index").innerHTML = renderIndex(data);
+  renderFilters(data);
+  renderPresets(data);
 }
 
 async function selectPage(pageId) {
   const error = document.getElementById("error");
   const target = document.getElementById("page");
+  const status = document.getElementById("status");
   error.textContent = "";
+  viewState.pageId = pageId;
+  const query = queryString(viewState.filters);
   try {
-    const page = await get(API_PAGE + encodeURIComponent(pageId));
+    status.textContent = "loading " + pageId + " " + query;
+    const page = await get(API_PAGE + encodeURIComponent(pageId) + query);
     current = pageId;
     target.innerHTML = renderPage(page);
+    renderCrumbs(await get(API_PAGES), page);
     renderTabs(await get(API_PAGES), current);
-    document.getElementById("status").textContent =
-      "loaded " + pageId + " at " + new Date().toISOString();
+    // The address bar keeps the non-secret question, so the view is bookmarkable and
+    // shareable; the credential that protects the data is never written into it.
+    window.history.replaceState(null, "", "?page=" + encodeURIComponent(pageId) + query);
+    status.textContent = "loaded " + pageId + " at " + new Date().toISOString() +
+      " | watermark " + (page.watermark || "none");
+    document.getElementById("main").focus();
   } catch (exc) {
-    target.innerHTML = "";
+    // A failed read is stated as a failure, and the stale view is replaced by that statement
+    // rather than left on screen as if it answered the new question.
+    target.innerHTML = '<div class="banner meta">This view could not be read. The failure is ' +
+      "reported below, and nothing above it is an answer to this request.</div>";
     error.textContent = String(exc);
+    status.textContent = "failed to load " + pageId;
   }
 }
 
@@ -322,9 +560,14 @@ async function load() {
   try {
     const data = await get(API_PAGES);
     renderIndexInto(data);
-    renderTabs(data, data.pages.length ? data.pages[0].page_id : null);
-    if (data.pages.length) {
-      await selectPage(data.pages[0].page_id);
+    // A bookmarked view is honoured without ever taking the credential from the address bar:
+    // only the page and its typed filters are read from it.
+    const location = filtersFromLocation();
+    viewState.filters = location.filters;
+    const wanted = location.pageId || (data.pages.length ? data.pages[0].page_id : null);
+    renderTabs(data, wanted);
+    if (wanted) {
+      await selectPage(wanted);
     }
   } catch (exc) {
     error.textContent = String(exc);
@@ -332,6 +575,9 @@ async function load() {
 }
 
 document.getElementById("load").addEventListener("click", load);
+document.getElementById("secret").addEventListener("keydown", function (event) {
+  if (event.key === "Enter") { event.preventDefault(); load(); }
+});
 </script>
 </body>
 </html>
