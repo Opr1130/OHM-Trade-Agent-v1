@@ -718,6 +718,43 @@ transitive import coupling.
 No application module changed, no coefficient changed, no runtime was activated, and
 no production figure is asserted anywhere.
 
+## Mission 04 - learning and AI Committee evidence (coverage audit)
+
+Status: `AUDIT DELIVERED, AI-ECONOMICS INSUFFICIENT_EVIDENCE RECORDED, NO APPLICATION CODE CHANGED`
+
+Mission 04 asked for the prospective expected-versus-actual learning pipeline and the
+independent Committee advisory process to be proven, including attributable costs and
+nonauthority. Before building anything, the repository was audited for what it already
+proves - and it proves a great deal: 190 tests across six committee suites alone (30 of
+them safety assertions), 26 latency assertions, a 41-test pre-trade suite, the R5-F
+prospective-outcome contract with nine approved criteria, the R6 shadow-review-readiness
+contract with eight, and a learning suite that proves the entire governed chain as one
+assembled lineage.
+
+| Claim | Source of truth | How it was verified |
+| --- | --- | --- |
+| 58 rows assessed, 50 already proven | `docs/atdd/evidence/R5_M04_LEARNING_COMMITTEE_MATRIX.md` | 44 coverage items across workstreams A-E plus the 14 mandatory negative tests; every `PROVEN` row cites a named test node that the acceptance test re-resolves |
+| The governed chain is proven as a chain | `app/opip/committee/learning.py` | `test_a_chain_assembles_the_full_lineage_in_order`, `test_the_stage_reports_the_furthest_completed_link` and `test_the_chain_can_be_looked_up_by_hypothesis`, plus a release that must name **who decided** and the exact approved SHA |
+| No autonomous policy mutation and no unsupported causal claim | the learning suite | `test_a_conclusion_never_authorises_a_policy_change`, `test_an_unmeasured_effect_stays_null`, and `test_learning_can_only_reach_human_review` on the legacy path |
+| The Committee has no authority anywhere | the safety suite | `test_committee_declares_non_authority`, `test_committee_contracts_expose_no_authority_field`, `test_no_application_module_outside_the_package_imports_the_committee`, `test_committee_reports_are_never_wired_to_a_production_consumer`, `test_bake_off_can_never_promote_or_rank_for_action` |
+| No Committee timer activation | R6 | `test_ac_002_a_recorded_owner_decision_never_enables_the_timer` and `test_ac_002_an_undecided_timer_policy_is_insufficient_evidence` |
+| Invocation-attempt telemetry exists and is durable | `app/opip/committee/contracts.py` | provider family and reported provider, requested and reported model, per-attempt number, input/output tokens, estimated cost, a runtime charge, a cost-completeness token, latency, request/response instants and a failure class - all on a content-derived identity, so a retry re-delivering one observation is a duplicate and never a second opinion |
+| **No billed cost exists** | the whole application package | the string `billed` appears nowhere under `app/`; what exists is an estimated cost from tokens and a separate runtime charge, so "billed versus estimated" is `INSUFFICIENT_EVIDENCE` |
+| Cache cost is declared, not measured | `app/opip/committee/registry.py` | `CACHE_SAVINGS_CREDITED = False` with the recorded reason that cache usage is unmeasured, so cost is accounted at uncached rates and no unmeasured saving is credited |
+| The cost basis is **not canonical** | `app/opip/committee/store.py` | committee evidence is written to the committee plane's own bounded JSONL archive rather than through the single canonical writer, which is exactly why the F10 read plane withholds it |
+
+The read plane already publishes the same verdict this audit reaches:
+`REASON_NO_CANONICAL_AI_COST = "NO_CANONICAL_AI_COST_EVIDENCE"` is what the semantic
+service returns for the attributable-AI-cost panel against `AC-073`, and
+`app/opip/cockpit/ai_cost.py` remains a declared absence. No AI net value was estimated
+in either direction, and Cline/DeepSeek engineering-development spend was not treated as
+Committee trading-operating expense at any point.
+
+Four rows remain partial and one follower closes them; three rows are owner-gated. No
+application module changed, no producer or publication boundary was created, no
+Committee timer or provider call was enabled, and no threshold or price was ratified.
+
+
 
 
 
