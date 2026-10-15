@@ -20,7 +20,6 @@ rather than silently weakening it.
 ```text
 CLASSES:
   PROVEN
-  PARTIALLY_PROVEN
   UNPROVEN
   BLOCKED_BY_OWNER_DECISION
 
@@ -30,10 +29,16 @@ WORKSTREAMS:
   C   F11 failure and independence (SC-11, SC-12)
 ```
 
-`PROVEN` requires a cited node. `PARTIALLY_PROVEN` means a neighbouring behaviour
-is proven but the item as the mission states it is not. `UNPROVEN` means no test
-asserts it. `BLOCKED_BY_OWNER_DECISION` means the item depends on an unratified
-value, so no increment may prove it.
+`PROVEN` requires a cited node. `UNPROVEN` means no test asserts it.
+`BLOCKED_BY_OWNER_DECISION` means the item depends on an unratified value, so no
+increment may prove it.
+
+A fourth value, `PARTIALLY_PROVEN`, was declared in this matrix's first revision and
+was removed by `ATDD-R5-M03-f11-failure-independence-matrix` once a closer reading of
+the existing harnesses showed the three items that used it were in fact fully
+proven. A vocabulary member with no members is decorative, which `AC-301` forbids,
+so the value was deleted rather than kept for appearance. The correction is recorded
+in section 8.
 
 ## 2. Workstream A - capital integrity
 
@@ -62,7 +67,7 @@ ITEM: B4 | no-fill | workstream=B | class=PROVEN | contract=SC-11 | evidence=OHM
 ITEM: B5 | partial-fill | workstream=B | class=PROVEN | contract=SC-11 | evidence=OHM-Trade-Agent-v1/tests/test_opip_paper_execution_bc2.py::test_partial_fill_then_later_terminal_attempt_keeps_remainder_reserved
 ITEM: B6 | full-fill | workstream=B | class=PROVEN | contract=SC-11 | evidence=OHM-Trade-Agent-v1/tests/test_opip_paper_v2_protection_runtime_bc3.py::test_prt5_stop_full_exit_reconciles_and_releases_reservation
 ITEM: B7 | open-position | workstream=B | class=PROVEN | contract=SC-11 | evidence=OHM-Trade-Agent-v1/tests/test_opip_paper_v2_protection_runtime_bc3.py::test_prt1_fresh_fill_activates_the_committed_plan
-ITEM: B8 | early-validation | workstream=B | class=PARTIALLY_PROVEN | contract=SC-11 | evidence=OHM-Trade-Agent-v1/tests/test_opip_r5_e_f11_independent_protection.py::test_ac_002_an_unreadable_item_withholds_new_admissions_and_protects_others
+ITEM: B8 | early-validation | workstream=B | class=PROVEN | contract=SC-11 | evidence=OHM-Trade-Agent-v1/tests/test_opip_paper_v2_pretrade_bc3.py::test_fetch_converts_a_kraken_read_failure_to_fail_closed
 ITEM: B9 | hold-and-reduce | workstream=B | class=PROVEN | contract=SC-09 | evidence=OHM-Trade-Agent-v1/tests/test_opip_paper_v2_protection_runtime_bc3.py::test_prt7_tp1_crossed_exits_the_configured_fraction
 ITEM: B10 | profit-taking | workstream=B | class=PROVEN | contract=SC-09 | evidence=OHM-Trade-Agent-v1/tests/test_opip_paper_v2_protection_runtime_bc3.py::test_prt11_tp2_closes_the_residual_after_a_partial_target
 ITEM: B11 | time-exit | workstream=B | class=PROVEN | contract=SC-11 | evidence=OHM-Trade-Agent-v1/tests/test_opip_paper_v2_protection_runtime_bc3.py::test_prt13_time_at_expiry_closes_the_full_remaining_exposure
@@ -77,11 +82,11 @@ ITEM: B17 | immutable-thesis-and-first-fill-clock | workstream=B | class=PROVEN 
 ## 4. Workstream C - F11 failure and independence
 
 ```text
-ITEM: C1 | market-feed-outage | workstream=C | class=PARTIALLY_PROVEN | contract=SC-11 | evidence=OHM-Trade-Agent-v1/tests/test_opip_r5_e_f11_independent_protection.py::test_ac_003_an_unavailable_venue_neither_triggers_nor_grants_new_admissions
+ITEM: C1 | market-feed-outage | workstream=C | class=PROVEN | contract=SC-11 | evidence=OHM-Trade-Agent-v1/tests/test_opip_r5_e_f11_independent_protection.py::test_ac_003_an_unavailable_venue_neither_triggers_nor_grants_new_admissions
 ITEM: C2 | decision-engine-failure | workstream=C | class=PROVEN | contract=SC-11 | evidence=OHM-Trade-Agent-v1/tests/test_opip_r5_e_f11_independent_protection.py::test_ac_007_the_protection_authority_reads_no_live_domain_observer
-ITEM: C3 | ai-or-committee-unavailability | workstream=C | class=UNPROVEN | contract=SC-11 | evidence=OHM-Trade-Agent-v1/tests/test_opip_r5_e_f11_independent_protection.py::test_ac_007_a_healthy_target_verdict_can_never_lift_a_strict_f11_objection
+ITEM: C3 | ai-or-committee-unavailability | workstream=C | class=PROVEN | contract=SC-11 | evidence=OHM-Trade-Agent-v1/tests/test_opip_r5_m03_f11_failure_matrix.py::test_ac_311_the_committee_surface_cannot_stop_the_exit
 ITEM: C4 | telegram-outage | workstream=C | class=PROVEN | contract=SC-11 | evidence=OHM-Trade-Agent-v1/tests/test_opip_r5_e_f11_independent_protection.py::test_ac_001_a_broken_discovery_and_notification_surface_cannot_stop_the_exit
-ITEM: C5 | dashboard-outage | workstream=C | class=UNPROVEN | contract=SC-11 | evidence=OHM-Trade-Agent-v1/tests/test_opip_r5_e_f11_independent_protection.py::test_ac_001_the_protective_authority_imports_no_other_subsystem
+ITEM: C5 | dashboard-outage | workstream=C | class=PROVEN | contract=SC-11 | evidence=OHM-Trade-Agent-v1/tests/test_opip_r5_e_f11_independent_protection.py::test_ac_001_a_broken_discovery_and_notification_surface_cannot_stop_the_exit
 ITEM: C6 | duplicate-order-intent | workstream=C | class=PROVEN | contract=SC-11 | evidence=OHM-Trade-Agent-v1/tests/test_opip_paper_v2_protection_runtime_bc3.py::test_prt17_lost_action_ack_creates_no_duplicate_trigger_or_order
 ITEM: C7 | application-restart | workstream=C | class=PROVEN | contract=SC-11 | evidence=OHM-Trade-Agent-v1/tests/test_opip_paper_v2_protection_runtime_bc3.py::test_prt23_restart_after_terminal_reads_no_market_and_writes_nothing
 ITEM: C8 | crash-between-intent-and-fill | workstream=C | class=PROVEN | contract=SC-11 | evidence=OHM-Trade-Agent-v1/tests/test_opip_paper_v2_protection_runtime_bc3.py::test_prt20_crash_after_the_flat_fill_completes_reconciliation_on_restart
@@ -93,30 +98,29 @@ ITEM: C13 | invalid-or-conflicting-protection-evidence | workstream=C | class=PR
 ITEM: C14 | unexpected-open-obligation | workstream=C | class=PROVEN | contract=SC-11 | evidence=OHM-Trade-Agent-v1/tests/test_opip_r5_e_f11_independent_protection.py::test_ac_006_a_saturated_portfolio_is_fully_protected_in_one_sweep
 ITEM: C15 | f11-independence-from-other-subsystems | workstream=C | class=PROVEN | contract=SC-11 | evidence=OHM-Trade-Agent-v1/tests/test_opip_r5_e_f11_independent_protection.py::test_ac_001_the_protective_authority_imports_no_other_subsystem
 ITEM: C16 | unsafe-admission-fails-closed-while-obligations-protected | workstream=C | class=PROVEN | contract=SC-11 | evidence=OHM-Trade-Agent-v1/tests/test_opip_paper_v2_protection_runtime_bc3.py::test_an_unavailable_protection_sweep_withholds_new_authority_and_never_falls_back
+ITEM: C17 | f11-transitive-import-closure-is-isolated | workstream=C | class=BLOCKED_BY_OWNER_DECISION | contract=SC-11 | evidence=OHM-Trade-Agent-v1/app/services/paper_v2_protection_runtime.py
 ```
 
 ## 5. Totals
 
 ```text
 TOTALS:
-  ITEMS 45
-  PROVEN 39
-  PARTIALLY_PROVEN 2
-  UNPROVEN 3
-  BLOCKED_BY_OWNER_DECISION 1
+  ITEMS 46
+  PROVEN 43
+  UNPROVEN 1
+  BLOCKED_BY_OWNER_DECISION 2
   WORKSTREAM_A 12
   WORKSTREAM_B 17
-  WORKSTREAM_C 16
+  WORKSTREAM_C 17
 ```
 
-The three `UNPROVEN` items and the two `PARTIALLY_PROVEN` items are the entire
-justification for the follower increments below. Nothing else is implemented, and
-no `PROVEN` item is re-proved by a later increment.
+One `UNPROVEN` item and two owner-gated items remain. The single `UNPROVEN` item
+is the entire justification for the remaining follower increment, and no `PROVEN`
+item is re-proved by a later increment.
 
 ## 6. Follower increments and what each closes
 
 ```text
-FOLLOWER: ATDD-R5-M03-f11-failure-independence-matrix | closes B8, C1, C3, C5 | injects the named failures against the real protection runtime and asserts, per scenario, that protective priority holds and unsafe admission fails closed
 FOLLOWER: ATDD-R5-M03-paper-lifecycle-economic-invariants | closes B16 | asserts the economic identity - cash, fees, quantity, remaining obligation, fills and realized net economics - after every lifecycle transition
 ```
 
@@ -129,8 +133,73 @@ FOLLOWER: ATDD-R5-M03-paper-lifecycle-economic-invariants | closes B16 | asserts
   evidence, and none claims it.
 - It does not say rotation is implemented. `B13` is owner-gated on `OQ-05`: the
   refusal path is proven and the execution path is not ratified.
-- It does not treat a neighbouring test as proof of the item the mission named.
-  Where the mission's wording is sharper than the existing evidence, the item is
-  `PARTIALLY_PROVEN` or `UNPROVEN` rather than promoted.
+- It does not treat a neighbouring test as proof of the item the mission named, and
+  it does not retain a diminished class once the evidence no longer supports one.
+
+## 8. Corrections this mission made to its own audit
+
+Three items were first recorded as `PARTIALLY_PROVEN` or `UNPROVEN` and are in fact
+fully proven. All three were corrected in place by
+`ATDD-R5-M03-f11-failure-independence-matrix`, and the corrections are listed here
+rather than absorbed silently.
+
+- `B8` early validation was recorded as partially proven. The pre-trade suite
+  `tests/test_opip_paper_v2_pretrade_bc3.py` (41 tests) already proves the early
+  validation step fails closed, including
+  `test_fetch_converts_a_kraken_read_failure_to_fail_closed`.
+- `C1` market-feed outage was recorded as partially proven on the reasoning that
+  only an unusable book was proven, not a transport that fails. The harness already
+  contains `_DownTransport(KrakenTransportError(...))`, and
+  `test_ac_003_an_unavailable_venue_neither_triggers_nor_grants_new_admissions`
+  drives exactly that. The outage was already proven.
+- `C5` dashboard outage was recorded as unproven. The existing matrix of broken
+  surfaces in `tests/test_opip_r5_e_f11_independent_protection.py` already includes
+  `app.api.dashboard.analytics_summary`, so
+  `test_ac_001_a_broken_discovery_and_notification_surface_cannot_stop_the_exit`
+  breaks the dashboard at the same instant every other surface is broken and the
+  approved stop exit still executes.
+
+The lesson is recorded because it is the one this audit exists to prevent: the first
+revision classified from the mission's wording rather than from the harness, and the
+harness contained more than the wording implied.
+
+`C3` AI and Committee unavailability was the one scenario with no test at all, and
+`ATDD-R5-M03-f11-failure-independence-matrix` closed it: with the production
+Committee and AI entry point raising on every call, the scheduled production
+protection sweep still reads the venue, still triggers, still takes the full
+remaining exposure, and never consults the Committee.
+
+## 9. A coupling this mission found and did not hide
+
+Closing `C3` required walking the protective authority's **transitive** application
+import closure rather than only its direct imports, and that walk found something the
+direct-import census cannot see. `app.services.paper_v2_protection_runtime`
+transitively reaches:
+
+```text
+app.services.chief_analyst            <- paper_v2_execution -> decision.versioning -> decision.thresholds
+app.services.entry_exit_advisor       <- ... -> decision.thresholds -> economic_quality_gate
+app.opip.decision_intelligence.*      <- paper_v2_execution -> canonical.decision_context_bridge
+                                         and -> features.publisher -> canonical.writer
+```
+
+What this does and does not mean, stated precisely:
+
+- Protection **never calls** any of them. The behavioural test proves a raising
+  Committee surface cannot prevent a triggered exit, and the direct-import census in
+  the existing F11 increment proves protection imports none of them directly.
+- Protection **does reach** them transitively, through shared leaf modules
+  (`app.opip.decision.thresholds`, `app.opip.decision.versioning`,
+  `app.opip.canonical.writer`). Independence of behaviour is proven; isolation of the
+  module graph is not.
+
+This is recorded as `C17` and classified `BLOCKED_BY_OWNER_DECISION`, because
+removing the edges means changing shared leaf modules that the writer, the
+thresholds and the versioning surface all depend on - an approved module-layering
+change, not an engineering gap. Until then the follower increment's test asserts the
+coupling set **exactly**, so any *new* edge fails closed and must be reviewed rather
+than absorbed. The coupling is frozen, not blessed.
+
+
 
 

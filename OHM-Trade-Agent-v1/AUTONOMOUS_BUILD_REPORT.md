@@ -657,6 +657,38 @@ disagreed - which is exactly the failure mode the check exists for.
 This increment changed no application module, activated no runtime, ratified no
 threshold and re-proved nothing that an existing named test already proves.
 
+## Mission 03 - portfolio execution and protection (F11 failure matrix)
+
+Status: `C3 CLOSED, THREE AUDIT MISCLASSIFICATIONS CORRECTED, ONE COUPLING RECORDED`
+
+Mission 03's Workstream C named fourteen failure scenarios. The audit found twelve
+already proven and `C3` AI/Committee unavailability unproven. This increment closes
+`C3` and asserts the matrix.
+
+| Claim | Source of truth | How it was verified |
+| --- | --- | --- |
+| An unavailable Committee cannot stop a protective exit | `tests/test_opip_r5_m03_f11_failure_matrix.py` | with `app.services.chief_analyst.review_candidates` raising on every call, the scheduled production sweep still read the venue, still triggered, still took the full remaining exposure, and never called the committee |
+| A dead feed changes no book and admits nothing | the same module | a transport raising on every call: the seam really tried the venue, nothing triggered, nothing exited, both armed obligations stayed `ACTIVE` with their entry fill as their only fill, no exit order was fabricated, and the canonical book was unchanged |
+| The matrix accounts for every named scenario | the audit's Workstream C rows | all fourteen scenario slugs appear exactly once with resolving nodes, plus the two independence assertions and the recorded coupling |
+| Three audit classifications were wrong and are corrected | the audit's section 8 | `B8`, `C1` and `C5` moved from PARTIALLY_PROVEN/UNPROVEN to PROVEN; the now-unused class was deleted from both the audit and its test rather than kept for appearance |
+
+**A coupling this mission found and did not hide.** Closing `C3` required walking the
+protective authority's **transitive** import closure, not just its direct imports.
+That walk showed `app.services.paper_v2_protection_runtime` transitively reaches
+`app.services.chief_analyst`, `app.services.entry_exit_advisor` and the
+`app.opip.decision_intelligence` family through shared leaf modules
+(`decision.thresholds`, `decision.versioning`, `canonical.writer`). Protection never
+**calls** any of them - the behavioural test proves that - but the module graph is not
+isolated. The first draft of the assertion claimed isolation, it failed, and the
+response was to record the coupling exactly rather than relax the test: the test now
+freezes the coupling set so any *new* edge fails closed. The isolation gap is filed
+as owner decision `C17`, because removing the edges means changing shared modules the
+writer, thresholds and versioning surfaces all depend on.
+
+No application module changed, no protection rule or precedence changed, no threshold
+was ratified, and nothing already proven was re-proved.
+
+
 
 
 
