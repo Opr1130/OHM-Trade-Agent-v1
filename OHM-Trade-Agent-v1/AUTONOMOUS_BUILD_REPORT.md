@@ -862,3 +862,38 @@ this worktree. Rollback configuration was inspected read-only and deliberately n
 exercised, because exercising it would require a mode change. No production write, mode
 change, deletion, drain or retirement occurred. `TARGET_PAPER` remains `BLOCKED`.
 
+
+## Mission 07 — readiness evidence (owner resolution and recovery orchestration)
+
+Status: `TWO CONTRACTS PROVEN READ-ONLY; NO RATIFICATION, NO ACTIVATION`
+
+Cut from the **verified top-of-stack recovery head** `34901ef4` (PR #394, full Linux
+`test` green), not from `eebbafb4`, whose `test` job failed on an unrelated
+timing-sensitive test. No application module changed.
+
+| Claim | How it was verified |
+| --- | --- |
+| Effective ownership resolves without erasing history | every F/G row resolves to the designated owner while the frozen cell it supersedes still reads `UNASSIGNED`; a row with no decision resolves to its frozen value |
+| The decision record is append-only and intact | `OD-001` is the first and only decision, its ratified-number statement is `NONE`, its scope is accountability only, and it claims no second approval |
+| Unreadable recovery evidence is not empty evidence | a projection that is not OK, and one whose accessor raises, both report `UNAVAILABLE` naming the upstream failure, consider nothing and submit no canonical event |
+| Unsafe work keeps its reservation | entries without committed payloads are counted as considered and reported retryable with the real `PaperV2ExecutionError` and reason; nothing completes, nothing is released, nothing is submitted |
+| One bad trade does not stop the sweep | a failure on the first entry does not prevent the second from being considered |
+
+**Recovery's happy path is not proven** — completing a fill from a committed quote needs
+the committed quote-evidence payload shape, and guessing it would be fabrication. Only the
+fail-closed, retryable and unavailable paths are proven. The happy path remains
+`INSUFFICIENT_EVIDENCE`.
+
+**Two mismatches were found by the tests rather than relaxed:** an entry missing its
+payload keys raises `KeyError` before the explicit guard, so the test now uses
+present-but-malformed payloads to exercise the real message; and a first-draft string
+assertion did not match the register's table formatting.
+
+**Preflight finding, recorded because it is a real CI failure.** PR #393's Linux `test`
+job failed on `test_opip_export_diagnostics_readonly_v1.py::test_true_flock_ownership_is_reported_and_young_holder_is_not_a_stall`
+(`assert 'YES' == 'NO'`). The test is `@pytestmark_posix`, so it skips on Windows and never
+appeared in local runs; it exercises a flock stall-detection heuristic with a 300-second
+threshold. The increment touches zero application modules and the same commit passes CI on
+`34901ef4`. Classified as a pre-existing timing-sensitive flake, **not** a regression, and
+deliberately not edited.
+
