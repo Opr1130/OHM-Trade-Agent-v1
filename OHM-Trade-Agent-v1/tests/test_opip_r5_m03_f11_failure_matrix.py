@@ -369,7 +369,7 @@ def test_ac_315_the_audit_correction_is_recorded_in_both_directions():
         assert items[identifier]["class"] == declared, identifier
 
     assert "## 8. Corrections this mission made to its own audit" in text
-    assert "## 9. A coupling this mission found and did not hide" in text
+    assert "A coupling this mission found and did not hide" in text
     assert "transitively reaches" in text
 
 

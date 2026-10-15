@@ -31,7 +31,6 @@ ROW_KEYS = ("workstream", "class", "contract", "evidence")
 CLASSES = frozenset(
     {
         "PROVEN",
-        "UNPROVEN",
         "BLOCKED_BY_OWNER_DECISION",
     }
 )
@@ -42,9 +41,7 @@ CONTRACTS = frozenset(
     {f"SC-{index:02d}" for index in range(6, 14)}
 )
 
-FOLLOWER_INCREMENTS = (
-    "ATDD-R5-M03-paper-lifecycle-economic-invariants",
-)
+FOLLOWER_INCREMENTS: tuple[str, ...] = ()
 
 
 def _text() -> str:
@@ -89,6 +86,9 @@ def _followers() -> list[tuple[str, str]]:
         if not stripped.startswith("FOLLOWER: "):
             continue
         head, _, closes = stripped[len("FOLLOWER: ") :].partition("| closes ")
+        # `FOLLOWER: NONE` is the sentinel for "no follower remains", not a follower.
+        if head.strip().startswith("NONE"):
+            continue
         followers.append((head.strip(), closes.split("|")[0].strip()))
     return followers
 
