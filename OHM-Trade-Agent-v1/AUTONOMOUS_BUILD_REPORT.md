@@ -558,3 +558,42 @@ for them.
 No merge, deployment, activation, timer enablement, Feature Bus widening, Paper-v2
 enablement, writer stop or deletion was performed, and none is proposed by this report.
 
+## Mission 02 - intelligence integration (source-of-truth audit)
+
+Status: `AUDIT DELIVERED, ONE SEAM UNPROVEN, FIVE OWNER DECISIONS REQUESTED`
+
+The continuous advisor pipeline was audited end to end with the four axes kept
+separate: repository existence, target wiring, runtime activity and production
+proof. The result is `docs/atdd/evidence/F1_F7_INTEGRATION_MATRIX.md` - nineteen
+rows, all six classification classes used, and `NOT_PROVEN` on the proof axis for
+every row - plus `docs/atdd/evidence/F1_F7_READ_PLANE_OWNER_PROPOSAL.md`, which
+implements nothing and requests five decisions.
+
+| Claim | Source of truth | How it was verified |
+| --- | --- | --- |
+| F3 IGNITION is wired into the continuous engine and not into any production path | `app/opip/events/opportunity_engine.py` | `inspect.signature(ContinuousOpportunityEngine).parameters["detector_evaluate"].default is ignition.evaluate`; the engine's compiled mode is `"off"`, its authority is `"NONE"` and `engine_reads_environment()` is `False` |
+| F5, F6 and F7 have no application caller | the application package | every module importing `app.opip.feasibility`, `app.opip.forecast` or `app.opip.portfolio_selector` was listed; the only hits are the defining modules, confirmed independently by `git grep` |
+| F7's admission authority has not moved | `app/jobs/scan_opportunities.py` | the scheduled job imports and calls `rank_capital_efficiency` at line 2030, and the target selector is imported by no application module |
+| Decision and candidate evidence is not canonical | `app/opip/decision/store.py` | the store is an append-only JSONL WAL under `Path("/app/data/opip/qualification")`, matching the census's own `TRADING_HOST_FILE_WAL` gap rows |
+| Seven canonical event types exist and are undeclared on the read plane | `app/opip/contracts/events.py`, `app/opip/fev_evidence_event.py`, `app/opip/cockpit/semantic.py` | `FEATURE_BUS_EVENT_TYPES` equals the six declared types, `FEASIBILITY_EVIDENCE_RECORDED` is `"feasibility.evidence.recorded"`, and no declared read-plane fact names an observation, coverage, feasibility, detector or feature family |
+| The two F4 episode-opening paths agree today | an executed probe against the frozen F3 fixtures | both `apply_claim` and `episode_from_claim` produced `OPEP:084327d4571400a96c1bbe79fd0de0e5` for the same claim, and all twelve identity fields matched |
+| The two F4 episode-opening paths agree, and cannot fork | `app/opip/contracts/opportunity.py` | `OpportunityLifecyclePolicy.__post_init__` refuses any unratified `episode_schema_version`, `lifecycle_version` or `policy_version`; an executed probe produced `OPEP:084327d4571400a96c1bbe79fd0de0e5` from both `apply_claim` and `episode_from_claim` with all twelve identity fields equal, and `opportunity-episode-v2` raised `OpportunityContractError` |
+| The engine's outcome does not carry the claim object | `app/opip/events/opportunity_engine.py` | `EvaluationOutcome` declares `claim_id`, `episode`, `thesis` and `snapshot_id` but no `DetectorClaim` |
+| The audit is authorized and changed no application file | the `atdd-scope` gate and git | `python tests/atdd_scope.py` against the F10-G base returns `PASS`; the changed set is two evidence documents, one test module, the contract, the pointer and this report |
+
+Two corrections to in-flight findings are recorded rather than hidden. An early
+search for canonical event-type literals matched single-quoted strings only and
+returned one type, which would have supported a wrong conclusion that the
+canonical plane holds market observations alone; re-reading the contract modules
+showed seven types across two streams, and the matrix and the proposal carry the
+corrected inventory. Separately, the two F4 episode-opening paths were briefly
+recorded as a latent identity fork; `OpportunityLifecyclePolicy` in fact refuses
+any unratified version token, so the agreement is a guarantee of fail-closed
+validation rather than a coincidence, and the corrected finding is stronger than
+the one it replaced. Neither correction was smoothed over: both are visible in the
+matrix, the proposal and the deferred discoveries.
+
+Nothing in this increment activated a mode, added a route or a fact, wrote a
+canonical row, transferred an authority, ratified a threshold or claimed parity.
+
+
