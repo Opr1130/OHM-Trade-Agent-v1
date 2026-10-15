@@ -234,13 +234,16 @@ projection still renders every panel with null values instead of dropping the pa
 
 Bookkeeping note, read off the authoritative runner: the eight acceptance tests this
 slice adds took the same `pytest` job from `8203 passed, 9 skipped` on the parent head
-`16a61d476511ecc9de7ff73a14a55f6b5d0e27b0` to `8211 passed, 9 skipped` on this head, so
-the added coverage is the slice's own and no earlier test was renamed or dropped away.
-The only non-green check on this head is the `CircleCI Pipeline` error reporting that no
-CircleCI configuration exists in the project, which fails identically on every head
-including `main`; that is a pre-existing repository condition rather than a result of
-this slice. The slice is not merged, not deployed and not activated, and its branch
-chain stays in draft.
+`16a61d476511ecc9de7ff73a14a55f6b5d0e27b0` to `8211 passed, 9 skipped` on the slice head
+`c565194f9746d270a3589b462c9ca5265aa61fee`, so the added coverage is the slice's own and
+no earlier test was renamed or dropped away. The follow-up head that carries this record
+was re-verified after it was written and its own `pytest` job reports the same
+`8211 passed, 9 skipped`, with `atdd scope`, the release architecture gate, the release
+security gate (Bandit) and `semgrep/ci` green as well. The only check that is not green
+on either head is the `CircleCI Pipeline` error reporting that no CircleCI configuration
+exists in the project, which fails identically on every head including `main`; that is a
+pre-existing repository condition rather than a result of this slice. The slice is not
+merged, not deployed and not activated, and its branch chain stays in draft.
 
 ## Prepared owner decision package — F10 eight-page dashboard and decision-first Telegram (NOT IMPLEMENTED)
 

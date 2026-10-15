@@ -534,10 +534,11 @@ def test_ac_006_the_report_the_pointer_and_the_criteria_agree() -> None:
     and the acceptance-test index
     WHEN the report, the contract, the pointer and the index are read together
     THEN the report records the two increments this slice stacks on by their own commits with
-    the Linux CI result of the head it stacks on, records this increment as delivered with
-    this module's own acceptance-test count, leaves the eight-page parity row OUTSTANDING with
-    the parity predicate NOT_VERIFIED and R7 unstarted, the pointer resolves to a declared
-    contract, and every approved criterion is traced to a matching test and mapped to a path
+    the Linux CI result of the head it stacks on, records this increment as delivered with this
+    module's own acceptance-test count and the Linux CI result of its own head, leaves the
+    eight-page parity row OUTSTANDING with the parity predicate NOT_VERIFIED and R7 unstarted,
+    the pointer resolves to a declared contract, and every approved criterion is traced to a
+    matching test and mapped to a path
     """
     contracts = load_scope_contracts(CONTRACT.parent)
     declared = {item.increment for item in contracts}
@@ -564,7 +565,10 @@ def test_ac_006_the_report_the_pointer_and_the_criteria_agree() -> None:
     assert "16a61d476511ecc9de7ff73a14a55f6b5d0e27b0" in report
     assert "pull/376" in report
     assert "pull/377" in report
+    assert "pull/378" in report
     assert "8203 passed, 9 skipped" in report
+    assert "8211 passed, 9 skipped" in report
+    assert "c565194f9746d270a3589b462c9ca5265aa61fee" in report
     assert f"{_acceptance_test_count(pathlib.Path(__file__))} acceptance tests" in report
     assert "| F10 dashboard parity | OUTSTANDING |" in report
     assert "| R7 governed retirement | OUTSTANDING |" in report
