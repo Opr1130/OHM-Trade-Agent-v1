@@ -3912,7 +3912,7 @@ class PortfolioPlan:
 
         The record's own statement of the capital a switch moves is the plan's
         declared ``ROTATE`` step. A caller may declare the capital of a switch the
-        plan does not declare - the hold-shaped plan asked what a rotation *would*
+        plan does not declare - the hold-oriented plan asked what a rotation *would*
         turn over - and may never lower the plan's own recorded figure, because
         understating the capital is how a switch could slip past a turnover budget.
         ``None`` means the capital is unestablished, and the turnover branch fails

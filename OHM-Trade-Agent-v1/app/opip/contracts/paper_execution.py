@@ -965,7 +965,7 @@ class RotationRequalification:
 
     A decided requalification must name the instant and the policy it was decided
     under; a pending, not-required or abstained decision must carry neither. An
-    undecided requalification therefore cannot borrow the shape of a decided one.
+    undecided requalification therefore cannot adopt the form of a decided one.
     """
 
     decision: RotationRequalificationDecision
@@ -1505,7 +1505,7 @@ class RotationGroup:
         }
 
     def to_dict(self) -> dict[str, Any]:
-        """``as_dict()`` under the ``SC-08`` record naming, so one payload shape serves both halves of R5-D."""
+        """``as_dict()`` under the ``SC-08`` record naming, so one payload form serves both halves of R5-D."""
 
         return self.as_dict()
 
