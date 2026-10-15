@@ -25,6 +25,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from app.api.cockpit import router as cockpit_router
+from app.api.cockpit_semantic import router as cockpit_semantic_router
 
 app = FastAPI(
     title="O'Pip Cockpit (read-only)",
@@ -40,6 +41,14 @@ app = FastAPI(
 # The Cockpit router only. Deliberately not the trading router: the analytics plane
 # must not be able to reach order, alert, paper-control or scheduler surfaces.
 app.include_router(cockpit_router)
+
+# The F10-B semantic read surface (System Pulse, Discovery and Regime, Decision Trace).
+# Widening the mounted path set is an owner-visible decision: it is authorized for the
+# `ATDD-R5-F10-dashboard-parity-implementation` increment alone, recorded in that
+# increment's scope contract, and pinned by the exposure regression suite. Every route it
+# adds is a GET over the same read-only replica and the same secret gate as the B/C-4
+# reads; no write, trading, Telegram or promotion path is reachable through it.
+app.include_router(cockpit_semantic_router)
 
 
 __all__ = ["app"]

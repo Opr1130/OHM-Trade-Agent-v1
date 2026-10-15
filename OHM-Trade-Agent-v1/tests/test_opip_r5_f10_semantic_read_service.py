@@ -515,15 +515,47 @@ def test_ac_004_declaration_mounts_nothing_and_adds_no_authority():
     assert semantic.MOUNTED_PATHS == ()
     assert semantic.DECLARED_ROUTES, "the surface is declared even while unmounted"
 
+    # This increment's own letter is unchanged: the service module mounts nothing and
+    # still carries no HTTP surface. Mounting the declared routes was explicitly out of
+    # scope here and was later authorized as its own owner-visible exposure decision -
+    # increment `ATDD-R5-F10-dashboard-parity-implementation`, whose router is the *only*
+    # module under app/api/ permitted to name these routes. The scan below therefore stays
+    # total over the package minus that one named site: every other API module naming a
+    # semantic route would still be a second, unreviewed read surface for the same facts.
+    mounting_module = "cockpit_semantic.py"
     api_sources = {
-        path: path.read_text(encoding="utf-8") for path in API_DIR.glob("*.py")
+        path.name: path.read_text(encoding="utf-8") for path in sorted(API_DIR.glob("*.py"))
     }
     assert api_sources, "the analytics API package must exist"
-    for path, text in api_sources.items():
-        assert "cockpit import semantic" not in text, path
-        assert "cockpit.semantic" not in text, path
+    assert mounting_module in api_sources, "the authorized mounting router must exist"
+    for name, text in api_sources.items():
+        if name == mounting_module:
+            continue
+        assert "cockpit import semantic" not in text, name
+        assert "cockpit.semantic" not in text, name
         for route in semantic.DECLARED_ROUTES:
-            assert route.split(" ", 1)[1] not in text, (path, route)
+            assert route.split(" ", 1)[1] not in text, (name, route)
+    mounted_router = api_sources[mounting_module]
+    # The one allowed site is held to a narrower rule, not a looser one: it must read
+    # through the F10-A service and the F10-B read model, must mount exactly the declared
+    # GET route set, and must reach no writer, order or exchange path.
+    assert "from app.opip.cockpit.semantic import" in mounted_router, mounted_router[:0]
+    assert "from app.opip.cockpit.semantic_pages import" in mounted_router
+    assert mounted_router.count("@router.get(") == len(semantic.DECLARED_ROUTES) + 1
+    for forbidden in (
+        "CanonicalWriter",
+        "get_paper_v2_ledger",
+        "place_order",
+        "cancel_order",
+        "modify_order",
+        "create_order",
+        ".commit(",
+        "post(",
+        "put(",
+        "delete(",
+        "patch(",
+    ):
+        assert forbidden not in mounted_router, forbidden
 
     source = _source()
     # No HTTP surface and no route decorator.
