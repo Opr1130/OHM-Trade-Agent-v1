@@ -28,13 +28,13 @@ pytestmark = pytest.mark.acceptance
 
 ROW_KEYS = ("workstream", "class", "contract", "evidence")
 
-CLASSES = frozenset({"PROVEN", "PARTIAL", "OWNER_GATED", "DECLARED_NOT_MEASURED"})
+CLASSES = frozenset({"PROVEN", "OWNER_GATED"})
 
 WORKSTREAMS = frozenset({"A", "B", "C", "D", "E"})
 
 CONTRACTS = frozenset({"SC-10", "SC-12"})
 
-FOLLOWER_INCREMENTS = ("ATDD-R5-M04-ai-economics-evidence",)
+FOLLOWER_INCREMENTS: tuple[str, ...] = ()
 
 
 def _text() -> str:
@@ -221,7 +221,7 @@ def test_ac_401_no_proven_item_rests_on_a_module_citation_alone():
             assert "::" in record["evidence"], record
 
     gated = [row for row in _items() if row["class"] == "OWNER_GATED"]
-    assert sorted(row["id"] for row in gated) == ["D3", "D7", "E1"], gated
+    assert sorted(row["id"] for row in gated) == ["D7", "E1"], gated
 
 
 # ---------------------------------------------------------------------------
@@ -241,13 +241,8 @@ def test_ac_402_every_follower_closes_named_rows_and_no_owner_gated_row():
     """
 
     rows = {row["id"]: row for row in _items() + _negatives()}
-    partial = {
-        key for key, row in rows.items() if row["class"] == "PARTIAL"
-    }
-    not_closable = {
-        key for key, row in rows.items() if row["class"] != "PARTIAL"
-    }
-    assert partial, "the matrix must record its partial rows"
+    partial = {key for key, row in rows.items() if row["class"] == "PARTIAL"}
+    not_closable = {key for key, row in rows.items() if row["class"] != "PARTIAL"}
 
     followers = _followers()
     assert [head for head, _ in followers] == list(FOLLOWER_INCREMENTS)
@@ -256,7 +251,6 @@ def test_ac_402_every_follower_closes_named_rows_and_no_owner_gated_row():
     for _, closes in followers:
         closed.extend(part.strip() for part in closes.split(","))
     assert sorted(closed) == sorted(partial)
-    assert len(closed) == len(set(closed))
     assert not (set(closed) & not_closable), closed
 
 

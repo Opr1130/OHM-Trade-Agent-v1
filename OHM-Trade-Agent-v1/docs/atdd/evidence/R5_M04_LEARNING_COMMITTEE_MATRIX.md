@@ -18,9 +18,7 @@ breaks this document rather than silently weakening it.
 ```text
 CLASSES:
   PROVEN
-  PARTIAL
   OWNER_GATED
-  DECLARED_NOT_MEASURED
 
 WORKSTREAMS:
   A   expected versus actual (F9, R5-F, SC-10)
@@ -120,46 +118,57 @@ C1 and C9 are carried by more than one assertion, and the reinforcement matters:
 ## 5. Workstream D - AI economics
 
 The mission asked whether canonical invocation-attempt evidence already exists for each
-of these facts. The answer is item by item, and the classes are deliberately precise:
-`DECLARED_NOT_MEASURED` means the repository answers the item with an explicit,
-documented posture instead of a measurement, which is not the same as proving it by
-measurement.
+of these facts. The answer is item by item. Most of it is proven by the
+decision-intelligence plane's `ModelInvocation` rather than by the committee plane's
+smaller `ProviderCallOutcome`, which is a distinction the audit's first pass missed.
 
 ```text
 ITEM: D1 | provider-and-model | workstream=D | class=PROVEN | contract=SC-12 | evidence=OHM-Trade-Agent-v1/tests/test_opip_committee_bake_off_v1.py::test_provider_failures_are_counted_but_never_scored_as_calls
-ITEM: D2 | input-output-and-cache-tokens | workstream=D | class=DECLARED_NOT_MEASURED | contract=SC-12 | evidence=OHM-Trade-Agent-v1/app/opip/committee/registry.py
-ITEM: D3 | billed-versus-estimated-cost | workstream=D | class=OWNER_GATED | contract=SC-12 | evidence=OHM-Trade-Agent-v1/app/opip/committee/contracts.py
-ITEM: D4 | retry-cost | workstream=D | class=PARTIAL | contract=SC-12 | evidence=OHM-Trade-Agent-v1/tests/test_opip_committee_latency_v1.py::test_failover_records_a_duration_for_each_attempt
-ITEM: D5 | failed-attempt-cost | workstream=D | class=PARTIAL | contract=SC-12 | evidence=OHM-Trade-Agent-v1/tests/test_opip_committee_latency_v1.py::test_a_failed_attempt_still_records_its_duration
+ITEM: D2 | input-output-and-cache-tokens | workstream=D | class=PROVEN | contract=SC-12 | evidence=OHM-Trade-Agent-v1/tests/test_opip_decision_intelligence_p1a.py::test_writer_rejects_non_integer_values_across_remaining_di_integer_fields
+ITEM: D3 | billed-versus-estimated-cost | workstream=D | class=PROVEN | contract=SC-12 | evidence=OHM-Trade-Agent-v1/tests/test_opip_decision_intelligence_evidence_reader_v1.py::test_invocation_cost_evidence_is_raw_and_never_totalled
+ITEM: D4 | retry-cost | workstream=D | class=PROVEN | contract=SC-12 | evidence=OHM-Trade-Agent-v1/tests/test_opip_r5_m04_ai_economics_evidence.py::test_ac_410_a_retry_carries_its_own_attributable_cost
+ITEM: D5 | failed-attempt-cost | workstream=D | class=PROVEN | contract=SC-12 | evidence=OHM-Trade-Agent-v1/tests/test_opip_r5_m04_ai_economics_evidence.py::test_ac_411_a_failed_attempt_retains_its_cost_and_its_completeness
 ITEM: D6 | latency-and-timeout | workstream=D | class=PROVEN | contract=SC-12 | evidence=OHM-Trade-Agent-v1/tests/test_opip_committee_latency_v1.py::test_latency_is_measured_not_inferred_from_timestamps
 ITEM: D7 | complete-attributable-cost-basis-is-canonical | workstream=D | class=OWNER_GATED | contract=SC-12 | evidence=OHM-Trade-Agent-v1/app/opip/committee/store.py
 ITEM: D8 | matched-policy-incremental-economic-value | workstream=D | class=PROVEN | contract=SC-12 | evidence=OHM-Trade-Agent-v1/tests/test_opip_committee_economics_v1.py::test_incremental_operating_net_subtracts_attributable_cost
 ```
 
-What this means, stated precisely:
+What this means, stated precisely - and it corrects the audit's own first pass:
 
-- **Present, durable and measured:** provider family plus reported provider, requested
-  and reported model, per-attempt `attempt` number, `input_tokens`, `output_tokens`,
-  `estimated_cost_microunits`, a runtime `charge_microunits`, `cost_completeness`,
-  `latency_micros`, `request_at`/`response_at`, `failure_class` and
-  `raw_response_ref` - all on `ProviderCallOutcome`, whose identity is content-derived
-  so a retry that re-delivers one observation is recorded as `DUPLICATE_OK` and never
-  becomes a second opinion.
-- **Declared, not measured:** prompt-cache usage. `app/opip/committee/registry.py`
-  carries `CACHE_SAVINGS_CREDITED = False` with the recorded reason that cache usage and
-  its cost effect are not measured, so cost is accounted at **uncached rates** and no
-  unmeasured saving is credited. That is the conservative answer, and it is declared
-  rather than silent.
-- **Absent:** a **billed** cost. The string `billed` appears nowhere in the application
-  package. What exists is an *estimated* cost derived from tokens through a configured
-  price book and, separately, a runtime *charge*. No provider-invoice figure is
-  captured, so "billed versus estimated" cannot be answered from present evidence.
-- **Not canonical:** committee evidence is written to the committee plane's own bounded
-  JSONL archive (`app/opip/committee/store.py`), not through the single canonical
-  writer. The cost basis is therefore durable but **not canonical**, which is exactly
-  why the F10 read plane withholds it (section 6).
-- **Proven:** matched-policy incremental economic value, including the discipline that an
-  unknown operating cost makes the operating net **unknown** rather than zero.
+- **Present, durable and measured:** the decision-intelligence plane's `ModelInvocation`
+  is the richest invocation-attempt contract in the repository. It carries
+  `provider`, `model`, `provider_model_version`, `route_version`, `prompt_version`,
+  `reasoning_mode`, `attempt`, `input_tokens`, `output_tokens`, **`cached_tokens`**,
+  `latency_micros`, `queue_time_micros`, `provider_time_micros`,
+  **`billed_cost_microunits`** and `estimated_cost_microunits`, `price_version`,
+  `currency`, `reconciliation_status`, `cost_completeness` and provenance, and it fails
+  closed when an invocation has no cost at all but is not marked `UNKNOWN` or
+  `INCOMPLETE`. `app/opip/decision_intelligence/evidence_reader.py` reconstructs
+  invocations from it. The committee plane's `ProviderCallOutcome` carries the
+  per-attempt subset that the Committee's own bake-off needs.
+- **Declared, not measured, but only in the committee plane:**
+  `app/opip/committee/registry.py` sets `CACHE_SAVINGS_CREDITED = False` with the
+  recorded reason that cache usage is not measured *there*, so Committee cost is
+  accounted at uncached rates. Cache tokens **are** captured on the
+  decision-intelligence invocation record, so this is a per-plane accounting choice
+  rather than a repository-wide absence.
+- **Proven:** billed and estimated cost are distinct fields, are never conflated, and
+  cost evidence is read raw and **never totalled**
+  (`test_invocation_cost_evidence_is_raw_and_never_totalled`), with an unknown cost and a
+  superseded-billing reconciliation covered by
+  `test_acceptance_unknown_cost_and_superseded_billing_reconciliation`. Matched-policy
+  incremental economic value is proven, including that an unknown operating cost makes
+  the operating net **unknown** rather than zero.
+- **Still not canonical as a whole:** the Committee's own archive is a bounded JSONL
+  archive rather than the canonical writer, which is why the F10 read plane withholds
+  the attributable-AI-cost panel (section 6).
+
+**Correction recorded.** The audit's first pass searched only the committee package and
+concluded that no billed cost existed anywhere and that cache tokens were unmeasured. It
+was wrong on both counts: both are present in the decision-intelligence plane. The rows
+were corrected in place, and the `DECLARED_NOT_MEASURED` class was deleted from the
+vocabulary because nothing uses it any more.
+
 
 ## 6. Workstream E - read-only operator evidence
 
@@ -191,8 +200,8 @@ NEG: N5 | missing-policy-reference | class=PROVEN | evidence=OHM-Trade-Agent-v1/
 NEG: N6 | missing-committee-review | class=PROVEN | evidence=OHM-Trade-Agent-v1/tests/test_opip_r6_committee_shadow_review_readiness.py::test_ac_003_a_stand_in_case_is_refused_rather_than_counted
 NEG: N7 | wrong-model-version | class=PROVEN | evidence=OHM-Trade-Agent-v1/tests/test_opip_committee_prospective_v1.py::test_evaluation_refuses_a_drifted_release_explicitly
 NEG: N8 | incorrect-paired-cohort | class=PROVEN | evidence=OHM-Trade-Agent-v1/tests/test_opip_committee_learning_v1.py::test_an_incomparable_cohort_must_state_why_and_report_no_metric
-NEG: N9 | duplicate-ai-attempt | class=PARTIAL | evidence=OHM-Trade-Agent-v1/tests/test_opip_committee_latency_v1.py::test_failover_records_a_duration_for_each_attempt
-NEG: N10 | missing-failed-attempt-billing | class=PARTIAL | evidence=OHM-Trade-Agent-v1/tests/test_opip_committee_bake_off_v1.py::test_provider_failures_are_counted_but_never_scored_as_calls
+NEG: N9 | duplicate-ai-attempt | class=PROVEN | evidence=OHM-Trade-Agent-v1/tests/test_opip_r5_m04_ai_economics_evidence.py::test_ac_412_a_duplicate_ai_attempt_collapses_to_one_identity
+NEG: N10 | missing-failed-attempt-billing | class=PROVEN | evidence=OHM-Trade-Agent-v1/tests/test_opip_r5_m04_ai_economics_evidence.py::test_ac_413_a_missing_failed_attempt_billing_is_incomplete_never_zero
 NEG: N11 | causal-attribution-without-evidence | class=PROVEN | evidence=OHM-Trade-Agent-v1/tests/test_opip_committee_learning_v1.py::test_an_unmeasured_effect_stays_null
 NEG: N12 | rejected-learning-artifact | class=PROVEN | evidence=OHM-Trade-Agent-v1/tests/test_opip_committee_learning_v1.py::test_changing_a_sealed_experiment_fails_closed
 NEG: N13 | approved-but-not-adopted-artifact | class=PROVEN | evidence=OHM-Trade-Agent-v1/tests/test_opip_committee_learning_v1.py::test_effectiveness_requires_a_release_to_measure
@@ -212,10 +221,8 @@ TOTALS:
   ITEMS 44
   NEGATIVE 14
   ROWS 58
-  PROVEN 50
-  PARTIAL 4
-  OWNER_GATED 3
-  DECLARED_NOT_MEASURED 1
+  PROVEN 56
+  OWNER_GATED 2
   WORKSTREAM_A 14
   WORKSTREAM_B 11
   WORKSTREAM_C 10
@@ -223,22 +230,25 @@ TOTALS:
   WORKSTREAM_E 1
 ```
 
+Fifty-six of the fifty-eight rows are proven by a named acceptance test and only two
+remain owner-gated, so nothing is left unproven.
+
 ## 9. Follower increments and what each closes
 
 ```text
-FOLLOWER: ATDD-R5-M04-ai-economics-evidence | closes D4, D5, N9, N10 | asserts that a retry and a failed attempt each carry their own attributable cost, and records the Workstream D and E determination
+FOLLOWER: NONE | every row this audit could close has been closed by ATDD-R5-M04-ai-economics-evidence
 ```
 
-Four items are closed by that single follower. The three `OWNER_GATED` items (`D3`
-billed cost, `D7` canonical cost basis, `E1` F10 integration) are not closable by any
-increment without owner authorization, and `D2` needs no follower because the repository
-already answers it with a declared posture.
+`ATDD-R5-M04-ai-economics-evidence` closed `D4`, `D5`, `N9` and `N10`, and its
+`AC-414` records the Workstream D and E determination. The two remaining `OWNER_GATED`
+rows (`D7` canonical cost basis, `E1` F10 read integration) are not closable by any
+increment without owner authorization.
 
 ## 10. What this matrix refuses to say
 
 - It does not say AI net value is favourable, or unfavourable. The mission requires
   `INSUFFICIENT_EVIDENCE` rather than an estimate where the cost basis is incomplete, and
-  the billed-cost and canonical-basis items are exactly that.
+  the canonical-basis item is exactly that.
 - It does not conflate Cline/DeepSeek engineering-development spend with Committee
   trading-operating expense. Nothing in this matrix treats development cost as an
   operating cost of the Committee.

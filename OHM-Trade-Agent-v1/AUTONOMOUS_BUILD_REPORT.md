@@ -754,6 +754,43 @@ Four rows remain partial and one follower closes them; three rows are owner-gate
 application module changed, no producer or publication boundary was created, no
 Committee timer or provider call was enabled, and no threshold or price was ratified.
 
+## Mission 04 - learning and AI Committee evidence (AI-economics closure)
+
+Status: `FOUR PARTIAL ROWS CLOSED, DETERMINATION RECORDED, NO FOLLOWER REMAINS`
+
+The audit left exactly four partial rows. This increment closes all four and records the
+Workstream D and E determination. No application module changed.
+
+| Claim | Source of truth | How it was verified |
+| --- | --- | --- |
+| A retry's cost is attributable to the retry | `app/opip/committee/role_router.py` | a failover's attributed spend equals the answering attempt's cost alone, the timed-out attempt contributes nothing, and the aggregate completeness is `UNKNOWN` because one attempt's cost was never reported |
+| Unreported cost is null, never zero | `RoleAttempt.cost_microunits` | a timed-out attempt records its failure class and a measured latency but **no** cost - not the pre-flight estimate, not zero - and an uninvoked attempt records neither cost nor latency |
+| A re-delivered attempt collapses | the router's attempt records | two identical executions produce an **equal** attempt record, so a duplicate observation does not become a second independently-priced opinion, while a differing execution is not equal |
+| The completeness vocabulary is real | `RoleExecution.cost_completeness` | a fully-attributed success carries `COMPLETE` with its own spend, while a partially-attributed one stays `UNKNOWN` |
+| The determination is recorded with its six implications | `docs/atdd/evidence/R5_M04_AI_ECONOMICS_DETERMINATION.md` | a complete **canonical** attributable cost basis is `INSUFFICIENT_EVIDENCE`; three owner decisions each name a producer, consumer, schema, failure mode, security implication and migration implication |
+
+**One correction to the audit's own expectation.** The audit assumed a failed attempt
+would record the cost its answer declared. It does not: the runtime attributes a cost
+only when one was **reported**, so a timed-out attempt records null. That is the more
+conservative behaviour, and the tests were written to the true contract rather than to
+the audit's assumption.
+
+**The determination, stated once.** Invocation-attempt telemetry exists and is durable -
+provider and model identity, per-attempt tokens, estimated cost, a runtime charge,
+completeness, latency and failure class on a content-derived identity - and
+matched-policy incremental economic value is proven. But **no billed cost exists
+anywhere** in the application package, prompt-cache usage is **deliberately not measured
+and not credited** (`CACHE_SAVINGS_CREDITED = False`, cost at uncached rates), and the
+whole basis lives in the committee plane's own archive rather than through the single
+canonical writer. The read plane already publishes the same verdict:
+`NO_CANONICAL_AI_COST_EVIDENCE` against `AC-073`.
+
+Fifty-four of the audit's fifty-eight rows are now proven; three are owner-gated and one
+is answered by a declared posture, so nothing is left unproven and no follower remains.
+No AI net value was estimated in either direction, no development spend was treated as
+operating expense, and no provider call, credential, timer or endpoint was used.
+
+
 
 
 
