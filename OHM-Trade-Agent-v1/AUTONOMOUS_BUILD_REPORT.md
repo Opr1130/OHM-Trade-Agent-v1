@@ -797,3 +797,41 @@ operating expense, and no provider call, credential, timer or endpoint was used.
 
 
 
+
+## Mission 06 — OQ-01 owner decision (governance, recorded)
+
+Status: `OQ-01 OWNER_DECISION_CONFIRMED AND RECORDED; NO NUMBER RATIFIED`
+
+The owner confirmed that the same human operator serves as both **Business Decision
+Owner** and **Technical Release Owner**. That confirmation is recorded as `OD-001` in a
+new owner-decisions register, with F1–F12 and G1–G6 accountability mapped to that owner.
+
+| Claim | Source of truth | How it was verified |
+| --- | --- | --- |
+| The decision is recorded by role, not by person | `docs/architecture/OPIP_OWNER_DECISIONS_REGISTER.md` | the register declares a role-only identifier policy and states that no personal identifier is recorded and no independent human approval is claimed; the test asserts no personal marker appears |
+| Accountability is mapped for all eighteen rows | the register's mapping blocks | `test_ac_421_...` compares each mapped row with the frozen register and confirms each feature's mapped gate equals the register's own gate |
+| `G6`/`PM-02` keep a **separate** approval | Architecture v1.5.0 §19 | the mapping carries `separate_approver=YES` for `G6` alone, and the cited clause is asserted to exist in the architecture source |
+| Nothing else is ratified | the register's non-ratification block | exactly `OQ-02`…`OQ-10`, `SC-13`, `C17` and `PM-02` are declared not ratified, and `NUMERIC_POLICY_RATIFIED_BY_THIS_DECISION` is `NONE` |
+| **The frozen register is untouched** | `OPIP_R5_REQUIREMENTS_REGISTER.md` | all 18 owner cells still read `UNASSIGNED` and the existing conformance suite still passes unchanged |
+
+**Why the decision lives beside the freeze rather than inside it.** The requirements
+register's conformance contract requires the rows whose status is
+`OWNER_DECISION_REQUIRED` to be exactly `OQ-01`…`OQ-10`, so `OQ-01`'s status must stay.
+Rewriting an owner cell would ratify a decision *into* a freeze instead of recording it
+*beside* one, and would leave the register's own prose contradicting its cells. The same
+principle the conformance and retirement ledgers already use applies: a later value never
+erases an earlier recorded one.
+
+**A probe of mine lied before it was fixed.** An earlier script printed "remapped 18 rows"
+and the conformance suite passed — but the script reassigned a loop variable without
+writing it back, so it changed nothing and both results were meaningless. It was fixed,
+re-run, and re-verified against the file on disk. The real answer is that the register's
+owner vocabulary does accept `OWNER`; the register is nonetheless left alone for the
+reason above. Two subsequent mapping-test bugs (a wrong column index and a wrongly
+prefixed comparison) were corrected against the register's actual cell order rather than
+by relaxing the assertions.
+
+No application module changed. No threshold, duration, budget, cap or coefficient was
+ratified or invented. `TARGET_PAPER` remains `BLOCKED` and the release posture remains
+`EVIDENCE_SHADOW`.
+
