@@ -596,4 +596,36 @@ matrix, the proposal and the deferred discoveries.
 Nothing in this increment activated a mode, added a route or a fact, wrote a
 canonical row, transferred an authority, ratified a threshold or claimed parity.
 
+## Mission 02 - intelligence integration (pipeline seam)
+
+Status: `SEAM PROVEN IN PROCESS, PRODUCTION WIRING STILL ABSENT, NO AUTHORITY ADDED`
+
+The audit recorded that the pipeline's two halves had never been joined. This
+increment joins them with the real production callables and the frozen fixtures,
+and adds `tests/test_opip_r5_m02_pipeline_seam.py` plus its contract. No
+application module changed.
+
+| Claim | Source of truth | How it was verified |
+| --- | --- | --- |
+| The real engine claims through F1, F2, F3 and F4 | `app/opip/events/opportunity_engine.py` | two consumed observation intervals on the frozen grid, one observation-and-attention step and one evaluation step each; the first is a recorded `NO_CLAIM`, the second a `CLAIM` carrying `DCLM:024aa869879d5ee8945565ff5f9e5965`, episode `OPEP:084327d4571400a96c1bbe79fd0de0e5`, one thesis and the phase the detector reached |
+| One claim produces one episode across both F4 paths | an executed comparison in the test | the engine's episode equals `lifecycle.apply_claim`'s episode field for field, with the same opening event identity, and equals `episode_from_claim`'s |
+| The F4 paths cannot fork on version tokens | `app/opip/contracts/opportunity.py` | constructing a policy with an unratified `episode_schema_version`, `lifecycle_version` or `policy_version` raises `OpportunityContractError`, so the paths resolve to the same ratified token by construction |
+| The real F5, F6 and F7 accept the engine's own episode | `app/opip/feasibility.py`, `app/opip/forecast.py`, `app/opip/portfolio_selector.py` | F5 `FEASIBLE` bound to that episode, F6 `FORECAST` with `episode_id` and `feasibility_decision_id` bound through, F7 `SELECTED` with an allocation and a reservation plan |
+| Joining the halves changes nothing | `tests/test_opip_r4_b0_spine_composition.py` | the joined traversal's claim, episode, snapshot, feasibility, forecast and selection identities all agree with the R4-B0 composition over the same fixtures |
+| The traversal replays to one identical trace | the seam test | both runs produce element-for-element identical traces from observation to selection, and a duplicate delivery of an already evaluated instant produces no second claim or episode |
+| The refusals survive the join | the seam test | missing snapshot, stale snapshot, foreign instrument, duplicate delivery, pre-cut-off instant, proven `VETO`, untrusted calibration report and tampered policy version are each refused; cash is `CASH_NO_TRADE` and distinct from `INSUFFICIENT_EVIDENCE` |
+| No authority was added | the engine's compiled constants and the module's imports | mode `"off"`, authority `"NONE"`, no environment variable read, and no canonical, exchange, Telegram, registry-io, storage, job or configuration import in the seam module |
+
+Two abstention reasons are recorded as distinct rather than interchangeable: with
+an artifact present and the production empty registry, F6 abstains with
+`CALIBRATION_REPORT_UNTRUSTED`, where a missing artifact would abstain with
+`NO_CALIBRATED_MODEL`. The seam test asserts the first, and the distinction is in
+the contract's deferred discoveries so neither reason is assumed to be the other.
+
+`NO_PRODUCTION_SEAM_WIRING` remains true and is now named precisely: production
+still passes neither a snapshot source nor a composition callable, so the target
+path stays inert and non-authoritative. Proving the in-process traversal did not
+wire it, activate it, or move any `F1`-`F7` row of the audit matrix.
+
+
 

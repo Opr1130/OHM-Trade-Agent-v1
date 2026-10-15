@@ -24,7 +24,7 @@ Runtime activity is not production proof. Every row records all four, and the
 ```text
 AXES:
   repo    : EXISTS
-  wiring  : WIRED_INTO_DORMANT_ENGINE | WIRED_INTO_SCAN_JOB | NO_PRODUCTION_SNAPSHOT_SOURCE | NO_APP_RUNTIME_CALLER | NOT_THE_ADMISSION_AUTHORITY | LEGACY_AUTHORITATIVE | NOT_EXPOSED_BY_THE_READ_PLANE | NO_CANONICAL_PRODUCER | FILE_WAL_ON_TRADING_HOST | ABSENT_DECLARED | TWO_ENTRY_POINTS_CONSISTENT | UNPROVEN_BETWEEN_HALVES
+  wiring  : WIRED_INTO_DORMANT_ENGINE | WIRED_INTO_SCAN_JOB | NO_PRODUCTION_SNAPSHOT_SOURCE | NO_APP_RUNTIME_CALLER | NOT_THE_ADMISSION_AUTHORITY | LEGACY_AUTHORITATIVE | NOT_EXPOSED_BY_THE_READ_PLANE | NO_CANONICAL_PRODUCER | FILE_WAL_ON_TRADING_HOST | ABSENT_DECLARED | TWO_ENTRY_POINTS_CONSISTENT | NO_PRODUCTION_SEAM_WIRING
   runtime : INERT | ACTIVE_WHEN_SCAN_RUNS | NOT_RUNNING
   proof   : NOT_PROVEN
 ```
@@ -41,6 +41,13 @@ repository records what does not exist.
 path, which is verifiable here. Whether that job executed on the host is a
 deployment fact and is **not** verified by this increment, which is why it is not
 recorded as runtime activity, let alone as production proof.
+
+`wiring=NO_PRODUCTION_SEAM_WIRING` means production still passes neither a snapshot
+source nor a composition callable between the continuous engine and the F5/F6/F7
+spine, exactly as `ATDD-R4-B1-runtime-integration-dormant` records. It says nothing
+about whether the seam has been traversed in process, which is the class axis's
+job: after `ATDD-R5-M02-pipeline-seam-integration` the traversal is proven while
+the production wiring is still absent, and the two statements are not in conflict.
 
 ## 2. Classification vocabulary
 
@@ -83,20 +90,31 @@ ROW: CANONICAL | CANONICAL-FEATURE-BUS-EVIDENCE | class=IMPLEMENTED_NOT_INTEGRAT
 ROW: CANONICAL | CANONICAL-F5-FEASIBILITY-EVIDENCE-STREAM | class=IMPLEMENTED_NOT_INTEGRATED | repo=EXISTS | wiring=NOT_EXPOSED_BY_THE_READ_PLANE | runtime=NOT_RUNNING | proof=NOT_PROVEN | owner=OHM-Trade-Agent-v1/app/opip/fev_evidence_event.py | entry=app.opip.fev_evidence_event.FEASIBILITY_EVIDENCE_RECORDED | evidence=OHM-Trade-Agent-v1/tests/test_opip_r4_b2_feasibility_evidence_event.py
 ROW: F10 | F10-READ-MODEL-CONSUMPTION-OF-PIPELINE-FACTS | class=MISSING_CANONICAL_EVIDENCE | repo=EXISTS | wiring=NOT_EXPOSED_BY_THE_READ_PLANE | runtime=NOT_RUNNING | proof=NOT_PROVEN | owner=OHM-Trade-Agent-v1/app/opip/cockpit/semantic.py | entry=app.opip.cockpit.semantic.READ_MODEL_FACTS | evidence=OHM-Trade-Agent-v1/docs/architecture/OPIP_F10_SOURCE_CENSUS.md
 ROW: F10 | F10-DECISION-TRACE-READ-MODEL | class=MISSING_CODE | repo=EXISTS | wiring=ABSENT_DECLARED | runtime=NOT_RUNNING | proof=NOT_PROVEN | owner=OHM-Trade-Agent-v1/app/opip/cockpit/semantic.py | entry=app.opip.cockpit.semantic.SemanticReadService | evidence=OHM-Trade-Agent-v1/docs/architecture/OPIP_F10_SOURCE_CENSUS.md
-ROW: SEAM | SEAM-ENGINE-EPISODE-ACCEPTED-BY-THE-SPINE | class=NOT_YET_TESTED | repo=EXISTS | wiring=UNPROVEN_BETWEEN_HALVES | runtime=INERT | proof=NOT_PROVEN | owner=OHM-Trade-Agent-v1/app/opip/events/opportunity_engine.py | entry=app.opip.events.opportunity_engine.ContinuousOpportunityEngine.evaluate_due | evidence=OHM-Trade-Agent-v1/tests/test_opip_r4_b0_spine_composition.py
-ROW: SEAM | SEAM-CLAIM-OBJECT-NOT-EXPOSED-BY-THE-ENGINE | class=BLOCKED_BY_OWNER_DECISION | repo=EXISTS | wiring=UNPROVEN_BETWEEN_HALVES | runtime=INERT | proof=NOT_PROVEN | owner=OHM-Trade-Agent-v1/app/opip/events/opportunity_engine.py | entry=app.opip.events.opportunity_engine.EvaluationOutcome | evidence=OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B1-runtime-integration-dormant.md
+ROW: SEAM | SEAM-ENGINE-EPISODE-ACCEPTED-BY-THE-SPINE | class=IMPLEMENTED_AND_VERIFIED | repo=EXISTS | wiring=NO_PRODUCTION_SEAM_WIRING | runtime=INERT | proof=NOT_PROVEN | owner=OHM-Trade-Agent-v1/app/opip/events/opportunity_engine.py | entry=app.opip.events.opportunity_engine.ContinuousOpportunityEngine.evaluate_due | evidence=OHM-Trade-Agent-v1/tests/test_opip_r5_m02_pipeline_seam.py
+ROW: SEAM | SEAM-REFUSALS-SURVIVE-THE-JOIN | class=IMPLEMENTED_AND_VERIFIED | repo=EXISTS | wiring=NO_PRODUCTION_SEAM_WIRING | runtime=INERT | proof=NOT_PROVEN | owner=OHM-Trade-Agent-v1/app/opip/feasibility.py | entry=app.opip.feasibility.evaluate_feasibility | evidence=OHM-Trade-Agent-v1/tests/test_opip_r5_m02_pipeline_seam.py
+ROW: SEAM | SEAM-CANDIDATE-REQUALIFICATION-ACROSS-THE-SEAM | class=NOT_YET_TESTED | repo=EXISTS | wiring=NO_PRODUCTION_SEAM_WIRING | runtime=INERT | proof=NOT_PROVEN | owner=OHM-Trade-Agent-v1/app/opip/contracts/opportunity_phases.py | entry=app.opip.contracts.opportunity_phases.requalify_episode | evidence=OHM-Trade-Agent-v1/tests/test_opip_r5_a_continuous_opportunity_engine.py
+ROW: SEAM | SEAM-CLAIM-OBJECT-NOT-EXPOSED-BY-THE-ENGINE | class=BLOCKED_BY_OWNER_DECISION | repo=EXISTS | wiring=NO_PRODUCTION_SEAM_WIRING | runtime=INERT | proof=NOT_PROVEN | owner=OHM-Trade-Agent-v1/app/opip/events/opportunity_engine.py | entry=app.opip.events.opportunity_engine.EvaluationOutcome | evidence=OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R4-B1-runtime-integration-dormant.md
 ```
 
 ## 4. Movement this mission makes
 
-The two `SEAM` rows are the only rows this mission moves.
 `ATDD-R5-M02-pipeline-seam-integration` closes
 `SEAM-ENGINE-EPISODE-ACCEPTED-BY-THE-SPINE` by driving the real continuous engine
 into the real F5/F6/F7 spine with one snapshot and asserting that one claim, one
-episode and one thesis come out of it. It does **not** move
-`SEAM-CLAIM-OBJECT-NOT-EXPOSED-BY-THE-ENGINE`, which needs an owner decision, and
-it does not move a single `F1`-`F7` row: no wiring changed, so no wiring claim may
-change.
+episode, one thesis and one decision trace come out of it, and it closes
+`SEAM-REFUSALS-SURVIVE-THE-JOIN` by asserting that a stale snapshot, a missing
+snapshot, a foreign instrument, a proven veto, an untrusted calibration report and
+a tampered policy version are each refused across the join. Its records are
+`ATDD-R5-M02-pipeline-seam-integration`'s own contract and test module.
+
+It does **not** move `SEAM-CLAIM-OBJECT-NOT-EXPOSED-BY-THE-ENGINE`, which needs an
+owner decision, and it leaves `SEAM-CANDIDATE-REQUALIFICATION-ACROSS-THE-SEAM` as
+`NOT_YET_TESTED`: F4 requalification is covered by its own increment, but the
+interaction between a requalified episode and a candidate that already carries a
+forecast is not proven here and is not claimed.
+
+It does not move a single `F1`-`F7` row: no production wiring changed, so no wiring
+claim may change.
 
 ### 4.1 A finding this audit first recorded wrongly, and corrected
 
@@ -141,14 +159,14 @@ refusal and the identity - so the correction cannot silently reverse.
 
 ```text
 TOTALS:
-  ROWS 20
-  IMPLEMENTED_AND_VERIFIED 7
+  ROWS 22
+  IMPLEMENTED_AND_VERIFIED 9
   IMPLEMENTED_NOT_INTEGRATED 7
   MISSING_CODE 1
   MISSING_CANONICAL_EVIDENCE 2
   BLOCKED_BY_OWNER_DECISION 2
   NOT_YET_TESTED 1
-  PROOF_NOT_PROVEN 20
+  PROOF_NOT_PROVEN 22
 ```
 
 Every one of the six classes is used, so no class is a decorative row in a
