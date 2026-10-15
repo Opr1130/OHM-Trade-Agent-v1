@@ -31,7 +31,6 @@ ROW_KEYS = ("workstream", "class", "contract", "evidence")
 CLASSES = frozenset(
     {
         "PROVEN",
-        "PARTIALLY_PROVEN",
         "UNPROVEN",
         "BLOCKED_BY_OWNER_DECISION",
     }
@@ -44,7 +43,6 @@ CONTRACTS = frozenset(
 )
 
 FOLLOWER_INCREMENTS = (
-    "ATDD-R5-M03-f11-failure-independence-matrix",
     "ATDD-R5-M03-paper-lifecycle-economic-invariants",
 )
 
