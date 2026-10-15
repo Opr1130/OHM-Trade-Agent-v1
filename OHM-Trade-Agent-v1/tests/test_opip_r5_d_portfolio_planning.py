@@ -3150,3 +3150,158 @@ def test_ac_009_release_profile_and_non_authority_posture_are_unchanged() -> Non
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# F-007 remediation (AC-007): the frozen SC-09 payload order is enforced
+# ---------------------------------------------------------------------------
+
+
+def test_f007_the_frozen_payload_order_is_accepted_and_a_reorder_is_refused() -> None:
+    """AC-007: the durable payload must carry the frozen SC-09 keys in order."""
+
+    record = group()
+    payload = record.as_dict()
+    assert tuple(payload) == ROTATION_GROUP_PAYLOAD_KEYS
+    assert RotationGroup.from_dict(payload) == record
+
+    keys = list(ROTATION_GROUP_PAYLOAD_KEYS)
+    swapped = {key: payload[key] for key in ([keys[1], keys[0]] + keys[2:])}
+    assert list(swapped) != keys
+    with pytest.raises(RotationGroupContractError, match="order"):
+        RotationGroup.from_dict(swapped)
+
+    reversed_payload = {key: payload[key] for key in reversed(keys)}
+    with pytest.raises(RotationGroupContractError, match="order"):
+        RotationGroup.from_dict(reversed_payload)
+
+    rotated = {key: payload[key] for key in (keys[1:] + keys[:1])}
+    with pytest.raises(RotationGroupContractError, match="order"):
+        RotationGroup.from_dict(rotated)
+
+
+def test_f007_reordering_cannot_bypass_the_frozen_keys_or_identity() -> None:
+    """AC-007: a reorder neither hides a missing key nor forges an identity."""
+
+    record = group()
+    payload = record.as_dict()
+    keys = list(ROTATION_GROUP_PAYLOAD_KEYS)
+
+    missing = {key: payload[key] for key in keys if key != "reasons"}
+    with pytest.raises(RotationGroupContractError, match="missing"):
+        RotationGroup.from_dict(missing)
+
+    extra = dict(payload)
+    extra["extra_key"] = 1
+    with pytest.raises(RotationGroupContractError, match="unknown key"):
+        RotationGroup.from_dict(extra)
+
+    renamed = {("reasons_" if key == "reasons" else key): payload[key] for key in keys}
+    with pytest.raises(RotationGroupContractError, match="missing"):
+        RotationGroup.from_dict(renamed)
+
+    forged = dict(payload)
+    forged["group_id"] = f"{ROTATION_GROUP_ID_PREFIX}:{'0' * 32}"
+    with pytest.raises(RotationGroupContractError, match="content"):
+        RotationGroup.from_dict(forged)
+
+
+def test_f007_reordering_preserves_existing_refusals() -> None:
+    """AC-007: the ordering guard does not displace the existing refusals."""
+
+    record = group()
+    payload = dict(record.as_dict())
+    legs = [dict(leg) for leg in payload["legs"]]
+    legs[1]["fills"] = [dict(legs[1]["fills"][0], fill_id=legs[0]["fills"][0]["fill_id"])]
+    payload["legs"] = legs
+    with pytest.raises(RotationGroupContractError, match="both legs"):
+        RotationGroup.from_dict(payload)
+
+    with pytest.raises(RotationGroupContractError, match="cannot spend capital it never"):
+        group(entry_record=entry_leg(quantity=676.0), committed_to_entry=40.5)
+
+# ---------------------------------------------------------------------------
+# F-003 remediation (AC-003): completeness is a durable-record invariant
+# ---------------------------------------------------------------------------
+
+
+def _ac003_fixture():
+    cash_record = cash_leg()
+    hold_record = hold_leg()
+    replacement = replacement_leg(cash=cash_record)
+    legs = (hold_record, cash_record, replacement)
+    record = comparison(hold=hold_record, cash=cash_record, replacement=replacement)
+    return legs, record, hold_record, cash_record, replacement
+
+
+def test_f003_a_durable_plan_missing_a_passed_over_rejection_is_refused() -> None:
+    """AC-003: completeness is a durable-record invariant, not an optional call."""
+
+    legs, record, hold_record, cash_record, replacement = _ac003_fixture()
+    incomplete = plan(
+        alternatives=legs,
+        action=rotate_action(replacement.alternative_id),
+        comparisons=(record,),
+        constraints=scenario_constraints(),
+        rejected=(
+            PortfolioPlanRejection(
+                alternative_id=hold_record.alternative_id,
+                reason_code="LOWER_EXPECTED_NET",
+            ),
+        ),
+    )
+    with pytest.raises(PortfolioContractError, match="exactly once"):
+        incomplete.assert_rejections_are_complete()
+    with pytest.raises(PortfolioContractError, match="exactly once"):
+        PortfolioPlan.from_dict(incomplete.to_dict())
+
+
+def test_f003_an_invalid_rejection_cannot_be_loaded_as_a_durable_plan() -> None:
+    """AC-003: a complete record loads; duplicates, selected and uncompared stay refused."""
+
+    legs, record, hold_record, cash_record, replacement = _ac003_fixture()
+    complete = plan(
+        alternatives=legs,
+        action=rotate_action(replacement.alternative_id),
+        comparisons=(record,),
+        constraints=scenario_constraints(),
+    )
+    complete.assert_rejections_are_complete()
+    assert PortfolioPlan.from_dict(complete.to_dict()) == complete
+
+    with pytest.raises(PortfolioContractError, match="unnamed token"):
+        PortfolioPlanRejection(
+            alternative_id=hold_record.alternative_id, reason_code="BECAUSE_I_SAID_SO"
+        )
+
+    with pytest.raises(PortfolioContractError, match="exactly once"):
+        plan(
+            alternatives=legs,
+            action=rotate_action(replacement.alternative_id),
+            comparisons=(record,),
+            constraints=scenario_constraints(),
+            rejected=(
+                PortfolioPlanRejection(
+                    alternative_id=hold_record.alternative_id,
+                    reason_code="LOWER_EXPECTED_NET",
+                ),
+                PortfolioPlanRejection(
+                    alternative_id=hold_record.alternative_id,
+                    reason_code="EVIDENCE_INCOMPLETE",
+                ),
+            ),
+        )
+
+    with pytest.raises(PortfolioContractError, match="actually compared"):
+        plan(
+            alternatives=legs,
+            action=rotate_action(replacement.alternative_id),
+            comparisons=(record,),
+            constraints=scenario_constraints(),
+            rejected=(
+                PortfolioPlanRejection(
+                    alternative_id="PALT:R5D:uncompared",
+                    reason_code="LOWER_EXPECTED_NET",
+                ),
+            ),
+        )

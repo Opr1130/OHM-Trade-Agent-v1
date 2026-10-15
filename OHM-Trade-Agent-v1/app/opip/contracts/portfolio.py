@@ -4076,6 +4076,7 @@ class PortfolioPlan:
             raise PortfolioContractError(
                 "plan_id does not match its content; a forged plan fails closed"
             )
+        plan.assert_rejections_are_complete()
         return plan
 
 

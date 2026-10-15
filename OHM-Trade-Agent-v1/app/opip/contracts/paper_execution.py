@@ -1522,6 +1522,11 @@ class RotationGroup:
         body = _rotation_mapping(
             raw, field_name="rotation_group", expected_keys=ROTATION_GROUP_PAYLOAD_KEYS
         )
+        if tuple(str(key) for key in raw) != ROTATION_GROUP_PAYLOAD_KEYS:
+            raise RotationGroupContractError(
+                "the rotation group payload must carry the frozen SC-09 keys in the "
+                "declared order; a reordered payload fails closed"
+            )
         legs = _rotation_sequence(body["legs"], field_name="legs")
         group = cls(
             old_position=RotationOldPosition.from_dict(body["old_position"]),
