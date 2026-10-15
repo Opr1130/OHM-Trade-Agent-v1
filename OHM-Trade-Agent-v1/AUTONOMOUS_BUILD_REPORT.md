@@ -835,3 +835,30 @@ No application module changed. No threshold, duration, budget, cap or coefficien
 ratified or invented. `TARGET_PAPER` remains `BLOCKED` and the release posture remains
 `EVIDENCE_SHADOW`.
 
+
+## Mission 06 — P0-1 isolated recovery rehearsal
+
+Status: `RECOVERY PRIMITIVES PROVEN AGAINST A MODELLED BOOK; NOTHING ACTIVATED`
+
+The rehearsal runs entirely inside pytest `tmp_path` and drives the **real** durability
+primitives from `app.opip.storage.bounded_jsonl` rather than a re-implementation, because
+backup and restore correctness lives in that layer. Re-implementing them in the harness
+would only prove the harness is self-consistent.
+
+| Claim | How it was verified |
+| --- | --- |
+| A snapshot is complete and checksum-verified | the snapshot digest equals the live digest, the snapshot verifies *before* restore, and it round-trips byte-identically |
+| Cash, positions, fills and obligations recover | each row kind is compared element-by-element after restore, and the reconciled notional computed from fills is identical before and after |
+| An interrupted append is repaired, not lost | a genuine unterminated fragment is quarantined **byte-for-byte** in exactly one file while the file is truncated to the last complete row boundary, with the complete prefix digest unchanged |
+| Restoration is idempotent and duplicates nothing | a second restore changes no digest, produces no second quarantine file, duplicates no fill and double-counts no obligation |
+| The snapshot is immutable during restore | the snapshot digest is unchanged by the restore that reads it |
+| No partial file survives an atomic replacement | no temporary artifact remains, and every line of the live file parses as a complete row |
+| Recovery cannot be blocked by the AI plane | the storage module imports no committee, AI, network or notification surface |
+
+**Scope honesty.** The book is a named fixture modelling the row shapes a paper book has.
+The rehearsal proves the recovery *primitives* and that model; it does **not** prove
+recovery of the real Paper-v2 ledger file, whose live contents cannot be read safely from
+this worktree. Rollback configuration was inspected read-only and deliberately not
+exercised, because exercising it would require a mode change. No production write, mode
+change, deletion, drain or retirement occurred. `TARGET_PAPER` remains `BLOCKED`.
+
