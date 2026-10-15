@@ -1856,6 +1856,104 @@ FILTER_VOCABULARIES: Mapping[str, frozenset[str]] = MappingProxyType(
 #: Filters whose value is a free-form identity rather than a vocabulary member.
 IDENTITY_FILTERS: frozenset[str] = frozenset({"instrument", "policy_version"})
 
+#: The dimensions a request may widen with more than one value. Everything else - the paging
+#: controls and the two window edges - is single-valued by construction: two window starts or
+#: two limits do not describe one coherent request, and silently keeping the last one would
+#: answer a differently-scoped question than the caller asked.
+OR_CAPABLE_FILTERS: frozenset[str] = frozenset(
+    {
+        "quote_currency",
+        "instrument",
+        "lifecycle_status",
+        "economic_result",
+        "execution_result",
+        "exit_mechanism",
+        "policy_version",
+    }
+)
+
+
+@dataclass(frozen=True)
+class OrValues:
+    """Two or more validated values for one dimension: ``OR`` within the dimension.
+
+    A single value is never represented by this type. A one-member union collapses to the
+    scalar it equals, so a request that names one value keeps the exact shape it had before
+    this type existed and no consumer has to handle two spellings of the same scope.
+    """
+
+    dimension: str
+    values: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if len(self.values) < 2:
+            raise ValueError("OrValues needs at least two values; use the scalar instead")
+        if len(set(self.values)) != len(self.values):
+            raise ValueError("OrValues repeats a value")
+
+    def __contains__(self, item: object) -> bool:
+        return item in self.values
+
+    def to_json(self) -> list[str]:
+        """The values, in the order the request stated them."""
+        return list(self.values)
+
+
+def _merge_dimension(
+    dimension: str, existing: Any, incoming: Any
+) -> Any:
+    """Combine two statements about one dimension.
+
+    Repeating a dimension widens it, so the union is the answer and no stated value is ever
+    dropped. A repeated dimension that cannot be widened is refused rather than resolved to
+    its last value.
+    """
+    if existing is None:
+        return incoming
+    if incoming is None:
+        return existing
+    if existing == incoming:
+        return existing
+    if dimension not in OR_CAPABLE_FILTERS:
+        raise InvalidFilterValue(
+            f"{dimension} was given more than once and is not a dimension that ORs; "
+            "state it exactly once"
+        )
+    values: list[str] = []
+    for item in (existing, incoming):
+        if isinstance(item, OrValues):
+            values.extend(item.values)
+        else:
+            values.append(str(item))
+    if len(set(values)) == 1:
+        return values[0]
+    return OrValues(dimension, tuple(dict.fromkeys(values)))
+
+
+def _normalize_dimension(dimension: str, value: Any) -> Any:
+    """Normalize one dimension's value, whether it was stated once or several times.
+
+    A sequence states the same dimension more than once: every member is validated on its
+    own, and one member collapses to the scalar it equals.
+    """
+    if isinstance(value, (list, tuple, set, frozenset)) and not isinstance(value, str):
+        members = list(value)
+        if not members:
+            raise InvalidFilterValue(f"{dimension} was given an empty value list")
+        # The repeat itself is the error for a dimension that cannot widen, whatever the
+        # members happen to be: reporting a member's own problem would hide why it was refused.
+        if len(members) > 1 and dimension not in OR_CAPABLE_FILTERS:
+            raise InvalidFilterValue(
+                f"{dimension} was given more than once and is not a dimension that ORs; "
+                "state it exactly once"
+            )
+        normalized = [_normalize_filter_value(dimension, member) for member in members]
+        ordered = tuple(dict.fromkeys(normalized))
+        if len(ordered) == 1:
+            return ordered[0]
+        return OrValues(dimension, ordered)
+    return _normalize_filter_value(dimension, value)
+
 
 @dataclass(frozen=True)
 class FilterRequest:
@@ -1908,10 +2006,14 @@ class FilterRequest:
                     + " and ".join(sorted(canonical))
                 )
             target = canonical[0]
-            normalized = _normalize_filter_value(target, value)
-            if target in resolved and resolved[target] != normalized:
+            normalized = _normalize_dimension(target, value)
+            existing = resolved.get(target)
+            # Two *different names* for one dimension that disagree is an ambiguous request and
+            # is refused. The same canonical name stated again is a deliberate widen, which
+            # ``_merge_dimension`` unions.
+            if existing is not None and existing != normalized and name != target:
                 raise InvalidFilterValue(f"conflicting values for {target}")
-            resolved[target] = normalized
+            resolved[target] = _merge_dimension(target, existing, normalized)
         window_start = resolved.get("window_start")
         window_end = resolved.get("window_end")
         if (
@@ -1935,6 +2037,10 @@ class FilterRequest:
                 continue
             if isinstance(value, datetime):
                 value = value.isoformat().replace("+00:00", "Z")
+            elif isinstance(value, OrValues):
+                # A list value *is* the OR: the dimension was stated more than once, and the
+                # shape carries that fact without adding a second spelling of the same scope.
+                value = value.to_json()
             entries.append(
                 {
                     "dimension": name,
@@ -2453,28 +2559,40 @@ class SemanticReadService:
         )
 
     @staticmethod
-    def _matches(row: ReconciledPaperTrade, request: FilterRequest) -> bool:
+    def _passes(candidate: str, criterion: Any) -> bool:
+        """Whether one row's value passes one dimension's criterion.
+
+        A dimension stated once is equality; a dimension stated more than once is membership,
+        which is ``OR`` within that dimension. The two are different questions and the caller
+        always said which one it asked.
+        """
+        if isinstance(criterion, OrValues):
+            return candidate in criterion.values
+        return candidate == criterion
+
+    @classmethod
+    def _matches(cls, row: ReconciledPaperTrade, request: FilterRequest) -> bool:
         """Whether a row passes the row-level filters. ``AND`` across dimensions."""
         if request.quote_currency is not None:
-            if (row.quote_currency or "") != request.quote_currency:
+            if not cls._passes(row.quote_currency or "", request.quote_currency):
                 return False
         if request.instrument is not None:
-            if (row.native_symbol or "") != request.instrument:
+            if not cls._passes(row.native_symbol or "", request.instrument):
                 return False
         if request.lifecycle_status is not None:
-            if row.lifecycle_status.value != request.lifecycle_status:
+            if not cls._passes(row.lifecycle_status.value, request.lifecycle_status):
                 return False
         if request.economic_result is not None:
-            if row.economic_result.value != request.economic_result:
+            if not cls._passes(row.economic_result.value, request.economic_result):
                 return False
         if request.execution_result is not None:
-            if row.execution_result.value != request.execution_result:
+            if not cls._passes(row.execution_result.value, request.execution_result):
                 return False
         if request.exit_mechanism is not None:
-            if row.exit_mechanism.value != request.exit_mechanism:
+            if not cls._passes(row.exit_mechanism.value, request.exit_mechanism):
                 return False
         if request.policy_version is not None:
-            if (row.policy_version or "") != request.policy_version:
+            if not cls._passes(row.policy_version or "", request.policy_version):
                 return False
         return True
 
