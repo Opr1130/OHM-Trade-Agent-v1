@@ -820,3 +820,154 @@ class PendingHandoff:
     created_at: str
     applied_at: str | None = None
     payload: dict[str, Any] = field(default_factory=dict)
+
+
+#: Reservation lifecycle states. A reservation is created ``ACTIVE`` by the
+#: canonical admission authority and can only ever become ``RELEASED``, and only
+#: from committed terminal reconciliation evidence. No other state exists, so a
+#: reader cannot observe a reservation in a half-applied condition.
+ReservationState = Literal["ACTIVE", "RELEASED"]
+
+RESERVATION_STATES: frozenset[str] = frozenset({"ACTIVE", "RELEASED"})
+
+#: Constraints the frozen canonical capital policy can bind today. They are the
+#: only constraints a durable reservation may claim, because
+#: ``PaperCapitalPolicy`` declares exactly these two limits.
+BOUND_RESERVATION_CONSTRAINTS: tuple[str, ...] = ("EQUITY", "POSITION_COUNT")
+
+#: Constraints the approved R5-C binding set names but the frozen canonical policy
+#: does not resolve. They are declared *unbound* rather than assumed unlimited, so
+#: a durable reservation can never be read as proof they were enforced.
+UNBOUND_RESERVATION_CONSTRAINTS: tuple[str, ...] = (
+    "RISK",
+    "CONCENTRATION",
+    "LIQUIDITY",
+    "SLEEVE",
+)
+
+#: Every constraint name the reservation surfaces accept, bound or unbound.
+RESERVATION_CONSTRAINTS: frozenset[str] = frozenset(
+    BOUND_RESERVATION_CONSTRAINTS + UNBOUND_RESERVATION_CONSTRAINTS
+)
+
+
+@dataclass(frozen=True)
+class PaperReservationRecord:
+    """One canonically committed paper capital reservation.
+
+    Read-only and derived only from committed canonical evidence: the admission
+    disposition that created it and, once released, the terminal reconciliation
+    record that justified the release. An unknown fact is absent rather than
+    guessed, and the record carries no capacity figure of its own.
+    """
+
+    reservation_id: str
+    paper_trade_id: str
+    disposition_id: str
+    quote_currency: str
+    engine: str
+    amount: float
+    state: str
+    #: The portfolio version the producer observed and the writer verified as
+    #: current when the reservation committed, so replay proves the same order.
+    portfolio_version: int
+    history_epoch: int
+    local_sequence: int
+    #: Canonical identity of the terminal reconciliation evidence that released
+    #: this reservation, or ``None`` while the reservation is still active.
+    release_basis: str | None = None
+
+    @property
+    def is_active(self) -> bool:
+        return self.state == "ACTIVE"
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class PaperReservationLedger:
+    """Read-only projection of one quote currency's canonical reservations.
+
+    Reports the reservation lifecycle from committed evidence and explicitly
+    declares which constraints the frozen policy binds. It is evidence, never an
+    authorization: it cannot reserve, release or widen anything.
+    """
+
+    status: str
+    quote_currency: str | None = None
+    portfolio_version: int | None = None
+    reserved_capital: float | None = None
+    active_reservations: int | None = None
+    reservations: tuple[PaperReservationRecord, ...] = ()
+    history_epoch: int | None = None
+    local_sequence: int | None = None
+    bound_constraints: tuple[str, ...] = BOUND_RESERVATION_CONSTRAINTS
+    unbound_constraints: tuple[str, ...] = UNBOUND_RESERVATION_CONSTRAINTS
+    #: Always ``False`` while the R5-C binding constraint set is not resolvable by
+    #: the frozen capital policy, so no reader can mistake this ledger for proof
+    #: that risk, concentration, liquidity and sleeve caps were enforced.
+    policy_binding_complete: bool = False
+    #: A reservation ledger never confers trading or execution authority.
+    grants_authority: bool = False
+    error_code: str | None = None
+    detail: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "quote_currency": self.quote_currency,
+            "portfolio_version": self.portfolio_version,
+            "reserved_capital": self.reserved_capital,
+            "active_reservations": self.active_reservations,
+            "reservations": [record.to_dict() for record in self.reservations],
+            "history_epoch": self.history_epoch,
+            "local_sequence": self.local_sequence,
+            "bound_constraints": list(self.bound_constraints),
+            "unbound_constraints": list(self.unbound_constraints),
+            "policy_binding_complete": self.policy_binding_complete,
+            "grants_authority": self.grants_authority,
+            "error_code": self.error_code,
+            "detail": self.detail,
+        }
+
+
+@dataclass(frozen=True)
+class PaperReservationCapacity:
+    """Answer to a capacity question about one constraint.
+
+    ``ABSTAINED`` with ``POLICY_UNAVAILABLE`` is the only answer for a constraint
+    the frozen policy cannot resolve, and it carries no figure at all: an
+    unresolved policy is never treated as "no limit".
+    """
+
+    status: str
+    quote_currency: str | None = None
+    constraint: str | None = None
+    remaining_capacity: float | None = None
+    binding_policy_version: str | None = None
+    policy_binding_complete: bool = False
+    unbound_constraints: tuple[str, ...] = UNBOUND_RESERVATION_CONSTRAINTS
+    portfolio_version: int | None = None
+    history_epoch: int | None = None
+    local_sequence: int | None = None
+    grants_authority: bool = False
+    error_code: str | None = None
+    detail: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "quote_currency": self.quote_currency,
+            "constraint": self.constraint,
+            "remaining_capacity": self.remaining_capacity,
+            "binding_policy_version": self.binding_policy_version,
+            "policy_binding_complete": self.policy_binding_complete,
+            "unbound_constraints": list(self.unbound_constraints),
+            "portfolio_version": self.portfolio_version,
+            "history_epoch": self.history_epoch,
+            "local_sequence": self.local_sequence,
+            "grants_authority": self.grants_authority,
+            "error_code": self.error_code,
+            "detail": self.detail,
+        }
