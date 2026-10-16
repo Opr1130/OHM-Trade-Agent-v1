@@ -1412,7 +1412,7 @@ def test_ac_005_a_stale_or_unsupported_account_state_abstains() -> None:
     """
 
     assert CAPITAL_DEPLOYABLE_ABSTENTION_PRECEDENCE[0] is CapitalDeployableAbstentionReason.IDENTITY_NOT_BOUND
-    assert CAPITAL_DEPLOYABLE_ABSTENTION_PRECEDENCE[-1] is CapitalDeployableAbstentionReason.SLEEVE_LIMIT_NOT_CONFIGURED
+    assert CAPITAL_DEPLOYABLE_ABSTENTION_PRECEDENCE[-1] is CapitalDeployableAbstentionReason.SLEEVE_USAGE_NOT_DECLARED
     assert len(set(CAPITAL_DEPLOYABLE_ABSTENTION_PRECEDENCE)) == len(CapitalDeployableAbstentionReason)
     stale = check(snapshot(source_watermark=watermark(7, T0, True)))
     assert stale.status is CapitalDeployableStatus.ABSTAINED
@@ -1619,8 +1619,16 @@ def test_ac_005_one_trust_table_gates_the_deployable_and_commit_seams() -> None:
     against the same record
     THEN the deployable seam publishes its specific declared reason while the commit
     seam refuses with its one declared untrusted disposition, so the commit path can
-    never consume capital the deployable seam would refuse to size, and trusted
-    evidence still commits
+    never consume capital the deployable seam would refuse to size
+
+    SUPERSEDED IN THE SHADOW-ONLY POSTURE: the historical closing step of this
+    criterion expected trusted evidence to still commit (`COMMITTED`). The
+    owner-approved shadow-only capital-safety contract makes that unreachable,
+    because no owner-ratified funding policy exists (`OQ-06`), so a trusted record
+    is refused with `DEPLOYABLE_BOUND_UNAVAILABLE` without mutating anything.
+    PENDING INTEGRATION PROOF: "trusted account evidence commits" once a ratified
+    funding policy and trusted upstream consumption evidence exist (owned by the
+    `ATDD-R5-C-deployable-bound-closure` increment contract).
     """
 
     order = CAPITAL_DEPLOYABLE_ABSTENTION_PRECEDENCE
@@ -1682,7 +1690,10 @@ def test_ac_005_one_trust_table_gates_the_deployable_and_commit_seams() -> None:
         assert view.abstention_reason is expected, overrides
         assert view.deployable_capital is None
         refusal = commit_reservation(
-            record, plan=plan(version=record.portfolio_version), at_time=at(60)
+            record,
+            plan=plan(version=record.portfolio_version),
+            at_time=at(60),
+            deployable_policy=book_policy(record),
         )
         assert refusal.status is CapitalCommitStatus.REJECTED, overrides
         assert refusal.rejection is CapitalCommitRejection.ACCOUNT_STATE_UNTRUSTED, overrides
@@ -1702,7 +1713,12 @@ def test_ac_005_one_trust_table_gates_the_deployable_and_commit_seams() -> None:
         is CapitalDeployableAbstentionReason.SNAPSHOT_OUTLIVED_VALIDITY
     )
     assert (
-        commit_reservation(outlived, plan=plan(version=VERSION), at_time=at(60)).rejection
+        commit_reservation(
+            outlived,
+            plan=plan(version=VERSION),
+            at_time=at(60),
+            deployable_policy=book_policy(outlived),
+        ).rejection
         is CapitalCommitRejection.SNAPSHOT_OUTLIVED_VALIDITY
     )
 
@@ -1713,11 +1729,21 @@ def test_ac_005_one_trust_table_gates_the_deployable_and_commit_seams() -> None:
         evaluate_deployable_capital(trusted, policy=book_policy(trusted), at_time=at(60)).status
         is CapitalDeployableStatus.AVAILABLE
     )
+    # Trust is not authorisation: the evidence is good enough to size capital, and
+    # the commit still fails closed because no owner-ratified funding policy exists.
     control = commit_reservation(
-        trusted, plan=plan(version=trusted.portfolio_version), at_time=at(60)
+        trusted,
+        plan=plan(version=trusted.portfolio_version),
+        at_time=at(60),
+        deployable_policy=book_policy(trusted),
     )
-    assert control.status is CapitalCommitStatus.COMMITTED
-    assert control.snapshot is not None
+    assert control.status is CapitalCommitStatus.REJECTED
+    assert control.rejection is CapitalCommitRejection.DEPLOYABLE_BOUND_UNAVAILABLE
+    assert control.snapshot is None
+    assert control.committed_capital is None
+    assert control.successor_version is None
+    assert trusted.cash.amount(CapitalPartition.FREE_CASH) == Decimal("10000.00")
+    assert trusted.cash.amount(CapitalPartition.ORDER_RESERVES) == Decimal("0.00")
 
 
 # ---------------------------------------------------------------------------
@@ -1738,40 +1764,71 @@ def test_ac_006_a_plan_commits_atomically_against_the_version_it_was_built_for()
 
     GIVEN a current capital snapshot and a reservation plan bound to its version
     WHEN the plan is committed
-    THEN the plan's capital moves from free cash into order reserves, the declared
-    cash total is preserved, the committed amount is recorded, the successor is the
-    declared next version of the same lineage, and the frozen portfolio owner's own
-    capital-state seam follows the committed record
+    THEN the commit is refused with `DEPLOYABLE_BOUND_UNAVAILABLE` and publishes no
+    snapshot, no successor version and no consumed capital, the book and its own
+    derived capital state are unchanged, and the declaration the historical criterion
+    proved for a committed plan - the partition move, the preserved cash total and
+    the declared next version of the same lineage - stays provable as a lawful
+    recompute of the same book
+
+    SUPERSEDED IN THE SHADOW-ONLY POSTURE: this criterion historically expected the
+    plan's capital to move from free cash into order reserves with the committed
+    amount recorded. With no owner-ratified funding policy (`OQ-06`) the seam refuses
+    instead of committing.
+    PENDING INTEGRATION PROOF: "a reservation moves free cash into order reserves,
+    records the plan reference and advances the portfolio version by one step" once a
+    ratified funding policy and trusted upstream consumption evidence exist (owned by
+    the `ATDD-R5-C-deployable-bound-closure` increment contract).
     """
 
     record = commit_fixture("PAPER-LEDGER-R5C-COMMIT-1")
     reservation_plan = plan(version=record.portfolio_version)
-    result = commit_reservation(record, plan=reservation_plan, at_time=at(60))
+    result = commit_reservation(
+        record,
+        plan=reservation_plan,
+        at_time=at(60),
+        deployable_policy=book_policy(record),
+    )
 
-    assert result.status is CapitalCommitStatus.COMMITTED
-    assert result.rejection is None
+    assert result.status is CapitalCommitStatus.REJECTED
+    assert result.rejection is CapitalCommitRejection.DEPLOYABLE_BOUND_UNAVAILABLE
     assert result.commit_id.startswith(f"{CAPITAL_COMMIT_ID_PREFIX}:")
     assert result.applied_portfolio_version == record.portfolio_version
-    assert result.successor_version == "pv-r5c-0001.0001"
-    assert result.committed_capital == Decimal("1000.00")
-    successor = result.snapshot
-    assert successor is not None
-    assert result.snapshot_id == successor.snapshot_id
-    assert successor.cash.amount(CapitalPartition.FREE_CASH) == Decimal("9000.00")
-    assert successor.cash.amount(CapitalPartition.ORDER_RESERVES) == Decimal("1000.00")
-    assert successor.cash.amount(CapitalPartition.SAFETY_RESERVE) == Decimal("500.00")
-    assert successor.cash.cash_total == record.cash.cash_total
-    assert successor.derived_from == record.snapshot_id
-    assert successor.recompute_trigger is CapitalRecomputeTrigger.RESERVATION
-    assert reservation_plan.plan_id in successor.applied_reservation_references
-    assert_snapshot_recomputes_from(
-        record, successor, trigger=CapitalRecomputeTrigger.RESERVATION
-    )
+    assert result.successor_version is None
+    assert result.committed_capital is None
+    assert result.snapshot is None
+    assert result.snapshot_id is None
     payload = result.to_dict()
     assert payload["commit_schema_version"] == CAPITAL_COMMIT_SCHEMA_VERSION
-    assert payload["status"] == "COMMITTED"
-    assert payload["committed_capital"] == "1000.00"
+    assert payload["status"] == "REJECTED"
+    assert payload["committed_capital"] is None
+    assert payload["snapshot_id"] is None
     assert payload["authoritative"] is False
+
+    # The refusal is inert: the book did not move and re-derives to its own identity.
+    assert record.cash.amount(CapitalPartition.FREE_CASH) == Decimal("10000.00")
+    assert record.cash.amount(CapitalPartition.ORDER_RESERVES) == Decimal("0.00")
+    assert CapitalSnapshot.from_dict(record.to_dict()).snapshot_id == record.snapshot_id
+
+    # The historical commitment declaration is still proved where it is independently
+    # testable: the declared RESERVATION recompute law is the same all-or-nothing
+    # partition move that preserves the declared cash total and advances the version.
+    lawfully_moved = successor(
+        record,
+        trigger=CapitalRecomputeTrigger.RESERVATION,
+        cash_ledger=cash(free="9000.00", reserves="1000.00", safety="500.00"),
+        limit_usage=declared_usage(),
+    )
+    assert_snapshot_recomputes_from(
+        record, lawfully_moved, trigger=CapitalRecomputeTrigger.RESERVATION
+    )
+    assert lawfully_moved.portfolio_version == "pv-r5c-0001.0001"
+    assert lawfully_moved.derived_from == record.snapshot_id
+    assert lawfully_moved.recompute_trigger is CapitalRecomputeTrigger.RESERVATION
+    assert lawfully_moved.cash.amount(CapitalPartition.FREE_CASH) == Decimal("9000.00")
+    assert lawfully_moved.cash.amount(CapitalPartition.ORDER_RESERVES) == Decimal("1000.00")
+    assert lawfully_moved.cash.amount(CapitalPartition.SAFETY_RESERVE) == Decimal("500.00")
+    assert lawfully_moved.cash.cash_total == record.cash.cash_total
 
     state = to_portfolio_capital_state(record)
     assert state.portfolio_version == record.portfolio_version
@@ -1782,9 +1839,9 @@ def test_ac_006_a_plan_commits_atomically_against_the_version_it_was_built_for()
     assert state.currency == record.currency
     assert state.as_of == record.freshness.as_of
     assert state.capital_state_fingerprint.startswith("PCAP:")
-    committed_state = to_portfolio_capital_state(successor)
-    assert committed_state.portfolio_version == successor.portfolio_version
-    assert committed_state.available_capital == 9000.0
+    moved_state = to_portfolio_capital_state(lawfully_moved)
+    assert moved_state.portfolio_version == lawfully_moved.portfolio_version
+    assert moved_state.available_capital == 9000.0
 
 
 def test_ac_006_a_rejected_attempt_changes_nothing_at_all() -> None:
@@ -1793,9 +1850,20 @@ def test_ac_006_a_rejected_attempt_changes_nothing_at_all() -> None:
     GIVEN a current snapshot and plans that declare a stale expected version, an
     underfunded amount or a non-positive amount
     WHEN each is committed
-    THEN each is rejected with its declared reason, publishes no snapshot, no
-    successor version and no consumed capital, and a later valid plan on the same
-    version still commits, so nothing was written by the rejections
+    THEN each is rejected with its declared reason in the frozen order, publishes no
+    snapshot, no successor version and no consumed capital, and a later valid plan on
+    the same version is refused for the missing authorisation instead of consuming
+    anything, so nothing was written by any of the refusals
+
+    SUPERSEDED IN THE SHADOW-ONLY POSTURE: the historical closing step expected a
+    later valid plan to still commit (`COMMITTED`), which proved nothing had been
+    written. With no owner-ratified funding policy the closing step is a
+    `DEPLOYABLE_BOUND_UNAVAILABLE` refusal, and inertness is proved by the book
+    re-deriving to its own identity instead.
+    PENDING INTEGRATION PROOF: "a valid plan on an untouched version commits after
+    earlier rejections" once a ratified funding policy and trusted upstream
+    consumption evidence exist (owned by the
+    `ATDD-R5-C-deployable-bound-closure` increment contract).
     """
 
     record = commit_fixture("PAPER-LEDGER-R5C-COMMIT-2")
@@ -1804,6 +1872,7 @@ def test_ac_006_a_rejected_attempt_changes_nothing_at_all() -> None:
         plan=plan(version=record.portfolio_version),
         at_time=at(60),
         expected_portfolio_version="pv-r5c-0002",
+        deployable_policy=book_policy(record),
     )
     assert stale.status is CapitalCommitStatus.REJECTED
     assert stale.rejection is CapitalCommitRejection.STALE_EXPECTED_VERSION
@@ -1817,6 +1886,7 @@ def test_ac_006_a_rejected_attempt_changes_nothing_at_all() -> None:
         record,
         plan=plan(version="pv-r5c-0002", candidate="PCAND:R5C:2"),
         at_time=at(60),
+        deployable_policy=book_policy(record),
     )
     assert another_version.rejection is CapitalCommitRejection.STALE_EXPECTED_VERSION
     assert another_version.snapshot is None
@@ -1825,6 +1895,7 @@ def test_ac_006_a_rejected_attempt_changes_nothing_at_all() -> None:
         record,
         plan=plan(version=record.portfolio_version, amount=20000.0, candidate="PCAND:R5C:3"),
         at_time=at(60),
+        deployable_policy=book_policy(record),
     )
     assert underfunded.rejection is CapitalCommitRejection.INSUFFICIENT_FREE_CASH
     assert underfunded.snapshot is None
@@ -1834,16 +1905,24 @@ def test_ac_006_a_rejected_attempt_changes_nothing_at_all() -> None:
         record,
         plan=plan(version=record.portfolio_version, amount=0.0, candidate="PCAND:R5C:4"),
         at_time=at(60),
+        deployable_policy=book_policy(record),
     )
     assert empty.rejection is CapitalCommitRejection.NON_POSITIVE_AMOUNT
     assert empty.snapshot is None
 
     accepted = commit_reservation(
-        record, plan=plan(version=record.portfolio_version, candidate="PCAND:R5C:5"), at_time=at(60)
+        record,
+        plan=plan(version=record.portfolio_version, candidate="PCAND:R5C:5"),
+        at_time=at(60),
+        deployable_policy=book_policy(record),
     )
-    assert accepted.status is CapitalCommitStatus.COMMITTED
-    assert accepted.snapshot is not None
-    assert accepted.snapshot.cash.amount(CapitalPartition.FREE_CASH) == Decimal("9000.00")
+    assert accepted.status is CapitalCommitStatus.REJECTED
+    assert accepted.rejection is CapitalCommitRejection.DEPLOYABLE_BOUND_UNAVAILABLE
+    assert accepted.snapshot is None
+    assert accepted.successor_version is None
+    assert accepted.committed_capital is None
+    # Nothing any of the five attempts was offered wrote anything to the book.
+    assert CapitalSnapshot.from_dict(record.to_dict()).snapshot_id == record.snapshot_id
 
 
 def test_ac_006_a_live_book_or_an_undescribable_commit_is_refused() -> None:
@@ -1859,13 +1938,17 @@ def test_ac_006_a_live_book_or_an_undescribable_commit_is_refused() -> None:
     """
 
     live = commit_fixture("PAPER-LEDGER-R5C-COMMIT-3", environment=CapitalEnvironment.LIVE_OBSERVATION)
-    live_result = commit_reservation(live, plan=plan(version=VERSION), at_time=at(60))
+    live_result = commit_reservation(
+        live, plan=plan(version=VERSION), at_time=at(60), deployable_policy=book_policy(live)
+    )
     assert live_result.rejection is CapitalCommitRejection.ENVIRONMENT_NOT_FUNDABLE
     assert live_result.snapshot is None
     shadow = commit_fixture(
         "PAPER-LEDGER-R5C-COMMIT-4", environment=CapitalEnvironment.SHADOW_EVIDENCE
     )
-    shadow_result = commit_reservation(shadow, plan=plan(version=VERSION), at_time=at(60))
+    shadow_result = commit_reservation(
+        shadow, plan=plan(version=VERSION), at_time=at(60), deployable_policy=book_policy(shadow)
+    )
     assert shadow_result.rejection is CapitalCommitRejection.ENVIRONMENT_NOT_FUNDABLE
 
     funded = commit_fixture("PAPER-LEDGER-R5C-COMMIT-5")
@@ -1875,23 +1958,51 @@ def test_ac_006_a_live_book_or_an_undescribable_commit_is_refused() -> None:
         CapitalRecomputeTrigger.APPROVAL,
     ):
         refused = commit_reservation(
-            funded, plan=plan(version=VERSION), at_time=at(60), trigger=trigger
+            funded,
+            plan=plan(version=VERSION),
+            at_time=at(60),
+            trigger=trigger,
+            deployable_policy=book_policy(funded),
         )
         assert refused.rejection is CapitalCommitRejection.UNSUPPORTED_RECOMPUTE_TRIGGER
         assert refused.snapshot is None
     with pytest.raises(CapitalIntelligenceError, match="trigger"):
-        commit_reservation(funded, plan=plan(version=VERSION), at_time=at(60), trigger="RESERVATION")
+        commit_reservation(
+            funded,
+            plan=plan(version=VERSION),
+            at_time=at(60),
+            trigger="RESERVATION",
+            deployable_policy=book_policy(funded),
+        )
 
     outlived = commit_reservation(
-        funded, plan=plan(version=VERSION), at_time=at(901)
+        funded,
+        plan=plan(version=VERSION),
+        at_time=at(901),
+        deployable_policy=book_policy(funded),
     )
     assert outlived.rejection is CapitalCommitRejection.SNAPSHOT_OUTLIVED_VALIDITY
     with pytest.raises(CapitalIntelligenceError, match="as_of"):
-        commit_reservation(funded, plan=plan(version=VERSION), at_time=T0)
+        commit_reservation(
+            funded,
+            plan=plan(version=VERSION),
+            at_time=T0,
+            deployable_policy=book_policy(funded),
+        )
     with pytest.raises(CapitalIntelligenceError):
-        commit_reservation(funded, plan="PRSV:pasted", at_time=at(60))  # type: ignore[arg-type]
+        commit_reservation(
+            funded,
+            plan="PRSV:pasted",  # type: ignore[arg-type]
+            at_time=at(60),
+            deployable_policy=book_policy(funded),
+        )
     with pytest.raises(CapitalIntelligenceError):
-        commit_reservation("not-a-snapshot", plan=plan(version=VERSION), at_time=at(60))  # type: ignore[arg-type]
+        commit_reservation(
+            "not-a-snapshot",  # type: ignore[arg-type]
+            plan=plan(version=VERSION),
+            at_time=at(60),
+            deployable_policy=book_policy(funded),
+        )
 
 
 def test_ac_006_a_plan_outside_its_declared_window_is_refused() -> None:
@@ -1901,10 +2012,21 @@ def test_ac_006_a_plan_outside_its_declared_window_is_refused() -> None:
     while the snapshot is still valid, a plan a release has partially consumed and a
     plan carrying a version this increment never declared
     WHEN each is committed
-    THEN the future plan is not yet valid, the closed and partially consumed plans
-    are expired rather than committed for less capital than they declare, the
-    undeclared plan version fails closed in the frozen owner, and a retry of an
-    already committed plan still replays even after its window closed
+    THEN the future plan is not yet valid, a plan created exactly at the commit
+    instant is inside its window, a plan whose window is still open one second before
+    expiry is not refused for its window, the closed and partially consumed plans are
+    refused without consuming capital, the undeclared plan version fails closed in the
+    frozen owner, and an expired plan is refused as expired rather than replayed
+
+    SUPERSEDED IN THE SHADOW-ONLY POSTURE: the historical criterion expected a
+    boundary-window plan and the whole two-leg plan to commit (`COMMITTED`) and the
+    expired plan to replay (`IDEMPOTENT_REPLAY`). With no owner-ratified funding
+    policy no plan commits at all, so the window and expiry behaviour is proved by
+    which refusal each plan receives instead.
+    PENDING INTEGRATION PROOF: "a plan inside its window commits and a retry of that
+    committed plan replays" once a ratified funding policy and trusted upstream
+    consumption evidence exist (owned by the
+    `ATDD-R5-C-deployable-bound-closure` increment contract).
     """
 
     future_book = commit_fixture("PAPER-LEDGER-R5C-WINDOW-1")
@@ -1912,13 +2034,14 @@ def test_ac_006_a_plan_outside_its_declared_window_is_refused() -> None:
         future_book,
         plan=plan(version=future_book.portfolio_version, created_at=at(120)),
         at_time=at(60),
+        deployable_policy=book_policy(future_book),
     )
     assert early.status is CapitalCommitStatus.REJECTED
     assert early.rejection is CapitalCommitRejection.PLAN_NOT_YET_VALID
     assert early.snapshot is None
 
-    # A plan created exactly at the commit instant is inside its window: the
-    # boundary itself is committable.
+    # A plan created exactly at the commit instant is inside its window: the boundary
+    # itself passes the window check and is refused for the missing authorisation.
     boundary = commit_reservation(
         future_book,
         plan=plan(
@@ -1927,18 +2050,25 @@ def test_ac_006_a_plan_outside_its_declared_window_is_refused() -> None:
             candidate="PCAND:R5C:BOUNDARY",
         ),
         at_time=at(60),
+        deployable_policy=book_policy(future_book),
     )
-    assert boundary.status is CapitalCommitStatus.COMMITTED
+    assert boundary.status is CapitalCommitStatus.REJECTED
+    assert boundary.rejection is CapitalCommitRejection.DEPLOYABLE_BOUND_UNAVAILABLE
+    assert boundary.rejection is not CapitalCommitRejection.PLAN_NOT_YET_VALID
     assert boundary.applied_portfolio_version == future_book.portfolio_version
-    assert boundary.snapshot is not None
-    assert boundary.snapshot.cash.amount(CapitalPartition.FREE_CASH) == Decimal("9000.00")
+    assert boundary.snapshot is None
 
     closed_book = commit_fixture("PAPER-LEDGER-R5C-WINDOW-2")
     closing_plan = plan(version=closed_book.portfolio_version, expires_at=at(600))
-    assert (
-        commit_reservation(closed_book, plan=closing_plan, at_time=at(599)).status
-        is CapitalCommitStatus.COMMITTED
+    still_open = commit_reservation(
+        closed_book,
+        plan=closing_plan,
+        at_time=at(599),
+        deployable_policy=book_policy(closed_book),
     )
+    assert still_open.status is CapitalCommitStatus.REJECTED
+    assert still_open.rejection is CapitalCommitRejection.DEPLOYABLE_BOUND_UNAVAILABLE
+    assert still_open.rejection is not CapitalCommitRejection.PLAN_EXPIRED
     expiring = commit_reservation(
         closed_book,
         plan=plan(
@@ -1947,19 +2077,23 @@ def test_ac_006_a_plan_outside_its_declared_window_is_refused() -> None:
             candidate="PCAND:R5C:EXPIRED",
         ),
         at_time=at(600),
+        deployable_policy=book_policy(closed_book),
     )
     assert expiring.rejection is CapitalCommitRejection.PLAN_EXPIRED
     assert expiring.snapshot is None
     assert expiring.committed_capital is None
 
-    # A retry of the plan this process already committed still replays, even though
-    # its declared window has closed in the meantime: idempotency is not defeated by
-    # the clock and nothing is consumed twice.
-    replay = commit_reservation(closed_book, plan=closing_plan, at_time=at(700))
-    assert replay.status is CapitalCommitStatus.IDEMPOTENT_REPLAY
-    assert replay.snapshot is not None
-    assert replay.snapshot.cash.amount(CapitalPartition.FREE_CASH) == Decimal("9000.00")
-    assert replay.snapshot.cash.amount(CapitalPartition.ORDER_RESERVES) == Decimal("1000.00")
+    # The plan was never committed, so a retry after its window closed is refused as
+    # expired rather than replayed: expiry is still enforced ahead of authorisation.
+    replay = commit_reservation(
+        closed_book,
+        plan=closing_plan,
+        at_time=at(700),
+        deployable_policy=book_policy(closed_book),
+    )
+    assert replay.status is CapitalCommitStatus.REJECTED
+    assert replay.rejection is CapitalCommitRejection.PLAN_EXPIRED
+    assert replay.snapshot is None
 
     partial_book = commit_fixture("PAPER-LEDGER-R5C-WINDOW-3")
     two_legs = plan(
@@ -1972,12 +2106,24 @@ def test_ac_006_a_plan_outside_its_declared_window_is_refused() -> None:
         at_time=at(60),
     )
     assert released.planned_capital == 1000.0
-    partial = commit_reservation(partial_book, plan=released, at_time=at(60))
+    partial = commit_reservation(
+        partial_book,
+        plan=released,
+        at_time=at(60),
+        deployable_policy=book_policy(partial_book),
+    )
     assert partial.rejection is CapitalCommitRejection.PLAN_EXPIRED
     assert partial.snapshot is None
-    whole = commit_reservation(partial_book, plan=two_legs, at_time=at(60))
-    assert whole.status is CapitalCommitStatus.COMMITTED
-    assert whole.committed_capital == Decimal("2000.00")
+    whole = commit_reservation(
+        partial_book,
+        plan=two_legs,
+        at_time=at(60),
+        deployable_policy=book_policy(partial_book),
+    )
+    assert whole.status is CapitalCommitStatus.REJECTED
+    assert whole.rejection is CapitalCommitRejection.DEPLOYABLE_BOUND_UNAVAILABLE
+    assert whole.committed_capital is None
+    assert partial_book.cash.amount(CapitalPartition.ORDER_RESERVES) == Decimal("0.00")
 
     undeclared_book = commit_fixture("PAPER-LEDGER-R5C-WINDOW-4")
     legs = plan(version=undeclared_book.portfolio_version).reservations
@@ -2006,18 +2152,36 @@ def test_ac_006_a_reservation_never_extends_the_snapshot_validity() -> None:
     validity deadline
     WHEN reservations are committed against it, chained, offered at the deadline and
     read after it, and when the account is later genuinely re-observed
-    THEN the committed successor carries the same source evidence and the same
+    THEN a lawful RESERVATION recompute carries the same source evidence and the same
     deadline, chained reservations cannot extend it, the deadline and any later read
-    fail closed, and only a real re-observation with its own declared window moves
+    fail closed, and only a genuine re-observation with its own declared window moves
     the deadline
+
+    SUPERSEDED IN THE SHADOW-ONLY POSTURE: the historical criterion asserted the
+    deadline-carrying successor of a *committed* reservation. With no owner-ratified
+    funding policy the commit refuses, so the carrying law is proved on a lawful
+    RESERVATION recompute of the same book.
+    PENDING INTEGRATION PROOF: "a committed reservation cannot extend the snapshot
+    validity deadline" once a ratified funding policy and trusted upstream consumption
+    evidence exist (owned by the `ATDD-R5-C-deployable-bound-closure` contract).
     """
 
     book = commit_fixture("PAPER-LEDGER-R5C-VALIDITY-1")
     assert book.freshness.validity_deadline == at(900)
-    first = commit_reservation(book, plan=plan(version=book.portfolio_version), at_time=at(60))
-    assert first.status is CapitalCommitStatus.COMMITTED
-    reserved_snapshot = first.snapshot
-    assert reserved_snapshot is not None
+
+    # A reservation is a movement of cash, not a re-observation of the account, so the
+    # declared recompute law accepts a RESERVATION successor that carries the source
+    # evidence and the deadline forward unchanged.
+    reserved_snapshot = successor(
+        book,
+        trigger=CapitalRecomputeTrigger.RESERVATION,
+        freshness=fresh(as_of=at(60), deadline_seconds=840),
+        cash_ledger=cash(free="9000.00", reserves="1000.00", safety="500.00"),
+        limit_usage=declared_usage(),
+    )
+    assert_snapshot_recomputes_from(
+        book, reserved_snapshot, trigger=CapitalRecomputeTrigger.RESERVATION
+    )
     assert reserved_snapshot.freshness.as_of == at(60)
     assert reserved_snapshot.freshness.validity_deadline == book.freshness.validity_deadline
     assert reserved_snapshot.source_watermark == book.source_watermark
@@ -2025,39 +2189,47 @@ def test_ac_006_a_reservation_never_extends_the_snapshot_validity() -> None:
     assert reserved_snapshot.marks == book.marks
     assert reserved_snapshot.fee_state == book.fee_state
 
-    chained = commit_reservation(
+    chained = successor(
         reserved_snapshot,
-        plan=plan(version=reserved_snapshot.portfolio_version, candidate="PCAND:R5C:CHAINED"),
-        at_time=at(120),
+        trigger=CapitalRecomputeTrigger.RESERVATION,
+        freshness=fresh(as_of=at(120), deadline_seconds=780),
+        cash_ledger=cash(free="8000.00", reserves="2000.00", safety="500.00"),
+        limit_usage=declared_usage(),
     )
-    assert chained.status is CapitalCommitStatus.COMMITTED
-    assert chained.snapshot is not None
-    assert chained.snapshot.freshness.validity_deadline == book.freshness.validity_deadline
-    assert chained.snapshot.source_watermark == book.source_watermark
+    assert_snapshot_recomputes_from(
+        reserved_snapshot, chained, trigger=CapitalRecomputeTrigger.RESERVATION
+    )
+    assert chained.freshness.validity_deadline == book.freshness.validity_deadline
+    assert chained.source_watermark == book.source_watermark
     assert (
         evaluate_deployable_capital(
-            chained.snapshot, policy=book_policy(chained.snapshot), at_time=at(901)
+            chained, policy=book_policy(chained), at_time=at(901)
         ).abstention_reason
         is CapitalDeployableAbstentionReason.SNAPSHOT_OUTLIVED_VALIDITY
     )
     at_deadline = commit_reservation(
-        chained.snapshot,
-        plan=plan(version=chained.snapshot.portfolio_version, candidate="PCAND:R5C:DEADLINE"),
+        chained,
+        plan=plan(version=chained.portfolio_version, candidate="PCAND:R5C:DEADLINE"),
         at_time=at(900),
+        deployable_policy=book_policy(chained),
     )
     assert at_deadline.rejection is CapitalCommitRejection.SNAPSHOT_OUTLIVED_VALIDITY
     assert at_deadline.snapshot is None
+    assert chained.cash.amount(CapitalPartition.ORDER_RESERVES) == Decimal("2000.00")
 
     # Only a genuine re-observation moves the deadline: the fee recompute below
     # declares a newer source watermark and its own window, and the refreshed record
     # is deployable long after the original deadline had passed.
     observed = commit_fixture("PAPER-LEDGER-R5C-VALIDITY-2")
-    committed = commit_reservation(
-        observed, plan=plan(version=observed.portfolio_version), at_time=at(60)
+    observed_successor = successor(
+        observed,
+        trigger=CapitalRecomputeTrigger.RESERVATION,
+        cash_ledger=cash(free="9000.00", reserves="1000.00", safety="500.00"),
+        limit_usage=declared_usage(),
     )
-    assert committed.snapshot is not None
+    assert observed_successor.snapshot_id != observed.snapshot_id
     refreshed = successor(
-        committed.snapshot,
+        observed_successor,
         trigger=CapitalRecomputeTrigger.FEE,
         seconds=540,
         cash_ledger=cash(free="8990.00", reserves="1000.00", safety="500.00"),
@@ -2067,7 +2239,7 @@ def test_ac_006_a_reservation_never_extends_the_snapshot_validity() -> None:
         limit_usage=declared_usage(),
     )
     assert_snapshot_recomputes_from(
-        committed.snapshot, refreshed, trigger=CapitalRecomputeTrigger.FEE
+        observed_successor, refreshed, trigger=CapitalRecomputeTrigger.FEE
     )
     assert refreshed.freshness.validity_deadline == at(1500)
     assert refreshed.source_watermark.ledger_sequence == 8
@@ -2085,34 +2257,76 @@ def test_ac_006_a_reservation_never_extends_the_snapshot_validity() -> None:
 def test_ac_007_a_replay_of_a_committed_plan_consumes_nothing_twice() -> None:
     """ATDD-R5-C-capital-intelligence/AC-007: retries create nothing twice.
 
-    GIVEN a committed reservation of one plan
-    WHEN the very same plan is presented again
-    THEN the attempt is an idempotent replay of the recorded successor rather than
-    a second consumption, and a competing plan written against the consumed version
-    is refused, so a retry can never double spend
+    GIVEN a refused reservation of one plan
+    WHEN the very same plan is presented again, and when a competing plan is offered
+    after a lawful recompute has moved the tracked version of the book
+    THEN the retry reproduces the identical refusal instead of consuming anything
+    twice, nothing was written by either attempt, and the competing plan written
+    against the replaced version is refused as stale
+
+    SUPERSEDED IN THE SHADOW-ONLY POSTURE: the historical criterion expected an
+    idempotent replay of a recorded committed successor (`IDEMPOTENT_REPLAY`). With no
+    owner-ratified funding policy nothing is ever recorded, so determinism of the
+    refusal replaces the replay proof and the tracked-version boundary is proved with
+    a lawful recompute instead of a commit.
+    PENDING INTEGRATION PROOF: "a replay of a committed plan returns the recorded
+    successor and consumes nothing twice" once a ratified funding policy and trusted
+    upstream consumption evidence exist (owned by the
+    `ATDD-R5-C-deployable-bound-closure` increment contract).
     """
 
     record = commit_fixture("PAPER-LEDGER-R5C-CONCURRENCY-1")
     reservation_plan = plan(version=record.portfolio_version)
-    first = commit_reservation(record, plan=reservation_plan, at_time=at(60))
-    assert first.status is CapitalCommitStatus.COMMITTED
+    first = commit_reservation(
+        record,
+        plan=reservation_plan,
+        at_time=at(60),
+        deployable_policy=book_policy(record),
+    )
+    assert first.status is CapitalCommitStatus.REJECTED
+    assert first.rejection is CapitalCommitRejection.DEPLOYABLE_BOUND_UNAVAILABLE
+    assert first.snapshot is None
 
-    replay = commit_reservation(record, plan=reservation_plan, at_time=at(60))
-    assert replay.status is CapitalCommitStatus.IDEMPOTENT_REPLAY
-    assert replay.rejection is None
+    replay = commit_reservation(
+        record,
+        plan=reservation_plan,
+        at_time=at(60),
+        deployable_policy=book_policy(record),
+    )
+    assert replay.status is CapitalCommitStatus.REJECTED
+    assert replay.status is not CapitalCommitStatus.IDEMPOTENT_REPLAY
+    assert replay.rejection is CapitalCommitRejection.DEPLOYABLE_BOUND_UNAVAILABLE
     assert replay.commit_id == first.commit_id
-    assert replay.snapshot_id == first.snapshot_id
-    assert replay.committed_capital == first.committed_capital == Decimal("1000.00")
-    assert replay.snapshot is not None
-    assert replay.snapshot.cash.amount(CapitalPartition.FREE_CASH) == Decimal("9000.00")
-    assert replay.snapshot.cash.amount(CapitalPartition.ORDER_RESERVES) == Decimal("1000.00")
-    assert replay.snapshot.cash.cash_total == record.cash.cash_total
-    assert len(replay.snapshot.applied_reservation_references) == 1
+    assert replay.snapshot is None
+    assert replay.committed_capital is None
+    assert replay.successor_version is None
+    assert len(record.applied_reservation_references) == 0
+    assert record.cash.amount(CapitalPartition.FREE_CASH) == Decimal("10000.00")
+    assert record.cash.amount(CapitalPartition.ORDER_RESERVES) == Decimal("0.00")
+    assert CapitalSnapshot.from_dict(record.to_dict()).snapshot_id == record.snapshot_id
 
+    # A lawful recompute - not a commit - is what moves the version this process tracks
+    # for the book, so a competing plan written against the replaced version is stale.
+    advanced = successor(
+        record,
+        trigger=CapitalRecomputeTrigger.RECONCILIATION,
+        reconciliation=CapitalReconciliation(
+            status=CapitalReconciliationStatus.RECONCILED,
+            observed_at=at(120),
+            reference="RECON:2",
+            variance="0.00",
+        ),
+        source_watermark=watermark(8, at(120)),
+        freshness=fresh(as_of=at(120)),
+    )
+    assert_snapshot_recomputes_from(
+        record, advanced, trigger=CapitalRecomputeTrigger.RECONCILIATION
+    )
     competing = commit_reservation(
         record,
         plan=plan(version=record.portfolio_version, candidate="PCAND:R5C:COMPETING"),
-        at_time=at(60),
+        at_time=at(180),
+        deployable_policy=book_policy(record),
     )
     assert competing.status is CapitalCommitStatus.REJECTED
     assert competing.rejection is CapitalCommitRejection.STALE_EXPECTED_VERSION
@@ -2122,34 +2336,97 @@ def test_ac_007_a_replay_of_a_committed_plan_consumes_nothing_twice() -> None:
 def test_ac_007_a_plan_consumed_at_another_version_is_not_replayed() -> None:
     """ATDD-R5-C-capital-intelligence/AC-007: a plan is consumed once per book.
 
-    GIVEN a plan already committed against one version
-    WHEN the same plan is offered against the committed successor version
-    THEN it is refused as an already-consumed plan instead of being replayed onto
-    another version of the ledger
+    GIVEN a plan refused against one version of a book and a lawful recompute of that
+    same book
+    WHEN the same plan is offered again, and then against the recomputed version
+    THEN the repeat reproduces the identical refusal with nothing consumed, and the
+    plan is refused against the successor because it does not belong to that version
+
+    SUPERSEDED IN THE SHADOW-ONLY POSTURE: the historical criterion expected the
+    already-consumed disposition `PLAN_ALREADY_CONSUMED`, which only a plan recorded by
+    a successful commit can produce. With no owner-ratified funding policy no plan is
+    ever recorded, so the same scenario proves the version boundary instead.
+    PENDING INTEGRATION PROOF: "a plan consumed at one version is refused as already
+    consumed rather than replayed onto another version" once a ratified funding policy
+    and trusted upstream consumption evidence exist (owned by the
+    `ATDD-R5-C-deployable-bound-closure` increment contract).
     """
 
     record = commit_fixture("PAPER-LEDGER-R5C-CONCURRENCY-2")
     reservation_plan = plan(version=record.portfolio_version)
-    first = commit_reservation(record, plan=reservation_plan, at_time=at(60))
-    successor = first.snapshot
-    assert successor is not None
-    again = commit_reservation(successor, plan=reservation_plan, at_time=at(120))
-    assert again.status is CapitalCommitStatus.REJECTED
-    assert again.rejection is CapitalCommitRejection.PLAN_ALREADY_CONSUMED
+    first = commit_reservation(
+        record,
+        plan=reservation_plan,
+        at_time=at(60),
+        deployable_policy=book_policy(record),
+    )
+    assert first.status is CapitalCommitStatus.REJECTED
+    assert first.rejection is CapitalCommitRejection.DEPLOYABLE_BOUND_UNAVAILABLE
+    assert first.snapshot is None
+
+    again = commit_reservation(
+        record,
+        plan=reservation_plan,
+        at_time=at(60),
+        deployable_policy=book_policy(record),
+    )
+    assert again.rejection is CapitalCommitRejection.DEPLOYABLE_BOUND_UNAVAILABLE
+    assert again.rejection is not CapitalCommitRejection.PLAN_ALREADY_CONSUMED
+    assert again.commit_id == first.commit_id
     assert again.snapshot is None
     assert again.committed_capital is None
+
+    advanced = successor(
+        record,
+        trigger=CapitalRecomputeTrigger.RECONCILIATION,
+        reconciliation=CapitalReconciliation(
+            status=CapitalReconciliationStatus.RECONCILED,
+            observed_at=at(120),
+            reference="RECON:2",
+            variance="0.00",
+        ),
+        source_watermark=watermark(8, at(120)),
+        freshness=fresh(as_of=at(120)),
+    )
+    assert advanced.portfolio_version == "pv-r5c-0001.0001"
+    assert_snapshot_recomputes_from(
+        record, advanced, trigger=CapitalRecomputeTrigger.RECONCILIATION
+    )
+    offered_against_successor = commit_reservation(
+        advanced,
+        plan=reservation_plan,
+        at_time=at(180),
+        deployable_policy=book_policy(advanced),
+    )
+    assert offered_against_successor.status is CapitalCommitStatus.REJECTED
+    assert (
+        offered_against_successor.rejection
+        is CapitalCommitRejection.STALE_EXPECTED_VERSION
+    )
+    assert offered_against_successor.snapshot is None
+    assert offered_against_successor.committed_capital is None
 
 
 
 def test_ac_007_a_losing_racer_never_double_spends() -> None:
     """ATDD-R5-C-capital-intelligence/AC-007: one winner, many honest losers.
 
-    GIVEN two decisions that compete for the same contested cash at the same
-    version, started together
+    GIVEN two decisions that compete for the same contested cash at the same version,
+    started together
     WHEN both are committed concurrently
-    THEN exactly one consumes the capacity, the loser is refused without a partial
-    write, the contested partition moved exactly once, and the loser can reread the
-    committed version and replan successfully
+    THEN neither consumes anything, both are refused deterministically with the same
+    declared reason, the contested partition never moves, and the book stays
+    replannable because no attempt was recorded against it
+
+    SUPERSEDED IN THE SHADOW-ONLY POSTURE: the historical criterion expected exactly
+    one racer to win (`COMMITTED`) and the other to be refused as stale. With no
+    owner-ratified funding policy there is no winner to have, so the same concurrent
+    scenario proves that contested capacity is never consumed by accident and that no
+    partial write appears under concurrency.
+    PENDING INTEGRATION PROOF: "exactly one of two concurrent racers consumes the
+    contested capacity and the loser can replan against the committed version" once a
+    ratified funding policy and trusted upstream consumption evidence exist (owned by
+    the `ATDD-R5-C-deployable-bound-closure` increment contract).
     """
 
     record = commit_fixture("PAPER-LEDGER-R5C-CONCURRENCY-3")
@@ -2162,7 +2439,14 @@ def test_ac_007_a_losing_racer_never_double_spends() -> None:
 
     def race(reservation_plan) -> None:
         gate.wait(timeout=10)
-        results.append(commit_reservation(record, plan=reservation_plan, at_time=at(60)))
+        results.append(
+            commit_reservation(
+                record,
+                plan=reservation_plan,
+                at_time=at(60),
+                deployable_policy=book_policy(record),
+            )
+        )
 
     threads = [threading.Thread(target=race, args=(row,)) for row in racers]
     for thread in threads:
@@ -2171,35 +2455,64 @@ def test_ac_007_a_losing_racer_never_double_spends() -> None:
         thread.join(timeout=20)
 
     assert len(results) == len(racers)
-    assert sorted(result.status.value for result in results) == ["COMMITTED", "REJECTED"]
-    winner = next(
-        result for result in results if result.status is CapitalCommitStatus.COMMITTED
-    )
-    loser = next(
-        result for result in results if result.status is CapitalCommitStatus.REJECTED
-    )
-    assert loser.rejection is CapitalCommitRejection.STALE_EXPECTED_VERSION
-    assert loser.snapshot is None
-    assert loser.committed_capital is None
-    assert winner.snapshot is not None
-    assert winner.snapshot.cash.amount(CapitalPartition.FREE_CASH) == Decimal("9000.00")
-    assert winner.snapshot.cash.amount(CapitalPartition.ORDER_RESERVES) == Decimal("1000.00")
-    assert len(winner.snapshot.applied_reservation_references) == 1
+    assert sorted(result.status.value for result in results) == ["REJECTED", "REJECTED"]
+    for result in results:
+        assert result.rejection is CapitalCommitRejection.DEPLOYABLE_BOUND_UNAVAILABLE
+        assert result.snapshot is None
+        assert result.snapshot_id is None
+        assert result.committed_capital is None
+        assert result.successor_version is None
+    # The contested partition moved exactly zero times and nothing was recorded.
+    assert record.cash.amount(CapitalPartition.FREE_CASH) == Decimal("10000.00")
+    assert record.cash.amount(CapitalPartition.ORDER_RESERVES) == Decimal("0.00")
+    assert record.cash.cash_total == Decimal("10500.00")
+    assert record.applied_reservation_references == ()
+    assert CapitalSnapshot.from_dict(record.to_dict()).snapshot_id == record.snapshot_id
 
+    # No attempt was recorded against the book, so it stays replannable: a further
+    # decision is judged on its own merits rather than being refused as stale.
     replanned = commit_reservation(
-        winner.snapshot,
+        record,
+        plan=plan(version=record.portfolio_version, candidate="PCAND:R5C:REPLANNED"),
+        at_time=at(60),
+        deployable_policy=book_policy(record),
+    )
+    assert replanned.rejection is CapitalCommitRejection.DEPLOYABLE_BOUND_UNAVAILABLE
+    assert replanned.rejection is not CapitalCommitRejection.STALE_EXPECTED_VERSION
+    assert replanned.snapshot is None
+
+    # The same "reread and replan" obligation, proved lawfully: a plan offered against
+    # the version a reservation *would* have produced is judged on its own merits, and
+    # the contested partition stays exactly as the book declared it.
+    advanced = successor(
+        record,
+        trigger=CapitalRecomputeTrigger.RESERVATION,
+        cash_ledger=cash(free="9000.00", reserves="1000.00", safety="500.00"),
+        limit_usage=declared_usage(),
+    )
+    assert_snapshot_recomputes_from(
+        record, advanced, trigger=CapitalRecomputeTrigger.RESERVATION
+    )
+    assert advanced.portfolio_version == "pv-r5c-0001.0001"
+    replanned_after_advance = commit_reservation(
+        advanced,
         plan=plan(
-            version=winner.snapshot.portfolio_version,
+            version=advanced.portfolio_version,
             candidate="PCAND:R5C:RACER-C",
             amount=250.0,
         ),
         at_time=at(120),
+        deployable_policy=book_policy(advanced),
     )
-    assert replanned.status is CapitalCommitStatus.COMMITTED
-    assert replanned.successor_version == "pv-r5c-0001.0002"
-    assert replanned.snapshot is not None
-    assert replanned.snapshot.cash.amount(CapitalPartition.FREE_CASH) == Decimal("8750.00")
-    assert replanned.snapshot.cash.amount(CapitalPartition.ORDER_RESERVES) == Decimal("1250.00")
+    assert replanned_after_advance.status is CapitalCommitStatus.REJECTED
+    assert (
+        replanned_after_advance.rejection
+        is CapitalCommitRejection.DEPLOYABLE_BOUND_UNAVAILABLE
+    )
+    assert replanned_after_advance.snapshot is None
+    assert replanned_after_advance.committed_capital is None
+    assert advanced.cash.amount(CapitalPartition.FREE_CASH) == Decimal("9000.00")
+    assert advanced.cash.amount(CapitalPartition.ORDER_RESERVES) == Decimal("1000.00")
 
 
 
@@ -2207,21 +2520,34 @@ def test_ac_007_a_losing_racer_never_double_spends() -> None:
 def test_ac_007_a_lawful_recompute_moves_the_tracked_current_version() -> None:
     """ATDD-R5-C-capital-intelligence/AC-007: the book follows its real lineage.
 
-    GIVEN a committed reservation, a lawful reconciliation recompute of its
-    successor and the earlier version that recompute replaced
-    WHEN the next reservation is committed, and when a reservation is offered
-    against the replaced version
-    THEN the next reservation consumes the version that actually is current for the
-    book instead of being refused as stale, and the replaced version never becomes
-    current again
+    GIVEN a lawful RESERVATION recompute of a book, a lawful reconciliation recompute
+    of that successor and the replaced version the reconciliation superseded
+    WHEN a reservation is offered against the current version and another against the
+    replaced version
+    THEN the reservation against the current version is judged on its merits instead of
+    being refused as stale, and the replaced version never becomes current again
+
+    SUPERSEDED IN THE SHADOW-ONLY POSTURE: the historical criterion expected the first
+    and the second reservation to commit (`COMMITTED`). With no owner-ratified funding
+    policy neither commits, so the tracked-version law is proved by which version each
+    attempt is judged against.
+    PENDING INTEGRATION PROOF: "consecutive reservations consume the version that is
+    actually current for the book" once a ratified funding policy and trusted upstream
+    consumption evidence exist (owned by the `ATDD-R5-C-deployable-bound-closure`
+    increment contract).
     """
 
     book = commit_fixture("PAPER-LEDGER-R5C-VERSION-CHAIN-1")
-    first = commit_reservation(book, plan=plan(version=book.portfolio_version), at_time=at(60))
-    assert first.status is CapitalCommitStatus.COMMITTED
-    assert first.successor_version == "pv-r5c-0001.0001"
-    reserved = first.snapshot
-    assert reserved is not None
+    reserved = successor(
+        book,
+        trigger=CapitalRecomputeTrigger.RESERVATION,
+        cash_ledger=cash(free="9000.00", reserves="1000.00", safety="500.00"),
+        limit_usage=declared_usage(),
+    )
+    assert_snapshot_recomputes_from(
+        book, reserved, trigger=CapitalRecomputeTrigger.RESERVATION
+    )
+    assert reserved.portfolio_version == "pv-r5c-0001.0001"
 
     reconciled = successor(
         reserved,
@@ -2241,21 +2567,24 @@ def test_ac_007_a_lawful_recompute_moves_the_tracked_current_version() -> None:
         reserved, reconciled, trigger=CapitalRecomputeTrigger.RECONCILIATION
     )
 
+    # The reconciliation moved the version this process tracks for the book, so an
+    # attempt against the current version is judged on its merits rather than as stale.
     second = commit_reservation(
         reconciled,
         plan=plan(version=reconciled.portfolio_version, candidate="PCAND:R5C:AFTER-RECON"),
         at_time=at(180),
+        deployable_policy=book_policy(reconciled),
     )
-    assert second.status is CapitalCommitStatus.COMMITTED
-    assert second.successor_version == "pv-r5c-0001.0003"
-    assert second.snapshot is not None
-    assert second.snapshot.cash.amount(CapitalPartition.FREE_CASH) == Decimal("8000.00")
-    assert second.snapshot.cash.amount(CapitalPartition.ORDER_RESERVES) == Decimal("2000.00")
+    assert second.status is CapitalCommitStatus.REJECTED
+    assert second.rejection is CapitalCommitRejection.DEPLOYABLE_BOUND_UNAVAILABLE
+    assert second.snapshot is None
 
+    # The replaced version never becomes current again.
     replaced = commit_reservation(
         reserved,
         plan=plan(version=reserved.portfolio_version, candidate="PCAND:R5C:REPLACED"),
         at_time=at(240),
+        deployable_policy=book_policy(reserved),
     )
     assert replaced.status is CapitalCommitStatus.REJECTED
     assert replaced.rejection is CapitalCommitRejection.STALE_EXPECTED_VERSION
@@ -2712,7 +3041,12 @@ def test_ac_007_the_plan_current_check_reuses_the_frozen_owner() -> None:
         assert_reservation_plan_current(
             stale_plan, current_portfolio_version=record.portfolio_version
         )
-    refusal = commit_reservation(record, plan=stale_plan, at_time=at(60))
+    refusal = commit_reservation(
+        record,
+        plan=stale_plan,
+        at_time=at(60),
+        deployable_policy=book_policy(record),
+    )
     assert refusal.rejection is CapitalCommitRejection.STALE_EXPECTED_VERSION
 
     source = r5c_source()
@@ -3062,8 +3396,8 @@ def test_ac_011_release_profile_and_paper_posture_are_unchanged() -> None:
 def test_ac_011_every_record_declares_itself_non_authoritative() -> None:
     """ATDD-R5-C-capital-intelligence/AC-011: research-only evidence.
 
-    GIVEN a snapshot, a deployable view, a commit, a measurement, a cohort and an
-    aggregate
+    GIVEN a snapshot, a deployable view, a commit attempt, a measurement, a cohort
+    and an aggregate
     WHEN each record's flag and serialized keys are inspected
     THEN every record declares itself non-authoritative, no serialized record
     carries an authority or secret key, and the component records carry no
@@ -3072,10 +3406,12 @@ def test_ac_011_every_record_declares_itself_non_authoritative() -> None:
 
     record = snapshot()
     view = evaluate_deployable_capital(record, policy=policy(), at_time=at(60))
+    posture_book = commit_fixture("PAPER-LEDGER-R5C-POSTURE")
     commit = commit_reservation(
-        commit_fixture("PAPER-LEDGER-R5C-POSTURE"),
+        posture_book,
         plan=plan(version=VERSION),
         at_time=at(60),
+        deployable_policy=book_policy(posture_book),
     )
     series = points((0, "1000.00"), (3600, "1000.00"))
     measured = measure_capital_hours(series, policy=hours_policy())
@@ -3113,12 +3449,20 @@ def test_ac_011_the_increment_claims_no_durable_or_restart_safe_allocation() -> 
 
     GIVEN every record this increment produces and the process-scoped reservation
     witness
-    WHEN the declared durability status, the module source and a committed record are
-    inspected
+    WHEN the declared durability status, the module source and a refused commit record
+    are inspected
     THEN the increment declares its witness process-scoped and in-memory, names the
     `R5-E` delivery that would own a canonical durable reservation record, states that
     restart, multi-worker and durable-ledger safety are NOT claimed, and exposes no
     persistence facility at all
+
+    SUPERSEDED IN THE SHADOW-ONLY POSTURE: the historical criterion inspected the
+    record of a *committed* reservation. With no owner-ratified funding policy the
+    seam refuses, so the non-authority property is inspected on the refusal record
+    instead; the durability declaration itself is unchanged.
+    PENDING INTEGRATION PROOF: "a committed reservation record stays non-authoritative
+    and non-durable" once a ratified funding policy exists (owned by the
+    `ATDD-R5-C-deployable-bound-closure` increment contract).
     """
 
     assert CAPITAL_RESERVATION_DURABILITY_STATUS == "PROCESS_SCOPED_IN_MEMORY_WITNESS"
@@ -3132,15 +3476,17 @@ def test_ac_011_the_increment_claims_no_durable_or_restart_safe_allocation() -> 
     for token in FORBIDDEN_PERSISTENCE_TOKENS:
         assert token not in source, token
 
+    durability_book = commit_fixture("PAPER-LEDGER-R5C-DURABILITY")
     result = commit_reservation(
-        commit_fixture("PAPER-LEDGER-R5C-DURABILITY"),
+        durability_book,
         plan=plan(version=VERSION),
         at_time=at(60),
+        deployable_policy=book_policy(durability_book),
     )
-    assert result.status is CapitalCommitStatus.COMMITTED
+    assert result.status is CapitalCommitStatus.REJECTED
+    assert result.rejection is CapitalCommitRejection.DEPLOYABLE_BOUND_UNAVAILABLE
     assert result.authoritative is False
-    assert result.snapshot is not None
-    assert result.snapshot.authoritative is False
+    assert result.snapshot is None
     assert result.to_dict()["authoritative"] is False
 
 
