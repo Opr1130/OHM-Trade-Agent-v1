@@ -379,10 +379,16 @@ def test_no_ml_dependency_is_introduced():
     inspects real imports with `ast`. Ordinary English that merely contains
     `shap` (as in `shape` or `authority-shaped`) is no longer treated as a model
     dependency, while an actual prohibited distribution or import still fails
-    this test. The test name and its criterion citation are unchanged.
+    this test. Since `ATDD-DECISION-SAFETY-SCAN-v2` a dependency include that
+    cannot be read fails closed, a module reached through a literal dynamic
+    import is inspected, and an unprovable dynamic-import call is refused
+    instead of skipped. The test name and its criterion citation are unchanged.
     """
+    modules = sorted(OPIP_PACKAGE.rglob("*.py"))
     assert _declared_prohibited(_dependency_declarations()) == ()
-    assert _prohibited_imports_in_paths(sorted(OPIP_PACKAGE.rglob("*.py"))) == ()
+    assert _prohibited_imports_in_paths(modules) == ()
+    assert _prohibited_dynamic_imports_in_paths(modules) == ()
+    assert _unprovable_dynamic_imports_in_paths(modules) == ()
 
 
 def test_model_version_is_declared_but_unset():
@@ -540,27 +546,62 @@ def _declared_in_pyproject(text: str) -> frozenset[str]:
     return frozenset(name for name in names if name)
 
 
+class UnresolvableDeclarationError(RuntimeError):
+    """A dependency declaration could not be read to a proof.
+
+    The scan fails closed: an include that is missing, unreadable or remote means
+    the declared dependency set cannot be proven clean, so the scan refuses
+    instead of reporting nothing. Refusing is the only safe answer for a guard
+    whose entire purpose is to prove that no model dependency is declared.
+    """
+
+
+#: A remote include (`-r https://...`) cannot be read by a static scan.
+_REMOTE_INCLUDE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://")
+
+
+def _required_by(line: str) -> str | None:
+    """The file a `-r` / `--requirement` line includes, or `None` otherwise."""
+
+    stripped = line.split("#", 1)[0].strip()
+    if not stripped.startswith(("-r ", "--requirement ", "-r=", "--requirement=")):
+        return None
+    return re.split(r"[= ]", stripped, maxsplit=1)[1].strip().strip("\"'")
+
+
 def _declared_in(
     path: str,
     kind: str,
     read: Callable[[str], str],
     _seen: frozenset[str] = frozenset(),
 ) -> frozenset[str]:
-    """Every distribution one declaration file names, includes followed."""
+    """Every distribution one declaration file names, includes followed.
+
+    Failure rules (`ATDD-DECISION-SAFETY-SCAN-v2/AC-001`): a declaration file or
+    include that cannot be read, and a remote include, fail closed with
+    `UnresolvableDeclarationError`. A circular include is resolvable - the
+    revisit is skipped - so it terminates and still reports what it contains.
+    """
 
     if path in _seen:
         return frozenset()
     try:
         text = read(path)
-    except OSError:  # pragma: no cover - a missing declaration declares nothing
-        return frozenset()
+    except (OSError, KeyError) as exc:  # missing or unreadable: fail closed
+        raise UnresolvableDeclarationError(
+            f"declaration {path!r} could not be read: {exc}"
+        ) from exc
     if kind == "pyproject":
         return _declared_in_pyproject(text)
     found: set[str] = set()
     for line in text.splitlines():
-        stripped = line.split("#", 1)[0].strip()
-        if stripped.startswith(("-r ", "--requirement ", "-r=", "--requirement=")):
-            target = re.split(r"[= ]", stripped, maxsplit=1)[1].strip().strip("\"'")
+        target = _required_by(line)
+        if target is not None:
+            if _REMOTE_INCLUDE.match(target):
+                raise UnresolvableDeclarationError(
+                    f"declaration {path!r} includes the remote requirement "
+                    f"{target!r}, which this scan cannot read"
+                )
             found |= _declared_in(target, "requirements", read, _seen | {path})
             continue
         name = _requirement_name(line)
@@ -632,6 +673,93 @@ def _prohibited_imports_in_paths(paths: Sequence[Path]) -> tuple[str, ...]:
     """Prohibited import roots in the given module files."""
 
     return _prohibited_imports_in_sources(
+        [path.read_text(encoding="utf-8") for path in paths]
+    )
+
+
+#: The dynamic-import call names this scan evaluates. A prohibited module reached
+#: through one of them is a real import even though no `Import` node names it.
+_DYNAMIC_IMPORT_CALLS = frozenset({"__import__", "import_module", "find_spec"})
+
+
+def _called_name(node: ast.Call) -> str | None:
+    """The called function's own name, however it is qualified."""
+
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def _dynamic_import_calls(source: str) -> tuple[tuple[str, str | None], ...]:
+    """Every dynamic-import call in `source` as `(call name, literal target)`.
+
+    The target is `None` when the first argument is not a string literal - a
+    variable, an f-string, a concatenation, or no argument at all. That case is
+    reported by `_unprovable_dynamic_imports_in_sources`, which the scan asserts
+    is empty, so an unprovable call is refused rather than skipped.
+    """
+
+    calls: list[tuple[str, str | None]] = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _called_name(node)
+        if name not in _DYNAMIC_IMPORT_CALLS:
+            continue
+        target: str | None = None
+        if node.args and isinstance(node.args[0], ast.Constant):
+            first = node.args[0].value
+            if isinstance(first, str):
+                target = first
+        calls.append((name, target))
+    return tuple(sorted(calls))
+
+
+def _prohibited_dynamic_imports_in_sources(
+    sources: Sequence[str],
+) -> tuple[str, ...]:
+    """Prohibited import roots reached by a literal dynamic-import call."""
+
+    found: set[str] = set()
+    for source in sources:
+        for _name, target in _dynamic_import_calls(source):
+            if target:
+                found.add(_root_module(target))
+    return tuple(sorted(found & PROHIBITED_ML_DISTRIBUTIONS))
+
+
+def _prohibited_dynamic_imports_in_paths(paths: Sequence[Path]) -> tuple[str, ...]:
+    """Prohibited dynamic imports in the given module files."""
+
+    return _prohibited_dynamic_imports_in_sources(
+        [path.read_text(encoding="utf-8") for path in paths]
+    )
+
+
+def _unprovable_dynamic_imports_in_sources(
+    sources: Sequence[str],
+) -> tuple[str, ...]:
+    """Dynamic-import calls whose target cannot be proven from the source.
+
+    This is the fail-closed signal (`AC-003`): the scan asserts it is empty, so a
+    call the scan cannot resolve is refused instead of assumed harmless.
+    """
+
+    found: set[str] = set()
+    for source in sources:
+        for name, target in _dynamic_import_calls(source):
+            if target is None:
+                found.add(name)
+    return tuple(sorted(found))
+
+
+def _unprovable_dynamic_imports_in_paths(paths: Sequence[Path]) -> tuple[str, ...]:
+    """Unprovable dynamic imports in the given module files."""
+
+    return _unprovable_dynamic_imports_in_sources(
         [path.read_text(encoding="utf-8") for path in paths]
     )
 
@@ -804,3 +932,220 @@ def test_ac_004_the_scan_contract_authorizes_every_changed_surface() -> None:
     assert global_pointer_pin_violations(
         Path(__file__).read_text(encoding="utf-8")
     ) == []
+
+
+# --------- v2: fail-closed declarations and literal dynamic-import detection ------
+
+
+SCAN_V2_INCREMENT = "ATDD-DECISION-SAFETY-SCAN-v2"
+SCAN_V2_CHANGED_SURFACES = (
+    "OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT",
+    "OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-DECISION-SAFETY-SCAN-v2.md",
+    "OHM-Trade-Agent-v1/tests/test_opip_decision_safety_v1.py",
+)
+
+
+@pytest.mark.acceptance
+def test_ac_001_an_unresolvable_dependency_include_fails_closed() -> None:
+    """ATDD-DECISION-SAFETY-SCAN-v2/AC-001: an include that cannot be read is refused.
+
+    GIVEN requirement declarations that include another file by `-r` or
+    `--requirement`, covering a missing target, an unreadable target and a
+    remote target, together with a resolvable include and a circular include
+    WHEN the scan resolves those declarations
+    THEN the missing, unreadable and remote includes fail closed with an error
+    naming the unresolvable target instead of reporting nothing, the resolvable
+    include is still followed and reports its prohibited dependency, and the
+    circular include terminates while still reporting the prohibited dependency
+    it contains
+    """
+
+    missing = {"requirements.txt": "-r missing.txt\n"}
+    with pytest.raises(UnresolvableDeclarationError, match="missing.txt"):
+        _declared_prohibited(
+            (("requirements.txt", "requirements"),), read=missing.__getitem__
+        )
+    remote = {"requirements.txt": "--requirement https://example.invalid/req.txt\n"}
+    with pytest.raises(UnresolvableDeclarationError, match="example.invalid"):
+        _declared_prohibited(
+            (("requirements.txt", "requirements"),), read=remote.__getitem__
+        )
+
+    def _denied(_name: str) -> str:
+        raise PermissionError("permission denied")
+
+    with pytest.raises(UnresolvableDeclarationError, match="permission denied"):
+        _declared_prohibited((("requirements.txt", "requirements"),), read=_denied)
+
+    resolvable = {
+        "requirements.txt": "-r included.txt\n",
+        "included.txt": "shap==0.45.0\n",
+    }
+    assert _declared_prohibited(
+        (("requirements.txt", "requirements"),), read=resolvable.__getitem__
+    ) == ("shap",)
+
+    circular = {
+        "requirements.txt": "-r second.txt\n",
+        "second.txt": "-r requirements.txt\ntorch==2.4.0\n",
+    }
+    assert _declared_prohibited(
+        (("requirements.txt", "requirements"),), read=circular.__getitem__
+    ) == ("torch",)
+
+
+@pytest.mark.acceptance
+def test_ac_002_a_prohibited_module_reached_by_a_literal_dynamic_import_is_reported() -> None:
+    """ATDD-DECISION-SAFETY-SCAN-v2/AC-002: literal dynamic imports are evidence.
+
+    GIVEN source that reaches a module through `importlib.import_module`,
+    `__import__` and `importlib.util.find_spec` with string-literal targets,
+    including aliased spellings and a submodule literal
+    WHEN the scan parses that source
+    THEN every prohibited distribution is reported under its normalized name,
+    and a benign literal target is accepted
+    """
+
+    assert _prohibited_dynamic_imports_in_sources(
+        ['import importlib\nimportlib.import_module("shap")\n']
+    ) == ("shap",)
+    assert _prohibited_dynamic_imports_in_sources(['__import__("torch")\n']) == (
+        "torch",
+    )
+    assert _prohibited_dynamic_imports_in_sources(
+        ['from importlib import util\nutil.find_spec("sklearn")\n']
+    ) == ("sklearn",)
+    assert _prohibited_dynamic_imports_in_sources(
+        ['import importlib as il\nil.import_module("xgboost.train")\n']
+    ) == ("xgboost",)
+    assert _prohibited_dynamic_imports_in_sources(
+        ['import importlib\nimportlib.import_module("json")\n']
+    ) == ()
+    assert _prohibited_dynamic_imports_in_sources(
+        ['import importlib\nimportlib.import_module(name)\n']
+    ) == ()
+
+
+@pytest.mark.acceptance
+def test_ac_003_an_unprovable_dynamic_import_fails_closed(tmp_path: Path) -> None:
+    """ATDD-DECISION-SAFETY-SCAN-v2/AC-003: an unprovable dynamic import is refused.
+
+    GIVEN dynamic-import calls whose target cannot be proven from the source - a
+    variable, an f-string, a concatenation and a call with no argument - plus a
+    literal call and the real decision package
+    WHEN the scan evaluates that source
+    THEN every unprovable call is reported by name so the caller refuses it
+    instead of skipping it, the literal call is not reported as unprovable, and
+    the real package contains no unprovable and no prohibited dynamic import
+    """
+
+    assert _unprovable_dynamic_imports_in_sources(
+        ["import importlib\nimportlib.import_module(target)\n"]
+    ) == ("import_module",)
+    assert _unprovable_dynamic_imports_in_sources(['__import__(f"{name}.sub")\n']) == (
+        "__import__",
+    )
+    assert _unprovable_dynamic_imports_in_sources(
+        ['import importlib\nimportlib.import_module(prefix + ".train")\n']
+    ) == ("import_module",)
+    assert _unprovable_dynamic_imports_in_sources(
+        ["import importlib\nimportlib.import_module()\n"]
+    ) == ("import_module",)
+    assert _unprovable_dynamic_imports_in_sources(
+        ['import importlib\nimportlib.import_module("json")\n']
+    ) == ()
+
+    modules = sorted(OPIP_PACKAGE.rglob("*.py"))
+    assert modules, "the decision package must contain modules to scan"
+    assert _unprovable_dynamic_imports_in_paths(modules) == ()
+    assert _prohibited_dynamic_imports_in_paths(modules) == ()
+
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        "import importlib\nimportlib.import_module(variable_target)\n",
+        encoding="utf-8",
+    )
+    assert _unprovable_dynamic_imports_in_paths([probe]) == ("import_module",)
+
+
+@pytest.mark.acceptance
+def test_ac_004_prose_and_lookalike_calls_are_still_accepted() -> None:
+    """ATDD-DECISION-SAFETY-SCAN-v2/AC-004: no new false positives.
+
+    GIVEN ordinary English, a lookalike call name and the accepted v1 controls -
+    the real decision package, the real declarations and every static import form
+    WHEN the widened scan reads them
+    THEN the prose source is accepted by all three scans, the real package and
+    the real declarations stay clean, and each static form is still refused
+    """
+
+    prose = (
+        '"""A payload shape serves both halves; an authority-shaped record."""\n'
+        "def _timing_shape(moves: dict[str, float]):\n"
+        '    """reshape the plan note."""\n'
+        '    note = "borrow the shape of a decided one"\n'
+        "    return _timing_shape_like(note)\n"
+    )
+    assert _prohibited_imports_in_sources([prose]) == ()
+    assert _prohibited_dynamic_imports_in_sources([prose]) == ()
+    assert _unprovable_dynamic_imports_in_sources([prose]) == ()
+
+    assert _prohibited_imports_in_sources(["import shap\n"]) == ("shap",)
+    assert _prohibited_imports_in_sources(["import shap as explainer\n"]) == ("shap",)
+    assert _prohibited_imports_in_sources(["from shap import KernelExplainer\n"]) == (
+        "shap",
+    )
+    assert _prohibited_imports_in_sources(["import torch.nn as nn\n"]) == ("torch",)
+    assert _prohibited_imports_in_sources(["from xgboost.sklearn import XGB\n"]) == (
+        "xgboost",
+    )
+    assert _normalized_distribution("SciKit_Learn") == "scikit-learn"
+    assert _declared_prohibited(_dependency_declarations()) == ()
+    assert _prohibited_imports_in_paths(sorted(OPIP_PACKAGE.rglob("*.py"))) == ()
+
+
+@pytest.mark.acceptance
+def test_ac_005_the_v2_contract_authorizes_every_changed_surface() -> None:
+    """ATDD-DECISION-SAFETY-SCAN-v2/AC-005: the widening is contract-authorized.
+
+    GIVEN this increment's contract, the acceptance index and the changed files
+    WHEN the real scope gate evaluates them
+    THEN the movable pointer resolves to a declared increment, this increment's
+    contract maps every changed surface to a criterion of its own, the gate
+    passes with no traceability gap and no unapproved criterion, the changed
+    surfaces touch no runtime path, and this module pins no global pointer
+    """
+
+    from tests.atdd_scope import (  # noqa: PLC0415 - local import keeps the header stable
+        PASS,
+        check_scope,
+        load_acceptance_index,
+        load_scope_contracts,
+        read_increment_pointer,
+    )
+    from tests.test_atdd_scope_control import global_pointer_pin_violations
+
+    contracts = load_scope_contracts(SCAN_CONTRACTS)
+    assert read_increment_pointer(SCAN_POINTER) in {
+        item.increment for item in contracts
+    }
+    ours = [item for item in contracts if item.increment == SCAN_V2_INCREMENT]
+    assert len(ours) == 1
+    contract = ours[0]
+    allowed = {
+        path for paths in contract.implementation_map.values() for path in paths
+    }
+    for surface in SCAN_V2_CHANGED_SURFACES:
+        assert surface in allowed, surface
+    assert contract.sections["UNAPPROVED SCOPE CHANGES"] == "NONE"
+    assert not [surface for surface in SCAN_V2_CHANGED_SURFACES if "/app/" in surface]
+    result = check_scope(
+        contract,
+        load_acceptance_index(SCAN_APP_ROOT / "tests"),
+        SCAN_V2_CHANGED_SURFACES,
+    )
+    assert result.status == PASS, result.reasons
+    assert global_pointer_pin_violations(
+        Path(__file__).read_text(encoding="utf-8")
+    ) == []
+
