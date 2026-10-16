@@ -30,6 +30,8 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from dataclasses import replace as _dc_replace
+from app.services import capital_admission_integration as _seam
 import yaml
 
 APP_ROOT = Path(__file__).resolve().parents[1]
@@ -114,8 +116,8 @@ CONTRACT = APP_ROOT / "docs" / "atdd" / "scope-contracts" / f"{INCREMENT}.md"
 POINTER = APP_ROOT / "docs" / "atdd" / "ACTIVE_INCREMENT"
 SEAM_MODULE = APP_ROOT / "app" / "services" / "capital_admission_integration.py"
 
-NOW = datetime(2026, 9, 19, 12, 0, 0, tzinfo=timezone.utc)
-STAMPED = "2026-09-19T12:00:00Z"
+NOW = datetime(2026, 9, 19, 11, 10, 0, tzinfo=timezone.utc)
+STAMPED = NOW.strftime("%Y-%m-%dT%H:%M:%SZ")
 T0 = datetime(2026, 9, 19, 11, 0, 0, tzinfo=timezone.utc)
 
 CAP_VERSION = "pv-r5e2i-0001"
@@ -286,6 +288,41 @@ def capital_snapshot(
         ),
     )
 
+
+
+def _fresh_snapshot(deadline_hours: float = 2.0):
+    """A snapshot whose freshness window covers the temporal cases under test."""
+
+    base = capital_snapshot()
+    return _dc_replace(
+        base,
+        freshness=_dc_replace(
+            base.freshness,
+            as_of=T0,
+            validity_deadline=T0 + timedelta(hours=deadline_hours),
+        ),
+    )
+
+
+def _short_window_plan() -> PortfolioReservationPlan:
+    """The same book with a reservation window that closes inside freshness."""
+
+    return PortfolioReservationPlan(
+        portfolio_version=CAP_VERSION,
+        window_identity=WINDOW_IDENTITY,
+        created_at=T0,
+        reservations=(
+            PortfolioReservation(
+                candidate_id=CANDIDATE,
+                symbol=SYMBOL,
+                direction=PortfolioDirection.LONG,
+                reserved_capital=AMOUNT,
+                portfolio_version=CAP_VERSION,
+                created_at=T0,
+                expires_at=T0 + timedelta(seconds=300),
+            ),
+        ),
+    )
 
 def reservation_plan(
     *,
@@ -1414,7 +1451,7 @@ def test_ac_010_the_increment_contract_and_pointer_are_self_consistent():
     assert contract.sections["INCREMENT"] == INCREMENT
     assert contract.sections["UNAPPROVED SCOPE CHANGES"] == "NONE"
     assert list(contract.acceptance_criteria) == [
-        f"AC-{index:03d}" for index in range(1, 12)
+        f"AC-{index:03d}" for index in range(1, 14)
     ]
 
     pointer_name = read_increment_pointer(POINTER)
@@ -1541,3 +1578,45 @@ def test_ac_010_the_ratified_consumer_and_caller_lists_name_this_seam():
 
 
 
+
+
+@pytest.mark.parametrize(
+    ("offset", "short_window", "expected_reason"),
+    [
+        (timedelta(seconds=-1), False, _seam.CAPITAL_ADMISSION_INPUT_INVALID),
+        (timedelta(seconds=300), True, _seam.CAPITAL_ADMISSION_RESERVATION_INACTIVE),
+        (timedelta(seconds=301), True, _seam.CAPITAL_ADMISSION_RESERVATION_INACTIVE),
+    ],
+)
+def test_a1_admission_refuses_outside_the_plan_reservation_window(
+    offset, short_window, expected_reason
+):
+    """ATDD-R5-E-capital-admission-integration/AC-013: invalid timing refuses before any canonical read or write."""
+
+    recorder = RecordingClient()
+    result = _admit(
+        recorder,
+        disposition_id="a1-outside",
+        context_id="ctx-a1",
+        plan=_short_window_plan() if short_window else reservation_plan(),
+        snapshot=capital_snapshot(),
+        disposition_time=T0 + offset,
+    )
+    assert result.status == _seam.CAPITAL_ADMISSION_REFUSED, (result.reason, result.detail)
+    assert result.reason == expected_reason, (result.reason, result.detail)
+    assert recorder.calls == []
+
+
+def test_a1_admission_still_admits_inside_the_window(client):
+    """ATDD-R5-E-capital-admission-integration/AC-013: the window guard must not disturb a legitimate in-window admission."""
+
+    result = _admit(
+        client,
+        disposition_id="a1-inside",
+        context_id="ctx-a1-inside",
+        disposition_time=T0 + timedelta(seconds=30),
+    )
+    assert result.reason not in (
+        _seam.CAPITAL_ADMISSION_INPUT_INVALID,
+        _seam.CAPITAL_ADMISSION_RESERVATION_INACTIVE,
+    ), (result.reason, result.detail)

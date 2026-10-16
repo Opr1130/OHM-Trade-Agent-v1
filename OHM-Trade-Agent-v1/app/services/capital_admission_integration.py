@@ -612,6 +612,21 @@ def admit_planned_reservation(
             )
         reservation = selected[0]
 
+    if instant < plan.created_at:
+        return _refuse(
+            CAPITAL_ADMISSION_INPUT_INVALID,
+            "the disposition instant precedes the plan creation instant, so no "
+            f"admission for this plan is valid (instant < created_at={plan.created_at.isoformat()})",
+            **book,
+        )
+    if instant >= reservation.expires_at:
+        return _refuse(
+            CAPITAL_ADMISSION_RESERVATION_INACTIVE,
+            "the selected reservation is expired at this instant; the adopted "
+            f"comparator refuses at the boundary (expires_at={reservation.expires_at.isoformat()})",
+            **book,
+        )
+
     booked: dict[str, Any] = {**book, "reservation": reservation}
 
     if explicit_version is not None:

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sys
+
+import pytest
 from pathlib import Path
 
 APP_ROOT = Path(__file__).resolve().parents[1]
@@ -16,8 +18,9 @@ from app.services.capital_admission_integration import (  # noqa: E402
 )
 
 
+@pytest.mark.acceptance
 def test_a2_disposition_exposes_the_committed_context_identity() -> None:
-    """The durable artifact must carry the context identity a retry must reuse."""
+    """ATDD-R5-E-capital-admission-integration/AC-012: the durable artifact must carry the context identity a retry must reuse."""
 
     disposition = CapitalAdmissionDisposition(
         status=CAPITAL_ADMISSION_REFUSED,
