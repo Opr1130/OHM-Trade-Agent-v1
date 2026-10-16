@@ -49,7 +49,7 @@ def test_canonical_delivery_ledger_tracks_message_id_retry_and_latency(monkeypat
     assert third.attempt == 3
     assert third.retry_count == 2
 
-    rows = [json.loads(line) for line in event_file.read_text().splitlines()]
+    rows = [json.loads(line) for line in event_file.read_text(encoding="utf-8").splitlines()]
     assert [row["status"] for row in rows] == [
         "SEND_FAILED",
         "SEND_FAILED",
@@ -60,9 +60,9 @@ def test_canonical_delivery_ledger_tracks_message_id_retry_and_latency(monkeypat
     assert rows[-1]["signal_id"] == "S-123"
     assert rows[-1]["trade_id"] == "T-123"
     assert rows[-1]["latency_ms"] >= 0
-    assert "super-secret-token" not in event_file.read_text()
+    assert "super-secret-token" not in event_file.read_text(encoding="utf-8")
 
-    state = json.loads(state_file.read_text())
+    state = json.loads(state_file.read_text(encoding="utf-8"))
     assert state["identities"]["EARLY_MOVER:METUSD"]["message_id"] == 4321
 
 
@@ -175,7 +175,7 @@ def test_failed_terminal_pending_alert_persists_truth_and_retries_out_of_band(mo
     # Market truth advances even though Telegram failed.
     assert terminalized == [("T-1", "invalidated")]
     assert lifecycle["status"] == "invalidated"
-    queued = json.loads(retry_file.read_text())
+    queued = json.loads(retry_file.read_text(encoding="utf-8"))
     assert queued["T-1"]["result"]["status"] == "INVALIDATED"
 
     monkeypatch.setattr(
@@ -195,8 +195,8 @@ def test_failed_terminal_pending_alert_persists_truth_and_retries_out_of_band(mo
         chat_id="chat",
     )
     assert (sent, failed) == (1, 0)
-    assert json.loads(retry_file.read_text()) == {}
-    saved = json.loads(state_file.read_text())
+    assert json.loads(retry_file.read_text(encoding="utf-8")) == {}
+    saved = json.loads(state_file.read_text(encoding="utf-8"))
     assert saved["T-1"]["status"] == "INVALIDATED"
     assert saved["T-1"]["message_id"] == 99
     assert emitted
@@ -249,7 +249,7 @@ def test_outbox_retry_reapplies_terminal_truth_after_crash_window(monkeypatch, t
     assert (sent, failed) == (1, 0)
     assert terminalized == [("T-1", "invalidated")]
     assert lifecycle["status"] == "invalidated"
-    assert json.loads(retry_file.read_text()) == {}
+    assert json.loads(retry_file.read_text(encoding="utf-8")) == {}
 
 
 def test_terminal_outbox_claim_prevents_concurrent_duplicate_workers(monkeypatch, tmp_path):
@@ -298,7 +298,7 @@ def test_requeue_preserves_active_terminal_outbox_lease(monkeypatch, tmp_path):
     token, _ = claim
 
     pending_notifier._queue_terminal_notification(setup, result)
-    row = json.loads(retry_file.read_text())["T-1"]
+    row = json.loads(retry_file.read_text(encoding="utf-8"))["T-1"]
     assert row["lease_token"] == token
 
 
@@ -349,7 +349,7 @@ def test_malformed_terminal_outbox_row_remains_quarantined_and_observable(monkey
         chat_id="chat",
     )
     assert (sent, failed) == (0, 1)
-    assert json.loads(retry_file.read_text()) == {"T-1": None}
+    assert json.loads(retry_file.read_text(encoding="utf-8")) == {"T-1": None}
 
     entry_result = PendingSetupMonitorResult(
         symbol=setup.symbol,
@@ -408,8 +408,8 @@ def test_terminal_retry_does_not_duplicate_already_recorded_delivery(monkeypatch
     )
 
     assert (sent, failed) == (1, 0)
-    assert json.loads(retry_file.read_text()) == {}
-    saved = json.loads(state_file.read_text())
+    assert json.loads(retry_file.read_text(encoding="utf-8")) == {}
+    saved = json.loads(state_file.read_text(encoding="utf-8"))
     assert saved["T-1"]["message_id"] == 777
 
 
@@ -441,19 +441,19 @@ def test_terminal_alert_outbox_retires_when_exchange_fill_supersedes_market_aler
         "token",
         "chat",
     ) is False
-    assert json.loads(retry_file.read_text()) == {}
+    assert json.loads(retry_file.read_text(encoding="utf-8")) == {}
 
 
 def test_telegram_alert_state_writers_use_atomic_registry_io():
     sources = [
-        Path(pending_notifier.__file__).read_text(),
+        Path(pending_notifier.__file__).read_text(encoding="utf-8"),
     ]
     from app.services import trade_monitor_notifier, emergency_alert_notifier
 
     sources.extend(
         [
-            Path(trade_monitor_notifier.__file__).read_text(),
-            Path(emergency_alert_notifier.__file__).read_text(),
+            Path(trade_monitor_notifier.__file__).read_text(encoding="utf-8"),
+            Path(emergency_alert_notifier.__file__).read_text(encoding="utf-8"),
         ]
     )
     for source in sources:
