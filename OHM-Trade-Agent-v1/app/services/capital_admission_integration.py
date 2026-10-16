@@ -193,6 +193,9 @@ class CapitalAdmissionDisposition:
     schema_version: str = CAPITAL_ADMISSION_SCHEMA_VERSION
     #: A reservation ledger read-back never confers trading or execution authority.
     grants_execution_authority: bool = False
+    #: The committed decision-context identity this disposition belongs to, so a
+    #: lost acknowledgement retries against the same canonical commitment.
+    decision_context_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.status not in CAPITAL_ADMISSION_STATUSES:
@@ -213,6 +216,7 @@ class CapitalAdmissionDisposition:
             "disposition_time": self.disposition_time,
             "candidate_id": self.candidate_id,
             "plan_id": self.plan_id,
+            "decision_context_id": self.decision_context_id,
             "plan_portfolio_version": self.plan_portfolio_version,
             "account": self.account,
             "capital_engine": self.capital_engine,
@@ -607,6 +611,21 @@ def admit_planned_reservation(
                 **book,
             )
         reservation = selected[0]
+
+    if instant < plan.created_at:
+        return _refuse(
+            CAPITAL_ADMISSION_INPUT_INVALID,
+            "the disposition instant precedes the plan creation instant, so no "
+            f"admission for this plan is valid (instant < created_at={plan.created_at.isoformat()})",
+            **book,
+        )
+    if instant >= reservation.expires_at:
+        return _refuse(
+            CAPITAL_ADMISSION_RESERVATION_INACTIVE,
+            "the selected reservation is expired at this instant; the adopted "
+            f"comparator refuses at the boundary (expires_at={reservation.expires_at.isoformat()})",
+            **book,
+        )
 
     booked: dict[str, Any] = {**book, "reservation": reservation}
 
