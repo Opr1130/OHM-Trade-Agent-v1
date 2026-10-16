@@ -22,19 +22,19 @@ every file it reads is decoded as UTF-8 explicitly, so no `UnicodeDecodeError` i
 
 AC-002:
 GIVEN:
-the module's existing assertions and test names
+the module's delivery-ledger obligations (message-id, retry and latency tracking; suppressed versus not-eligible versus failed classification)
 WHEN:
 the decoding repair is applied
 THEN:
-no assertion is weakened, skipped, removed or re-scoped, and no test intent changes
+those obligations are still exercised by the same tests under their original names and expectations, with no assertion weakened, skipped or re-scoped
 
 AC-003:
 GIVEN:
-the delivery-outbox and registry-IO behaviour exercised by the module
+the terminal-outbox and registry-IO obligations that the module exercises against the real application modules
 WHEN:
 the repair is applied
 THEN:
-application behaviour is unchanged and the module's atomic-registry-IO and terminal-outbox obligations are still exercised
+those obligations remain exercised and application behaviour is unchanged
 
 EXPLICITLY OUT OF SCOPE:
 - Any change to `app/**`: notifiers, delivery ledger, retry/outbox behaviour, registry IO and every runtime path stay exactly as shipped.
@@ -52,7 +52,12 @@ ACCEPTANCE TEST TRACEABILITY:
 AC-001 -> tests/test_telegram_delivery_closure_v2.py::test_telegram_alert_state_writers_use_atomic_registry_io
 AC-002 -> tests/test_telegram_delivery_closure_v2.py::test_canonical_delivery_ledger_tracks_message_id_retry_and_latency
 AC-002 -> tests/test_telegram_delivery_closure_v2.py::test_delivery_summary_distinguishes_suppressed_not_eligible_and_failed
+AC-003 -> tests/test_telegram_delivery_closure_v2.py::test_failed_terminal_pending_alert_persists_truth_and_retries_out_of_band
+AC-003 -> tests/test_telegram_delivery_closure_v2.py::test_outbox_retry_reapplies_terminal_truth_after_crash_window
 AC-003 -> tests/test_telegram_delivery_closure_v2.py::test_terminal_outbox_claim_prevents_concurrent_duplicate_workers
+AC-003 -> tests/test_telegram_delivery_closure_v2.py::test_requeue_preserves_active_terminal_outbox_lease
+AC-003 -> tests/test_telegram_delivery_closure_v2.py::test_pending_entry_alert_is_quarantined_while_terminal_outbox_exists
+AC-003 -> tests/test_telegram_delivery_closure_v2.py::test_malformed_terminal_outbox_row_remains_quarantined_and_observable
 AC-003 -> tests/test_telegram_delivery_closure_v2.py::test_terminal_retry_does_not_duplicate_already_recorded_delivery
 AC-003 -> tests/test_telegram_delivery_closure_v2.py::test_terminal_alert_outbox_retires_when_exchange_fill_supersedes_market_alert
 

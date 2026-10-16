@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from types import SimpleNamespace
+import pytest
 
 from app.services import pending_setup_notifier as pending_notifier
 from app.services import telegram_delivery
@@ -10,7 +11,9 @@ from app.services.pending_setup_monitor import PendingSetupMonitorResult
 from app.services.pending_setup_registry import PendingSetup
 
 
+@pytest.mark.acceptance
 def test_canonical_delivery_ledger_tracks_message_id_retry_and_latency(monkeypatch, tmp_path):
+    """ATDD-TELEGRAM-DELIVERY-UTF8-DECODE-v1/AC-002: the canonical delivery ledger keeps tracking message id, retry and latency exactly as shipped."""
     event_file = tmp_path / "telegram_delivery_events.jsonl"
     state_file = tmp_path / "telegram_delivery_state.json"
     results = iter([None, None, 4321])
@@ -66,7 +69,9 @@ def test_canonical_delivery_ledger_tracks_message_id_retry_and_latency(monkeypat
     assert state["identities"]["EARLY_MOVER:METUSD"]["message_id"] == 4321
 
 
+@pytest.mark.acceptance
 def test_delivery_summary_distinguishes_suppressed_not_eligible_and_failed(monkeypatch, tmp_path):
+    """ATDD-TELEGRAM-DELIVERY-UTF8-DECODE-v1/AC-002: delivery classification stays suppressed versus not-eligible versus failed exactly as shipped."""
     event_file = tmp_path / "events.jsonl"
     state_file = tmp_path / "state.json"
     monkeypatch.setattr(
@@ -132,7 +137,9 @@ def _pending_setup() -> PendingSetup:
     )
 
 
+@pytest.mark.acceptance
 def test_failed_terminal_pending_alert_persists_truth_and_retries_out_of_band(monkeypatch, tmp_path):
+    """ATDD-TELEGRAM-DELIVERY-UTF8-DECODE-v1/AC-003: failed terminal alerts keep persisting truth and retrying out of band, unchanged."""
     setup = _pending_setup()
     result = PendingSetupMonitorResult(
         symbol=setup.symbol,
@@ -202,7 +209,9 @@ def test_failed_terminal_pending_alert_persists_truth_and_retries_out_of_band(mo
     assert emitted
 
 
+@pytest.mark.acceptance
 def test_outbox_retry_reapplies_terminal_truth_after_crash_window(monkeypatch, tmp_path):
+    """ATDD-TELEGRAM-DELIVERY-UTF8-DECODE-v1/AC-003: outbox retry keeps reapplying terminal truth after a crash window, unchanged."""
     setup = _pending_setup()
     result = PendingSetupMonitorResult(
         symbol=setup.symbol,
@@ -252,7 +261,9 @@ def test_outbox_retry_reapplies_terminal_truth_after_crash_window(monkeypatch, t
     assert json.loads(retry_file.read_text(encoding="utf-8")) == {}
 
 
+@pytest.mark.acceptance
 def test_terminal_outbox_claim_prevents_concurrent_duplicate_workers(monkeypatch, tmp_path):
+    """ATDD-TELEGRAM-DELIVERY-UTF8-DECODE-v1/AC-003: the terminal outbox claim stays duplicate-proof across workers, unchanged."""
     setup = _pending_setup()
     result = PendingSetupMonitorResult(
         symbol=setup.symbol,
@@ -282,7 +293,9 @@ def test_terminal_outbox_claim_prevents_concurrent_duplicate_workers(monkeypatch
     assert recovered[0] != first[0]
 
 
+@pytest.mark.acceptance
 def test_requeue_preserves_active_terminal_outbox_lease(monkeypatch, tmp_path):
+    """ATDD-TELEGRAM-DELIVERY-UTF8-DECODE-v1/AC-003: requeue keeps preserving an active terminal outbox lease, unchanged."""
     setup = _pending_setup()
     result = PendingSetupMonitorResult(
         symbol=setup.symbol,
@@ -302,7 +315,9 @@ def test_requeue_preserves_active_terminal_outbox_lease(monkeypatch, tmp_path):
     assert row["lease_token"] == token
 
 
+@pytest.mark.acceptance
 def test_pending_entry_alert_is_quarantined_while_terminal_outbox_exists(monkeypatch, tmp_path):
+    """ATDD-TELEGRAM-DELIVERY-UTF8-DECODE-v1/AC-003: pending-entry alerts stay quarantined while a terminal outbox exists, unchanged."""
     setup = _pending_setup()
     terminal_result = PendingSetupMonitorResult(
         symbol=setup.symbol,
@@ -336,7 +351,9 @@ def test_pending_entry_alert_is_quarantined_while_terminal_outbox_exists(monkeyp
     ) is False
 
 
+@pytest.mark.acceptance
 def test_malformed_terminal_outbox_row_remains_quarantined_and_observable(monkeypatch, tmp_path):
+    """ATDD-TELEGRAM-DELIVERY-UTF8-DECODE-v1/AC-003: malformed terminal outbox rows stay quarantined and observable, unchanged."""
     setup = _pending_setup()
     retry_file = tmp_path / "pending_terminal_outbox.json"
     retry_file.write_text(json.dumps({"T-1": None}))
@@ -372,7 +389,9 @@ def test_malformed_terminal_outbox_row_remains_quarantined_and_observable(monkey
     ) is False
 
 
+@pytest.mark.acceptance
 def test_terminal_retry_does_not_duplicate_already_recorded_delivery(monkeypatch, tmp_path):
+    """ATDD-TELEGRAM-DELIVERY-UTF8-DECODE-v1/AC-003: terminal retry still never duplicates an already recorded delivery, unchanged."""
     setup = _pending_setup()
     result = PendingSetupMonitorResult(
         symbol=setup.symbol,
@@ -413,7 +432,9 @@ def test_terminal_retry_does_not_duplicate_already_recorded_delivery(monkeypatch
     assert saved["T-1"]["message_id"] == 777
 
 
+@pytest.mark.acceptance
 def test_terminal_alert_outbox_retires_when_exchange_fill_supersedes_market_alert(monkeypatch, tmp_path):
+    """ATDD-TELEGRAM-DELIVERY-UTF8-DECODE-v1/AC-003: a terminal alert outbox still retires when an exchange fill supersedes the market alert, unchanged."""
     setup = _pending_setup()
     result = PendingSetupMonitorResult(
         symbol=setup.symbol,
@@ -444,7 +465,9 @@ def test_terminal_alert_outbox_retires_when_exchange_fill_supersedes_market_aler
     assert json.loads(retry_file.read_text(encoding="utf-8")) == {}
 
 
+@pytest.mark.acceptance
 def test_telegram_alert_state_writers_use_atomic_registry_io():
+    """ATDD-TELEGRAM-DELIVERY-UTF8-DECODE-v1/AC-001: reads the notifier sources as text and proves the writers use atomic registry IO; with explicit UTF-8 decoding this holds on any host locale."""
     sources = [
         Path(pending_notifier.__file__).read_text(encoding="utf-8"),
     ]
