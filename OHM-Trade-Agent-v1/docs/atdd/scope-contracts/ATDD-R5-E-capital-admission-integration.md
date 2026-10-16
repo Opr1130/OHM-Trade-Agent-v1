@@ -107,6 +107,22 @@ the whole application tree, the runtime roots, the permitted integration module 
 THEN:
 the historical clause is superseded in part for exactly one declared application consumer, `app/services/capital_admission_integration.py`, and every other AC-017 restriction is retained: no runtime root imports the capital owner, the permitted module is not wired into any runtime entry point, any additional undeclared consumer is rejected, the resolution witness stays process-scoped and in-memory with `R5-E` as the declared durable dependency, canonical ownership and the writer-owned accounting/policy are unchanged, every record stays `authoritative = False`, `EVIDENCE_SHADOW` remains active with `TARGET_PAPER` blocked and `OPIP_PAPER_V2_MODE` off, and no new execution, funding or promotion authority exists. Invoking the permitted module can create durable paper-plane admission records through the existing writer (`WriterClient.admit_paper_opportunity`, whose limits come from the frozen capital policy and never from the request): the exception admits a real canonical mutation path on the paper plane and is not justified by the absence of exchange authority. The historical contract `ATDD-R5-C-deployable-bound-closure.md` and its criterion set are left unchanged; this successor increment owns the criterion and its evidence.
 
+AC-012:
+GIVEN:
+a disposition carrying the frozen request identity and expected portfolio version
+WHEN:
+the durable recovery artifact is inspected after a lost acknowledgement
+THEN:
+the committed decision-context identity is declared and serialized on the disposition, so a retry reuses the same canonical commitment and creates no second reservation
+
+AC-013:
+GIVEN:
+a plan with `created_at` and one selected active reservation with `expires_at`, plus a disposition instant
+WHEN:
+the admission seam evaluates the attempt
+THEN:
+an instant before the plan creation instant is refused as invalid input, an instant at or after the reservation expiry is refused as an inactive reservation (adopted `expires_at <= instant` comparator), no canonical read or write occurs in either refusal, and an instant inside the window keeps existing admission behaviour
+
 EXPLICITLY OUT OF SCOPE:
 - No second admission, reservation, release or capital authority. The seam never writes SQL, never opens a transaction of its own, never mints a canonical identity, never releases or adjusts a reservation, and never adds a `WriterIntent` kind, an event type, a table, a store, a queue, a scheduler, an allocator, a cash ledger or a retry loop. Release stays exactly where the reservation-authority increment left it: committed terminal reconciliation evidence read by the existing writer.
 - No runtime activation and no wiring. The seam stays dormant: no runtime module, Compose service, scheduler job, Telegram path, deployment unit or environment variable is added or switched, no mode key is introduced, and `OPIP_PAPER_V2_MODE` stays `off`. `TARGET_PAPER` stays `BLOCKED`.
@@ -162,6 +178,9 @@ AC-011 -> tests/test_opip_r5_c_deployable_bound_closure.py::test_ac_011_the_decl
 AC-011 -> tests/test_opip_r5_c_deployable_bound_closure.py::test_ac_011_prohibited_runtime_wiring_of_the_permitted_integration_is_rejected
 AC-011 -> tests/test_opip_r5_c_deployable_bound_closure.py::test_ac_011_prohibited_runtime_wiring_is_detected_for_all_import_forms
 AC-011 -> tests/test_opip_r5_c_deployable_bound_closure.py::test_ac_011_indirect_or_dynamic_reachability_is_outside_this_direct_import_scanner
+AC-012 -> tests/test_review_a2_context_identity.py::test_a2_disposition_exposes_the_committed_context_identity
+AC-013 -> tests/test_opip_r5_e_capital_admission_integration.py::test_a1_admission_refuses_outside_the_plan_reservation_window
+AC-013 -> tests/test_opip_r5_e_capital_admission_integration.py::test_a1_admission_still_admits_inside_the_window
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/services/capital_admission_integration.py
 AC-001 -> OHM-Trade-Agent-v1/tests/test_opip_r5_e_capital_admission_integration.py
@@ -192,6 +211,9 @@ AC-011 -> OHM-Trade-Agent-v1/tests/test_opip_r5_c_deployable_bound_closure.py
 AC-011 -> OHM-Trade-Agent-v1/app/services/capital_admission_integration.py
 AC-011 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R5-E-capital-admission-integration.md
 AC-011 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
+AC-012 -> OHM-Trade-Agent-v1/tests/test_review_a2_context_identity.py
+AC-013 -> OHM-Trade-Agent-v1/tests/test_opip_r5_e_capital_admission_integration.py
+AC-013 -> OHM-Trade-Agent-v1/app/services/capital_admission_integration.py
 DEFERRED DISCOVERIES:
 - Nothing in the repository calls the seam yet, so the seam has no production consumption: wiring it into the R5-C capital-intelligence or R5-D selector runtime is the next R5-E integration step, and it needs its own increment, its own dormant-mode proof, its own release-profile decision and an owner-approved activation path. Until then the seam stays dormant under `OPIP_PAPER_V2_MODE=off`.
 - The reservation identity of the R5-D `PortfolioReservationPlan` and the canonical reservation identity are still two different identities: the seam reports both and equates neither. Reconciling them, and any plan expiry or supersession policy for a plan, remain open.
