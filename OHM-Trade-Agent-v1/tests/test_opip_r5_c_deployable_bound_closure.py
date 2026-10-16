@@ -2352,6 +2352,92 @@ def test_ac_017_the_shadow_only_posture_is_declared_in_the_module() -> None:
         assert "secret" not in key and "api_key" not in key and "credential" not in key
 
 
+RUNTIME_WIRING_TARGETS: frozenset[str] = frozenset({
+    "capital_rotation_intelligence",
+    "app.services.capital_rotation_intelligence",
+    "capital_admission_integration",
+    "app.services.capital_admission_integration",
+})
+
+
+def module_references(path: Path) -> set[str]:
+    """Modules referenced by a file, including aliased ``from`` imports.
+
+    ``module_imports`` records only ``node.module`` for ``from`` imports, so an
+    aliased ``from app.services import x as y`` form is invisible to it. This
+    helper also composes ``module.name`` for every imported alias.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                found.add(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                found.add(node.module)
+            for alias in node.names:
+                found.add((node.module + "." + alias.name) if node.module else alias.name)
+    return found
+
+
+def runtime_root_wiring_offenders(roots) -> list[str]:
+    """Runtime-root modules that reference the seam or the permitted integration.
+
+    Limit: this is a direct-import scanner. It cannot see dynamic or computed
+    imports, attribute-level indirection or runtime module mutation.
+    """
+    offenders: list[str] = []
+    for root in roots:
+        for path in sorted(root.rglob("*.py")):
+            hits = sorted(n for n in module_references(path) if n in RUNTIME_WIRING_TARGETS)
+            if hits:
+                offenders.append(str(path.name) + ": " + str(hits))
+    return offenders
+
+DECLARED_APPLICATION_CONSUMERS: frozenset[str] = frozenset({
+    "app/services/capital_admission_integration.py"
+})
+
+SEAM_TARGETS: frozenset[str] = frozenset({
+    "capital_rotation_intelligence",
+    "app.services.capital_rotation_intelligence",
+})
+
+
+def _app_relative(path: Path) -> str:
+    try:
+        return path.relative_to(APP_ROOT).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def runtime_consumers(paths) -> list[str]:
+    """App-relative modules whose source references the capital-owner seam."""
+    found = []
+    for path in sorted(paths):
+        if _app_relative(path) == _app_relative(MODULE):
+            continue
+        if "capital_rotation_intelligence" in module_source(path):
+            found.append(_app_relative(path))
+    return sorted(found)
+
+
+def undeclared_consumers(paths) -> list[str]:
+    """Consumers outside the bounded declared exception."""
+    return sorted(n for n in runtime_consumers(paths) if n not in DECLARED_APPLICATION_CONSUMERS)
+
+
+def runtime_root_offenders(roots) -> list[str]:
+    """Runtime-root modules that import the capital owner (prohibited wiring)."""
+    offenders: list[str] = []
+    for root in roots:
+        for path in sorted(root.rglob("*.py")):
+            hits = sorted(n for n in module_imports(path) if n in SEAM_TARGETS)
+            if hits:
+                offenders.append(str(path.name) + ": " + str(hits))
+    return offenders
+
 def test_ac_017_the_seam_gains_no_runtime_consumer_or_authority_surface() -> None:
     """ATDD-R5-C-deployable-bound-closure/AC-017: nothing new consumes the seam.
 
@@ -2365,25 +2451,15 @@ def test_ac_017_the_seam_gains_no_runtime_consumer_or_authority_surface() -> Non
     exists in the section
     """
 
-    targets = {
-        "capital_rotation_intelligence",
-        "app.services.capital_rotation_intelligence",
-    }
-    offenders: list[str] = []
-    for root in RUNTIME_ROOTS:
-        for path in sorted(root.rglob("*.py")):
-            hits = sorted(name for name in module_imports(path) if name in targets)
-            if hits:
-                offenders.append(f"{path.name}: {hits}")
-    assert offenders == []
+    assert runtime_root_offenders(RUNTIME_ROOTS) == []
+    assert runtime_root_wiring_offenders(RUNTIME_ROOTS) == []
 
     app_files = sorted((APP_ROOT / "app").rglob("*.py"))
-    consumers = [
-        path.relative_to(APP_ROOT).as_posix()
-        for path in app_files
-        if path != MODULE and "capital_rotation_intelligence" in module_source(path)
-    ]
-    assert consumers == []
+    assert DECLARED_APPLICATION_CONSUMERS == {
+        "app/services/capital_admission_integration.py"
+    }, "the supersession is bounded to exactly one declared application consumer"
+    assert undeclared_consumers(app_files) == []
+    assert set(runtime_consumers(app_files)) <= DECLARED_APPLICATION_CONSUMERS
     callers = [
         path.relative_to(APP_ROOT).as_posix()
         for path in app_files
@@ -2698,3 +2774,81 @@ def test_ac_018_the_supersession_is_versioned_in_this_contract() -> None:
     }
     assert {INCREMENT, R5C_INCREMENT} <= increments
     assert global_pointer_pin_violations(module_source(Path(__file__))) == []
+
+
+
+def test_ac_011_a_declared_consumer_is_admitted_and_is_the_only_one(tmp_path=None) -> None:
+    """ATDD-R5-E-capital-admission-integration/AC-011: the declared consumer is the only application consumer."""
+    app_files = sorted((APP_ROOT / "app").rglob("*.py"))
+    consumers = runtime_consumers(app_files)
+    assert consumers == ["app/services/capital_admission_integration.py"], consumers
+    assert undeclared_consumers(app_files) == []
+
+
+def test_ac_011_an_additional_undeclared_consumer_is_rejected(tmp_path) -> None:
+    """ATDD-R5-E-capital-admission-integration/AC-011: a second consumer is rejected."""
+    extra = tmp_path / "extra_seam_consumer.py"
+    extra.write_text("from app.services import capital_rotation_intelligence as c" + chr(10), encoding="utf-8")
+    offenders = undeclared_consumers([extra])
+    assert len(offenders) == 1
+    assert offenders[0].endswith("extra_seam_consumer.py")
+
+
+def test_ac_011_prohibited_runtime_wiring_is_rejected(tmp_path) -> None:
+    """ATDD-R5-E-capital-admission-integration/AC-011: runtime wiring of the seam is rejected."""
+    wiring = tmp_path / "wired_job.py"
+    wiring.write_text("import app.services.capital_rotation_intelligence" + chr(10), encoding="utf-8")
+    detected = runtime_root_offenders([tmp_path])
+    assert detected and "wired_job.py" in detected[0]
+    assert runtime_root_offenders(RUNTIME_ROOTS) == []
+
+
+def test_ac_011_the_permitted_module_is_not_prohibited_runtime_wiring(tmp_path=None) -> None:
+    """ATDD-R5-E-capital-admission-integration/AC-011: the exception does not open runtime wiring."""
+    offenders = runtime_root_offenders(RUNTIME_ROOTS)
+    assert offenders == []
+    assert "capital_admission_integration.py" not in "".join(offenders)
+
+
+def test_ac_011_the_declared_consumer_touches_the_existing_writer_without_new_authority(tmp_path=None) -> None:
+    """ATDD-R5-E-capital-admission-integration/AC-011: the consumer reuses the existing writer and gains no new authority."""
+    import importlib
+    mod = importlib.import_module("app.services.capital_admission_integration")
+    assert callable(getattr(mod, "admit_planned_reservation", None))
+    src = module_source(APP_ROOT / "app" / "services" / "capital_admission_integration.py")
+    assert "WriterClient" in src
+    assert "grants_execution_authority" in src
+    forbidden = ("place_order", "submit_order", "cancel_order", "create_order")
+    assert [token for token in forbidden if token in src] == []
+
+
+def test_ac_011_prohibited_runtime_wiring_of_the_permitted_integration_is_rejected(tmp_path) -> None:
+    """ATDD-R5-E-capital-admission-integration/AC-011: a runtime entry point may not wire the permitted integration."""
+    wiring = tmp_path / "wired_integration_job.py"
+    wiring.write_text("from app.services.capital_admission_integration import admit_planned_reservation" + chr(10), encoding="utf-8")
+    detected = runtime_root_wiring_offenders([tmp_path])
+    assert detected and "wired_integration_job.py" in detected[0]
+    assert runtime_root_wiring_offenders(RUNTIME_ROOTS) == []
+
+
+def test_ac_011_prohibited_runtime_wiring_is_detected_for_all_import_forms(tmp_path) -> None:
+    """ATDD-R5-E-capital-admission-integration/AC-011: aliased and plain forms are both detected."""
+    plain = tmp_path / "plain_seam.py"
+    plain.write_text("import app.services.capital_rotation_intelligence" + chr(10), encoding="utf-8")
+    direct = tmp_path / "direct_integration.py"
+    direct.write_text("import app.services.capital_admission_integration" + chr(10), encoding="utf-8")
+    aliased = tmp_path / "aliased_integration.py"
+    aliased.write_text("from app.services import capital_admission_integration as seam" + chr(10), encoding="utf-8")
+    detected = runtime_root_wiring_offenders([tmp_path])
+    joined = " ".join(detected)
+    assert "plain_seam.py" in joined
+    assert "direct_integration.py" in joined
+    assert "aliased_integration.py" in joined, "the aliased from-import form must be detected"
+
+
+def test_ac_011_indirect_or_dynamic_reachability_is_outside_this_direct_import_scanner(tmp_path) -> None:
+    """ATDD-R5-E-capital-admission-integration/AC-011: the detector limit is executable, not implied."""
+    dynamic = tmp_path / "dynamic_wiring.py"
+    dynamic.write_text("import importlib" + chr(10) + "importlib.import_module('app.services.capital_admission_integration')" + chr(10), encoding="utf-8")
+    known = {name for name in module_references(dynamic) if name in RUNTIME_WIRING_TARGETS}
+    assert known == set(), "a computed import name is not a direct import reference"
