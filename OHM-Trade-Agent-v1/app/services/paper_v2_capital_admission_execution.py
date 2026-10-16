@@ -180,7 +180,23 @@ def execute_admitted_research_paper_opportunity(
     if not isinstance(opportunity, PaperV2Opportunity):
         raise ValueError("opportunity must be a PaperV2Opportunity")
 
-    progress, evidence = read_committed_admission(opportunity, client=client)
+    try:
+        progress, evidence = read_committed_admission(opportunity, client=client)
+    except (OSError, TimeoutError) as exc:
+        # Transport/availability failure of the canonical read fails closed:
+        # no synthetic success, no stale fallback, no execution, no canonical write.
+        # Programming errors (ValueError/KeyError/TypeError) stay visible.
+        disposition_id = build_disposition_id(
+            episode_id=opportunity.episode_id,
+            native_symbol=opportunity.native_symbol,
+            direction=str(opportunity.direction),
+        )
+        return ResearchPaperExecutionOutcome(
+            status=OUTCOME_BLOCKED,
+            reason_code=REASON_UNUSABLE_CANONICAL_STATE,
+            disposition_id=disposition_id,
+            detail=f"canonical read transport failed: {exc}",
+        )
 
     if getattr(progress, "status", "") != "OK":
         return ResearchPaperExecutionOutcome(
@@ -222,6 +238,18 @@ def execute_admitted_research_paper_opportunity(
             detail=divergence,
         )
 
+    if not evidence.decision_context_id:
+        return ResearchPaperExecutionOutcome(
+            status=OUTCOME_BLOCKED,
+            reason_code=REASON_UNUSABLE_CANONICAL_STATE,
+            disposition_id=evidence.disposition_id,
+            admission=evidence,
+            detail=(
+                "the committed admission carries no authoritative decision "
+                "context identity, so the execution cannot reuse it"
+            ),
+        )
+
     try:
         result = run_paper_v2_opportunity(
             opportunity,
@@ -230,6 +258,7 @@ def execute_admitted_research_paper_opportunity(
             settings=settings,
             now=now,
             clock=clock,
+            committed_decision_context_id=evidence.decision_context_id,
         )
     except PaperV2ExecutionError as exc:
         return ResearchPaperExecutionOutcome(

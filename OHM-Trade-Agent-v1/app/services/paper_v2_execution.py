@@ -276,6 +276,7 @@ def run_paper_v2_opportunity(
     settings: Any,
     now: datetime,
     clock: Callable[[], datetime] | None = None,
+    committed_decision_context_id: str | None = None,
 ) -> PaperV2ExecutionResult:
     """Execute one qualified opportunity through the frozen canonical path.
 
@@ -388,12 +389,17 @@ def run_paper_v2_opportunity(
         emitted_at=moment,
         source_record_refs=opportunity.source_record_refs,
     )
-    try:
-        context_id, _context_proof = commit_decision_context(facts, client=client)
-    except ValueError as exc:
-        raise PaperV2ExecutionError(f"decision context failed: {exc}") from exc
-    except RuntimeError as exc:
-        raise PaperV2ExecutionError(f"decision context failed: {exc}") from exc
+    if committed_decision_context_id is not None:
+        # Already-admitted execution: the committed admission carries the
+        # authoritative decision context. Reuse it; never commit a second context.
+        context_id = committed_decision_context_id
+    else:
+        try:
+            context_id, _context_proof = commit_decision_context(facts, client=client)
+        except ValueError as exc:
+            raise PaperV2ExecutionError(f"decision context failed: {exc}") from exc
+        except RuntimeError as exc:
+            raise PaperV2ExecutionError(f"decision context failed: {exc}") from exc
 
     # --- 3. restart check before admitting ---------------------------------
     progress = client.get_paper_v2_execution_state(disposition_id)
@@ -401,6 +407,12 @@ def run_paper_v2_opportunity(
         progress.status == "OK",
         f"canonical progress unavailable: {progress.error_code or progress.status}",
     )
+    if committed_decision_context_id is not None:
+        _require(
+            bool(progress.admitted)
+            and progress.decision_context_id == committed_decision_context_id,
+            "committed admission evidence does not match canonical state",
+        )
     paper_trade_id = progress.paper_trade_id
     assert paper_trade_id is not None
 
