@@ -350,6 +350,24 @@ NO-THIRD-TRUTH BOUNDARY (AC-026): the sole current coverage-degradation truth is
 
 HISTORICAL BOOTSTRAP LIMITATION (AC-026 is not retroactive over the installed controller): as with AC-024, the host executes the already-installed `/usr/local/sbin/ohm-deploy` for a given deploy. The first deploy after this increment may still run a controller that predates the AC-026 receipt readiness contract; AC-026 governs the transaction only once this revision is the installed controller. No manual controller install is introduced by this increment.
 
+AC-027:
+GIVEN:
+a pull request whose base is a `feature/...` branch and the release CI workflow that already runs on `main`
+WHEN:
+the workflow trigger, its job set and its ATDD scope base are evaluated
+THEN:
+(a) `pull_request` is exactly the explicit allowlist `branches: [main, 'feature/**']` and `push` stays exactly `branches: [main]`, so the existing workflow starts for the stacked R5-F/R6 pull requests without adding a trigger event, a manual-dispatch input, a scheduled run or any new push authority
+
+(b) the job set is unchanged and complete: exactly `test`, `atdd-scope`, `architecture-gate`, `security-gate` and `release-candidate`, every job `runs-on: ubuntu-latest`, the four gate jobs carry no `if` guard, and `release-candidate` stays non-deploying with `if: github.event_name == 'push' && github.ref == 'refs/heads/main'` over the same four gates
+
+(c) no gate is skipped, filtered, deselected, ignored or made advisory: the workflow defines no `continue-on-error`, no `--deselect`, no `--ignore` and no caller-supplied input, and the pytest, architecture and pinned-Bandit invocations the workflow already had are preserved
+
+(d) the ATDD scope base stays GitHub-derived and fail-closed: a pull request diffs against `origin/<github.base_ref>`, a push diffs against `github.event.before`, a missing or all-zero base exits non-zero, and the active increment stays the movable `docs/atdd/ACTIVE_INCREMENT` pointer rather than a value pinned into the workflow
+
+(e) the change is contract-authorized: `docs/atdd/ACTIVE_INCREMENT` resolves to a declared contract, every surface this change touches (`.github/workflows/pytest.yml`, the pointer, this contract and the guard test module) is mapped to AC-027, and the scope gate passes for that exact changed-file set
+
+(f) nothing else changes: no new gate, workflow, scheduler, runner, secret, deployment path or authority is introduced, `TARGET_PAPER` stays BLOCKED, and the production deploy control plane is untouched
+
 EXPLICITLY OUT OF SCOPE:
 - Activating TARGET_PAPER, Paper-v2, the Committee, or any funded/live/exchange/order authority
 - Deleting, rewriting or rescoping the historical ATDD increments that recorded the Feature Bus `off`
@@ -357,6 +375,7 @@ EXPLICITLY OUT OF SCOPE:
 - Replacing the compose pin with an unconstrained `${...}` expansion that a stale `.env` could drive
 - Modifying the v1.4.3 authority DOCX
 - Weakening the bridge no-weakening protection into a generic relaxation
+- Adding a manual-dispatch input, schedule, second workflow or caller-supplied base to the release gates
 
 FROZEN BOUNDARIES:
 Release profile as the activation authority. The only mechanism that may place the Feature Bus into `shadow` is the explicit selection and validation of the `EVIDENCE_SHADOW` release profile. Free-form `.env` mode values are never the activation authority, and the core-service modes are literals that override `env_file: .env`. `SAFE_BASELINE` remains the rollback posture and resolves the Feature Bus `off` and feasibility-capture notional `0.0`.
@@ -368,6 +387,8 @@ Bounded authorization. `EVIDENCE_SHADOW` authorizes exactly Feature Bus `shadow`
 Rollback writer-recovery barrier. Before rollback may touch the canonical writer, rollback must have exclusive ownership of BOTH scheduled-producer host launch locks and must prove that no candidate evidence producer process remains inside the candidate core container. The launch locks are the existing producer flock identities the cron entries already use; their acquisition is a finite, fail-closed wait, never an unbounded block or an arbitrary sleep, and never a lock-file deletion. Ownership is held on stable file descriptors through previous-SHA reset, SAFE_BASELINE override creation, previous writer rebuild/start, previous core rebuild/start, core health proof, writer health proof and SAFE_BASELINE mode validation, and is released only after the previously snapshotted scheduler state is restored. Removing the candidate cron entries alone is explicitly NOT a quiescence proof. `UNKNOWN`, `NOT_QUIESCED` and launch-lock timeout all fail closed: rollback must not reset the SHA or restore the writer, and `OPIP_SAFE_BASELINE_ROLLBACK=SUCCESS` is never emitted in that case. A fail-closed abort preserves the pre-deploy scheduler transaction as durable recovery evidence and never deletes it; it is moved out of the `scheduler-before.*` namespace so the deploy-controller bootstrap's exactly-one-transaction proof is not broken on the next deploy. Paper-v2 stays `off`, the Committee stays `off`, funded/live authority stays absent, legacy remains the sole new-entry authority, and `TARGET_PAPER` stays BLOCKED.
 
 Local engineering tooling. The `chore/vscode-aider-bootstrap-v2` local bootstrap (VS Code tasks/settings, Aider ignore rules and its development-only `pytest-cov`/`pyright` pins) is not an architecture or authority change. It adds no deploy, trading, Paper-v2, Committee or merge capability, and it does not alter the release-profile, scheduler, protection, writer or Feature Bus contracts above.
+
+Stacked-branch gates. `pull_request` on `main` and on the explicit `feature/**` pattern runs the same five-job workflow that `main` runs; `push` stays `main`-only; the ATDD scope base is always GitHub's `github.base_ref` for a pull request and `github.event.before` for a push, never a caller-supplied input. This only makes the existing gates start for stacked work; widening the trigger, the gate set or the job list, or adding an advisory escape hatch, is a contract change rather than a CI convenience.
 
 ACCEPTANCE TEST TRACEABILITY:
 AC-001 -> tests/test_opip_release_pipeline_v1.py::test_ac_001_profile_allowlist_and_exact_modes
@@ -617,6 +638,12 @@ AC-026 -> tests/test_release_runtime_verifier.py::test_ac_026_runtime_verifier_p
 AC-026 -> tests/test_opip_deployment_transaction_boundary_v1.py::test_ac_026_workflow_gate_requires_explicit_shadow_readiness
 AC-026 -> tests/test_opip_deployment_transaction_boundary_v1.py::test_ac_026_workflow_keeps_owner_manual_exact_sha_controls
 
+AC-027 -> tests/test_opip_feature_stack_gates_v1.py::test_ac_027_feature_stack_pull_requests_run_the_same_gates
+AC-027 -> tests/test_opip_feature_stack_gates_v1.py::test_ac_027_the_gate_set_is_unchanged_and_never_advisory
+AC-027 -> tests/test_opip_feature_stack_gates_v1.py::test_ac_027_the_scope_base_stays_github_derived_and_fail_closed
+AC-027 -> tests/test_opip_feature_stack_gates_v1.py::test_ac_027_the_contract_authorizes_every_changed_surface
+AC-027 -> tests/test_opip_feature_stack_gates_v1.py::test_ac_027_the_ci_increment_does_not_pin_the_movable_pointer
+
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/services/release_profiles.py
 AC-001 -> OHM-Trade-Agent-v1/tests/test_release_profiles.py
@@ -775,6 +802,10 @@ AC-026 -> OHM-Trade-Agent-v1/tests/test_release_runtime_verifier.py
 AC-026 -> OHM-Trade-Agent-v1/tests/test_opip_deployment_transaction_boundary_v1.py
 AC-026 -> OHM-Trade-Agent-v1/tests/test_opip_f11_precutover_protection.py
 AC-026 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
+AC-027 -> .github/workflows/pytest.yml
+AC-027 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
+AC-027 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-PIPELINE-v1.md
+AC-027 -> OHM-Trade-Agent-v1/tests/test_opip_feature_stack_gates_v1.py
 
 DEFERRED DISCOVERIES:
 - `TARGET_PAPER` remains BLOCKED. Activating it (Paper-v2) requires the ATDD-R4-B2 AC-011 comparator evidence, F11 protection READY, legacy drain READY and explicit OWNER approval, and is a separate OWNER increment; this contract does not authorize it.
