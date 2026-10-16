@@ -2854,12 +2854,35 @@ def test_ac_008_a_plan_cannot_consume_more_than_is_deployable() -> None:
 def test_ac_008_the_commit_boundary_validates_identity_and_snapshot_version() -> None:
     """ATDD-R5-D-portfolio-planning/AC-008: the commit boundary is the gate.
 
-    GIVEN a reservation plan built against a capital snapshot version
+    GIVEN a reservation plan built against a capital snapshot version, and a
+    book-bound engineering-scenario deployable policy
     WHEN it is validated and committed, and a stale or over-consuming competitor
     arrives
-    THEN the current plan commits, while a superseded or unaffordable one is
-    refused without a partial write
+    THEN the superseded plan keeps its own earlier refusal first and the
+    unaffordable one keeps its own refusal second, while the currently valid plan is
+    refused fail-closed with `DEPLOYABLE_BOUND_UNAVAILABLE` because no owner-ratified
+    funding policy exists - and no refusal writes a successor, a committed amount, a
+    reservation reference or a moved cash partition
+
+    PENDING POSITIVE INTEGRATION PROOF. This criterion's former nominal outcome -
+    "the current plan commits" - is not an authorized result, and this test does NOT
+    prove it. Still unproven here: the successful authorized commit, the atomic
+    free-cash-to-order-reserve movement, the recorded committed capital and plan
+    reference, the successor-version advance, replay and consumed-plan behaviour,
+    contested-capital concurrency, complete economic usage-delta provenance and
+    durable restart safety. Those obligations remain registered as the ten
+    `PENDING INTEGRATION PROOF` items of `ATDD-R5-C-deployable-bound-closure`
+    (machine-checked by its AC-018) and are deliberately not duplicated here, because
+    this increment owns no second proof registry. A refused attempt is never evidence
+    for a successful-commit proof: an engineering-scenario policy proves arithmetic,
+    not funding authority, and a nominally affordable amount is not authorized
+    funding.
     """
+
+    def partitions_of(book: CapitalSnapshot) -> tuple[tuple[str, Decimal], ...]:
+        """Every declared cash partition of a book, in declared order."""
+
+        return tuple((part.value, book.cash.amount(part)) for part in CapitalPartition)
 
     record = capital_snapshot(account="PAPER-LEDGER-R5D-COMMIT")
     plan_record, _ = rotation_plan()
@@ -2875,42 +2898,119 @@ def test_ac_008_the_commit_boundary_validates_identity_and_snapshot_version() ->
             reservation, current_portfolio_version="pv-r5d-0002"
         )
 
+    # The book-bound engineering-scenario policy is arithmetic only: it is not an
+    # owner-ratified funding policy, so it establishes no commit authorization even
+    # though this amount is affordable under the declared bounds.
+    policy = scenario_deployable_policy(record)
+    assert capital_module.capital_policy_grants_funding_authority(
+        policy.policy_version
+    ) is False
+    assert policy.policy_version not in capital_module.OWNER_RATIFIED_CAPITAL_POLICY_VERSIONS
+    assert capital_module.OWNER_RATIFIED_CAPITAL_POLICY_VERSIONS == ()
+    affordable_view = deployable(record, policy=policy)
+    assert affordable_view.status is CapitalDeployableStatus.AVAILABLE
+    assert affordable_view.deployable_capital == Decimal("100.00")
+    assert plan_record.authoritative is False
+
+    partitions_before = partitions_of(record)
+    references_before = record.applied_reservation_references
+    version_before = record.portfolio_version
+    snapshot_id_before = record.snapshot_id
+
     commit = commit_reservation(
         record,
         plan=reservation,
         at_time=T0 + timedelta(seconds=60),
         expected_portfolio_version=record.portfolio_version,
+        deployable_policy=policy,
     )
-    assert commit.status is CapitalCommitStatus.COMMITTED
-    assert commit.applied_portfolio_version == record.portfolio_version
-    assert commit.committed_capital == Decimal("100.00")
-    assert commit.plan_id == reservation.plan_id
-    assert commit.snapshot.portfolio_version == commit.successor_version
-    assert plan_record.authoritative is False
+    # Affordable arithmetic, no authorization: absent usage-delta evidence is missing
+    # evidence and is never an assertion of true economic zero consumption.
+    assert commit.status is CapitalCommitStatus.REJECTED
+    assert commit.rejection is CapitalCommitRejection.DEPLOYABLE_BOUND_UNAVAILABLE
+    assert commit.committed_capital is None
+    assert commit.snapshot is None
+    assert commit.successor_version is None
+    assert partitions_of(record) == partitions_before
+    assert record.cash.amount(CapitalPartition.FREE_CASH) == Decimal("10000.00")
+    assert record.cash.amount(CapitalPartition.ORDER_RESERVES) == Decimal("0.00")
+    assert record.applied_reservation_references == references_before == ()
+    assert record.portfolio_version == version_before
+    assert record.snapshot_id == snapshot_id_before
+    assert CapitalSnapshot.from_dict(record.to_dict()).snapshot_id == snapshot_id_before
+
+    # A refused plan is never a committed one: repeating it is refused again and is
+    # never misreported as a successfully committed replay.
+    again = commit_reservation(
+        record,
+        plan=reservation,
+        at_time=T0 + timedelta(seconds=61),
+        expected_portfolio_version=record.portfolio_version,
+        deployable_policy=policy,
+    )
+    assert again.status is CapitalCommitStatus.REJECTED
+    assert again.rejection is CapitalCommitRejection.DEPLOYABLE_BOUND_UNAVAILABLE
+    assert again.rejection is not CapitalCommitRejection.PLAN_ALREADY_CONSUMED
+    assert again.snapshot is None
 
     stale_book = capital_snapshot(account="PAPER-LEDGER-R5D-STALE")
     stale = reservation_plan(stale_book, amount=25.0, portfolio_version="pv-r5d-0000")
+    stale_partitions = partitions_of(stale_book)
+    stale_version = stale_book.portfolio_version
+    stale_snapshot_id = stale_book.snapshot_id
     stale_commit = commit_reservation(
         stale_book,
         plan=stale,
         at_time=T0 + timedelta(seconds=60),
         expected_portfolio_version=stale_book.portfolio_version,
+        deployable_policy=scenario_deployable_policy(stale_book),
     )
+    # Plan currency is decided before any bound is established, so the stale competitor
+    # keeps its own earlier reason and that reason takes precedence over the
+    # unratified funding gate.
     assert stale_commit.status is CapitalCommitStatus.REJECTED
     assert stale_commit.rejection is CapitalCommitRejection.STALE_EXPECTED_VERSION
+    assert (
+        stale_commit.rejection
+        is not CapitalCommitRejection.DEPLOYABLE_BOUND_UNAVAILABLE
+    )
     assert stale_commit.snapshot is None
+    assert stale_commit.committed_capital is None
+    assert stale_commit.successor_version is None
+    assert partitions_of(stale_book) == stale_partitions
+    assert stale_book.applied_reservation_references == ()
+    assert stale_book.portfolio_version == stale_version
+    assert stale_book.snapshot_id == stale_snapshot_id
 
     over_book = capital_snapshot(account="PAPER-LEDGER-R5D-OVER", free="500.00")
     over = reservation_plan(over_book, amount=20_000.0)
+    over_partitions = partitions_of(over_book)
+    over_version = over_book.portfolio_version
+    over_snapshot_id = over_book.snapshot_id
+    assert over_book.cash.amount(CapitalPartition.FREE_CASH) == Decimal("500.00")
     over_commit = commit_reservation(
         over_book,
         plan=over,
         at_time=T0 + timedelta(seconds=60),
         expected_portfolio_version=over_book.portfolio_version,
+        deployable_policy=scenario_deployable_policy(over_book),
     )
+    # Free cash is decided before any bound is established, so the unaffordable
+    # competitor keeps its own reason and that reason also takes precedence over the
+    # unratified funding gate.
     assert over_commit.status is CapitalCommitStatus.REJECTED
     assert over_commit.rejection is CapitalCommitRejection.INSUFFICIENT_FREE_CASH
+    assert (
+        over_commit.rejection
+        is not CapitalCommitRejection.DEPLOYABLE_BOUND_UNAVAILABLE
+    )
     assert over_commit.snapshot is None
+    assert over_commit.committed_capital is None
+    assert over_commit.successor_version is None
+    assert partitions_of(over_book) == over_partitions
+    assert over_book.applied_reservation_references == ()
+    assert over_book.portfolio_version == over_version
+    assert over_book.snapshot_id == over_snapshot_id
 
 
 def test_ac_008_an_unratified_policy_fails_closed_and_records_the_dependency() -> None:
