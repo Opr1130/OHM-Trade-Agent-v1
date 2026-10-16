@@ -708,19 +708,24 @@ Streams live under `/app/data/opip/committee/`:
   not inferential guarantees.** They prevent anecdotal claims; they do not make a
   passing sample statistically conclusive.
 
-## Contributor caution: the frozen boundary token scan
+## Contributor caution: the boundary token scan is evidence-based
 
 `tests/test_opip_decision_safety_v1.py::test_no_ml_dependency_is_introduced`
-lowercases every file under `app/opip/**` and asserts that the substrings
-`xgboost`, `lightgbm`, `shap`, `sklearn`, `scikit`, `torch`, and `tensorflow`
-appear **nowhere**. Ordinary English words trip it — most often
-"authority-*shap*ed" or "action-*shap*ed" in a docstring, which contains `shap`.
-This has broken the suite three times during Module 2 development.
+keeps its name and its intent: no model package may be declared or imported by
+the decision package. Since `ATDD-DECISION-SAFETY-SCAN-v1` the scan reads the
+declared distribution names from every `requirements*.txt` and `pyproject.toml`
+and inspects real imports with `ast`, so `xgboost`, `lightgbm`, `shap`, `sklearn`,
+`scikit`, `torch` and `tensorflow` are refused when they are a *decision*, not
+when they appear inside an ordinary word.
 
-Write **"authority-bearing"** / **"action-bearing"** instead, and run
-`tests/test_opip_decision_safety_v1.py` after any change that touches prose under
-`app/opip/`. The scan is a frozen contract and must not be weakened to
-accommodate wording.
+Historical note: the previous revision asserted that those sequences appear
+nowhere in `app/opip/**`, so ordinary English tripped it — most often
+"authority-*shap*ed" or "action-*shap*ed" in a docstring, which contains `shap`,
+and which broke the suite three times during Module 2 development. The wording
+workaround ("authority-bearing" / "action-bearing") is no longer required. The
+scan was never weakened to accommodate wording; it was narrowed to evidence. Run
+`tests/test_opip_decision_safety_v1.py` after any change that touches dependency
+declarations or imports under `app/opip/`.
 
 ## IC-001 to IC-045 reconciliation
 

@@ -8,8 +8,17 @@ futures position, and no model influences any trading decision.
 
 import ast
 import inspect
+import re
+from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
+
+import pytest
+
+try:  # `tomllib` ships with Python 3.11+; the scan fails closed without it.
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - unsupported interpreter
+    tomllib = None
 
 from app.jobs import scan_opportunities
 from app.opip.decision import (
@@ -363,12 +372,17 @@ def test_opip_modules_reference_no_futures_surface():
 
 
 def test_no_ml_dependency_is_introduced():
-    source = _opip_source().lower()
-    for name in ("xgboost", "lightgbm", "shap", "sklearn", "scikit", "torch", "tensorflow"):
-        assert name not in source
-    requirements = Path("requirements.txt").read_text(encoding="utf-8").lower()
-    for name in ("xgboost", "lightgbm", "shap", "scikit-learn", "torch", "tensorflow"):
-        assert name not in requirements
+    """No model package is declared or imported by the decision package.
+
+    Evidence-based since `ATDD-DECISION-SAFETY-SCAN-v1`: the scan reads declared
+    distribution names from every requirement file and `pyproject.toml`, and
+    inspects real imports with `ast`. Ordinary English that merely contains
+    `shap` (as in `shape` or `authority-shaped`) is no longer treated as a model
+    dependency, while an actual prohibited distribution or import still fails
+    this test. The test name and its criterion citation are unchanged.
+    """
+    assert _declared_prohibited(_dependency_declarations()) == ()
+    assert _prohibited_imports_in_paths(sorted(OPIP_PACKAGE.rglob("*.py"))) == ()
 
 
 def test_model_version_is_declared_but_unset():
@@ -445,3 +459,348 @@ def test_confidence_evidence_cannot_reach_alert_paper_or_order_code():
     # or exchange-order functions.
     for name in forbidden:
         assert name not in package_source
+
+
+# --------------------------------------- ML dependency scan (evidence-based) --
+#
+# Increment `ATDD-DECISION-SAFETY-SCAN-v1` replaces the raw substring scan with
+# evidence: declared distribution names and parsed imports. The authority for
+# what each assertion below means is
+# `docs/atdd/scope-contracts/ATDD-DECISION-SAFETY-SCAN-v1.md`.
+
+SCAN_APP_ROOT = Path(__file__).resolve().parents[1]
+SCAN_INCREMENT = "ATDD-DECISION-SAFETY-SCAN-v1"
+SCAN_CONTRACTS = SCAN_APP_ROOT / "docs" / "atdd" / "scope-contracts"
+SCAN_POINTER = SCAN_APP_ROOT / "docs" / "atdd" / "ACTIVE_INCREMENT"
+SCAN_CHANGED_SURFACES = (
+    "OHM-Trade-Agent-v1/docs/MODULE2_INTELLIGENCE_COMMITTEE.md",
+    "OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT",
+    "OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-DECISION-SAFETY-SCAN-v1.md",
+    "OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R5-B-horizon-intelligence.md",
+    "OHM-Trade-Agent-v1/tests/test_opip_decision_safety_v1.py",
+)
+
+#: The prohibited model distributions. Declaring or importing any of them means a
+#: model could influence a trading decision. `sklearn` is kept beside its
+#: distribution name `scikit-learn` because it is both a valid import root and a
+#: valid (legacy) requirement spelling.
+PROHIBITED_ML_DISTRIBUTIONS = frozenset(
+    {
+        "lightgbm",
+        "scikit-learn",
+        "shap",
+        "sklearn",
+        "tensorflow",
+        "torch",
+        "xgboost",
+    }
+)
+
+#: Distribution names are compared under PEP 503 normalization, so `Scikit_Learn`,
+#: `scikit-learn` and `scikit.learn` are one name.
+_DISTRIBUTION_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def _normalized_distribution(name: str) -> str:
+    """The PEP 503 form of a distribution name."""
+
+    return re.sub(r"[-_.]+", "-", name.strip().lower()).strip("-")
+
+
+def _requirement_name(line: str) -> str | None:
+    """The distribution a requirement line declares, or `None` if it declares none.
+
+    Comments, blank lines and pip options (`-r`, `-e`, `--hash`, ...) declare no
+    distribution of their own and return `None`.
+    """
+
+    stripped = line.split("#", 1)[0].strip()
+    if not stripped or stripped.startswith("-"):
+        return None
+    match = _DISTRIBUTION_NAME.match(stripped)
+    return _normalized_distribution(match.group(0)) if match else None
+
+
+def _read_text_relative(name: str) -> str:
+    """The default reader: dependency declarations live at the app root."""
+
+    return Path(name).read_text(encoding="utf-8")
+
+
+def _declared_in_pyproject(text: str) -> frozenset[str]:
+    """Distributions declared by PEP 621 `project` dependencies."""
+
+    if tomllib is None:  # pragma: no cover - fail closed, never pass silently
+        raise AssertionError("pyproject dependency parsing requires Python 3.11+")
+    project = tomllib.loads(text).get("project") or {}
+    declared: list[str] = list(project.get("dependencies") or ())
+    for extra in (project.get("optional-dependencies") or {}).values():
+        declared.extend(extra or ())
+    names = {_requirement_name(str(item)) for item in declared}
+    return frozenset(name for name in names if name)
+
+
+def _declared_in(
+    path: str,
+    kind: str,
+    read: Callable[[str], str],
+    _seen: frozenset[str] = frozenset(),
+) -> frozenset[str]:
+    """Every distribution one declaration file names, includes followed."""
+
+    if path in _seen:
+        return frozenset()
+    try:
+        text = read(path)
+    except OSError:  # pragma: no cover - a missing declaration declares nothing
+        return frozenset()
+    if kind == "pyproject":
+        return _declared_in_pyproject(text)
+    found: set[str] = set()
+    for line in text.splitlines():
+        stripped = line.split("#", 1)[0].strip()
+        if stripped.startswith(("-r ", "--requirement ", "-r=", "--requirement=")):
+            target = re.split(r"[= ]", stripped, maxsplit=1)[1].strip().strip("\"'")
+            found |= _declared_in(target, "requirements", read, _seen | {path})
+            continue
+        name = _requirement_name(line)
+        if name:
+            found.add(name)
+    return frozenset(found)
+
+
+def _declared_prohibited(
+    sources: Sequence[tuple[str, str]],
+    *,
+    read: Callable[[str], str] | None = None,
+) -> tuple[str, ...]:
+    """Prohibited distributions declared by `sources`.
+
+    `sources` is a sequence of `(path, kind)` where `kind` is `"requirements"` or
+    `"pyproject"`. `read` resolves an included requirement file, so `-r` includes
+    are followed instead of being skipped (the default reads from the app root).
+    """
+
+    reader = read if read is not None else _read_text_relative
+    found: set[str] = set()
+    for path, kind in sources:
+        found |= _declared_in(path, kind, reader)
+    return tuple(sorted(found & PROHIBITED_ML_DISTRIBUTIONS))
+
+
+def _dependency_declarations() -> tuple[tuple[str, str], ...]:
+    """Every dependency declaration this scan reads, discovered from the app root.
+
+    Discovery globs the app root, so a new requirement file is covered without
+    editing this module - the scan widens with the repository instead of relying
+    on a hand-kept list.
+    """
+
+    declarations = [
+        (path.name, "requirements") for path in sorted(Path().glob("requirements*.txt"))
+    ]
+    if Path("pyproject.toml").is_file():
+        declarations.append(("pyproject.toml", "pyproject"))
+    return tuple(declarations)
+
+
+def _root_module(name: str) -> str:
+    return name.split(".", 1)[0].lower()
+
+
+def _prohibited_imports_in_sources(sources: Sequence[str]) -> tuple[str, ...]:
+    """Prohibited import roots found in already-read module sources.
+
+    The scan reads `ast.Import` / `ast.ImportFrom` nodes, so plain, aliased,
+    from-import and submodule forms are all covered without matching prose.
+    Relative imports (level > 0) carry no distribution and are ignored.
+    """
+
+    found: set[str] = set()
+    for source in sources:
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    found.add(_root_module(alias.name))
+            elif isinstance(node, ast.ImportFrom):
+                if node.level == 0 and node.module:
+                    found.add(_root_module(node.module))
+    return tuple(sorted(found & PROHIBITED_ML_DISTRIBUTIONS))
+
+
+def _prohibited_imports_in_paths(paths: Sequence[Path]) -> tuple[str, ...]:
+    """Prohibited import roots in the given module files."""
+
+    return _prohibited_imports_in_sources(
+        [path.read_text(encoding="utf-8") for path in paths]
+    )
+
+
+@pytest.mark.acceptance
+def test_ac_001_a_real_ml_dependency_is_rejected_in_every_declared_and_imported_form() -> None:
+    """ATDD-DECISION-SAFETY-SCAN-v1/AC-001: real violations are still refused.
+
+    GIVEN declared dependency forms (plain, pinned, extra, specifier, included)
+    and imported forms (plain, aliased, from-import, submodule)
+    WHEN the evidence scan reads each declaration and each import
+    THEN every prohibited distribution is reported under its normalized name, so
+    a real model dependency can never pass this increment by being written in an
+    unusual but valid form and the detection is never replaced by an exclusion
+    """
+    declared = {
+        "requirements.txt": (
+            "# ordinary prose: one payload shape serves both halves\n"
+            "shap==0.45.0\n"
+            "xgboost\n"
+            "lightgbm[extra]>=4.0\n"
+            "scikit_learn~=1.4\n"
+            "-r included.txt\n"
+        ),
+        "included.txt": "torch==2.4.0\nnumpy==2.0.0\n",
+        "pyproject.toml": (
+            "[project]\n"
+            'name = "sample"\n'
+            'dependencies = ["pandas", "tensorflow==2.16.1"]\n'
+            "[project.optional-dependencies]\n"
+            'dev = ["pytest", "scikit-learn"]\n'
+        ),
+    }
+    sources = (
+        ("requirements.txt", "requirements"),
+        ("pyproject.toml", "pyproject"),
+    )
+    assert _declared_prohibited(sources, read=declared.__getitem__) == (
+        "lightgbm",
+        "scikit-learn",
+        "shap",
+        "tensorflow",
+        "torch",
+        "xgboost",
+    )
+    assert _prohibited_imports_in_sources(["import shap\n"]) == ("shap",)
+    assert _prohibited_imports_in_sources(["import shap as explainer\n"]) == ("shap",)
+    assert _prohibited_imports_in_sources(["from shap import KernelExplainer\n"]) == (
+        "shap",
+    )
+    assert _prohibited_imports_in_sources(["import torch.nn as nn\n"]) == ("torch",)
+    assert _prohibited_imports_in_sources(["from xgboost.sklearn import XGB\n"]) == (
+        "xgboost",
+    )
+    assert _prohibited_imports_in_sources(["from .shap import local_helper\n"]) == ()
+    assert _normalized_distribution("SciKit_Learn") == "scikit-learn"
+    assert _requirement_name("SciKit_Learn[extra]>=1.0") == "scikit-learn"
+    assert _requirement_name("--index-url https://example.invalid") is None
+
+
+@pytest.mark.acceptance
+def test_ac_002_harmless_prose_identifiers_and_strings_are_accepted() -> None:
+    """ATDD-DECISION-SAFETY-SCAN-v1/AC-002: prose is not a dependency.
+
+    GIVEN the ordinary English and identifiers a substring scan rejected -
+    `shape`, `shaped`, `authority-shaped`, `_timing_shape(`, a docstring and
+    string literals - together with unrelated real dependencies
+    WHEN the evidence scan reads that source and the real decision package
+    THEN nothing is reported, because only declared distributions and parsed
+    imports count as evidence
+    """
+    prose = (
+        '"""A payload shape serves both halves; an authority-shaped record."""\n'
+        "def _timing_shape(moves: dict[str, float]) -> tuple[bool, str | None]:\n"
+        '    """The hold-shaped plan asked what a rotation would do."""\n'
+        '    note = "borrow the shape of a decided one"\n'
+        "    labels = {'shape': 'unchanged', 'reshaped': True}\n"
+        "    return True, note + str(labels)\n"
+    )
+    assert _prohibited_imports_in_sources([prose]) == ()
+    assert _declared_prohibited((), read=lambda _name: "") == ()
+    assert _prohibited_imports_in_paths(sorted(OPIP_PACKAGE.rglob("*.py"))) == ()
+    declared = {
+        "requirements.txt": "numpy==2.0.0\npandas>=2.0\npytest==8.4.2\n",
+        "pyproject.toml": '[project]\ndependencies = ["pandas"]\n',
+    }
+    assert (
+        _declared_prohibited(
+            (("requirements.txt", "requirements"), ("pyproject.toml", "pyproject")),
+            read=declared.__getitem__,
+        )
+        == ()
+    )
+
+
+@pytest.mark.acceptance
+def test_ac_003_every_module_and_declaration_is_still_examined(tmp_path: Path) -> None:
+    """ATDD-DECISION-SAFETY-SCAN-v1/AC-003: no file-level escape from the scan.
+
+    GIVEN the real decision package and its discovered dependency declarations,
+    plus a synthetic module and an included requirement file that each *do*
+    declare a prohibited form
+    WHEN the scan enumerates and inspects them
+    THEN the enumeration covers every `app/opip/**/*.py` file and every
+    discovered `requirements*.txt` and `pyproject.toml`, an included requirement
+    file is followed rather than skipped, and a violating file is detected
+    wherever it lives - so no blanket exclusion or allowlist replaces detection
+    """
+    modules = sorted(OPIP_PACKAGE.rglob("*.py"))
+    assert modules, "the decision package must contain modules to scan"
+    declarations = _dependency_declarations()
+    kinds = {kind for _path, kind in declarations}
+    assert kinds == {"requirements", "pyproject"}
+    declared_names = {
+        Path(path).name for path, kind in declarations if kind == "requirements"
+    }
+    assert declared_names == {path.name for path in Path().glob("requirements*.txt")}
+    violating = tmp_path / "violating.py"
+    violating.write_text("from shap import KernelExplainer\n", encoding="utf-8")
+    clean = tmp_path / "clean.py"
+    clean.write_text('"""authority-shaped prose only."""\n', encoding="utf-8")
+    assert _prohibited_imports_in_paths([violating]) == ("shap",)
+    assert _prohibited_imports_in_paths([clean]) == ()
+    assert _prohibited_imports_in_paths([clean, violating]) == ("shap",)
+    hidden = {"requirements.txt": "-r hidden.txt\n", "hidden.txt": "shap==0.45.0\n"}
+    assert _declared_prohibited(
+        (("requirements.txt", "requirements"),), read=hidden.__getitem__
+    ) == ("shap",)
+
+
+@pytest.mark.acceptance
+def test_ac_004_the_scan_contract_authorizes_every_changed_surface() -> None:
+    """ATDD-DECISION-SAFETY-SCAN-v1/AC-004: the change is contract-authorized.
+
+    GIVEN this increment's contract, the acceptance index and the changed files
+    WHEN the real scope gate evaluates them
+    THEN the movable pointer resolves to this declared increment, every changed
+    surface is mapped to an AC of this contract, the gate passes with no
+    traceability gap and no unapproved criterion, and this module pins no global
+    pointer
+    """
+    from tests.atdd_scope import (  # noqa: PLC0415 - local import keeps the header stable
+        PASS,
+        check_scope,
+        load_acceptance_index,
+        load_scope_contracts,
+        read_increment_pointer,
+    )
+    from tests.test_atdd_scope_control import global_pointer_pin_violations
+
+    contracts = load_scope_contracts(SCAN_CONTRACTS)
+    assert read_increment_pointer(SCAN_POINTER) in {
+        item.increment for item in contracts
+    }
+    ours = [item for item in contracts if item.increment == SCAN_INCREMENT]
+    assert len(ours) == 1
+    contract = ours[0]
+    allowed = {
+        path for paths in contract.implementation_map.values() for path in paths
+    }
+    for surface in SCAN_CHANGED_SURFACES:
+        assert surface in allowed, surface
+    assert contract.sections["UNAPPROVED SCOPE CHANGES"] == "NONE"
+    result = check_scope(
+        contract,
+        load_acceptance_index(SCAN_APP_ROOT / "tests"),
+        SCAN_CHANGED_SURFACES,
+    )
+    assert result.status == PASS, result.reasons
+    assert global_pointer_pin_violations(
+        Path(__file__).read_text(encoding="utf-8")
+    ) == []
