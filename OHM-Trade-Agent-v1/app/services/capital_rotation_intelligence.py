@@ -345,6 +345,32 @@ DECLARED_CAPITAL_POLICY_VERSIONS: tuple[str, ...] = (
 OPEN_OWNER_INPUTS: tuple[str, ...] = ("OQ-06",)
 OWNER_INPUT_STATUS = "OWNER_DECISION_REQUIRED"
 
+#: Capital policy versions an *owner* has ratified for funding authority. It is
+#: deliberately EMPTY: no capital policy has been ratified (`OQ-06`), and an
+#: engineering-scenario policy version is a deterministic code artifact tagged by
+#: this module and not an owner ratification. A commit may only consume capital
+#: under a bound established by a policy listed here, so the seam fails closed
+#: until the owner ratifies one. Membership is never inferred: the token is not
+#: derived from `DECLARED_CAPITAL_POLICY_VERSIONS`, from a caller argument or from
+#: a test fixture, and no approval flag, signature or ratification record exists.
+OWNER_RATIFIED_CAPITAL_POLICY_VERSIONS: tuple[str, ...] = ()
+
+#: The declared authorization posture of the reservation-commit seam. The seam may
+#: compare and commit, but it does not authorise: while no funding policy is
+#: ratified every commit abstains with `DEPLOYABLE_BOUND_UNAVAILABLE`, and the
+#: owner input that would change that is named rather than assumed.
+CAPITAL_COMMIT_AUTHORIZATION_STATUS = "FAIL_CLOSED_NO_OWNER_RATIFIED_CAPITAL_POLICY"
+CAPITAL_COMMIT_AUTHORIZATION_DEPENDENCY = "OQ-06"
+
+#: What this engine can say about the horizon dimension of `CI-02`.
+#: `CapitalBound.HORIZON` names the horizon-sleeve family, and this engine splits no
+#: bound for it: there is no independent numeric bound for the horizon dimension in
+#: this contract. The horizon-sleeve limit is represented only by named policy
+#: sleeves, whose bound is published as `CapitalBound.SLEEVE`. Inventing a seventh
+#: bound, or certifying independent horizon enforcement, would claim a limit this
+#: contract does not have.
+CAPITAL_HORIZON_BOUND_STATUS = "NAMED_SLEEVE_REPRESENTATION_ONLY"
+
 #: The exact money grid. No money field here may carry more precision than this
 #: quantum, and none is rounded onto it silently.
 MONEY_QUANTUM = Decimal("0.01")
@@ -488,8 +514,9 @@ class CapitalDeployableAbstentionReason(str, Enum):
     Missing evidence is never favourable evidence (`CI-02`), so every reason
     here publishes no number instead of a conservative guess. A configured cap
     whose own usage row was never declared is its own reason for exactly that
-    rule: the missing row is named, never filled from another limit family and
-    never read as the whole cap.
+    rule: the missing row is named, never filled from another limit family, never
+    read as the whole cap, and never read as a zero - in the limit families and in
+    the sleeve family alike.
     """
 
     IDENTITY_NOT_BOUND = "IDENTITY_NOT_BOUND"
@@ -509,6 +536,7 @@ class CapitalDeployableAbstentionReason(str, Enum):
     LIMIT_NOT_CONFIGURED = "LIMIT_NOT_CONFIGURED"
     LIMIT_USAGE_NOT_DECLARED = "LIMIT_USAGE_NOT_DECLARED"
     SLEEVE_LIMIT_NOT_CONFIGURED = "SLEEVE_LIMIT_NOT_CONFIGURED"
+    SLEEVE_USAGE_NOT_DECLARED = "SLEEVE_USAGE_NOT_DECLARED"
 
 
 class CapitalCommitStatus(str, Enum):
@@ -530,7 +558,11 @@ class CapitalCommitRejection(str, Enum):
     its declared window must be open and whole, the account evidence must be
     trusted (`_capital_trust_abstention`), the version this process tracks as
     current for the book must be the one being committed, the amount must be
-    positive, and free cash must cover the reservation.
+    positive, free cash must cover the reservation, a valid deployable bound must
+    have been *established* - by an owner-ratified policy and complete declared
+    usage evidence, never by a missing one - and only then may the consumption be
+    refused for exceeding that bound. A missing or unresolvable bound is reported
+    as a missing bound, never as a numeric limit breach.
     """
 
     STALE_EXPECTED_VERSION = "STALE_EXPECTED_VERSION"
@@ -543,6 +575,8 @@ class CapitalCommitRejection(str, Enum):
     INSUFFICIENT_FREE_CASH = "INSUFFICIENT_FREE_CASH"
     UNSUPPORTED_RECOMPUTE_TRIGGER = "UNSUPPORTED_RECOMPUTE_TRIGGER"
     SNAPSHOT_OUTLIVED_VALIDITY = "SNAPSHOT_OUTLIVED_VALIDITY"
+    DEPLOYABLE_BOUND_UNAVAILABLE = "DEPLOYABLE_BOUND_UNAVAILABLE"
+    EXCEEDS_DEPLOYABLE_CAPITAL = "EXCEEDS_DEPLOYABLE_CAPITAL"
 
 
 class CapitalHoursStatus(str, Enum):
@@ -638,6 +672,7 @@ CAPITAL_DEPLOYABLE_ABSTENTION_PRECEDENCE: tuple[
     CapitalDeployableAbstentionReason.LIMIT_NOT_CONFIGURED,
     CapitalDeployableAbstentionReason.LIMIT_USAGE_NOT_DECLARED,
     CapitalDeployableAbstentionReason.SLEEVE_LIMIT_NOT_CONFIGURED,
+    CapitalDeployableAbstentionReason.SLEEVE_USAGE_NOT_DECLARED,
 )
 
 #: One hour in seconds. The occupancy integral is expressed in currency-hours,
@@ -1342,6 +1377,72 @@ class CapitalLimitUsage:
             used_capital=body["used_capital"],
             as_of=_persisted_utc(body["as_of"], field_name="as_of"),
         )
+
+
+@dataclass(frozen=True)
+class ReservationUsageDelta:
+    """Declared incremental capital consumption of one reservation commit (`CI-04`).
+
+    Usage is *evidence* about this book, never an assertion about the world: a delta
+    states how much capacity the committing plan declares it consumes in exactly one
+    usage row the snapshot already declares, and it is bound to the plan that
+    declared it, to the portfolio version it was measured against and to the instant
+    it was observed at. Adding is the only admissible movement - a delta can never
+    replace, reduce or create a usage row - and nothing infers usage from the
+    committed amount, so an explicit zero delta is a declared statement and is not
+    proof that the true incremental exposure is zero.
+    """
+
+    plan_id: str
+    base_portfolio_version: str
+    as_of: datetime
+    used_capital_delta: Decimal
+    limit_kind: CapitalLimitKind | None = None
+    sleeve: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "plan_id", _text(self.plan_id, field_name="plan_id"))
+        object.__setattr__(
+            self,
+            "base_portfolio_version",
+            _text(
+                self.base_portfolio_version, field_name="base_portfolio_version"
+            ),
+        )
+        object.__setattr__(self, "as_of", _utc(self.as_of, field_name="as_of"))
+        delta = _money(self.used_capital_delta, field_name="used_capital_delta")
+        if delta < 0:
+            raise CapitalIntelligenceError("used_capital_delta must not be negative")
+        object.__setattr__(self, "used_capital_delta", delta)
+        kind = _optional_enum_of(
+            CapitalLimitKind, self.limit_kind, field_name="limit_kind"
+        )
+        sleeve = None if self.sleeve is None else _text(self.sleeve, field_name="sleeve")
+        if (kind is None) == (sleeve is None):
+            raise CapitalIntelligenceError(
+                "exactly one of limit_kind and sleeve must name the usage row this "
+                "delta is measured against"
+            )
+        object.__setattr__(self, "limit_kind", kind)
+        object.__setattr__(self, "sleeve", sleeve)
+
+    @property
+    def usage_identity(self) -> tuple[str, str]:
+        """The one declared usage row this delta evidences."""
+
+        if self.limit_kind is not None:
+            return ("limit", self.limit_kind.value)
+        return ("sleeve", self.sleeve or "")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "plan_id": self.plan_id,
+            "base_portfolio_version": self.base_portfolio_version,
+            "limit_kind": None if self.limit_kind is None else self.limit_kind.value,
+            "sleeve": self.sleeve,
+            "used_capital_delta": _money_text(self.used_capital_delta),
+            "as_of": iso_z(self.as_of, field_name="as_of"),
+        }
 
 
 _CASH_LEDGER_DURABLE_KEYS: tuple[str, ...] = ("partitions", "cash_total")
@@ -2439,6 +2540,22 @@ def capital_deployable_engineering_scenario_policy(
     )
 
 
+def capital_policy_grants_funding_authority(policy_version: Any) -> bool:
+    """Whether one policy version may authorise a capital commitment.
+
+    Funding authority is *ratification*, not declaration. Only a version an owner
+    has ratified is admitted, and the module declares that set explicitly and
+    currently empty (`OQ-06`): the engineering-scenario versions this increment
+    ships are deterministic code artifacts and are never admitted by inference, so
+    an unratified policy cannot establish a bound a commit may consume. A token of
+    another type is refused rather than coerced.
+    """
+
+    if not isinstance(policy_version, str):
+        return False
+    return policy_version.strip() in OWNER_RATIFIED_CAPITAL_POLICY_VERSIONS
+
+
 @dataclass(frozen=True)
 class CapitalDeployableView:
     """The outcome of one deployable-capital evaluation.
@@ -2633,9 +2750,10 @@ def evaluate_deployable_capital(
     condition the clause lists as blocking - an unbound or mismatched identity, a
     stale account state, an unsupported accounting state, a failed or skipped
     reconciliation, an unresolved negative balance, missing fees, a currency
-    mismatch, an outlived validity limit, incomplete evidence, a limit that has
-    usage but no configured cap, or a configured cap whose own usage was never
-    declared - abstains in the declared precedence order and publishes no number.
+    mismatch, an outlived validity limit, incomplete evidence, a limit or sleeve
+    that has usage but no configured cap, or a configured limit or sleeve cap whose
+    own usage was never declared - abstains in the declared precedence order and
+    publishes no number.
     """
 
     if not isinstance(record, CapitalSnapshot):
@@ -2716,6 +2834,15 @@ def evaluate_deployable_capital(
     )
     if missing_sleeves:
         return abstain(reason.SLEEVE_LIMIT_NOT_CONFIGURED, missing_sleeves)
+    missing_sleeve_usage = tuple(
+        name for name in policy.sleeve_limits if name not in sleeve_usage
+    )
+    if missing_sleeve_usage:
+        # The mirror of the limit rule above, and the one silent zero this seam
+        # used to carry: a configured sleeve cap whose own usage row was never
+        # declared is missing evidence, so the bound abstains and names the sleeve
+        # instead of reading the whole cap as available.
+        return abstain(reason.SLEEVE_USAGE_NOT_DECLARED, missing_sleeve_usage)
 
     bounds: dict[CapitalBound, Decimal] = {
         CapitalBound.FREE_CASH: record.cash.free_cash
@@ -2736,9 +2863,9 @@ def evaluate_deployable_capital(
     if policy.sleeve_limits:
         tightest_value: Decimal | None = None
         for name in policy.sleeve_limits:
-            bound = policy.sleeve_limits[name] - sleeve_usage.get(
-                name, Decimal("0.00")
-            )
+            # Every configured sleeve is guaranteed a declared row by the
+            # abstention above, so this read can never default to zero.
+            bound = policy.sleeve_limits[name] - sleeve_usage[name]
             if bound < 0:
                 if CapitalBound.SLEEVE not in over:
                     over.append(CapitalBound.SLEEVE)
@@ -2932,25 +3059,301 @@ def _commit_identity(
     )
 
 
+def _validate_usage_deltas(
+    snapshot: "CapitalSnapshot", *, deltas: Any
+) -> tuple[ReservationUsageDelta, ...]:
+    """Refuse usage evidence that is not additive, unique and about this book.
+
+    A delta is evidence, so it is validated the way the record it belongs to is: a
+    submission that is not a sequence of deltas, that evidences the same declared row
+    twice, or that names a row the snapshot never declared is refused structurally.
+    Nothing here creates a usage row - a row that was never declared is missing
+    evidence, not a zero.
+    """
+
+    if not isinstance(snapshot, CapitalSnapshot):
+        raise CapitalIntelligenceError(
+            "usage evidence is validated against a CapitalSnapshot"
+        )
+    declared_limits = {row.kind.value for row in snapshot.limit_usage}
+    declared_sleeves = {row.sleeve for row in snapshot.sleeve_usage}
+    ordered: list[ReservationUsageDelta] = []
+    seen: set[tuple[str, str]] = set()
+    for delta in _records(
+        deltas, field_name="usage_deltas", kind=ReservationUsageDelta
+    ):
+        identity = delta.usage_identity
+        if identity in seen:
+            raise CapitalIntelligenceError(
+                "usage_deltas must not duplicate a usage row: "
+                f"{identity[1]} is declared more than once"
+            )
+        seen.add(identity)
+        if identity[0] == "limit":
+            if identity[1] not in declared_limits:
+                raise CapitalIntelligenceError(
+                    "usage_deltas may only evidence a usage row the snapshot "
+                    f"declares: {identity[1]} is not a declared usage row"
+                )
+        elif identity[1] not in declared_sleeves:
+            raise CapitalIntelligenceError(
+                "usage_deltas may only evidence a usage row the snapshot declares: "
+                f"{identity[1]} is not a declared usage row"
+            )
+        ordered.append(delta)
+    return tuple(ordered)
+
+
+def _validate_usage_delta_binding(
+    *,
+    deltas: tuple[ReservationUsageDelta, ...],
+    plan_id: str,
+    base_portfolio_version: str,
+    at_time: datetime,
+) -> None:
+    """Refuse usage evidence that is not bound to this commit.
+
+    Provenance is not decorative: a delta must belong to the plan being committed,
+    describe the portfolio version being committed and be observed at the commit
+    instant. A claim about another plan, another version or another instant is a
+    claim about another decision, and is refused rather than reinterpreted.
+    """
+
+    declared_plan = _text(plan_id, field_name="plan_id")
+    declared_base = _text(base_portfolio_version, field_name="base_portfolio_version")
+    expected_instant = _utc(at_time, field_name="at_time")
+    for delta in deltas:
+        if delta.plan_id != declared_plan:
+            raise CapitalIntelligenceError(
+                "usage_deltas must be evidenced for the plan being committed: "
+                f"{delta.plan_id!r} is not the plan {declared_plan!r}"
+            )
+        if delta.base_portfolio_version != declared_base:
+            raise CapitalIntelligenceError(
+                "usage_deltas must be measured against the portfolio version being "
+                f"committed: {delta.base_portfolio_version!r} is not {declared_base!r}"
+            )
+        if delta.as_of != expected_instant:
+            raise CapitalIntelligenceError(
+                "each usage delta must be observed at the commit instant: expected "
+                f"{iso_z(expected_instant, field_name='at_time')}, observed "
+                f"{iso_z(delta.as_of, field_name='as_of')}"
+            )
+
+
+def _missing_usage_delta_identities(
+    snapshot: "CapitalSnapshot",
+    ordered: tuple[ReservationUsageDelta, ...],
+) -> tuple[str, ...]:
+    """Name the declared usage rows already-validated deltas do not evidence."""
+
+    evidenced = {delta.usage_identity for delta in ordered}
+    missing: list[str] = []
+    for row in snapshot.limit_usage:
+        if ("limit", row.kind.value) not in evidenced:
+            missing.append(row.kind.value)
+    for row in snapshot.sleeve_usage:
+        if ("sleeve", row.sleeve) not in evidenced:
+            missing.append(row.sleeve)
+    return tuple(missing)
+
+
+def missing_usage_delta_identities(
+    snapshot: "CapitalSnapshot", *, deltas: Any
+) -> tuple[str, ...]:
+    """Name the declared usage rows a submission does not evidence, in record order.
+
+    A declared usage row that a commit does not account for would be carried forward
+    as if nothing had been consumed, and a later evaluation would read consumed
+    capacity as available. The answer is a pure function of the record's own declared
+    rows and the submitted deltas, so the completeness rule is testable without
+    committing any capital.
+    """
+
+    ordered = _validate_usage_deltas(snapshot, deltas=deltas)
+    return _missing_usage_delta_identities(snapshot, ordered)
+
+
+def derive_successor_usage(
+    snapshot: "CapitalSnapshot",
+    *,
+    plan_id: str,
+    base_portfolio_version: str,
+    at_time: datetime,
+    deltas: Any = (),
+) -> tuple[tuple[CapitalLimitUsage, ...], tuple[SleeveUsage, ...]]:
+    """Derive the successor's usage from the record's declared rows plus its deltas.
+
+    The record's own declared usage is authoritative and the deltas are additive
+    evidence about it, so the result is exactly ``declared + delta`` per row, in the
+    record's own row order, observed at the commit instant. Nothing is inferred from
+    the committed amount, no row is replaced, reduced, dropped or created, and the
+    derivation is a pure function of its arguments: two calls with the same arguments
+    produce identical rows and therefore an identical successor identity.
+
+    Incomplete evidence is refused rather than derived, and every refusal happens
+    before any successor snapshot exists, so a submission that cannot be validated
+    leaves the capital record and the process witness untouched.
+    """
+
+    if not isinstance(snapshot, CapitalSnapshot):
+        raise CapitalIntelligenceError(
+            "successor usage is derived from a CapitalSnapshot"
+        )
+    if base_portfolio_version != snapshot.portfolio_version:
+        raise CapitalIntelligenceError(
+            "successor usage is derived against the snapshot's own portfolio version: "
+            f"{base_portfolio_version!r} is not {snapshot.portfolio_version!r}"
+        )
+    ordered = _validate_usage_deltas(snapshot, deltas=deltas)
+    _validate_usage_delta_binding(
+        deltas=ordered,
+        plan_id=plan_id,
+        base_portfolio_version=base_portfolio_version,
+        at_time=at_time,
+    )
+    missing = _missing_usage_delta_identities(snapshot, ordered)
+    if missing:
+        raise CapitalIntelligenceError(
+            "successor usage requires declared evidence for every usage row the "
+            f"snapshot declares; missing {missing}"
+        )
+    by_identity = {delta.usage_identity: delta for delta in ordered}
+    limit_rows = tuple(
+        CapitalLimitUsage(
+            kind=row.kind,
+            used_capital=(
+                row.used_capital
+                + by_identity[("limit", row.kind.value)].used_capital_delta
+            ),
+            as_of=by_identity[("limit", row.kind.value)].as_of,
+        )
+        for row in snapshot.limit_usage
+    )
+    sleeve_rows = tuple(
+        SleeveUsage(
+            sleeve=row.sleeve,
+            used_capital=(
+                row.used_capital
+                + by_identity[("sleeve", row.sleeve)].used_capital_delta
+            ),
+            as_of=by_identity[("sleeve", row.sleeve)].as_of,
+        )
+        for row in snapshot.sleeve_usage
+    )
+    return limit_rows, sleeve_rows
+
+
+def reservation_amount_rejection(
+    *, committed: Any, free_cash: Any
+) -> CapitalCommitRejection | None:
+    """Positions ten and eleven: is the requested amount itself affordable?
+
+    The compute is pure and depends on the request alone: deciding a non-positive amount
+    and an amount above free cash needs no account state, plan window, version boundary or
+    usage evidence. The commit seam invokes it at exactly the position that declared order
+    requires - after the higher-priority trigger, environment, expected-version,
+    snapshot-validity, plan-currency, plan-window, account-trust and tracked-version
+    checks, and before any usage-delta validation - so malformed usage evidence can never
+    preempt a refusal the seam would have reached first. Purity plus that declared call
+    site is what makes the frozen order a property of the code rather than of statement
+    order.
+    """
+
+    amount = _money(committed, field_name="reservation amount")
+    cash = _money(free_cash, field_name="free cash")
+    if amount <= 0:
+        return CapitalCommitRejection.NON_POSITIVE_AMOUNT
+    if amount > cash:
+        return CapitalCommitRejection.INSUFFICIENT_FREE_CASH
+    return None
+
+
+def reservation_consumption_rejection(
+    *,
+    committed: Any,
+    deployable_bound: Any = None,
+    free_cash: Any,
+) -> CapitalCommitRejection | None:
+    """The declared affordability decision of one reservation, in the frozen order.
+
+    Positions ten to thirteen, decided in one place: the amount gate of
+    ``reservation_amount_rejection`` runs first, then an unestablished bound, and only
+    then a bound that is genuinely exceeded. A missing or unresolvable bound is therefore
+    never published as a numeric limit breach, and ``None`` means the consumption is
+    admissible at this position. ``deployable_bound`` of ``None`` means *no valid bound
+    was established*; it never means "no limit".
+
+    This function decides positions ten to thirteen *given* a bound and a request; the
+    commit seam decides *when* each position is reached, and it reaches this one only
+    after every higher-priority refusal has been evaluated.
+    """
+
+    amount_gate = reservation_amount_rejection(committed=committed, free_cash=free_cash)
+    if amount_gate is not None:
+        return amount_gate
+    amount = _money(committed, field_name="reservation amount")
+    bound = (
+        None
+        if deployable_bound is None
+        else _money(deployable_bound, field_name="deployable bound")
+    )
+    if bound is None:
+        return CapitalCommitRejection.DEPLOYABLE_BOUND_UNAVAILABLE
+    if amount > bound:
+        return CapitalCommitRejection.EXCEEDS_DEPLOYABLE_CAPITAL
+    return None
+
+
+def _established_deployable_bound(
+    record: "CapitalSnapshot",
+    *,
+    policy: CapitalDeployablePolicy,
+    at_time: datetime,
+) -> Decimal | None:
+    """The numeric bound a commit may consume, or ``None`` when it cannot be proven.
+
+    A bound is *established* only when an owner-ratified policy asks for it and the
+    evaluation publishes a number from the record's own declared usage. An
+    engineering-scenario policy establishes nothing, so nothing here reads an
+    approval flag, a signature, a caller-supplied override or a fabricated
+    ratification record: the only source of funding authority is the module's
+    declared ratification set.
+    """
+
+    if not capital_policy_grants_funding_authority(policy.policy_version):
+        return None
+    view = evaluate_deployable_capital(record, policy=policy, at_time=at_time)
+    if view.status is not CapitalDeployableStatus.AVAILABLE:
+        return None
+    return view.deployable_capital
+
+
 def _reserved_successor(
     snapshot: "CapitalSnapshot",
     *,
     plan: PortfolioReservationPlan,
     committed: Decimal,
     at_time: datetime,
-    limit_usage: tuple[CapitalLimitUsage, ...] | None,
-    sleeve_usage: tuple[SleeveUsage, ...] | None,
+    limit_usage: tuple[CapitalLimitUsage, ...],
+    sleeve_usage: tuple[SleeveUsage, ...],
 ) -> "CapitalSnapshot":
     """Build the successor snapshot of one reservation commit.
 
     The committed capital *moves* between partitions: free cash falls by exactly
     the committed amount and order reserves rise by exactly the same amount, so
     the declared cash total is preserved (`PRESERVE_TOTAL`). Positions, marks,
-    fees, watermarks and reconciliation are carried, the validity deadline the
+    fees, watermarks and reconciliation are carried, and the validity deadline the
     account evidence was observed under is carried *unchanged* - a reservation is
     a movement of cash, not a re-observation of the account, so it may never
-    extend how long a snapshot may be read as current - and the risk and sleeve
-    usage are whatever the caller declared - nothing here invents a usage number.
+    extend how long a snapshot may be read as current.
+
+    Usage is not a caller-supplied number here either: the rows handed in are the
+    ones `derive_successor_usage` built from the predecessor's own declared rows
+    plus validated, additive deltas, so a commit can neither reduce, replace nor
+    invent the capacity it consumed, and the successor records exactly the
+    consumption that was evidenced. Committed capital is never read as incremental
+    risk, concentration, liquidity or sleeve usage.
     """
 
     partitions = dict(snapshot.cash.partitions)
@@ -2975,12 +3378,8 @@ def _reserved_successor(
         cash=ledger,
         positions=snapshot.positions,
         marks=snapshot.marks,
-        sleeve_usage=(
-            snapshot.sleeve_usage if sleeve_usage is None else tuple(sleeve_usage)
-        ),
-        limit_usage=(
-            snapshot.limit_usage if limit_usage is None else tuple(limit_usage)
-        ),
+        sleeve_usage=sleeve_usage,
+        limit_usage=limit_usage,
         fee_state=snapshot.fee_state,
         source_watermark=snapshot.source_watermark,
         reconciliation=snapshot.reconciliation,
@@ -3036,10 +3435,10 @@ def commit_reservation(
     *,
     plan: PortfolioReservationPlan,
     at_time: datetime,
+    deployable_policy: CapitalDeployablePolicy | None,
+    usage_deltas: Any = (),
     trigger: CapitalRecomputeTrigger = CapitalRecomputeTrigger.RESERVATION,
     expected_portfolio_version: str | None = None,
-    limit_usage: tuple[CapitalLimitUsage, ...] | None = None,
-    sleeve_usage: tuple[SleeveUsage, ...] | None = None,
 ) -> CapitalCommitResult:
     """Compare-and-commit one reservation plan against one capital snapshot (`CI-04`).
 
@@ -3056,9 +3455,31 @@ def commit_reservation(
     open and whole, the account evidence must pass the same `CI-02` blocking table
     the deployable seam consults, the version this process tracks as current for
     the book must be the version being committed, sufficient free cash must be
-    present, and a rejection writes nothing at all. A replay of a plan this process
-    already committed returns the recorded successor rather than consuming the
-    contested capacity again.
+    present, the consumption must fit inside a deployable bound that was actually
+    *established*, and a rejection writes nothing at all. A replay of a plan this
+    process already committed returns the recorded successor rather than consuming
+    the contested capacity again.
+
+    Funding authority is not read from the caller. A bound is established only by a
+    policy version the owner has ratified (`OWNER_RATIFIED_CAPITAL_POLICY_VERSIONS`)
+    plus complete declared usage evidence, so while no policy is ratified this seam
+    abstains with ``DEPLOYABLE_BOUND_UNAVAILABLE`` rather than committing. An
+    engineering-scenario policy establishes the arithmetic and nothing else: there
+    is no approval flag, signature, ratification record or caller-supplied override
+    to consult, and committed capital is never treated as incremental risk,
+    concentration, liquidity or sleeve usage.
+
+    Usage is evidence too. Each ``ReservationUsageDelta`` must belong to this plan,
+    describe this portfolio version, be observed at this commit instant and evidence
+    exactly one usage row the snapshot already declares; the successor then carries
+    the snapshot's declared usage plus those additive deltas, so a commit can never
+    reduce, replace or invent the capacity it consumed. That evidence is validated at
+    its own position in the ladder - after every higher-priority refusal, including
+    positions ten and eleven, and inside the witness lock - so a malformed submission can
+    never preempt a refusal the seam would have reached first, and it is validated before
+    any successor is constructed, so a submission that cannot be validated touches neither
+    the record nor the witness. Evidence that cannot be validated raises; evidence that is
+    merely incomplete leaves the bound unestablished at position twelve.
 
     The seam publishes exactly one declared rejection, in this order:
 
@@ -3078,6 +3499,13 @@ def commit_reservation(
        the version being committed.
     10. ``NON_POSITIVE_AMOUNT`` - the plan declares no committable capital.
     11. ``INSUFFICIENT_FREE_CASH`` - free cash does not cover the reservation.
+    12. ``DEPLOYABLE_BOUND_UNAVAILABLE`` - no valid deployable bound could be
+       established: no policy, an unbound or unratified policy, an abstaining
+       evaluation, or usage evidence that is missing a declared row. A missing bound
+       is never reported as a numeric breach.
+    13. ``EXCEEDS_DEPLOYABLE_CAPITAL`` - a valid bound was established and the
+       reservation exceeds it while still fitting inside free cash. An amount equal
+       to the bound is admissible; only a genuine excess reaches this position.
 
     Restart, multi-worker and durable-ledger safety are explicitly NOT claimed by
     this increment: the reservation witness is process-scoped and in-memory, so
@@ -3092,6 +3520,14 @@ def commit_reservation(
     if not isinstance(plan, PortfolioReservationPlan):
         raise CapitalIntelligenceError(
             "a reservation commit requires a PortfolioReservationPlan"
+        )
+    if deployable_policy is not None and not isinstance(
+        deployable_policy, CapitalDeployablePolicy
+    ):
+        raise CapitalIntelligenceError(
+            "a reservation commit requires a CapitalDeployablePolicy, not "
+            f"{type(deployable_policy).__name__}: a bound cannot be read from a "
+            "policy-shaped object, and an absent policy is expressed as None"
         )
     requested_at = _utc(at_time, field_name="at_time")
     requested_trigger = _enum_of(
@@ -3176,17 +3612,63 @@ def commit_reservation(
         current = holder["current"].get(identity_key)
         if current is not None and current != snapshot.portfolio_version:
             return rejected(CapitalCommitRejection.STALE_EXPECTED_VERSION)
-        if committed <= 0:
-            return rejected(CapitalCommitRejection.NON_POSITIVE_AMOUNT)
-        if committed > snapshot.cash.free_cash:
-            return rejected(CapitalCommitRejection.INSUFFICIENT_FREE_CASH)
+        # Positions ten and eleven, decided from the request alone and therefore decided
+        # before the usage evidence is read at all: a malformed delta may never preempt a
+        # refusal the seam would have reached first.
+        amount_gate = reservation_amount_rejection(
+            committed=committed, free_cash=snapshot.cash.free_cash
+        )
+        if amount_gate is not None:
+            return rejected(amount_gate)
+        # Usage evidence is validated here: under the witness lock, after every
+        # higher-priority refusal above, and before any successor is constructed, so a
+        # submission that cannot be validated touches neither the record nor the witness.
+        # A malformed, forged, foreign, duplicate or undeclared-row delta is structural
+        # misuse and raises; incompleteness is *not* misuse - a declared row with no delta
+        # is missing evidence, and it leaves the bound unestablished at position twelve.
+        ordered_deltas = _validate_usage_deltas(snapshot, deltas=usage_deltas)
+        _validate_usage_delta_binding(
+            deltas=ordered_deltas,
+            plan_id=plan.plan_id,
+            base_portfolio_version=snapshot.portfolio_version,
+            at_time=requested_at,
+        )
+        missing_deltas = _missing_usage_delta_identities(snapshot, ordered_deltas)
+        # Positions twelve and thirteen. The bound is established here, inside the lock and
+        # after the version boundary has been compared, and it stays unestablished when the
+        # policy is absent, unratified or unbound, when the evaluation abstains, or when the
+        # usage evidence is incomplete - so a missing bound can never be published as a
+        # numeric breach, and a genuine excess is reported only when a bound really exists.
+        deployable_bound = (
+            None
+            if deployable_policy is None or missing_deltas
+            else _established_deployable_bound(
+                snapshot, policy=deployable_policy, at_time=requested_at
+            )
+        )
+        rejection = reservation_consumption_rejection(
+            committed=committed,
+            deployable_bound=deployable_bound,
+            free_cash=snapshot.cash.free_cash,
+        )
+        if rejection is not None:
+            return rejected(rejection)
+        # Admissible: derive the usage the successor carries from the record's own
+        # declared rows plus the validated deltas, then commit the partition move.
+        limit_rows, sleeve_rows = derive_successor_usage(
+            snapshot,
+            plan_id=plan.plan_id,
+            base_portfolio_version=snapshot.portfolio_version,
+            at_time=requested_at,
+            deltas=ordered_deltas,
+        )
         successor = _reserved_successor(
             snapshot,
             plan=plan,
             committed=committed,
             at_time=requested_at,
-            limit_usage=limit_usage,
-            sleeve_usage=sleeve_usage,
+            limit_usage=limit_rows,
+            sleeve_usage=sleeve_rows,
         )
         result = CapitalCommitResult(
             status=CapitalCommitStatus.COMMITTED,
@@ -4236,10 +4718,13 @@ def aggregate_capital_time_efficiency(
 #: vocabulary: none of them places, sizes, allocates or executes anything.
 __all__ = [
     "CAPITAL_BOUND_PRECEDENCE",
+    "CAPITAL_COMMIT_AUTHORIZATION_DEPENDENCY",
+    "CAPITAL_COMMIT_AUTHORIZATION_STATUS",
     "CAPITAL_COMMIT_ID_PREFIX",
     "CAPITAL_COMMIT_SCHEMA_VERSION",
     "CAPITAL_DEPLOYABLE_ABSTENTION_PRECEDENCE",
     "CAPITAL_DEPLOYABLE_ENGINEERING_SCENARIO_POLICY_VERSION",
+    "CAPITAL_HORIZON_BOUND_STATUS",
     "CAPITAL_HOURS_BASIS_TOKEN",
     "CAPITAL_HOURS_ENGINEERING_SCENARIO_POLICY_VERSION",
     "CAPITAL_HOURS_ID_PREFIX",
@@ -4260,6 +4745,7 @@ __all__ = [
     "MONEY_QUANTUM",
     "OPEN_OWNER_INPUTS",
     "OWNER_INPUT_STATUS",
+    "OWNER_RATIFIED_CAPITAL_POLICY_VERSIONS",
     "CapitalAccountingState",
     "CapitalBound",
     "CapitalCashLaw",
@@ -4294,6 +4780,7 @@ __all__ = [
     "CapitalTimeEfficiencyCohort",
     "CapitalTimeEfficiencyStatus",
     "CashPartitionLedger",
+    "ReservationUsageDelta",
     "SleeveUsage",
     "aggregate_capital_time_efficiency",
     "assert_portfolio_version_lineage",
@@ -4301,12 +4788,17 @@ __all__ = [
     "capital_deployable_engineering_scenario_policy",
     "capital_hours_engineering_scenario_policy",
     "capital_occupancy_point",
+    "capital_policy_grants_funding_authority",
     "capital_snapshot_identity",
     "capital_time_efficiency",
     "commit_reservation",
+    "derive_successor_usage",
     "evaluate_deployable_capital",
     "measure_capital_hours",
+    "missing_usage_delta_identities",
     "next_portfolio_version",
+    "reservation_amount_rejection",
+    "reservation_consumption_rejection",
     "to_portfolio_capital_state",
 ]
 
