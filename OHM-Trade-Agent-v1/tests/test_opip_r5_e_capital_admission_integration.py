@@ -1414,7 +1414,7 @@ def test_ac_010_the_increment_contract_and_pointer_are_self_consistent():
     assert contract.sections["INCREMENT"] == INCREMENT
     assert contract.sections["UNAPPROVED SCOPE CHANGES"] == "NONE"
     assert list(contract.acceptance_criteria) == [
-        f"AC-{index:03d}" for index in range(1, 11)
+        f"AC-{index:03d}" for index in range(1, 12)
     ]
 
     pointer_name = read_increment_pointer(POINTER)
