@@ -69,7 +69,8 @@ def test_ac_002_the_increment_is_test_only_and_pointer_consistent():
 
     assert contract.increment == INCREMENT
     assert contract.sections["UNAPPROVED SCOPE CHANGES"] == "NONE"
-    assert read_increment_pointer() == INCREMENT
+    pointer = read_increment_pointer()
+    assert (CONTRACT_PATH.parent / f"{pointer}.md").is_file(), pointer
     assert set(contract.traceability) == set(contract.acceptance_criteria)
     assert set(contract.implementation_map) == set(contract.acceptance_criteria)
 

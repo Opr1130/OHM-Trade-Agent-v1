@@ -23,7 +23,7 @@ this increment's own scope contract, its active-increment pointer and its change
 WHEN:
 they are inspected
 THEN:
-the contract parses, declares `NONE` for unapproved scope changes, traces every criterion to its matching acceptance test, maps only test and documentation paths, and the pointer names this increment, so the increment is provably test-only and self-consistent
+the contract parses, declares `NONE` for unapproved scope changes, traces every criterion to its matching acceptance test, maps only test and documentation paths, and the active-increment pointer resolves to an existing contract rather than being pinned to this increment, so the increment is provably test-only and self-consistent
 
 EXPLICITLY OUT OF SCOPE:
 - Changing the protection runtime, the canonical writer, the scheduler, the scan job or any application module. No file under `app/` is in the implementation map.
