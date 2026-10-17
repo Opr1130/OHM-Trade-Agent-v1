@@ -343,7 +343,7 @@ def reservation_plan(
                 reserved_capital=amount,
                 portfolio_version=version,
                 created_at=T0,
-                expires_at=T0 + timedelta(hours=1),
+                expires_at=T0 + timedelta(hours=2),
             )
             for candidate_id, amount in entries
         ),
