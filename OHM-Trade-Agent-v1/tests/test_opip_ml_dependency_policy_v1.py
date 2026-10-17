@@ -51,13 +51,21 @@ GUARDED_PACKAGE = APP_ROOT / "app" / "opip"
 GUARD_MODULE = APP_ROOT / "tests" / "test_opip_decision_safety_v1.py"
 GUARD_TEST_NAME = "test_no_ml_dependency_is_introduced"
 
-#: Modules whose lowercased text contains `shap` while importing nothing. The
-#: text scan failed on exactly these; the syntax-aware policy does not.
-TEXT_SCAN_COLLISIONS = (
-    "app/opip/contracts/paper_execution.py",
-    "app/opip/contracts/portfolio.py",
-    "app/opip/learning/evaluation.py",
-)
+#: The text scan failed on every real module whose prose contains `shap`. That
+#: population is discovered, never pinned: another increment may legitimately
+#: rewrite a module's prose, and a pinned list would then assert a fact about a
+#: file this increment does not own. What must stay true is that the guarded
+#: package really does contain such prosaic collisions *and* still imports
+#: nothing - which is what makes the syntax-aware repair meaningful.
+def _text_scan_collisions() -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            path.relative_to(APP_ROOT).as_posix()
+            for path in GUARDED_PACKAGE.rglob("*.py")
+            if "__pycache__" not in path.parts
+            and "shap" in path.read_text(encoding="utf-8").lower()
+        )
+    )
 
 CHANGED_SURFACES = frozenset(
     {
@@ -84,15 +92,15 @@ SHAPE_WORDS = (
 def test_ac_001_the_real_package_passes_where_the_text_guard_failed() -> None:
     """ATDD-ML-DEPENDENCY-POLICY-v1/AC-001: the guarded package is provably clean.
 
-    GIVEN the real `app/opip` package whose text contains the ordinary words
-    "shape", "shaped" and "reshape"
+    GIVEN the real `app/opip` package, whose source contains the ordinary words
+    "shape", "shaped" and "reshape" in at least one real module (the population
+    is discovered at test time, not pinned to a file list another increment owns)
     WHEN the repaired guard evaluates its static and dynamic imports
-    THEN the package is reported clean, while the same files still contain the
+    THEN the package is reported clean, while those modules still contain the
     token that made the previous text scan fail
     """
-    for relative in TEXT_SCAN_COLLISIONS:
-        text = (APP_ROOT / relative).read_text(encoding="utf-8")
-        assert "shap" in text.lower(), relative
+    collisions = _text_scan_collisions()
+    assert collisions, "no real module carries the prosaic token any more"
     scanned = [
         path
         for path in GUARDED_PACKAGE.rglob("*.py")

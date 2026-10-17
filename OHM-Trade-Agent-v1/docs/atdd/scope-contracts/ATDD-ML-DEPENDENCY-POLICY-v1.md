@@ -46,9 +46,9 @@ ARCHITECTURE REFERENCES:
 
 APPROVED ACCEPTANCE CRITERIA:
 AC-001:
-GIVEN: the real `app/opip` package, whose source contains the ordinary words "shape", "shaped" and "reshape" in `app/opip/contracts/paper_execution.py`, `app/opip/contracts/portfolio.py` and `app/opip/learning/evaluation.py`
+GIVEN: the real `app/opip` package, whose source contains the ordinary words "shape", "shaped" and "reshape" in at least one real module, discovered by the test rather than pinned to a file list that another increment owns
 WHEN: the repaired guard evaluates that package's static and dynamic imports, and the policy evaluates synthetic modules whose docstring, comment, identifier, class or string constant contains those words
-THEN: no violation is reported, while the same files still contain the token that made the previous text scan fail
+THEN: no violation is reported, while those modules still contain the token that made the previous text scan fail
 
 AC-002:
 GIVEN: the token list the original guard forbade in package source and in the dependency manifests, plus every static import form that reaches an ML library (plain, aliased, submodule, from-import and same-family distribution such as `torchvision`) and declared requirements including an editable requirement and a same-family distribution
