@@ -1081,11 +1081,22 @@ def test_cockpit_exposure_contract_is_unchanged():
     from app.api import cockpit_service
 
     paths = set(cockpit_service.app.openapi().get("paths", {}) or {})
+    # Widened once, deliberately, by the F10-B increment
+    # (`ATDD-R5-F10-dashboard-parity-implementation`), which mounts the semantic read
+    # service's five declared GET routes plus its page asset on this plane. That was an
+    # owner-visible exposure decision recorded in that increment's contract - not a
+    # widening by Profit Intelligence, which still declares no HTTP surface of its own.
     assert paths == {
         "/cockpit",
         "/api/cockpit/overview",
         "/api/cockpit/trades",
         "/api/cockpit/trades/{paper_trade_id}",
+        "/cockpit/f10",
+        "/api/cockpit/semantic/pages",
+        "/api/cockpit/semantic/pages/{page_id}",
+        "/api/cockpit/semantic/panels/{panel_id}",
+        "/api/cockpit/semantic/metrics/{metric_id}",
+        "/api/cockpit/semantic/facts/{fact_id}",
     }, paths
 
 
