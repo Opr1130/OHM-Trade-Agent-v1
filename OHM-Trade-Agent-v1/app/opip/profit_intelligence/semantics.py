@@ -226,6 +226,53 @@ MISSED_OPPORTUNITY_SAFEGUARDS = MissedOpportunitySafeguards()
 
 
 @dataclass(frozen=True)
+class MissedOpportunityUnblockEvidence:
+    """The exact evidence still missing before classification may be attempted.
+
+    Recorded by the 4A epic. The typed qualification-funnel and forward-outcome
+    projections now exist as read models, but a market outcome is not executable
+    profit and the counterfactual feasibility evidence does not exist, so the
+    disposition stays blocked rather than being approximated.
+    """
+
+    disposition: str
+    missing_ingredients: tuple[str, ...]
+    required_producer: str
+    note: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "disposition": self.disposition,
+            "missing_ingredients": list(self.missing_ingredients),
+            "required_producer": self.required_producer,
+            "note": self.note,
+        }
+
+
+#: Precise unblock evidence for the still-blocked missed-opportunity increment.
+MISSED_OPPORTUNITY_UNBLOCK = MissedOpportunityUnblockEvidence(
+    disposition=MISSED_OPPORTUNITY_DISPOSITION,
+    missing_ingredients=(
+        "the sealed funnel record and its forward outcome readable on one plane",
+        "a canonical episode bridge between the funnel and every forward-outcome family",
+        "executable-quantity, realistic-entry and realistic-exit evidence",
+        "cost, slippage, capacity and risk-feasibility assumptions for the counterfactual",
+    ),
+    required_producer=(
+        "learning-plane accountability (app.services.opportunity_accountability) exposed "
+        "as a versioned derived read model, plus a canonical execution-feasibility "
+        "counterfactual contract"
+    ),
+    note=(
+        "Epic 4A delivered typed qualification-funnel and forward-outcome projections "
+        "and an evidence-only join; classification remains "
+        "BLOCKED_AT_FROZEN_BOUNDARY because a market outcome alone is not executable "
+        "profit."
+    ),
+)
+
+
+@dataclass(frozen=True)
 class EvidenceGap:
     """A fact Profit Intelligence cannot truthfully answer on this plane.
 
@@ -281,9 +328,12 @@ EVIDENCE_GAPS: tuple[EvidenceGap, ...] = (
         ),
         frozen_boundary="trading-host evidence plane / canonical replica scope",
         recommended_increment=(
-            "Publish a typed screening/funnel projection into the canonical writer "
-            "(or a verified replica stream) under an explicit owner-approved "
-            "contract, then project the funnel here."
+            "The typed projection now exists in "
+            "app.opip.profit_intelligence.qualification_funnel "
+            "(QualificationFunnelProjectionV1). To close this gap, replicate the "
+            "canonical funnel_events/screening_evaluations evidence (or the "
+            "projection) to the analytics plane under an explicit owner-approved "
+            "replica contract."
         ),
     ),
     EvidenceGap(
@@ -299,8 +349,10 @@ EVIDENCE_GAPS: tuple[EvidenceGap, ...] = (
         ),
         frozen_boundary="trading-host evidence plane / canonical event vocabulary",
         recommended_increment=(
-            "Add a canonical rejection/gate event with an owner-approved schema, "
-            "then attribute rejections from canonical evidence."
+            "Rejections are already attributed from canonical funnel gate evidence in "
+            "app.opip.profit_intelligence.qualification_funnel, which never infers a "
+            "rejection from downstream absence. To close this gap, replicate that "
+            "evidence/projection to the analytics plane."
         ),
     ),
     EvidenceGap(
@@ -316,9 +368,10 @@ EVIDENCE_GAPS: tuple[EvidenceGap, ...] = (
         ),
         frozen_boundary="learning/analytics plane separation and canonical replica scope",
         recommended_increment=(
-            "Expose the accountability summary as a versioned derived read model "
-            "with its own freshness and completeness contract, and consume it here "
-            "without granting it any policy authority."
+            "Epic 4A delivered the typed qualification-funnel and forward-outcome "
+            "projections and an evidence-only join. Classification stays blocked: see "
+            "MISSED_OPPORTUNITY_UNBLOCK for the exact missing ingredients and the "
+            "producer required."
         ),
     ),
     EvidenceGap(
@@ -334,9 +387,11 @@ EVIDENCE_GAPS: tuple[EvidenceGap, ...] = (
         ),
         frozen_boundary="point-in-time / sealed-evaluation boundary",
         recommended_increment=(
-            "Publish forward outcomes as an explicitly point-in-time-labelled derived "
-            "stream, keeping decision-time facts and future outcomes in separate "
-            "fields."
+            "The point-in-time projection now exists in "
+            "app.opip.profit_intelligence.forward_outcomes "
+            "(ForwardOutcomeProjectionV1), keeping decision-time facts and future "
+            "outcomes in separate fields. To close this gap, replicate the canonical "
+            "forward-outcome streams to the analytics plane."
         ),
     ),
     EvidenceGap(
@@ -446,6 +501,7 @@ __all__ = [
     "METRIC_AUTHORITY",
     "MISSED_OPPORTUNITY_DISPOSITION",
     "MISSED_OPPORTUNITY_SAFEGUARDS",
+    "MISSED_OPPORTUNITY_UNBLOCK",
     "PNL_TOLERANCE",
     "PROFIT_INTELLIGENCE_CONTRACT_VERSION",
     "SUPPORTED_COST_COMPONENTS",
@@ -456,6 +512,7 @@ __all__ = [
     "LineageStage",
     "MissedOpportunityCause",
     "MissedOpportunitySafeguards",
+    "MissedOpportunityUnblockEvidence",
     "net_pnl_reconciles",
     "supported_costs_sum",
 ]
