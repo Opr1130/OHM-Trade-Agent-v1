@@ -2,7 +2,7 @@ INCREMENT:
 ATDD-R5-E-research-paper-execution
 
 OWNER-APPROVED INTENT:
-Deliver the R5-E slice that consumes one committed capital admission and dispatches exactly one F8 research-paper execution, and nothing else. The seam `execute_admitted_research_paper_opportunity` in `app/services/paper_v2_capital_admission_execution.py` reads the committed paper admission evidence of exactly one disposition identity through the existing canonical read projection (`WriterClient.get_paper_v2_execution_state`), refuses before dispatch when that evidence is absent, unusable, uncommitted or divergent from the intent being dispatched, and otherwise calls the single existing paper execution producer `app.services.paper_v2_execution.run_paper_v2_opportunity` exactly once and reports the producer's own canonical outcome verbatim. The increment exists because the increment that closed the admission write path, `ATDD-R5-E-capital-admission-integration`, records this dependency explicitly as a deferred discovery: "Nothing in the repository calls the seam yet, so the seam has no production consumption: wiring it into the R5-C capital-intelligence or R5-D selector runtime is the next R5-E integration step, and it needs its own increment, its own dormant-mode proof, its own release-profile decision and an owner-approved activation path." This increment is that step, and it is delivered by reuse only: no new `WriterIntent` kind, no new event type, no new table, no new schema version, no second store, no second producer, no second capital path, no allocator, no scheduler, no budget, no retry loop, no clock, no environment read, no secret, no funded-account path and no order or exchange surface. `grants_execution_authority` remains hard-coded `False` in every record the seam returns. The owner directive that governs the R5-E line, and that this increment obeys unchanged, is: reuse the existing reservation and execution authority, do not automatically create a new `WriterIntent` kind, fail closed on missing `OQ-05`/`OQ-06` policy rather than inventing a numerical rule, and never treat free cash alone as deployable capital. This increment claims no new authority: it is a consume-and-dispatch seam whose only canonical read is the existing committed-state projection and whose only canonical write is the existing producer's own transaction.
+Deliver the R5-E slice that consumes one committed capital admission and dispatches exactly one F8 research-paper execution, and nothing else. The seam `execute_admitted_research_paper_opportunity` in `app/services/paper_v2_capital_admission_execution.py` reads the committed paper admission evidence of exactly one disposition identity through the existing canonical read projection (`WriterClient.get_paper_v2_execution_state`), refuses before dispatch when that evidence is absent, unusable, uncommitted or divergent from the intent being dispatched, and otherwise calls the single existing paper execution producer `app.services.paper_v2_execution.run_paper_v2_opportunity` exactly once and reports the producer's own canonical outcome verbatim. The increment exists because the increment that closed the admission write path, `ATDD-R5-E-capital-admission-integration`, records this dependency explicitly as a deferred discovery: "Nothing in the repository calls the seam yet, so the seam has no production consumption: wiring it into the R5-C capital-intelligence or R5-D selector runtime is the next R5-E integration step, and it needs its own increment, its own dormant-mode proof, its own release-profile decision and an owner-approved activation path." This increment is that step, and it is delivered by reuse only: no new `WriterIntent` kind, no new event type, no new table, no new schema version, no second store, no second producer, no second capital path, no allocator, no scheduler, no budget, no retry loop, no clock, no environment read, no secret, no funded-account path and no order or exchange surface. `grants_execution_authority` remains hard-coded `False` in every record the seam returns. The owner directive that governs the R5-E line, and that this increment obeys unchanged, is: reuse the existing reservation and execution authority, do not automatically create a new `WriterIntent` kind, fail closed on missing `OQ-05`/`OQ-06` policy rather than inventing a numerical rule, and never treat free cash alone as deployable capital. This increment claims no new authority: it is a consume-and-dispatch seam whose only canonical read is the existing committed-state projection and whose only canonical write is the existing producer's own transaction. Owner-approved amendment (2026-10-17, review findings B1/B2): the same existing producer must additionally reuse the decision-context identity its committed admission already carries instead of committing a second one, so `run_paper_v2_opportunity` accepts one optional `committed_decision_context_id` and, when it is supplied, commits no decision context of its own and refuses a canonical state whose decision context differs; the seam must also refuse a committed admission that carries no decision-context identity, and must fail closed on a canonical-read transport failure instead of treating it as a refusal. That is the only change authorised in `app.services.paper_v2_execution`: no new producer, event type, admission authority, execution stage, sizing policy, retry, bound, budget, tolerance or trading permission is added, and the call path without the optional identity is unchanged.
 
 ARCHITECTURE REFERENCES:
 - `docs/architecture/OPIP_R5_0_CONTRACT_FREEZE.md`, SC-07 "Reservation, atomic consumption and concurrent change": the reservation this seam consumes was compared and committed atomically by the canonical writer under the existing rule, and concurrent change already fails closed there. The seam adds no second consumption, no release, no re-reservation and no concurrent-change path of its own; it reads the committed result and never re-decides it.
@@ -87,10 +87,26 @@ they are inspected
 THEN:
 the increment's own scope contract parses, is self-consistent, traces every criterion to its matching acceptance test and maps it to its changed files, declares `NONE` for unapproved scope changes and pins no global active-increment pointer, the pointer resolves to an existing contract and names this increment, and the `EVIDENCE_SHADOW` profile, the blocked `TARGET_PAPER` profile and the Compose `OPIP_PAPER_V2_MODE=off` posture are unchanged with no new `OPIP_R5*` mode key
 
+AC-011:
+GIVEN:
+one committed capital admission whose canonical projection already carries an
+authoritative decision-context identity, and the single existing paper execution
+producer the seam dispatches into
+WHEN:
+the seam dispatches that admission and hands the producer the committed
+decision-context identity
+THEN:
+the execution reuses exactly that committed identity, no second decision-context
+event is committed, the admission request, reservation, disposition, order intent,
+execution attempt, fill and protection plan are each unchanged by the dispatch, and
+a canonical projection whose decision context differs from the admission being
+consumed is refused with no further canonical write, so one admission carries
+exactly one committed decision context and one committed economic effect
+
 EXPLICITLY OUT OF SCOPE:
 - Admitting capital. The seam never calls `admit_paper_opportunity`, `admit_planned_reservation` or any other reservation authority; producing the committed admission it consumes stays owned by `ATDD-R5-E-capital-admission-integration` and the canonical writer.
 - Selecting, planning or rotating. Opportunity selection, portfolio planning and rotation-group switching stay owned by the existing R5-C/R5-D increments; the seam re-derives no selection and evaluates no rotation comparison.
-- Changing the execution producer. `app.services.paper_v2_execution` is consumed as-is: no new stage, event type, disposition, terminal state, retry, bound, budget or tolerance is added to it, and no second producer is created.
+- Changing the execution producer beyond committed-context reuse. `app.services.paper_v2_execution` is consumed as-is except for the single owner-approved B1 amendment recorded above: it may accept and reuse the committed decision-context identity, and it may refuse a canonical decision context that differs from the admission being consumed. No new stage, event type, disposition, terminal state, retry, bound, budget or tolerance is added to it, no second producer is created, no admission or reservation authority and no sizing policy are added, and no trading permission is widened.
 - Any funded-account, exchange-order, credential or private-API surface. The seam places no order, cancels nothing, reads no funded balance and holds no secret.
 - Activation. No scheduler, worker, telegram path, feature flag, mode key or Compose literal wires the seam into runtime; runtime wiring needs its own increment, its own dormant-mode proof, its own release-profile decision and an owner-approved activation path.
 - Reconciliation and recovery automation. An operator-driven recovery of a failed or divergent dispatch is not automated here; the seam performs no in-seam retry, no backfill, no compensating write and no state repair.
@@ -108,7 +124,7 @@ FROZEN BOUNDARIES:
 9. Zero authority. `grants_execution_authority` is `False` in every returned record, the record refuses to be constructed with it `True`, and no record can reserve, release, widen, authorize or dispatch anything by itself.
 10. Isolation from funded accounts and production data. Only the canonical paper lineage is read, no funded account or exchange credential is reachable, no order is placed, no analytics store or database is added, and no production data is mutated.
 11. Determinism and idempotent consumption. The same inputs against the same committed state produce the same outcome and the same reported identities; a replay or a post-restart dispatch consumes the one committed admission without adding canonical evidence, and nothing is deleted, backfilled or rewritten.
-12. Additive and reversible. The increment adds one dormant module, its acceptance tests, one documentation contract, one active-increment pointer update and no ratified-guard change; it changes no frozen behavior, no persisted format, no limit and no reader, so reverting the increment reverts the proof rather than a production capability.
+12. Additive and reversible. The increment adds one dormant module, its acceptance tests, one documentation contract, one active-increment pointer update and no ratified-guard change; apart from the owner-approved committed-context reuse and refusal inside the one existing producer it changes no frozen behavior, no persisted format, no limit and no reader, so reverting the increment reverts the proof rather than a production capability.
 
 ACCEPTANCE TEST TRACEABILITY:
 AC-001 -> tests/test_opip_r5_e_research_paper_execution.py::test_ac_001_a_committed_admission_is_dispatched_into_one_execution
@@ -136,6 +152,10 @@ AC-010 -> tests/test_opip_r5_e_research_paper_execution.py::test_ac_010_the_incr
 AC-010 -> tests/test_opip_r5_e_research_paper_execution.py::test_ac_010_the_release_profile_and_posture_are_unchanged
 AC-010 -> tests/test_opip_r5_e_research_paper_execution.py::test_ac_010_no_release_or_runtime_surface_names_the_seam
 
+AC-011 -> tests/test_opip_r5_e_research_paper_execution.py::test_ac_011_an_admitted_dispatch_reuses_the_committed_decision_context
+AC-011 -> tests/test_opip_r5_e_research_paper_execution.py::test_ac_011_a_divergent_committed_context_is_refused_without_writing
+AC-011 -> tests/test_opip_r5_e_research_paper_execution.py::test_ac_011_a_dispatch_commits_no_second_admission_or_reservation
+
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/services/paper_v2_capital_admission_execution.py
 AC-001 -> OHM-Trade-Agent-v1/tests/test_opip_r5_e_research_paper_execution.py
@@ -160,12 +180,19 @@ AC-010 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
 AC-010 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-R5-E-research-paper-execution.md
 AC-010 -> OHM-Trade-Agent-v1/tests/test_opip_r5_e_research_paper_execution.py
 
+AC-011 -> OHM-Trade-Agent-v1/app/services/paper_v2_execution.py
+AC-011 -> OHM-Trade-Agent-v1/tests/test_opip_r5_e_research_paper_execution.py
+AC-011 -> OHM-Trade-Agent-v1/tests/test_review_b1_context_reuse.py
+AC-011 -> OHM-Trade-Agent-v1/tests/test_review_b1_behavioral.py
+AC-003 -> OHM-Trade-Agent-v1/tests/test_review_b2_transport.py
+
 DEFERRED DISCOVERIES:
 - Nothing in the repository calls this seam yet, so the increment has no production consumption: wiring it into a scheduler, worker or runtime root is a later R5-E step that needs its own increment, its own dormant-mode proof, its own release-profile decision and an owner-approved activation path. Until then the seam stays dormant under `OPIP_PAPER_V2_MODE=off` and no module under `app/` names it.
 - The committed admission is consumed by disposition identity, and the identity is the producer's own derivation (`build_disposition_id`), so an opportunity whose episode, instrument or direction differs from the committed admission is not refused as a divergence but simply has no committed admission of its own and is blocked as `NO_COMMITTED_ADMISSION`. Any cross-identity reconciliation policy is left open and is deliberately not invented here.
 - The seam treats a committed admission as valid evidence without re-reading the capital policy version, the equity limit or the live portfolio: re-verifying them would duplicate the writer's authority and make this seam a second source of truth. A committed admission that is later superseded or released upstream is therefore still consumed as evidence, and any supersession or expiry policy for committed admissions remains open.
 - Recovery from a `FAILED` producer or an already-consumed admission is not automated: the seam performs no retry, no backfill and no compensating canonical write. An operator-driven re-attempt remains the only supported recovery path.
 - `OQ-05` (turnover semantics), `OQ-06` (sleeve caps) and `OQ-08` (legacy paper-engine coexistence) remain owner inputs and are unchanged by this increment; the seam adds no limit, tolerance or policy that could stand in for them.
+- Review remediation is recorded here as a bounded correction, not as new capability: the producer's committed-context reuse and refusal are proved by the `AC-011` acceptance tests, while `tests/test_review_b1_context_reuse.py` and `tests/test_review_b1_behavioral.py` are mapped as changed files and deliberately carry no acceptance marker, so they stay regression evidence rather than being claimed as acceptance proof. `tests/test_review_b2_transport.py` is likewise regression evidence for `AC-003`, not an acceptance test of it.
 
 UNAPPROVED SCOPE CHANGES:
 NONE

@@ -44,6 +44,9 @@ from app.opip.contracts.paper_execution_runtime import (  # noqa: E402
     PAPER_ADMISSION_REQUEST_RECORDED,
     PAPER_QUOTE_EVIDENCE_RECORDED,
 )
+from app.opip.decision_intelligence.events import (  # noqa: E402
+    DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+)
 from app.services import paper_v2_capital_admission_execution as seam  # noqa: E402
 from app.services.paper_v2_capital_admission_execution import (  # noqa: E402
     OUTCOME_BLOCKED,
@@ -59,6 +62,7 @@ from app.services.paper_v2_capital_admission_execution import (  # noqa: E402
 from app.services.paper_v2_execution import (  # noqa: E402
     PaperV2ExecutionError,
     build_disposition_id,
+    run_paper_v2_opportunity,
 )
 from tests.test_opip_paper_v2_execution_bc3 import (  # noqa: E402
     NOW,
@@ -816,4 +820,77 @@ def test_ac_010_no_release_or_runtime_surface_names_the_seam():
         in path.read_text(encoding="utf-8", errors="ignore")
     ]
     assert offenders == [], offenders
+
+
+# ---------------------------------------------------------------------------
+# AC-011: committed-context continuity and zero duplicate economic effect
+# ---------------------------------------------------------------------------
+
+
+def _decision_contexts(writer):
+    return _rows(writer, DECISION_INTELLIGENCE_CONTEXT_RECORDED)
+
+
+def test_ac_011_an_admitted_dispatch_reuses_the_committed_decision_context(env):
+    """ATDD-R5-E-research-paper-execution/AC-011: a dispatch reuses the committed decision context."""
+
+    server, client = env
+    seeded = _seed_committed_admission(env)
+    assert seeded.status == "EXECUTED"
+
+    committed = client.get_paper_v2_execution_state(seeded.disposition_id)
+    assert committed.decision_context_id
+    contexts_before = _decision_contexts(server.writer)
+    assert len(contexts_before) == 1
+
+    outcome = _dispatch(env)
+
+    assert outcome.status == OUTCOME_EXECUTED
+    assert _decision_contexts(server.writer) == contexts_before
+    after = client.get_paper_v2_execution_state(seeded.disposition_id)
+    assert after.decision_context_id == committed.decision_context_id
+
+
+def test_ac_011_a_divergent_committed_context_is_refused_without_writing(env):
+    """ATDD-R5-E-research-paper-execution/AC-011: a divergent committed context is refused before writing."""
+
+    server, client = env
+    seeded = _seed_committed_admission(env)
+    assert seeded.status == "EXECUTED"
+
+    counts_before = _counts(server.writer)
+    contexts_before = _decision_contexts(server.writer)
+
+    with pytest.raises(PaperV2ExecutionError) as raised:
+        run_paper_v2_opportunity(
+            _opportunity(),
+            client=client,
+            kraken_client=_kraken(),
+            settings=_Settings(),
+            now=NOW,
+            committed_decision_context_id="decision-context-not-committed",
+        )
+
+    assert "does not match canonical state" in str(raised.value)
+    assert _counts(server.writer) == counts_before
+    assert _decision_contexts(server.writer) == contexts_before
+
+
+def test_ac_011_a_dispatch_commits_no_second_admission_or_reservation(env):
+    """ATDD-R5-E-research-paper-execution/AC-011: a dispatch commits no second admission or reservation."""
+
+    server, _client = env
+    seeded = _seed_committed_admission(env)
+    counts_before = _counts(server.writer)
+    portfolio_before = _portfolio(server.writer)
+
+    outcome = _dispatch(env)
+
+    assert outcome.status == OUTCOME_EXECUTED
+    assert _counts(server.writer) == counts_before
+    assert _portfolio(server.writer) == portfolio_before
+    assert outcome.admission.reservation_id == seeded.reservation_id
+    assert outcome.execution.reservation_id == seeded.reservation_id
+    assert len(_rows(server.writer, PAPER_ADMISSION_REQUEST_RECORDED)) == 1
+    assert len(_rows(server.writer, PAPER_OPPORTUNITY_DISPOSITION_RECORDED)) == 1
 
