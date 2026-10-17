@@ -21,8 +21,11 @@ about capital, and it writes no canonical record of its own:
    RPC (the identity the producer derives, so no new identity is minted);
 2. refuse, without executing, when that state is unusable, is not admitted, has
    no committed reservation, or its committed admission does not describe the
-   execution intent this opportunity asks for (currency and requested
-   reservation amount are compared exactly against the committed values);
+   execution intent this opportunity asks for: the quote currency and the
+   requested reservation amount are compared exactly against the committed
+   values, and a committed admission that declares neither is refused rather than
+   treated as a match, because "not declared" is not evidence that the reservation
+   describes this intent;
 3. dispatch exactly one F8 execution and report the producer's own canonical
    outcome verbatim, including the producer's zero-fill and terminal statuses.
 
@@ -290,18 +293,34 @@ def _intent_divergence(
     compared exactly: no tolerance, no default and no re-derivation. Direction is
     bound by construction, because the committed disposition is addressed by the
     identity that carries episode, instrument symbol and direction.
+
+    An undeclared value is not a match. A committed projection that omits the
+    quote currency or the requested reservation amount cannot be shown to
+    describe this intent, so it is refused rather than dispatched: the
+    reservation is committed per currency book, and the entry is sized from the
+    opportunity's own amount, so treating "not declared" as "not divergent" would
+    spend a reservation of unknown size and unknown book on this intent. The
+    refusal keeps the module's closed reason vocabulary unchanged; no value is
+    substituted for the missing committed evidence.
     """
-    if (
-        evidence.quote_currency is not None
-        and str(evidence.quote_currency) != str(opportunity.quote_currency)
-    ):
+    if evidence.quote_currency is None:
+        return (
+            "committed admission declares no quote currency, so it cannot be "
+            "proven to describe execution intent "
+            f"{opportunity.quote_currency!r}"
+        )
+    if str(evidence.quote_currency) != str(opportunity.quote_currency):
         return (
             "committed admission quote currency "
             f"{evidence.quote_currency!r} does not describe execution intent "
             f"{opportunity.quote_currency!r}"
         )
     if evidence.requested_reservation_amount is None:
-        return None
+        return (
+            "committed admission declares no requested reservation amount, so "
+            "it cannot be proven to describe execution intent "
+            f"{opportunity.requested_reservation_amount!r}"
+        )
     if float(evidence.requested_reservation_amount) != float(
         opportunity.requested_reservation_amount
     ):
