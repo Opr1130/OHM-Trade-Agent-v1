@@ -144,22 +144,56 @@ def _app_imports(path: Path) -> set[str]:
     return modules
 
 
+def _source_calls_tokens(source: str, tokens: frozenset[str]) -> bool:
+    """True when ``source`` statically references a token as a call target, a
+    qualified attribute, an imported or aliased name, or a scheduled-job callback.
+
+    C1: the census must not miss aliased imports (``from m import n as x``) or
+    statically identifiable scheduled-job callbacks (``scheduler.add_job(n, ...)``).
+    Dynamically resolved calls (``getattr(...)``) are intentionally NOT detected:
+    they cannot be proven statically and stay explicitly outside this census.
+    """
+    tree = ast.parse(source)
+    aliases: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                aliases[alias.asname or alias.name] = alias.name
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                aliases[alias.asname or root] = root
+
+    def _resolved(name: str) -> str:
+        return aliases.get(name, name)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name):
+            if _resolved(func.id) in tokens:
+                return True
+        elif isinstance(func, ast.Attribute):
+            if func.attr in tokens:
+                return True
+        for arg in node.args:
+            if isinstance(arg, ast.Name) and _resolved(arg.id) in tokens:
+                return True
+        for keyword in node.keywords:
+            value = keyword.value
+            if isinstance(value, ast.Name) and _resolved(value.id) in tokens:
+                return True
+    return False
+
+
 def _mutating_exposure_callers(tokens: frozenset[str]) -> set[str]:
     callers: set[str] = set()
     for path in sorted((APP_ROOT / "app").rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            name = (
-                func.id
-                if isinstance(func, ast.Name)
-                else (func.attr if isinstance(func, ast.Attribute) else None)
-            )
-            if name in tokens:
-                callers.add(path.relative_to(APP_ROOT).as_posix())
-                break
+        if _source_calls_tokens(path.read_text(encoding="utf-8"), tokens):
+            callers.add(path.relative_to(APP_ROOT).as_posix())
     return callers
 
 
