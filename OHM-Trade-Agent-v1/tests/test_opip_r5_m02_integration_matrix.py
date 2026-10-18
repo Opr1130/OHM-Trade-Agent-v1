@@ -71,7 +71,7 @@ WIRINGS = frozenset(
         "FILE_WAL_ON_TRADING_HOST",
         "ABSENT_DECLARED",
         "TWO_ENTRY_POINTS_CONSISTENT",
-        "UNPROVEN_BETWEEN_HALVES",
+        "NO_PRODUCTION_SEAM_WIRING",
     }
 )
 
