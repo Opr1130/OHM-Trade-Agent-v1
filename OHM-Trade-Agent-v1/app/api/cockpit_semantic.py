@@ -71,8 +71,10 @@ from app.opip.cockpit.semantic import (
 )
 from app.opip.cockpit.semantic_pages import (
     ALL_PAGES,
+    PRESETS,
     PageReadModel,
     UnsupportedSlicePage,
+    filter_catalog,
 )
 
 router = APIRouter()
@@ -112,12 +114,27 @@ def _filters(query: Mapping[str, Any]) -> dict[str, Any]:
 
     Parameter names are checked against the service's declared filter allowlist before any
     value is parsed, so an undeclared name is refused as a name rather than ignored.
+
+    A dimension stated more than once is read as *all* of its values: taking only the last one
+    would silently answer a differently-scoped question than the caller asked. The service
+    decides whether a repeat is a widen or a refusal.
     """
     filters: dict[str, Any] = {}
     for name in query:
         if name not in ACCEPTED_PARAMETERS:
             raise UnsupportedQueryFilter(name)
-        value = query[name]
+        repeated = (
+            list(query.getlist(name))  # type: ignore[attr-defined]
+            if hasattr(query, "getlist")
+            else [query[name]]
+        )
+        if len(repeated) > 1:
+            # The service decides whether a repeat widens the dimension or is refused, so the
+            # paging bound is not exempt: resolving a repeated control to its last value here
+            # would be the same silent scope change this increment repairs.
+            filters[name] = repeated
+            continue
+        value = repeated[0]
         if name == "limit":
             try:
                 filters["limit"] = int(value)
@@ -207,6 +224,11 @@ def semantic_pages(
         "watermark": envelope["watermark"],
         "read_surface": envelope["read_surface"],
         "mounted_paths": list(MOUNTED_PATHS),
+        # The typed filter contract and the declared presets, published from the read model's
+        # own declarations so the surface renders its controls from the authority instead of
+        # from a hand-kept copy. Neither carries a value: a preset is a question, not a result.
+        "filters": [dict(entry) for entry in filter_catalog()],
+        "presets": [preset.to_dict() for preset in PRESETS],
     }
 
 

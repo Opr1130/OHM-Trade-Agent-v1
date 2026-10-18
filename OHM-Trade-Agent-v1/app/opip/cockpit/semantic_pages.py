@@ -77,6 +77,7 @@ from app.opip.cockpit.semantic import (
     REASON_UPSTREAM_NOT_ON_READ_PLANE,
     ROW_FACT_FIELDS,
     SEMANTIC_SERVICE_VERSION,
+    SERVED_FACT_NAMES,
     SERVED_STATES,
     SemanticReadService,
     THRESHOLD_POLICY,
@@ -241,6 +242,140 @@ _DECISION_FACT_GROUPS: Mapping[str, tuple[str, ...]] = MappingProxyType(
 )
 
 
+@dataclass(frozen=True)
+class PresetDeclaration:
+    """One named analysis preset: a question, the typed filters that ask it, and what it needs.
+
+    A preset is a *view*, not a fact: it names filters the service already declares and the
+    declared facts whose readings answer it. It carries no value of its own, so a preset can
+    never assert a result the panels could not publish. Following a preset's drill link is how
+    it is evaluated, and the panels' own states and reasons are how insufficiency is reported.
+    """
+
+    preset_id: str
+    label: str
+    question: str
+    page_id: str
+    filters: Mapping[str, Any]
+    requires: tuple[str, ...]
+    criterion: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "preset_id": self.preset_id,
+            "label": self.label,
+            "question": self.question,
+            "page_id": self.page_id,
+            "filters": {name: list(value) if isinstance(value, (list, tuple)) else value
+                        for name, value in self.filters.items()},
+            "requires": list(self.requires),
+            "criterion": self.criterion,
+            "evaluated_by": "FOLLOW_THE_DRILL_LINK; THE PANELS REPORT THEIR OWN INSUFFICIENCY",
+        }
+
+
+#: The presets this read model declares. Each one asks a question the frozen pages already
+#: declare, over filters the service already declares, and names the declared facts that
+#: answer it -- including the facts whose populations this plane cannot produce, so the preset
+#: reports insufficiency instead of a result.
+PRESETS: tuple[PresetDeclaration, ...] = (
+    PresetDeclaration(
+        preset_id="SETTLED_USD_ECONOMICS",
+        label="Settled USD economics",
+        question="what did the isolated paper account actually earn and cost in USD",
+        page_id="P4_PAPER_PORTFOLIO",
+        filters={"quote_currency": "USD"},
+        requires=(
+            "paper.population.settled",
+            "paper.realized_net_pnl",
+            "paper.execution_cost",
+        ),
+        criterion="AC-051",
+    ),
+    PresetDeclaration(
+        preset_id="OPEN_USD_COMMITMENT",
+        label="Open USD commitment",
+        question="what capital is still committed to open positions in USD",
+        page_id="P4_PAPER_PORTFOLIO",
+        filters={"quote_currency": "USD", "lifecycle_status": "OPEN"},
+        requires=(
+            "paper.population.open_positions",
+            "paper.population.reserved_capital",
+        ),
+        criterion="AC-050",
+    ),
+    PresetDeclaration(
+        preset_id="NON_DEFINITIVE_ECONOMICS",
+        label="Economics that are not definitive",
+        question="which lifecycles have no settled economics yet",
+        page_id="P4_PAPER_PORTFOLIO",
+        filters={"lifecycle_status": "UNRESOLVED"},
+        requires=("paper.population.flat_unverified", "paper.unresolved_count"),
+        criterion="AC-066",
+    ),
+    PresetDeclaration(
+        preset_id="MISSED_AND_LATE",
+        label="Missed and late opportunities",
+        question="what did the platform miss or find too late to act on",
+        page_id="P5_QUALITY_MISSED_OPPORTUNITY",
+        filters={},
+        requires=("paper.capture_efficiency",),
+        criterion="AC-061",
+    ),
+)
+
+#: The mount-relative routes a panel and a page are read at. A drill target is built from one
+#: of these plus the effective filters, so a link the operator follows asks the same question
+#: the page was asked.
+PANEL_ROUTE = "/api/cockpit/semantic/panels/{panel_id}"
+PAGE_ROUTE = "/api/cockpit/semantic/pages/{page_id}"
+
+#: The paging controls are transport, not evidence identity, so a drill target never carries
+#: them: two links that differ only by a page cursor point at the same evidence.
+_DRILL_EXCLUDED = frozenset({"limit", "cursor"})
+
+
+def filter_catalog() -> tuple[Mapping[str, Any], ...]:
+    """The typed dimensions a caller may filter on, exactly as the service declares them.
+
+    The presentation layer renders its controls from this catalog rather than from a local
+    copy, so a dimension the service adds or removes appears or disappears with it and a
+    control can never offer a filter the service would refuse.
+    """
+    catalog: list[Mapping[str, Any]] = []
+    for name in semantic.SUPPORTED_FILTERS:
+        vocabulary = semantic.FILTER_VOCABULARIES.get(name)
+        catalog.append(
+            {
+                "dimension": name,
+                "constrains": semantic.FILTER_ROW_FIELDS[name],
+                "or_capable": name in semantic.OR_CAPABLE_FILTERS,
+                "values": sorted(vocabulary) if vocabulary is not None else None,
+                "value_kind": (
+                    "VOCABULARY"
+                    if vocabulary is not None
+                    else "IDENTITY"
+                    if name in semantic.IDENTITY_FILTERS
+                    else "INSTANT"
+                    if name in ("window_start", "window_end")
+                    else "INTEGER"
+                    if name == "limit"
+                    else "TOKEN"
+                ),
+            }
+        )
+    return tuple(catalog)
+
+
+def _drill_query(filters: Mapping[str, Any]) -> dict[str, Any]:
+    """The effective filters a drill link carries, without the paging controls."""
+    return {
+        name: list(value) if isinstance(value, (list, tuple)) else value
+        for name, value in sorted(filters.items())
+        if name not in _DRILL_EXCLUDED and value is not None
+    }
+
+
 class PageReadModelError(Exception):
     """A refusal by the page read model, never a substituted value."""
 
@@ -273,6 +408,7 @@ class PanelReading:
     exclusions: tuple[str, ...] = ()
     evidence_refs: tuple[str, ...] = ()
     serving: bool = False
+    drill: Mapping[str, Any] | None = None
 
     @property
     def carries_value(self) -> bool:
@@ -293,6 +429,7 @@ class PanelReading:
                 "facts": list(self.facts),
                 "exclusions": list(self.exclusions),
                 "evidence_refs": list(self.evidence_refs),
+                "drill": dict(self.drill) if self.drill is not None else None,
             }
         )
         return payload
@@ -314,6 +451,7 @@ class PageReading:
     annexes: Mapping[str, Any] = field(default_factory=dict)
     reconciliation: Mapping[str, Any] = field(default_factory=dict)
     envelope: Mapping[str, Any] = field(default_factory=dict)
+    drill: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def served_panels(self) -> int:
@@ -350,6 +488,7 @@ class PageReading:
             },
             "withheld_sections": [dict(item) for item in self.withheld_sections],
             "annexes": dict(self.annexes),
+            "drill": dict(self.drill),
             "reconciliation": dict(self.reconciliation),
             "read_model_version": PAGE_READ_MODEL_VERSION,
             **dict(self.envelope),
@@ -488,6 +627,11 @@ class PageReadModel:
             annexes=self._annexes(page_id, with_values=with_values, **filters),
             reconciliation=self._reconciliation(page_id, **filters),
             envelope=self._page_envelope(reading),
+            drill={
+                "route": PAGE_ROUTE.format(page_id=page_id),
+                "query": _drill_query(filters),
+                "kind": "PAGE",
+            },
         )
 
     # -- panels --------------------------------------------------------------
@@ -527,6 +671,7 @@ class PageReadModel:
                 declaration=declaration,
                 reasons=tuple(binding.unserved_reasons),
                 gap_id=binding.gap_id,
+                drill=self._panel_drill(panel_id, filters),
             )
         if not with_value:
             return PanelReading(
@@ -537,6 +682,7 @@ class PageReadModel:
                 gap_id=binding.gap_id,
                 facts=tuple(binding.served),
                 serving=True,
+                drill=self._panel_drill(panel_id, filters),
             )
         value, state, reasons, exclusions, refs = self._panel_value(
             panel_id, tuple(binding.served), limit=limit, **filters
@@ -564,7 +710,22 @@ class PageReadModel:
             exclusions=exclusions,
             evidence_refs=refs,
             serving=True,
+            drill=self._panel_drill(panel_id, filters),
         )
+
+    def _panel_drill(
+        self, panel_id: str, filters: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        """The evidence link for one panel, carrying the effective filters.
+
+        Following it asks the same question the page was asked, which is what makes a
+        cross-filter context-preserving rather than a fresh unscoped query.
+        """
+        return {
+            "route": PANEL_ROUTE.format(panel_id=panel_id),
+            "query": _drill_query(filters),
+            "kind": "EVIDENCE",
+        }
 
     # -- value assembly ------------------------------------------------------
 
@@ -1004,6 +1165,66 @@ def _validate_declarations() -> None:
                 )
         if len(set(groups)) != len(groups):
             raise PageReadModelError(f"{panel_id} names a fact group twice: {groups}")
+    _validate_presets()
+
+
+def _validate_presets() -> None:
+    """Fail closed at import on a preset that would offer a filter the service refuses.
+
+    A preset may only name declared dimensions, values inside a dimension's declared
+    vocabulary, and declared facts. A preset that could not be asked, or that named a fact no
+    reading answers, would be a promise the surface cannot keep.
+    """
+    declared_facts = (
+        set(SERVED_FACT_NAMES)
+        | set(semantic.METRIC_BINDINGS)
+        | set(semantic.POPULATION_FACTS)
+        | set(semantic.READ_MODEL_FACTS)
+    )
+    for preset in PRESETS:
+        if preset.page_id not in PAGE_BY_ID:
+            raise PageReadModelError(
+                f"preset {preset.preset_id} names an unknown page {preset.page_id}"
+            )
+        if not preset.label.strip() or not preset.question.strip():
+            raise PageReadModelError(f"preset {preset.preset_id} has no label or question")
+        if not re.fullmatch(_CRITERION_ID.pattern, preset.criterion):
+            raise PageReadModelError(
+                f"preset {preset.preset_id} cites an unshaped criterion"
+            )
+        for name, value in preset.filters.items():
+            if name not in semantic.SUPPORTED_FILTERS:
+                raise PageReadModelError(
+                    f"preset {preset.preset_id} filters on undeclared {name}"
+                )
+            values = value if isinstance(value, (list, tuple)) else (value,)
+            if not values:
+                raise PageReadModelError(
+                    f"preset {preset.preset_id} states an empty {name}"
+                )
+            vocabulary = semantic.FILTER_VOCABULARIES.get(name)
+            if vocabulary is not None:
+                outside = tuple(
+                    member
+                    for member in values
+                    if str(member).strip().upper() not in vocabulary
+                )
+                if outside:
+                    raise PageReadModelError(
+                        f"preset {preset.preset_id} states {name}={outside} outside its "
+                        "declared vocabulary"
+                    )
+            elif name not in semantic.IDENTITY_FILTERS:
+                raise PageReadModelError(
+                    f"preset {preset.preset_id} filters on {name}, which a preset may not set"
+                )
+        if not preset.requires:
+            raise PageReadModelError(f"preset {preset.preset_id} requires no fact")
+        undeclared = tuple(fact for fact in preset.requires if fact not in declared_facts)
+        if undeclared:
+            raise PageReadModelError(
+                f"preset {preset.preset_id} requires undeclared facts: {undeclared}"
+            )
 
 
 _validate_declarations()
@@ -1019,15 +1240,20 @@ __all__ = [
     "INDEX_COUNTS_BASIS",
     "MOUNTED_SURFACE",
     "PAGE_READ_MODEL_VERSION",
+    "PAGE_ROUTE",
+    "PANEL_ROUTE",
+    "PRESETS",
     "PanelDispositionConflict",
     "PanelReading",
     "PageIndexEntry",
     "PageReadModel",
     "PageReadModelError",
     "PageReading",
+    "PresetDeclaration",
     "REASON_ALIGNMENT_UNPROVEN",
     "REASON_NO_IDENTIFIABLE_DECISION",
     "SLICE_PAGES",
     "UnsupportedSlicePage",
     "WITHHELD_SECTIONS",
+    "filter_catalog",
 ]
