@@ -40,6 +40,11 @@ from app.opip.decision.models import DecisionOutcome
 from app.opip.decision.observer import NullScanObserver, OPipScanObserver
 
 from tests.test_profit_ranking import _configure_pipeline
+from tests.ml_dependency_policy import (
+    RELEVANT_MANIFESTS,
+    manifest_file_violations,
+    package_import_violations,
+)
 
 
 OPIP_PACKAGE = Path("app/opip")
@@ -374,21 +379,16 @@ def test_opip_modules_reference_no_futures_surface():
 def test_no_ml_dependency_is_introduced():
     """No model package is declared or imported by the decision package.
 
-    Evidence-based since `ATDD-DECISION-SAFETY-SCAN-v1`: the scan reads declared
-    distribution names from every requirement file and `pyproject.toml`, and
-    inspects real imports with `ast`. Ordinary English that merely contains
-    `shap` (as in `shape` or `authority-shaped`) is no longer treated as a model
-    dependency, while an actual prohibited distribution or import still fails
-    this test. Since `ATDD-DECISION-SAFETY-SCAN-v2` a dependency include that
-    cannot be read fails closed, a module reached through a literal dynamic
-    import is inspected, and an unprovable dynamic-import call is refused
-    instead of skipped. The test name and its criterion citation are unchanged.
+    The prohibition is unchanged; the detection delegates to the shared policy
+    (`tests.ml_dependency_policy`). Static imports and the supported
+    dynamic-import paths are read from the module AST, and the declared
+    manifests are parsed as requirements, so an ML dependency or a declared ML
+    distribution is still caught while ordinary prose that merely contains
+    `shap` is not. Anything the policy cannot prove fails closed.
     """
-    modules = sorted(OPIP_PACKAGE.rglob("*.py"))
-    assert _declared_prohibited(_dependency_declarations()) == ()
-    assert _prohibited_imports_in_paths(modules) == ()
-    assert _prohibited_dynamic_imports_in_paths(modules) == ()
-    assert _unprovable_dynamic_imports_in_paths(modules) == ()
+    assert package_import_violations(OPIP_PACKAGE) == ()
+    for name in RELEVANT_MANIFESTS:
+        assert manifest_file_violations(Path(name)) == ()
 
 
 def test_model_version_is_declared_but_unset():
