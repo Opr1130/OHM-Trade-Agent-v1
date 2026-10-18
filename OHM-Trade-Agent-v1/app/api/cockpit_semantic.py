@@ -70,7 +70,7 @@ from app.opip.cockpit.semantic import (
     UnsupportedPage,
 )
 from app.opip.cockpit.semantic_pages import (
-    DELIVERED_PAGES,
+    ALL_PAGES,
     PageReadModel,
     UnsupportedSlicePage,
 )
@@ -138,11 +138,13 @@ def _service() -> SemanticReadService:
 def _read_model() -> PageReadModel:
     """The page read model over a fresh service for this request.
 
-    It serves the delivered page set: the F10-B slice plus the two pages whose facts this
-    plane can reach. The served set is declared by the read model rather than assembled
-    here, so the mounting surface and the served set cannot drift apart.
+    It serves every frozen page, because a page whose panels this plane cannot produce is
+    still a page: serving it lets the operator see which panels are withheld and why, and an
+    absent page would be indistinguishable from a healthy one. The served set is declared by
+    the read model rather than assembled here, so the mounting surface and the served set
+    cannot drift apart. Serving a page claims nothing about it.
     """
-    return PageReadModel(_service(), pages=DELIVERED_PAGES)
+    return PageReadModel(_service(), pages=ALL_PAGES)
 
 
 def _refuse(exc: Exception) -> HTTPException:

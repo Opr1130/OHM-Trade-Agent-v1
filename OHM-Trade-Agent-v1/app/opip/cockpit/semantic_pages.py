@@ -68,7 +68,9 @@ from app.opip.cockpit.semantic import (
     PARITY_STATUS_NOT_VERIFIED,
     PARITY_VERIFIED_PAGES,
     PROOF_REQUIRED,
+    REASON_NO_CANONICAL_AI_COST,
     REASON_NO_CANONICAL_CASH_LEDGER,
+    REASON_NO_CANONICAL_INCIDENT_STORE,
     REASON_NO_MARK_EVIDENCE,
     REASON_QUOTE_CURRENCY_REQUIRED,
     REASON_UNREADABLE,
@@ -108,6 +110,17 @@ SLICE_PAGES: tuple[str, ...] = (
 DELIVERED_PAGES: tuple[str, ...] = SLICE_PAGES + (
     "P4_PAPER_PORTFOLIO",
     "P5_QUALITY_MISSED_OPPORTUNITY",
+)
+
+#: Every frozen page, in inventory order. A page whose every panel this plane cannot produce
+#: is still a page: it is served so the operator can see which panels are withheld and why,
+#: and serving it claims nothing about it. This is the set the read router serves.
+ALL_PAGES: tuple[str, ...] = SLICE_PAGES + (
+    "P4_PAPER_PORTFOLIO",
+    "P5_QUALITY_MISSED_OPPORTUNITY",
+    "P6_COMMITTEE_VALUE_AI_COST",
+    "P7_LEARNING_RELEASES",
+    "P8_INCIDENTS_INFRASTRUCTURE",
 )
 
 #: The row identity a decision-grain join keys on. It is a declared field of the ledger
@@ -189,6 +202,30 @@ WITHHELD_SECTIONS: Mapping[str, tuple[tuple[str, str, str], ...]] = MappingProxy
             ("MFE and MAE retained path evidence", "AC-064", REASON_UPSTREAM_NOT_ON_READ_PLANE),
             ("versioned feasible counterfactual comparison", "AC-065", REASON_UPSTREAM_NOT_ON_READ_PLANE),
             ("pending, censored and incomplete-outcome labels", "AC-066", REASON_UPSTREAM_NOT_ON_READ_PLANE),
+        ),
+        "P6_COMMITTEE_VALUE_AI_COST": (
+            ("Committee trust stage, measured cases and exclusions", "AC-070", REASON_UPSTREAM_NOT_ON_READ_PLANE),
+            ("four-way prospective correctness and false interventions", "AC-071", REASON_UPSTREAM_NOT_ON_READ_PLANE),
+            ("incremental trading net against a matched-policy comparison", "AC-072", REASON_UPSTREAM_NOT_ON_READ_PLANE),
+            ("attributable AI cost by provider, model and attempt", "AC-073", REASON_NO_CANONICAL_AI_COST),
+            ("role, model and provider versions with timeliness and retries", "AC-074", REASON_UPSTREAM_NOT_ON_READ_PLANE),
+        ),
+        "P7_LEARNING_RELEASES": (
+            ("frozen expected outcomes against matured actual outcomes", "AC-080", REASON_UPSTREAM_NOT_ON_READ_PLANE),
+            ("durable weakness findings with severity and recurrence", "AC-081", REASON_UPSTREAM_NOT_ON_READ_PLANE),
+            ("hypothesis, experiment and champion or challenger evidence", "AC-082", REASON_UPSTREAM_NOT_ON_READ_PLANE),
+            ("release identity, profile and compatibility", "AC-083", REASON_UPSTREAM_NOT_ON_READ_PLANE),
+            ("observed adoption and post-change economics", "AC-084", REASON_UPSTREAM_NOT_ON_READ_PLANE),
+            ("promotion, release and activation controls", "AC-085", REASON_UPSTREAM_NOT_ON_READ_PLANE),
+        ),
+        "P8_INCIDENTS_INFRASTRUCTURE": (
+            ("incident inventory, severity and lifecycle", "AC-090", REASON_NO_CANONICAL_INCIDENT_STORE),
+            ("feed coverage gaps and missing intervals", "AC-091", REASON_UPSTREAM_NOT_ON_READ_PLANE),
+            ("projection failure and reconciliation mismatch", "AC-092", REASON_UPSTREAM_NOT_ON_READ_PLANE),
+            ("release identity mismatch", "AC-093", REASON_UPSTREAM_NOT_ON_READ_PLANE),
+            ("F11 protection state and degradation", "AC-094", REASON_UPSTREAM_NOT_ON_READ_PLANE),
+            ("Telegram delivery failures, retries and recovery", "AC-095", REASON_UPSTREAM_NOT_ON_READ_PLANE),
+            ("host CPU, memory, storage and WAL indicators", "AC-096", REASON_UPSTREAM_NOT_ON_READ_PLANE),
         ),
     }
 )
@@ -913,7 +950,11 @@ def _validate_declarations() -> None:
     a criterion identifier and a reason the service itself registers, so a section cannot be
     withdrawn under an invented reason or lost to a typo.
     """
-    for pages, label in ((SLICE_PAGES, "slice"), (DELIVERED_PAGES, "delivered")):
+    for pages, label in (
+        (SLICE_PAGES, "slice"),
+        (DELIVERED_PAGES, "delivered"),
+        (ALL_PAGES, "all"),
+    ):
         for page_id in pages:
             if page_id not in PAGE_BY_ID:
                 raise PageReadModelError(
@@ -968,6 +1009,7 @@ def _validate_declarations() -> None:
 _validate_declarations()
 
 __all__ = [
+    "ALL_PAGES",
     "DELIVERED_PAGES",
     "EXCLUSION_ALIGNMENT_UNPROVEN",
     "EXCLUSION_JOIN_KEY_MISSING",
