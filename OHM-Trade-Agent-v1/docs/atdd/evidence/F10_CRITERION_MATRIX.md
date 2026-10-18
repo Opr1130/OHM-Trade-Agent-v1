@@ -153,8 +153,11 @@ PARITY_VERIFIED_PAGES: 0 of 8
   pages.
 - It does not ratify a threshold, a tolerance, a sample size, a freshness window or a cost bound.
   The threshold policy stays `OWNER_DECISION_REQUIRED`.
-- It does not carry the criteria the census plans for `ATDD-R5-F10-F` or `ATDD-R5-F10-G`,
-  including the accessibility and operator-usefulness criterion and the Telegram criteria. Those
-  increments' own contracts own them, and recording them here would transfer them by accident.
+- It does not carry the criteria the census plans for `ATDD-R5-F10-G`, including the accessibility and
+  operator-usefulness criterion. That increment's own contract owns them, and recording them here
+  would transfer them by accident.
+- The criteria the census plans for `ATDD-R5-F10-F` are **not** among the 54 and are **not** recorded
+  in this matrix. They were delivered by that increment's own contract, under the census's own
+  identifiers, as increment `ATDD-R5-F10-F`; this matrix's rows and totals are unchanged by that work.
 - It changes no runtime behavior, decides no policy and conveys no trading, deployment,
   promotion or release authority.
