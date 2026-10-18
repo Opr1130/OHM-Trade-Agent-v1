@@ -53,6 +53,11 @@ from app.opip.contracts.opportunity_phases import (  # noqa: E402
     episode_from_claim,
 )
 from app.opip.contracts.portfolio import PortfolioStatus  # noqa: E402
+from app.opip.contracts.portfolio_paper_handoff import (  # noqa: E402
+    PaperExecutionLineage,
+    PortfolioPaperHandoffError,
+    build_portfolio_paper_handoffs,
+)
 from app.opip.events.attention import AttentionReason, AttentionState  # noqa: E402
 from app.opip.events.coverage import IntervalEvidence  # noqa: E402
 from app.opip.events.opportunity_engine import (  # noqa: E402
@@ -201,9 +206,58 @@ def _spine_from_episode(episode, snapshot, *, expected_return=EXPECTED_RETURN, r
     return feasibility, forecast, candidate, decision
 
 
-def _decision_trace(outcome, feasibility, forecast, decision) -> tuple:
-    """A point-in-time trace of one traversal, from observation to selection."""
+def _lineage_from_engine(outcome, snapshot, geometry) -> PaperExecutionLineage:
+    """The approved PaperExecutionLineage for the engine-originated traversal.
 
+    Every field is either the engine's own committed identity or the same frozen
+    fixture the independently verified R4-B0 composition uses, so no lineage field
+    is fabricated and none is inferred from a status or a timestamp.
+    """
+
+    return PaperExecutionLineage(
+        snapshot_id=snapshot.snapshot_id,
+        snapshot_cutoff=CLAIM_CUTOFF,
+        instrument_version_id=outcome.episode.instrument_version_id,
+        venue_instrument_id=outcome.episode.venue_instrument_id,
+        cohort_id="COHORT:r4b0",
+        native_symbol="SOL/USD",
+        quote_currency="USD",
+        entry_reference=(geometry.entry_low + geometry.entry_high) / 2,
+        detector_claim_id=outcome.claim_id,
+        decision_context_id="DCTX:" + "0" * 32,
+    )
+
+
+def _handoffs_from_spine(decision, candidate, geometry, lineage, episode_id):
+    """Produce the selection's paper handoffs through the real production callable.
+
+    This builds a dormant, in-process lineage record only: it reserves no capital,
+    invokes no adapter, writes nothing to the canonical store and grants no
+    authority.
+    """
+
+    return build_portfolio_paper_handoffs(
+        decision,
+        candidates={candidate.candidate_id: candidate},
+        geometries={candidate.candidate_id: geometry},
+        lineages={episode_id: lineage},
+        portfolio_version=str(
+            decision.reservation_plan.portfolio_version
+            if decision.reservation_plan is not None
+            else r4b0._capital().portfolio_version
+        ),
+    )
+
+
+def _decision_trace(outcome, feasibility, forecast, candidate, decision, handoffs) -> tuple:
+    """A point-in-time trace of one traversal, from observation to handoff.
+
+    Every element is a contract identity or a canonical representation of one, so
+    two traces can only agree when the same decisions were really produced. No
+    ``repr()`` and no object address is ever recorded.
+    """
+
+    plan = decision.reservation_plan
     return (
         outcome.claim_id,
         outcome.episode_id,
@@ -211,11 +265,45 @@ def _decision_trace(outcome, feasibility, forecast, decision) -> tuple:
         outcome.detector_phase,
         outcome.thesis.horizon_class.value if outcome.thesis else None,
         outcome.thesis.research_only if outcome.thesis else None,
+        outcome.episode.source_claim_id,
+        outcome.episode.instrument_version_id,
+        outcome.episode.venue_instrument_id,
+        feasibility.decision_id,
+        feasibility.episode_id,
         feasibility.disposition.value,
+        forecast.decision_id,
+        forecast.feasibility_decision_id,
+        forecast.episode_id,
         forecast.status.value,
         forecast.abstention_reason.value if forecast.abstention_reason else None,
-        forecast.episode_id,
+        decision.decision_id,
         decision.status.value,
+        candidate.candidate_id,
+        tuple(
+            (row.allocation_id, row.candidate_id, row.episode_id, row.allocated_capital)
+            for row in decision.allocations
+        ),
+        (
+            (plan.plan_id, plan.portfolio_version, plan.window_identity)
+            if plan is not None
+            else None
+        ),
+        tuple(
+            (
+                handoff.handoff_id,
+                handoff.execution_candidate_id,
+                handoff.economic_candidate_id,
+                handoff.detector_claim_id,
+                handoff.episode_id,
+                handoff.feasibility_decision_id,
+                handoff.forecast_id,
+                handoff.portfolio_decision_id,
+                handoff.allocation_id,
+                handoff.reservation_plan_id,
+                handoff.geometry_id,
+            )
+            for handoff in handoffs
+        ),
     )
 
 
@@ -469,28 +557,151 @@ def test_ac_212_the_joined_traversal_matches_the_spine_composition():
 
     GIVEN the joined traversal and the independently verified R4-B0 composition over
     the same frozen fixtures
-    WHEN their claim, episode, snapshot, feasibility, forecast and selection
-    identities are compared
-    THEN every one agrees, so driving the spine from the engine's real output is the
-    same traversal the spine already proved, not a second one
+    WHEN the claim, episode, snapshot, feasibility, forecast and selection identities
+    are compared directly, and the joined selection is projected through the real
+    paper-handoff callable
+    THEN every decision identity agrees with the composition, each decision keeps the
+    lineage of the one before it, the joined selection produces exactly one handoff
+    that restates those identities, and a composition over different evidence cannot
+    satisfy the same comparison
     """
 
     _engine_, snapshot, _cycle, outcome = _front_half()
-    feasibility, forecast, _candidate, decision = _spine_from_episode(
+    feasibility, forecast, candidate, decision = _spine_from_episode(
         outcome.episode, snapshot
     )
     composition = r4b0._compose(direction="LONG")
 
+    # --- AC-212-A: F1-F4 identity continuity -------------------------------
     assert outcome.claim_id == composition.claim.claim_id
     assert outcome.episode_id == composition.episode.episode_id
     assert outcome.snapshot_id == composition.snapshot.snapshot_id
-    assert feasibility.disposition is composition.feasibility.disposition
-    assert forecast.status is composition.forecast.status
+
+    # Structural lineage, not three loose identifiers.
+    assert outcome.episode.source_claim_id == outcome.claim_id
+    assert outcome.episode.source_claim_id == composition.episode.source_claim_id
+    assert (
+        outcome.episode.instrument_version_id
+        == composition.episode.instrument_version_id
+    )
+    assert outcome.episode.venue_instrument_id == composition.episode.venue_instrument_id
+    assert outcome.episode.snapshot_id == outcome.snapshot_id
+    assert outcome.episode.snapshot_id == composition.episode.snapshot_id
+    assert composition.claim.snapshot_id == composition.snapshot.snapshot_id
+    assert composition.claim.evaluation_cutoff == CLAIM_CUTOFF
+
+    # --- AC-212-B: F5 feasibility identity ---------------------------------
+    assert feasibility.disposition is FeasibilityDisposition.FEASIBLE
+    assert composition.feasibility.disposition is FeasibilityDisposition.FEASIBLE
+    assert feasibility.decision_id == composition.feasibility.decision_id
+    assert feasibility.decision_id.startswith("FEAS:")
+    assert feasibility.episode_id == outcome.episode_id
+    assert feasibility.episode_id == composition.feasibility.episode_id
+    assert feasibility.detector_snapshot_id == snapshot.snapshot_id
+    assert (
+        composition.feasibility.detector_snapshot_id
+        == composition.snapshot.snapshot_id
+    )
+
+    # --- AC-212-C: F6 forecast identity ------------------------------------
+    assert forecast.status is ForecastStatus.FORECAST
+    assert composition.forecast.status is ForecastStatus.FORECAST
+    assert forecast.decision_id == composition.forecast.decision_id
+    assert forecast.decision_id.startswith("FCST:")
+    assert forecast.episode_id == outcome.episode_id
+    assert forecast.feasibility_decision_id == feasibility.decision_id
+    assert (
+        forecast.feasibility_decision_id
+        == composition.forecast.feasibility_decision_id
+    )
+    assert composition.forecast.episode_id == composition.episode.episode_id
+    assert (
+        composition.forecast.feasibility_decision_id
+        == composition.feasibility.decision_id
+    )
+    # A matching status and a matching economy are corroboration, never the proof.
     assert forecast.expected_return_unconditional == (
         composition.forecast.expected_return_unconditional
     )
-    assert decision.status is composition.decision.status
-    assert len(composition.handoffs) >= 0
+    assert forecast.valid_until == composition.forecast.valid_until
+
+    # --- AC-212-D: F7 selection identity -----------------------------------
+    assert decision.status is PortfolioStatus.SELECTED
+    assert composition.decision.status is PortfolioStatus.SELECTED
+    assert decision.decision_id == composition.decision.decision_id
+    assert decision.decision_id.startswith("PSEL:")
+    assert candidate.candidate_id == composition.candidate.candidate_id
+
+    assert decision.allocations != ()
+    assert composition.decision.allocations != ()
+    assert [row.allocation_id for row in decision.allocations] == [
+        row.allocation_id for row in composition.decision.allocations
+    ]
+    assert [row.candidate_id for row in decision.allocations] == [
+        row.candidate_id for row in composition.decision.allocations
+    ]
+    assert [row.episode_id for row in decision.allocations] == [
+        row.episode_id for row in composition.decision.allocations
+    ]
+    assert decision.allocations[0].episode_id == outcome.episode_id
+    assert decision.allocations[0].allocated_capital == pytest.approx(
+        composition.decision.allocations[0].allocated_capital
+    )
+
+    assert decision.reservation_plan is not None
+    assert composition.decision.reservation_plan is not None
+    assert decision.reservation_plan.plan_id == (
+        composition.decision.reservation_plan.plan_id
+    )
+    assert decision.reservation_plan.plan_id.startswith("PRSV:")
+    assert decision.reservation_plan.portfolio_version == (
+        composition.decision.reservation_plan.portfolio_version
+    )
+    assert decision.reservation_plan.window_identity == (
+        composition.decision.reservation_plan.window_identity
+    )
+
+    # --- AC-212-E: the selection's handoff restates those identities --------
+    lineage = _lineage_from_engine(outcome, snapshot, composition.geometry)
+    assert lineage == composition.lineage
+
+    handoffs = _handoffs_from_spine(
+        decision, candidate, composition.geometry, lineage, outcome.episode_id
+    )
+    assert len(handoffs) == len(composition.handoffs) == 1
+    joined = handoffs[0]
+    reference = composition.handoffs[0]
+    assert joined.handoff_id == reference.handoff_id
+    assert joined.execution_candidate_id == reference.execution_candidate_id
+    assert joined.economic_candidate_id == reference.economic_candidate_id
+    assert joined.detector_claim_id == outcome.claim_id
+    assert joined.episode_id == outcome.episode_id
+    assert joined.snapshot_id == outcome.snapshot_id
+    assert joined.instrument_version_id == outcome.episode.instrument_version_id
+    assert joined.feasibility_decision_id == feasibility.decision_id
+    assert joined.forecast_id == forecast.decision_id
+    assert joined.portfolio_decision_id == decision.decision_id
+    assert joined.allocation_id == decision.allocations[0].allocation_id
+    assert joined.reservation_plan_id == decision.reservation_plan.plan_id
+    assert joined.geometry_id == reference.geometry_id
+    assert joined.portfolio_version == decision.reservation_plan.portfolio_version
+
+    # --- mutation sensitivity: the comparison must be able to fail ----------
+    foreign = r4b0._compose(direction="SHORT")
+    assert foreign.feasibility.decision_id != feasibility.decision_id
+    assert foreign.forecast.decision_id != forecast.decision_id
+    assert foreign.decision.decision_id != decision.decision_id
+
+    # The handoff also depends on real lineage propagation: without the selected
+    # episode's lineage the production callable refuses rather than inventing one.
+    with pytest.raises(PortfolioPaperHandoffError):
+        build_portfolio_paper_handoffs(
+            decision,
+            candidates={candidate.candidate_id: candidate},
+            geometries={candidate.candidate_id: composition.geometry},
+            lineages={},
+            portfolio_version=str(decision.reservation_plan.portfolio_version),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -503,19 +714,42 @@ def test_ac_213_the_whole_traversal_replays_to_one_identical_trace():
     """ATDD-R5-M02-pipeline-seam-integration/AC-213: replay is the same decision.
 
     GIVEN the joined traversal run twice from a fresh engine
-    WHEN the point-in-time trace from observation to selection is compared
-    THEN both traces are identical element for element, and a duplicate observation
-    of an already evaluated instant produces no second claim, so replay cannot
-    double-count an opportunity
+    WHEN the point-in-time trace from observation to handoff is compared, including
+    the feasibility, forecast, selection, allocation, reservation and handoff
+    identities
+    THEN both traces are identical element for element, both really produced every
+    downstream decision, and a duplicate observation of an already evaluated instant
+    produces no second claim, so replay cannot double-count an opportunity
     """
 
     traces = []
     for _ in range(2):
         engine, snapshot, _cycle, outcome = _front_half()
-        feasibility, forecast, _candidate, decision = _spine_from_episode(
+        feasibility, forecast, candidate, decision = _spine_from_episode(
             outcome.episode, snapshot
         )
-        traces.append(_decision_trace(outcome, feasibility, forecast, decision))
+        geometry = r4b0._geometry(direction="LONG")
+        lineage = _lineage_from_engine(outcome, snapshot, geometry)
+        handoffs = _handoffs_from_spine(
+            decision, candidate, geometry, lineage, outcome.episode_id
+        )
+
+        # Non-vacuous controls: this traversal really produced F5, F6, F7 and a
+        # handoff, so an identical trace cannot be the agreement of two failures.
+        assert feasibility.decision_id.startswith("FEAS:")
+        assert forecast.decision_id.startswith("FCST:")
+        assert forecast.feasibility_decision_id == feasibility.decision_id
+        assert forecast.episode_id == outcome.episode_id
+        assert decision.decision_id.startswith("PSEL:")
+        assert decision.allocations
+        assert decision.reservation_plan is not None
+        assert len(handoffs) == 1
+
+        traces.append(
+            _decision_trace(
+                outcome, feasibility, forecast, candidate, decision, handoffs
+            )
+        )
 
         # At-least-once delivery of an observation the engine has already evaluated.
         _observe(engine, CLAIM_CUTOFF)
