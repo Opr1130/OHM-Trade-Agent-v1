@@ -1231,3 +1231,1145 @@ def total_for_kind(measures: Iterable[MeasureRecord], *, kind: MeasureKind) -> f
                 "a time"
             )
     return math.fsum(row.value for row in rows)
+
+
+# R5-F prospective outcome integration (SC-10, SC-12)
+#
+# The learning half of the chain the R5-E slice opened: a frozen prospective
+# expectation is joined to the committed canonical terminal paper outcome the
+# canonical writer already owns, and the join is turned into economic truth,
+# capital time, a named root cause, a named consumption disposition and a paired
+# prospective champion/challenger comparison.
+#
+# It stays evidence and nothing else, exactly as ``SC-10`` freezes it: it holds no
+# order, no clock of its own, no durable write, no storage handle, no venue
+# client, no authority and no runtime consumer. The canonical outcome is supplied
+# by the caller as the validated payload of one committed terminal outcome that
+# was read back through the read-only reader, and the committed fill count is
+# supplied by the caller's committed execution evidence rather than being
+# inferred, so no figure here is guessed.
+#
+# Money is in quote-currency units, duration is in seconds and every share is
+# dimensionless; the unit of each reported figure is declared on its own record.
+
+#: The absolute window within which the committed net of a canonical outcome must
+#: equal its own gross minus its fees. It matches the canonical contract's own
+#: consistency window, so a cost deducted twice is detected rather than divided.
+CANONICAL_ECONOMICS_TOLERANCE = 1e-6
+
+#: The canonical terminal status whose outcome asserts realized economics. The
+#: other terminal statuses assert nothing realised or nothing knowable, so they
+#: yield no facts rather than zeros.
+CANONICAL_CLOSED_STATUS = "CLOSED"
+
+#: The exact evidence keys one ex-ante decision capture must carry.
+DECISION_EVIDENCE_KEYS: tuple[str, ...] = (
+    "grain_id",
+    "entity",
+    "policy_id",
+    "horizon",
+    "revision",
+    "population",
+    "decision_at_utc",
+    "cutoff",
+    "maturity_at",
+    "recorded_at",
+    "baseline_id",
+    "baseline_description",
+    "measure_kinds",
+    "correction_of",
+    "expected_net_return",
+    "expected_duration_seconds",
+    "expected_cost_dollars",
+    "expected_horizon_seconds",
+)
+
+
+class LearningRootCause(str, Enum):
+    """The closed structural causes of a realized shortfall or its absence."""
+
+    NO_VERIFIED_OUTCOME = "NO_VERIFIED_OUTCOME"
+    HORIZON_MISMATCH = "HORIZON_MISMATCH"
+    COST_DRAG = "COST_DRAG"
+    EXECUTION_TIMING = "EXECUTION_TIMING"
+    MARKET_ADVERSE_MOVE = "MARKET_ADVERSE_MOVE"
+    OUTCOME_MET_EXPECTATION = "OUTCOME_MET_EXPECTATION"
+
+
+#: The frozen precedence of the root-cause classes. The first class that the
+#: evidence supports is the classification, so a horizon breach is never reported
+#: as a cost overrun and a met expectation is never reported as a shortfall.
+ROOT_CAUSE_PRECEDENCE: tuple[str, ...] = tuple(
+    cause.value for cause in LearningRootCause
+)
+
+ROOT_CAUSE_REASON_NO_FACTS = "NO_VERIFIED_OUTCOME_FACTS"
+ROOT_CAUSE_REASON_HORIZON = "REALISED_DURATION_BEYOND_DECLARED_HORIZON"
+ROOT_CAUSE_REASON_COST = "REALISED_COST_BEYOND_EXPECTED_COST"
+ROOT_CAUSE_REASON_TIMING = "REALISED_DURATION_BEFORE_EXPECTED_DURATION"
+ROOT_CAUSE_REASON_ADVERSE = "REALISED_NET_BELOW_EXPECTED_WITH_FULL_HORIZON"
+ROOT_CAUSE_REASON_MET = "REALISED_NET_MET_EXPECTED"
+
+
+class LearningDisposition(str, Enum):
+    """The closed consumption dispositions one learning artifact can receive.
+
+    A disposition says how an artifact may be consumed as evidence. It never
+    authorizes a policy, a trade decision or a size: ``LIVE`` means the artifact
+    is reachable from the live read path as evidence, not that it holds authority.
+    """
+
+    LIVE = "LIVE"
+    ADVISORY = "ADVISORY"
+    SHADOW = "SHADOW"
+    REJECTED = "REJECTED"
+    QUARANTINED = "QUARANTINED"
+    SUPERSEDED = "SUPERSEDED"
+
+
+#: The closed disposition vocabulary, in its declared order.
+LEARNING_DISPOSITIONS: tuple[str, ...] = tuple(
+    disposition.value for disposition in LearningDisposition
+)
+
+#: The frozen precedence of the dispositions. The first rule the artifact matches
+#: is its disposition, so an unusable artifact is always quarantined and never
+#: silently dropped, and a superseded revision is never consumed as current.
+DISPOSITION_PRECEDENCE: tuple[str, ...] = (
+    LearningDisposition.QUARANTINED.value,
+    LearningDisposition.SUPERSEDED.value,
+    LearningDisposition.REJECTED.value,
+    LearningDisposition.SHADOW.value,
+    LearningDisposition.LIVE.value,
+    LearningDisposition.ADVISORY.value,
+)
+
+DISPOSITION_REASON_NO_REALIZED_KIND = "NO_REALIZED_MEASURE_KIND_DECLARED"
+DISPOSITION_REASON_MATURED_TAKEN = "MATURED_REALIZED_OUTCOME_CONSUMED_AS_EVIDENCE"
+
+
+@dataclass(frozen=True)
+class AttachedOutcome:
+    """One frozen expectation and the committed evidence resolved against it.
+
+    It is one artifact: the frozen expectation, the closed outcome resolution, the
+    committed attachment when one was verified, the committed capital the episode
+    occupied when it was verified, and the integrity reason when the evidence
+    could not be verified at all. An artifact is never dropped: an unusable one
+    keeps its identity and carries the reason it could not be used.
+    """
+
+    expectation: ProspectiveExpectation
+    resolution: OutcomeResolution
+    attachment: ExpectationAttachment | None = None
+    committed_capital: float | None = None
+    integrity_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.expectation, ProspectiveExpectation):
+            raise ExpectationError("expectation must be a ProspectiveExpectation")
+        if not isinstance(self.resolution, OutcomeResolution):
+            raise ExpectationError("resolution must be an OutcomeResolution")
+        if self.attachment is not None:
+            if not isinstance(self.attachment, ExpectationAttachment):
+                raise ExpectationError("attachment must be an ExpectationAttachment")
+            if self.attachment.expectation_id != self.expectation.expectation_id:
+                raise ExpectationError("an attachment belongs to the expectation it measures")
+        if self.committed_capital is not None:
+            object.__setattr__(
+                self,
+                "committed_capital",
+                _expectation_number(
+                    self.committed_capital,
+                    field_name="committed_capital",
+                    minimum=0.0,
+                ),
+            )
+        if self.integrity_reason is not None:
+            object.__setattr__(
+                self,
+                "integrity_reason",
+                _expectation_text(self.integrity_reason, field_name="integrity_reason"),
+            )
+
+    @property
+    def expectation_id(self) -> str:
+        return self.expectation.expectation_id
+
+    @property
+    def grain_id(self) -> str:
+        return self.expectation.grain.grain_id
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "expectation_id": self.expectation.expectation_id,
+            "grain_id": self.expectation.grain.grain_id,
+            "population": self.expectation.population.value,
+            "status": self.resolution.status.value,
+            "reasons": [reason.value for reason in self.resolution.reasons],
+            "expected_hash": self.expectation.expected_hash,
+            "facts": self.attachment.facts.as_dict() if self.attachment else None,
+            "committed_capital": self.committed_capital,
+            "integrity_reason": self.integrity_reason,
+            "measurement_only": True,
+        }
+
+
+def capture_expectation_from_decision(
+    decision: Mapping[str, Any],
+) -> ProspectiveExpectation:
+    """Freeze one prospective expectation from ex-ante decision evidence.
+
+    The evidence key set is exact, the decision's own clock must fall at or before
+    the cutoff, and the record is then frozen by the existing capture seam, so a
+    capture recorded after its own cutoff, built from evidence dated after it, or
+    carrying an unexpected key is refused rather than recorded.
+    """
+
+    body = _expectation_mapping(
+        decision, field_name="decision", expected_keys=DECISION_EVIDENCE_KEYS
+    )
+    decision_at = _expectation_instant_from_text(
+        body["decision_at_utc"], field_name="decision_at_utc"
+    )
+    cutoff = _expectation_instant_from_text(body["cutoff"], field_name="cutoff")
+    if decision_at > cutoff:
+        raise ExpectationError(
+            "a decision clock that falls after the cutoff is hindsight contamination"
+        )
+
+    raw_kinds = body["measure_kinds"]
+    if isinstance(raw_kinds, (str, MeasureKind)) or not isinstance(raw_kinds, Sequence):
+        raise ExpectationError("measure_kinds must be a sequence of measure kinds")
+
+    return freeze_expectation(
+        grain=ExpectationGrain(
+            grain_id=body["grain_id"],
+            entity=body["entity"],
+            policy_id=body["policy_id"],
+            horizon=body["horizon"],
+            revision=body["revision"],
+        ),
+        population=body["population"],
+        expected_payload=ExpectedOutcome(
+            expected_net_return=body["expected_net_return"],
+            expected_duration_seconds=body["expected_duration_seconds"],
+            expected_cost_dollars=body["expected_cost_dollars"],
+            expected_horizon_seconds=body["expected_horizon_seconds"],
+        ),
+        cutoff=cutoff,
+        maturity_at=_expectation_instant_from_text(
+            body["maturity_at"], field_name="maturity_at"
+        ),
+        recorded_at=_expectation_instant_from_text(
+            body["recorded_at"], field_name="recorded_at"
+        ),
+        baseline=ExpectationBaseline(
+            baseline_id=body["baseline_id"],
+            description=body["baseline_description"],
+        ),
+        measure_kinds=tuple(raw_kinds),
+        correction_of=body["correction_of"],
+    )
+
+
+def _coverage_share(value: Any) -> float | None:
+    """A measured coverage share of the declared window, or nothing measured."""
+
+    if value is None:
+        return None
+    share = _expectation_number(value, field_name="coverage", minimum=0.0)
+    if share > 1.0:
+        raise ExpectationError("coverage cannot exceed the declared window it measures")
+    return share
+
+
+def outcome_facts_from_canonical_outcome(
+    payload: Mapping[str, Any],
+    *,
+    committed_fill_count: int,
+) -> OutcomeFacts:
+    """Derive attachment facts from one committed canonical terminal outcome.
+
+    Only a closed outcome asserts realized economics: a cancelled outcome realised
+    nothing and an unresolved one knows nothing, so both yield no facts rather than
+    zeros. The committed fill count is supplied by the caller's committed
+    execution evidence instead of being inferred. The committed net must equal the
+    payload's own gross minus its fees, so a cost deducted twice is refused, and
+    the duration is measured from the payload's own committed timestamps.
+    """
+
+    if not isinstance(payload, Mapping):
+        raise ExpectationError("a canonical outcome must be a mapping")
+    status = str(payload.get("terminal_status") or "").strip().upper()
+    if status != CANONICAL_CLOSED_STATUS:
+        raise ExpectationError(
+            f"a {status or 'non-terminal'} outcome asserts no realised economics, so "
+            "it yields no attachment facts and never zeros"
+        )
+
+    if isinstance(committed_fill_count, bool) or not isinstance(committed_fill_count, int):
+        raise ExpectationError("committed_fill_count must be an integer")
+    if committed_fill_count < 1:
+        raise ExpectationError("an attachment requires at least one committed fill")
+
+    gross = _expectation_number(payload.get("gross_pnl"), field_name="gross_pnl")
+    fees = _expectation_number(
+        payload.get("fees_paid"), field_name="fees_paid", minimum=0.0
+    )
+    net = _expectation_number(payload.get("net_pnl"), field_name="net_pnl")
+    if abs(net - (gross - fees)) > CANONICAL_ECONOMICS_TOLERANCE:
+        raise ExpectationError(
+            "the committed net disagrees with its gross minus its fees, so a cost "
+            "was not deducted exactly once"
+        )
+
+    entry = _expectation_instant_from_text(
+        payload.get("entry_timestamp"), field_name="entry_timestamp"
+    )
+    exit_at = _expectation_instant_from_text(
+        payload.get("exit_timestamp"), field_name="exit_timestamp"
+    )
+    if exit_at < entry:
+        raise ExpectationError("a committed outcome cannot exit before it entered")
+
+    return OutcomeFacts(
+        fill_count=committed_fill_count,
+        net_return=net,
+        duration_seconds=(exit_at - entry).total_seconds(),
+        cost_dollars=fees,
+    )
+
+
+def attach_canonical_outcome(
+    expectation: ProspectiveExpectation,
+    payload: Mapping[str, Any],
+    *,
+    committed_fill_count: int,
+    recorded_at: datetime,
+    coverage: float | None = None,
+) -> AttachedOutcome:
+    """Join one frozen expectation to one committed canonical outcome.
+
+    The facts are derived from the committed payload, the attachment is legal only
+    after the cutoff, at or after the maturity horizon and at or after the moment
+    the episode itself exited, and the closed outcome status is then resolved with
+    the measured coverage. The frozen expectation is never rewritten: a refused
+    attachment leaves it exactly as it was.
+    """
+
+    if not isinstance(expectation, ProspectiveExpectation):
+        raise ExpectationError("expectation must be a ProspectiveExpectation")
+    facts = outcome_facts_from_canonical_outcome(
+        payload, committed_fill_count=committed_fill_count
+    )
+    moment = _expectation_utc(recorded_at, field_name="recorded_at")
+    exit_at = _expectation_instant_from_text(
+        payload.get("exit_timestamp"), field_name="exit_timestamp"
+    )
+    if moment < exit_at:
+        raise ExpectationError(
+            "an outcome cannot be attached before the episode it describes has exited"
+        )
+    capital = _expectation_number(
+        payload.get("capital_committed"), field_name="capital_committed", minimum=0.0
+    )
+    attachment = attach_outcome(expectation, facts, recorded_at=moment)
+    resolution = resolve_outcome_status(
+        expectation,
+        evaluated_at=moment,
+        attachment=attachment,
+        coverage=_coverage_share(coverage),
+    )
+    return AttachedOutcome(
+        expectation=expectation,
+        resolution=resolution,
+        attachment=attachment,
+        committed_capital=capital,
+    )
+
+
+def assess_unattached_expectation(
+    expectation: ProspectiveExpectation,
+    *,
+    evaluated_at: datetime,
+    coverage: float | None = None,
+    censored: OutcomeStatusReason | None = None,
+) -> AttachedOutcome:
+    """Resolve the outcome status of a frozen expectation with no attachment.
+
+    No facts were verified, so nothing is claimed: the artifact keeps its identity
+    and reports pending, censored or insufficient evidence with its own reasons
+    rather than being measured as a result.
+    """
+
+    if not isinstance(expectation, ProspectiveExpectation):
+        raise ExpectationError("expectation must be a ProspectiveExpectation")
+    resolution = resolve_outcome_status(
+        expectation,
+        evaluated_at=evaluated_at,
+        coverage=_coverage_share(coverage),
+        censored=censored,
+    )
+    return AttachedOutcome(expectation=expectation, resolution=resolution)
+
+
+def mark_unusable_expectation(
+    expectation: ProspectiveExpectation,
+    *,
+    evaluated_at: datetime,
+    reason: str,
+) -> AttachedOutcome:
+    """Keep one artifact whose committed evidence could not be verified.
+
+    The reason is recorded with the artifact and the outcome stays insufficient
+    evidence, so unusable evidence is quarantined with its cause instead of being
+    dropped, defaulted to zero or reported as a break-even result.
+    """
+
+    if not isinstance(expectation, ProspectiveExpectation):
+        raise ExpectationError("expectation must be a ProspectiveExpectation")
+    text = _expectation_text(reason, field_name="reason")
+    resolution = resolve_outcome_status(expectation, evaluated_at=evaluated_at)
+    return AttachedOutcome(
+        expectation=expectation, resolution=resolution, integrity_reason=text
+    )
+
+
+def _support_threshold(value: Any) -> int:
+    """A declared minimum support, which is a caller parameter and no policy."""
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ExpectationError("minimum_support must be an integer")
+    if value < 2:
+        raise ExpectationError("minimum_support must be at least 2")
+    return value
+
+
+def _measured_rows(
+    expectations: Iterable[AttachedOutcome], wanted: Population
+) -> tuple[AttachedOutcome, ...]:
+    """Validate one population's matured, verified artifacts without mixing them.
+
+    An unusable artifact, an artifact of another population, an artifact whose
+    window has not matured and a grain measured twice are each refused, so a
+    combined or duplicated number can never be produced by accident.
+    """
+
+    rows = tuple(expectations)
+    if not rows:
+        raise ExpectationError("a population evaluation needs at least one artifact")
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, AttachedOutcome):
+            raise ExpectationError("artifacts must be AttachedOutcome records")
+        if row.integrity_reason is not None:
+            raise ExpectationError(
+                "an artifact whose evidence is unusable cannot be measured"
+            )
+        if row.expectation.population is not wanted:
+            raise ExpectationError(
+                f"a {row.expectation.population.value} artifact cannot be measured as "
+                f"{wanted.value}: populations are never mixed"
+            )
+        if row.resolution.status is not OutcomeStatus.MATURED or row.attachment is None:
+            raise ExpectationError(
+                "only a matured, verified outcome carries a realized measure"
+            )
+        grain_id = row.expectation.grain.grain_id
+        if grain_id in seen:
+            raise ExpectationError(
+                "one grain is measured once: a duplicate artifact is refused"
+            )
+        seen.add(grain_id)
+    return rows
+
+
+def _committed_capital(rows: tuple[AttachedOutcome, ...]) -> float:
+    """The committed capital of every episode, which an occupancy view needs."""
+
+    if any(row.committed_capital is None for row in rows):
+        raise ExpectationError(
+            "an occupancy view needs the committed capital of every episode"
+        )
+    return math.fsum(float(row.committed_capital) for row in rows)
+
+
+def realized_outcome_measures(
+    attached: Iterable[AttachedOutcome],
+    *,
+    population: Population | None = None,
+) -> tuple[MeasureRecord, ...]:
+    """One realized measure per matured grain, and never another kind.
+
+    The series is built from verified realized outcomes only, so a counterfactual
+    or hindsight value can never enter it, and it is never mixed across
+    populations or duplicated at one grain.
+    """
+
+    rows = tuple(attached)
+    if not rows:
+        raise ExpectationError("a realized measure series needs at least one artifact")
+    if population is None:
+        populations = {
+            row.expectation.population
+            for row in rows
+            if isinstance(row, AttachedOutcome)
+        }
+        if not populations:
+            raise ExpectationError("artifacts must be AttachedOutcome records")
+        if len(populations) != 1:
+            raise ExpectationError(
+                "a realized measure series is never mixed across populations"
+            )
+        wanted = next(iter(populations))
+    else:
+        wanted = _expectation_enum(population, Population, field_name="population")
+    validated = _measured_rows(rows, wanted)
+    return tuple(
+        MeasureRecord(
+            kind=MeasureKind.REALIZED_PAPER_OUTCOME,
+            grain_id=row.expectation.grain.grain_id,
+            value=row.attachment.facts.net_return,
+        )
+        for row in validated
+    )
+
+
+@dataclass(frozen=True)
+class PopulationEconomics:
+    """The realized economic truth of one retained population.
+
+    Every figure is in quote-currency units except the shares, which are
+    dimensionless. ``cost_share`` is the ratio of the summed costs to the summed
+    gross, and ``mean_episode_cost_share_diagnostic`` is the per-episode mean kept
+    beside it as a diagnostic only; the two are reported separately because the
+    ratio of sums is the population truth and the mean of ratios is not.
+    """
+
+    population: Population
+    kind: MeasureKind
+    support: int
+    minimum_support: int
+    support_sufficiency: EvaluationSupport
+    committed_capital: float
+    gross_dollars: float
+    cost_dollars: float
+    net_dollars: float
+    cost_share: float | None
+    mean_episode_cost_share_diagnostic: MetricEstimate
+    net_return_on_capital: float | None
+    net_expectancy: MetricEstimate
+    measurement_only: bool = True
+    authoritative: bool = False
+    can_promote: bool = False
+    affects_live_decisions: bool = False
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "population": self.population.value,
+            "kind": self.kind.value,
+            "support": self.support,
+            "minimum_support": self.minimum_support,
+            "support_sufficiency": self.support_sufficiency.value,
+            "committed_capital": self.committed_capital,
+            "gross_dollars": self.gross_dollars,
+            "cost_dollars": self.cost_dollars,
+            "net_dollars": self.net_dollars,
+            "cost_share": self.cost_share,
+            "mean_episode_cost_share_diagnostic": (
+                self.mean_episode_cost_share_diagnostic.as_dict()
+            ),
+            "net_return_on_capital": self.net_return_on_capital,
+            "net_expectancy": self.net_expectancy.as_dict(),
+            "measurement_only": True,
+            "authoritative": False,
+            "can_promote": False,
+            "affects_live_decisions": False,
+        }
+
+
+def evaluate_population_economics(
+    expectations: Iterable[AttachedOutcome],
+    *,
+    population: Population,
+    minimum_support: int = 30,
+) -> PopulationEconomics:
+    """Evaluate the realized economic truth of exactly one population.
+
+    Operating costs are deducted exactly once, because each committed net already
+    accounts for its own fees and the population total is the sum of those nets;
+    the reported cost share is the ratio of the summed costs to the summed gross,
+    which is the population truth, and the per-episode mean is kept only as a
+    diagnostic. Nothing promotes, nothing becomes authoritative and support is
+    reported rather than assumed.
+    """
+
+    wanted = _expectation_enum(population, Population, field_name="population")
+    threshold = _support_threshold(minimum_support)
+    rows = _measured_rows(expectations, wanted)
+    capital = _committed_capital(rows)
+    nets = [row.attachment.facts.net_return for row in rows]
+    costs = [row.attachment.facts.cost_dollars for row in rows]
+    net_total = math.fsum(nets)
+    cost_total = math.fsum(costs)
+    gross_total = net_total + cost_total
+    episode_shares = [
+        cost / (cost + net) for net, cost in zip(nets, costs) if (cost + net) > 0.0
+    ]
+    measured_shares = (
+        _metric(episode_shares, minimum_support=threshold)
+        if episode_shares
+        else MetricEstimate(
+            n=0,
+            mean=None,
+            ci_low=None,
+            ci_high=None,
+            support=EvaluationSupport.INSUFFICIENT,
+        )
+    )
+    return PopulationEconomics(
+        population=wanted,
+        kind=MeasureKind.REALIZED_PAPER_OUTCOME,
+        support=len(rows),
+        minimum_support=threshold,
+        support_sufficiency=(
+            EvaluationSupport.SUFFICIENT
+            if len(rows) >= threshold
+            else EvaluationSupport.INSUFFICIENT
+        ),
+        committed_capital=capital,
+        gross_dollars=gross_total,
+        cost_dollars=cost_total,
+        net_dollars=net_total,
+        cost_share=(cost_total / gross_total) if gross_total > 0.0 else None,
+        mean_episode_cost_share_diagnostic=measured_shares,
+        net_return_on_capital=(net_total / capital) if capital > 0.0 else None,
+        net_expectancy=_metric(nets, minimum_support=threshold),
+    )
+
+
+@dataclass(frozen=True)
+class CapitalTimeEvaluation:
+    """The occupied capital time of one retained population.
+
+    Occupied capital time is the committed capital multiplied by the realized
+    duration, and it is compared with the capital time the frozen expectations
+    themselves declared. A holding that outlived its own declared horizon is
+    counted and shared as a breach rather than smoothed away.
+    """
+
+    population: Population
+    support: int
+    minimum_support: int
+    support_sufficiency: EvaluationSupport
+    committed_capital: float
+    capital_time_seconds: float
+    expected_capital_time_seconds: float
+    capital_time_utilisation: float | None
+    mean_holding_seconds: MetricEstimate
+    horizon_breaches: int
+    horizon_breach_share: float
+    measurement_only: bool = True
+    affects_live_decisions: bool = False
+    authoritative: bool = False
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "population": self.population.value,
+            "support": self.support,
+            "minimum_support": self.minimum_support,
+            "support_sufficiency": self.support_sufficiency.value,
+            "committed_capital": self.committed_capital,
+            "capital_time_seconds": self.capital_time_seconds,
+            "expected_capital_time_seconds": self.expected_capital_time_seconds,
+            "capital_time_utilisation": self.capital_time_utilisation,
+            "mean_holding_seconds": self.mean_holding_seconds.as_dict(),
+            "horizon_breaches": self.horizon_breaches,
+            "horizon_breach_share": self.horizon_breach_share,
+            "measurement_only": True,
+            "affects_live_decisions": False,
+            "authoritative": False,
+        }
+
+
+def evaluate_capital_time(
+    expectations: Iterable[AttachedOutcome],
+    *,
+    population: Population,
+    minimum_support: int = 30,
+) -> CapitalTimeEvaluation:
+    """Evaluate occupied capital time against the declared horizons.
+
+    The declared horizon is the frozen expectation's own figure, so nothing here
+    invents a holding boundary: the view reports how much capital time was
+    occupied, how much the expectations themselves declared and which episodes
+    outlived the horizon they had declared.
+    """
+
+    wanted = _expectation_enum(population, Population, field_name="population")
+    threshold = _support_threshold(minimum_support)
+    rows = _measured_rows(expectations, wanted)
+    capital = _committed_capital(rows)
+    durations = [row.attachment.facts.duration_seconds for row in rows]
+    occupied = math.fsum(
+        float(row.committed_capital) * row.attachment.facts.duration_seconds
+        for row in rows
+    )
+    declared = math.fsum(
+        float(row.committed_capital)
+        * row.expectation.expected_payload.expected_horizon_seconds
+        for row in rows
+    )
+    breaches = sum(
+        1
+        for row in rows
+        if row.attachment.facts.duration_seconds
+        > row.expectation.expected_payload.expected_horizon_seconds
+    )
+    return CapitalTimeEvaluation(
+        population=wanted,
+        support=len(rows),
+        minimum_support=threshold,
+        support_sufficiency=(
+            EvaluationSupport.SUFFICIENT
+            if len(rows) >= threshold
+            else EvaluationSupport.INSUFFICIENT
+        ),
+        committed_capital=capital,
+        capital_time_seconds=occupied,
+        expected_capital_time_seconds=declared,
+        capital_time_utilisation=(occupied / declared) if declared > 0.0 else None,
+        mean_holding_seconds=_metric(durations, minimum_support=threshold),
+        horizon_breaches=breaches,
+        horizon_breach_share=breaches / len(rows),
+    )
+
+
+@dataclass(frozen=True)
+class RootCauseClassification:
+    """One named structural cause for one artifact, with its own reasons."""
+
+    expectation_id: str
+    grain_id: str
+    population: Population
+    root_cause: LearningRootCause
+    reasons: tuple[str, ...]
+    measurement_only: bool = True
+    affects_live_decisions: bool = False
+    authoritative: bool = False
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "expectation_id": self.expectation_id,
+            "grain_id": self.grain_id,
+            "population": self.population.value,
+            "root_cause": self.root_cause.value,
+            "reasons": list(self.reasons),
+            "measurement_only": True,
+            "affects_live_decisions": False,
+            "authoritative": False,
+        }
+
+
+def classify_root_cause(attached: AttachedOutcome) -> RootCauseClassification:
+    """Classify one artifact's structural root cause by the frozen precedence.
+
+    The evidence is the artifact's own committed facts and the expectation's own
+    declared figures: no external threshold and no hindsight measure takes part.
+    An artifact with no verified outcome yields no cause at all, and the first
+    supported class wins, so a holding that outlived its declared horizon is named
+    a horizon mismatch before anything else is considered.
+    """
+
+    if not isinstance(attached, AttachedOutcome):
+        raise ExpectationError("attached must be an AttachedOutcome")
+    expectation = attached.expectation
+    verified = (
+        attached.integrity_reason is None
+        and attached.attachment is not None
+        and attached.resolution.status is OutcomeStatus.MATURED
+    )
+    if not verified:
+        cause = LearningRootCause.NO_VERIFIED_OUTCOME
+        reasons = (ROOT_CAUSE_REASON_NO_FACTS,)
+    else:
+        facts = attached.attachment.facts
+        expected = expectation.expected_payload
+        if facts.duration_seconds > expected.expected_horizon_seconds:
+            cause = LearningRootCause.HORIZON_MISMATCH
+            reasons = (ROOT_CAUSE_REASON_HORIZON,)
+        elif (
+            facts.net_return < expected.expected_net_return
+            and facts.cost_dollars > expected.expected_cost_dollars
+        ):
+            cause = LearningRootCause.COST_DRAG
+            reasons = (ROOT_CAUSE_REASON_COST,)
+        elif facts.net_return < expected.expected_net_return:
+            if facts.duration_seconds < expected.expected_duration_seconds:
+                cause = LearningRootCause.EXECUTION_TIMING
+                reasons = (ROOT_CAUSE_REASON_TIMING,)
+            else:
+                cause = LearningRootCause.MARKET_ADVERSE_MOVE
+                reasons = (ROOT_CAUSE_REASON_ADVERSE,)
+        else:
+            cause = LearningRootCause.OUTCOME_MET_EXPECTATION
+            reasons = (ROOT_CAUSE_REASON_MET,)
+    return RootCauseClassification(
+        expectation_id=expectation.expectation_id,
+        grain_id=expectation.grain.grain_id,
+        population=expectation.population,
+        root_cause=cause,
+        reasons=reasons,
+    )
+
+
+@dataclass(frozen=True)
+class RepairLineage:
+    """One expectation's place in its repair lineage, resolved to its root."""
+
+    expectation_id: str
+    root_expectation_id: str
+    depth: int
+    chain: tuple[str, ...]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "expectation_id": self.expectation_id,
+            "root_expectation_id": self.root_expectation_id,
+            "depth": self.depth,
+            "chain": list(self.chain),
+        }
+
+
+def resolve_repair_lineage(
+    expectations: Iterable[ProspectiveExpectation],
+) -> tuple[RepairLineage, ...]:
+    """Resolve every correction to its root, and refuse an impossible lineage.
+
+    A correction must name an expectation that is present, of its own grain, at a
+    later revision, recorded at or after the expectation it corrects, and one
+    revision of one grain is claimed only once. A dangling parent, a self-
+    reference, a cycle, an inverted recording and an ambiguous revision therefore
+    fail closed instead of being resolved by a guess.
+    """
+
+    rows = tuple(expectations)
+    if not rows:
+        raise ExpectationError("a repair lineage needs at least one expectation")
+    by_id: dict[str, ProspectiveExpectation] = {}
+    for row in rows:
+        if not isinstance(row, ProspectiveExpectation):
+            raise ExpectationError(
+                "expectations must be ProspectiveExpectation records"
+            )
+        if row.expectation_id in by_id:
+            raise ExpectationError("one identity cannot appear twice in one lineage")
+        by_id[row.expectation_id] = row
+
+    revisions: dict[tuple[str, str, str, str, int], str] = {}
+    for row in rows:
+        key = (
+            row.grain.grain_id,
+            row.grain.entity,
+            row.grain.policy_id,
+            row.grain.horizon,
+            row.grain.revision,
+        )
+        prior = revisions.get(key)
+        if prior is not None and prior != row.expectation_id:
+            raise ExpectationError(
+                "one grain revision is claimed by more than one expectation"
+            )
+        revisions[key] = row.expectation_id
+
+    resolved: list[RepairLineage] = []
+    for row in rows:
+        chain = [row.expectation_id]
+        current = row
+        while current.correction_of is not None:
+            parent = by_id.get(current.correction_of)
+            if parent is None:
+                raise ExpectationError(
+                    "the repair lineage names an unknown expectation: "
+                    f"{current.correction_of}"
+                )
+            if parent.expectation_id in chain:
+                raise ExpectationError("the repair lineage is cyclic")
+            if parent.recorded_at > current.recorded_at:
+                raise ExpectationError(
+                    "a correction cannot be recorded before the expectation it corrects"
+                )
+            if parent.grain.grain_id != current.grain.grain_id:
+                raise ExpectationError(
+                    "a correction must name an expectation of its own grain"
+                )
+            if parent.grain.revision >= current.grain.revision:
+                raise ExpectationError(
+                    "a correction must carry a later revision than the expectation "
+                    "it corrects"
+                )
+            chain.append(parent.expectation_id)
+            current = parent
+        resolved.append(
+            RepairLineage(
+                expectation_id=row.expectation_id,
+                root_expectation_id=chain[-1],
+                depth=len(chain) - 1,
+                chain=tuple(reversed(chain)),
+            )
+        )
+    return tuple(resolved)
+
+
+@dataclass(frozen=True)
+class LearningConsumptionDisposition:
+    """How one learning artifact may be consumed, and nothing more.
+
+    The record names the disposition, the reason it was chosen and the artifact it
+    belongs to. It declares itself evidence only and grants no authority: it can
+    never edit a policy, place an order or change a trade decision, and it never
+    reports the artifact as anything other than evidence.
+    """
+
+    artifact_id: str
+    grain_id: str
+    population: Population
+    disposition: LearningDisposition
+    reason: str
+    consumed_as_evidence_only: bool = True
+    authority_granted: bool = False
+    trade_authority_changed: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "artifact_id",
+            _expectation_text(self.artifact_id, field_name="artifact_id"),
+        )
+        object.__setattr__(
+            self, "grain_id", _expectation_text(self.grain_id, field_name="grain_id")
+        )
+        object.__setattr__(
+            self,
+            "population",
+            _expectation_enum(self.population, Population, field_name="population"),
+        )
+        object.__setattr__(
+            self,
+            "disposition",
+            _expectation_enum(
+                self.disposition, LearningDisposition, field_name="disposition"
+            ),
+        )
+        object.__setattr__(
+            self, "reason", _expectation_text(self.reason, field_name="reason")
+        )
+        if self.consumed_as_evidence_only is not True:
+            raise ExpectationError("a disposition is evidence only")
+        if self.authority_granted is not False:
+            raise ExpectationError("a disposition never grants authority")
+        if self.trade_authority_changed is not False:
+            raise ExpectationError("a disposition never changes trade authority")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "artifact_id": self.artifact_id,
+            "grain_id": self.grain_id,
+            "population": self.population.value,
+            "disposition": self.disposition.value,
+            "reason": self.reason,
+            "consumed_as_evidence_only": True,
+            "authority_granted": False,
+            "trade_authority_changed": False,
+        }
+
+
+def disposition_for(
+    attached: AttachedOutcome,
+    *,
+    superseded_by: str | None = None,
+) -> LearningConsumptionDisposition:
+    """Assign exactly one named consumption disposition to one artifact.
+
+    The frozen precedence decides: unusable evidence is quarantined, a superseded
+    revision is superseded, an artifact whose declared kinds could never carry
+    realized truth is rejected, an unresolved artifact stays shadow, a matured
+    taken outcome is consumed as live evidence and a matured outcome of another
+    retained population is consumed as advisory evidence. Nothing is dropped and
+    nothing is consumed twice.
+    """
+
+    if not isinstance(attached, AttachedOutcome):
+        raise ExpectationError("attached must be an AttachedOutcome")
+    expectation = attached.expectation
+    replacement: str | None = None
+    if superseded_by is not None:
+        replacement = _expectation_text(superseded_by, field_name="superseded_by")
+        if replacement == expectation.expectation_id:
+            raise ExpectationError("an expectation cannot supersede itself")
+
+    if attached.integrity_reason is not None:
+        disposition = LearningDisposition.QUARANTINED
+        reason = attached.integrity_reason
+    elif replacement is not None:
+        disposition = LearningDisposition.SUPERSEDED
+        reason = f"SUPERSEDED_BY:{replacement}"
+    elif not any(
+        kind is MeasureKind.REALIZED_PAPER_OUTCOME for kind in expectation.measure_kinds
+    ):
+        disposition = LearningDisposition.REJECTED
+        reason = DISPOSITION_REASON_NO_REALIZED_KIND
+    elif attached.resolution.status is not OutcomeStatus.MATURED:
+        disposition = LearningDisposition.SHADOW
+        reason = attached.resolution.reasons[0].value
+    elif expectation.population is Population.TAKEN:
+        disposition = LearningDisposition.LIVE
+        reason = DISPOSITION_REASON_MATURED_TAKEN
+    else:
+        disposition = LearningDisposition.ADVISORY
+        reason = f"MATURED_{expectation.population.value}_CONSUMED_AS_ADVISORY"
+    return LearningConsumptionDisposition(
+        artifact_id=expectation.expectation_id,
+        grain_id=expectation.grain.grain_id,
+        population=expectation.population,
+        disposition=disposition,
+        reason=reason,
+    )
+
+
+def assert_every_artifact_has_one_disposition(
+    dispositions: Iterable[LearningConsumptionDisposition],
+) -> tuple[str, ...]:
+    """Prove every artifact received exactly one disposition from the vocabulary.
+
+    An empty retained set and a duplicated artifact are both refused, so the
+    returned tuple is a complete, non-repeated coverage of the artifacts that were
+    supplied rather than a partial view of them.
+    """
+
+    rows = tuple(dispositions)
+    if not rows:
+        raise ExpectationError("a retained set cannot hold zero dispositions")
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, LearningConsumptionDisposition):
+            raise ExpectationError(
+                "dispositions must be LearningConsumptionDisposition records"
+            )
+        if row.artifact_id in seen:
+            raise ExpectationError(
+                "one artifact is consumed once: a duplicate disposition is refused"
+            )
+        seen.add(row.artifact_id)
+        if row.disposition.value not in LEARNING_DISPOSITIONS:
+            raise ExpectationError(
+                f"the disposition {row.disposition.value} is not in the frozen vocabulary"
+            )
+    return tuple(row.disposition.value for row in rows)
+
+
+def _arm_index(arm: Iterable[AttachedOutcome], name: str) -> dict[str, AttachedOutcome]:
+    """Index one arm of a prospective comparison by deduplicated grain."""
+
+    index: dict[str, AttachedOutcome] = {}
+    for row in arm:
+        if not isinstance(row, AttachedOutcome):
+            raise ExpectationError("an arm holds AttachedOutcome records")
+        grain_id = row.expectation.grain.grain_id
+        if grain_id in index:
+            raise ExpectationError(
+                f"the {name} arm declares one grain twice: {grain_id}"
+            )
+        index[grain_id] = row
+    return index
+
+
+def _took_the_episode(row: AttachedOutcome) -> bool:
+    """Whether one arm actually took the episode, on verified committed facts."""
+
+    return (
+        row.integrity_reason is None
+        and row.attachment is not None
+        and row.resolution.status is OutcomeStatus.MATURED
+        and row.expectation.population is Population.TAKEN
+    )
+
+
+def compare_prospective_arms(
+    champion: Iterable[AttachedOutcome],
+    challenger: Iterable[AttachedOutcome],
+    *,
+    minimum_support: int = 30,
+) -> ChampionChallengerEvaluation:
+    """Compare two frozen arms prospectively against one frozen baseline.
+
+    The comparison is paired: both arms must be captured at the same grains under
+    the same frozen baseline and horizon and under two distinct policies. A grain
+    present in only one arm, a grain both arms took and an imputed realized return
+    are all refused, so a realized figure is only ever the committed outcome of the
+    arm that actually took the episode. The paired evaluation, and with it every
+    support, coverage and uncertainty figure, is then delegated to the existing
+    measurement-only champion/challenger seam, whose promotion flags stay false.
+    """
+
+    champion_index = _arm_index(champion, "champion")
+    challenger_index = _arm_index(challenger, "challenger")
+    if not champion_index or not challenger_index:
+        raise ExpectationError("a prospective comparison needs both arms")
+
+    rows = tuple(champion_index.values()) + tuple(challenger_index.values())
+    baselines = {row.expectation.baseline.baseline_id for row in rows}
+    if len(baselines) != 1:
+        raise ExpectationError(
+            "a prospective comparison is measured against one frozen baseline"
+        )
+    horizons = {row.expectation.grain.horizon for row in rows}
+    if len(horizons) != 1:
+        raise ExpectationError(
+            "a prospective comparison measures one horizon at a time"
+        )
+    champion_policies = {
+        row.expectation.grain.policy_id for row in champion_index.values()
+    }
+    challenger_policies = {
+        row.expectation.grain.policy_id for row in challenger_index.values()
+    }
+    if len(champion_policies) != 1 or len(challenger_policies) != 1:
+        raise ExpectationError("each arm is captured under exactly one policy")
+    if champion_policies == challenger_policies:
+        raise ExpectationError("a prospective comparison needs two distinct policies")
+    if set(champion_index) != set(challenger_index):
+        raise ExpectationError(
+            "a prospective comparison is paired: both arms must cover the same grains"
+        )
+
+    baseline_id = next(iter(baselines))
+    horizon = next(iter(horizons))
+    cohort = f"{baseline_id}:{horizon}"
+    samples: list[PairedEvaluationSample] = []
+    for grain_id in sorted(champion_index):
+        champion_row = champion_index[grain_id]
+        challenger_row = challenger_index[grain_id]
+        champion_took = _took_the_episode(champion_row)
+        challenger_took = _took_the_episode(challenger_row)
+        if champion_took and challenger_took:
+            raise ExpectationError(
+                "one episode cannot be taken by both arms, and no realized return "
+                "is imputed from a counterfactual measure"
+            )
+        realized: float | None = None
+        if champion_took and champion_row.attachment is not None:
+            realized = champion_row.attachment.facts.net_return
+        elif challenger_took and challenger_row.attachment is not None:
+            realized = challenger_row.attachment.facts.net_return
+        samples.append(
+            PairedEvaluationSample(
+                sample_id=grain_id,
+                cohort=cohort,
+                champion_admitted=champion_took,
+                challenger_admitted=challenger_took,
+                realized_net_return=realized,
+            )
+        )
+    return evaluate_champion_challenger(samples, minimum_support=minimum_support)
