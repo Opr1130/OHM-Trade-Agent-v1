@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>O'Pip F10 dashboard - read-only</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; padding: 1.25rem 1.5rem 3rem;
+    font: 14px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: #10151c; color: #d7dee8;
+  }
+  h1 { font-size: 1.15rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1rem; margin: 1.5rem 0 .5rem; }
+  .sub { color: #8c9bb0; margin: 0 0 1rem; }
+  .row { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; }
+  .tabs { display: flex; flex-wrap: wrap; gap: .4rem; margin: 1rem 0; }
+  button, input {
+    font: inherit; border-radius: 4px;
+    border: 1px solid #33415a; background: #182231; color: #d7dee8; padding: .35rem .6rem;
+  }
+  button.active { border-color: #3b82f6; background: #1d2b42; }
+  button:hover { border-color: #4b5f7f; }
+  input { min-width: 22ch; }
+  table { border-collapse: collapse; width: 100%; margin: .35rem 0 .75rem; }
+  th, td { border: 1px solid #26313f; padding: .3rem .45rem; text-align: left; vertical-align: top; }
+  th { color: #9fb0c6; font-weight: 600; }
+  .panel { border: 1px solid #26313f; border-radius: 6px; padding: .7rem .8rem; margin: .6rem 0; }
+  .panel h3 { margin: 0 0 .3rem; font-size: .95rem; }
+  .meta { color: #8c9bb0; font-size: .8rem; }
+  .chip { display: inline-block; border-radius: 999px; padding: .05rem .5rem; font-size: .75rem; border: 1px solid; }
+  .s-served { color: #86efac; border-color: #14532d; background: #0f2417; }
+  .s-partial { color: #fde68a; border-color: #78350f; background: #251a0b; }
+  .s-withheld { color: #fca5a5; border-color: #7f1d1d; background: #2a1212; }
+  .s-unknown { color: #cbd5e1; border-color: #33415a; background: #161d28; }
+  .withheld { color: #fca5a5; }
+  pre { white-space: pre-wrap; word-break: break-word; background: #0c1116; border: 1px solid #223041;
+        border-radius: 4px; padding: .5rem; max-height: 22rem; overflow: auto; }
+  .banner { border-left: 3px solid #f59e0b; padding: .4rem .7rem; background: #1c1a12; }
+  #error { color: #fca5a5; }
+</style>
+</head>
+<body>
+<h1>O'Pip F10 semantic dashboard</h1>
+<p class="sub">
+  Read-only. Served by the analytics plane from the verified canonical replica. No page is
+  claimed, no parity is verified, no threshold is ratified, and no value here can override a
+  risk or execution gate.
+</p>
+
+<div class="row">
+  <label for="secret">Cockpit secret</label>
+  <input id="secret" type="password" autocomplete="off" placeholder="OPIP_COCKPIT_SECRET" />
+  <button id="load">Load</button>
+  <span id="status" class="meta"></span>
+</div>
+
+<p class="banner meta" id="posture">
+  Authority, parity and threshold posture load with the page index.
+</p>
+
+<div class="tabs" id="tabs"></div>
+<div id="error"></div>
+<div id="page"></div>
+<div id="index"></div>
+
+<script>
+"use strict";
+
+const API_BASE = "/api/cockpit/semantic";
+let secret = "";
+let current = null;
+
+function esc(value) {
+  return String(value === null || value === undefined ? "" : value)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+function chip(state) {
+  const text = String(state || "UNKNOWN");
+  let cls = "s-unknown";
+  if (text === "SERVED") { cls = "s-served"; }
+  else if (text === "SERVED_PARTIAL" || text === "SERVED_WITHHELD") { cls = "s-partial"; }
+  else if (text === "BLOCKED_BY_UPSTREAM_EVIDENCE" || text === "UNAVAILABLE" || text === "ABSENT") {
+    cls = "s-withheld";
+  }
+  return '<span class="chip ' + cls + '">' + esc(text) + "</span>";
+}
+
+function list(values) {
+  if (!values || !values.length) { return "none"; }
+  return values.map(esc).join(", ");
+}
+
+async function get(path) {
+  const response = await fetch(path, { headers: { "x-webhook-secret": secret } });
+  if (!response.ok) {
+    throw new Error(path + " -> HTTP " + response.status);
+  }
+  return response.json();
+}
+
+function renderWithheld(panel) {
+  return '<div class="withheld">WITHHELD - no value is published for this panel.</div>' +
+    '<div class="meta">reasons: ' + list(panel.panel_reasons) +
+    " | evidence gap: " + esc(panel.evidence_gap || "none") + "</div>";
+}
+
+function renderTable(rows, columns) {
+  let html = "<table><thead><tr>";
+  columns.forEach(function (column) { html += "<th>" + esc(column) + "</th>"; });
+  html += "</tr></thead><tbody>";
+  rows.forEach(function (row) {
+    html += "<tr>";
+    columns.forEach(function (column) {
+      const value = row && typeof row === "object" ? row[column] : undefined;
+      html += "<td>" + esc(
+        value === null || value === undefined ? "-"
+          : (typeof value === "object" ? JSON.stringify(value) : value)
+      ) + "</td>";
+    });
+    html += "</tr>";
+  });
+  return html + "</tbody></table>";
+}
+
+const ENTRY_COLUMNS = [
+  "paper_trade_id", "decision_context_id", "candidate_id", "quote_currency",
+  "policy_version", "evaluation_at", "first_entry_fill_at", "last_exit_fill_at",
+  "lifecycle_status", "economic_result", "exit_mechanisms", "entry_quantity",
+  "exited_quantity", "remaining_quantity", "entry_price_vwap", "exit_price_vwap",
+  "holding_seconds"
+];
+
+function entryColumns(entries) {
+  const present = [];
+  entries.forEach(function (entry) {
+    Object.keys(entry).forEach(function (key) {
+      if (key !== "facts" && present.indexOf(key) === -1) { present.push(key); }
+    });
+  });
+  const ordered = ENTRY_COLUMNS.filter(function (column) { return present.indexOf(column) !== -1; });
+  present.forEach(function (column) {
+    if (ordered.indexOf(column) === -1) { ordered.push(column); }
+  });
+  return ordered;
+}
+
+function renderValue(panel) {
+  const value = panel.value;
+  if (!value) { return '<div class="meta">no value</div>'; }
+  if (value.entries) {
+    const columns = entryColumns(value.entries);
+    let html = '<div class="meta">grain: ' + esc(value.grain) + " | count: " + esc(value.count) +
+      " | watermark: " + esc(value.watermark || "none") + "</div>";
+    html += '<div class="meta">join key: ' + esc(value.join_key) + " | decision key: " +
+      esc(value.decision_key) + " | alignment oracle: " + esc(
+        value.alignment ? value.alignment.oracle : "none") + " (declared by panel: " + esc(
+        value.alignment ? value.alignment.oracle_declared_by_panel : "unknown") + ")</div>";
+    html += renderTable(value.entries.slice(0, 25), columns);
+    html += '<div class="meta">showing ' + (value.entries.length > 25 ? 25 : value.entries.length) +
+      " of " + value.entries.length + " entries; only the fields this panel's declared fact " +
+      "groups publish are shown, and every value is printed exactly as served.</div>";
+    if (value.lineage) {
+      html += '<div class="meta">execution lineage stages (existing projection): ' +
+        list(value.lineage.stages) + " | projection: " +
+        esc(value.lineage_projection_version || "none") + "</div>";
+    }
+    return html;
+  }
+  return "<pre>" + esc(JSON.stringify(value, null, 2)) + "</pre>";
+}
+
+function renderPanel(panel) {
+  let html = '<div class="panel"><h3>' + esc(panel.panel_id) + " - " +
+    esc(panel.operator_question) + "</h3>";
+  html += '<div class="meta">page: ' + esc(panel.page_id) + " | state: " + chip(panel.state) +
+    " | producer: " + esc(panel.producer) + " | service serving: " + esc(panel.serving) + "</div>";
+  html += '<div class="meta">trust rule: ' + esc(panel.trust_rule) +
+    " | drill target: " + esc(panel.drill_target) +
+    " | facts: " + list(panel.facts) + "</div>";
+  html += panel.carries_value ? renderValue(panel) : renderWithheld(panel);
+  if (panel.exclusions && panel.exclusions.length) {
+    html += '<div class="meta">excluded: ' + list(panel.exclusions) + "</div>";
+  }
+  return html + "</div>";
+}
+
+const API_PAGES = "/api/cockpit/semantic/pages";
+const API_PAGE = "/api/cockpit/semantic/pages/";
+
+function renderPage(page) {
+  let html = "<h2>" + esc(page.page_id) + " - " + esc(page.descriptor.adopted_name) + "</h2>";
+  html += '<div class="meta">operator question: ' + esc(page.descriptor.operator_question) + "</div>";
+  html += '<div class="row"><span>page state: ' + chip(page.state) + "</span><span>claimed: " +
+    esc(page.claimed) + "</span><span>evidence state: " +
+    esc(page.descriptor.evidence_state) + "</span></div>";
+  html += '<div class="meta">unmet requirements: ' + list(page.unmet_requirements) + "</div>";
+  html += '<div class="meta">panels: ' + esc(page.panel_counts.service_serving) +
+    " of " + esc(page.panel_counts.total) + " served by disposition, " +
+    esc(page.panel_counts.served) + " published a value in this response, " +
+    esc(page.panel_counts.withheld) + " withheld</div>";
+
+  if (page.withheld_sections && page.withheld_sections.length) {
+    html += "<h3>Withheld sections</h3>";
+    page.withheld_sections.forEach(function (section) {
+      html += '<div class="withheld">' + esc(section.section) + " - requirement " +
+        esc(section.requirement_id) + " - reason " + esc(section.reason) + "</div>";
+    });
+  }
+
+  html += "<h3>Panels</h3>";
+  page.panels.forEach(function (panel) { html += renderPanel(panel); });
+
+  if (page.annexes && page.annexes.row_grain_evidence) {
+    const annex = page.annexes.row_grain_evidence;
+    html += "<h3>Row-grain evidence</h3>";
+    html += '<div class="banner meta">' + esc(annex.presented_as) + " - " +
+      esc(annex.not_a_funnel_reason) + "</div>";
+    html += '<div class="meta">state: ' + chip(annex.state) + " | observations: " +
+      esc(annex.observations) + " | unit: " + esc(annex.unit) + " | exclusions: " +
+      list(annex.exclusions) + "</div>";
+    html += renderTable(annex.rows, ["paper_trade_id", "candidate_id", "episode_id",
+      "cohort_id", "quote_currency", "policy_version"]);
+  }
+
+  html += "<h3>Reconciliation and posture</h3>";
+  html += '<div class="meta">reconciliation: ' + esc(page.reconciliation.status) +
+    " at watermark " + esc(page.reconciliation.watermark || "none") +
+    " | counts-and-P&L reconciliation: " +
+    esc(page.reconciliation.counts_and_pnl_reconciliation) + "</div>";
+  html += '<div class="meta">proof still required: ' +
+    esc(page.reconciliation.counts_and_pnl_proof_required) + "</div>";
+  html += "<pre>" + esc(JSON.stringify(page.reconciliation.recounted || {}, null, 2)) + "</pre>";
+
+  html += "<h3>Envelope</h3>";
+  html += '<div class="meta">authority: ' + esc(page.authority) + " | parity: " +
+    esc(page.parity_status) + " (" + esc(page.parity_verified_pages) + " verified) | thresholds: " +
+    esc(page.thresholds) + "</div>";
+  html += '<div class="meta">watermark: ' + esc(page.watermark || "none") + " | source: " +
+    esc(page.source) + " | semantic: " + esc(page.semantic_version) + " | service: " +
+    esc(page.service_version) + " | read model: " + esc(page.read_model_version) + "</div>";
+  html += '<div class="meta">ledger projection: ' + esc(page.ledger_projection_version) +
+    " | portfolio projection: " + esc(page.portfolio_projection_version) + " | " +
+    esc(mountingPosture(page)) + "</div>";
+  return html;
+}
+
+function renderIndex(data) {
+  let html = "<h2>Page index</h2>";
+  html += '<div class="meta">watermark: ' + esc(data.watermark || "none") +
+    " | read model: " + esc(data.read_model_version) + "</div>";
+  html += "<table><thead><tr><th>page</th><th>state</th><th>panels</th>" +
+    "<th>served</th><th>withheld</th></tr></thead><tbody>";
+  data.pages.forEach(function (entry) {
+    html += "<tr><td>" + esc(entry.page_id) + " - " + esc(entry.adopted_name) + "</td><td>" +
+      chip(entry.state) + "</td><td>" + esc(entry.panel_count) + "</td><td>" +
+      esc(entry.served_panels) + "</td><td>" + esc(entry.withheld_panels) + "</td></tr>";
+  });
+  return html + "</tbody></table>";
+}
+
+function renderTabs(data, active) {
+  const tabs = document.getElementById("tabs");
+  tabs.innerHTML = "";
+  data.pages.forEach(function (entry) {
+    const button = document.createElement("button");
+    button.textContent = entry.adopted_name;
+    if (entry.page_id === active) { button.className = "active"; }
+    button.addEventListener("click", function () { selectPage(entry.page_id); });
+    tabs.appendChild(button);
+  });
+}
+
+function mountingPosture(envelope) {
+  const surface = envelope.read_surface;
+  if (!surface) {
+    return "mounting posture: UNKNOWN - the read model published none";
+  }
+  return "mounted by " + surface.mounting_module + " as " + surface.mounted_routes.length +
+    " declared read routes on " + surface.mounted_on + ", authorized by " +
+    surface.authorized_by_increment + "; the read service module itself mounts " +
+    (surface.service_module_mounts ? "its own routes" : "nothing");
+}
+
+function renderIndexInto(data) {
+  document.getElementById("posture").textContent =
+    "authority " + data.authority + " | parity " + data.parity_status + " (" +
+    data.parity_verified_pages + " of 8 verified) | thresholds " + data.thresholds +
+    " | counts-and-P&L reconciliation " + data.counts_and_pnl_reconciliation +
+    " | " + mountingPosture(data);
+  document.getElementById("index").innerHTML = renderIndex(data);
+}
+
+async function selectPage(pageId) {
+  const error = document.getElementById("error");
+  const target = document.getElementById("page");
+  error.textContent = "";
+  try {
+    const page = await get(API_PAGE + encodeURIComponent(pageId));
+    current = pageId;
+    target.innerHTML = renderPage(page);
+    renderTabs(await get(API_PAGES), current);
+    document.getElementById("status").textContent =
+      "loaded " + pageId + " at " + new Date().toISOString();
+  } catch (exc) {
+    target.innerHTML = "";
+    error.textContent = String(exc);
+  }
+}
+
+/* The secret lives only in this variable for the lifetime of the tab: it is never
+   written to storage, a cookie or disk. Letting a read credential outlive the operator's
+   session would make the page's own claim ("read-only, secret-gated") weaker than it
+   looks, and a persisted copy is a credential the operator did not leave behind. */
+async function load() {
+  const error = document.getElementById("error");
+  error.textContent = "";
+  secret = document.getElementById("secret").value;
+  try {
+    const data = await get(API_PAGES);
+    renderIndexInto(data);
+    renderTabs(data, data.pages.length ? data.pages[0].page_id : null);
+    if (data.pages.length) {
+      await selectPage(data.pages[0].page_id);
+    }
+  } catch (exc) {
+    error.textContent = String(exc);
+  }
+}
+
+document.getElementById("load").addEventListener("click", load);
+</script>
+</body>
+</html>
