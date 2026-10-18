@@ -627,5 +627,38 @@ still passes neither a snapshot source nor a composition callable, so the target
 path stays inert and non-authoritative. Proving the in-process traversal did not
 wire it, activate it, or move any `F1`-`F7` row of the audit matrix.
 
+## Mission 03 - replay determinism (test-only)
+
+Status: `REPLAY EQUALITY PROVEN FOR THE CALLABLE SURFACE, NO APPLICATION CHANGE, NO AUTHORITY ADDED`
+
+The downstream certification recorded a narrow evidence gap: idempotency was proven
+for the R5-F learning surfaces, but no test executed the same R5-F evaluation twice
+and compared the results. This increment closes that gap. It adds no application
+code: the delta is one scope contract, one acceptance module and the movable ATDD
+pointer, and `app/` is byte-identical to the parent landing tip.
+
+| Claim | Source of truth | How it was verified |
+| --- | --- | --- |
+| Identical decision evidence freezes one identical expectation | `app/opip/learning/evaluation.py` `capture_expectation_from_decision` | two independent captures compared on identity, expected-payload hash and canonical serialization; both carry `PEXP` identities and claim no authority |
+| The frozen SC-10 record round-trips losslessly | `ProspectiveExpectation.to_dict` / `from_dict` | the rebuilt record equals the captured one in identity, hash, payload and frozen cut-off, maturity and recorded instants |
+| A forged record fails closed | `ProspectiveExpectation.from_dict` | a rewritten `expected_net_return` is refused rather than loaded |
+| Two independent evaluations produce one identical attachment | `attach_canonical_outcome` | attachment identity, `OutcomeFacts`, committed capital and `OutcomeResolution` compared; facts are `fill_count=1`, `net_return=21`, `cost_dollars=4`, `duration_seconds=21600` |
+| Maturity and consumption are stable under replay | `resolve_outcome_status`, `disposition_for` | status `MATURED` with identical reasons, identical measure series, one `LIVE` evidence-only disposition |
+| Re-delivery adds no second contribution | `realized_outcome_measures`, `assert_every_artifact_has_one_disposition` | repeated derivations identical; the same grain twice in one collection is refused, not summed; a duplicated or empty disposition set is refused |
+| The canonical delivery key is identity-bound | `terminal_outcome_idempotency_key` | stable across calls, equal for one outcome identity carrying different economics, distinct for another identity |
+| Valid delivery order does not change the truth | `evaluate_population_economics` | all six permutations of three grains yield an identical economics record, measure series and normalized disposition set |
+| Invalid time is never order-excused | `attach_canonical_outcome`, `assess_unattached_expectation` | an attachment recorded before the episode's own exit is refused with the same classification every time; an immature window reports `PENDING` and never matures |
+| Failures are classified deterministically | the same callables | hindsight capture, an unverifiable fill count, a duplicated grain and a forged payload each produce the same refusal type and message on both attempts |
+| The learning path grants no authority | `get_release_profiles`, `validate_profile_contract`, record flags, module imports | `EVIDENCE_SHADOW` valid, `TARGET_PAPER` blocked, `PAPER_V2` off; expectation and disposition declare no authority; the module imports no writer, exchange, storage, job, Telegram, network or process surface |
+
+Two limits are recorded in the contract rather than smoothed away. Determinism here
+is behavioural - `identical inputs -> identical outputs` - and is not a claim that
+the module holds no wall-clock dependence anywhere. And the canonical writer's own
+conflict policy for one identity carrying two payloads is exercised only at the
+key-derivation boundary; that refusal belongs to the canonical contract.
+
+Nothing in this increment activated a mode, added a route, wrote a canonical row,
+promoted a policy, ratified a threshold or claimed production proof.
+
 
 
