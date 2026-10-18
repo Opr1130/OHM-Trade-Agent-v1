@@ -43,7 +43,9 @@ Each row carries two governed values that are never collapsed into a score.
 criterion asks about. Exactly one value is used per row:
 
 - `IMPLEMENTED_AND_VERIFIED` - the capability's invariant is asserted by a delivered increment's
-  own acceptance test. It is not a parity verdict.
+  own acceptance test. It is not a parity verdict, it does not mean the census criterion has been
+  approved or transferred out of the increment that owns it, and the row's governance column still
+  records that ownership.
 - `IMPLEMENTED_INSUFFICIENT_PARITY_EVIDENCE` - a panel publishes a real reading, and the
   counts-and-P&L reconciliation the parity predicate requires is not recorded, so parity stays
   `NOT_VERIFIED` for it.
@@ -120,9 +122,9 @@ AC-093 | F10-P8-04 | P8_INCIDENTS_INFRASTRUCTURE | - | DEFERRED_UNCLAIMED | BLOC
 AC-094 | F10-P8-05 | NO_PANEL | - | DEFERRED_UNCLAIMED | BLOCKED_BY_UPSTREAM_EVIDENCE | ATDD-R5-F10-dashboard-parity-implementation | OHM-Trade-Agent-v1/docs/architecture/OPIP_F10_SOURCE_CENSUS.md
 AC-095 | F10-P8-06 | P8_INCIDENTS_INFRASTRUCTURE | - | DEFERRED_UNCLAIMED | BLOCKED_BY_UPSTREAM_EVIDENCE | ATDD-R5-F10-dashboard-parity-implementation | OHM-Trade-Agent-v1/docs/architecture/OPIP_F10_SOURCE_CENSUS.md
 AC-096 | F10-P8-07 | NO_PANEL | - | DEFERRED_UNCLAIMED | BLOCKED_BY_UPSTREAM_EVIDENCE | ATDD-R5-F10-dashboard-parity-implementation | OHM-Trade-Agent-v1/docs/architecture/OPIP_F10_SOURCE_CENSUS.md
-AC-100 | F10-FLT-02 | NO_PANEL | - | DEFERRED_UNCLAIMED | NOT_IMPLEMENTED_NEXT_INCREMENT | ATDD-R5-F10-dashboard-parity-implementation | NONE
+AC-100 | F10-FLT-02 | NO_PANEL | - | DEFERRED_UNCLAIMED | IMPLEMENTED_AND_VERIFIED | ATDD-R5-F10-dashboard-parity-implementation | OHM-Trade-Agent-v1/tests/test_opip_r5_f10_e_operator_interaction.py
 AC-101 | F10-FLT-03 | NO_PANEL | - | OWNER_RESERVED | BLOCKED_BY_OWNER_DECISION | ATDD-R5-F10-dashboard-parity-implementation | OHM-Trade-Agent-v1/docs/architecture/OPIP_F10_SOURCE_CENSUS.md
-AC-102 | F10-FLT-04 | NO_PANEL | - | DEFERRED_UNCLAIMED | NOT_IMPLEMENTED_NEXT_INCREMENT | ATDD-R5-F10-dashboard-parity-implementation | NONE
+AC-102 | F10-FLT-04 | NO_PANEL | - | DEFERRED_UNCLAIMED | IMPLEMENTED_AND_VERIFIED | ATDD-R5-F10-dashboard-parity-implementation | OHM-Trade-Agent-v1/tests/test_opip_r5_f10_e_operator_interaction.py
 AC-105 | F10-SEC-04 | NO_PANEL | - | DEFERRED_UNCLAIMED | IMPLEMENTED_AND_VERIFIED | ATDD-R5-F10-dashboard-parity-implementation | OHM-Trade-Agent-v1/tests/test_opip_r5_f10_c_paper_portfolio_quality.py
 ```
 
@@ -132,11 +134,11 @@ AC-105 | F10-SEC-04 | NO_PANEL | - | DEFERRED_UNCLAIMED | IMPLEMENTED_AND_VERIFI
 CRITERIA_RECORDED: 54
 GOVERNANCE_DEFERRED_UNCLAIMED: 52
 GOVERNANCE_OWNER_RESERVED: 2
-DISPOSITION_IMPLEMENTED_AND_VERIFIED: 2
+DISPOSITION_IMPLEMENTED_AND_VERIFIED: 4
 DISPOSITION_IMPLEMENTED_INSUFFICIENT_PARITY_EVIDENCE: 10
 DISPOSITION_BLOCKED_BY_UPSTREAM_EVIDENCE: 37
 DISPOSITION_BLOCKED_BY_OWNER_DECISION: 2
-DISPOSITION_NOT_IMPLEMENTED_NEXT_INCREMENT: 3
+DISPOSITION_NOT_IMPLEMENTED_NEXT_INCREMENT: 1
 PARITY_VERIFIED_PAGES: 0 of 8
 ```
 
