@@ -198,11 +198,21 @@ def test_e_cockpit_service_exposes_only_cockpit_paths():
     from app.api import cockpit_service
 
     paths = set(cockpit_service.app.openapi().get("paths", {}) or {})
+    # The F10-B semantic read surface is added here deliberately and is not a drift:
+    # increment `ATDD-R5-F10-dashboard-parity-implementation` authorizes mounting the
+    # service's five declared GET routes on this analytics-plane app (and no other
+    # app), and the exact set stays pinned rather than becoming "whatever is mounted".
     assert paths == {
         "/cockpit",
         "/api/cockpit/overview",
         "/api/cockpit/trades",
         "/api/cockpit/trades/{paper_trade_id}",
+        "/cockpit/f10",
+        "/api/cockpit/semantic/pages",
+        "/api/cockpit/semantic/pages/{page_id}",
+        "/api/cockpit/semantic/panels/{panel_id}",
+        "/api/cockpit/semantic/metrics/{metric_id}",
+        "/api/cockpit/semantic/facts/{fact_id}",
     }, paths
 
 
@@ -502,7 +512,14 @@ def test_j_requirements_are_unchanged_by_this_change():
 
 
 def test_j_cockpit_service_holds_no_trading_or_exchange_authority():
-    """Checked via the AST, so prose explaining the boundary is not mistaken for it."""
+    """Checked via the AST, so prose explaining the boundary is not mistaken for it.
+
+    The mounted path set was widened once, deliberately, by the F10-B increment
+    (``ATDD-R5-F10-dashboard-parity-implementation``): the read-only semantic read router
+    joins the read-only B/C-4 cockpit router. The authority invariant is not relaxed to
+    accommodate it - the added module is held to the same AST rule here, so this app can
+    only ever mount a surface that is itself authority-free.
+    """
     module = (REPO / "app" / "api" / "cockpit_service.py").read_text(encoding="utf-8")
     tree = ast.parse(module)
 
@@ -513,8 +530,13 @@ def test_j_cockpit_service_holds_no_trading_or_exchange_authority():
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported.add(node.module)
 
-    # The only application surface it may mount is the read-only cockpit router.
-    assert imported == {"__future__", "fastapi", "app.api.cockpit"}, imported
+    # The only application surfaces it may mount are read-only cockpit routers.
+    assert imported == {
+        "__future__",
+        "fastapi",
+        "app.api.cockpit",
+        "app.api.cockpit_semantic",
+    }, imported
 
     called = {
         node.func.attr
@@ -529,19 +551,58 @@ def test_j_cockpit_service_holds_no_trading_or_exchange_authority():
         "add_job",
     ):
         if banned == "include_router":
-            # Exactly one mount, of the cockpit router, is expected and asserted below.
+            # Exactly the two mounts below are expected and asserted.
             continue
         assert banned not in called, f"cockpit service calls {banned!r}"
 
-    # Exactly one router is mounted, and it is the cockpit router.
+    # Exactly two routers are mounted, and both are read-only cockpit routers.
     mounts = [
         node
         for node in ast.walk(tree)
         if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "include_router"
     ]
-    assert len(mounts) == 1, mounts
-    mounted = getattr(mounts[0].args[0], "id", None)
-    assert mounted == "cockpit_router", mounted
+    assert len(mounts) == 2, mounts
+    mounted = [getattr(mount.args[0], "id", None) for mount in mounts]
+    assert mounted == ["cockpit_router", "cockpit_semantic_router"], mounted
+
+    # The added mount earns its place from its own source, never from this file's prose:
+    # the semantic router may reach only the read-only replica path, the semantic read
+    # service and the page read model - no exchange, order, Telegram, scheduler, learning
+    # or writer module. Its import set is pinned exactly, so a future widening of it fails
+    # here as well as in the increment that owns it.
+    semantic_tree = ast.parse(
+        (REPO / "app" / "api" / "cockpit_semantic.py").read_text(encoding="utf-8")
+    )
+    reached: set[str] = set()
+    for node in ast.walk(semantic_tree):
+        if isinstance(node, ast.Import):
+            reached.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            reached.add(node.module)
+    assert reached == {
+        "__future__",
+        "datetime",
+        "pathlib",
+        "typing",
+        "fastapi",
+        "fastapi.responses",
+        "app.api.cockpit",
+        "app.opip.cockpit.semantic",
+        "app.opip.cockpit.semantic_pages",
+    }, reached
+    for banned in (
+        "apscheduler",
+        "telegram",
+        "sqlite3",
+        "app.exchange",
+        "app.api.telegram",
+        "app.opip.exchange",
+        "app.opip.learning",
+        "app.opip.cockpit.canonical",
+    ):
+        assert not any(
+            name == banned or name.startswith(banned + ".") for name in reached
+        ), banned
 
 
 def test_j_container_remains_hardened():
