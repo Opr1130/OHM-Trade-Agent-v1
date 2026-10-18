@@ -46,10 +46,12 @@ publishes may override a deterministic risk or execution gate.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Mapping
 
+from app.opip.cockpit import semantic
 from app.opip.cockpit.semantic import (
     AUTHORITY_UNDECIDED,
     COUNTS_AND_PNL_RECONCILIATION,
@@ -57,6 +59,8 @@ from app.opip.cockpit.semantic import (
     FactReading,
     FactState,
     FOLLOWER_INCREMENT,
+    InvalidFilterValue,
+    METRIC_BINDINGS,
     PAGE_BY_ID,
     PAGE_IDS,
     PANEL_BY_ID,
@@ -64,6 +68,9 @@ from app.opip.cockpit.semantic import (
     PARITY_STATUS_NOT_VERIFIED,
     PARITY_VERIFIED_PAGES,
     PROOF_REQUIRED,
+    REASON_NO_CANONICAL_CASH_LEDGER,
+    REASON_NO_MARK_EVIDENCE,
+    REASON_QUOTE_CURRENCY_REQUIRED,
     REASON_UNREADABLE,
     REASON_UPSTREAM_NOT_ON_READ_PLANE,
     ROW_FACT_FIELDS,
@@ -80,12 +87,27 @@ from app.opip.profit_intelligence.lineage import (
 
 PAGE_READ_MODEL_VERSION = "cockpit-semantic-pages-v1"
 
+#: The shape of a census criterion identifier. A withheld section names the criterion it
+#: belongs to, and an unshaped identifier is a defect rather than a section.
+_CRITERION_ID = re.compile(r"AC-\d{3}")
+
 #: The three pages of the F10-B first slice, in inventory order. A page outside this
 #: tuple is refused rather than half-rendered.
 SLICE_PAGES: tuple[str, ...] = (
     "P1_SYSTEM_PULSE",
     "P2_DISCOVERY_REGIME",
     "P3_DECISION_TRACE",
+)
+
+#: The pages this read model serves once the succeeding increment adds the two whose facts
+#: the analytics plane can reach: the F10-B slice plus Paper Portfolio and Quality and
+#: Missed Opportunity. P6, P7 and P8 stay out because their canonically required facts are
+#: not on this plane, and a page whose every panel is unproducible is an absence rather
+#: than a page. This tuple is the only place the served set is widened; the default
+#: construction still serves the slice exactly as delivered.
+DELIVERED_PAGES: tuple[str, ...] = SLICE_PAGES + (
+    "P4_PAPER_PORTFOLIO",
+    "P5_QUALITY_MISSED_OPPORTUNITY",
 )
 
 #: The row identity a decision-grain join keys on. It is a declared field of the ledger
@@ -151,6 +173,22 @@ WITHHELD_SECTIONS: Mapping[str, tuple[tuple[str, str, str], ...]] = MappingProxy
             ("frozen plan record and cash alternative", "AC-042", REASON_UPSTREAM_NOT_ON_READ_PLANE),
             ("Committee review and role disagreement", "AC-043", REASON_UPSTREAM_NOT_ON_READ_PLANE),
             ("expected-versus-actual attribution", "AC-045", REASON_UPSTREAM_NOT_ON_READ_PLANE),
+        ),
+        "P4_PAPER_PORTFOLIO": (
+            ("cash and available capital per currency", "AC-050", REASON_NO_CANONICAL_CASH_LEDGER),
+            ("marked equity and marked drawdown beyond the realized basis", "AC-053", REASON_NO_MARK_EVIDENCE),
+            ("unrealized mark-to-market P&L on an open position", "AC-054", REASON_NO_MARK_EVIDENCE),
+            ("valuation of the residual exposure a rotation has not yet realized", "AC-055", REASON_NO_MARK_EVIDENCE),
+            ("capital-occupancy, capital-hours and efficiency diagnostics", "AC-056", REASON_UPSTREAM_NOT_ON_READ_PLANE),
+        ),
+        "P5_QUALITY_MISSED_OPPORTUNITY": (
+            ("candidate population with its exclusions and no-claims", "AC-060", REASON_UPSTREAM_NOT_ON_READ_PLANE),
+            ("missed, late and expired opportunities", "AC-061", REASON_UPSTREAM_NOT_ON_READ_PLANE),
+            ("calibration and matured expected-versus-actual outcomes", "AC-062", REASON_UPSTREAM_NOT_ON_READ_PLANE),
+            ("trading net after cost by strategy with complete cost evidence", "AC-063", REASON_UPSTREAM_NOT_ON_READ_PLANE),
+            ("MFE and MAE retained path evidence", "AC-064", REASON_UPSTREAM_NOT_ON_READ_PLANE),
+            ("versioned feasible counterfactual comparison", "AC-065", REASON_UPSTREAM_NOT_ON_READ_PLANE),
+            ("pending, censored and incomplete-outcome labels", "AC-066", REASON_UPSTREAM_NOT_ON_READ_PLANE),
         ),
     }
 )
@@ -317,31 +355,47 @@ def _json_ready(value: Any) -> Any:
 
 
 class PageReadModel:
-    """The F10-B page read model over an injected semantic read service.
+    """The F10 page read model over an injected semantic read service.
 
     The service is the single fact authority this read model reads through: every panel
     value is a reading the service produced, every panel disposition is the service's
     declaration, and every withheld section keeps the service's own reason. This module's
-    own decisions are presentation decisions only: how a page's panels and annexes are
-    grouped, and which decision-grain join an entry is assembled by.
+    own decisions are presentation decisions only: which pages it serves, how a page's
+    panels and annexes are grouped, and which declared read entry point a fact is read
+    through.
+
+    The served page set is a constructor argument so the increment that widens it does not
+    silently narrow or widen the delivered slice's behaviour: the default is the F10-B
+    three-page slice, and :data:`DELIVERED_PAGES` is what the read router serves.
     """
 
-    def __init__(self, service: SemanticReadService) -> None:
+    def __init__(
+        self,
+        service: SemanticReadService,
+        *,
+        pages: tuple[str, ...] = SLICE_PAGES,
+    ) -> None:
         if not isinstance(service, SemanticReadService):
             raise PageReadModelError("service must be a SemanticReadService")
+        unknown = tuple(page for page in pages if page not in PAGE_BY_ID)
+        if unknown:
+            raise PageReadModelError(f"declared pages are not in the registry: {unknown}")
+        if len(set(pages)) != len(pages):
+            raise PageReadModelError(f"declared pages name a page twice: {pages}")
         self.service = service
+        self.pages = tuple(pages)
 
     # -- index ---------------------------------------------------------------
 
     def index(self) -> tuple[PageIndexEntry, ...]:
-        """Every page of the slice, in inventory order, without any panel value.
+        """Every served page, in inventory order, without any panel value.
 
         Because this route materializes no value, it reports the service's panel
         dispositions and labels that basis, so its counts can never be read as a count of
         published values.
         """
         entries: list[PageIndexEntry] = []
-        for page_id in SLICE_PAGES:
+        for page_id in self.pages:
             reading = self.page(page_id, with_values=False)
             entries.append(
                 PageIndexEntry(
@@ -365,7 +419,7 @@ class PageReadModel:
         limit: int | None = None,
         **filters: Any,
     ) -> PageReading:
-        """One page of the slice: declaration, panels, annexes and reconciliation.
+        """One served page: declaration, panels, annexes and reconciliation.
 
         The page state is the service's own page state and is never recomputed here: a
         page is claimable only when the service says every required fact family is
@@ -373,7 +427,7 @@ class PageReadModel:
         a panel the service declares withheld keeps that state even though other panels on
         the same page carry values - the same page, not the same verdict.
         """
-        if page_id not in SLICE_PAGES:
+        if page_id not in self.pages:
             raise UnsupportedSlicePage(page_id)
         reading = self.service.page(page_id)
         descriptor = reading.descriptor
@@ -421,7 +475,7 @@ class PageReadModel:
         if binding is None:
             raise UnsupportedSlicePage(panel_id)
         page_id = PANEL_PAGE[panel_id]
-        if page_id not in SLICE_PAGES:
+        if page_id not in self.pages:
             raise UnsupportedSlicePage(panel_id)
         declaration = binding.to_dict()
         if not binding.carries_value:
@@ -464,7 +518,10 @@ class PageReadModel:
             state=state,
             declaration=declaration,
             value=value,
-            reasons=reasons,
+            # The declaration's own qualification reasons are kept beside the reading's, so
+            # a served form of a qualified panel cannot drop the qualification that says
+            # what the panel does not prove.
+            reasons=tuple(dict.fromkeys((*binding.unserved_reasons, *reasons))),
             gap_id=binding.gap_id,
             facts=tuple(binding.served),
             exclusions=exclusions,
@@ -502,7 +559,17 @@ class PageReadModel:
             if panel_id in _DECISION_FACT_GROUPS
             else facts
         )
-        readings = self._readings(read_facts, limit=limit, **filters)
+        try:
+            readings = self._readings(read_facts, limit=limit, **filters)
+        except InvalidFilterValue as exc:
+            # A fact family that is scoped to one quote currency refuses without one, and
+            # the refusal is this panel's answer rather than the whole page's: assuming a
+            # currency would answer a different question, and failing the page would hide
+            # the panels that are readable. Any other invalid filter value is a genuine
+            # client error and is still raised.
+            if REASON_QUOTE_CURRENCY_REQUIRED not in str(exc):
+                raise
+            return None, FactState.UNAVAILABLE, (REASON_QUOTE_CURRENCY_REQUIRED,), (), ()
         unavailable = tuple(
             reading for reading in readings.values() if reading.state not in SERVED_STATES
         )
@@ -556,13 +623,32 @@ class PageReadModel:
     def _readings(
         self, facts: tuple[str, ...], *, limit: int | None = None, **filters: Any
     ) -> dict[str, FactReading]:
-        """One fact reading per declared fact family, from the service."""
+        """One fact reading per declared fact family, from the service.
+
+        Each fact is read through the entry point the service declares for it: a fact the
+        versioned metric registry binds is read through the service's metric read, and
+        every other declared fact through its population read. The read model keeps no
+        registry of its own and restates no formula, population, unit or exclusion - it
+        only chooses which declared door to knock on.
+        """
         requested = dict(filters)
         if limit is not None and facts and all(
             fact.startswith("ledger.row.") for fact in facts
         ):
             requested["limit"] = limit
-        return {fact: self.service.population(fact, **requested) for fact in facts}
+        return {fact: self._read_fact(fact, requested) for fact in facts}
+
+    def _read_fact(self, fact: str, requested: Mapping[str, Any]) -> FactReading:
+        """One declared fact, read through the service entry point it belongs to.
+
+        A registered metric is never read through the population read and a declared
+        population is never read through the metric read: a fact that the declared entry
+        point refuses stays refused rather than being answered by the other one under the
+        registry's name.
+        """
+        if fact in METRIC_BINDINGS:
+            return self.service.metric(fact, **requested)
+        return self.service.population(fact, **requested)
 
     @staticmethod
     def _reading_payload(reading: FactReading) -> Mapping[str, Any]:
@@ -821,13 +907,41 @@ class PageReadModel:
 def _validate_declarations() -> None:
     """Fail closed at import on a declaration this read model would misread.
 
-    Every fact group a decision panel is assembled from must be a fact that panel declares
-    as served, so a value can never be assembled from an undeclared fact; and every slice
-    page must exist in the frozen registry.
+    Every served page set must name registry pages; every fact group a decision panel is
+    assembled from must be a fact that panel declares as served, so a value can never be
+    assembled from an undeclared fact; and every withheld section must name a registry page,
+    a criterion identifier and a reason the service itself registers, so a section cannot be
+    withdrawn under an invented reason or lost to a typo.
     """
-    for page_id in SLICE_PAGES:
+    for pages, label in ((SLICE_PAGES, "slice"), (DELIVERED_PAGES, "delivered")):
+        for page_id in pages:
+            if page_id not in PAGE_BY_ID:
+                raise PageReadModelError(
+                    f"{label} page {page_id} is not in the page registry"
+                )
+        if len(set(pages)) != len(pages):
+            raise PageReadModelError(f"{label} pages name a page twice: {pages}")
+    if not set(SLICE_PAGES) <= set(DELIVERED_PAGES):
+        raise PageReadModelError("the delivered page set narrowed the slice")
+    registered_reasons = frozenset(
+        value
+        for name, value in vars(semantic).items()
+        if name.startswith("REASON_") and isinstance(value, str)
+    )
+    for page_id, sections in WITHHELD_SECTIONS.items():
         if page_id not in PAGE_BY_ID:
-            raise PageReadModelError(f"slice page {page_id} is not in the page registry")
+            raise PageReadModelError(f"withheld section for unknown page {page_id}")
+        for section, criterion, reason in sections:
+            if not section.strip():
+                raise PageReadModelError(f"{page_id} declares an empty withheld section")
+            if not _CRITERION_ID.fullmatch(criterion):
+                raise PageReadModelError(
+                    f"{page_id} cites an unshaped criterion: {criterion}"
+                )
+            if reason not in registered_reasons:
+                raise PageReadModelError(
+                    f"{page_id} withholds {section!r} for an unregistered reason: {reason}"
+                )
     for panel_id, groups in _DECISION_FACT_GROUPS.items():
         binding = PANEL_BY_ID.get(panel_id)
         if binding is None:
@@ -854,6 +968,7 @@ def _validate_declarations() -> None:
 _validate_declarations()
 
 __all__ = [
+    "DELIVERED_PAGES",
     "EXCLUSION_ALIGNMENT_UNPROVEN",
     "EXCLUSION_JOIN_KEY_MISSING",
     "EXCLUSION_LINEAGE_ROW_ABSENT",
