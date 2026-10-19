@@ -146,8 +146,7 @@ def test_bootstrap_locates_helpers_outside_the_certified_tree(tmp_path):
     assert not (certified / "deploy" / "m07").exists(), "c196dd67 must not contain the toolkit"
 
     toolkit = tmp_path / "toolkit"
-    provisioned = _run(["bash", str(BOOTSTRAP), "--mode", "provision-toolkit",
-                        "--from", str(R1), "--to", str(toolkit)])
+    provisioned = _provision(toolkit)
     assert provisioned.returncode == 0, provisioned.stderr
     assert (toolkit / "TOOLKIT-MANIFEST.sha256").is_file()
 
