@@ -1,5 +1,10 @@
 # 10 — HF Defect Evidence (before → after)
 
+> **HISTORICAL EVIDENCE (R2) — not an executable procedure.** It records the
+> defects that R3 corrected (`R3-FINAL-VERDICT.md`,
+> `R3-RELEASE-QUALIFICATION.md`). Where it quotes an obsolete overlay path, that
+> path is evidence of the defect, not an instruction.
+
 Every defect was reproduced with a synthetic fixture **before** correction and is covered by an executable test **after**. "Before" = the pre-change baseline at `C:\Users\ohmpr\opip-mission-07-r1-baseline` (28 files, snapshotted before any edit).
 
 ## HF-01 — Unsafe bundle verification

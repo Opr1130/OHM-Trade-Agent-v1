@@ -1,5 +1,11 @@
 # 11 — Single Ordered V2 Cutover Procedure
 
+> **HISTORICAL (R2) — not executable.** Superseded by R3
+> (`06-SINGLE-CUTOVER-RUNBOOK.md`, `R3-FINAL-VERDICT.md`,
+> `R3-SECURITY-REVIEW.md`). Any owner-staged Compose overlay, `/tmp/opip-v2`
+> input or generated nginx configuration described below is obsolete and must
+> not be used.
+
 One sequence, executed by the owner. Nothing here was executed by this mission.
 
 **Phase 0 — live prerequisites (read-only)**

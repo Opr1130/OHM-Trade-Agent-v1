@@ -1,5 +1,11 @@
 # 03 — Revised Deployment Procedure (R1)
 
+> **HISTORICAL (R1/R2) — not executable.** Superseded by R3
+> (`06-SINGLE-CUTOVER-RUNBOOK.md`, `R3-FINAL-VERDICT.md`,
+> `R3-SECURITY-REVIEW.md`). Any owner-staged Compose overlay, `/tmp/opip-v2`
+> input or generated nginx configuration described below is obsolete and must
+> not be used.
+
 Two distinct paths. They must never be mixed.
 
 | Situation | Path | Entry point |

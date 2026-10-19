@@ -19,7 +19,11 @@ LIVE_DB="$APP_ROOT/data/opip/canonical/opip_canonical_v1.sqlite3"
 DURABLE="/var/lib/opip-rollback"
 PRESERVE="/var/lib/opip-cutover-evidence"
 ETC="/etc/opip/v2"
-TOOLS="/opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1/deploy/m07/scripts"
+# R3 correction: the certified commit does not ship this toolkit. Helpers are
+# provisioned separately and integrity-verified; the release fallback only
+# applies to a future release that carries them under APP_ROOT.
+TOOLKIT_ROOT="/opt/opip-m07-toolkit"
+TOOLS=""
 LOG="/var/log/opip-rollback.log"
 
 MODE=""; KIND="safe-baseline"; PREV_SHA=""; PREV_IMAGE=""
@@ -27,6 +31,40 @@ MODE=""; KIND="safe-baseline"; PREV_SHA=""; PREV_IMAGE=""
 log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" | tee -a "$LOG" >&2; }
 die() { log "REFUSED: $*"; exit 3; }
 run() { local d="$1"; shift; log "RUN: $d :: $*"; "$@" >>"$LOG" 2>&1 || { log "FAILED: $d"; exit 1; }; }
+
+toolkit_manifest_verify() {
+  local root="$1"
+  local manifest="$root/TOOLKIT-MANIFEST.sha256"
+  [[ -d "$root/scripts" && -s "$manifest" ]] || return 1
+  local helper perms owner
+  for helper in opip_receipts.py opip_rollback_guard.py opip_recovery.py opip_bundle.py \
+                opip_archive.py opip_layout.py opip_provenance.py opip_signals.py; do
+    [[ -f "$root/scripts/$helper" ]] || return 1
+  done
+  if ! perms="$(stat -c '%a' "$manifest" 2>/dev/null)"; then return 1; fi
+  [[ "$perms" =~ ^[0-7]{3,4}$ ]] || return 1
+  (( (8#$perms & 8#022) == 0 )) || return 1
+  (( (8#$perms & 8#6000) == 0 )) || return 1
+  if ! owner="$(stat -c '%U:%G' "$manifest" 2>/dev/null)"; then return 1; fi
+  [[ "$owner" == "root:root" ]] || return 1
+  if ! owner="$(stat -c '%U:%G' "$root/scripts" 2>/dev/null)"; then return 1; fi
+  [[ "$owner" == "root:root" ]] || return 1
+  ( cd "$root" && sha256sum -c --quiet TOOLKIT-MANIFEST.sha256 ) >/dev/null 2>&1 || return 1
+}
+
+resolve_toolkit() {
+  if toolkit_manifest_verify "$TOOLKIT_ROOT"; then
+    TOOLS="$TOOLKIT_ROOT/scripts"
+    log "toolkit verified (separately provisioned): $TOOLKIT_ROOT"
+    return 0
+  fi
+  if [[ -d "$APP_ROOT/deploy/m07/scripts" ]]; then
+    TOOLS="$APP_ROOT/deploy/m07/scripts"
+    log "toolkit resolved inside the installed release: $TOOLS"
+    return 0
+  fi
+  return 1
+}
 
 # R3: identical Compose invocation to the certified controller.
 compose() { ( cd "$APP_ROOT" && docker compose "$@" ); }
@@ -37,6 +75,7 @@ while [[ $# -gt 0 ]]; do
     --kind) KIND="$2"; shift 2 ;;
     --previous-sha) PREV_SHA="$2"; shift 2 ;;
     --previous-image) PREV_IMAGE="$2"; shift 2 ;;
+    --toolkit-root) TOOLKIT_ROOT="$2"; shift 2 ;;
     *) die "unknown argument $1" ;;
   esac
 done
@@ -48,6 +87,8 @@ done
 if [[ "$KIND" == "data" ]]; then
   die "data rollback is not performed here: use the native canonical restore with a verified recovery receipt"
 fi
+
+resolve_toolkit || die "M07 toolkit not found or failed integrity verification: $TOOLKIT_ROOT"
 
 install -d -m 0700 "$DURABLE"; touch "$LOG"; chmod 0600 "$LOG"
 PLAN_DIR="$DURABLE/$PREV_SHA"

@@ -86,9 +86,9 @@ try {
                         param($e) $e.Trim() -eq $sha })) { $exit = 1 }
             if (-not (Invoke-PhaseProbe 'ENV_PRESENT' "test -s $app/.env && stat -c '%a %U' $app/.env" {
                         param($e) $e.Trim() -match '^(600|640) root' })) { $exit = 1 }
-            if (-not (Invoke-PhaseProbe 'EFFECTIVE_COMPOSE' "cd $app && COMPOSE_FILE=$app/docker-compose.yml:/etc/opip/v2/docker-compose.v2.yml sudo -n -E docker compose config 2>/dev/null | grep -E 'mem_limit|cpus|OPIP_PAPER_V2_MODE|OPIP_CANONICAL_WRITER_MODE' | sort -u" {
+            if (-not (Invoke-PhaseProbe 'EFFECTIVE_COMPOSE' "cd $app && sudo -n docker compose config 2>/dev/null | grep -E 'mem_limit|cpus|OPIP_PAPER_V2_MODE|OPIP_CANONICAL_WRITER_MODE' | sort -u" {
                         param($e) ($e -match '128m' -or $e -match '1280m') -and $e -match 'OPIP_PAPER_V2_MODE' -and $e -match 'off' })) { $exit = 1 }
-            if (-not (Invoke-PhaseProbe 'VOLUMES' "cd $app && COMPOSE_FILE=$app/docker-compose.yml:/etc/opip/v2/docker-compose.v2.yml sudo -n -E docker compose config --volumes" {
+            if (-not (Invoke-PhaseProbe 'VOLUMES' "cd $app && sudo -n docker compose config --volumes" {
                         param($e) $e -match 'data' })) { $exit = 1 }
             if (-not (Invoke-PhaseProbe 'RELEASE_MODES' "cd $app && sudo -n docker compose run --rm --no-deps ohm-trade-agent python -m app.services.release_profiles --profile EVIDENCE_SHADOW" {
                         param($e) $e -match 'ARCHITECTURE_GATE=PASS' })) { $exit = 1 }

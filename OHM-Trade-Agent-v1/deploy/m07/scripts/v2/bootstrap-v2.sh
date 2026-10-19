@@ -26,6 +26,12 @@ DROPLET_ID="610307364"
 IMAGE_TAG="opip-v2:certified-c196dd67"
 RELEASES_ROOT="/srv/opip-v2/releases"
 RELEASE_ROOT="$RELEASES_ROOT/$SHA"
+# R3 correction: the certified commit does not contain this toolkit. Helpers are
+# provisioned separately, integrity-verified here, and never copied into the
+# certified application source.
+TOOLKIT_ROOT="/opt/opip-m07-toolkit"
+TOOLKIT_MANIFEST="$TOOLKIT_ROOT/TOOLKIT-MANIFEST.sha256"
+PROVISION_FROM=""
 SRC=""                      # resolved by resolve_src (never guessed)
 REPO_ROOT="/opt/OHM-Trade-Agent-v1"
 APP_ROOT="$REPO_ROOT/OHM-Trade-Agent-v1"
@@ -51,7 +57,15 @@ CONFIRM_HOST=""
 ACK_FRESH="0"
 OWNER="owner"
 
-log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" | tee -a "$LOG" >&2; }
+log() {
+  local line
+  line="$(printf '%s %s' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*")"
+  if [[ -n "$LOG" ]]; then
+    printf '%s\n' "$line" | tee -a "$LOG" >&2
+  else
+    printf '%s\n' "$line" >&2
+  fi
+}
 die() { log "REFUSED: $*"; exit 3; }
 run() {
   local desc="$1"; shift
@@ -62,21 +76,128 @@ run() {
   fi
 }
 
+# --- separately provisioned toolkit (R3 integration correction) --------------
+# The certified commit c196dd67 does not contain deploy/m07. Helpers are
+# provisioned out of band into TOOLKIT_ROOT with a SHA-256 manifest, and every
+# mode verifies that manifest before using them. The certified release is still
+# verified against its own manifest in verify_source(), so this adds an
+# integrity control and weakens no SHA verification.
+toolkit_required_helpers() {
+  for helper in opip_receipts.py opip_rollback_guard.py opip_recovery.py opip_bundle.py \
+                opip_archive.py opip_layout.py opip_provenance.py opip_signals.py; do
+    printf '%s\n' "$helper"
+  done
+}
+
+toolkit_manifest_verify() {
+  local root="$1"
+  local manifest="$root/TOOLKIT-MANIFEST.sha256"
+  [[ -d "$root/scripts" && -s "$manifest" ]] || return 1
+  local helper perms owner
+  while IFS= read -r helper; do
+    [[ -f "$root/scripts/$helper" ]] || return 1
+  done < <(toolkit_required_helpers)
+  if ! perms="$(stat -c '%a' "$manifest" 2>/dev/null)"; then return 1; fi
+  [[ "$perms" =~ ^[0-7]{3,4}$ ]] || return 1
+  (( (8#$perms & 8#022) == 0 )) || return 1   # never group/world writable
+  (( (8#$perms & 8#6000) == 0 )) || return 1  # never setuid/setgid
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    if ! owner="$(stat -c '%U:%G' "$manifest" 2>/dev/null)"; then return 1; fi
+    [[ "$owner" == "root:root" ]] || return 1
+    if ! owner="$(stat -c '%U:%G' "$root/scripts" 2>/dev/null)"; then return 1; fi
+    [[ "$owner" == "root:root" ]] || return 1
+  fi
+  ( cd "$root" && sha256sum -c --quiet TOOLKIT-MANIFEST.sha256 ) >/dev/null 2>&1 || return 1
+}
+
+resolve_toolkit() {
+  if toolkit_manifest_verify "$TOOLKIT_ROOT"; then
+    TOOLS="$TOOLKIT_ROOT/scripts"
+    log "toolkit verified (separately provisioned): $TOOLKIT_ROOT"
+    return 0
+  fi
+  # A future release that ships the toolkit is already covered by the release
+  # manifest verified in verify_source(); no second manifest is needed there.
+  if [[ -n "${SRC:-}" && -d "$SRC/deploy/m07/scripts" ]]; then
+    TOOLS="$SRC/deploy/m07/scripts"
+    log "toolkit resolved inside the verified release: $TOOLS"
+    return 0
+  fi
+  return 1
+}
+
+toolkit_manifest_build() {
+  local root="$1"
+  ( cd "$root" \
+    && find . -type f ! -name 'TOOLKIT-MANIFEST.sha256' -print0 \
+    | LC_ALL=C sort -z \
+    | xargs -0 sha256sum ) >"$root/TOOLKIT-MANIFEST.sha256"
+  chmod 0644 "$root/TOOLKIT-MANIFEST.sha256"
+}
+
+mode_provision_toolkit() {
+  [[ -n "$PROVISION_FROM" ]] || die "--from <verified toolkit directory> is required"
+  [[ -d "$PROVISION_FROM/scripts" ]] || die "toolkit source has no scripts/: $PROVISION_FROM"
+  [[ -f "$PROVISION_FROM/scripts/v2/bootstrap-v2.sh" ]] \
+    || die "toolkit source has no scripts/v2/bootstrap-v2.sh"
+  if [[ -n "$(find "$PROVISION_FROM" -type l -print -quit 2>/dev/null)" ]]; then
+    die "toolkit source contains symlinks; refusing to provision"
+  fi
+  install -d -m 0755 "$TOOLKIT_ROOT"
+  local staging="$TOOLKIT_ROOT/.staging.$$"
+  local owner_opt=()
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then owner_opt=(--chown=root:root); fi
+  rm -rf "$staging"
+  install -d -m 0755 "$staging"
+  rsync -a --delete "${owner_opt[@]}" --exclude '__pycache__' --exclude 'tests' --exclude 'evidence' \
+    --exclude 'TOOLKIT-MANIFEST.sha256' "$PROVISION_FROM/" "$staging/"
+  toolkit_manifest_build "$staging"
+  rsync -a --delete --exclude '.staging.*' "$staging/" "$TOOLKIT_ROOT/"
+  rm -rf "$staging"
+  find "$TOOLKIT_ROOT" -type d -exec chmod 0755 {} +
+  find "$TOOLKIT_ROOT" -type f -exec chmod 0644 {} +
+  find "$TOOLKIT_ROOT" -type f -name '*.sh' -exec chmod 0755 {} +
+  toolkit_manifest_verify "$TOOLKIT_ROOT" || die "provisioned toolkit failed integrity verification"
+  log "toolkit provisioned and verified: $TOOLKIT_ROOT"
+}
+
+mode_check_toolkit() {
+  resolve_src
+  resolve_toolkit \
+    || die "M07 toolkit not found or failed integrity verification: $TOOLKIT_ROOT"
+  printf 'TOOLKIT=%s\n' "$TOOLS"
+  if [[ "$TOOLS" == "$TOOLKIT_ROOT/scripts" ]]; then
+    printf 'TOOLKIT_SOURCE=separate\n'
+  else
+    printf 'TOOLKIT_SOURCE=release\n'
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --mode) MODE="$2"; shift 2 ;;
     --confirm-sha) CONFIRM_SHA="$2"; shift 2 ;;
     --confirm-host) CONFIRM_HOST="$2"; shift 2 ;;
     --acknowledge-fresh-host) ACK_FRESH="1"; shift ;;
+    --toolkit-root) TOOLKIT_ROOT="$2"; TOOLKIT_MANIFEST="$TOOLKIT_ROOT/TOOLKIT-MANIFEST.sha256"; shift 2 ;;
+    --release-root) RELEASE_ROOT="$2"; shift 2 ;;
+    --from) PROVISION_FROM="$2"; shift 2 ;;
     --activate-scheduler) shift ;;   # legacy flag: scheduler needs its own mode now
     *) die "unknown argument $1" ;;
   esac
 done
 
-[[ "${EUID:-$(id -u)}" -eq 0 ]] || die "bootstrap must run as root (use sudo -n)"
-[[ -n "$MODE" ]] || die "--mode prepare|authorize|execute|activate-writer|activate-scheduler is required"
-install -d -m 0700 "$STATE"
-touch "$LOG"; chmod 0600 "$LOG"
+[[ -n "$MODE" ]] || die "--mode prepare|authorize|execute|activate-writer|activate-scheduler|provision-toolkit|check-toolkit is required"
+case "$MODE" in
+  check-toolkit|provision-toolkit)
+    LOG=""   # read-only / provisioning modes must work without a host state dir
+    ;;
+  *)
+    [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "bootstrap must run as root (use sudo -n)"
+    install -d -m 0700 "$STATE"
+    touch "$LOG"; chmod 0600 "$LOG"
+    ;;
+esac
 
 metadata_id() { curl -fsS --max-time 5 http://169.254.169.254/metadata/v1/id; }
 
@@ -174,6 +295,7 @@ mode_execute() {
   verify_identity
   verify_source
   verify_image
+  resolve_toolkit || die "M07 toolkit not found or failed integrity verification: $TOOLKIT_ROOT"
   [[ -s "$AUTHORIZED" ]] || die "no BOOTSTRAP_AUTHORIZED receipt; owner authorisation is required"
   local cfg
   cfg="$(config_digest_value)"
@@ -248,6 +370,7 @@ mode_prepare() {
   verify_identity
   verify_source 0
   verify_image
+  resolve_toolkit || die "M07 toolkit not found or failed integrity verification: $TOOLKIT_ROOT"
   [[ -s "$ENV_FILE" ]] || die ".env is missing at $ENV_FILE (canonical location, owner-provided)"
   install -d -m 0755 -o root -g root "$ETC" "$APP_ROOT" "$APP_ROOT/data"
   local df_kb
@@ -270,6 +393,7 @@ mode_authorize() {
   verify_identity
   verify_source
   verify_image
+  resolve_toolkit || die "M07 toolkit not found or failed integrity verification: $TOOLKIT_ROOT"
   [[ -s "$PREPARED" ]] || die "no BOOTSTRAP_PREPARED receipt; run --mode prepare first"
   [[ "$CONFIRM_SHA" == "$SHA" ]] || die "--confirm-sha must equal $SHA"
   [[ "$CONFIRM_HOST" == "$DROPLET_ID" ]] || die "--confirm-host must equal $DROPLET_ID"
@@ -365,6 +489,7 @@ mode_activate_writer() {
   verify_identity
   verify_source
   verify_image
+  resolve_toolkit || die "M07 toolkit not found or failed integrity verification: $TOOLKIT_ROOT"
   [[ -s "$EXECUTED" ]] || die "no BOOTSTRAP_EXECUTED receipt; run --mode execute first"
   if compose ps --status running --services | grep -qx 'opip-canonical-writer'; then
     die "a canonical writer is already running; refusing to start a second writer"
@@ -430,6 +555,8 @@ case "$MODE" in
   execute) mode_execute ;;
   activate-writer) mode_activate_writer ;;
   activate-scheduler) mode_activate_scheduler ;;
+  provision-toolkit) mode_provision_toolkit ;;
+  check-toolkit) mode_check_toolkit ;;
   *) die "unknown mode $MODE" ;;
 esac
 

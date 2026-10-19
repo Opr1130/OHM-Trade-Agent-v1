@@ -48,6 +48,10 @@ jobs:
         working-directory: OHM-Trade-Agent-v1/deploy/m07
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The toolkit-location regression extracts the certified commit with
+          # `git archive`; a depth-1 clone cannot see c196dd67.
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:

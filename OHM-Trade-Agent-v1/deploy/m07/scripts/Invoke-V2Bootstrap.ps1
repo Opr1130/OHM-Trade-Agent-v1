@@ -5,9 +5,11 @@
 .DESCRIPTION
     The host-side work lives in scripts/v2/bootstrap-v2.sh (single guarded
     execution script). This wrapper only:
-      * uploads the script and the external configuration,
+      * verifies the separately provisioned toolkit (SHA-256 manifest) before use,
       * runs each phase over ssh as opipadmin with sudo -n,
       * mirrors the three receipts (PREPARED / AUTHORIZED / EXECUTED) locally.
+    It stages no Compose overlay and no generated nginx configuration: the
+    certified docker-compose.yml under $APP_ROOT is the single source of truth.
     It never converts a protection-preflight verdict into PASS; the authorization
     step refuses blocking incidents regardless of acknowledgements.
 #>
@@ -16,10 +18,10 @@ param(
     [Parameter(Mandatory)][ValidateSet('Prepare', 'Authorize', 'Execute')][string]$Phase,
     [switch]$Authorize,
     [switch]$AcknowledgeFreshHost,
-    [switch]$ActivateScheduler,
     [string]$ConfirmSha,
     [string]$ConfirmHost,
     [string]$SshUser = 'opipadmin',
+    [string]$ToolkitRoot = '/opt/opip-m07-toolkit',
     [switch]$NoReceipt
 )
 
@@ -29,8 +31,7 @@ $ErrorActionPreference = 'Stop'
 
 $receipt = New-R1Receipt -Name 'Invoke-V2Bootstrap.ps1' -Mode $Phase
 $exit = 0
-$remote = '/tmp/opip-v2'
-$script = Join-Path $script:OpipR1Scripts 'v2\bootstrap-v2.sh'
+$toolkit = Join-Path $ToolkitRoot 'scripts/v2/bootstrap-v2.sh'
 
 try {
     if ($SshUser -ne $script:OpipR1V2.SshUser) {
@@ -57,7 +58,6 @@ try {
 
     if ($Phase -eq 'Execute') {
         $remoteArgs = "--mode execute"
-        if ($ActivateScheduler) { $remoteArgs += ' --activate-scheduler' }
     }
     elseif ($Phase -eq 'Authorize') {
         $remoteArgs = "--mode authorize --confirm-sha $($script:OpipR1CertifiedSha) --confirm-host $($script:OpipR1V2.DropletId)"
@@ -68,11 +68,8 @@ try {
     }
 
     $steps = @(
-        "sudo -n install -d -m 0700 $remote",
-        "sudo -n install -m 0700 /dev/stdin $remote/bootstrap-v2.sh   # uploaded by this wrapper",
-        "sudo -n install -m 0644 /dev/stdin $remote/docker-compose.v2.yml",
-        "sudo -n install -m 0644 /dev/stdin $remote/nginx-v2.conf",
-        "sudo -n bash $remote/bootstrap-v2.sh $remoteArgs"
+        "sudo -n $toolkit --mode check-toolkit --toolkit-root $ToolkitRoot",
+        "sudo -n $toolkit $remoteArgs --toolkit-root $ToolkitRoot"
     )
     $receipt.notes += "REMOTE_STEPS ($Phase):"
     foreach ($step in $steps) { $receipt.notes += $step }
@@ -82,7 +79,8 @@ try {
     # agent process can mutate production infrastructure.
     Add-R1Check $receipt 'REMOTE_EXECUTION' 'INSUFFICIENT' `
         'PENDING LIVE VALIDATION: this wrapper prints the authorised remote sequence; it never opens a remote shell'
-    $receipt.notes += 'ARTIFACTS: scripts/v2/bootstrap-v2.sh, drafts/docker-compose.v2.yml, drafts/nginx-v2.conf'
+    $receipt.notes += "TOOLKIT: $ToolkitRoot (separately provisioned, SHA-256 manifest verified at every run)"
+    $receipt.notes += 'No Compose overlay and no generated nginx configuration are staged; the certified docker-compose.yml is the only Compose file'
     if ($exit -eq 0) { $exit = 2 }
 }
 catch {

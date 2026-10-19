@@ -61,13 +61,13 @@ try {
 
     $remoteArgs = "--mode $($Phase.ToLower()) --kind $Kind --previous-sha $PreviousSha"
     if ($PreviousImage) { $remoteArgs += " --previous-image $PreviousImage" }
+    $toolkitScript = '/opt/opip-m07-toolkit/scripts/v2/rollback-v2.sh'
     $steps = @(
-        'sudo -n install -d -m 0700 /tmp/opip-v2',
-        'sudo -n install -m 0700 /dev/stdin /tmp/opip-v2/rollback-v2.sh   # uploaded by this wrapper',
-        "sudo -n bash /tmp/opip-v2/rollback-v2.sh $remoteArgs"
+        "sudo -n $toolkitScript $remoteArgs --toolkit-root /opt/opip-m07-toolkit"
     )
     $receipt.notes += "REMOTE_STEPS ($Phase/$Kind):"
     foreach ($step in $steps) { $receipt.notes += $step }
+    $receipt.notes += 'TOOLKIT: /opt/opip-m07-toolkit (separately provisioned, SHA-256 manifest verified)'
     $receipt.notes += 'EPOCH_SOURCE: destination database read on the host (never owner-entered)'
 
     Add-R1Check $receipt 'REMOTE_EXECUTION' 'INSUFFICIENT' `

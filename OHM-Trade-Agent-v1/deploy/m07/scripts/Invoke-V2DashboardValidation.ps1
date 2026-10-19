@@ -34,11 +34,13 @@ try {
     if ($text -match '_require_secret\(x_webhook_secret\)') { Add-R1Check $receipt 'AUTH_REQUIRED' 'PASS' 'analytics routes require x-webhook-secret' }
     else { Add-R1Check $receipt 'AUTH_REQUIRED' 'FAIL' 'no secret check found'; $exit = 1 }
 
-    $nginx = Get-Content -LiteralPath (Join-Path $script:OpipR1Root 'drafts\nginx-v2.conf') -Raw
-    if ($nginx -match 'ssl_certificate\s+/etc/letsencrypt/live/178-128-147-125\.sslip\.io/fullchain\.pem') {
-        Add-R1Check $receipt 'NGINX_CERT_PATH' 'PASS' 'V2 certificate path'
+    # R3: the tracked config from the certified release is authoritative; no V2
+    # nginx configuration is generated, staged or overlaid.
+    $nginx = Get-Content -LiteralPath (Join-Path $script:OpipR1Root '..\nginx\dashboard-sidecar.conf') -Raw
+    if ($nginx -match 'ssl_certificate\s+/etc/letsencrypt/live/161-35-106-207\.sslip\.io/fullchain\.pem') {
+        Add-R1Check $receipt 'NGINX_CERT_PATH' 'PASS' 'tracked certificate path'
     }
-    else { Add-R1Check $receipt 'NGINX_CERT_PATH' 'FAIL' 'V2 certificate path missing'; $exit = 1 }
+    else { Add-R1Check $receipt 'NGINX_CERT_PATH' 'FAIL' 'tracked certificate path missing'; $exit = 1 }
     if ($nginx -match 'location / \{\s*return 404;') { Add-R1Check $receipt 'FAIL_CLOSED_DEFAULT' 'PASS' 'unknown paths return 404' }
     else { Add-R1Check $receipt 'FAIL_CLOSED_DEFAULT' 'FAIL' 'default 404 missing'; $exit = 1 }
 
