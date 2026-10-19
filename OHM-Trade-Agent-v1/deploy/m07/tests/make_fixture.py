@@ -25,7 +25,13 @@ from pathlib import Path
 
 CERTIFIED_SHA = "c196dd674678b3b1ee91c351ee97c1c9e2b3938d"
 LARGE_DATASET_FILES = 2600
-CERT_SRC = Path(os.environ.get("OPIP_CERTIFIED_SRC", r"C:\Users\ohmpr\opip-mission-07\src")) / "OHM-Trade-Agent-v1"
+# R3 portability: same resolution rule as tests/conftest.py - an explicit
+# OPIP_CERTIFIED_SRC override wins, otherwise the certified tree is the one that
+# contains this file. No authoring-workstation absolute path.
+_CERT_ENV = os.environ.get("OPIP_CERTIFIED_SRC")
+CERT_SRC = ((Path(_CERT_ENV) / "OHM-Trade-Agent-v1") if _CERT_ENV
+            else Path(__file__).resolve().parents[3])
+
 
 
 def _sha(path: Path) -> str:

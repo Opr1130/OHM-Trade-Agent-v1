@@ -6,15 +6,17 @@ Maps to mandated scenarios 1, 2, 3, 4, 10, 11, 12, 13, 14 and 15.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import opip_recovery as recovery
 import opip_signals as signals
+from conftest import CERT_SRC
 
 R1 = Path(__file__).resolve().parents[2]
-BASE_COMPOSE = Path(os.environ.get("OPIP_CERTIFIED_SRC", r"C:\Users\ohmpr\opip-mission-07\src")) / \
-    "OHM-Trade-Agent-v1" / "docker-compose.yml"
+# R3 portability: resolve the certified tree the same way conftest does instead
+# of defaulting to an authoring-workstation absolute path. It must also accept
+# the OPIP_CERTIFIED_SRC override, which conftest already normalises.
+BASE_COMPOSE = CERT_SRC / "docker-compose.yml"
 
 
 def _host(tmp_path: Path, *, env: bool = True, head: bool = True) -> Path:
