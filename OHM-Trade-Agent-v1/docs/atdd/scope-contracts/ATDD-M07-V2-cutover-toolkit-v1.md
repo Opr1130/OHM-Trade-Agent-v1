@@ -33,6 +33,10 @@ ARCHITECTURE REFERENCES:
   production authority; nothing here connects to them.
 - `OHM_P1_PROMOTION_GATES.md`: shadow and evidence paths cannot promote policy
   or gain execution authority.
+- `docs/architecture/v1.5.0/ARCHITECTURE.md` `Release profiles`: preserve
+  SAFE_BASELINE, EVIDENCE_SHADOW and gated TARGET_PAPER, with no hidden
+  environment-variable activation and no new profile. This increment adds none
+  and the toolkit selects no profile.
 - `deploy/remote/ohm-deploy`: the certified controller whose Compose invocation
   and host layout the toolkit must mirror.
 
@@ -222,6 +226,8 @@ AC-004 -> OHM-Trade-Agent-v1/deploy/m07/tests/scenarios/test_r3_concurrency_and_
 AC-004 -> OHM-Trade-Agent-v1/deploy/m07/tests/scenarios/test_r3_controller_parity.py
 AC-006 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-M07-V2-cutover-toolkit-v1.md
 AC-006 -> OHM-Trade-Agent-v1/tests/test_atdd_m07_cutover_toolkit_v1.py
+AC-005 -> OHM-Trade-Agent-v1/tests/test_opip_export_diagnostics_readonly_v1.py
+AC-006 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
 
 DEFERRED DISCOVERIES:
 - Linux-native host execution of the scripts (restore, rollback, writer
