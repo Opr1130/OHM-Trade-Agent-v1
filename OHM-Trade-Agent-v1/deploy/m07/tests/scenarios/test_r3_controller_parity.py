@@ -302,3 +302,46 @@ def test_provisioning_replaces_only_a_verified_toolkit(tmp_path):
     assert 'mv -- "$staging" "$dest"' in block
     assert 'CANONICAL_TOOLKIT_ROOT="/opt/opip-m07-toolkit"' in text
 
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX: executes the real bash entrypoint")
+def test_provisioning_refuses_an_incomplete_toolkit_source(tmp_path):
+    for tool in ("bash", "rsync", "realpath", "mktemp"):
+        if shutil.which(tool) is None:
+            pytest.skip(f"{tool} is required for this regression")
+
+    incomplete = tmp_path / "incomplete"
+    shutil.copytree(R1, incomplete, ignore=shutil.ignore_patterns("__pycache__", "evidence"))
+    (incomplete / "scripts" / "opip_receipts.py").unlink()
+    destination = tmp_path / "toolkit"
+    result = _provision(destination, incomplete)
+    assert result.returncode != 0
+    assert not destination.exists(), "an incomplete toolkit must not be promoted"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX: executes the real bash entrypoint")
+def test_failed_provisioning_preserves_a_verified_toolkit(tmp_path):
+    for tool in ("bash", "rsync", "realpath", "mktemp"):
+        if shutil.which(tool) is None:
+            pytest.skip(f"{tool} is required for this regression")
+    if os.geteuid() == 0:
+        pytest.skip("non-root is required to make a source file unreadable")
+
+    toolkit = tmp_path / "toolkit"
+    assert _provision(toolkit).returncode == 0
+    manifest_before = (toolkit / "TOOLKIT-MANIFEST.sha256").read_bytes()
+    helper_before = (toolkit / "scripts" / "opip_receipts.py").read_bytes()
+
+    broken = tmp_path / "broken"
+    shutil.copytree(R1, broken, ignore=shutil.ignore_patterns("__pycache__", "evidence"))
+    blocked = broken / "scripts" / "opip_receipts.py"
+    blocked.chmod(0)
+    try:
+        result = _provision(toolkit, broken)
+    finally:
+        blocked.chmod(0o644)
+
+    assert result.returncode != 0
+    assert (toolkit / "TOOLKIT-MANIFEST.sha256").read_bytes() == manifest_before
+    assert (toolkit / "scripts" / "opip_receipts.py").read_bytes() == helper_before
+
