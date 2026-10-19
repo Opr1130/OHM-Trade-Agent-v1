@@ -1,0 +1,128 @@
+name: m07-cutover-toolkit
+
+# Linux qualification for the Mission 07 V2 cutover toolkit (deploy/m07).
+#
+# This workflow closes exactly the two gates R3 could not prove on the authoring
+# workstation (see OHM-Trade-Agent-v1/deploy/m07/R3-RELEASE-QUALIFICATION.md §2):
+#
+#   R3-G1  Linux-native `bash -n` of the delivered LF-only host scripts
+#   R3-G3  `docker compose config` against a real Compose implementation
+#
+# It also runs the offline regression suite on Linux, including the recovery
+# and rollback safety contracts.
+#
+# Scope: read-only. Nothing here contacts a host, starts a container, touches a
+# database, reads a secret, or grants deployment / writer / scheduler / trading
+# authority. The Compose step only *renders* the certified file.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'OHM-Trade-Agent-v1/deploy/m07/**'
+      - 'OHM-Trade-Agent-v1/docker-compose.yml'
+      - 'OHM-Trade-Agent-v1/deploy/remote/ohm-deploy'
+      - '.github/workflows/m07-cutover-toolkit.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'OHM-Trade-Agent-v1/deploy/m07/**'
+      - 'OHM-Trade-Agent-v1/docker-compose.yml'
+      - 'OHM-Trade-Agent-v1/deploy/remote/ohm-deploy'
+      - '.github/workflows/m07-cutover-toolkit.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: m07-cutover-toolkit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-qualification:
+    name: Linux shell, Compose and offline regressions
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: OHM-Trade-Agent-v1/deploy/m07
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install the pinned test dependency
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install 'pytest>=8.3,<9'
+
+      - name: R3-G1a - delivered bytes are LF-only with a bash shebang
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          scripts = ("scripts/v2/bootstrap-v2.sh", "scripts/v2/rollback-v2.sh")
+          for name in scripts:
+              raw = Path(name).read_bytes()
+              assert b"\r\n" not in raw, f"{name}: CRLF found"
+              assert raw.startswith(b"#!/usr/bin/env bash\n"), f"{name}: bad shebang"
+          print("LF-only + shebang: PASS")
+          PY
+          bash --version | head -1
+
+      - name: R3-G1b - Linux-native bash syntax
+        run: |
+          set -euo pipefail
+          bash -n scripts/v2/bootstrap-v2.sh
+          bash -n scripts/v2/rollback-v2.sh
+          echo "bash -n: PASS"
+
+      - name: Python syntax
+        run: python -m compileall -q scripts tests
+
+      - name: R3-G3 - Compose renders from the certified file only
+        working-directory: OHM-Trade-Agent-v1
+        run: |
+          set -euo pipefail
+          docker compose version
+
+          # Controller parity: the host scripts invoke Compose exactly as
+          # deploy/remote/ohm-deploy does - no `-f` overlay on the core stack.
+          ! grep -q 'docker compose -f' deploy/m07/scripts/v2/bootstrap-v2.sh
+          grep -Fq '( cd "$APP_ROOT" && docker compose "$@" )' \
+            deploy/m07/scripts/v2/bootstrap-v2.sh
+
+          # Never render over a stale activation file. `.env` is required only
+          # because the core service declares `env_file: .env`; it is created
+          # empty here and removed on exit, so no value is injected anywhere.
+          test ! -e .env
+          : > .env
+          trap 'rm -f .env' EXIT
+
+          docker compose config --quiet
+          docker compose config --services | sort > /tmp/m07-services.txt
+          cat /tmp/m07-services.txt
+          printf '%s\n' \
+            ohm-dashboard-edge \
+            ohm-trade-agent \
+            opip-canonical-writer \
+            opip-stream-worker | sort > /tmp/m07-expected.txt
+          diff -u /tmp/m07-expected.txt /tmp/m07-services.txt
+          echo "compose render: PASS (4 services, no overlay)"
+
+      - name: Recovery and rollback safety contracts
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          python -m pytest \
+            tests/scenarios/test_hf02_recovery_gate.py \
+            tests/scenarios/test_r3_concurrency_and_compose.py \
+            -q
+
+      - name: R3 offline regression suite (116 tests)
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python -m pytest tests/scenarios -q
