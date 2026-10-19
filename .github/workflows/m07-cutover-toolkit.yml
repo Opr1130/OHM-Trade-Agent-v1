@@ -53,10 +53,12 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install the pinned test dependency
+      - name: Install the test dependencies
+        # pytest is pinned by requirements.txt. PyYAML is required by the
+        # Compose-contract tests and is installed the same way pytest.yml does.
         run: |
           python -m pip install --upgrade pip
-          python -m pip install 'pytest>=8.3,<9'
+          python -m pip install 'pytest>=8.3,<9' 'PyYAML>=6,<7'
 
       - name: R3-G1a - delivered bytes are LF-only with a bash shebang
         run: |
