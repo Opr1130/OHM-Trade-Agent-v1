@@ -26,6 +26,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -1597,6 +1598,37 @@ def test_long_lived_log_consumer_is_not_reported_as_the_exporter(tmp_path):
         consumer.wait(timeout=5)
 
 
+def _start_lock_holder(lock_path: Path) -> subprocess.Popen:
+    """Start a fresh process that holds a real kernel flock on ``lock_path``.
+
+    The regression needs a genuinely *young* holder: the block derives a lock
+    holder's age from that process's start time, and the pytest process is
+    long-lived by the time this test runs, so it cannot stand in for a fresh
+    export run. The child prints its PID only after ``LOCK_EX`` succeeds, so the
+    caller can never observe the lock before it is held.
+    """
+    program = (
+        "import fcntl, os, sys, time\n"
+        "handle = open(sys.argv[1], 'w')\n"
+        "fcntl.flock(handle.fileno(), fcntl.LOCK_EX)\n"
+        "print(os.getpid(), flush=True)\n"
+        "time.sleep(120)\n"
+    )
+    holder = subprocess.Popen(
+        [sys.executable, "-c", program, str(lock_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    claimed = holder.stdout.readline().strip()
+    if not claimed.isdigit() or int(claimed) != holder.pid:
+        holder.kill()
+        holder.wait(timeout=5)
+        detail = holder.stderr.read() if holder.stderr is not None else ""
+        raise AssertionError(f"lock holder failed to start: {claimed!r} {detail}")
+    return holder
+
+
 @pytestmark_posix
 @pytest.mark.skipif(
     shutil.which("lslocks") is None,
@@ -1605,31 +1637,36 @@ def test_long_lived_log_consumer_is_not_reported_as_the_exporter(tmp_path):
 def test_true_flock_ownership_is_reported_and_young_holder_is_not_a_stall(tmp_path):
     """Real integration of the lslocks path: a genuine flock IS ownership.
 
-    Proves the strong evidence path still works end to end. The holder is this
-    test process, so its age is far below the threshold and the verdict is NO -
-    proving a real held lock is observed but not automatically called a stall.
+    Proves the strong evidence path still works end to end. The holder is a
+    freshly started child process, so its kernel-reported age is genuinely young
+    and the verdict is NO - proving a real held lock is observed but not
+    automatically called a stall.
     """
-    import fcntl
-
     fx = _fixture(tmp_path)
     fx["log"].write_text("O'Pip learning evidence export: OK\n", encoding="utf-8")
-    holder = open(fx["internal"], "w")
-    fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+    holder = _start_lock_holder(fx["internal"])
     try:
+        assert holder.poll() is None, "lock holder exited before the observation"
         fields = _run_block(tmp_path, fx, "2026-09-17T19:00:47Z")
         assert fields["internal_export_lock_file"] == "EXISTS"
         assert fields["internal_export_lock_owner_source"] == "LSLOCKS"
         assert fields["internal_export_lock_state"] == "HELD"
         assert fields["internal_export_lock_ownership_proven"] == "YES"
         assert fields["internal_export_lock_held_instantaneously"] == "YES"
-        assert fields["internal_export_lock_owner_pid"] == str(os.getpid())
-        # A real held lock, but a young holder: observed, not condemned.
+        assert fields["internal_export_lock_owner_pid"] == str(holder.pid)
+        # The holder is the fresh child, so its age is small and the real lock is
+        # observed without being condemned as a stall.
+        age = fields["internal_export_lock_owner_elapsed_seconds"]
+        assert age.isdigit(), age
+        assert int(age) < int(fields["export_stall_threshold_seconds"])
         assert fields["internal_export_lock_stall_verdict"] == "NO"
         assert fields["export_stall_threshold_seconds"] == "300"
         assert fields["export_lock_stall_suspected"] == "NO"
+        assert holder.poll() is None, "lock holder exited during the observation"
     finally:
-        fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
-        holder.close()
+        holder.kill()
+        holder.wait(timeout=5)
+
 
 
 @pytestmark_posix
