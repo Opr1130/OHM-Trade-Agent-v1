@@ -54,11 +54,14 @@ jobs:
           python-version: '3.12'
 
       - name: Install the test dependencies
-        # pytest is pinned by requirements.txt. PyYAML is required by the
-        # Compose-contract tests and is installed the same way pytest.yml does.
+        # The recovery path imports the certified app (`app.services.registry_io`
+        # -> httpx), so the app's pinned runtime requirements are required.
+        # PyYAML is needed by the Compose-contract tests and is installed the
+        # same way pytest.yml does.
         run: |
           python -m pip install --upgrade pip
-          python -m pip install 'pytest>=8.3,<9' 'PyYAML>=6,<7'
+          python -m pip install -r "$GITHUB_WORKSPACE/OHM-Trade-Agent-v1/requirements.txt"
+          python -m pip install 'PyYAML>=6,<7'
 
       - name: R3-G1a - delivered bytes are LF-only with a bash shebang
         run: |
