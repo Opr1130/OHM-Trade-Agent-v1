@@ -1,0 +1,35 @@
+requirement_id,requirement,source,implementation,test,verdict
+ARCH-1,One runtime app root for code+compose+env+data,deploy/remote/ohm-deploy (REPO_ROOT/APP_ROOT),scripts/opip_layout.py,test_layout_contract_is_single_root,PASS
+ARCH-2,Compose invoked exactly as the certified controller,ohm-deploy: `cd "$APP_ROOT"; docker compose`,scripts/v2/bootstrap-v2.sh compose(),test_bootstrap_matches_the_controller_invocation,PASS
+ARCH-3,No overlay layered on the core project,ohm-deploy core calls carry no -f,compose() has no -f,test_bootstrap_matches_the_controller_invocation,PASS
+ARCH-4,Rollback overlay keeps the base compose file first,ohm-deploy SAFE_BASELINE_OVERRIDE pattern,rollback compose -f docker-compose.yml -f $OVERLAY,test_rollback_overlay_pattern_matches_the_controller,PASS
+ARCH-5,Tracked nginx config is used unmodified,compose mounts ./deploy/nginx/dashboard-sidecar.conf:ro,no generated nginx file,test_tracked_nginx_config_is_mounted_read_only,PASS
+ARCH-6,.env is the only environment file at APP_ROOT,compose `env_file: .env` for core,ENV_FILE=$APP_ROOT/.env,test_environment_file_contract_is_the_app_root_dotenv,PASS
+ARCH-7,Writer/stream do not inherit arbitrary .env,compose uses explicit environment blocks,unchanged by toolkit,test_environment_file_contract_is_the_app_root_dotenv,PASS
+ARCH-8,Core has no dependency on the writer,compose depends_on,unchanged,test_core_does_not_depend_on_the_writer,PASS
+ARCH-9,Writer publishes no port,compose,unchanged,test_writer_declares_no_published_port,PASS
+ARCH-10,All services the scripts drive exist in the certified compose,compose services,service targets parsed from bootstrap,test_bootstrap_service_targets_exist_in_the_certified_project,PASS
+ARCH-11,Every release path the scripts need exists,docker-compose.yml/app/deploy/nginx/deploy/remote,toolkit checks,test_scripts_only_reference_paths_that_exist_in_the_release,PASS
+ARCH-12,Python tools resolve inside the shipped toolkit,deploy/m07 layout,TOOLS=$SRC/deploy/m07/scripts,test_tools_resolve_inside_the_shipped_toolkit,PASS
+ARCH-13,No owner-staged overlay inputs,controller parity,/tmp/opip-v2 removed,test_no_host_script_depends_on_staged_overlay_inputs,PASS
+ARCH-14,Config digest binds the real configuration,receipts,config_digest_value(compose+.env),test_config_digest_covers_only_the_certified_configuration,PASS
+SEQ-1,Execute never starts a writer or scheduler,master prompt,bootstrap mode_execute,test_execute_never_starts_writer_or_scheduler,PASS
+SEQ-2,Writer requires a PASS receipt bound to the live DB,master prompt,activate-writer + writer-gate,test_writer_gate_* (6),PASS
+SEQ-3,Scheduler requires writer + HTTPS/Telegram acceptance,master prompt,activate-scheduler + LIVE-ACCEPTANCE,test_scheduler_activation_requires_writer_and_live_acceptance,PASS
+SEQ-4,A CLI boolean is never proof of recovery,master prompt,promote requires a receipt,HF-02 regressions,PASS
+DAT-1,WAL-safe consistent snapshot,master prompt,opip_rollback_guard.snapshot_database,test_snapshot_is_wal_safe_and_verified,PASS
+DAT-2,Uncheckpointed WAL rows survive the snapshot,master prompt,backup API,test_snapshot_preserves_uncheckpointed_wal_rows,PASS
+DAT-3,Snapshot is consistent under concurrent writes,master prompt,backup API + WAL,test_snapshot_under_concurrent_writes_is_consistent_and_leaves_source_intact,PASS
+DAT-4,No equal-epoch/newer-sequence history,directive,compare_history,test_compare_refuses_equal_epoch_with_newer_sequence_or_count,PASS
+DAT-5,Integrity + FK verified on the snapshot and live DB,directive,_facts/integrity_check,test_compare_refuses_a_corrupt_live_database,PASS
+SEC-1,Receipts are digest-bound,expiring,single-use,directive,opip_receipts,4 tests,PASS
+SEC-2,Blocking preflight incidents cannot be acknowledged away,directive,bind_authorization,test_blocking_incident_receipt_cannot_be_authorized,PASS
+SEC-3,Path containment and symlink ancestors rejected,directive,_safe_destination,2 tests,PASS
+SEC-4,Archive members cannot traverse,directive,opip_archive,HF-01 8 tests,PASS
+SEC-5,Live writer lock prevents restore/recovery,directive,writer_is_quiescent,test_held_writer_lock_is_detected_as_not_quiescent,PASS
+SEC-6,No secrets in the committed tree,directive,secret scan 0 hits,R3-SECURITY-REVIEW,PASS
+GIT-1,Toolkit reproducible from an immutable commit,directive,git archive c3337d51,116 passed from export,PASS
+GIT-2,Shell scripts LF in the index,directive,.gitattributes,git ls-files --eol i/lf,PASS
+LIVE-1,Readiness against the real host,directive,n/a,L-01,BLOCKED
+LIVE-2,Final V1 generation + native restore,directive,n/a,L-06/L-07,BLOCKED
+LIVE-3,Linux-native bash -n + compose render,directive,n/a,R3-G1/G3,BLOCKED
