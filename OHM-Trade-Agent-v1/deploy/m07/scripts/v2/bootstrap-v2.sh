@@ -49,7 +49,9 @@ SCHEDULER_RECEIPT="$STATE/SCHEDULER_ACTIVATED.json"
 LIVE_ACCEPTANCE="$STATE/LIVE-ACCEPTANCE.json"
 MANIFEST="$STATE/release-manifest.sha256"
 TOOLS=""
-LOG="/var/log/opip-bootstrap.log"
+# Filled only for privileged host modes; check/provision and early argument
+# errors must never write to the host log path.
+LOG=""
 
 MODE=""
 CONFIRM_SHA=""
@@ -180,6 +182,7 @@ while [[ $# -gt 0 ]]; do
     --confirm-host) CONFIRM_HOST="$2"; shift 2 ;;
     --acknowledge-fresh-host) ACK_FRESH="1"; shift ;;
     --toolkit-root) TOOLKIT_ROOT="$2"; TOOLKIT_MANIFEST="$TOOLKIT_ROOT/TOOLKIT-MANIFEST.sha256"; shift 2 ;;
+    --to) TOOLKIT_ROOT="$2"; TOOLKIT_MANIFEST="$TOOLKIT_ROOT/TOOLKIT-MANIFEST.sha256"; shift 2 ;;
     --release-root) RELEASE_ROOT="$2"; shift 2 ;;
     --from) PROVISION_FROM="$2"; shift 2 ;;
     --activate-scheduler) shift ;;   # legacy flag: scheduler needs its own mode now
@@ -194,6 +197,7 @@ case "$MODE" in
     ;;
   *)
     [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "bootstrap must run as root (use sudo -n)"
+    LOG="/var/log/opip-bootstrap.log"
     install -d -m 0700 "$STATE"
     touch "$LOG"; chmod 0600 "$LOG"
     ;;
