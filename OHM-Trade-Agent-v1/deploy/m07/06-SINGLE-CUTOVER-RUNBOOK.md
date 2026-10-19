@@ -53,6 +53,14 @@ sudo -n /opt/opip-m07-toolkit/scripts/v2/bootstrap-v2.sh --mode check-toolkit
 later mode re-verifies that manifest. The certified application source is never
 modified and its own SHA verification is unchanged.
 
+Provisioning is fail-closed on the destination: as root it accepts only
+`/opt/opip-m07-toolkit`; it refuses root or protected paths, symlinks and
+symlink ancestors, source/destination overlap, and any existing directory that
+is not a previously verified toolkit with exactly the expected entries. It
+never deletes into the destination: a staging directory is built on the same
+filesystem, verified, then promoted atomically, and a failed promotion restores
+the previous verified tree.
+
 ## Phase 1 — Prepare (read-only)
 
 ```

@@ -30,6 +30,7 @@ RELEASE_ROOT="$RELEASES_ROOT/$SHA"
 # provisioned separately, integrity-verified here, and never copied into the
 # certified application source.
 TOOLKIT_ROOT="/opt/opip-m07-toolkit"
+CANONICAL_TOOLKIT_ROOT="/opt/opip-m07-toolkit"
 TOOLKIT_MANIFEST="$TOOLKIT_ROOT/TOOLKIT-MANIFEST.sha256"
 PROVISION_FROM=""
 SRC=""                      # resolved by resolve_src (never guessed)
@@ -145,22 +146,108 @@ mode_provision_toolkit() {
   if [[ -n "$(find "$PROVISION_FROM" -type l -print -quit 2>/dev/null)" ]]; then
     die "toolkit source contains symlinks; refusing to provision"
   fi
-  install -d -m 0755 "$TOOLKIT_ROOT"
-  local staging="$TOOLKIT_ROOT/.staging.$$"
-  local owner_opt=()
+
+  local src dest parent tmp_root dest_raw
+  src="$(realpath -e -- "$PROVISION_FROM" 2>/dev/null)" \
+    || die "toolkit source does not resolve: $PROVISION_FROM"
+  dest_raw="${TOOLKIT_ROOT%/}"
+  [[ "$dest_raw" == /* ]] || die "destination must be an absolute path: $TOOLKIT_ROOT"
+  case "$dest_raw" in
+    *"/../"*|*"/./"*|*"//"*|*/..|*/.) die "destination contains non-canonical components: $TOOLKIT_ROOT" ;;
+  esac
+  dest="$(realpath -m -- "$dest_raw" 2>/dev/null)" || die "invalid destination: $TOOLKIT_ROOT"
+  [[ "$dest" == "$dest_raw" ]] \
+    || die "destination traverses a symlink or non-canonical prefix: $dest_raw -> $dest"
+
+  # 1. Production (root) provisioning is restricted to the canonical location.
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    [[ "$dest" == "$CANONICAL_TOOLKIT_ROOT" ]] \
+      || die "root provisioning is restricted to $CANONICAL_TOOLKIT_ROOT (got $dest)"
+  else
+    tmp_root="${TMPDIR:-/tmp}"
+    case "$dest" in
+      "$CANONICAL_TOOLKIT_ROOT"|"$tmp_root"/*|/tmp/*) ;;
+      *) die "non-root provisioning is limited to $CANONICAL_TOOLKIT_ROOT or a temporary root (got $dest)" ;;
+    esac
+  fi
+
+  # 2. Refuse root and protected destinations outright.
+  case "$dest" in
+    /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/media|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var)
+      die "refusing protected destination: $dest" ;;
+    /bin/*|/boot/*|/dev/*|/etc/*|/lib/*|/lib64/*|/media/*|/mnt/*|/proc/*|/root/*|/run/*|/sbin/*|/srv/*|/sys/*|/usr/*|/var/*)
+      die "refusing protected destination: $dest" ;;
+  esac
+
+  # 3. Refuse source/destination overlap in either direction.
+  case "$dest/" in "$src/"*) die "destination is inside the toolkit source: $dest" ;; esac
+  case "$src/" in "$dest/"*) die "toolkit source is inside the destination: $src" ;; esac
+
+  # 4. An existing destination may only be a previously verified toolkit with
+  #    exactly the expected files; anything else is left untouched.
+  if [[ -e "$dest" || -L "$dest" ]]; then
+    [[ -d "$dest" && ! -L "$dest" ]] \
+      || die "destination exists and is not a plain directory: $dest"
+    if [[ -n "$(find "$dest" -type l -print -quit 2>/dev/null)" ]]; then
+      die "destination contains symlinks; refusing to modify: $dest"
+    fi
+    toolkit_manifest_verify "$dest" \
+      || die "destination exists with unexpected contents; refusing to modify: $dest"
+    local allowed_top top manifested present
+    allowed_top="$(awk '{print $2}' "$dest/TOOLKIT-MANIFEST.sha256" \
+      | sed 's#^\./##' | cut -d/ -f1 | sort -u)"
+    while IFS= read -r top; do
+      [[ "$top" == "TOOLKIT-MANIFEST.sha256" ]] && continue
+      grep -Fxq -- "$top" <<<"$allowed_top" \
+        || die "destination contains an unexpected entry: $dest/$top"
+    done < <(find "$dest" -mindepth 1 -maxdepth 1 -printf '%f\n')
+    manifested="$(wc -l <"$dest/TOOLKIT-MANIFEST.sha256")"
+    present="$(find "$dest" -type f ! -name 'TOOLKIT-MANIFEST.sha256' | wc -l)"
+    [[ "$manifested" -eq "$present" ]] \
+      || die "destination contains unexpected files; refusing to modify: $dest"
+  fi
+
+  parent="$(dirname -- "$dest")"
+  [[ -d "$parent" && ! -L "$parent" ]] \
+    || die "destination parent is missing or a symlink: $parent"
+
+  # 5. Build in an isolated staging directory on the destination filesystem.
+  #    No destructive sync ever targets the destination itself.
+  local staging previous owner_opt=()
+  staging="$(mktemp -d -- "$parent/.opip-m07-toolkit.staging.XXXXXX")" \
+    || die "cannot create a staging directory in $parent"
+  trap '[[ -n "${staging:-}" && -d "${staging:-}" ]] && rm -rf -- "$staging"' EXIT
   if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then owner_opt=(--chown=root:root); fi
-  rm -rf "$staging"
-  install -d -m 0755 "$staging"
-  rsync -a --delete "${owner_opt[@]}" --exclude '__pycache__' --exclude 'tests' --exclude 'evidence' \
-    --exclude 'TOOLKIT-MANIFEST.sha256' "$PROVISION_FROM/" "$staging/"
+  rsync -a "${owner_opt[@]}" --exclude '__pycache__' --exclude 'tests' --exclude 'evidence' \
+    --exclude 'TOOLKIT-MANIFEST.sha256' "$src/" "$staging/" \
+    || die "staging copy failed; destination was not modified"
+  find "$staging" -type d -exec chmod 0755 {} +
+  find "$staging" -type f -exec chmod 0644 {} +
+  find "$staging" -type f -name '*.sh' -exec chmod 0755 {} +
   toolkit_manifest_build "$staging"
-  rsync -a --delete --exclude '.staging.*' "$staging/" "$TOOLKIT_ROOT/"
-  rm -rf "$staging"
-  find "$TOOLKIT_ROOT" -type d -exec chmod 0755 {} +
-  find "$TOOLKIT_ROOT" -type f -exec chmod 0644 {} +
-  find "$TOOLKIT_ROOT" -type f -name '*.sh' -exec chmod 0755 {} +
-  toolkit_manifest_verify "$TOOLKIT_ROOT" || die "provisioned toolkit failed integrity verification"
-  log "toolkit provisioned and verified: $TOOLKIT_ROOT"
+  toolkit_manifest_verify "$staging" \
+    || die "staged toolkit failed integrity verification; destination was not modified"
+
+  # 6. Atomic promotion. A verified previous toolkit is moved aside first and
+  #    restored if the promotion fails.
+  if [[ -e "$dest" ]]; then
+    previous="$parent/.opip-m07-toolkit.previous.$$"
+    [[ ! -e "$previous" ]] || die "stale previous directory present: $previous"
+    mv -- "$dest" "$previous" \
+      || die "cannot move the existing toolkit aside; nothing was changed"
+    if ! mv -- "$staging" "$dest"; then
+      mv -- "$previous" "$dest" \
+        || die "promotion failed and the previous toolkit could not be restored: $previous"
+      die "promotion failed; the previous toolkit was restored"
+    fi
+    rm -rf -- "$previous"
+  else
+    mv -- "$staging" "$dest" || die "cannot promote the staged toolkit to $dest"
+  fi
+  trap - EXIT
+
+  toolkit_manifest_verify "$dest" || die "promoted toolkit failed integrity verification"
+  log "toolkit provisioned and verified: $dest"
 }
 
 mode_check_toolkit() {

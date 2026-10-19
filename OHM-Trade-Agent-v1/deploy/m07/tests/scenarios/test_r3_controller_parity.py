@@ -197,3 +197,108 @@ def test_operator_guidance_contains_no_obsolete_overlay_or_nginx_staging():
                        "11-HF-CUTOVER-PROCEDURE.md"):
         text = (R1 / historical).read_text(encoding="utf-8")
         assert "HISTORICAL" in text.splitlines()[2], historical
+
+
+def _provision(destination, source=None):
+    return _run(["bash", str(BOOTSTRAP), "--mode", "provision-toolkit",
+                 "--from", str(source or R1), "--to", str(destination)])
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX: executes the real bash entrypoint")
+def test_provisioning_refuses_unsafe_destinations_before_any_mutation(tmp_path):
+    for tool in ("bash", "rsync", "realpath", "mktemp"):
+        if shutil.which(tool) is None:
+            pytest.skip(f"{tool} is required for this regression")
+
+    # Root and protected destinations are refused.
+    probe = Path("/etc") / "opip-m07-toolkit-do-not-create"
+    for destination in ("/", "/etc", "/opt", str(probe)):
+        result = _provision(destination)
+        assert result.returncode != 0, destination
+        assert not probe.exists()
+
+    # Unexpected existing contents survive untouched.
+    unexpected = tmp_path / "unexpected"
+    unexpected.mkdir()
+    sentinel = unexpected / "keep.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    before = sorted(p.name for p in unexpected.iterdir())
+    result = _provision(unexpected)
+    assert result.returncode != 0
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert sorted(p.name for p in unexpected.iterdir()) == before
+    assert not (unexpected / "TOOLKIT-MANIFEST.sha256").exists()
+
+    # A symlink destination and a symlink ancestor are refused.
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "keep.txt").write_text("keep", encoding="utf-8")
+    link = tmp_path / "link"
+    link.symlink_to(real, target_is_directory=True)
+    result = _provision(link)
+    assert result.returncode != 0
+    assert link.is_symlink()
+    assert (real / "keep.txt").read_text(encoding="utf-8") == "keep"
+
+    ancestor_target = tmp_path / "ancestor-target"
+    ancestor_target.mkdir()
+    ancestor = tmp_path / "ancestor"
+    ancestor.symlink_to(ancestor_target, target_is_directory=True)
+    result = _provision(ancestor / "toolkit")
+    assert result.returncode != 0
+    assert not (ancestor_target / "toolkit").exists()
+
+    # Source/destination overlap in both directions.
+    source = tmp_path / "source"
+    shutil.copytree(R1, source, ignore=shutil.ignore_patterns("__pycache__", "evidence"))
+    result = _provision(source / "nested", source)
+    assert result.returncode != 0
+    assert not (source / "nested").exists()
+    assert (source / "scripts" / "v2" / "bootstrap-v2.sh").is_file()
+
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    nested_source = parent / "toolkit-source"
+    shutil.copytree(R1, nested_source, ignore=shutil.ignore_patterns("__pycache__", "evidence"))
+    result = _provision(parent, nested_source)
+    assert result.returncode != 0
+    assert (nested_source / "scripts" / "v2" / "bootstrap-v2.sh").is_file()
+
+    # Non-root may not provision outside the canonical path or a temporary root.
+    outside = Path.home() / ".opip-m07-toolkit-should-refuse"
+    result = _provision(outside)
+    assert result.returncode != 0
+    assert not outside.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX: executes the real bash entrypoint")
+def test_provisioning_replaces_only_a_verified_toolkit(tmp_path):
+    for tool in ("bash", "rsync", "realpath", "mktemp"):
+        if shutil.which(tool) is None:
+            pytest.skip(f"{tool} is required for this regression")
+
+    toolkit = tmp_path / "toolkit"
+    assert _provision(toolkit).returncode == 0
+    assert _provision(toolkit).returncode == 0  # verified tree may be replaced
+    manifest = toolkit / "TOOLKIT-MANIFEST.sha256"
+    assert manifest.is_file()
+    original_manifest = manifest.read_bytes()
+
+    # A tampered tree is refused and left exactly as it was.
+    helper = toolkit / "scripts" / "opip_receipts.py"
+    tampered = helper.read_text(encoding="utf-8") + "\n# tampered\n"
+    helper.write_text(tampered, encoding="utf-8")
+    result = _provision(toolkit)
+    assert result.returncode != 0
+    assert helper.read_text(encoding="utf-8") == tampered
+    assert manifest.read_bytes() == original_manifest
+
+    # No destructive synchronisation is used by the provisioning path.
+    text = BOOTSTRAP.read_text(encoding="utf-8")
+    start = text.index("mode_provision_toolkit() {")
+    block = text[start:text.index("\n}\n", start)]
+    assert "--delete" not in block
+    assert "mktemp -d" in block
+    assert 'mv -- "$staging" "$dest"' in block
+    assert 'CANONICAL_TOOLKIT_ROOT="/opt/opip-m07-toolkit"' in text
+
