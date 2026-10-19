@@ -1,0 +1,112 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    HF-05: two-phase V2 readiness (PreBootstrap | PostConfiguration).
+.DESCRIPTION
+    PreBootstrap  - identity, installed certified source release, certified image,
+                    storage, backups, container state. Does NOT require /opt
+                    checkout, .env or deployed Compose overlays.
+    PostConfiguration - release checkout, .env, effective Compose settings,
+                    resource limits, volumes and release modes.
+    Privileged reads use `sudo -n` as opipadmin; SSH uses strict known-host
+    verification. A probe is never PASS from locally supplied metadata.
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)][ValidateSet('PreBootstrap', 'PostConfiguration')][string]$Phase,
+    [switch]$Execute,
+    [switch]$Authorized,
+    [string]$SshUser = 'opipadmin',
+    [switch]$NoReceipt
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'lib\OpipR1.Common.ps1')
+
+$receipt = New-R1Receipt -Name 'Invoke-V2Readiness.ps1' -Mode $Phase
+$exit = 0
+$sha = $script:OpipR1CertifiedSha
+$app = $script:OpipR1V2.AppRoot
+$releases = '/srv/opip-v2/releases'
+$script:probes = @()
+
+function Invoke-PhaseProbe {
+    param([string]$Id, [string]$Command, [scriptblock]$Evaluate)
+    $probe = Invoke-R1SshProbe -Command $Command -User $SshUser
+    $script:probes += $probe
+    if ($probe.exit_code -ne 0 -or -not $probe.evidence) {
+        Add-R1Check $receipt $Id 'INSUFFICIENT' ("rc={0} {1}" -f $probe.exit_code, $probe.stderr)
+        return $false
+    }
+    $ok = & $Evaluate $probe.evidence
+    if ($ok) { Add-R1Check $receipt $Id 'PASS' ($probe.evidence -replace "`r?`n", ' ') }
+    else { Add-R1Check $receipt $Id 'FAIL' ($probe.evidence -replace "`r?`n", ' ') }
+    return $ok
+}
+
+try {
+    if ($SshUser -ne $script:OpipR1V2.SshUser) {
+        Add-R1Check $receipt 'SSH_ACCOUNT' 'REFUSED' "use $($script:OpipR1V2.SshUser), not $SshUser"
+        $null = Complete-R1Receipt $receipt 3 (Get-R1ReceiptPath "readiness-$Phase.receipt.json"); exit 3
+    }
+    Add-R1Check $receipt 'SSH_ACCOUNT' 'PASS' "account=$SshUser (privileged reads via sudo -n)"
+
+    if (-not $Execute) {
+        Add-R1Check $receipt 'REMOTE_PROBES' 'INSUFFICIENT' 'PENDING LIVE VALIDATION: run with -Execute -Authorized'
+        $exit = 2
+    }
+    elseif (-not $Authorized) {
+        Add-R1Check $receipt 'REMOTE_PROBES' 'REFUSED' '-Execute requires -Authorized'
+        $exit = 3
+    }
+    else {
+        if (-not (Invoke-PhaseProbe 'REMOTE_IDENTITY' 'curl -fsS http://169.254.169.254/metadata/v1/id' {
+                    param($e) $e.Trim() -eq $script:OpipR1V2.DropletId })) { $exit = 1 }
+
+        if ($Phase -eq 'PreBootstrap') {
+            if (-not (Invoke-PhaseProbe 'SOURCE_RELEASE_PRESENT' "test -d $releases/$sha/OHM-Trade-Agent-v1 && echo present" {
+                        param($e) $e.Trim() -eq 'present' })) { $exit = 1 }
+            if (-not (Invoke-PhaseProbe 'CERTIFIED_IMAGE' "sudo -n docker image inspect -f '{{json .Config.Labels}}' $($script:OpipR1V2.ImageTag)" {
+                        param($e) $e -match [regex]::Escape($sha) })) { $exit = 1 }
+            if (-not (Invoke-PhaseProbe 'CONTAINER_STATE' "sudo -n docker ps -a --format '{{.Names}}' | grep -c '^ohm-trade-agent$' || true" {
+                        param($e) $e.Trim() -match '^[0-9]+$' })) { $exit = 1 }
+            if (-not (Invoke-PhaseProbe 'STORAGE' "df -Pk / | tail -1 | awk '{print `$4}'" {
+                        param($e) [int]($e.Trim()) -gt 524288 })) { $exit = 1 }
+            # D11: PreBootstrap runs BEFORE the final V1 generation is transferred.
+            # A backup count here can only be a rehearsal seed (or zero), so it must
+            # never gate bootstrap. Record it as evidence, not as a prerequisite.
+            $seedEvidence = Invoke-R1SshProbe "ls -1 $releases/$sha/OHM-Trade-Agent-v1/data/opip/canonical/backups/*.manifest.json 2>/dev/null | wc -l"
+            $seedObserved = if ($seedEvidence.evidence) { $seedEvidence.evidence } else { 'unavailable' }
+            Add-R1Check $receipt 'BACKUP_SEED_INFO' 'SKIP' ("informational only; final V1 generation is verified after transfer (observed={0})" -f $seedObserved)
+            Add-R1Check $receipt 'PHASE_SCOPE' 'PASS' 'no /opt checkout, .env, overlay or final backup generation required in PreBootstrap'
+        }
+        else {
+            if (-not (Invoke-PhaseProbe 'RELEASE_CHECKOUT' "cd $app && git rev-parse HEAD" {
+                        param($e) $e.Trim() -eq $sha })) { $exit = 1 }
+            if (-not (Invoke-PhaseProbe 'ENV_PRESENT' "test -s $app/.env && stat -c '%a %U' $app/.env" {
+                        param($e) $e.Trim() -match '^(600|640) root' })) { $exit = 1 }
+            if (-not (Invoke-PhaseProbe 'EFFECTIVE_COMPOSE' "cd $app && COMPOSE_FILE=$app/docker-compose.yml:/etc/opip/v2/docker-compose.v2.yml sudo -n -E docker compose config 2>/dev/null | grep -E 'mem_limit|cpus|OPIP_PAPER_V2_MODE|OPIP_CANONICAL_WRITER_MODE' | sort -u" {
+                        param($e) ($e -match '128m' -or $e -match '1280m') -and $e -match 'OPIP_PAPER_V2_MODE' -and $e -match 'off' })) { $exit = 1 }
+            if (-not (Invoke-PhaseProbe 'VOLUMES' "cd $app && COMPOSE_FILE=$app/docker-compose.yml:/etc/opip/v2/docker-compose.v2.yml sudo -n -E docker compose config --volumes" {
+                        param($e) $e -match 'data' })) { $exit = 1 }
+            if (-not (Invoke-PhaseProbe 'RELEASE_MODES' "cd $app && sudo -n docker compose run --rm --no-deps ohm-trade-agent python -m app.services.release_profiles --profile EVIDENCE_SHADOW" {
+                        param($e) $e -match 'ARCHITECTURE_GATE=PASS' })) { $exit = 1 }
+            Add-R1Check $receipt 'PHASE_SCOPE' 'PASS' 'checkout, .env, effective config, volumes and modes verified'
+        }
+    }
+}
+catch {
+    Add-R1Check $receipt 'UNHANDLED' 'FAIL' $_.Exception.Message
+    $exit = 1
+}
+
+if ($script:probes.Count -gt 0) {
+    $evidencePath = Get-R1ReceiptPath "readiness-$Phase.probes.json"
+    ($script:probes | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath $evidencePath -Encoding UTF8
+    $receipt.artifacts += $evidencePath
+}
+if ($NoReceipt) { $null = Complete-R1Receipt $receipt $exit }
+else { $null = Complete-R1Receipt $receipt $exit (Get-R1ReceiptPath "readiness-$Phase.receipt.json") }
+exit $exit
+

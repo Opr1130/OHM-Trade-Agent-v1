@@ -1,0 +1,29 @@
+requirement_id,requirement,implementation,evidence,status
+R-A1,Verify input hashes and the certified source pin,SOURCE-PIN.json + re-hash of the certified extract,1217 files 0 mismatches; SHA c196dd67 exists as a commit in the worktree repo,VERIFIED
+R-A2,Map requirements to implementation/tests/status,this matrix + 02/03/04,99 collected tests mapped,VERIFIED
+R-A3,Inspect scripts for failure atomicity / quoting / symlinks / TOCTOU / secret exposure,manual review + structural tests,_safe_destination; no secret reads; `set -Eeuo pipefail`; no `eval`,VERIFIED
+R-B1,Single host layout contract proven from certified artefacts,scripts/opip_layout.py,derived from deploy/remote/ohm-deploy REPO_ROOT/APP_ROOT and docker-compose bind mounts,VERIFIED
+R-B2,PreBootstrap checks only pre-transfer prerequisites,Invoke-V2Readiness.ps1,backup count is SKIP evidence; no /opt or .env requirement,VERIFIED (live run BLOCKED)
+R-B3,Prepare/authorize/execute receipts bound to host/SHA/image/config/expiry,scripts/opip_receipts.py,digest + expiry + nonce + prepared->authorized binding + consume,VERIFIED
+R-B4,Reject stale receipts, failed preflights, missing config and host drift,opip_receipts.verify_for_execute,test_expired_*; test_host_drift_*; test_blocking_incident_*,VERIFIED
+R-C1,Exactly one approved writer/scheduler sequence,bootstrap-v2.sh modes execute/activate-writer/activate-scheduler,test_execute_never_starts_writer_or_scheduler + writer gate tests,VERIFIED (design) / BLOCKED (live)
+R-C2,A CLI boolean is never proof of DB recovery,opip_bundle.promote + opip_recovery.validate_recovery_receipt,HF-02 regressions (staging receipt misuse refused),VERIFIED
+R-C3,Failure leaves writer and scheduler OFF and preserves V1 and V2 data,bootstrap mode separation + rollback snapshot,every refusal path exits before `up`,VERIFIED (static)
+R-C4,Failure injection at every transition,negative tests,R2 suite (35) + HF suites,VERIFIED
+R-D1,Manifest paths cannot escape source/staging/destination incl. symlink ancestors,opip_bundle._safe_destination,test_safe_destination_* (2),VERIFIED
+R-D2,Checksums verified before writes and immediately before promotion,stage_bundle verify_first + promote file index,test_promote_refuses_a_staged_file_changed_after_staging,VERIFIED
+R-D3,Preflight all conflicts before the first copy,promote preflight phase,test_promote_refuses_without_writing_when_a_later_conflict_exists,VERIFIED
+R-D4,WAL-aware consistent SQLite snapshot under quiescence,opip_rollback_guard.snapshot_database,test_snapshot_is_wal_safe_and_verified,VERIFIED
+R-D5,Refuse equal-epoch but newer sequence/event history,opip_rollback_guard.compare_history,test_compare_refuses_equal_epoch_with_newer_sequence_or_count,VERIFIED
+R-D6,Code / safe-baseline / data rollback remain distinct,rollback-v2.sh --kind,data kind refused; code requires immutable image id,VERIFIED
+R-D7,LF-only shell scripts inside the final ZIP and .gitattributes,.gitattributes + byte checks,test_host_scripts_are_lf_only_on_disk on the extracted package,VERIFIED (bytes) / BLOCKED (Linux bash -n)
+R-E1,Acceptance tests before implementation,R2 suite written first then fixes applied,35 R2 tests,VERIFIED
+R-E2,No `or True`, no guard-bypassing monkeypatch, test-integrity scan,repo-wide scan,test_no_vacuous_assertions_in_any_test,VERIFIED
+R-E3,Run tests against the exact certified SHA,conftest OPIP_CERTIFIED_SRC + SOURCE-PIN.json,pinned extract verified by hash,VERIFIED
+R-E4,Re-extract the packaged bytes and repeat syntax + tests,package verification step,separate extracted tree,VERIFIED (MSYS) / BLOCKED (Linux-native)
+R-F1,Deliver 01-10 + ZIP + SHA-256,this package,see 10-FINAL-VERDICT.md,VERIFIED
+R-F2,Release decision stays HOLD if any guard/source/regression/Linux/live gate is open,10-FINAL-VERDICT.md,HOLD,VERIFIED
+OWNER-1,No production SSH / V2 mutation / live DB / merge / deploy,no such command executed,execution logs,HONOURED
+OWNER-2,No secrets read or printed,only file hashes of .env are computed on-host; no local secret access,n/a,HONOURED
+OWNER-3,Do not stage or commit _m07_audit_inputs,_m07_audit_inputs not present in this workspace; no git add/commit run,n/a,NOT APPLICABLE
+OWNER-4,Do not modify the certified baseline or other worktrees,changes confined to C:\Users\ohmpr\opip-mission-07-r1,hash re-check,VERIFIED

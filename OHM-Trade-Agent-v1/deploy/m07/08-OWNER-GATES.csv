@@ -1,0 +1,15 @@
+gate_id,gate,owner_action,blocks,evidence_needed,status
+L-01,Read-only opipadmin probe of the V2 host,authorise one read-only SSH probe (known-host),PreBootstrap readiness exit 0,readiness receipt with REMOTE_IDENTITY/BACKUP_SEED_INFO,BLOCKED
+L-02,Installed certified release at the exact SHA,confirm the release path and SHA on the host,prepare,manifest digest + `git rev-parse HEAD`,BLOCKED
+L-03,Certified image present with the SHA label,confirm `docker image inspect` output,prepare/execute,image id + label evidence,BLOCKED
+L-04,`.env` present at APP_ROOT with mode 600/640 root,place the file,execute,`stat` evidence (never content),BLOCKED
+L-05,Overlay + nginx staged at /tmp/opip-v2,upload both files,execute,sha256 of each staged file,BLOCKED
+L-06,Final V1 generation exported and transferred,authorise the V1 export,promote,archive sha256 + manifest,BLOCKED
+L-07,Native canonical restore on Linux,authorise the restore (disposable or live),writer activation,recovery receipt with epoch/seq/count,BLOCKED
+L-08,HTTPS live acceptance,authorise DNS/certbot,release from HOLD,`https_ok=true` in LIVE-ACCEPTANCE.json,BLOCKED
+L-09,Tracked Telegram acceptance,authorise a tracked send,scheduler activation,`telegram_ok=true` in LIVE-ACCEPTANCE.json,BLOCKED
+L-10,Backup schedule verified on V2,confirm the timer/backups,exit of HOLD,backup listing + restore rehearsal,BLOCKED
+R2-G1,Linux-native `bash -n` of the delivered bytes,provide a Linux runner or container runtime,release certification,exit 0 from a Linux shell on the extracted ZIP,BLOCKED
+R2-G2,Fresh-host rehearsal of prepare->execute->activate,C1 disposable Linux host,sequence proof,receipt chain + logs,BLOCKED
+R2-G3,Compose render with the real project,container runtime + staged overlay,execute,`docker compose config --quiet` exit 0,BLOCKED
+R2-G4,Certified source available to an independent reviewer,publish/point to the pinned checkout,full-suite reproduction,99 passed at c196dd67,AVAILABLE LOCALLY (independent checkout BLOCKED)

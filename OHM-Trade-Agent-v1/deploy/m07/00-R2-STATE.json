@@ -1,0 +1,36 @@
+{
+  "schema": 2,
+  "mission": "OPIP-M07-R2-DEEP-AUDIT-CORRECTIVE",
+  "status": "HOLD",
+  "scope": "offline correction of the R1 toolchain only; no business logic, no production activation",
+  "baseline": {
+    "pre_change_tree": "C:/Users/ohmpr/opip-mission-07-r1-baseline",
+    "certified_sha": "c196dd674678b3b1ee91c351ee97c1c9e2b3938d",
+    "certified_files_hash_verified": 1217,
+    "hash_mismatches": 0
+  },
+  "tests": {
+    "collected": 100,
+    "passed": 100,
+    "failed": 0,
+    "skipped": 0,
+    "errors": 0,
+    "exit_code": 0,
+    "duration_seconds": 190.6,
+    "r2_module": 36,
+    "log": "evidence/r2/full-suite.log"
+  },
+  "defects": {
+    "closed_offline": 15,
+    "open_live_or_linux": ["R2-G1", "R2-G2", "L-01", "L-02", "L-03", "L-04", "L-05", "L-06", "L-07", "L-08", "L-09", "L-10"]
+  },
+  "safety_state": {
+    "production_ssh": "none",
+    "v1_or_v2_mutation": "none",
+    "live_database": "none",
+    "trading_activation": "none",
+    "git_merge_push_remote": "none",
+    "secrets_read": "none",
+    "certified_tree_modified": false
+  }
+}

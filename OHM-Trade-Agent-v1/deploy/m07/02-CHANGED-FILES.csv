@@ -1,0 +1,20 @@
+path,change_type,r0_state,r1_state,reason
+scripts/opip_bundle.py,ADDED,n/a,"export/verify/stage/promote/reconcile engine (no file cap, self-verifying archive)","P0-02"
+scripts/opip_recovery.py,ADDED,n/a,"fresh-host classification, rollback planner, certified canonical restore, overlay/ssh/TLS/uniqueness guards","P0-01, P0-03, P1-01, P1-02"
+scripts/opip_signals.py,ADDED,n/a,"tracked delivery vs transport-only, dedupe probe, pipeline state model","P1-03"
+scripts/telegram_tracked_acceptance.py,ADDED,n/a,"offline tracked-delivery acceptance against the certified delivery module","P1-03"
+scripts/lib/OpipR1.Common.ps1,ADDED,R0 lib,"receipts, exit codes, python/ssh invocation with per-probe evidence","shared"
+scripts/Invoke-V2Readiness.ps1,REPLACED,"root@, user-supplied identity, no rc enforcement","opipadmin, server-side metadata identity, rc=0 + evidence, host-only compose config","P1-01"
+scripts/Invoke-V2Bootstrap.ps1,ADDED,absent,"first-install path that runs+records the certified preflight and excludes paper/P1/controller","P0-01"
+scripts/Invoke-V2Rollback.ps1,REPLACED,"depended on transient controller override","durable generated overlay + epoch/history guard","P0-03"
+scripts/Invoke-OpipDataMigration.ps1,REPLACED,"PS-only copy chain","thin orchestrator over the tested python engine incl. explicit RestoreCanonical","P0-02"
+scripts/Invoke-V2DashboardValidation.ps1,ADDED,absent,"TLS prerequisite gate + route/auth assertions + live commands","P1-02"
+scripts/Invoke-V2TelegramValidation.ps1,ADDED,absent,"tracked-delivery gate with transport probe separated","P1-03"
+tests/conftest.py,ADDED,n/a,"R1 paths, fixture reuse, bundle fixture",test harness
+tests/make_fixture.py,ADDED,n/a,"synthetic V1 tree incl. 2600-file dataset and canonical generation",P0-02
+tests/scenarios/test_r1_bundle.py,ADDED,n/a,"scenarios 5,6,7,8,9 + large dataset + archive-only verification",regression
+tests/scenarios/test_r1_operations.py,ADDED,n/a,"scenarios 1,2,3,4,10,11,12,13,14,15",regression
+drafts/docker-compose.v2.yml,COPIED,unchanged,identical to Mission 07 (writer pinned 128m),input
+drafts/nginx-v2.conf,COPIED,unchanged,identical to Mission 07,input
+drafts/environment-template.example,COPIED,unchanged,names-only template,input
+drafts/v1-dataset-spec.json,COPIED,unchanged,44 datasets / 23 required,input

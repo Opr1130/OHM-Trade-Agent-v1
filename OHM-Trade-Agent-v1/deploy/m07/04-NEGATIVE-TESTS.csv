@@ -1,0 +1,28 @@
+test_id,scenario,injection,expected,observed
+R2-promote-later-conflict,two staged files with only the later one conflicting,conflicting file exists in target,REFUSED, 0 writes, earlier file absent,REFUSED, writes_performed=0
+R2-promote-force,force=True with a conflict,force mode,preflight still runs; both files promoted,PASS, promoted=2
+R2-promote-tamper,staged file modified after the staging receipt,byte change,REFUSED, 0 writes,problem "changed after staging",REFUSED
+R2-path-escape,`../escape.txt`, `a/../../x`, `/etc/passwd`, `C:/...`,absolute/traversal,SystemExit each time,SystemExit x2 (parametrized)
+R2-symlink-ancestor,symlinked directory inside the target,symlink, SystemExit,SystemExit (skipped if symlinks are not permitted)
+R2-snapshot-existing,pre-existing snapshot destination,existing file,SystemExit; file untouched,SystemExit, content preserved
+R2-compare-newer-seq,same epoch with next_local_sequence advanced,seq 4 > plan 3,REFUSED naming next_local_sequence,REFUSED
+R2-compare-newer-count,same epoch/seq with one more event,count 3 > plan 2,REFUSED,REFUSED
+R2-compare-corrupt,live integrity_check != ok,corruption marker,REFUSED,REFUSED
+R2-receipt-expired,prepared TTL -1,expired receipt,SystemExit "expired",SystemExit
+R2-receipt-replay,authorization already consumed,replay,FAIL with "consumed",FAIL
+R2-receipt-reprepare,second prepare after authorization,new nonce,FAIL with "not bound",FAIL
+R2-receipt-drift,image id changed between authorize and execute,drift,FAIL naming image_id drifted,FAIL
+R2-receipt-blocking,prepared receipt with a blocking incident,acknowledgement supplied,SystemExit,SystemExit
+R2-writer-gate-missing,no receipt,missing file,REFUSED,REFUSED
+R2-writer-gate-failed,completed=False / verdict=FAIL,failed restore,REFUSED,REFUSED
+R2-writer-gate-other-destination,receipt bound to another DB path,path mismatch,REFUSED naming destination,REFUSED
+R2-writer-gate-stale,restored_at 30h ago with max 24h,staleness,REFUSED naming stale,REFUSED
+R2-writer-gate-drift,receipt epoch 2 vs live epoch 3,history drift,REFUSED naming history_epoch,REFUSED
+R2-orphan-body,statement outside a function,structural,no offenders / balanced braces,pass
+R2-errexit,`]] && die` at statement level,structural,no offenders,pass
+R2-vacuous,`or True` in any test,structural,no offenders,pass
+R2-crlf,CRLF anywhere in a .sh,byte scan,no CRLF and LF shebang,pass
+R2-backup-gate,PreBootstrap requiring a backup,structural,no `-ge 1` in the PreBootstrap block,pass
+HF-02-staging-receipt,staged generation with only a staging receipt,caller true,refused; target untouched,refused
+HF-02-stale-pass,a failed restore after a PASS,failure overwrite,receipt no longer PASS,pass
+HF-01-archive-traversal,invalid checksum archive with ../../outside-proof.txt,traversal,refused; file never created,refused

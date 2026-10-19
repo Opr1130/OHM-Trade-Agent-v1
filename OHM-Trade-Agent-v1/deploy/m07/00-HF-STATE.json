@@ -1,0 +1,152 @@
+{
+  "mission": "MISSION-07-R1-HF",
+  "name": "Final Release Toolchain Hardening",
+  "certified_sha": "c196dd674678b3b1ee91c351ee97c1c9e2b3938d",
+  "workspace": {
+    "correction_root": "C:\\Users\\ohmpr\\opip-mission-07-r1",
+    "pre_change_baseline": "C:\\Users\\ohmpr\\opip-mission-07-r1-baseline",
+    "baseline_files": 28,
+    "mission_07_evidence_untouched": true,
+    "phase5e_branch_untouched": true,
+    "certified_tree_modified": false
+  },
+  "changes": {
+    "added": 9,
+    "modified": 7,
+    "removed": 0,
+    "inventory": "09-HF-CHANGED-FILES.csv"
+  },
+  "hardening": [
+    {
+      "id": "HF-01",
+      "status": "PASS",
+      "tests": 8,
+      "summary": "digest-first, member-safe, non-destructive verification"
+    },
+    {
+      "id": "HF-02",
+      "status": "PASS",
+      "tests": 11,
+      "summary": "persisted receipt re-verified against the live DB before promotion"
+    },
+    {
+      "id": "HF-03",
+      "status": "PASS",
+      "tests": 11,
+      "summary": "guarded prepare/authorize/execute bootstrap, three receipts, no paper/P1/clone"
+    },
+    {
+      "id": "HF-04",
+      "status": "PASS",
+      "tests": 4,
+      "summary": "host-generated durable overlay, DB epochs, kind separation, newer-data refusal"
+    },
+    {
+      "id": "HF-05",
+      "status": "PASS",
+      "tests": 2,
+      "summary": "PreBootstrap and PostConfiguration phases as opipadmin with sudo -n"
+    },
+    {
+      "id": "HF-06",
+      "status": "PASS",
+      "tests": 11,
+      "summary": "host-evidence identity, fresh cutoff, archive digest, dataset completeness"
+    },
+    {
+      "id": "HF-07",
+      "status": "PASS",
+      "tests": 0,
+      "summary": "before/after evidence, cutover, live prerequisites, adversarial review, matrix"
+    }
+  ],
+  "tests": {
+    "hf_subset": {
+      "command": "pytest tests/scenarios/test_hf01_archive_safety.py test_hf02_recovery_gate.py test_hf03_hf04_host_scripts.py test_hf06_provenance.py test_r1_operations.py -q",
+      "exit_code": 0,
+      "passed": 54
+    },
+    "bundle_suite": {
+      "command": "pytest tests/scenarios/test_r1_bundle.py -q",
+      "exit_code": 0,
+      "passed": 10
+    },
+    "total_passed": 64,
+    "total_failed": 0,
+    "shell_syntax": {
+      "bootstrap-v2.sh": 0,
+      "rollback-v2.sh": 0,
+      "tool": "bash -n (Git bash 5.3)"
+    },
+    "powershell_parse": "all .ps1 parse cleanly"
+  },
+  "script_runs": [
+    {
+      "script": "Invoke-V2Readiness.ps1 -Phase PreBootstrap",
+      "exit": 2,
+      "meaning": "offline: probes pending"
+    },
+    {
+      "script": "Invoke-V2Readiness.ps1 -Phase PostConfiguration",
+      "exit": 2,
+      "meaning": "offline: probes pending"
+    },
+    {
+      "script": "Invoke-V2Readiness.ps1 -Phase PreBootstrap -SshUser root",
+      "exit": 3,
+      "meaning": "wrong account refused"
+    },
+    {
+      "script": "Invoke-V2Bootstrap.ps1 -Phase Prepare",
+      "exit": 2,
+      "meaning": "printed remote sequence; no shell opened"
+    },
+    {
+      "script": "Invoke-V2Bootstrap.ps1 -Phase Execute (no -Authorize)",
+      "exit": 3,
+      "meaning": "refused"
+    },
+    {
+      "script": "Invoke-V2Rollback.ps1 -Phase Prepare -Kind safe-baseline",
+      "exit": 2,
+      "meaning": "printed remote sequence"
+    },
+    {
+      "script": "Invoke-V2Rollback.ps1 -Kind data",
+      "exit": 3,
+      "meaning": "data recovery is not a code rollback"
+    },
+    {
+      "script": "Invoke-V2Rollback.ps1 -Kind code (no image)",
+      "exit": 3,
+      "meaning": "immutable image required"
+    },
+    {
+      "script": "Invoke-OpipDataMigration.ps1 -Mode Promote (no -Authorize)",
+      "exit": 3,
+      "meaning": "refused"
+    }
+  ],
+  "live_gates": [
+    "L-01 read-only V2 probe",
+    "L-02 installed release",
+    "L-03 certified image",
+    "L-04 .env",
+    "L-05 preflight verdict",
+    "L-06 final V1 generation",
+    "L-07 Linux native restore",
+    "L-08 TLS",
+    "L-09 Telegram",
+    "L-10 backups"
+  ],
+  "verdict": "HOLD",
+  "verdict_basis": "All identified toolchain defects are corrected and covered by executable tests; no V2 runtime, real V1 history, backup protection, HTTPS or Telegram acceptance was possible without owner authorisation.",
+  "safety_state": {
+    "production_ssh_mutations": "none",
+    "v1_restart": "none",
+    "v2_activation": "none",
+    "dns_or_firewall": "unchanged",
+    "secrets": "none read or written",
+    "merges_or_deploys": "none"
+  }
+}
