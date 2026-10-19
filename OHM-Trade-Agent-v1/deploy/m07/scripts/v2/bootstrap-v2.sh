@@ -33,6 +33,11 @@ TOOLKIT_ROOT="/opt/opip-m07-toolkit"
 CANONICAL_TOOLKIT_ROOT="/opt/opip-m07-toolkit"
 TOOLKIT_MANIFEST="$TOOLKIT_ROOT/TOOLKIT-MANIFEST.sha256"
 PROVISION_FROM=""
+SOURCE_SHA=""
+CHECK_APP_ROOT=""
+CHECK_MANIFEST=""
+CHECK_RECEIPT=""
+RUNNING_IMAGE_ID=""
 SRC=""                      # resolved by resolve_src (never guessed)
 REPO_ROOT="/opt/OHM-Trade-Agent-v1"
 APP_ROOT="$REPO_ROOT/OHM-Trade-Agent-v1"
@@ -96,6 +101,7 @@ toolkit_manifest_verify() {
   local root="$1"
   local manifest="$root/TOOLKIT-MANIFEST.sha256"
   [[ -d "$root/scripts" && -s "$manifest" ]] || return 1
+  [[ -s "$root/TOOLKIT-PROVENANCE.json" ]] || return 1
   local helper perms owner
   while IFS= read -r helper; do
     [[ -f "$root/scripts/$helper" ]] || return 1
@@ -150,6 +156,17 @@ mode_provision_toolkit() {
   local src dest parent tmp_root dest_raw
   src="$(realpath -e -- "$PROVISION_FROM" 2>/dev/null)" \
     || die "toolkit source does not resolve: $PROVISION_FROM"
+
+  # AC-010: trusted source origin. A locally generated manifest is not origin
+  # evidence; the source must be a clean git checkout at an explicit commit.
+  [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] \
+    || die "--source-sha <40-hex reviewed toolkit commit> is required for provisioning"
+  [[ "$(git -C "$src" rev-parse --is-inside-work-tree 2>/dev/null)" == "true" ]] \
+    || die "toolkit source must be a git checkout for provenance: $src"
+  [[ "$(git -C "$src" rev-parse HEAD 2>/dev/null)" == "$SOURCE_SHA" ]] \
+    || die "toolkit source HEAD does not equal --source-sha $SOURCE_SHA"
+  [[ -z "$(git -C "$src" status --porcelain -- . 2>/dev/null)" ]] \
+    || die "toolkit source has uncommitted changes; review and commit before provisioning"
   dest_raw="${TOOLKIT_ROOT%/}"
   [[ "$dest_raw" == /* ]] || die "destination must be an absolute path: $TOOLKIT_ROOT"
   case "$dest_raw" in
@@ -224,6 +241,18 @@ mode_provision_toolkit() {
   find "$staging" -type d -exec chmod 0755 {} +
   find "$staging" -type f -exec chmod 0644 {} +
   find "$staging" -type f -name '*.sh' -exec chmod 0755 {} +
+  python3 - "$staging/TOOLKIT-PROVENANCE.json" "$SOURCE_SHA" "$SHA" <<'PY'
+import json, sys
+from datetime import datetime, timezone
+path, source_sha, certified = sys.argv[1:4]
+json.dump({
+    "toolkit_schema": 1,
+    "source_git_sha": source_sha,
+    "certified_app_sha": certified,
+    "provisioned_at_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+}, open(path, "w", encoding="utf-8"), indent=2, sort_keys=True)
+PY
+  chmod 0644 "$staging/TOOLKIT-PROVENANCE.json"
   toolkit_manifest_build "$staging"
   toolkit_manifest_verify "$staging" \
     || die "staged toolkit failed integrity verification; destination was not modified"
@@ -262,6 +291,33 @@ mode_check_toolkit() {
   fi
 }
 
+mode_check_release() {
+  # AC-009: verify the installed tree against the installer manifest using
+  # exactly the installation exclusions. No .git is required or consulted.
+  local root="${CHECK_APP_ROOT:-$APP_ROOT}"
+  local manifest="${CHECK_MANIFEST:-$MANIFEST}"
+  local receipt="${CHECK_RECEIPT:-$EXECUTED}"
+  [[ -d "$root" ]] || die "installed release root missing: $root"
+  [[ -s "$manifest" ]] || die "release manifest missing: $manifest"
+  manifest_verify "$root" "$manifest" \
+    || die "installed release does not match the certified manifest"
+  [[ -s "$receipt" ]] || die "bootstrap execution receipt missing: $receipt"
+  python3 - "$receipt" "$SHA" <<'PY' || die "execution receipt does not attest the certified SHA"
+import json, sys
+path, sha = sys.argv[1:3]
+doc = json.load(open(path, encoding="utf-8"))
+if doc.get("receipt") != "BOOTSTRAP_EXECUTED":
+    raise SystemExit(3)
+if str(doc.get("certified_sha")) != sha:
+    raise SystemExit(3)
+if doc.get("writer_started") is not False:
+    raise SystemExit(3)
+PY
+  printf 'RELEASE_CHECK=PASS\n'
+  printf 'RELEASE_ROOT=%s\n' "$root"
+  printf 'CERTIFIED_SHA=%s\n' "$SHA"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --mode) MODE="$2"; shift 2 ;;
@@ -272,6 +328,10 @@ while [[ $# -gt 0 ]]; do
     --to) TOOLKIT_ROOT="$2"; TOOLKIT_MANIFEST="$TOOLKIT_ROOT/TOOLKIT-MANIFEST.sha256"; shift 2 ;;
     --release-root) RELEASE_ROOT="$2"; shift 2 ;;
     --from) PROVISION_FROM="$2"; shift 2 ;;
+    --source-sha) SOURCE_SHA="$2"; shift 2 ;;
+    --app-root) CHECK_APP_ROOT="$2"; shift 2 ;;
+    --manifest) CHECK_MANIFEST="$2"; shift 2 ;;
+    --receipt) CHECK_RECEIPT="$2"; shift 2 ;;
     --activate-scheduler) shift ;;   # legacy flag: scheduler needs its own mode now
     *) die "unknown argument $1" ;;
   esac
@@ -279,7 +339,7 @@ done
 
 [[ -n "$MODE" ]] || die "--mode prepare|authorize|execute|activate-writer|activate-scheduler|provision-toolkit|check-toolkit is required"
 case "$MODE" in
-  check-toolkit|provision-toolkit)
+  check-toolkit|provision-toolkit|check-release)
     LOG=""   # read-only / provisioning modes must work without a host state dir
     ;;
   *)
@@ -382,6 +442,37 @@ compose() {
   ( cd "$APP_ROOT" && docker compose "$@" )
 }
 
+verify_service_image() {
+  local service="$1" rendered verdict
+  rendered="$(mktemp "${TMPDIR:-/tmp}/opip-compose-render.XXXXXX.json")" \
+    || die "cannot create a Compose render file"
+  if ! compose config --format json >"$rendered" 2>/dev/null; then
+    rm -f -- "$rendered"
+    die "cannot render the certified Compose configuration"
+  fi
+  if ! verdict="$(python3 "$TOOLS/opip_image.py" verify --compose-json "$rendered" \
+      --service "$service" --certified-image-id "$IMAGE_ID" --docker docker)"; then
+    log "$verdict"
+    rm -f -- "$rendered"
+    die "certified image identity check failed for $service"
+  fi
+  rm -f -- "$rendered"
+  log "$verdict"
+}
+
+verify_running_image() {
+  local service="$1" cid image
+  cid="$(compose ps -q "$service" 2>/dev/null | head -n 1)"
+  [[ -n "$cid" ]] || die "no running container for $service"
+  image="$(docker inspect -f '{{.Image}}' "$cid" 2>/dev/null)"
+  [[ -n "$image" ]] || die "cannot read the running image for $service"
+  python3 "$TOOLS/opip_image.py" container --observed-image-id "$image" \
+    --certified-image-id "$IMAGE_ID" >/dev/null \
+    || die "running $service image $image does not match the certified $IMAGE_ID"
+  RUNNING_IMAGE_ID="$image"
+  log "running $service image verified: $image"
+}
+
 mode_execute() {
   verify_identity
   verify_source
@@ -421,7 +512,9 @@ PY
     log "writer service present in the project (must stay stopped until activate-writer)"
   fi
 
-  run "start core" compose up -d --no-deps ohm-trade-agent
+  verify_service_image ohm-trade-agent
+  run "start core" compose up -d --no-build --no-deps ohm-trade-agent
+  verify_running_image ohm-trade-agent
   local healthy=0
   for _ in $(seq 1 30); do
     if curl -fsS http://127.0.0.1:8000/health | grep -q '"status":"ok"'; then healthy=1; break; fi
@@ -435,13 +528,14 @@ PY
     die "canonical writer is running before canonical recovery; refusing to continue"
   fi
 
-  python3 - "$EXECUTED" "$DROPLET_ID" "$SHA" "$IMAGE_ID" "$cfg" <<'PY'
+  python3 - "$EXECUTED" "$DROPLET_ID" "$SHA" "$IMAGE_ID" "$cfg" "$RUNNING_IMAGE_ID" <<'PY'
 import json, sys
 from datetime import datetime, timezone
-path, host, sha, image, cfg = sys.argv[1:6]
+path, host, sha, image, cfg, runtime_image = sys.argv[1:7]
 json.dump({"receipt": "BOOTSTRAP_EXECUTED", "receipt_schema": 2,
            "executed_at_utc": datetime.now(timezone.utc).isoformat(),
-           "host": host, "certified_sha": sha, "image_id": image, "config_digest": cfg,
+           "host": host, "certified_sha": sha, "image_id": image,
+           "runtime_image_id": runtime_image, "config_digest": cfg,
            "writer_started": False, "scheduler_started": False,
            "next_required_gate": "canonical recovery, then --mode activate-writer",
            "paper_stack": "ABSENT", "p1_retirement": "NOT_RUN"},
@@ -594,18 +688,21 @@ mode_activate_writer() {
     die "recovery receipt does not authorise a canonical writer for $LIVE_DB"
   fi
   log "writer gate PASS: $gate"
-  run "start writer" compose up -d --no-deps opip-canonical-writer
+  verify_service_image opip-canonical-writer
+  run "start writer" compose up -d --no-build --no-deps opip-canonical-writer
+  verify_running_image opip-canonical-writer
   local running
   running="$(compose ps --status running --services | grep -cx 'opip-canonical-writer' || true)"
   [[ "$running" == "1" ]] || die "expected exactly one running canonical writer, observed $running"
-  python3 - "$WRITER_RECEIPT" "$DROPLET_ID" "$SHA" "$RECOVERY_RECEIPT" "$(sha256sum "$RECOVERY_RECEIPT" | cut -d' ' -f1)" <<'PY'
+  python3 - "$WRITER_RECEIPT" "$DROPLET_ID" "$SHA" "$RECOVERY_RECEIPT" "$(sha256sum "$RECOVERY_RECEIPT" | cut -d' ' -f1)" "$RUNNING_IMAGE_ID" <<'PY'
 import json, sys
 from datetime import datetime, timezone
-path, host, sha, receipt, digest = sys.argv[1:6]
+path, host, sha, receipt, digest, runtime_image = sys.argv[1:7]
 json.dump({"receipt": "WRITER_ACTIVATED", "receipt_schema": 2,
            "activated_at_utc": datetime.now(timezone.utc).isoformat(),
            "host": host, "certified_sha": sha,
            "recovery_receipt": receipt, "recovery_receipt_sha256": digest,
+           "runtime_image_id": runtime_image,
            "writers_running": 1}, open(path, "w", encoding="utf-8"), indent=2, sort_keys=True)
 PY
   chmod 0600 "$WRITER_RECEIPT"
@@ -648,6 +745,7 @@ case "$MODE" in
   activate-scheduler) mode_activate_scheduler ;;
   provision-toolkit) mode_provision_toolkit ;;
   check-toolkit) mode_check_toolkit ;;
+  check-release) mode_check_release ;;
   *) die "unknown mode $MODE" ;;
 esac
 

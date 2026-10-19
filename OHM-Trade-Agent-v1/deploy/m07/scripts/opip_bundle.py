@@ -186,6 +186,59 @@ def _export_canonical(canonical_dir, payload: Path, dataset: dict, allow_synthet
         "files": files,
         "size_bytes": sum(f["size"] for f in files),
     }
+def load_identity_evidence(
+    path: str | Path | None,
+    *,
+    expected: dict,
+    max_age_hours: float = 24.0,
+) -> dict:
+    """Load and verify independently produced host-identity evidence.
+
+    The evidence document must name the expected droplet and IP, an explicit
+    source generation, and a fresh capture time. Its digest is returned so it can
+    be bound into the export manifest. A bare ``--identity-proof`` string is not
+    evidence and is never accepted on its own.
+    """
+    if not path:
+        raise SystemExit("refusing export: --identity-evidence is required for host-evidence")
+    evidence_path = Path(path)
+    if not evidence_path.is_file():
+        raise SystemExit(f"refusing export: identity evidence not found: {evidence_path}")
+    raw = evidence_path.read_bytes()
+    try:
+        document = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"refusing export: identity evidence is not valid JSON: {exc}") from exc
+    required = ("droplet_id", "ip", "captured_at_utc", "source_generation")
+    missing = [key for key in required if not str(document.get(key) or "").strip()]
+    if missing:
+        raise SystemExit(f"refusing export: identity evidence is missing {', '.join(missing)}")
+    if str(document["droplet_id"]) != str(expected.get("droplet_id")):
+        raise SystemExit("refusing export: identity evidence droplet does not match the source")
+    if str(document["ip"]) != str(expected.get("ip")):
+        raise SystemExit("refusing export: identity evidence IP does not match the source")
+    try:
+        captured = datetime.fromisoformat(str(document["captured_at_utc"]).replace("Z", "+00:00"))
+        if captured.tzinfo is None:
+            captured = captured.replace(tzinfo=timezone.utc)
+    except ValueError as exc:
+        raise SystemExit(f"refusing export: identity evidence has no usable capture time: {exc}") from exc
+    age_hours = (datetime.now(timezone.utc) - captured).total_seconds() / 3600.0
+    if age_hours < 0:
+        raise SystemExit("refusing export: identity evidence is dated in the future")
+    if age_hours > max_age_hours:
+        raise SystemExit(
+            f"refusing export: identity evidence is stale ({age_hours:.1f}h > {max_age_hours}h)"
+        )
+    return {
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "droplet_id": str(document["droplet_id"]),
+        "ip": str(document["ip"]),
+        "captured_at_utc": str(document["captured_at_utc"]),
+        "source_generation": str(document["source_generation"]),
+    }
+
+
 def export(
     *,
     source_root: Path,
@@ -195,6 +248,7 @@ def export(
     canonical_dir: Path | None,
     cutoff_utc: str,
     source_identity: dict,
+    identity_evidence: dict | None = None,
     chunk_size_mb: int = 0,
     allow_synthetic_canonical: bool = False,
     force: bool = False,
@@ -203,7 +257,15 @@ def export(
     archive_mod.assert_source_tree(source_root)
     proof = str(source_identity.get("identity_proof", "")).strip().lower()
     if proof == "host-evidence":
-        pass
+        if not identity_evidence:
+            raise SystemExit(
+                "refusing export: host-evidence requires a verified --identity-evidence document"
+            )
+        if str(identity_evidence.get("droplet_id")) != str(source_identity.get("droplet_id")) \
+                or str(identity_evidence.get("ip")) != str(source_identity.get("ip")):
+            raise SystemExit(
+                "refusing export: verified evidence does not match the declared source identity"
+            )
     elif proof == "fixture" and allow_synthetic_canonical:
         pass  # rehearsal only; provenance verification still requires --allow-fixture
     else:
@@ -280,6 +342,8 @@ def export(
         "certified_sha": CERTIFIED_SHA, "bundle_name": bundle_name,
         "exported_at_utc": utc_now(), "consistency_cutoff_utc": cutoff_utc,
         "source": source_identity, "canonical": canonical,
+        "source_identity_evidence": identity_evidence,
+        "identity_evidence_sha256": (identity_evidence or {}).get("sha256"),
         "datasets": sorted(datasets, key=lambda d: int(d["ordering"])),
         "exclusions": exclusions,
         "totals": {"datasets": len(datasets), "files": sum(d["file_count"] for d in datasets),
@@ -812,6 +876,8 @@ def main(argv: list[str] | None = None) -> int:
     p_exp.add_argument("--droplet-id", default="589794133")
     p_exp.add_argument("--ip", default="161.35.106.207")
     p_exp.add_argument("--identity-proof", default="UNPROVEN")
+    p_exp.add_argument("--identity-evidence")
+    p_exp.add_argument("--identity-max-age-hours", type=float, default=24.0)
     p_exp.add_argument("--chunk-mb", type=int, default=0)
     p_exp.add_argument("--allow-synthetic-canonical", action="store_true")
     p_exp.add_argument("--force", action="store_true")
@@ -857,6 +923,13 @@ def main(argv: list[str] | None = None) -> int:
                               "message": "re-run with --authorize to write the bundle"}, indent=2))
             return 77
         spec = load_spec(Path(args.spec))
+        evidence = None
+        if str(args.identity_proof).strip().lower() == "host-evidence":
+            evidence = load_identity_evidence(
+                args.identity_evidence,
+                expected={"droplet_id": args.droplet_id, "ip": args.ip},
+                max_age_hours=args.identity_max_age_hours,
+            )
         result = export(
             source_root=Path(args.source_root), spec=spec, out_dir=Path(args.out_dir),
             bundle_name=args.bundle_name,
@@ -864,6 +937,7 @@ def main(argv: list[str] | None = None) -> int:
             cutoff_utc=args.cutoff or utc_now(),
             source_identity={"droplet_id": args.droplet_id, "ip": args.ip,
                              "identity_proof": args.identity_proof},
+            identity_evidence=evidence,
             chunk_size_mb=args.chunk_mb,
             allow_synthetic_canonical=args.allow_synthetic_canonical,
             force=args.force,

@@ -22,6 +22,8 @@ param(
     [string]$LiveDb,
     [string]$RecoveryReceipt,
     [string]$ProvenanceEvidence,
+    [string]$SourceIdentityEvidence,
+    [string]$IdentityMaxAgeHours = '24',
     [string]$MaxAgeHours = '24',
     [switch]$AllowFixture,
     [int]$ChunkMB = 0,
@@ -64,14 +66,31 @@ try {
         }
         'Export' {
             if (-not $SourceRoot) { throw 'Export requires -SourceRoot' }
+            if ($Authorize) {
+                if (-not $SourceIdentityEvidence) {
+                    Add-R1Check $receipt 'SOURCE_IDENTITY_EVIDENCE' 'REFUSED' `
+                        '-SourceIdentityEvidence is required for an authorized export'
+                    $exit = 3
+                    break
+                }
+                if ($AllowSyntheticCanonical) {
+                    Add-R1Check $receipt 'SYNTHETIC_ISOLATION' 'REFUSED' `
+                        'synthetic canonical data cannot be exported as a real authorized generation'
+                    $exit = 3
+                    break
+                }
+            }
             $args = @($bundleCli, 'export', '--source-root', $SourceRoot, '--spec', $spec,
                 '--out-dir', (Join-Path $script:OpipR1Evidence 'bundles'),
                 '--bundle-name', ("r1-" + (Get-Date -Format 'yyyyMMddTHHmmssZ')),
                 '--chunk-mb', "$ChunkMB")
             if ($CanonicalDir) { $args += @('--canonical-dir', $CanonicalDir) }
-            if ($AllowSyntheticCanonical) { $args += '--allow-synthetic-canonical' }
             if ($Force) { $args += '--force' }
-            if ($Authorize) { $args += '--authorize' }
+            if ($Authorize) {
+                $args += @('--authorize', '--identity-proof', 'host-evidence',
+                    '--identity-evidence', $SourceIdentityEvidence,
+                    '--identity-max-age-hours', $IdentityMaxAgeHours)
+            }
             $exit = Invoke-R1Step 'EXPORT' $args 'export.json'
         }
         'Verify' {

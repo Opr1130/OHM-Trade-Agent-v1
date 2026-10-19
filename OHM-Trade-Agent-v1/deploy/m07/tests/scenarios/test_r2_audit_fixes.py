@@ -8,6 +8,7 @@ pass vacuously (R2 explicitly removed the `or True` escape).
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -441,3 +442,82 @@ def test_compare_refuses_a_corrupt_live_database():
     live = {"history_epoch": 2, "next_local_sequence": 3, "event_count": 2,
             "integrity_check": "*** in database main ***", "foreign_key_violations": 0}
     assert guard.compare_history(plan=plan, live=live)["verdict"] == "REFUSED"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX: executes an executable docker shim")
+def test_image_binding_resolves_build_services_and_refuses_drift(tmp_path):
+    """AC-007: build-only services resolve to project images and drift is refused."""
+    import opip_image
+
+    config = {
+        "name": "proj",
+        "services": {
+            "ohm-trade-agent": {"build": "."},
+            "opip-canonical-writer": {"build": "."},
+            "ohm-dashboard-edge": {"image": "nginx:1.27-alpine"},
+        },
+    }
+    images = opip_image.compose_images(config)
+    assert images["ohm-trade-agent"] == "proj-ohm-trade-agent"
+    assert images["opip-canonical-writer"] == "proj-opip-canonical-writer"
+    assert images["ohm-dashboard-edge"] == "nginx:1.27-alpine"
+
+    shim = tmp_path / "docker"
+    shim.write_text("#!/bin/sh\nprintf 'sha256:certified\\n'\n", encoding="utf-8")
+    shim.chmod(0o755)
+    good = opip_image.verify_service(config, service="opip-canonical-writer",
+                                     certified_image_id="sha256:certified", docker=str(shim))
+    assert good["verdict"] == "PASS", good
+
+    shim.write_text("#!/bin/sh\nprintf 'sha256:stale\\n'\n", encoding="utf-8")
+    shim.chmod(0o755)
+    stale = opip_image.verify_service(config, service="opip-canonical-writer",
+                                      certified_image_id="sha256:certified", docker=str(shim))
+    assert stale["verdict"] == "REFUSED"
+    assert "not the certified" in " ".join(stale["problems"])
+
+    missing = opip_image.verify_service(config, service="not-a-service",
+                                        certified_image_id="sha256:certified", docker=str(shim))
+    assert missing["verdict"] == "REFUSED"
+
+
+def test_identity_evidence_requires_matching_fresh_host_document(tmp_path):
+    """AC-008: a bare proof string is not evidence; host/gen/freshness bind."""
+    import json as json_mod
+    from datetime import datetime, timedelta, timezone
+
+    import opip_bundle
+
+    expected = {"droplet_id": "610307364", "ip": "161.35.106.207"}
+    evidence = tmp_path / "identity.json"
+
+    def write(**overrides):
+        document = {
+            "droplet_id": "610307364",
+            "ip": "161.35.106.207",
+            "captured_at_utc": datetime.now(timezone.utc).isoformat(),
+            "source_generation": "gen-0001",
+        }
+        document.update(overrides)
+        evidence.write_text(json_mod.dumps(document), encoding="utf-8")
+
+    write()
+    loaded = opip_bundle.load_identity_evidence(evidence, expected=expected)
+    assert len(loaded["sha256"]) == 64
+    assert loaded["source_generation"] == "gen-0001"
+
+    with pytest.raises(SystemExit):
+        opip_bundle.load_identity_evidence(None, expected=expected)
+
+    write(droplet_id="999")
+    with pytest.raises(SystemExit):
+        opip_bundle.load_identity_evidence(evidence, expected=expected)
+
+    write(captured_at_utc=(datetime.now(timezone.utc) - timedelta(hours=48)).isoformat())
+    with pytest.raises(SystemExit):
+        opip_bundle.load_identity_evidence(evidence, expected=expected, max_age_hours=24)
+
+    write(source_generation="")
+    with pytest.raises(SystemExit):
+        opip_bundle.load_identity_evidence(evidence, expected=expected)
+

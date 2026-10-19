@@ -6,8 +6,8 @@
     PreBootstrap  - identity, installed certified source release, certified image,
                     storage, backups, container state. Does NOT require /opt
                     checkout, .env or deployed Compose overlays.
-    PostConfiguration - release checkout, .env, effective Compose settings,
-                    resource limits, volumes and release modes.
+    PostConfiguration - installed release manifest (no Git), .env, effective Compose
+                    settings, resource limits, volumes and release modes.
     Privileged reads use `sudo -n` as opipadmin; SSH uses strict known-host
     verification. A probe is never PASS from locally supplied metadata.
 #>
@@ -17,6 +17,7 @@ param(
     [switch]$Execute,
     [switch]$Authorized,
     [string]$SshUser = 'opipadmin',
+    [string]$ToolkitRoot = '/opt/opip-m07-toolkit',
     [switch]$NoReceipt
 )
 
@@ -82,8 +83,11 @@ try {
             Add-R1Check $receipt 'PHASE_SCOPE' 'PASS' 'no /opt checkout, .env, overlay or final backup generation required in PreBootstrap'
         }
         else {
-            if (-not (Invoke-PhaseProbe 'RELEASE_CHECKOUT' "cd $app && git rev-parse HEAD" {
-                        param($e) $e.Trim() -eq $sha })) { $exit = 1 }
+            # AC-009: the runtime tree is installed without .git. Verify the
+            # installer manifest, recomputed from installed contents, using the
+            # same exclusions as installation; no Git command is used.
+            if (-not (Invoke-PhaseProbe 'RELEASE_MANIFEST' "sudo -n $ToolkitRoot/scripts/v2/bootstrap-v2.sh --mode check-release" {
+                        param($e) $e -match 'RELEASE_CHECK=PASS' })) { $exit = 1 }
             if (-not (Invoke-PhaseProbe 'ENV_PRESENT' "test -s $app/.env && stat -c '%a %U' $app/.env" {
                         param($e) $e.Trim() -match '^(600|640) root' })) { $exit = 1 }
             if (-not (Invoke-PhaseProbe 'EFFECTIVE_COMPOSE' "cd $app && sudo -n docker compose config 2>/dev/null | grep -E 'mem_limit|cpus|OPIP_PAPER_V2_MODE|OPIP_CANONICAL_WRITER_MODE' | sort -u" {
@@ -92,7 +96,7 @@ try {
                         param($e) $e -match 'data' })) { $exit = 1 }
             if (-not (Invoke-PhaseProbe 'RELEASE_MODES' "cd $app && sudo -n docker compose run --rm --no-deps ohm-trade-agent python -m app.services.release_profiles --profile EVIDENCE_SHADOW" {
                         param($e) $e -match 'ARCHITECTURE_GATE=PASS' })) { $exit = 1 }
-            Add-R1Check $receipt 'PHASE_SCOPE' 'PASS' 'checkout, .env, effective config, volumes and modes verified'
+            Add-R1Check $receipt 'PHASE_SCOPE' 'PASS' 'installed manifest, .env, effective config, volumes and modes verified'
         }
     }
 }

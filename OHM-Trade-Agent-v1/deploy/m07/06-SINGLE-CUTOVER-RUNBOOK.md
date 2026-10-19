@@ -44,6 +44,7 @@ toolkit from its reviewed extraction and verify it:
 sudo -n bash /srv/opip-v2/toolkit/<toolkit-sha>/OHM-Trade-Agent-v1/deploy/m07/scripts/v2/bootstrap-v2.sh \
   --mode provision-toolkit \
   --from /srv/opip-v2/toolkit/<toolkit-sha>/OHM-Trade-Agent-v1/deploy/m07 \
+  --source-sha <toolkit-sha> \
   --to /opt/opip-m07-toolkit
 sudo -n /opt/opip-m07-toolkit/scripts/v2/bootstrap-v2.sh --mode check-toolkit
 ```
@@ -94,6 +95,23 @@ render the single Compose file → core only → `/health` ok → release-profil
 (`writer_started=false`, `scheduler_started=false`) → consume the authorization.
 No overlay is staged and no nginx configuration is generated; the tracked
 `deploy/nginx/dashboard-sidecar.conf` from the verified release is used as-is.
+
+Compose declares `build: .` without an explicit `image`, so the three
+application services resolve to project-scoped image names. Before `execute`
+those names must already resolve locally to the certified immutable image ID;
+the bootstrap resolves them and refuses (it never builds) when any is missing or
+different. Create them from the verified image, for example:
+
+```
+for name in $(sudo -n bash /opt/opip-m07-toolkit/scripts/opip_image.py resolve \
+    --compose-json <(cd $APP_ROOT && sudo -n docker compose config --format json) \
+    | python3 -c 'import json,sys;print(" ".join(json.load(sys.stdin)["images"].values()))'); do
+  sudo -n docker tag <certified-image> "$name"
+done
+```
+
+The bootstrap verifies each service image before start and verifies the running
+container image ID afterwards; a mismatch refuses before any activation receipt.
 
 ## Phase 4 — Final V1 generation (owner, L-06)
 

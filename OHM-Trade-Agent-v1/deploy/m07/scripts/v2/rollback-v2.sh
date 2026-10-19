@@ -175,18 +175,6 @@ mode_execute() {
   perms="$(stat -c '%a %U:%G' "$OVERLAY")"
   [[ "$perms" == "640 root:root" ]] || die "overlay permissions drifted: $perms"
 
-  local facts
-  facts="$(db_facts)"
-  [[ "$(python3 -c 'import json,sys;print(json.loads(sys.argv[1])["readable"])' "$facts")" == "True" ]] \
-    || die "destination database unreadable; refusing to roll back blind"
-  # D07: epoch alone is not enough - sequence and event count must not advance either.
-  local guard
-  if ! guard="$(python3 "$TOOLS/opip_rollback_guard.py" compare --plan "$PLAN" --db "$LIVE_DB")"; then
-    log "$guard"
-    die "live canonical history advanced since prepare; refusing rollback"
-  fi
-  log "history guard PASS: $guard"
-
   local stamp preserve
   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
   preserve="$PRESERVE/$stamp"
@@ -211,6 +199,21 @@ import json, sys
 json.dump(json.loads(sys.argv[2]), open(sys.argv[1], "w", encoding="utf-8"), indent=2, sort_keys=True)
 PY
   [[ -s "$preserve/opip_canonical_v1.sqlite3" ]] || die "snapshot file missing after a reported success"
+
+  # AC-003: the authoritative comparison runs AFTER the writer is quiesced and
+  # proved stopped and AFTER the WAL-consistent snapshot is preserved. A
+  # pre-quiescence comparison cannot close the race and is not used as the gate.
+  local facts guard
+  facts="$(db_facts)"
+  [[ "$(python3 -c 'import json,sys;print(json.loads(sys.argv[1])["readable"])' "$facts")" == "True" ]] \
+    || die "destination database unreadable after quiescence; refusing rollback"
+  # D07: epoch alone is not enough - sequence and event count must not advance either.
+  if ! guard="$(python3 "$TOOLS/opip_rollback_guard.py" compare --plan "$PLAN" --db "$LIVE_DB")"; then
+    log "$guard"
+    die "live canonical history advanced since prepare; refusing rollback"
+  fi
+  log "history guard PASS: $guard"
+
   if [[ "$KIND" == "code" ]]; then
     [[ -n "$PREV_IMAGE" ]] || die "code rollback requires --previous-image (immutable image id)"
     docker image inspect -f '{{.Id}}' "$PREV_IMAGE" >/dev/null 2>&1 || die "previous image not present locally: $PREV_IMAGE"

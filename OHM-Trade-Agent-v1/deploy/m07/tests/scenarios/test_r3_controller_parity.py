@@ -7,6 +7,8 @@ if anyone reintroduces a second Compose source of truth.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import shutil
@@ -199,9 +201,113 @@ def test_operator_guidance_contains_no_obsolete_overlay_or_nginx_staging():
         assert "HISTORICAL" in text.splitlines()[2], historical
 
 
+def _git_head(path: Path) -> str:
+    proc = _run(["git", "-C", str(path), "rev-parse", "HEAD"])
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def _git_init(path: Path) -> str:
+    """Make a temp toolkit copy a clean git checkout with one reviewed commit."""
+    env = dict(os.environ, GIT_AUTHOR_NAME="ci", GIT_AUTHOR_EMAIL="ci@opip.invalid",
+               GIT_COMMITTER_NAME="ci", GIT_COMMITTER_EMAIL="ci@opip.invalid")
+    for command in (["init", "-q"], ["add", "-A"], ["commit", "-qm", "toolkit source"]):
+        subprocess.run(["git", "-C", str(path), *command], check=True, env=env,
+                       capture_output=True, text=True)
+    return _git_head(path)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX: executes the real bash entrypoint")
+def test_check_release_verifies_installed_tree_without_git(tmp_path):
+    """AC-009: PostConfiguration integrity uses the installer manifest, not Git."""
+    for tool in ("git", "tar", "bash"):
+        if shutil.which(tool) is None:
+            pytest.skip(f"{tool} is required for this regression")
+    probe = _run(["git", "-C", str(REPO), "cat-file", "-e", f"{CERT_SHA}^{{commit}}"])
+    if probe.returncode != 0:
+        pytest.skip("certified commit is absent in this checkout (shallow clone)")
+    archive = _run_bytes(["git", "-C", str(REPO), "archive", "--format=tar", CERT_SHA,
+                          "OHM-Trade-Agent-v1"])
+    assert archive.returncode == 0, archive.stderr.decode()
+    container = tmp_path / "release"
+    container.mkdir()
+    extract = _run_bytes(["tar", "-x", "-C", str(container)], input=archive.stdout)
+    assert extract.returncode == 0, extract.stderr.decode()
+    app = container / "OHM-Trade-Agent-v1"
+    assert not (app / ".git").exists()
+
+    lines = []
+    for path in sorted(app.rglob("*")):
+        rel = path.relative_to(app)
+        if rel.parts and rel.parts[0] in {".git", "data"}:
+            continue
+        if path.name == ".env" or "__pycache__" in rel.parts or not path.is_file():
+            continue
+        lines.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {rel.as_posix()}")
+    manifest = tmp_path / "release-manifest.sha256"
+    manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    receipt = tmp_path / "BOOTSTRAP_EXECUTED.json"
+    receipt.write_text(json.dumps({"receipt": "BOOTSTRAP_EXECUTED", "certified_sha": CERT_SHA,
+                                   "writer_started": False}), encoding="utf-8")
+
+    def check() -> subprocess.CompletedProcess:
+        return _run(["bash", str(BOOTSTRAP), "--mode", "check-release",
+                     "--app-root", str(app), "--manifest", str(manifest),
+                     "--receipt", str(receipt)])
+
+    passed = check()
+    assert passed.returncode == 0, passed.stderr
+    assert "RELEASE_CHECK=PASS" in passed.stdout
+
+    victim = app / "docker-compose.yml"
+    victim.write_text(victim.read_text(encoding="utf-8") + "\n# tampered\n", encoding="utf-8")
+    tampered = check()
+    assert tampered.returncode != 0
+    assert "RELEASE_CHECK=PASS" not in tampered.stdout
+
+    missing = _run(["bash", str(BOOTSTRAP), "--mode", "check-release",
+                    "--app-root", str(tmp_path / "absent"), "--manifest", str(manifest),
+                    "--receipt", str(receipt)])
+    assert missing.returncode != 0
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX: uses the real Compose renderer")
+def test_image_helper_resolves_the_certified_compose_project():
+    """AC-007: the real certified Compose file resolves to project image names."""
+    import opip_image
+
+    app = REPO / "OHM-Trade-Agent-v1"
+    if shutil.which("docker") is None:
+        pytest.skip("docker is required for the Compose render")
+    if _run(["docker", "compose", "version"]).returncode != 0:
+        pytest.skip("docker compose v2 is required")
+    env_path = app / ".env"
+    created = False
+    if not env_path.exists():
+        env_path.write_text("", encoding="utf-8")
+        created = True
+    try:
+        rendered = _run(["docker", "compose", "config", "--format", "json"], cwd=str(app))
+    finally:
+        if created:
+            env_path.unlink()
+    assert rendered.returncode == 0, rendered.stderr
+    config = json.loads(rendered.stdout)
+    resolved = opip_image.compose_images(config)
+    assert resolved["ohm-trade-agent"] == f"{config['name']}-ohm-trade-agent"
+    assert resolved["opip-canonical-writer"] == f"{config['name']}-opip-canonical-writer"
+    assert resolved["ohm-dashboard-edge"] == "nginx:1.27-alpine"
+    refused = opip_image.verify_service(
+        config, service="ohm-trade-agent",
+        certified_image_id="sha256:" + "0" * 64,
+    )
+    assert refused["verdict"] == "REFUSED"
+
+
 def _provision(destination, source=None):
+    source = source or R1
+    sha = _git_head(source)
     return _run(["bash", str(BOOTSTRAP), "--mode", "provision-toolkit",
-                 "--from", str(source or R1), "--to", str(destination)])
+                 "--from", str(source), "--to", str(destination), "--source-sha", sha])
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX: executes the real bash entrypoint")
@@ -251,6 +357,7 @@ def test_provisioning_refuses_unsafe_destinations_before_any_mutation(tmp_path):
     # Source/destination overlap in both directions.
     source = tmp_path / "source"
     shutil.copytree(R1, source, ignore=shutil.ignore_patterns("__pycache__", "evidence"))
+    _git_init(source)
     result = _provision(source / "nested", source)
     assert result.returncode != 0
     assert not (source / "nested").exists()
@@ -260,6 +367,7 @@ def test_provisioning_refuses_unsafe_destinations_before_any_mutation(tmp_path):
     parent.mkdir()
     nested_source = parent / "toolkit-source"
     shutil.copytree(R1, nested_source, ignore=shutil.ignore_patterns("__pycache__", "evidence"))
+    _git_init(nested_source)
     result = _provision(parent, nested_source)
     assert result.returncode != 0
     assert (nested_source / "scripts" / "v2" / "bootstrap-v2.sh").is_file()
@@ -313,6 +421,7 @@ def test_provisioning_refuses_an_incomplete_toolkit_source(tmp_path):
     incomplete = tmp_path / "incomplete"
     shutil.copytree(R1, incomplete, ignore=shutil.ignore_patterns("__pycache__", "evidence"))
     (incomplete / "scripts" / "opip_receipts.py").unlink()
+    _git_init(incomplete)
     destination = tmp_path / "toolkit"
     result = _provision(destination, incomplete)
     assert result.returncode != 0
@@ -334,6 +443,7 @@ def test_failed_provisioning_preserves_a_verified_toolkit(tmp_path):
 
     broken = tmp_path / "broken"
     shutil.copytree(R1, broken, ignore=shutil.ignore_patterns("__pycache__", "evidence"))
+    _git_init(broken)
     blocked = broken / "scripts" / "opip_receipts.py"
     blocked.chmod(0)
     try:

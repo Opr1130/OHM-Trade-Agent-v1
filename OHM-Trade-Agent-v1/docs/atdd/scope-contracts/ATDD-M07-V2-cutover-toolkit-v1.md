@@ -69,10 +69,16 @@ a host running V1 with a WAL-mode canonical database
 WHEN:
 a data rollback or safe-baseline rollback is prepared and executed
 THEN:
-the scheduler is frozen first, the canonical store is snapshotted and verified
-before any service stops, a raw `cp` is never used as a snapshot, newer live
-canonical history is refused, and the durable plan remains independent of a
-transient controller override
+the scheduler is frozen first, the canonical writer is then quiesced and proved
+stopped before the authoritative snapshot is taken, no competing writer can
+advance canonical history during the protected transition, a WAL-consistent
+snapshot is preserved with integrity and foreign-key checks passing, the
+authoritative post-quiescence history is compared with the approved plan and any
+newer epoch, sequence or event count or inconsistent history is refused before
+any code or profile switch, a pre-quiescence evidence snapshot may be retained
+but never substitutes for that validation, remaining services stop only after
+the comparison passes, a raw `cp` is never used as a snapshot, preserved
+evidence stays recoverable, and scheduler activation remains separately gated
 AC-004:
 GIVEN:
 the reviewed toolkit on a Linux runner
@@ -107,6 +113,65 @@ the R3 set remains the authority in its declared order, the earlier R1/R2
 documents remain present and labelled historical, and the final verdict states
 engineering qualification PASS, production readiness HOLD and authorised
 deployment NO
+AC-007:
+GIVEN:
+a certified Docker image with an immutable image ID, an authorized bootstrap
+receipt, and the certified Compose configuration whose services declare
+`build: .` without an explicit `image`
+WHEN:
+the core or canonical writer is started or recreated
+THEN:
+the expected image is independently verified and its identity is bound to the
+authorization evidence, the effective Compose operation cannot silently build
+or select another image, the actual running container image ID equals its
+authorized identity, mismatch, missing image, tag drift and stale project images
+fail closed before or after startup, no successful activation receipt is issued
+for a mismatched image, the writer and scheduler remain unauthorized after
+failure, and no second Compose configuration source or unapproved overlay is
+introduced
+AC-008:
+GIVEN:
+a V1 source and independent host-identity evidence
+WHEN:
+an authorized export is requested through the PowerShell wrapper and the Python
+export CLI
+THEN:
+the source identity is validated against trusted host evidence including host
+and droplet identity, approved IP where applicable, source generation and
+evidence freshness, the host-evidence classification cannot be supplied without
+that verification, the verified evidence identity and digest are bound to the
+export manifest, default or operator-declared values alone cannot establish
+authenticity, missing forged stale or inconsistent evidence is refused, a
+successful export verifies and reconciles against its manifest, and
+synthetic/fixture provenance stays strictly isolated from real export
+authorization
+AC-009:
+GIVEN:
+a certified release installed into the runtime root without `.git`
+WHEN:
+PostConfiguration readiness is performed
+THEN:
+the installed release is validated against the actual certified release
+manifest with hashes recomputed from installed contents, the certified SHA is
+established through trustworthy installation evidence, the check uses exactly
+the installer-approved file exclusions, missing corrupted unexpected or altered
+source files are refused, runtime data and `.env` follow their distinct
+contracts with `.env` contents never printed or recorded, readiness does not
+require `.git`, and success demonstrates actual installed-release integrity
+AC-010:
+GIVEN:
+a candidate M07 toolkit and its provisioning source
+WHEN:
+provisioning is requested
+THEN:
+the source toolkit is bound to an explicit reviewed Git commit or another
+independently trusted source attestation, the source bytes match that recorded
+identity, the source tree is complete with no unauthorized changes, a locally
+generated manifest alone is not accepted as trusted origin, manifest and
+file-integrity checks remain mandatory, destination canonicalization and
+destructive-path protections remain mandatory, previously verified installations
+survive failed replacement, and no source or destination symlink or overlap can
+bypass the containment rules
 
 EXPLICITLY OUT OF SCOPE:
 - No production or host deployment, SSH, DNS, TLS, firewall, scheduler
@@ -137,10 +202,14 @@ FROZEN BOUNDARIES:
 ACCEPTANCE TEST TRACEABILITY:
 AC-001 -> tests/test_atdd_m07_cutover_toolkit_v1.py::test_ac_001_compose_is_invoked_exactly_as_the_certified_controller
 AC-002 -> tests/test_atdd_m07_cutover_toolkit_v1.py::test_ac_002_writer_and_scheduler_activation_are_receipt_gated
-AC-003 -> tests/test_atdd_m07_cutover_toolkit_v1.py::test_ac_003_rollback_freezes_then_snapshots_before_stopping_services
+AC-003 -> tests/test_atdd_m07_cutover_toolkit_v1.py::test_ac_003_rollback_freezes_then_quiesces_then_snapshots_then_compares
 AC-004 -> tests/test_atdd_m07_cutover_toolkit_v1.py::test_ac_004_linux_ci_qualifies_shell_compose_and_the_offline_suite_read_only
 AC-005 -> tests/test_atdd_m07_cutover_toolkit_v1.py::test_ac_005_certified_tree_is_portable_and_the_lock_holder_is_genuinely_young
 AC-006 -> tests/test_atdd_m07_cutover_toolkit_v1.py::test_ac_006_the_r3_evidence_chain_stays_explicitly_non_deployable
+AC-007 -> tests/test_atdd_m07_cutover_toolkit_v1.py::test_ac_007_runtime_image_identity_is_bound_and_verified
+AC-008 -> tests/test_atdd_m07_cutover_toolkit_v1.py::test_ac_008_export_requires_verified_host_evidence
+AC-009 -> tests/test_atdd_m07_cutover_toolkit_v1.py::test_ac_009_readiness_uses_the_installer_manifest_without_git
+AC-010 -> tests/test_atdd_m07_cutover_toolkit_v1.py::test_ac_010_toolkit_source_origin_is_independently_verified
 
 IMPLEMENTATION MAP:
 AC-004 -> .github/workflows/m07-cutover-toolkit.yml
@@ -228,6 +297,13 @@ AC-006 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-M07-V2-cutover-toolk
 AC-006 -> OHM-Trade-Agent-v1/tests/test_atdd_m07_cutover_toolkit_v1.py
 AC-005 -> OHM-Trade-Agent-v1/tests/test_opip_export_diagnostics_readonly_v1.py
 AC-006 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
+AC-007 -> OHM-Trade-Agent-v1/deploy/m07/scripts/opip_image.py
+AC-007 -> OHM-Trade-Agent-v1/deploy/m07/scripts/v2/bootstrap-v2.sh
+AC-008 -> OHM-Trade-Agent-v1/deploy/m07/scripts/opip_bundle.py
+AC-008 -> OHM-Trade-Agent-v1/deploy/m07/scripts/Invoke-OpipDataMigration.ps1
+AC-009 -> OHM-Trade-Agent-v1/deploy/m07/scripts/v2/bootstrap-v2.sh
+AC-009 -> OHM-Trade-Agent-v1/deploy/m07/scripts/Invoke-V2Readiness.ps1
+AC-010 -> OHM-Trade-Agent-v1/deploy/m07/scripts/v2/bootstrap-v2.sh
 
 DEFERRED DISCOVERIES:
 - Linux-native host execution of the scripts (restore, rollback, writer

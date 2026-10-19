@@ -74,11 +74,11 @@ def test_ac_002_writer_and_scheduler_activation_are_receipt_gated():
 
     gate = bootstrap.index('opip_rollback_guard.py" writer-gate')
     start_writer = bootstrap.index(
-        'run "start writer" compose up -d --no-deps opip-canonical-writer'
+        'run "start writer" compose up -d --no-build --no-deps opip-canonical-writer'
     )
     assert gate < start_writer, "the writer may only start after its receipt gate"
 
-    assert 'compose up -d --no-deps ohm-trade-agent' in bootstrap
+    assert 'compose up -d --no-build --no-deps ohm-trade-agent' in bootstrap
     assert "activate-writer" in bootstrap and "activate-scheduler" in bootstrap
     assert '"$LIVE_ACCEPTANCE"' in bootstrap, "scheduler needs live acceptance evidence"
     assert "retire-p1" not in bootstrap
@@ -86,14 +86,19 @@ def test_ac_002_writer_and_scheduler_activation_are_receipt_gated():
 
 
 @pytest.mark.acceptance
-def test_ac_003_rollback_freezes_then_snapshots_before_stopping_services():
+def test_ac_003_rollback_freezes_then_quiesces_then_snapshots_then_compares():
     """ATDD-M07-V2-cutover-toolkit-v1/AC-003: WAL-safe, newest-data-aware rollback."""
     rollback = _read(ROLLBACK)
 
     freeze = rollback.index('run "freeze scheduler"')
+    quiesce = rollback.index('run "quiesce writer"')
     snapshot = rollback.index('opip_rollback_guard.py" snapshot')
+    compare = rollback.index('opip_rollback_guard.py" compare')
     stop = rollback.index('run "stop services"')
-    assert freeze < snapshot < stop, "freeze, then preserve, then stop"
+    assert freeze < quiesce < snapshot < compare < stop, (
+        "freeze, quiesce and prove the writer stopped, snapshot, compare the "
+        "authoritative post-quiescence history, then stop the remaining services"
+    )
 
     assert 'DURABLE="/var/lib/opip-rollback"' in rollback
     assert "WAL-safe canonical snapshot failed verification" in rollback
@@ -171,3 +176,48 @@ def test_ac_006_the_r3_evidence_chain_stays_explicitly_non_deployable():
 
     for name in ("R3-OWNER-GATES.md", "R3-SECURITY-REVIEW.md", "SOURCE-PIN.json"):
         assert (M07 / name).is_file(), name
+
+
+@pytest.mark.acceptance
+def test_ac_007_runtime_image_identity_is_bound_and_verified():
+    """ATDD-M07-V2-cutover-toolkit-v1/AC-007: certified image identity."""
+    bootstrap = _read(BOOTSTRAP)
+    assert (M07 / "scripts" / "opip_image.py").is_file()
+    assert "opip_image.py" in bootstrap
+    assert "--no-build" in bootstrap
+    assert "runtime_image_id" in bootstrap
+    assert bootstrap.count("verify_service_image") >= 2, "core and writer paths"
+
+
+@pytest.mark.acceptance
+def test_ac_008_export_requires_verified_host_evidence():
+    """ATDD-M07-V2-cutover-toolkit-v1/AC-008: trusted V1 export provenance."""
+    wrapper = _read(M07 / "scripts" / "Invoke-OpipDataMigration.ps1")
+    bundle = _read(M07 / "scripts" / "opip_bundle.py")
+    assert "SourceIdentityEvidence" in wrapper
+    assert "--identity-proof" in wrapper and "host-evidence" in wrapper
+    assert "--identity-evidence" in wrapper
+    assert "def load_identity_evidence" in bundle
+    assert "identity_evidence_sha256" in bundle
+
+
+@pytest.mark.acceptance
+def test_ac_009_readiness_uses_the_installer_manifest_without_git():
+    """ATDD-M07-V2-cutover-toolkit-v1/AC-009: Git-free installed-release readiness."""
+    readiness = _read(M07 / "scripts" / "Invoke-V2Readiness.ps1")
+    bootstrap = _read(BOOTSTRAP)
+    assert "check-release" in readiness
+    assert "git rev-parse HEAD" not in readiness
+    assert "check-release" in bootstrap
+    assert "RELEASE_CHECK=PASS" in bootstrap
+
+
+@pytest.mark.acceptance
+def test_ac_010_toolkit_source_origin_is_independently_verified():
+    """ATDD-M07-V2-cutover-toolkit-v1/AC-010: trusted toolkit source origin."""
+    bootstrap = _read(BOOTSTRAP)
+    assert "--source-sha" in bootstrap
+    assert "TOOLKIT-PROVENANCE.json" in bootstrap
+    assert "rev-parse HEAD" in bootstrap
+    assert "status --porcelain" in bootstrap
+
