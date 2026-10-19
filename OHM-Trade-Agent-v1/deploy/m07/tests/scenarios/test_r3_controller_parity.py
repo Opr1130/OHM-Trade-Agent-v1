@@ -201,7 +201,7 @@ def test_operator_guidance_contains_no_obsolete_overlay_or_nginx_staging():
 
 
 def _git_head(path: Path) -> str:
-    proc = _run(["git", "-c", f"safe.directory={path}", "-C", str(path), "rev-parse", "HEAD"])
+    proc = _run(["git", "-c", "safe.directory=*", "-C", str(path), "rev-parse", "HEAD"])
     return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
