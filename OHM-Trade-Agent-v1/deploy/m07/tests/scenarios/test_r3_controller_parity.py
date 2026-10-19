@@ -7,7 +7,6 @@ if anyone reintroduces a second Compose source of truth.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -202,7 +201,7 @@ def test_operator_guidance_contains_no_obsolete_overlay_or_nginx_staging():
 
 
 def _git_head(path: Path) -> str:
-    proc = _run(["git", "-C", str(path), "rev-parse", "HEAD"])
+    proc = _run(["git", "-c", f"safe.directory={path}", "-C", str(path), "rev-parse", "HEAD"])
     return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
@@ -235,16 +234,19 @@ def test_check_release_verifies_installed_tree_without_git(tmp_path):
     app = container / "OHM-Trade-Agent-v1"
     assert not (app / ".git").exists()
 
-    lines = []
-    for path in sorted(app.rglob("*")):
-        rel = path.relative_to(app)
-        if rel.parts and rel.parts[0] in {".git", "data"}:
-            continue
-        if path.name == ".env" or "__pycache__" in rel.parts or not path.is_file():
-            continue
-        lines.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {rel.as_posix()}")
+    generator = r"""
+cd "$1" || exit 1
+find . -path ./.git -prune -o -path ./data -prune -o -name .env -prune \
+  -o -name __pycache__ -prune -o -type f -print \
+  | LC_ALL=C sort \
+  | while IFS= read -r f; do
+      printf '%s  %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "${f#./}"
+    done
+"""
+    generated = _run(["bash", "-c", generator, "_", str(app)])
+    assert generated.returncode == 0, generated.stderr
     manifest = tmp_path / "release-manifest.sha256"
-    manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    manifest.write_text(generated.stdout, encoding="utf-8")
     receipt = tmp_path / "BOOTSTRAP_EXECUTED.json"
     receipt.write_text(json.dumps({"receipt": "BOOTSTRAP_EXECUTED", "certified_sha": CERT_SHA,
                                    "writer_started": False}), encoding="utf-8")

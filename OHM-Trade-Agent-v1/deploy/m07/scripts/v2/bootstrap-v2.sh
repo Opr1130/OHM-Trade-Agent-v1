@@ -161,11 +161,11 @@ mode_provision_toolkit() {
   # evidence; the source must be a clean git checkout at an explicit commit.
   [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] \
     || die "--source-sha <40-hex reviewed toolkit commit> is required for provisioning"
-  [[ "$(git -C "$src" rev-parse --is-inside-work-tree 2>/dev/null)" == "true" ]] \
+  [[ "$(git -c safe.directory="$src" -C "$src" rev-parse --is-inside-work-tree 2>/dev/null)" == "true" ]] \
     || die "toolkit source must be a git checkout for provenance: $src"
-  [[ "$(git -C "$src" rev-parse HEAD 2>/dev/null)" == "$SOURCE_SHA" ]] \
+  [[ "$(git -c safe.directory="$src" -C "$src" rev-parse HEAD 2>/dev/null)" == "$SOURCE_SHA" ]] \
     || die "toolkit source HEAD does not equal --source-sha $SOURCE_SHA"
-  [[ -z "$(git -C "$src" status --porcelain -- . 2>/dev/null)" ]] \
+  [[ -z "$(git -c safe.directory="$src" -C "$src" status --porcelain -- . 2>/dev/null)" ]] \
     || die "toolkit source has uncommitted changes; review and commit before provisioning"
   dest_raw="${TOOLKIT_ROOT%/}"
   [[ "$dest_raw" == /* ]] || die "destination must be an absolute path: $TOOLKIT_ROOT"
