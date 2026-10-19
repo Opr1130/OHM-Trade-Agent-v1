@@ -41,7 +41,15 @@ jobs:
           cache-dependency-path: OHM-Trade-Agent-v1/requirements.txt
       - run: python -m pip install --upgrade pip
       - run: pip install -r requirements.txt
-      - run: python -m pytest -q
+      # deploy/m07 is a self-contained release-engineering toolkit with its own
+      # Linux job (m07-cutover-toolkit). It is excluded here so this application
+      # suite keeps the collection order and timing profile it had before the
+      # toolkit existed: tests/test_opip_export_diagnostics_readonly_v1.py
+      # derives a lock's age from the pytest process start time and asserts a
+      # "young holder" below 300 s, so adding a whole collected subtree ahead of
+      # `tests/` changes that unrelated test's input. The toolkit suite is still
+      # enforced on every change to deploy/m07 by its dedicated workflow.
+      - run: python -m pytest -q --ignore=deploy/m07
       - run: python -m compileall -q app
       - name: Validate production Compose
         run: |
