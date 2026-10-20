@@ -16,7 +16,9 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import shutil
 import sqlite3
+import subprocess
 import sys
 import threading
 from dataclasses import replace
@@ -42,6 +44,11 @@ WINDOWS_ONLY = pytest.mark.skipif(
 
 _env_cert = os.environ.get("OPIP_CERTIFIED_SRC")
 CERT_SRC = (Path(_env_cert) / "OHM-Trade-Agent-v1") if _env_cert else Path(__file__).resolve().parents[4]
+
+#: The host bootstrap whose install routine is exercised below. It lives in the
+#: toolkit, not in the certified application tree.
+M07_ROOT = Path(__file__).resolve().parents[2]
+BOOTSTRAP = M07_ROOT / "scripts" / "v2" / "bootstrap-v2.sh"
 
 
 class _MetadataHandler(BaseHTTPRequestHandler):
@@ -980,3 +987,187 @@ def test_a_genesis_receipt_without_the_certified_source_is_refused(tmp_path) -> 
     assert gate["verdict"] == "REFUSED"
     assert any("--app-root" in problem for problem in gate["problems"])
 
+
+
+# --- bootstrap install_release: `.env`/`data` are runtime state ------------------
+# `prepare` requires the owner-provided `.env` at APP_ROOT and creates `data`, so
+# `execute` must be able to install into a root holding both, while still refusing
+# a root that holds anything unrelated. The host script is exercised directly: the
+# real `install_release` function is extracted and driven with a stubbed manifest.
+
+_INSTALL_RELEASE_STUBS = """#!/usr/bin/env bash
+set -Eeuo pipefail
+log() { printf 'LOG %s\\n' "$*" >&2; }
+die() { printf 'REFUSED: %s\\n' "$*" >&2; exit 3; }
+run() { local _desc="$1"; shift; "$@"; }
+manifest_verify() { [[ "${STUB_MANIFEST_OK:-0}" == "1" ]]; }
+"""
+
+
+def _bootstrap_text() -> str:
+    return BOOTSTRAP.read_text(encoding="utf-8")
+
+
+def _install_release_body(text: str) -> str:
+    start = text.index("install_release() {")
+    end = text.index("\n}\n", start) + len("\n}\n")
+    return text[start:end]
+
+
+def _usable_bash() -> str | None:
+    """A bash that actually executes; a broken shim must not produce fake signal."""
+    candidate = shutil.which("bash")
+    if not candidate:
+        fallback = Path(r"C:\Program Files\Git\usr\bin\bash.exe")
+        candidate = str(fallback) if fallback.is_file() else None
+    if not candidate:
+        return None
+    probe = subprocess.run([candidate, "-c", "exit 0"], capture_output=True)
+    return candidate if probe.returncode == 0 else None
+
+
+def _write_install_harness(tmp_path, text: str) -> Path:
+    script = tmp_path / "install_harness.sh"
+    script.write_text(
+        _INSTALL_RELEASE_STUBS + _install_release_body(text) + "install_release\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    return script
+
+
+def _run_install_release(tmp_path, *, manifest_ok: bool):
+    bash = _usable_bash()
+    if not bash:
+        pytest.skip("no working bash to exercise install_release")
+    if not shutil.which("rsync"):
+        pytest.skip("rsync not available to exercise install_release")
+
+    src = tmp_path / "release_src"
+    (src / "app").mkdir(parents=True)
+    (src / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+    (src / "app" / "main.py").write_text("print('ok')\n", encoding="utf-8")
+    manifest = tmp_path / "release-manifest.sha256"
+    manifest.write_text("stub\n", encoding="utf-8")
+
+    script = _write_install_harness(tmp_path, _bootstrap_text())
+    env = dict(os.environ)
+    env.update(
+        PATH=str(Path(bash).parent) + os.pathsep + env.get("PATH", ""),
+        SRC=str(src),
+        APP_ROOT=str(tmp_path / "app_root"),
+        MANIFEST=str(manifest),
+        SHA=CERTIFIED_SHA,
+        STUB_MANIFEST_OK="1" if manifest_ok else "0",
+    )
+    completed = subprocess.run([bash, str(script)], capture_output=True, text=True, env=env)
+    return completed, tmp_path / "app_root"
+
+
+def test_install_release_treats_env_and_data_as_runtime_state() -> None:
+    """The pre-install classification must ignore exactly `data` and `.env`."""
+    body = _install_release_body(_bootstrap_text())
+    assert "local foreign" in body
+    assert "! -name data ! -name .env" in body
+    # The retired form classified `.env` as foreign content.
+    assert "! -name data -print -quit 2>/dev/null)" not in body
+    # Both entries must also survive the install copy.
+    assert "--exclude 'data'" in body
+    assert "--exclude '.env'" in body
+
+
+
+
+def test_install_release_installs_into_a_root_holding_only_env_and_data(
+    tmp_path,
+) -> None:
+    """Positive: prepare's `.env` + `data` must not deadlock execute."""
+    app_root = tmp_path / "app_root"
+    app_root.mkdir()
+    (app_root / ".env").write_text("OWNER_PROVIDED=value\n", encoding="utf-8")
+    (app_root / "data").mkdir()
+    (app_root / "data" / "runtime-state.txt").write_text("keep\n", encoding="utf-8")
+
+    completed, root = _run_install_release(tmp_path, manifest_ok=True)
+
+    assert completed.returncode == 0, completed.stderr
+    assert "non-certified content" not in completed.stderr
+    assert (root / "docker-compose.yml").is_file()
+    assert (root / "app" / "main.py").is_file()
+    assert (root / ".env").read_text(encoding="utf-8") == "OWNER_PROVIDED=value\n"
+    assert (root / "data" / "runtime-state.txt").read_text(encoding="utf-8") == "keep\n"
+
+
+def test_install_release_refuses_unrelated_content(tmp_path) -> None:
+    """Negative: any other top-level entry still refuses on the manifest mismatch."""
+    app_root = tmp_path / "app_root"
+    app_root.mkdir()
+    (app_root / ".env").write_text("OWNER_PROVIDED=value\n", encoding="utf-8")
+    (app_root / "data").mkdir()
+    (app_root / "stray-foreign.txt").write_text("unknown\n", encoding="utf-8")
+
+    completed, root = _run_install_release(tmp_path, manifest_ok=False)
+
+    assert completed.returncode == 3, completed.stdout
+    assert "non-certified content" in completed.stderr
+    assert (root / "stray-foreign.txt").exists(), "a refusal must not delete content"
+    assert (root / ".env").exists()
+    assert not (root / "docker-compose.yml").exists(), "a refusal must install nothing"
+
+
+def test_install_release_refuses_mismatched_release_content(tmp_path) -> None:
+    """Negative: a drifted release tree is refused, never silently reinstalled."""
+    app_root = tmp_path / "app_root"
+    app_root.mkdir()
+    (app_root / "docker-compose.yml").write_text(
+        "services: {drifted: true}\n", encoding="utf-8"
+    )
+
+    completed, root = _run_install_release(tmp_path, manifest_ok=False)
+
+    assert completed.returncode == 3, completed.stdout
+    assert "non-certified content" in completed.stderr
+    assert (root / "docker-compose.yml").read_text(encoding="utf-8").startswith(
+        "services: {drifted"
+    ), "the drifted tree must be left untouched"
+
+
+def test_install_release_is_idempotent_when_already_installed(tmp_path) -> None:
+    """Positive: a verified existing install returns early without reinstalling."""
+    app_root = tmp_path / "app_root"
+    app_root.mkdir()
+    (app_root / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+    (app_root / ".env").write_text("OWNER_PROVIDED=value\n", encoding="utf-8")
+
+    completed, _root = _run_install_release(tmp_path, manifest_ok=True)
+
+    assert completed.returncode == 0, completed.stderr
+    assert "already installed and verified" in completed.stderr
+
+
+def test_install_release_still_refuses_a_symlinked_runtime_root(tmp_path) -> None:
+    """Regression: the single-root contract is unchanged by this fix."""
+    target = tmp_path / "real_root"
+    target.mkdir()
+    link = tmp_path / "linked_root"
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation is not permitted on this platform")
+
+    bash = _usable_bash()
+    if not bash:
+        pytest.skip("no working bash to exercise install_release")
+    script = _write_install_harness(tmp_path, _bootstrap_text())
+    env = dict(os.environ)
+    env.update(
+        PATH=str(Path(bash).parent) + os.pathsep + env.get("PATH", ""),
+        SRC=str(tmp_path),
+        APP_ROOT=str(link),
+        MANIFEST=str(tmp_path / "m.sha256"),
+        SHA=CERTIFIED_SHA,
+        STUB_MANIFEST_OK="1",
+    )
+    completed = subprocess.run([bash, str(script)], capture_output=True, text=True, env=env)
+    assert completed.returncode == 3, completed.stdout
+    assert "single-root contract" in completed.stderr
