@@ -137,7 +137,7 @@ jobs:
         run: python -m pytest tests/scenarios -q
 
   r3-g2-rehearsal:
-    name: R3-G2 disposable-host rehearsal (synthetic)
+    name: R3-G2 disposable-host rehearsal (synthetic; subset explicit)
     # A disposable GitHub-hosted Ubuntu runner with Docker. Every identity fact
     # below is produced by an isolated local IMDS stub and is labelled SIMULATED;
     # nothing here contacts production, reads a secret, or attests the real V2
@@ -239,6 +239,13 @@ jobs:
             | tee "$RUNNER_TEMP/prepare.json"
 
       - name: Authorize (synthetic owner evidence)
+        id: authorize
+        # A protection preflight that is BLOCKED cannot be acknowledged unless the
+        # toolkit itself classifies the host as fresh-host-only. On a host with no
+        # exchange credentials it does not, and it must not: authorizing there
+        # would bypass a protection gate. The rehearsal records that refusal as a
+        # blocker and keeps execute/writer/scheduler UNPROVEN.
+        continue-on-error: true
         run: |
           set -euo pipefail
           ACK=""
@@ -250,9 +257,10 @@ jobs:
           then ACK="--acknowledge-fresh-host"; fi
           sudo /opt/opip-m07-toolkit/scripts/v2/bootstrap-v2.sh --mode authorize \
             --confirm-sha "$CERT_SHA" --confirm-host 610307364 $ACK \
-            | tee "$RUNNER_TEMP/authorize.json"
+            2>&1 | tee "$RUNNER_TEMP/authorize.log"
 
       - name: Bind the project-scoped images to the certified image id
+        if: steps.authorize.outcome == 'success'
         run: |
           set -euo pipefail
           # APP_ROOT is not installed until execute, so render the certified file
@@ -270,6 +278,7 @@ jobs:
           done
 
       - name: Execute (core only, writer stays OFF)
+        if: steps.authorize.outcome == 'success'
         run: |
           set -euo pipefail
           sudo /opt/opip-m07-toolkit/scripts/v2/bootstrap-v2.sh --mode execute \
@@ -281,6 +290,7 @@ jobs:
           fi
 
       - name: PostConfiguration checks on the installed release
+        if: steps.authorize.outcome == 'success'
         run: |
           set -euo pipefail
           {
@@ -337,7 +347,47 @@ jobs:
           python scripts/opip_bundle.py stage --bundle "$BUNDLE" \
             --staging "$RUNNER_TEMP/staging" --out "$RUNNER_TEMP/stage.json"
 
+      - name: Linux native restore on a disposable destination
+        # Runs even when authorisation is blocked: this exercises the real Linux
+        # restore code and the writer gate without any bootstrap authority.
+        run: |
+          set -euo pipefail
+          cd "$M07"
+          export PYTHONDONTWRITEBYTECODE=1
+          BUNDLE="$RUNNER_TEMP/bundles/r3g2"
+          LIVE="$RUNNER_TEMP/rehearsal-app/data/opip/canonical/opip_canonical_v1.sqlite3"
+          mkdir -p "$(dirname "$LIVE")"
+          python3 scripts/opip_recovery.py restore-canonical --bundle "$BUNDLE" \
+            --app-root "$RUNNER_TEMP/cert/OHM-Trade-Agent-v1" --live-db "$LIVE" \
+            --authorize --receipt-out "$RUNNER_TEMP/canonical-recovery-receipt.json" \
+            | tee "$RUNNER_TEMP/restore.json"
+          python3 scripts/opip_rollback_guard.py writer-gate \
+            --receipt "$RUNNER_TEMP/canonical-recovery-receipt.json" --db "$LIVE" \
+            | tee "$RUNNER_TEMP/writer-gate.json"
+          python3 - "$LIVE" <<'PY'
+          import json, sqlite3, sys
+          conn = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+          try:
+              epoch, seq = conn.execute(
+                  "SELECT history_epoch, next_local_sequence FROM meta WHERE id = 1"
+              ).fetchone()
+              events = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+              integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+              fk = len(conn.execute("PRAGMA foreign_key_check").fetchall())
+          finally:
+              conn.close()
+          facts = {"history_epoch": epoch, "next_local_sequence": seq,
+                   "event_count": events, "integrity": integrity, "fk": fk}
+          print(json.dumps(facts))
+          assert epoch == 3, facts
+          assert seq == 1, facts
+          assert events == 4, facts
+          assert integrity == "ok" and fk == 0, facts
+          PY
+
+
       - name: Linux native canonical restore and writer gate
+        if: steps.authorize.outcome == 'success'
         run: |
           set -euo pipefail
           cd "$M07"
@@ -354,6 +404,7 @@ jobs:
             --db "$LIVE_DB" | tee "$RUNNER_TEMP/writer-gate.json"
 
       - name: Activate exactly one writer
+        if: steps.authorize.outcome == 'success'
         run: |
           set -euo pipefail
           sudo /opt/opip-m07-toolkit/scripts/v2/bootstrap-v2.sh --mode activate-writer \
@@ -369,6 +420,7 @@ jobs:
           echo "second activate-writer refused with exit $SECOND"
 
       - name: Scheduler refuses before HTTPS and Telegram acceptance
+        if: steps.authorize.outcome == 'success'
         run: |
           set -euo pipefail
           sudo test ! -e "$STATE/SCHEDULER_ACTIVATED.json"
@@ -385,8 +437,8 @@ jobs:
         run: |
           set -euo pipefail
           cd "$M07"
-          LIVE_DB="$APP_ROOT/data/opip/canonical/opip_canonical_v1.sqlite3"
-          sudo python3 scripts/opip_rollback_guard.py snapshot --db "$LIVE_DB" \
+          LIVE_DB="$RUNNER_TEMP/rehearsal-app/data/opip/canonical/opip_canonical_v1.sqlite3"
+          python3 scripts/opip_rollback_guard.py snapshot --db "$LIVE_DB" \
             --out "$RUNNER_TEMP/canonical-snapshot.sqlite3" | tee "$RUNNER_TEMP/snapshot.json"
           sudo python3 - "$LIVE_DB" "$RUNNER_TEMP/plan.json" <<'PY'
           import json, sqlite3, sys
@@ -440,6 +492,35 @@ jobs:
           set -e
           test "$WRONG_RC" -eq 3
           echo "wrong-SHA authorization refused with exit $WRONG_RC"
+
+      - name: Rehearsal disposition (executed subset is explicit)
+        if: always()
+        run: |
+          set -euo pipefail
+          AUTH="${{ steps.authorize.outcome }}"
+          if [ "$AUTH" = "success" ]; then
+            {
+              echo "R3_G2_DISPOSITION=FULL_CHAIN_EXECUTED"
+              echo "identity=SIMULATED; production identity UNPROVEN"
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+          elif grep -q 'preflight is blocked' "$RUNNER_TEMP/authorize.log"; then
+            {
+              echo "R3_G2_DISPOSITION=UNPROVEN_SUBSET"
+              echo "executed=image-identity,release-staging,simulated-identity,toolkit-provision,prepare,synthetic-export,linux-native-restore,writer-gate,wal-snapshot,negatives"
+              echo "blocked_at=authorize"
+              echo "reason=protection preflight BLOCKED because private exchange credentials are absent; the gate correctly refused (no synthetic exchange credentials are permitted)"
+              echo "unmet=execute,core-start,postconfiguration,app-root-restore,activate-writer,scheduler,full-rollback"
+              echo "identity_attestation=SIMULATED"
+              echo "production_identity=UNPROVEN"
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "unexpected authorization failure" >&2
+            tail -n 30 "$RUNNER_TEMP/authorize.log" >&2 || true
+            exit 1
+          fi
+          test -s "$STATE/BOOTSTRAP_PREPARED.json"
+          test -s "$RUNNER_TEMP/restore.json"
+          test -s "$RUNNER_TEMP/writer-gate.json"
 
       - name: Collect qualification evidence
         if: always()

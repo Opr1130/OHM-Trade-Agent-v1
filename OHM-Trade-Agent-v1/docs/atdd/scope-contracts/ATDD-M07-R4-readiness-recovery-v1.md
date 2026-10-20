@@ -176,6 +176,17 @@ DEFERRED DISCOVERIES:
 - The Phase 5E V2 resource overlay remains outside this increment.
 - The prior PHASE4B ad-hoc script was not preserved, so the restore diagnosis is
   bounded by the recorded failure line and the certified code contract.
+- Authorization requires a READY protection preflight. A host without private
+  exchange credentials is BLOCKED and the toolkit correctly refuses to authorize
+  it; the full prepare→authorize→execute chain therefore requires the real
+  production `.env` (L-04). Synthesizing exchange credentials is prohibited, so
+  execute, core start, writer activation, scheduler activation and a full
+  rollback remain UNPROVEN in the disposable rehearsal.
+- `preflight_evaluate` reads `verdict.reason_codes`, while the preflight receipt
+  carries its blocking reason codes under `evidence_shadow.blocking_reason_codes`
+  and `protection.reason_codes`. The current empty-reason result is fail-closed
+  (a blocked host is never acknowledged), so it is recorded as an observation,
+  not changed here.
 
 UNAPPROVED SCOPE CHANGES:
 NONE
