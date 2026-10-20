@@ -43,12 +43,20 @@ def test_ac_001_readiness_reads_the_release_through_the_approved_sudo_path():
 def test_ac_002_release_provenance_is_grounded_in_trusted_evidence():
     """ATDD-M07-R4-readiness-recovery-v1/AC-002: L-02 Git-free provenance."""
     tool = _read(M07 / "scripts" / "opip_release_provenance.py")
+    tests = _read(M07 / "tests" / "scenarios" / "test_r4_release_provenance.py")
     assert "def build_expected" in tool and "def build_actual" in tool
     assert "def compare_inventories" in tool
     assert "source_authenticity" in tool and "UNPROVEN" in tool
     assert "candidate-generated inventory cannot establish its own authenticity" in tool
     assert "git-checkout" in tool and "git-archive" in tool
     assert "manifest_digest" in tool
+    # Archive provenance must derive the expected inventory from verified bytes.
+    assert "def _verified_archive_tree" in tool
+    assert '"derived_from": "archive-bytes"' in tool
+    assert '"extraction": "isolated-tempdir"' in tool
+    assert "--root is not used with git-archive" in tool
+    assert "archive-derived inventory is not bound to verified archive bytes" in tool
+    assert "test_a_candidate_cannot_authenticate_against_an_unrelated_approved_archive" in tests
     assert (M07 / "L2-RELEASE-PROVENANCE.md").is_file()
     assert (M07 / "tests" / "scenarios" / "test_r4_release_provenance.py").is_file()
 
@@ -86,6 +94,8 @@ def test_ac_004_the_rehearsal_is_disposable_and_labels_simulated_identity():
     assert "restore-canonical" in steps
     assert "writer-gate" in steps
     assert "opip_rollback_guard.py snapshot" in steps
+    assert "R3_G2_DISPOSITION" in steps
+    assert "ac_004_runtime_sequence=NOT_PASS" in steps
     assert "self-hosted" not in job["runs-on"]
 
 

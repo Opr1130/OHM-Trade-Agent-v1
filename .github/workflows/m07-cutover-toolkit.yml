@@ -505,11 +505,13 @@ jobs:
           if [ "$AUTH" = "0" ]; then
             {
               echo "R3_G2_DISPOSITION=FULL_CHAIN_EXECUTED"
+              echo "ac_004_runtime_sequence=EXECUTED"
               echo "identity=SIMULATED; production identity UNPROVEN"
             } | tee -a "$GITHUB_STEP_SUMMARY" "$RUNNER_TEMP/disposition.txt"
           elif grep -q 'preflight is blocked' "$RUNNER_TEMP/authorize.log"; then
             {
               echo "R3_G2_DISPOSITION=UNPROVEN_SUBSET"
+              echo "ac_004_runtime_sequence=NOT_PASS"
               echo "executed=image-identity,release-staging,simulated-identity,toolkit-provision,prepare,synthetic-export,linux-native-restore,writer-gate,wal-snapshot,negatives"
               echo "blocked_at=authorize"
               echo "reason=protection preflight BLOCKED because private exchange credentials are absent; the gate correctly refused (no synthetic exchange credentials are permitted)"
@@ -551,6 +553,20 @@ jobs:
             echo "host=$(hostname)"
             echo "kernel=$(uname -srm)"
             echo "docker=$(docker version --format '{{.Server.Version}}')"
+            echo ""
+            echo "## R3-G2 disposition"
+            if [ -f "$RUNNER_TEMP/disposition.txt" ]; then
+              cat "$RUNNER_TEMP/disposition.txt"
+            else
+              echo "R3_G2_DISPOSITION=UNKNOWN"
+            fi
+            echo ""
+            echo "## AC-004 runtime sequence"
+            if grep -q 'FULL_CHAIN_EXECUTED' "$RUNNER_TEMP/disposition.txt" 2>/dev/null; then
+              echo "ac_004_runtime_sequence=EXECUTED"
+            else
+              echo "ac_004_runtime_sequence=NOT_PASS (subset only; unmet gates are listed above)"
+            fi
           } > "$EVIDENCE/SUMMARY.md"
           sudo chown -R "$(id -u):$(id -g)" "$EVIDENCE"
           ls -l "$EVIDENCE"

@@ -17,10 +17,15 @@ expected inventory describes the same bytes the installer would accept.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
+import stat
 import subprocess
+import tarfile
+import tempfile
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,6 +38,9 @@ EXCLUDED_DIRS = (".git", "data", "__pycache__")
 EXCLUDED_NAMES = (".env",)
 TRUSTED_PROVENANCE = ("git-checkout", "git-archive")
 MAX_RUNTIME_DETAIL = 200
+#: Bounds that make a decompression bomb fail before it can fill the disk.
+MAX_ARCHIVE_MEMBERS = 100_000
+MAX_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024
 
 EXIT_PASS = 0
 EXIT_FAIL = 1
@@ -202,7 +210,129 @@ def _git_checkout_provenance(root: Path, certified_sha: str) -> dict:
     }
 
 
-def _archive_provenance(archive: Path, expected_digest: str) -> dict:
+def _archive_member_path(name: str) -> str:
+    """Validate and normalise one archive member path, fail-closed.
+
+    Absolute paths, traversal, drive letters, backslashes (a separator on the
+    operator host), empty segments, control characters and ``.``/``..`` are all
+    refused before anything is written.
+    """
+    if not isinstance(name, str) or not name:
+        raise ValueError("archive member has an empty path")
+    if name.startswith(("/", "\\")):
+        raise ValueError(f"archive member has an absolute path: {name!r}")
+    if "\\" in name:
+        raise ValueError(f"archive member contains a backslash: {name!r}")
+    if "\x00" in name or any(ord(char) < 32 for char in name):
+        raise ValueError(f"archive member contains a control character: {name!r}")
+    candidate = name.rstrip("/")
+    if not candidate:
+        raise ValueError(f"archive member has an empty path: {name!r}")
+    if len(candidate) >= 2 and candidate[1] == ":":
+        raise ValueError(f"archive member contains a drive letter: {name!r}")
+    parts = candidate.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise ValueError(f"archive member contains an unsafe segment: {name!r}")
+    return "/".join(parts)
+
+
+def _write_member(destination: Path, relative: str, source, size: int, budget: list[int]) -> None:
+    target = destination / relative
+    resolved = target.resolve()
+    root = destination.resolve()
+    if resolved != root and root not in resolved.parents:
+        raise ValueError(f"archive member escapes the extraction root: {relative!r}")
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    written = 0
+    with resolved.open("wb") as handle:
+        while True:
+            block = source.read(1 << 20)
+            if not block:
+                break
+            written += len(block)
+            budget[0] += len(block)
+            if budget[0] > MAX_ARCHIVE_BYTES:
+                raise ValueError("archive exceeds the approved extraction size bound")
+            handle.write(block)
+    if written != size:
+        raise ValueError(f"archive member is truncated: {relative!r}")
+
+
+def _extract_tar(archive: Path, destination: Path) -> dict:
+    seen: set[str] = set()
+    files = 0
+    dirs = 0
+    budget = [0]
+    with tarfile.open(archive, "r:*") as handle:
+        members = handle.getmembers()
+        if len(members) > MAX_ARCHIVE_MEMBERS:
+            raise ValueError("archive exceeds the approved member bound")
+        for member in members:
+            relative = _archive_member_path(member.name)
+            key = relative.casefold()
+            if key in seen:
+                raise ValueError(f"archive contains a duplicate member: {relative!r}")
+            seen.add(key)
+            if member.isdir():
+                (destination / relative).mkdir(parents=True, exist_ok=True)
+                dirs += 1
+                continue
+            if not member.isfile():
+                kind = "symlink" if member.issym() else "link/special file"
+                raise ValueError(f"archive member is an unsafe {kind}: {member.name!r}")
+            if member.size < 0:
+                raise ValueError(f"archive member has an invalid size: {member.name!r}")
+            source = handle.extractfile(member)
+            if source is None:
+                raise ValueError(f"archive member cannot be read: {member.name!r}")
+            with source:
+                _write_member(destination, relative, source, member.size, budget)
+            files += 1
+    return {"format": "tar", "members": len(members), "files": files, "dirs": dirs}
+
+
+def _extract_zip(archive: Path, destination: Path) -> dict:
+    seen: set[str] = set()
+    files = 0
+    dirs = 0
+    budget = [0]
+    with zipfile.ZipFile(archive) as handle:
+        infos = handle.infolist()
+        if len(infos) > MAX_ARCHIVE_MEMBERS:
+            raise ValueError("archive exceeds the approved member bound")
+        for info in infos:
+            relative = _archive_member_path(info.filename)
+            key = relative.casefold()
+            if key in seen:
+                raise ValueError(f"archive contains a duplicate member: {relative!r}")
+            seen.add(key)
+            mode = info.external_attr >> 16
+            if info.is_dir():
+                (destination / relative).mkdir(parents=True, exist_ok=True)
+                dirs += 1
+                continue
+            file_type = stat.S_IFMT(mode)
+            if file_type == stat.S_IFLNK:
+                raise ValueError(f"archive member is an unsafe symlink: {info.filename!r}")
+            if file_type not in (0, stat.S_IFREG):
+                raise ValueError(f"archive member is an unsafe special file: {info.filename!r}")
+            if info.flag_bits & 0x1:
+                raise ValueError(f"archive member is encrypted: {info.filename!r}")
+            with handle.open(info) as source:
+                _write_member(destination, relative, source, info.file_size, budget)
+            files += 1
+    return {"format": "zip", "members": len(infos), "files": files, "dirs": dirs}
+
+
+@contextlib.contextmanager
+def _verified_archive_tree(archive: Path, expected_digest: str):
+    """Verify the approved digest, then derive an inventory from those bytes.
+
+    The extracted tree exists only inside a private temporary directory and is
+    removed when the inventory has been computed. No candidate-supplied root is
+    read for archive provenance, so a release cannot authenticate itself against
+    an unrelated approved archive.
+    """
     archive = Path(archive)
     if not archive.is_file():
         raise ValueError(f"certified archive is missing: {archive}")
@@ -211,16 +341,32 @@ def _archive_provenance(archive: Path, expected_digest: str) -> dict:
         raise ValueError(
             "certified archive digest does not match the approved evidence value"
         )
-    return {
-        "kind": "git-archive",
-        "archive_sha256": observed,
-        "archive_name": archive.name,
-    }
+    with tempfile.TemporaryDirectory(prefix="opip-archive-") as temporary:
+        destination = Path(temporary) / "root"
+        destination.mkdir()
+        if zipfile.is_zipfile(archive):
+            info = _extract_zip(archive, destination)
+        elif tarfile.is_tarfile(archive):
+            info = _extract_tar(archive, destination)
+        else:
+            raise ValueError("approved archive is neither a tar nor a zip archive")
+        record = {
+            "kind": "git-archive",
+            "archive_sha256": observed,
+            "archive_name": archive.name,
+            "derived_from": "archive-bytes",
+            "extraction": "isolated-tempdir",
+            "archive_format": info["format"],
+            "members": info["members"],
+            "member_files": info["files"],
+            "member_dirs": info["dirs"],
+        }
+        yield record, destination
 
 
 def build_expected(
     *,
-    root: Path,
+    root: Path | None,
     certified_sha: str,
     provenance: str,
     archive: Path | None,
@@ -237,8 +383,10 @@ def build_expected(
         )
     if provenance not in TRUSTED_PROVENANCE:
         raise ValueError(f"unsupported provenance: {provenance}")
-    scanned = scan_tree(Path(root))
     if provenance == "git-checkout":
+        if root is None:
+            raise ValueError("--root is required for git-checkout provenance")
+        scanned = scan_tree(Path(root))
         record = _git_checkout_provenance(Path(root), certified_sha)
         observed_paths = {entry["path"] for entry in scanned["source_files"]}
         observed_paths.update(entry["path"] for entry in scanned["source_symlinks"])
@@ -253,7 +401,13 @@ def build_expected(
     else:
         if archive is None or not archive_sha256:
             raise ValueError("--archive and --archive-sha256 are required for git-archive")
-        record = _archive_provenance(Path(archive), archive_sha256)
+        if root is not None:
+            raise ValueError(
+                "--root is not used with git-archive: the inventory is derived from "
+                "the authenticated archive bytes"
+            )
+        with _verified_archive_tree(Path(archive), archive_sha256) as (record, extracted):
+            scanned = scan_tree(extracted)
     return {
         "schema": SCHEMA,
         "kind": "expected",
@@ -298,6 +452,14 @@ def _require_trusted_expected(expected: dict, *, allow_test_sha: bool = False) -
         raise PermissionError(
             "expected inventory provenance must be a trusted checkout or archive"
         )
+    if provenance.get("kind") == "git-archive":
+        if (
+            provenance.get("derived_from") != "archive-bytes"
+            or provenance.get("extraction") != "isolated-tempdir"
+        ):
+            raise PermissionError(
+                "archive-derived inventory is not bound to verified archive bytes"
+            )
     if not allow_test_sha and expected.get("certified_sha") != CERTIFIED_SHA:
         raise PermissionError(
             f"expected inventory certifies {expected.get('certified_sha')}, "
@@ -405,7 +567,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_build = sub.add_parser("build", help="expected inventory from trusted evidence")
-    p_build.add_argument("--root", required=True)
+    p_build.add_argument("--root")
     p_build.add_argument("--out", required=True)
     p_build.add_argument("--certified-sha", default=CERTIFIED_SHA)
     p_build.add_argument(
@@ -435,7 +597,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "build":
             payload = build_expected(
-                root=Path(args.root),
+                root=Path(args.root) if args.root else None,
                 certified_sha=args.certified_sha,
                 provenance=args.provenance,
                 archive=Path(args.archive) if args.archive else None,

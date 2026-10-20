@@ -119,8 +119,19 @@ function Join-OpipPosixPath {
     if (-not $cleanRoot.StartsWith('/')) {
         throw "remote root must be an absolute POSIX path: $Root"
     }
-    if ($cleanRoot -match '[\r\n'']' -or $cleanChild -match '[\r\n'']') {
-        throw 'remote path contains an unsupported character (newline or single quote)'
+    # Single quotes are valid path characters; shell safety is the quoting
+    # helper's job. Newlines, NULs, traversal and empty segments are refused.
+    foreach ($value in @($cleanRoot, $cleanChild)) {
+        if ($value -match "[`r`n]" -or $value.IndexOf([char]0) -ge 0) {
+            throw 'remote path contains a newline or NUL'
+        }
+        $trimmed = $value.Trim('/')
+        if ($trimmed -eq '') { continue }
+        foreach ($segment in $trimmed.Split('/')) {
+            if ($segment -eq '' -or $segment -eq '.' -or $segment -eq '..') {
+                throw "remote path contains an unsafe segment: $value"
+            }
+        }
     }
     if ($cleanChild -eq '') { return $cleanRoot }
     return "$cleanRoot/$cleanChild"

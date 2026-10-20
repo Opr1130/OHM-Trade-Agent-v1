@@ -34,8 +34,10 @@ $results['join_trailing'] = Join-OpipPosixPath -Root '/opt/opip-m07-toolkit/' -C
 $results['quote_plain'] = ConvertTo-OpipPosixArgument '/opt/opip-m07-toolkit/scripts/x.sh'
 $results['quote_space'] = ConvertTo-OpipPosixArgument '/opt/opip m07/scripts/x.sh'
 $results['quote_single'] = ConvertTo-OpipPosixArgument "/opt/it's here/x.sh"
+$results['join_quote'] = Join-OpipPosixPath -Root "/opt/opip's toolkit" -Child 'scripts/v2/x.sh'
 try { $null = Join-OpipPosixPath -Root 'relative/path' -Child 'x'; $results['relative_refused'] = 'NO' } catch { $results['relative_refused'] = 'YES' }
 try { $null = ConvertTo-OpipPosixArgument "a`nb"; $results['newline_refused'] = 'NO' } catch { $results['newline_refused'] = 'YES' }
+try { $null = Join-OpipPosixPath -Root '/opt/x' -Child '../escape'; $results['dotdot_refused'] = 'NO' } catch { $results['dotdot_refused'] = 'YES' }
 $results | ConvertTo-Json -Compress
 '''
 
@@ -68,10 +70,20 @@ def test_posix_quoting_round_trips_spaces_and_quotes(tmp_path):
     assert shlex.split(result["quote_single"]) == ["/opt/it's here/x.sh"]
 
 
+def test_posix_join_preserves_embedded_quotes_and_nested_paths(tmp_path):
+    result = _harness(tmp_path)
+    assert result["join_quote"] == "/opt/opip's toolkit/scripts/v2/x.sh"
+    assert "\\" not in result["join_quote"]
+    assert shlex.split(result["quote_single"]) == ["/opt/it's here/x.sh"]
+    assert result["dotdot_refused"] == "YES"
+
+
 def test_posix_helpers_refuse_escape_hatches(tmp_path):
     result = _harness(tmp_path)
     assert result["relative_refused"] == "YES"
     assert result["newline_refused"] == "YES"
+    assert result["dotdot_refused"] == "YES"
+
 
 
 def test_helpers_behave_the_same_in_windows_powershell_51(tmp_path):
@@ -117,12 +129,16 @@ def _run_wrapper(tmp_path: Path, toolkit_root: str) -> tuple[subprocess.Complete
     return completed, receipt, marker
 
 
-def test_wrapper_prints_posix_paths_and_never_calls_ssh(tmp_path):
-    completed, receipt, marker = _run_wrapper(tmp_path, "/opt/opip m07-toolkit")
+def test_wrapper_prints_shell_safe_paths_with_embedded_quotes(tmp_path):
+    completed, receipt, marker = _run_wrapper(tmp_path, "/opt/opip's m07 toolkit")
     assert completed.returncode == 2, completed.stdout + completed.stderr
-    assert receipt["status"] == "INSUFFICIENT_EVIDENCE"
     steps = "\n".join(receipt["notes"])
-    assert "/opt/opip m07-toolkit/scripts/v2/bootstrap-v2.sh" in steps
     assert "\\opt" not in steps
-    assert "'/opt/opip m07-toolkit/scripts/v2/bootstrap-v2.sh'" in steps
+    command = receipt["notes"][1]
+    tokens = shlex.split(command)
+    assert tokens[:3] == [
+        "sudo", "-n", "/opt/opip's m07 toolkit/scripts/v2/bootstrap-v2.sh"
+    ]
+    assert tokens[-2:] == ["--toolkit-root", "/opt/opip's m07 toolkit"]
     assert not marker.exists(), "the wrapper must never open a remote shell"
+

@@ -52,8 +52,10 @@ a release tree installed from the pinned commit without `.git` and without
 WHEN:
 release provenance is established
 THEN:
-an expected inventory is built only from a trusted checkout or approved archive
-of the pinned commit, the installer's exact inclusion/exclusion policy is
+an expected inventory is built only from a trusted checkout or from the
+authenticated bytes of an approved archive of the pinned commit, an archive is
+extracted only through the fail-closed isolated extractor and a candidate root is
+refused alongside it, the installer's exact inclusion/exclusion policy is
 applied, the certified SHA, manifest digest, file count and expected-manifest
 provenance are recorded, the actual inventory is recomputed and never trusted by
 itself, the full file inventory is compared so missing, added and changed files
@@ -187,6 +189,16 @@ DEFERRED DISCOVERIES:
   and `protection.reason_codes`. The current empty-reason result is fail-closed
   (a blocked host is never acknowledged), so it is recorded as an observation,
   not changed here.
+- Proposed testing seam for a future full-chain rehearsal (not implemented and
+  not authorised by this increment): a test-only preflight-evidence input consumed
+  by an isolated harness copy of the toolkit, guarded by an explicit test-mode
+  marker that the production bootstrap refuses. Acceptance for any such seam:
+  (a) production behaviour is byte-identical when the seam is absent; (b) the seam
+  is refused unless both the test-mode marker and a root-owned, non-release
+  evidence file are present; (c) the seam cannot satisfy `activate-writer`,
+  `activate-scheduler` or any live-acceptance gate; (d) adversarial tests prove the
+  marker cannot be enabled from `.env`, Compose or an unprivileged environment;
+  (e) the owner approves the seam as a separate contract change.
 
 UNAPPROVED SCOPE CHANGES:
 NONE

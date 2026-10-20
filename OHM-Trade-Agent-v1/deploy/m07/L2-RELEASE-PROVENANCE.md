@@ -31,15 +31,38 @@ classifies excluded paths as permitted runtime-only files.
 
 | Command | Purpose | Exit codes |
 |---|---|---|
-| `build --root <trusted> --out expected.json` | expected inventory from a clean Git checkout whose `HEAD` is the pinned SHA (or `--provenance git-archive --archive <file> --archive-sha256 <digest>` for an approved archive) | 0 PASS, 2 INSUFFICIENT, 3 REFUSED |
+| `build --root <trusted> --out expected.json` | expected inventory from a clean Git checkout whose `HEAD` is the pinned SHA | 0 PASS, 2 INSUFFICIENT, 3 REFUSED |
+| `build --out expected.json --provenance git-archive --archive <file> --archive-sha256 <digest>` | expected inventory derived by safe isolated extraction of the **verified archive bytes**; `--root` is refused | 0 PASS, 2 INSUFFICIENT, 3 REFUSED |
 | `inventory --root <host-release>` | actual inventory; never trusted by itself; `--out` optional so a probe can print to stdout | 0 |
 | `compare --expected --actual` | full path-by-path equivalence | 0 PASS, 1 FAIL, 3 REFUSED |
 
 `build` refuses a dirty checkout, a non-Git tree, an archive digest that does not
-match the approved value, an unpinned SHA in production mode, and any
-`candidate` provenance. `compare` refuses an expected inventory that is not
-trusted, whose certified SHA is not the pin, whose recorded manifest digest does
-not match its contents, or an actual inventory that claims authenticity.
+match the approved value, an archive plus a candidate `--root`, an unpinned SHA in
+production mode, unsafe archive members, and any `candidate` provenance.
+`compare` refuses an expected inventory that is not trusted, whose certified SHA
+is not the pin, whose recorded manifest digest does not match its contents, whose
+archive provenance is not bound to verified archive bytes, or an actual inventory
+that claims authenticity.
+
+## Archive trust boundary
+
+For `git-archive`, the approved digest authenticates **only the archive**. The
+expected inventory is therefore computed from an extraction of those bytes into a
+private temporary directory, never from an operator-supplied `--root`. Supplying
+both is refused, so a candidate release cannot authenticate itself against an
+unrelated approved archive.
+
+Extraction is manual and fail-closed:
+
+* digest verified before any member is read;
+* tar and zip are supported; anything else is refused;
+* absolute paths, drive letters, backslashes, `.`/`..`, empty segments and
+  control characters are refused before writing;
+* tar symlinks, hardlinks, devices and other special members are refused; zip
+  symlink/special mode bits are refused;
+* duplicate members (case-insensitive) are refused;
+* member count and extracted-byte bounds are enforced;
+* every write is re-checked to remain inside the private extraction root.
 
 ## Recorded evidence
 
@@ -48,8 +71,9 @@ not match its contents, or an actual inventory that claims authenticity.
 * `certified_sha` (must be `c196dd67…`),
 * `manifest_digest` — SHA-256 over the sorted `sha256  path` stream,
 * `counts.source_files` / `source_bytes` / `source_symlinks`,
-* `provenance` — `git-checkout` with `head` and `clean`, or `git-archive` with the
-  approved archive digest,
+* `provenance` — `git-checkout` with `head` and `clean`, or `git-archive` with
+  `derived_from: archive-bytes`, `extraction: isolated-tempdir`, the approved
+  digest, format and member counts,
 * the exact policy id and exclusions.
 
 `compare` output records missing, unexpected-added, changed, missing/added/
