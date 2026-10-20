@@ -507,6 +507,9 @@ mode_execute() {
   verify_image
   resolve_toolkit || die "M07 toolkit not found or failed integrity verification: $TOOLKIT_ROOT"
   [[ -s "$AUTHORIZED" ]] || die "no BOOTSTRAP_AUTHORIZED receipt; owner authorisation is required"
+  # Last pre-mutation check: the evidence the authorization was bound to must
+  # still describe the live host.
+  assert_incident_store_unchanged
   local cfg
   cfg="$(config_digest_value)"
   python3 - "$TOOLS/opip_receipts.py" "$PREPARED" "$AUTHORIZED" "$DROPLET_ID" "$SHA" "$IMAGE_ID" "$cfg" <<'PY' || exit 3
@@ -611,6 +614,9 @@ mode_authorize() {
   verify_image
   resolve_toolkit || die "M07 toolkit not found or failed integrity verification: $TOOLKIT_ROOT"
   [[ -s "$PREPARED" ]] || die "no BOOTSTRAP_PREPARED receipt; run --mode prepare first"
+  # The protection block was derived from a specific incident-store digest; it
+  # must not have moved between observation and authorization.
+  assert_incident_store_unchanged
   [[ "$CONFIRM_SHA" == "$SHA" ]] || die "--confirm-sha must equal $SHA"
   [[ "$CONFIRM_HOST" == "$DROPLET_ID" ]] || die "--confirm-host must equal $DROPLET_ID"
   local cfg
@@ -765,9 +771,24 @@ if rc != expected_rc:
     refuse(f"preflight exit {rc} contradicts verdict.ready={ready} (expected {expected_rc})")
 
 # --- durable incident store observation (never "absent means no incidents") ---
+# Aligned with the certified observers:
+#   read_json_without_quarantine() rejects non-finite constants and non-objects;
+#   read_incident_projection() treats a non-dict `incidents` map or any non-dict
+#   row as UNPROVEN, and skips rows whose state is RECOVERED.
+SCHEMA_SUPPORTED = (1, 2)          # system_incidents.SCHEMA_VERSION is 2; 1 is readable
+STATE_RECOVERED = "RECOVERED"
+
+
+def _reject_constant(value):
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
 store_state = "ABSENT"
 store_digest = None
 store_bytes = 0
+store_active = 0
+store_recovered = 0
+
 if store_path.exists() and not store_path.is_file():
     refuse("incident store is not a regular file")
 if store_path.is_file():
@@ -779,16 +800,52 @@ if store_path.is_file():
         store_digest = hashlib.sha256(raw).hexdigest()
         store_bytes = len(raw)
         try:
-            payload = json.loads(raw.decode("utf-8"))
+            payload = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant)
         except Exception:  # noqa: BLE001 - malformed state is never "no incident"
             store_state = "MALFORMED"
         else:
-            if not isinstance(payload, dict) or not isinstance(payload.get("incidents"), dict):
+            schema = payload.get("schema_version") if isinstance(payload, dict) else None
+            schema_ok = (
+                isinstance(schema, int)
+                and not isinstance(schema, bool)
+                and schema in SCHEMA_SUPPORTED
+            )
+            if not isinstance(payload, dict) or not schema_ok:
                 store_state = "MALFORMED"
-            elif payload["incidents"]:
-                store_state = "VALID_OPEN_INCIDENTS"
+            elif not isinstance(payload.get("incidents"), dict):
+                store_state = "MALFORMED"
             else:
-                store_state = "VALID_EMPTY"
+                malformed_row = False
+                for row in payload["incidents"].values():
+                    if not isinstance(row, dict):
+                        malformed_row = True
+                        break
+                    if str(row.get("state") or "") == STATE_RECOVERED:
+                        store_recovered += 1
+                    else:
+                        store_active += 1
+                if malformed_row:
+                    # A structurally corrupt record cannot be proven recovered and
+                    # is never "no incident": the whole store is unproven.
+                    store_state = "MALFORMED"
+                    store_recovered = store_active = 0
+                elif store_active:
+                    store_state = "VALID_OPEN_INCIDENTS"
+                elif store_recovered:
+                    store_state = "VALID_RECOVERED_ONLY"
+                else:
+                    store_state = "VALID_EMPTY"
+
+# --- READY must not contradict host incident evidence -------------------------
+# A READY verdict requires the certified projection to have seen a valid store
+# with no active incident. If the host-side store is absent, unreadable,
+# malformed or holds active rows, the observation and the host disagree and the
+# whole document is refused rather than trusted.
+if ready and store_state not in ("VALID_EMPTY", "VALID_RECOVERED_ONLY"):
+    refuse(
+        "verdict.ready=true contradicts host incident evidence "
+        f"(store={store_state}); refusing to trust the observation"
+    )
 
 # A first-host acknowledgement requires POSITIVE proof: a provably valid, EMPTY
 # incident store (incident state genuinely known) plus a block attributable only
@@ -816,6 +873,8 @@ print(json.dumps({
         "state": store_state,
         "sha256": store_digest,
         "bytes": store_bytes,
+        "active_records": store_active,
+        "recovered_records": store_recovered,
     },
     "fresh_host_only": fresh_host_only,
 }, sort_keys=True))
@@ -825,6 +884,44 @@ PY
 
   log "protection preflight contract: $evaluated"
   printf '%s\n' "$evaluated"
+}
+
+# --- incident-store drift protection -----------------------------------------
+# The preflight records the digest of the durable incident store it observed.
+# Authorization and the last pre-mutation check before execute re-derive the live
+# digest and refuse on any drift, so the phases can never silently disagree about
+# the evidence the protection block was based on.
+incident_store_digest() {
+  local store="$APP_ROOT/data/$INCIDENT_STATE_FILE"
+  if [[ -L "$store" ]]; then
+    die "incident store is a symlink; refusing: $store"
+  fi
+  if [[ ! -e "$store" ]]; then
+    printf 'ABSENT\n'
+    return 0
+  fi
+  if [[ ! -f "$store" ]]; then
+    die "incident store is not a regular file: $store"
+  fi
+  sha256sum "$store" | cut -d' ' -f1
+}
+
+assert_incident_store_unchanged() {
+  local recorded current
+  recorded="$(python3 - "$PREPARED" <<'PY2'
+import json
+import sys
+
+document = json.load(open(sys.argv[1], encoding="utf-8"))
+store = (document.get("preflight") or {}).get("incident_store") or {}
+print(store.get("sha256") or "ABSENT")
+PY2
+)"
+  current="$(incident_store_digest)"
+  if [[ "$recorded" != "$current" ]]; then
+    die "incident store drifted since prepare (prepared=$recorded live=$current); re-run prepare"
+  fi
+  log "incident store unchanged since prepare: $current"
 }
 
 config_digest_value() {

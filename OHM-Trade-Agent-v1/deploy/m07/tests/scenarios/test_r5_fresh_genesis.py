@@ -1265,14 +1265,61 @@ def test_preflight_observes_runtime_data_not_release_data() -> None:
 
 
 def test_preflight_contract_extracts_a_ready_verdict(tmp_path) -> None:
+    """READY is accepted only with a valid, non-active host incident store."""
     document = _preflight_document(
         ready=True, shadow_ready=True, state="READY", codes=[], incidents=[]
     )
-    completed, payload = _run_preflight_contract(tmp_path, document, 0, None)
+    completed, payload = _run_preflight_contract(
+        tmp_path, document, 0, {"incidents": {}, "schema_version": 2}
+    )
     assert completed.returncode == 0, completed.stdout
     assert payload["ready"] is True
     assert payload["evidence_shadow_state"] == "READY"
+    assert payload["incident_store"]["state"] == "VALID_EMPTY"
     assert payload["fresh_host_only"] is False
+
+
+@pytest.mark.parametrize(
+    "store",
+    [
+        pytest.param(None, id="absent-store"),
+        pytest.param("not-json{", id="malformed-json"),
+        pytest.param({"incidents": {}}, id="missing-schema"),
+        pytest.param({"incidents": {}, "schema_version": 99}, id="unsupported-schema"),
+        pytest.param({"incidents": {"SYSTEM_HEALTH:x": "not-a-dict"}}, id="non-dict-row"),
+        pytest.param(
+            {"incidents": {"SYSTEM_HEALTH:x": {"state": "OPEN"}}, "schema_version": 2},
+            id="active-incident",
+        ),
+    ],
+)
+def test_preflight_ready_refuses_absent_or_contradictory_host_evidence(
+    tmp_path, store
+) -> None:
+    """A READY verdict may not coexist with missing, corrupt or active incident state."""
+    document = _preflight_document(
+        ready=True, shadow_ready=True, state="READY", codes=[], incidents=[]
+    )
+    completed, _payload = _run_preflight_contract(tmp_path, document, 0, store)
+    assert completed.returncode == 4, completed.stdout
+    assert "contract_error" in completed.stdout
+
+
+def test_preflight_ready_accepts_recovered_only_store(tmp_path) -> None:
+    """Recovered rows are closed per the certified projection, so READY stays valid."""
+    store = {
+        "incidents": {"SYSTEM_HEALTH:kraken_read_only": {"state": "RECOVERED"}},
+        "schema_version": 2,
+    }
+    document = _preflight_document(
+        ready=True, shadow_ready=True, state="READY", codes=[], incidents=[]
+    )
+    completed, payload = _run_preflight_contract(tmp_path, document, 0, store)
+    assert completed.returncode == 0, completed.stdout
+    assert payload["incident_store"]["state"] == "VALID_RECOVERED_ONLY"
+    assert payload["incident_store"]["recovered_records"] == 1
+    assert payload["incident_store"]["active_records"] == 0
+
 
 
 def test_preflight_contract_extracts_blocked_verdict_and_real_reason_codes(tmp_path) -> None:
@@ -1346,15 +1393,34 @@ def test_preflight_contract_refuses_contradictions(tmp_path, document_kwargs, rc
     [
         pytest.param(None, "ABSENT", id="absent"),
         pytest.param({"incidents": {}, "schema_version": 2}, "VALID_EMPTY", id="valid-empty"),
-        pytest.param({"incidents": {"SYSTEM_HEALTH:kraken_read_only": {"state": "OPEN"}}},
-                     "VALID_OPEN_INCIDENTS", id="open-incidents"),
+        pytest.param(
+            {"incidents": {"SYSTEM_HEALTH:a": {"state": "RECOVERED"}},
+             "schema_version": 2},
+            "VALID_RECOVERED_ONLY", id="recovered-only"),
+        pytest.param(
+            {"incidents": {"SYSTEM_HEALTH:a": {"state": "RECOVERED"},
+                           "SYSTEM_HEALTH:b": {"state": "OPEN"}},
+             "schema_version": 2},
+            "VALID_OPEN_INCIDENTS", id="mixed-open-and-recovered"),
+        pytest.param(
+            {"incidents": {"SYSTEM_HEALTH:a": {"state": "OPEN"}}, "schema_version": 1},
+            "VALID_OPEN_INCIDENTS", id="schema-1-readable"),
         pytest.param("not-json{", "MALFORMED", id="malformed-json"),
+        pytest.param({"incidents": {}}, "MALFORMED", id="missing-schema"),
+        pytest.param({"incidents": {}, "schema_version": 99}, "MALFORMED", id="unsupported-schema"),
+        pytest.param({"incidents": {}, "schema_version": "2"}, "MALFORMED", id="schema-not-int"),
+        pytest.param({"incidents": {}, "schema_version": True}, "MALFORMED", id="schema-bool"),
         pytest.param({"schema_version": 2}, "MALFORMED", id="missing-incidents-map"),
-        pytest.param({"incidents": []}, "MALFORMED", id="incidents-not-a-map"),
+        pytest.param({"incidents": [], "schema_version": 2}, "MALFORMED", id="incidents-not-a-map"),
+        pytest.param({"incidents": {"SYSTEM_HEALTH:a": "oops"}, "schema_version": 2},
+                     "MALFORMED", id="non-dict-row"),
+        pytest.param('{"incidents": {}, "schema_version": 2, "x": NaN}',
+                     "MALFORMED", id="nonfinite-json"),
         pytest.param([], "MALFORMED", id="not-an-object"),
     ],
 )
 def test_preflight_contract_classifies_incident_state(tmp_path, store, expected) -> None:
+
     document = _preflight_document(
         ready=False, shadow_ready=False, state="BLOCKED",
         codes=["COVERAGE_INCOMPLETE"], incidents=[],
@@ -1369,7 +1435,10 @@ def test_preflight_contract_classifies_incident_state(tmp_path, store, expected)
     [
         pytest.param(None, id="absent-store"),
         pytest.param({"incidents": {}, "schema_version": 2}, id="valid-empty-store"),
-        pytest.param({"incidents": {"SYSTEM_HEALTH:x": {"state": "OPEN"}}}, id="open-store"),
+        pytest.param({"incidents": {"SYSTEM_HEALTH:x": {"state": "OPEN"}}, "schema_version": 2},
+                     id="active-store"),
+        pytest.param({"incidents": {"SYSTEM_HEALTH:x": {"state": "RECOVERED"}},
+                      "schema_version": 2}, id="recovered-only-store"),
         pytest.param("not-json{", id="malformed-store"),
     ],
 )
@@ -1399,6 +1468,24 @@ def test_preflight_contract_output_carries_no_secret_material(tmp_path) -> None:
         "evidence_shadow_state", "strict_f11_reason_codes", "incident_store",
         "fresh_host_only",
     }
-    assert set(payload["incident_store"]) == {"state", "sha256", "bytes"}
+    assert set(payload["incident_store"]) == {
+        "state", "sha256", "bytes", "active_records", "recovered_records",
+    }
     assert len(payload["incident_store"]["sha256"]) == 64
+
+
+def test_preflight_records_store_digest_for_drift_detection() -> None:
+    """prepare records the digest; authorize and execute must re-verify it."""
+    text = _bootstrap_source()
+
+    def body(name: str) -> str:
+        start = text.index(f"{name}() {{")
+        return text[start : text.index("\n}\n", start)]
+
+    assert "assert_incident_store_unchanged" in body("mode_authorize")
+    assert "assert_incident_store_unchanged" in body("mode_execute")
+    assert "incident store drifted since prepare" in text
+    assert "incident_store_digest" in body("assert_incident_store_unchanged")
+
+
 
