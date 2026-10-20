@@ -275,7 +275,9 @@ def test_incomplete_and_sidecar_generations_are_refused(tmp_path):
         bundle_dir=incomplete, app_root=CERT_SRC, live_db=live,
         authorize=True, receipt_out=tmp_path / "incomplete.json",
     )
-    assert result["verdict"] == "FAIL"
+    assert result["verdict"] == "INSUFFICIENT"
+    declared = next(c for c in result["checks"] if c["id"] == "CANONICAL_DECLARED")
+    assert declared["status"] == "FAIL"
     assert not live.exists()
 
     sidecar = Path(f"{backup_db}-wal")
