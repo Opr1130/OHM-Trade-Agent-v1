@@ -142,6 +142,21 @@ FROZEN BOUNDARIES:
   this increment because the owner explicitly approved this corrective ATM
   increment.
 
+R5 ACTIVE_INCREMENT HANDOFF (owner-authorized, narrow). This completed increment
+previously required `docs/atdd/ACTIVE_INCREMENT` to equal
+`ATDD-M07-R4-readiness-recovery-v1`. Under
+`ATDD-SCOPE-MOVABLE-ACTIVE-POINTER-v1` the pointer is deliberately movable
+orchestration state, and exact current-increment enforcement belongs to
+`tests/atdd_scope.py` and the pull-request CI job, never to a completed
+increment's acceptance test. AC-006 now proves R4's own identity from this frozen
+contract and its own test module, requires only that the pointer resolve to an
+existing scope contract, and records the handoff to
+`ATDD-M07-R5-fresh-canonical-genesis-v1`. Every substantive R4 assertion, the M07
+toolkit contract and every R4 acceptance criterion remain intact; no R4
+readiness, provenance, POSIX-path or restore semantic changes. This increment is
+the authorization record.
+
+
 ACCEPTANCE TEST TRACEABILITY:
 AC-001 -> tests/test_atdd_m07_r4_readiness_recovery_v1.py::test_ac_001_readiness_reads_the_release_through_the_approved_sudo_path
 AC-002 -> tests/test_atdd_m07_r4_readiness_recovery_v1.py::test_ac_002_release_provenance_is_grounded_in_trusted_evidence

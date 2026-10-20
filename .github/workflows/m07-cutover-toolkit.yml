@@ -122,6 +122,18 @@ jobs:
           diff -u /tmp/m07-expected.txt /tmp/m07-services.txt
           echo "compose render: PASS (4 services, no overlay)"
 
+      - name: R5 fresh-start genesis (focused Linux acceptance)
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          # Publishes a real empty canonical store in a disposable temporary
+          # directory and proves the refusals, the receipt, the writer gate and
+          # the single-writer contract. No host, container, secret or network
+          # (except a loopback metadata stub) is involved.
+          python -m pytest \
+            tests/scenarios/test_r5_fresh_genesis.py \
+            -q
+
       - name: Recovery and rollback safety contracts
         env:
           PYTHONDONTWRITEBYTECODE: '1'
@@ -131,7 +143,7 @@ jobs:
             tests/scenarios/test_r3_concurrency_and_compose.py \
             -q
 
-      - name: R3 offline regression suite (116 tests)
+      - name: R3 offline regression suite (whole scenarios tree)
         env:
           PYTHONDONTWRITEBYTECODE: '1'
         run: python -m pytest tests/scenarios -q
