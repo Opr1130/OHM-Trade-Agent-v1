@@ -8,6 +8,21 @@ integrity-verified M07 toolkit. `03-REVISED-DEPLOYMENT-PROCEDURE.md`,
 evidence**; where they describe an owner-staged overlay or a generated nginx
 config they are obsolete and must not be executed.
 
+## Route selection — read this before any phase
+
+The owner has selected the **FRESH-START ROUTE**: V2 begins a new canonical
+history with no V1 data, no historical learning and no old calibration.
+Use `16-FRESH-GENESIS-RUNBOOK.md` and skip phases 4–5 below.
+
+The **historical migration route** (phases 4–5: bundle export → native recovery
+of the 220,721 V1 events) remains available in this document, but it is
+**inactive** and must not be executed unless the owner explicitly reverses that
+decision. The two routes are selected explicitly: the writer gate accepts either
+a native-recovery receipt (default) or a fresh-genesis receipt
+(`--genesis-receipt <path>`), never both, and never a receipt it cannot
+re-verify against the live store.
+
+
 ## Host layout (single contract)
 
 | Item | Path |
@@ -145,10 +160,21 @@ python3 /opt/opip-m07-toolkit/scripts/opip_bundle.py stage --bundle <bundle> --s
 sudo -n /opt/opip-m07-toolkit/scripts/v2/bootstrap-v2.sh --mode activate-writer
 ```
 
-Refused unless: `BOOTSTRAP_EXECUTED` exists, no writer is running, the recovery
-receipt passes `writer-gate` (completed PASS, destination match, epoch+sequence+
-event-count match, integrity/FK, age ≤ 24 h). Afterwards exactly one running
-writer is asserted and `WRITER_ACTIVATED.json` is written.
+Refused unless: `BOOTSTRAP_EXECUTED` exists, no writer is running, no
+`WRITER_ACTIVATED.json` exists yet (duplicate activation is refused), and the
+authorising receipt passes `writer-gate` for this destination. The gate accepts
+either receipt kind and re-verifies its facts independently:
+
+* `canonical-native-restore` (historical migration route) — completed PASS,
+  destination match, epoch+sequence+event-count match, integrity/FK, age ≤ 24 h;
+* `canonical-fresh-genesis` (fresh-start route, selected with
+  `--genesis-receipt <path>`) — store bytes, schema fingerprint, epoch/sequence,
+  zero events, integrity/FK, certified source module digests, host identity and
+  age ≤ 24 h.
+
+Afterwards exactly one running writer is asserted and `WRITER_ACTIVATED.json` is
+written with `activation_route` and the authorising receipt digest.
+
 
 ## Phase 7 — TLS and tracked Telegram acceptance
 

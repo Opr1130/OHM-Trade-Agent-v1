@@ -28,18 +28,18 @@ bash -n scripts/v2/rollback-v2.sh
 # 3. python syntax
 python -m compileall -q scripts tests
 
-# 4. full suite (99 tests)
+# 4. full suite
 python -m pytest tests/scenarios -q
 
 # 5. fast, fixture-free subset (35 tests, ~0.3 s)
 python -m pytest tests/scenarios/test_r2_audit_fixes.py -q
+
+# 6. R5 fresh-start genesis (Linux: publishes a real empty store; Windows: refusals only)
+python -m pytest tests/scenarios/test_r5_fresh_genesis.py -q
 ```
 
-Expected output of step 4:
-
-```
-99 passed
-```
+Expected output of step 4: the whole suite passes; the recovery, genesis and
+durability scenarios are POSIX-only and report `skipped` on other platforms.
 
 ## Notes
 

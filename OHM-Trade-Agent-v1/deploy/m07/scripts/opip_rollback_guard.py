@@ -20,6 +20,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import opip_genesis
+
 
 def _utc() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -79,13 +81,89 @@ def compare_history(*, plan: dict, live: dict) -> dict:
             "plan": plan_live, "live": live}
 
 
-def writer_gate(*, receipt_path: Path, db: Path, max_age_hours: float = 24.0) -> dict:
-    """Refuse canonical-writer start unless a PASS receipt is bound to this DB."""
+NATIVE_RECOVERY_OPERATION = opip_genesis.NATIVE_RECOVERY_OPERATION
+
+
+def writer_gate(
+    *,
+    receipt_path: Path,
+    db: Path,
+    max_age_hours: float = 24.0,
+    app_root: Path | None = None,
+    expected_host: str | None = None,
+) -> dict:
+    """Refuse canonical-writer start unless a supported receipt is bound to this DB.
+
+    Two receipt kinds are accepted, and neither is trusted on its own:
+
+    * ``canonical-native-restore`` — the historical migration route, whose
+      epoch/sequence/event-count must match the live store;
+    * ``canonical-fresh-genesis`` — a brand-new empty V2 history, re-verified
+      against the live store bytes, the certified source modules and the host
+      identity. It is never accepted from the receipt's own claims.
+
+    Any other (or missing) operation is refused, so a fabricated or unrelated
+    document cannot authorise a writer.
+    """
     receipt_path, db = Path(receipt_path), Path(db)
     problems: list[str] = []
     if not receipt_path.is_file():
-        return {"verdict": "REFUSED", "problems": [f"recovery receipt missing: {receipt_path}"]}
-    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        return {
+            "verdict": "REFUSED",
+            "receipt_kind": "missing",
+            "problems": [f"recovery receipt missing: {receipt_path}"],
+        }
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {
+            "verdict": "REFUSED",
+            "receipt_kind": "unreadable",
+            "problems": [f"receipt unreadable: {type(exc).__name__}: {exc}"],
+        }
+    if not isinstance(receipt, dict):
+        return {
+            "verdict": "REFUSED",
+            "receipt_kind": "not-an-object",
+            "problems": ["receipt is not a JSON object"],
+        }
+    operation = receipt.get("operation")
+    if operation == opip_genesis.GENESIS_OPERATION:
+        if app_root is None:
+            return {
+                "verdict": "REFUSED",
+                "receipt_kind": operation,
+                "receipt": str(receipt_path),
+                "problems": [
+                    "a fresh-genesis receipt requires --app-root so the certified "
+                    "source bytes can be re-verified independently of the receipt"
+                ],
+            }
+        verified = opip_genesis.verify_genesis_receipt(
+            receipt_path=receipt_path,
+            db=db,
+            app_root=Path(app_root),
+            expected_host=expected_host or opip_genesis.DROPLET_ID,
+            max_age_hours=max_age_hours,
+        )
+        return {
+            "verdict": verified["verdict"],
+            "receipt_kind": operation,
+            "problems": verified["problems"],
+            "receipt": str(receipt_path),
+            "live": verified["live"],
+        }
+    if operation != NATIVE_RECOVERY_OPERATION:
+        return {
+            "verdict": "REFUSED",
+            "receipt_kind": str(operation),
+            "receipt": str(receipt_path),
+            "problems": [
+                f"receipt operation {operation!r} is not a supported writer-gate "
+                f"receipt ({NATIVE_RECOVERY_OPERATION!r} or "
+                f"{opip_genesis.GENESIS_OPERATION!r})"
+            ],
+        }
     if receipt.get("completed") is not True or receipt.get("verdict") != "PASS":
         problems.append(f"receipt is not a completed PASS (completed={receipt.get('completed')}, verdict={receipt.get('verdict')})")
     recorded_dest = str(receipt.get("destination_db") or "")
@@ -111,7 +189,12 @@ def writer_gate(*, receipt_path: Path, db: Path, max_age_hours: float = 24.0) ->
         problems.append("receipt has no usable restored_at_utc")
     if not db.is_file():
         problems.append(f"live database missing: {db}")
-        return {"verdict": "REFUSED", "problems": problems, "receipt": str(receipt_path)}
+        return {
+            "verdict": "REFUSED",
+            "receipt_kind": NATIVE_RECOVERY_OPERATION,
+            "problems": problems,
+            "receipt": str(receipt_path),
+        }
     live = _facts(db)
     if live["integrity_check"] != "ok":
         problems.append(f"live integrity_check={live['integrity_check']}")
@@ -120,8 +203,10 @@ def writer_gate(*, receipt_path: Path, db: Path, max_age_hours: float = 24.0) ->
     for key in ("history_epoch", "next_local_sequence", "event_count"):
         if int(restored.get(key, -1)) != int(live[key]):
             problems.append(f"{key} mismatch: receipt={restored.get(key)} live={live[key]}")
-    return {"verdict": "PASS" if not problems else "REFUSED", "problems": problems,
-            "receipt": str(receipt_path), "live": live}
+    return {"verdict": "PASS" if not problems else "REFUSED",
+            "receipt_kind": NATIVE_RECOVERY_OPERATION,
+            "problems": problems, "receipt": str(receipt_path), "live": live}
+
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -140,12 +225,19 @@ def main(argv: list[str] | None = None) -> int:
     wg.add_argument("--receipt", required=True)
     wg.add_argument("--db", required=True)
     wg.add_argument("--max-age-hours", type=float, default=24.0)
+    # Required for the fresh-genesis route: the certified source bytes are
+    # re-verified rather than trusted from the receipt.
+    wg.add_argument("--app-root")
+    wg.add_argument("--expected-host", default=opip_genesis.DROPLET_ID)
 
     args = parser.parse_args(argv)
 
     if args.command == "writer-gate":
         result = writer_gate(receipt_path=Path(args.receipt), db=Path(args.db),
-                             max_age_hours=args.max_age_hours)
+                             max_age_hours=args.max_age_hours,
+                             app_root=Path(args.app_root) if args.app_root else None,
+                             expected_host=args.expected_host)
+
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0 if result["verdict"] == "PASS" else 3
 

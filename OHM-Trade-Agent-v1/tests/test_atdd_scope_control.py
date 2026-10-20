@@ -1258,7 +1258,11 @@ SCANNED_INCREMENT_MODULES = (
     "test_opip_r3_f5_feasibility.py",
     "test_opip_r3_f6_forecast_engine.py",
     "test_opip_r0r1_audit_reconciliation.py",
+    # R5 correction: the completed R4 increment reintroduced a global-pointer
+    # ownership pin; it is now lifecycle-safe and stays under this guard.
+    "test_atdd_m07_r4_readiness_recovery_v1.py",
 )
+
 
 GOVERNANCE_ID = "ATDD-SCOPE-MOVABLE-ACTIVE-POINTER-v1"
 F5_ID = "ATDD-R3-F5-feasibility-safety"

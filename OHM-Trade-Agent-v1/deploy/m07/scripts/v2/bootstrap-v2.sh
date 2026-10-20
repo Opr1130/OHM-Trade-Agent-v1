@@ -5,7 +5,10 @@
 #   --mode prepare             read-only: identity, release, image, storage, preflight
 #   --mode authorize           owner gate: confirm sha+host, acknowledge an expected block
 #   --mode execute             mutate: install verified release, dirs, config, core only
-#   --mode activate-writer     start EXACTLY ONE writer after a verified recovery receipt
+#   --mode activate-writer     start EXACTLY ONE writer after a verified receipt:
+#                              the historical native-recovery receipt (default) or
+#                              the owner-authorized fresh-genesis receipt
+#                              (--genesis-receipt <path>)
 #   --mode activate-scheduler  reconcile the scheduler only after live acceptance
 #
 # Single host-layout contract (proven from the certified controller and Compose):
@@ -47,6 +50,11 @@ LIVE_DB="$CANONICAL_DIR/opip_canonical_v1.sqlite3"
 ETC="/etc/opip/v2"
 STATE="/var/lib/opip-bootstrap"
 RECOVERY_RECEIPT="/var/lib/opip-migration/canonical-recovery-receipt.json"
+# Fresh-start route: a brand-new, empty V2 canonical history. This receipt is
+# only used when the operator selects it explicitly with --genesis-receipt, so
+# the historical migration route stays available but is never inferred.
+GENESIS_RECEIPT="$STATE/canonical-fresh-genesis-receipt.json"
+GENESIS_ROUTE="0"
 PREPARED="$STATE/BOOTSTRAP_PREPARED.json"
 AUTHORIZED="$STATE/BOOTSTRAP_AUTHORIZED.json"
 EXECUTED="$STATE/BOOTSTRAP_EXECUTED.json"
@@ -91,8 +99,9 @@ run() {
 # verified against its own manifest in verify_source(), so this adds an
 # integrity control and weakens no SHA verification.
 toolkit_required_helpers() {
-  for helper in opip_receipts.py opip_rollback_guard.py opip_recovery.py opip_bundle.py \
-                opip_archive.py opip_layout.py opip_provenance.py opip_signals.py; do
+  for helper in opip_receipts.py opip_rollback_guard.py opip_recovery.py opip_genesis.py \
+                opip_bundle.py opip_archive.py opip_layout.py opip_provenance.py \
+                opip_signals.py; do
     printf '%s\n' "$helper"
   done
 }
@@ -335,6 +344,7 @@ while [[ $# -gt 0 ]]; do
     --app-root) CHECK_APP_ROOT="$2"; shift 2 ;;
     --manifest) CHECK_MANIFEST="$2"; shift 2 ;;
     --receipt) CHECK_RECEIPT="$2"; shift 2 ;;
+    --genesis-receipt) GENESIS_RECEIPT="$2"; GENESIS_ROUTE="1"; shift 2 ;;
     --activate-scheduler) shift ;;   # legacy flag: scheduler needs its own mode now
     *) die "unknown argument $1" ;;
   esac
@@ -679,38 +689,58 @@ mode_activate_writer() {
   verify_image
   resolve_toolkit || die "M07 toolkit not found or failed integrity verification: $TOOLKIT_ROOT"
   [[ -s "$EXECUTED" ]] || die "no BOOTSTRAP_EXECUTED receipt; run --mode execute first"
+  # Activation is a one-shot owner gate. Re-running it must never admit a second
+  # writer, and must never rewrite the activation evidence.
+  [[ ! -e "$WRITER_RECEIPT" ]] \
+    || die "WRITER_ACTIVATED already exists at $WRITER_RECEIPT; duplicate activation is refused"
   if compose ps --status running --services | grep -qx 'opip-canonical-writer'; then
     die "a canonical writer is already running; refusing to start a second writer"
   fi
-  [[ -f "$RECOVERY_RECEIPT" ]] \
-    || die "no canonical recovery receipt at $RECOVERY_RECEIPT; the writer stays OFF"
-  local gate
-  if ! gate="$(python3 "$TOOLS/opip_rollback_guard.py" writer-gate \
-      --receipt "$RECOVERY_RECEIPT" --db "$LIVE_DB")"; then
-    log "$gate"
-    die "recovery receipt does not authorise a canonical writer for $LIVE_DB"
+  local receipt route gate
+  if [[ "$GENESIS_ROUTE" == "1" ]]; then
+    # Fresh-start route: a brand-new empty V2 history. The gate re-verifies the
+    # store bytes, schema, coordinates, certified source and host identity.
+    receipt="$GENESIS_RECEIPT"
+    route="fresh-genesis"
+    [[ -f "$receipt" ]] \
+      || die "no fresh-genesis receipt at $receipt; the writer stays OFF"
+  else
+    # Historical migration route (unchanged, and never inferred):
+    # the native-recovery receipt must be bound to this destination.
+    receipt="$RECOVERY_RECEIPT"
+    route="native-recovery"
+    [[ -f "$receipt" ]] \
+      || die "no canonical recovery receipt at $RECOVERY_RECEIPT; the writer stays OFF (use --genesis-receipt for the documented fresh-start route)"
   fi
-  log "writer gate PASS: $gate"
+  if ! gate="$(python3 "$TOOLS/opip_rollback_guard.py" writer-gate \
+      --receipt "$receipt" --db "$LIVE_DB" --app-root "$APP_ROOT" \
+      --expected-host "$DROPLET_ID")"; then
+    log "$gate"
+    die "authorising receipt does not permit a canonical writer for $LIVE_DB"
+  fi
+  log "writer gate PASS ($route): $gate"
   verify_service_image opip-canonical-writer
   run "start writer" compose up -d --no-build --no-deps opip-canonical-writer
   verify_running_image opip-canonical-writer
   local running
   running="$(compose ps --status running --services | grep -cx 'opip-canonical-writer' || true)"
   [[ "$running" == "1" ]] || die "expected exactly one running canonical writer, observed $running"
-  python3 - "$WRITER_RECEIPT" "$DROPLET_ID" "$SHA" "$RECOVERY_RECEIPT" "$(sha256sum "$RECOVERY_RECEIPT" | cut -d' ' -f1)" "$RUNNING_IMAGE_ID" <<'PY'
+  python3 - "$WRITER_RECEIPT" "$DROPLET_ID" "$SHA" "$receipt" "$(sha256sum "$receipt" | cut -d' ' -f1)" "$RUNNING_IMAGE_ID" "$route" <<'PY'
 import json, sys
 from datetime import datetime, timezone
-path, host, sha, receipt, digest, runtime_image = sys.argv[1:7]
+path, host, sha, receipt, digest, runtime_image, route = sys.argv[1:8]
 json.dump({"receipt": "WRITER_ACTIVATED", "receipt_schema": 2,
            "activated_at_utc": datetime.now(timezone.utc).isoformat(),
            "host": host, "certified_sha": sha,
-           "recovery_receipt": receipt, "recovery_receipt_sha256": digest,
+           "activation_route": route,
+           "authorizing_receipt": receipt, "authorizing_receipt_sha256": digest,
            "runtime_image_id": runtime_image,
            "writers_running": 1}, open(path, "w", encoding="utf-8"), indent=2, sort_keys=True)
 PY
   chmod 0600 "$WRITER_RECEIPT"
   log "exactly one canonical writer started; receipt: $WRITER_RECEIPT"
 }
+
 
 mode_activate_scheduler() {
   verify_identity

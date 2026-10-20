@@ -44,6 +44,9 @@ ROLLBACK_STATE = "/var/lib/opip-rollback"
 CUTOVER_EVIDENCE = "/var/lib/opip-cutover-evidence"
 
 RECOVERY_RECEIPT = f"{MIGRATION_STATE}/canonical-recovery-receipt.json"
+#: Fresh-start route (M07 R5): a brand-new, empty V2 canonical history.
+GENESIS_RECEIPT = f"{BOOTSTRAP_STATE}/canonical-fresh-genesis-receipt.json"
+
 WRITER_ACTIVATION_RECEIPT = f"{BOOTSTRAP_STATE}/WRITER_ACTIVATED.json"
 SCHEDULER_RECEIPT = f"{BOOTSTRAP_STATE}/SCHEDULER_ACTIVATED.json"
 

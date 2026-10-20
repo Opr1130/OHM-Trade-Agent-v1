@@ -117,13 +117,20 @@ def test_ac_005_the_restore_contract_resets_the_sequence_and_preserves_events():
 @pytest.mark.acceptance
 def test_ac_006_the_correction_is_bounded_and_leaves_the_m07_contract_intact():
     """ATDD-M07-R4-readiness-recovery-v1/AC-006: bounded corrective increment."""
+    # The global pointer is deliberately movable orchestration state: the ATDD
+    # scope checker and CI own exact current-increment enforcement, and a
+    # completed increment must not pin the pointer (see
+    # ATDD-SCOPE-MOVABLE-ACTIVE-POINTER-v1). R4 therefore proves only that the
+    # pointer resolves to an existing scope contract and that R4's own identity
+    # comes from its own frozen contract.
     active = _read(APP / "docs" / "atdd" / "ACTIVE_INCREMENT").strip()
-    assert active == "ATDD-M07-R4-readiness-recovery-v1"
+    assert (APP / "docs" / "atdd" / "scope-contracts" / f"{active}.md").is_file(), active
     contract = _read(
         APP / "docs" / "atdd" / "scope-contracts" / "ATDD-M07-R4-readiness-recovery-v1.md"
     )
     assert contract.startswith("INCREMENT:\nATDD-M07-R4-readiness-recovery-v1")
     assert contract.rstrip().endswith("NONE")
+    assert "R5 ACTIVE_INCREMENT HANDOFF" in contract
     for marker in ("GIVEN:", "WHEN:", "THEN:"):
         assert marker in contract
     previous = _read(
@@ -131,4 +138,5 @@ def test_ac_006_the_correction_is_bounded_and_leaves_the_m07_contract_intact():
     )
     assert "ATDD-M07-V2-cutover-toolkit-v1" in previous
     assert "AC-001" in previous and "AC-010" in previous
+
 
