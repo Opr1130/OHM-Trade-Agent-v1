@@ -1,0 +1,64 @@
+{
+  "mission": "MISSION-07-R1",
+  "name": "Release Blocker Remediation",
+  "certified_sha": "c196dd674678b3b1ee91c351ee97c1c9e2b3938d",
+  "workspace": {
+    "correction_root": "C:\\Users\\ohmpr\\opip-mission-07-r1",
+    "mission_07_evidence_preserved": "C:\\Users\\ohmpr\\opip-private-evidence\\MISSION-07-V2-RELEASE-FACTORY-20261019",
+    "dirty_phase5e_branch_touched": false,
+    "certified_tree_modified": false
+  },
+  "defects": [
+    {"id": "RC-01", "severity": "P0", "area": "fresh-host deployment", "status": "FIXED_AND_TESTED"},
+    {"id": "RC-02", "severity": "P0", "area": "export file cap >2000", "status": "FIXED_AND_TESTED"},
+    {"id": "RC-03", "severity": "P0", "area": "archive not self-verifiable", "status": "FIXED_AND_TESTED"},
+    {"id": "RC-04", "severity": "P0", "area": "canonical restore absent", "status": "FIXED_AND_TESTED_LOCAL"},
+    {"id": "RC-05", "severity": "P0", "area": "rollback transient override", "status": "FIXED_AND_TESTED"},
+    {"id": "RC-06", "severity": "P1", "area": "readiness identity/account", "status": "FIXED_AND_TESTED_LOCAL"},
+    {"id": "RC-07", "severity": "P1", "area": "TLS prerequisites", "status": "FIXED_AND_TESTED"},
+    {"id": "RC-08", "severity": "P1", "area": "telegram tracked delivery", "status": "FIXED_AND_TESTED_MOCK"},
+    {"id": "RC-09", "severity": "P2", "area": "verify-before-stage", "status": "FIXED_AND_TESTED"}
+  ],
+  "tests": {
+    "bundle_suite": {"command": "python -m pytest tests/scenarios/test_r1_bundle.py -q", "exit_code": 0, "result": "10 passed", "log": "evidence/logs/r1-bundle-suite.txt"},
+    "operations_suite": {"command": "python -m pytest tests -q --ignore=tests/scenarios/test_r1_bundle.py", "exit_code": 0, "result": "13 passed"},
+    "total": {"passed": 23, "failed": 0},
+    "scripts": [
+      {"script": "Invoke-V2Readiness.ps1", "exit": 2, "meaning": "local PASS, host facts unproven"},
+      {"script": "Invoke-V2Readiness.ps1 -SshUser root", "exit": 3, "meaning": "refused"},
+      {"script": "Invoke-V2Readiness.ps1 -Execute (no -Authorized)", "exit": 3, "meaning": "refused"},
+      {"script": "Invoke-V2Bootstrap.ps1 (facts, plan)", "exit": 77, "meaning": "plan printed"},
+      {"script": "Invoke-V2Bootstrap.ps1 -ContainerPresent yes", "exit": 3, "meaning": "incumbent host refused for bootstrap"},
+      {"script": "Invoke-V2Bootstrap.ps1 (authorised, no preflight ack)", "exit": 3, "meaning": "acknowledgement required"},
+      {"script": "Invoke-V2Bootstrap.ps1 (fully authorised)", "exit": 0, "meaning": "authorisation validated; sequence printed"},
+      {"script": "Invoke-V2Rollback.ps1 (plan)", "exit": 77, "meaning": "durable plan printed"},
+      {"script": "Invoke-V2Rollback.ps1 (newer history)", "exit": 3, "meaning": "refused"},
+      {"script": "Invoke-OpipDataMigration.ps1 -Mode DryRun", "exit": 77, "meaning": "inventory + export plan"},
+      {"script": "Invoke-V2DashboardValidation.ps1", "exit": 2, "meaning": "static PASS, host TLS pending"},
+      {"script": "Invoke-V2DashboardValidation.ps1 -TlsFactsPath ok", "exit": 0, "meaning": "prerequisites satisfied"},
+      {"script": "Invoke-V2DashboardValidation.ps1 -TlsFactsPath missing", "exit": 3, "meaning": "refused"},
+      {"script": "Invoke-V2TelegramValidation.ps1", "exit": 2, "meaning": "tracked mock PASS, live pending"},
+      {"script": "telegram_tracked_acceptance.py", "exit": 0, "meaning": "tracked receipt + dedupe verified offline"}
+    ]
+  },
+  "scenarios": {"mandated": 15, "executed": 15, "passed": 15, "evidence": "06-TARGETED-TEST-RESULTS.csv"},
+  "remaining_blockers": [
+    {"id": "L-01", "severity": "P1", "summary": "Read-only V2 probe as opipadmin (droplet id, image label, compose render) not yet executed"},
+    {"id": "L-02", "severity": "P1", "summary": "Certified canonical generation + native restore on Linux not yet executed"},
+    {"id": "L-03", "severity": "P1", "summary": "Final V1 extraction still requires owner authorisation"},
+    {"id": "L-04", "severity": "P2", "summary": "TLS issuance and external HTTPS codes unverified"},
+    {"id": "L-05", "severity": "P2", "summary": "Live tracked Telegram delivery unverified"},
+    {"id": "L-06", "severity": "P2", "summary": "Bootstrap sequence not executed on a real host"}
+  ],
+  "verdict": "HOLD",
+  "verdict_basis": "All release-blocking defects are corrected and verified with executable tests, but no production activation, live TLS/Telegram proof or real canonical restore was performed; those require explicit owner authorisation.",
+  "safety_state": {
+    "v1": "OFF, untouched",
+    "v2": "no container started, no file written by R1",
+    "learning_worker": "untouched",
+    "phase5e_branch": "untouched",
+    "secrets": "none read or written",
+    "deployment_controller": "not invoked",
+    "dns_firewall": "unchanged"
+  }
+}

@@ -1,0 +1,52 @@
+id,requirement,evidence,verdict
+HF-01a,External archive digest validated before extraction,test_hf01_archive_safety::test_wrong_checksum_with_traversal_member_creates_nothing_outside,PASS
+HF-01b,Missing/mismatched integrity evidence rejected before writes,test_hf01_archive_safety::test_missing_digest_evidence_fails_before_extraction,PASS
+HF-01c,Traversal members rejected even with a valid digest,test_hf01_archive_safety::test_correct_checksum_but_traversal_member_is_still_rejected,PASS
+HF-01d,Symlink and hardlink members rejected,test_hf01_archive_safety::test_symlink_member_is_rejected,PASS
+HF-01e,Duplicate members rejected,test_hf01_archive_safety::test_duplicate_member_is_rejected,PASS
+HF-01f,Existing verification directory never deleted,test_hf01_archive_safety::test_existing_verification_directory_is_never_deleted,PASS
+HF-01g,Source symlink escape rejected,test_hf01_archive_safety::test_source_symlink_escape_is_rejected,PASS
+HF-01h,Manifest paths must be relative and contained,verify_bundle MANIFEST_PATHS_SAFE (covered by HF-01 suite),PASS
+HF-02a,Caller flag cannot substitute for a receipt,test_hf02_recovery_gate::test_caller_flag_cannot_substitute_for_receipt,PASS
+HF-02b,Missing receipt blocks promotion,test_hf02_recovery_gate::test_missing_receipt_is_refused,PASS
+HF-02c,Forged destination blocked,test_hf02_recovery_gate::test_forged_receipt_for_another_destination_is_refused,PASS
+HF-02d,Stale epoch blocked,test_hf02_recovery_gate::test_stale_receipt_is_refused,PASS
+HF-02e,Incomplete receipt blocked,test_hf02_recovery_gate::test_incomplete_receipt_is_refused,PASS
+HF-02f,Receipt bound to another bundle blocked,test_hf02_recovery_gate::test_receipt_bound_to_a_different_bundle_is_refused,PASS
+HF-02g,Valid receipt permits promotion,test_hf02_recovery_gate::test_valid_receipt_allows_promotion,PASS
+HF-02h,Mutating operations require authorization,test_hf02_recovery_gate::test_promotion_requires_authorization + test_restore_requires_authorization,PASS
+HF-02i,Failed restore overwrites a stale PASS receipt,test_hf02_recovery_gate::test_failed_restore_overwrites_a_stale_pass_receipt,PASS
+HF-03a,Single guarded bootstrap script,bash -n + test_hf03_hf04_host_scripts::test_shell_syntax,PASS (syntax)
+HF-03b,Droplet identity validated on the host,test_hf03_hf04_host_scripts::test_bootstrap_validates_identity_and_never_touches_tracked_nginx,PASS (structural)
+HF-03c,No clone and no masked setup failures,test_bootstrap_never_clones_and_never_masks_setup,PASS
+HF-03d,Tracked nginx never modified,test_bootstrap_validates_identity_and_never_touches_tracked_nginx,PASS
+HF-03e,No paper stack and no P1 retirement,test_bootstrap_excludes_paper_p1_and_unapproved_scheduler,PASS
+HF-03f,Scheduler activation gated,test_bootstrap_excludes_paper_p1_and_unapproved_scheduler,PASS
+HF-03g,Preflight parsed and independently evaluated,test_bootstrap_separates_the_three_receipts + test_bootstrap_evaluates_preflight_independently,PASS
+HF-03h,Blocking protection condition prevents activation,authorize mode refuses blocking_incidents>0 (structural),PASS (structural)
+HF-03i,Three separate receipts,test_bootstrap_separates_the_three_receipts,PASS
+HF-04a,Durable overlay generated on the host,test_hf03_hf04_host_scripts::test_rollback_is_durable_and_reads_the_database,PASS
+HF-04b,Overlay existence/permissions/hash verified,bash -n + structural assertion,PASS (structural)
+HF-04c,Epoch/sequence read from the destination DB,test_rollback_is_durable_and_reads_the_database,PASS
+HF-04d,Kinds distinguished,test_rollback_separates_kinds_and_guards_newer_data,PASS
+HF-04e,Newer data rejected,test_rollback_separates_kinds_and_guards_newer_data,PASS
+HF-04f,Post-cutover writes preserved and validated,test_rollback_preserves_and_validates_before_switching,PASS
+HF-04g,Code rollback needs an immutable image,test_rollback_separates_kinds_and_guards_newer_data,PASS
+HF-05a,Two readiness phases,Invoke-V2Readiness.ps1 -Phase PreBootstrap|PostConfiguration (exit 2 offline),PASS
+HF-05b,opipadmin + sudo -n and strict known host,readiness -SshUser root -> exit 3,PASS
+HF-05c,No PASS from local metadata,remote probes with per-command rc + evidence,PASS (structural)
+HF-06a,Identity from host evidence (not defaults),test_hf06_provenance::test_export_refuses_default_identity,PASS
+HF-06b,Fixture identity needs the rehearsal flag,test_export_refuses_fixture_identity_without_rehearsal_flag,PASS
+HF-06c,Synthetic generation rejected as final,test_synthetic_generation_blocks_final_acceptance,PASS
+HF-06d,Cutoff freshness enforced,test_stale_cutoff_is_rejected,PASS
+HF-06e,Identity mismatch rejected,test_identity_mismatch_is_rejected + test_wrong_droplet_is_rejected,PASS
+HF-06f,Archive digest verified with provenance,test_tampered_archive_digest_is_rejected,PASS
+HF-06g,Large directories preserved,end to end bundle suite (2600 files),PASS
+HF-07a,Before/after evidence recorded,10-HF-DEFECT-EVIDENCE.md,PASS
+HF-07b,Exact test counts and exit codes,15-HF-FINAL-REPORT.md,PASS
+HF-07c,Adversarial review performed,13-HF-INDEPENDENT-REVIEW.md,PASS
+LIVE-01,V2 runtime verified,end to end on host,HOLD
+LIVE-02,Final V1 history migrated,HOLD
+LIVE-03,Backup protection verified,HOLD
+LIVE-04,HTTPS acceptance,HOLD
+LIVE-05,Telegram acceptance,HOLD

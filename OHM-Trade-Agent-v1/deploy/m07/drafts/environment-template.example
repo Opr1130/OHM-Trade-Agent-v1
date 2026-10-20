@@ -1,0 +1,79 @@
+# =============================================================================
+# O'Pip — MISSION 07 V2 environment TEMPLATE (NAMES ONLY, NO VALUES)
+# =============================================================================
+# Destination on V2: <APP_ROOT>/.env   (owner root:root, mode 0600)
+# <APP_ROOT> is /opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1 on the V2 host,
+# because the certified deploy controller hardcodes REPO_ROOT/APP_ROOT there
+# (deploy/remote/ohm-deploy:5-6) and must not be modified.
+#
+# THIS FILE CONTAINS NO SECRETS AND MUST NEVER CONTAIN SECRETS.
+# Placeholder values below are markers, not credentials: do not paste them into
+# .env and do not run a deployment with them present.
+#
+# Authority note: nothing in .env can widen release authority. The six
+# OPIP_* modes are literals in docker-compose.yml (base:60-87) and are repeated
+# at identical values by drafts/docker-compose.v2.yml. app/services/
+# release_profiles.py treats the Compose literals as the activation authority.
+# =============================================================================
+
+# --- Required by app/core/config.py:33 (min_length=12) -----------------------
+APP_ENV=production
+WEBHOOK_SECRET=REPLACE_WITH_32_PLUS_RANDOM_CHARS
+
+# NOTE ON BLAST RADIUS (read before choosing the value)
+# WEBHOOK_SECRET also gates POST /operator/mode/{mode}, POST /operator/orders,
+# PATCH /operator/orders/{trade_id}, ... (app/api/routes.py:107-193) and is the
+# header the dashboard analytics endpoints require (app/api/dashboard.py:19-46).
+# It therefore carries order-INTENT registry authority (local records only; no
+# Kraken order placement is enabled in EVIDENCE_SHADOW). Do not reuse a value
+# from any other host or plane, and do not place it on the analytics plane.
+
+# --- Telegram transport + operator interaction ------------------------------
+# app/core/config.py:59-70, 162-166; app/services/telegram_callback_listener.py
+TELEGRAM_ENABLED=true
+TELEGRAM_BOT_TOKEN=REPLACE_WITH_BOT_TOKEN
+TELEGRAM_CHAT_ID=REPLACE_WITH_NUMERIC_CHAT_ID
+# Optional second boundary for group chats. Strongly recommended: without it any
+# member of TELEGRAM_CHAT_ID may issue /scan and lifecycle callbacks.
+TELEGRAM_COMMAND_USER_ID=REPLACE_WITH_NUMERIC_USER_ID_OR_LEAVE_UNSET
+TELEGRAM_COMMAND_RATE_LIMIT_PER_MINUTE=12
+
+# Wave 9 external-alert contract (app/core/config.py:62-70). Keep actionable-only
+# true; Early Watch remains a deep-qualified advisory channel.
+OPIP_ACTIONABLE_ONLY_ALERTS=true
+OPIP_EARLY_WATCH_ALERTS_ENABLED=true
+
+# --- AI (advisory only; deterministic gates never depend on it) -------------
+AI_ENABLED=false
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-5.6
+
+# --- Analytics-plane historical reads (OPTIONAL, read-only) -----------------
+# app/opip/data_platform/config.py:36-55. Reads stay on the analytics plane; the
+# trading host never runs PostgreSQL. Leave disabled until the analytics plane
+# exposes a read-only role, otherwise the dashboard reports
+# data_platform.status=DISABLED with trend_source=FILE_WAL_FALLBACK (honest
+# degraded state, not an error).
+OPIP_DATA_PLATFORM_READS_ENABLED=false
+OPIP_DASHBOARD_DATABASE_URL=
+
+# --- Canonical store location (leave unset in production) -------------------
+# app/opip/canonical/paths.py:8-13 defaults to /app/data/opip/canonical, which
+# is ../data inside the bind mount. Only set this for isolated drills.
+# OPIP_CANONICAL_DIR=
+
+# --- Optional external market/event providers (all fail-soft) ---------------
+# COINGECKO_API_KEY=
+# CRYPTOPANIC_AUTH_TOKEN=
+# COINMARKETCAL_API_KEY=
+
+# =============================================================================
+# FORBIDDEN ON THIS HOST (must be ABSENT, not empty-but-present where the gate
+# checks key presence). app/services/release_profiles.py:17-23 checks for the
+# PRESENCE of these NAMES and fails the architecture gate if any is present.
+# =============================================================================
+# KRAKEN_API_KEY
+# KRAKEN_API_SECRET
+# KRAKEN_PRIVATE_KEY
+# KRKN_API_KEY
+# LIVE_TRADING_KEY

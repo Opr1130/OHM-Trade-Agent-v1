@@ -1,0 +1,23 @@
+suite,module,tests,passed,failed,skipped,duration_s,command,environment
+worktree,hf01_archive_safety,8,8,0,0,1.2,"pytest tests/scenarios -k ""not hf02 and not r1_bundle""",Windows 11 / Python 3.13.15 / worktree at c196dd67
+worktree,hf03_hf04_host_scripts,11,11,0,0,1.2,same,worktree
+worktree,hf06_provenance,11,11,0,0,1.2,same,worktree
+worktree,r1_operations,13,13,0,0,1.2,same,worktree
+worktree,r2_audit_fixes,36,36,0,0,1.2,same,worktree
+worktree,r3_controller_parity,6,6,0,0,1.2,same,worktree
+worktree,r3_concurrency_and_compose,10,10,0,0,1.2,same,worktree
+worktree,fast_subtotal,95,95,0,0,24.13,"pytest tests/scenarios -k ""not hf02 and not r1_bundle""",worktree
+worktree,hf02_recovery_gate,11,11,0,0,142.11,pytest tests/scenarios/test_hf02_recovery_gate.py,worktree (includes fixture build)
+worktree,r1_bundle,10,10,0,0,120.22,pytest tests/scenarios/test_r1_bundle.py,worktree
+worktree,total,116,116,0,0,286.46,,worktree
+commit-export,fast_subtotal,95,95,0,0,29.14,"pytest tests/scenarios -k ""not hf02 and not r1_bundle""",git archive c3337d51 + fresh extraction
+commit-export,hf02_recovery_gate,11,11,0,0,157.53,pytest tests/scenarios/test_hf02_recovery_gate.py,commit export (fixture rebuilt from scratch)
+commit-export,r1_bundle,10,10,0,0,104.48,pytest tests/scenarios/test_r1_bundle.py,commit export
+commit-export,total,116,116,0,0,291.15,,git archive of c3337d51
+r2-package,r2_candidate,100,100,0,0,190.6,python -m pytest tests/scenarios,standalone tree (baseline, unchanged)
+syntax,bash -n bootstrap-v2.sh,1,1,0,0,0.1,win32 bash 5.2 (MSYS),NOT Linux-native
+syntax,bash -n rollback-v2.sh,1,1,0,0,0.1,win32 bash 5.2 (MSYS),NOT Linux-native
+syntax,python compileall scripts+tests,1,1,0,0,3.0,python -m compileall -q scripts tests,Windows
+syntax,powershell parse Invoke-V2Readiness.ps1,1,1,0,0,0.2,Parser::ParseFile,PowerShell 7
+syntax,docker compose config,0,0,0,0,0,NOT RUN,BLOCKED: no container runtime
+syntax,Linux-native bash -n,0,0,0,0,0,NOT RUN,BLOCKED: no WSL distro, no Docker

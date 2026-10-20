@@ -1,0 +1,13 @@
+file,change,defect,test,authority_impact
+scripts/opip_layout.py,NEW single layout contract + digest helpers,D02,test_layout_contract_is_single_root,none (contract only)
+scripts/opip_receipts.py,NEW receipt digest/expiry/binding/consume,D06,5 tests,none (gate strengthening)
+scripts/opip_rollback_guard.py,NEW WAL-safe snapshot + history compare + writer gate,D03/D07,6 tests,none (gate strengthening)
+scripts/opip_bundle.py,`_safe_destination`; stage file index; two-phase promote,D04/D05,6 tests,none (gate strengthening)
+scripts/v2/bootstrap-v2.sh,rewritten: single root, manifest install, deferred writer/scheduler,D01/D02/D06,9 structural tests,writer authority now requires a receipt
+scripts/v2/rollback-v2.sh,sqlite backup snapshot + quiescence proof + full history guard,D03/D07,4 structural tests,none (rollback unchanged in authority)
+scripts/Invoke-V2Readiness.ps1,PreBootstrap backup gate removed (SKIP evidence),D11,test_prebootstrap_has_no_backup_gate,none
+tests/scenarios/test_hf03_hf04_host_scripts.py,removed `or True`; real assertions for the new contract,D10,7 tests,none
+tests/scenarios/test_r2_audit_fixes.py,NEW 35 regressions for every finding,-,35 tests,none
+04-REVISED-MIGRATION-PROCEDURE.md,promotion now uses -RecoveryReceipt,D09,test_runbooks_use_the_guarded_entrypoints,none
+05-REVISED-ROLLBACK-PROCEDURE.md,real parameters; WAL-safe snapshot documented,D09,same test,none
+.gitattributes,NEW: `*.sh text eol=lf`,D08,test_gitattributes_pins_shell_line_endings,none

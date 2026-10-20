@@ -1,0 +1,79 @@
+# =============================================================================
+# O'Pip — MISSION 07 V2 resource overlay (MIGRATION-ONLY CONFIGURATION ARTIFACT)
+# =============================================================================
+# Certified base: OHM-Trade-Agent-v1/docker-compose.yml at
+#   c196dd674678b3b1ee91c351ee97c1c9e2b3938d
+#
+# Purpose: select the V2 (4 GiB / 2 vCPU) resource envelope on the new host
+# WITHOUT changing certified application behaviour, authority, ports, mounts or
+# image content. This file is host-local configuration; it is NOT part of the
+# certified release tree and must never be committed to the application repo.
+#
+# HOW IT IS APPLIED (see 04-V2-DEPLOYMENT-PROFILE.md):
+#   COMPOSE_FILE=<abs APP_ROOT>/docker-compose.yml:<abs path to this file>
+#   exported explicitly by Invoke-V2Deployment.ps1 for the certified
+#   /usr/local/sbin/ohm-deploy controller. The controller must NOT be modified.
+#
+# CONSTRAINTS PROVEN FROM CERTIFIED SOURCE (do not "improve" these numbers):
+#   * deploy/remote/ohm-deploy:93-105 validate_writer_resource_limits() pins the
+#     canonical writer to 134217728 | 134217728 | 150000000 | 64 (128m/128m/
+#     0.15/64). ohm-deploy:1671-1674 fails the deploy when it differs. The
+#     mission's provisional writer budget (256 MiB / 0.20) is therefore
+#     INCOMPATIBLE with the certified deploy gate and is deliberately NOT
+#     applied here. Raising it requires a reviewed controller change.
+#   * ohm-trade-agent publishes 127.0.0.1:8000:8000 (base compose:88-89) and
+#     ohm-dashboard-edge publishes 8443:8443 (base compose:6-7). Neither is
+#     touched here: no new published port, no internal API exposure.
+#   * Release-authority modes are re-asserted at the SAME values as the
+#     EVIDENCE_SHADOW profile (app/services/release_profiles.py:57-96) purely as
+#     defence in depth. They can never widen authority: the preflight compares
+#     BOTH the base file and the merged file against the profile allowlist and
+#     fails closed on any difference.
+#
+# Rollback: dropping COMPOSE_FILE (or `docker compose -f docker-compose.yml
+# -f /var/lib/ohm-deploy/safe-baseline-rollback.override.yml`, which the
+# certified rollback path already uses) returns the host to the certified
+# 768 MiB baseline envelope. Compose ignores COMPOSE_FILE whenever an explicit
+# `-f` is passed, so the certified rollback path is unaffected by this file.
+# =============================================================================
+
+services:
+  ohm-trade-agent:
+    # Certified: 384m / 0.45. Evidence capture, the unified cycle and the
+    # Telegram listener all run inside this container; 384 MiB was sized for the
+    # 2 GiB V1 host with evidence jobs moved out of the cgroup. 1280 MiB is the
+    # provisional V2 budget pending measurement (M5 §Memory).
+    mem_limit: 1280m
+    memswap_limit: 1280m
+    cpus: "1.00"
+
+    # Re-asserted (identical to base) release-authority literals.
+    environment:
+      OPIP_RELEASE_PROFILE: "EVIDENCE_SHADOW"
+      OPIP_FEATURE_BUS_MODE: "shadow"
+      OPIP_CANONICAL_WRITER_MODE: "shadow"
+      OPIP_TARGET_SPINE_MODE: "shadow"
+      OPIP_PAPER_V2_MODE: "off"
+      OPIP_COMMITTEE_MODE: "off"
+      OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD: "1000.0"
+
+  opip-canonical-writer:
+    # UNCHANGED BY DESIGN — certified deploy gate pins 128m/128m/0.15/64.
+    mem_limit: 128m
+    memswap_limit: 128m
+    cpus: "0.15"
+
+  opip-stream-worker:
+    # Certified: 192m / 0.35. V2 budget raises memory headroom only; CPU stays
+    # at the certified cap so the worker can never starve the core API.
+    mem_limit: 256m
+    memswap_limit: 256m
+    cpus: "0.35"
+
+  ohm-dashboard-edge:
+    # Certified: 64m / 0.05 — already matches the V2 budget. Declared explicitly
+    # so the effective configuration is self-describing and cannot silently fall
+    # back to a different value if the base file drifts.
+    mem_limit: 64m
+    memswap_limit: 64m
+    cpus: "0.05"
