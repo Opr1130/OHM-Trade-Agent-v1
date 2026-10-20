@@ -59,7 +59,7 @@ canonical store at the certified destination and publishes a genesis receipt.
    `--mode check-release` (`SOURCE_IMAGE` in the readiness table).
 2. `--mode prepare` and `--mode authorize` passed for this host and SHA
    (`CONFIG_PROTECTION`).
-3. A **verified recoverable V2 baseline** exists before the first canonical
+3. A **verified recoverable backup for V2** exists before the first canonical
    mutation (`RECOVERABLE_BACKUP`): a completed V2 backup or snapshot and an
    independently verified recovery on an isolated, non-trading destination.
    A configured backup schedule or a pending backup window is **not** proof of
