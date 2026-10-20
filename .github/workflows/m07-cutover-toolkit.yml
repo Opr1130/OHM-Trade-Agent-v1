@@ -518,7 +518,7 @@ jobs:
             tail -n 30 "$RUNNER_TEMP/authorize.log" >&2 || true
             exit 1
           fi
-          test -s "$STATE/BOOTSTRAP_PREPARED.json"
+          sudo test -s "$STATE/BOOTSTRAP_PREPARED.json"
           test -s "$RUNNER_TEMP/restore.json"
           test -s "$RUNNER_TEMP/writer-gate.json"
 
