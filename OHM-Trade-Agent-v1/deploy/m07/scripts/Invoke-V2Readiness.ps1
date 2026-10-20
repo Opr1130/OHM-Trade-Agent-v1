@@ -66,8 +66,40 @@ try {
                     param($e) $e.Trim() -eq $script:OpipR1V2.DropletId })) { $exit = 1 }
 
         if ($Phase -eq 'PreBootstrap') {
-            if (-not (Invoke-PhaseProbe 'SOURCE_RELEASE_PRESENT' "test -d $releases/$sha/OHM-Trade-Agent-v1 && echo present" {
-                        param($e) $e.Trim() -eq 'present' })) { $exit = 1 }
+            # L-01: /srv/opip-v2/releases is 0700 root on the V2 host, so an
+            # unprivileged `test -d` is a false negative even for a correct
+            # release. The approved account performs this one privileged read
+            # through the same non-interactive `sudo -n` mechanism used for the
+            # image probe. An absent directory, an unreadable directory and a
+            # sudo refusal are all refusals; none of them can become PASS.
+            $releasePath = "$releases/$sha/OHM-Trade-Agent-v1"
+            $sourceProbe = Invoke-R1SshProbe -Command (
+                "sudo -n bash -c 'p=`"$releasePath`"; " +
+                "if [ ! -d `"`$p`" ]; then echo MISSING; exit 4; fi; " +
+                "if [ ! -r `"`$p`" ] || [ ! -x `"`$p`" ]; then echo UNREADABLE; exit 5; fi; " +
+                "echo PRESENT'"
+            ) -User $SshUser
+            $script:probes += $sourceProbe
+            $sourceText = (@($sourceProbe.evidence, $sourceProbe.stderr) | Where-Object { $_ }) -join ' '
+            if ($sourceProbe.exit_code -eq 0 -and $sourceProbe.evidence -and
+                $sourceProbe.evidence.Trim() -eq 'PRESENT') {
+                Add-R1Check $receipt 'SOURCE_RELEASE_PRESENT' 'PASS' $sourceText
+            }
+            elseif ($sourceText -match 'MISSING') {
+                Add-R1Check $receipt 'SOURCE_RELEASE_PRESENT' 'FAIL' "release directory absent: $releasePath"
+                $exit = 1
+            }
+            elseif ($sourceText -match 'UNREADABLE') {
+                Add-R1Check $receipt 'SOURCE_RELEASE_PRESENT' 'FAIL' `
+                    "release directory is not readable by $SshUser even via sudo -n: $releasePath"
+                $exit = 1
+            }
+            else {
+                Add-R1Check $receipt 'SOURCE_RELEASE_PRESENT' 'INSUFFICIENT' `
+                    ("rc={0} {1}" -f $sourceProbe.exit_code, $sourceText)
+                $exit = 1
+            }
+
             if (-not (Invoke-PhaseProbe 'CERTIFIED_IMAGE' "sudo -n docker image inspect -f '{{json .Config.Labels}}' $($script:OpipR1V2.ImageTag)" {
                         param($e) $e -match [regex]::Escape($sha) })) { $exit = 1 }
             if (-not (Invoke-PhaseProbe 'CONTAINER_STATE' "sudo -n docker ps -a --format '{{.Names}}' | grep -c '^ohm-trade-agent$' || true" {

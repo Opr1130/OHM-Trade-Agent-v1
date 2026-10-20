@@ -104,4 +104,51 @@ function Invoke-R1SshProbe {
     return $entry
 }
 
+function Join-OpipPosixPath {
+    <#
+      Join a POSIX root and child without ever producing Windows separators.
+      The host contract is POSIX-only, so `Join-Path` must not be used for a
+      remote path even when the operator runs this wrapper on Windows.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$Child
+    )
+    $cleanRoot = $Root.Replace('\', '/').TrimEnd('/')
+    $cleanChild = $Child.Replace('\', '/').TrimStart('/')
+    if (-not $cleanRoot.StartsWith('/')) {
+        throw "remote root must be an absolute POSIX path: $Root"
+    }
+    # Single quotes are valid path characters; shell safety is the quoting
+    # helper's job. Newlines, NULs, traversal and empty segments are refused.
+    foreach ($value in @($cleanRoot, $cleanChild)) {
+        if ($value -match "[`r`n]" -or $value.IndexOf([char]0) -ge 0) {
+            throw 'remote path contains a newline or NUL'
+        }
+        $trimmed = $value.Trim('/')
+        if ($trimmed -eq '') { continue }
+        foreach ($segment in $trimmed.Split('/')) {
+            if ($segment -eq '' -or $segment -eq '.' -or $segment -eq '..') {
+                throw "remote path contains an unsafe segment: $value"
+            }
+        }
+    }
+    if ($cleanChild -eq '') { return $cleanRoot }
+    return "$cleanRoot/$cleanChild"
+}
+
+function ConvertTo-OpipPosixArgument {
+    <#
+      Quote one POSIX shell argument. Single quotes preserve every byte of a
+      path (including spaces); an embedded single quote is emitted as '\''.
+      Newlines and NULs are refused rather than silently mangled.
+    #>
+    param([Parameter(Mandatory)][string]$Value)
+    if ($Value -match "[`r`n`0]") {
+        throw 'remote argument contains a newline or NUL'
+    }
+    return "'" + ($Value -replace "'", "'\''") + "'"
+}
+
 Write-Verbose 'OpipR1.Common loaded'
+

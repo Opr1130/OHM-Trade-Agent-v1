@@ -31,7 +31,9 @@ $ErrorActionPreference = 'Stop'
 
 $receipt = New-R1Receipt -Name 'Invoke-V2Bootstrap.ps1' -Mode $Phase
 $exit = 0
-$toolkit = Join-Path $ToolkitRoot 'scripts/v2/bootstrap-v2.sh'
+$toolkit = Join-OpipPosixPath -Root $ToolkitRoot -Child 'scripts/v2/bootstrap-v2.sh'
+$toolkitArg = ConvertTo-OpipPosixArgument $toolkit
+$toolkitRootArg = ConvertTo-OpipPosixArgument $ToolkitRoot
 
 try {
     if ($SshUser -ne $script:OpipR1V2.SshUser) {
@@ -68,8 +70,8 @@ try {
     }
 
     $steps = @(
-        "sudo -n $toolkit --mode check-toolkit --toolkit-root $ToolkitRoot",
-        "sudo -n $toolkit $remoteArgs --toolkit-root $ToolkitRoot"
+        "sudo -n $toolkitArg --mode check-toolkit --toolkit-root $toolkitRootArg",
+        "sudo -n $toolkitArg $remoteArgs --toolkit-root $toolkitRootArg"
     )
     $receipt.notes += "REMOTE_STEPS ($Phase):"
     foreach ($step in $steps) { $receipt.notes += $step }
