@@ -19,6 +19,9 @@ Owner decisions this route implements:
   and are never imported, merged, rewritten, moved or deleted here.
 * The 220,721 historical canonical events are **not** migrated.
 * No historical learning, calibration or runtime state is imported.
+* The V1 archive application-level restore drill is deferred for separate owner
+  consideration; V1 archive preservation remains mandatory. This decision does
+  **not** waive V2 backup and restore verification before genesis.
 * PAPER_V2 and funded trading remain disabled (`OPIP_PAPER_V2_MODE=off`,
   funded authority absent).
 * No live deployment, no service start, no writer/scheduler activation and no
@@ -56,10 +59,14 @@ canonical store at the certified destination and publishes a genesis receipt.
    `--mode check-release` (`SOURCE_IMAGE` in the readiness table).
 2. `--mode prepare` and `--mode authorize` passed for this host and SHA
    (`CONFIG_PROTECTION`).
-3. A **verified recoverable backup of the preserved V1 archives** exists and has
-   been restore-verified off the trading host (`RECOVERABLE_BACKUP`). Genesis
-   itself destroys nothing, but a new canonical history must not begin while the
-   historical evidence has no proven recovery path.
+3. A **verified recoverable V2 baseline** exists before the first canonical
+   mutation (`RECOVERABLE_BACKUP`): a completed V2 backup or snapshot and an
+   independently verified recovery on an isolated, non-trading destination.
+   A configured backup schedule or a pending backup window is **not** proof of
+   recovery. Preserve V2 backup coverage as new canonical history accumulates.
+   The V1 historical-archive application-level restore drill is **deferred by
+   owner decision** and is not a V2 fresh-start launch prerequisite; V1 stays
+   powered off and its archives remain unchanged.
 4. Resource limits for the V2 stack are the approved values for this droplet
    (`RESOURCE_LIMITS`); an unbounded container is a blocking prerequisite.
 5. Health and evidence collection is configured and readable before the writer
