@@ -238,16 +238,15 @@ jobs:
           sudo /opt/opip-m07-toolkit/scripts/v2/bootstrap-v2.sh --mode prepare \
             | tee "$RUNNER_TEMP/prepare.json"
 
-      - name: Authorize (synthetic owner evidence)
+      - name: Authorize attempt (synthetic owner evidence; refusal is recorded)
         id: authorize
-        # A protection preflight that is BLOCKED cannot be acknowledged unless the
-        # toolkit itself classifies the host as fresh-host-only. On a host with no
-        # exchange credentials it does not, and it must not: authorizing there
-        # would bypass a protection gate. The rehearsal records that refusal as a
-        # blocker and keeps execute/writer/scheduler UNPROVEN.
-        continue-on-error: true
+        # The step's job is to attempt authorization and record the result. A
+        # protection preflight that is BLOCKED must not be acknowledged, so the
+        # expected outcome on a credential-less host is a refusal. That refusal
+        # is recorded as a release blocker; execute/writer/scheduler stay
+        # UNPROVEN. Any other failure is still raised by the disposition step.
         run: |
-          set -euo pipefail
+          set -uo pipefail
           ACK=""
           if sudo python3 - "$STATE/BOOTSTRAP_PREPARED.json" <<'PY'
           import json, sys
@@ -255,12 +254,17 @@ jobs:
           raise SystemExit(0 if (doc.get("ready") is not True and doc.get("fresh_host_only") is True) else 1)
           PY
           then ACK="--acknowledge-fresh-host"; fi
+          set +e
           sudo /opt/opip-m07-toolkit/scripts/v2/bootstrap-v2.sh --mode authorize \
             --confirm-sha "$CERT_SHA" --confirm-host 610307364 $ACK \
             2>&1 | tee "$RUNNER_TEMP/authorize.log"
+          RC=${PIPESTATUS[0]}
+          set -e
+          printf 'AUTHORIZE_RC=%s\n' "$RC" | tee "$RUNNER_TEMP/authorize-status.txt"
+          echo "rc=$RC" >> "$GITHUB_OUTPUT"
 
       - name: Bind the project-scoped images to the certified image id
-        if: steps.authorize.outcome == 'success'
+        if: steps.authorize.outputs.rc == '0'
         run: |
           set -euo pipefail
           # APP_ROOT is not installed until execute, so render the certified file
@@ -278,7 +282,7 @@ jobs:
           done
 
       - name: Execute (core only, writer stays OFF)
-        if: steps.authorize.outcome == 'success'
+        if: steps.authorize.outputs.rc == '0'
         run: |
           set -euo pipefail
           sudo /opt/opip-m07-toolkit/scripts/v2/bootstrap-v2.sh --mode execute \
@@ -290,7 +294,7 @@ jobs:
           fi
 
       - name: PostConfiguration checks on the installed release
-        if: steps.authorize.outcome == 'success'
+        if: steps.authorize.outputs.rc == '0'
         run: |
           set -euo pipefail
           {
@@ -387,7 +391,7 @@ jobs:
 
 
       - name: Linux native canonical restore and writer gate
-        if: steps.authorize.outcome == 'success'
+        if: steps.authorize.outputs.rc == '0'
         run: |
           set -euo pipefail
           cd "$M07"
@@ -404,7 +408,7 @@ jobs:
             --db "$LIVE_DB" | tee "$RUNNER_TEMP/writer-gate.json"
 
       - name: Activate exactly one writer
-        if: steps.authorize.outcome == 'success'
+        if: steps.authorize.outputs.rc == '0'
         run: |
           set -euo pipefail
           sudo /opt/opip-m07-toolkit/scripts/v2/bootstrap-v2.sh --mode activate-writer \
@@ -420,7 +424,7 @@ jobs:
           echo "second activate-writer refused with exit $SECOND"
 
       - name: Scheduler refuses before HTTPS and Telegram acceptance
-        if: steps.authorize.outcome == 'success'
+        if: steps.authorize.outputs.rc == '0'
         run: |
           set -euo pipefail
           sudo test ! -e "$STATE/SCHEDULER_ACTIVATED.json"
@@ -497,8 +501,8 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
-          AUTH="${{ steps.authorize.outcome }}"
-          if [ "$AUTH" = "success" ]; then
+          AUTH="${{ steps.authorize.outputs.rc }}"
+          if [ "$AUTH" = "0" ]; then
             {
               echo "R3_G2_DISPOSITION=FULL_CHAIN_EXECUTED"
               echo "identity=SIMULATED; production identity UNPROVEN"
