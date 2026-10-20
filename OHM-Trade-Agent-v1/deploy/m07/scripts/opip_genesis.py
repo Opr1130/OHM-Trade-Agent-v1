@@ -13,7 +13,17 @@ Design rules:
     adopted or silently discarded;
   * the genesis receipt is *evidence*, not authority: writer activation
     re-derives every recorded fact from the live store and from the certified
-    source bytes before accepting it.
+    source bytes before accepting it;
+  * the two operator statements that make a genesis *intentional* -- the exact
+    destination (``--confirm-destination``) and the authoritative evidence path
+    (``--receipt-out``) -- are preconditions, not post-hoc checks. Missing either
+    one is refused before the canonical directory, the store or any evidence file
+    is created, so a mistyped runtime root can never produce an orphaned store
+    and evidence-free history;
+  * host identity is read only from the pinned droplet metadata endpoint. The
+    endpoint is not operator-selectable on the command line, and an in-process
+    override is accepted only for a literal loopback test stub, so an untrusted
+    or self-declared metadata URL can never substitute the production identity.
 
 Verdicts mirror the certified recovery engine so the existing host scripts and
 operator habits keep working: PASS(0), FAIL(1), PLATFORM_BLOCKED(2),
@@ -25,12 +35,14 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import ipaddress
 import json
 import os
 import platform
 import sqlite3
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass
@@ -42,7 +54,12 @@ from pathlib import Path
 CERTIFIED_SHA = "c196dd674678b3b1ee91c351ee97c1c9e2b3938d"
 #: The V2 droplet identity the bootstrap already pins.
 DROPLET_ID = "610307364"
-DEFAULT_IMDS_URL = "http://169.254.169.254/metadata/v1/id"
+#: The only metadata path that carries a host identity on the V2 droplet.
+METADATA_PATH = "/metadata/v1/id"
+#: The single production identity endpoint. It is deliberately a constant rather
+#: than a command-line option: an operator (or anything that can edit a command
+#: line) must never be able to point the identity read at a service it controls.
+DEFAULT_IMDS_URL = f"http://169.254.169.254{METADATA_PATH}"
 
 GENESIS_OPERATION = "canonical-fresh-genesis"
 NATIVE_RECOVERY_OPERATION = "canonical-native-restore"
@@ -125,11 +142,15 @@ def host_identity(
 ) -> tuple[str | None, str]:
     """Read the droplet identity from metadata. Returns ``(identity, detail)``.
 
-    ``identity`` is ``None`` when the metadata service cannot be read or returns
-    something that is not a plausible droplet id; callers must then refuse. No
-    fallback (hostname, ``platform.node()``, environment) is ever used as an
-    identity substitute, because those are self-declared.
+    ``identity`` is ``None`` when the endpoint is untrusted, when the metadata
+    service cannot be read, or when it returns something that is not a plausible
+    droplet id; callers must then refuse. No fallback (hostname,
+    ``platform.node()``, environment) is ever used as an identity substitute,
+    because those are self-declared.
     """
+    trusted, trust_detail = imds_endpoint_trust(imds_url)
+    if not trusted:
+        return None, trust_detail
     try:
         with urllib.request.urlopen(imds_url, timeout=timeout) as response:  # noqa: S310
             raw = response.read(256).decode("utf-8", "replace").strip()
@@ -138,6 +159,56 @@ def host_identity(
     if not raw or len(raw) > 64 or not all(ch.isalnum() or ch in "-._" for ch in raw):
         return None, f"metadata identity is not a plausible host id: {raw[:64]!r}"
     return raw, f"metadata identity read from {imds_url}"
+
+
+def imds_endpoint_trust(url: str) -> tuple[bool, str]:
+    """Classify a metadata URL as an accepted host-identity source.
+
+    Returns ``(trusted, detail)``. A URL is accepted only when it is the pinned
+    droplet metadata endpoint, or a literal loopback address carrying the same
+    metadata path, which is what the isolated test stub uses. Everything else --
+    a host name, a public or private network address, any other path, any other
+    scheme -- is a self-declared identity substitute and is refused before a
+    network read or a filesystem mutation. Only the pinned endpoint yields
+    production identity authority; a loopback stub is recorded as such and never
+    counts as proof about the production droplet.
+    """
+    raw = str(url or "").strip()
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+    except ValueError as exc:
+        return False, f"metadata endpoint is not a URL: {raw!r} ({exc})"
+    if (
+        parsed.scheme != "http"
+        or not parsed.hostname
+        or parsed.path != METADATA_PATH
+        or parsed.query
+        or parsed.fragment
+        or parsed.username
+        or parsed.password
+    ):
+        return False, (
+            "metadata endpoint must be the pinned plain-HTTP metadata URL "
+            f"{DEFAULT_IMDS_URL}; observed {raw!r}"
+        )
+    if raw == DEFAULT_IMDS_URL:
+        return True, f"pinned droplet metadata endpoint {DEFAULT_IMDS_URL}"
+    try:
+        address = ipaddress.ip_address(parsed.hostname)
+    except ValueError:
+        return False, (
+            "metadata endpoint host is not a literal IP address, so it is a "
+            f"self-declared identity source: {raw!r}"
+        )
+    if address.is_loopback:
+        return True, (
+            "loopback metadata stub "
+            f"{raw} (test evidence only; no production identity authority)"
+        )
+    return False, (
+        "metadata endpoint is neither the pinned droplet metadata service nor a "
+        f"loopback test stub: {raw!r}"
+    )
 
 
 def schema_fingerprint(connection: sqlite3.Connection) -> str:
@@ -378,9 +449,18 @@ def fresh_genesis(
 ) -> dict:
     """Create a brand-new empty canonical store with a verifiable receipt.
 
-    Every precondition is evaluated *before* anything is created. A refusal
-    leaves the filesystem exactly as it was and writes diagnostic evidence
-    beside (never on top of) the authoritative receipt path.
+    Every precondition is evaluated *before* anything is created: authorization,
+    the authoritative receipt path, the certified SHA, a trusted metadata
+    endpoint, the metadata host identity, the certified destination layout, the
+    operator's explicit destination confirmation, the receipt location and the
+    absence of any existing store, sidecar, writer or unknown file. A refusal
+    leaves the canonical directory, the store and the authoritative receipt
+    untouched, and publishes its own separate diagnostic evidence beside (never
+    on top of) the authoritative receipt path.
+
+    ``imds_url`` exists for the isolated test stub only. It must be the pinned
+    droplet endpoint or a literal loopback address; the command line does not
+    expose it, so production identity cannot be self-declared.
     """
     app_root = Path(app_root)
     live_db = Path(live_db)
@@ -407,15 +487,13 @@ def fresh_genesis(
         # ``generated_at_utc`` is the receipt timestamp the writer gate ages.
         result["generated_at_utc"] = result["finished_at_utc"]
         if receipt_path is None:
+            # Unreachable in a normal run: RECEIPT_REQUIRED refuses first. Kept
+            # as a defensive stop so a future edit can never publish a PASS
+            # without an authoritative receipt path.
+            result["receipt_error"] = (
+                "authoritative receipt path is required (--receipt-out)"
+            )
             if verdict == "PASS":
-                # A genesis that cannot produce its evidence is not a PASS.
-                _check(
-                    checks,
-                    "RECEIPT_REQUIRED",
-                    False,
-                    "a successful genesis must publish an authoritative receipt "
-                    "(--receipt-out)",
-                )
                 result["verdict"] = "FAIL"
                 result["completed"] = False
             return result
@@ -450,12 +528,36 @@ def fresh_genesis(
     ):
         return finish("REFUSED")
 
+    # The authoritative evidence path is a precondition, not a post-hoc check:
+    # a genesis that cannot publish its receipt must not create a store, because
+    # a published store without evidence is an orphan the writer gate can never
+    # admit and a retry can never replace.
+    if not _check(
+        checks,
+        "RECEIPT_REQUIRED",
+        receipt_path is not None,
+        f"an authoritative receipt path is required (--receipt-out): genesis never "
+        f"creates a store at {live_db} that it cannot produce evidence for",
+    ):
+        return finish("REFUSED")
+
     if not _check(
         checks,
         "CERTIFIED_SHA",
         certified_sha == CERTIFIED_SHA,
         f"certified_sha={certified_sha} must equal the certified application SHA "
         f"{CERTIFIED_SHA}",
+    ):
+        return finish("REFUSED")
+
+    # Which service may answer for this host is decided before it is contacted.
+    endpoint_trusted, endpoint_detail = imds_endpoint_trust(imds_url)
+    if not _check(
+        checks,
+        "HOST_IDENTITY_ENDPOINT",
+        endpoint_trusted,
+        f"{endpoint_detail}; production identity is read only from "
+        f"{DEFAULT_IMDS_URL}",
     ):
         return finish("REFUSED")
 
@@ -469,6 +571,8 @@ def fresh_genesis(
         return finish("REFUSED")
     result["host"] = observed_host
     result["host_identity_source"] = imds_url
+    result["host_identity_endpoint"] = endpoint_detail
+    result["host_identity_production_endpoint"] = imds_url == DEFAULT_IMDS_URL
     result["host_identity_proven"] = True
     result["hostname"] = platform.node()
 
@@ -476,13 +580,19 @@ def fresh_genesis(
     if not _check(checks, "DESTINATION_LAYOUT", layout_ok, layout_detail):
         return finish("REFUSED")
 
+    # A certified *shape* is not an operator confirmation. Without an explicit
+    # confirmation of this exact path, a mistyped runtime root or mount would
+    # silently initialize the wrong canonical store.
     if confirm_destination is None:
-        _check(
+        if not _check(
             checks,
             "DESTINATION_CONFIRMED",
-            True,
-            "no --confirm-destination supplied; the certified layout check applies",
-        )
+            False,
+            "an explicit destination confirmation is required "
+            f"(--confirm-destination {live_db}); genesis never creates a store at "
+            "a path the operator did not name",
+        ):
+            return finish("REFUSED")
     else:
         confirmed = Path(confirm_destination).expanduser().resolve()
         if not _check(
@@ -493,26 +603,24 @@ def fresh_genesis(
         ):
             return finish("REFUSED")
 
-
-    if receipt_path is not None:
-        resolved_receipt = receipt_path.expanduser().resolve()
-        inside_store = resolved_receipt.parent == canonical_dir.expanduser().resolve()
-        if not _check(
-            checks,
-            "RECEIPT_LOCATION",
-            not inside_store and resolved_receipt != live_db.expanduser().resolve(),
-            f"receipt {resolved_receipt} must live outside the canonical store "
-            "directory",
-        ):
-            return finish("REFUSED")
-        if not _check(
-            checks,
-            "RECEIPT_PRESENT",
-            not receipt_path.exists(),
-            f"a receipt already exists at {receipt_path}; genesis never overwrites "
-            "evidence",
-        ):
-            return finish("REFUSED")
+    resolved_receipt = receipt_path.expanduser().resolve()
+    inside_store = resolved_receipt.parent == canonical_dir.expanduser().resolve()
+    if not _check(
+        checks,
+        "RECEIPT_LOCATION",
+        not inside_store and resolved_receipt != live_db.expanduser().resolve(),
+        f"receipt {resolved_receipt} must live outside the canonical store "
+        "directory",
+    ):
+        return finish("REFUSED")
+    if not _check(
+        checks,
+        "RECEIPT_PRESENT",
+        not receipt_path.exists(),
+        f"a receipt already exists at {receipt_path}; genesis never overwrites "
+        "evidence",
+    ):
+        return finish("REFUSED")
 
     if not _check(
         checks,
@@ -960,14 +1068,31 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="M07 R5 fresh canonical genesis")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_fresh = sub.add_parser("fresh-genesis")
+    p_fresh = sub.add_parser(
+        "fresh-genesis",
+        description=(
+            "Create a new empty canonical store. Requires --authorize, "
+            "--confirm-destination and --receipt-out; host identity is read only "
+            "from the pinned droplet metadata endpoint."
+        ),
+    )
     p_fresh.add_argument("--app-root", required=True)
     p_fresh.add_argument("--live-db", required=True)
-    p_fresh.add_argument("--receipt-out")
-    p_fresh.add_argument("--confirm-destination")
+    p_fresh.add_argument(
+        "--receipt-out",
+        help="authoritative receipt path (required; genesis refuses without it)",
+    )
+    p_fresh.add_argument(
+        "--confirm-destination",
+        help=(
+            "the exact --live-db path the operator intends to initialize "
+            "(required; genesis refuses without it)"
+        ),
+    )
     p_fresh.add_argument("--certified-sha", default=CERTIFIED_SHA)
     p_fresh.add_argument("--expected-host", default=DROPLET_ID)
-    p_fresh.add_argument("--imds-url", default=DEFAULT_IMDS_URL)
+    # Deliberately no --imds-url: the identity endpoint is a constant, so the
+    # production path cannot be pointed at a service the operator controls.
     p_fresh.add_argument("--authorize", action="store_true")
     p_fresh.add_argument("--out")
 
@@ -990,7 +1115,6 @@ def main(argv: list[str] | None = None) -> int:
             receipt_out=Path(args.receipt_out) if args.receipt_out else None,
             certified_sha=args.certified_sha,
             expected_host=args.expected_host,
-            imds_url=args.imds_url,
             confirm_destination=args.confirm_destination,
             authorize=args.authorize,
         )

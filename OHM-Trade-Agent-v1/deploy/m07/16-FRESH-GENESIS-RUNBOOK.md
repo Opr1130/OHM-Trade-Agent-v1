@@ -108,14 +108,29 @@ sudo -n python3 /opt/opip-m07-toolkit/scripts/opip_genesis.py fresh-genesis \
 Exit codes: `0` PASS · `1` FAIL (initialization failure; no store published) ·
 `2` PLATFORM_BLOCKED / INSUFFICIENT · `3` REFUSED (precondition not met).
 
+`--confirm-destination` and `--receipt-out` are **mandatory**. Omitting either one
+is a refusal *before any mutation*: the canonical directory, the database and
+every evidence file stay absent, because a store created without an operator
+confirmation or without authoritative evidence cannot be admitted by the writer
+gate and cannot be replaced by a retry. The confirmation must name the exact
+`--live-db` path; a merely well-shaped path is not a confirmation.
+
+The metadata identity endpoint is not a command-line option. The tool always
+reads `http://169.254.169.254/metadata/v1/id`, so nobody can point the identity
+read at a service they control. `--expected-host 610307364` is the value that
+pinned endpoint must return.
+
 The command refuses, with the failing check named in its JSON output:
 
 | Check | Meaning |
 |---|---|
 | `AUTHORIZATION` | `--authorize` missing |
+| `RECEIPT_REQUIRED` | `--receipt-out` missing (refused before any mutation) |
 | `CERTIFIED_SHA` | not the certified application SHA |
+| `HOST_IDENTITY_ENDPOINT` | the identity endpoint is not the pinned metadata service |
 | `HOST_IDENTITY` | metadata identity unreadable or not `610307364` |
-| `DESTINATION_LAYOUT` / `DESTINATION_CONFIRMED` | not `.../data/opip/canonical/opip_canonical_v1.sqlite3` |
+| `DESTINATION_LAYOUT` | not `.../data/opip/canonical/opip_canonical_v1.sqlite3` |
+| `DESTINATION_CONFIRMED` | `--confirm-destination` missing or naming another path |
 | `RECEIPT_LOCATION` / `RECEIPT_PRESENT` | receipt inside the store dir or already present |
 | `EXISTING_CANONICAL_STORE` | a destination database (or symlink) already exists |
 | `SQLITE_SIDECARS` | `-wal` / `-shm` / `-journal` present |
@@ -126,7 +141,10 @@ The command refuses, with the failing check named in its JSON output:
 
 A refusal writes **nothing** to the store and publishes diagnostic evidence as
 `<receipt>.…failed.json` beside the receipt path; the authoritative receipt path
-stays free for a corrected retry.
+stays free for a corrected retry. A repeated invocation after a successful
+genesis therefore refuses on `RECEIPT_PRESENT` and adds one new
+`*.failed.json` per attempt, while the canonical database and the authoritative
+receipt stay byte-identical — evidence accumulates, canonical state never moves.
 
 ## Phase C — Independent verification (read-only)
 

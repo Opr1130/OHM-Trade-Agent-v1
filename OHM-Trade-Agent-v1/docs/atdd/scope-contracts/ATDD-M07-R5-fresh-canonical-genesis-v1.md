@@ -30,14 +30,14 @@ an owner-authorized genesis request
 WHEN:
 the operation runs
 THEN:
-owner authorization, the certified SHA, a metadata-read host identity, the certified canonical destination layout, the operator's destination confirmation, the receipt location, a free receipt path, the absence of an existing store, the absence of SQLite sidecars, the absence of a live writer and an empty canonical directory are all proven before anything is created, and a failed precondition leaves the filesystem unchanged while publishing diagnostic evidence beside (never on top of) the authoritative receipt path
+owner authorization, the authoritative receipt path, the certified SHA, a trusted metadata identity endpoint, a metadata-read host identity, the certified canonical destination layout, the operator's explicit confirmation of that exact destination, the receipt location, a free receipt path, the absence of an existing store, the absence of SQLite sidecars, the absence of a live writer and an empty canonical directory are all proven before anything is created; a missing `--confirm-destination` or `--receipt-out` is refused before any mutation, so no canonical directory, database or artifact is created; host identity is read only from the pinned droplet metadata endpoint, which is not operator-selectable and accepts no self-declared endpoint substitute (a literal loopback stub is accepted only for isolated tests and never counts as production identity proof); and a failed precondition leaves the canonical database and the authoritative receipt unchanged while publishing its own separate diagnostic evidence beside (never on top of) the authoritative receipt path
 AC-003:
 GIVEN:
-an existing canonical destination, an unknown file, a sidecar pair or an interrupted prior attempt
+an existing canonical destination, an unknown file, a sidecar pair, an interrupted prior attempt or a repeated invocation after a successful genesis
 WHEN:
 a fresh genesis is attempted
 THEN:
-the operation refuses with the specific reason, nothing is overwritten, adopted, deleted or replaced, publication uses a no-replace primitive with no replace-capable fallback, and staging cleanup is scoped to this tool's own private staging marker
+the operation refuses with the specific reason, nothing is overwritten, adopted, deleted or replaced, the canonical database and the authoritative receipt stay byte-identical across a repeated invocation while each refusal may add only its own separate diagnostic evidence file, publication uses a no-replace primitive with no replace-capable fallback, and staging cleanup is scoped to this tool's own private staging marker
 AC-004:
 GIVEN:
 a successfully published genesis store

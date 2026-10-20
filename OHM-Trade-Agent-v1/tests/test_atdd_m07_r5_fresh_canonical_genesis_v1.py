@@ -80,7 +80,9 @@ def test_ac_002_owner_identity_and_destination_are_proven_before_any_mutation():
     source = _read(GENESIS)
     for check_id in (
         "AUTHORIZATION",
+        "RECEIPT_REQUIRED",
         "CERTIFIED_SHA",
+        "HOST_IDENTITY_ENDPOINT",
         "HOST_IDENTITY",
         "DESTINATION_LAYOUT",
         "DESTINATION_CONFIRMED",
@@ -93,12 +95,54 @@ def test_ac_002_owner_identity_and_destination_are_proven_before_any_mutation():
     ):
         assert f'"{check_id}"' in source, check_id
     mutation = source.index("canonical_dir.mkdir")
-    for check_id in ("AUTHORIZATION", "HOST_IDENTITY", "UNKNOWN_DATABASE_FILE"):
+    for check_id in (
+        "AUTHORIZATION",
+        "RECEIPT_REQUIRED",
+        "HOST_IDENTITY_ENDPOINT",
+        "DESTINATION_CONFIRMED",
+        "RECEIPT_PRESENT",
+        "UNKNOWN_DATABASE_FILE",
+    ):
         assert source.index(f'"{check_id}"') < mutation, check_id
+    # A missing destination confirmation or receipt path is a refusal, never a
+    # PASS with a note.
+    assert "no --confirm-destination supplied" not in source
+    assert "an explicit destination confirmation is required" in source
+    assert "an authoritative receipt path is required" in source
     # A missing or unreachable identity is never replaced by a self-declared one.
     assert "platform.node()" in source
     assert 'result["host_identity_proven"] = True' in source
-    assert "hostname, ``platform.node()``, environment" in source
+    assert "No fallback (hostname," in source
+    assert "environment) is ever used as an identity substitute" in source
+    # Production identity may only be read from the pinned endpoint: the endpoint
+    # is a constant, not a CLI option, and an in-process override must be the
+    # pinned URL or a literal loopback test stub.
+    assert "def imds_endpoint_trust" in source
+    assert "DEFAULT_IMDS_URL = f\"http://169.254.169.254{METADATA_PATH}\"" in source
+    assert 'p_fresh.add_argument("--imds-url"' not in source
+    assert "imds_url=args.imds_url" not in source
+    assert "address.is_loopback" in source
+    assert (
+        'result["host_identity_production_endpoint"] = imds_url == DEFAULT_IMDS_URL'
+        in source
+    )
+
+    scenario = _read(SCENARIO)
+    for name in (
+        "test_a_missing_destination_confirmation_is_refused_before_any_mutation",
+        "test_a_missing_destination_confirmation_refuses_even_at_the_certified_path",
+        "test_a_missing_receipt_path_is_refused_before_any_store_is_created",
+        "test_a_missing_receipt_path_never_publishes_a_store_even_when_authorized",
+        "test_an_untrusted_metadata_endpoint_cannot_substitute_the_host_identity",
+        "test_only_the_pinned_endpoint_or_a_loopback_stub_may_name_the_host",
+        "test_the_pinned_and_loopback_endpoints_remain_accepted",
+        "test_the_production_cli_cannot_select_a_metadata_endpoint",
+        "test_a_repeated_invocation_preserves_the_store_and_receipt_and_adds_only_evidence",
+        "test_each_repeated_invocation_adds_its_own_evidence_and_nothing_else",
+    ):
+        assert f"def {name}" in scenario, name
+    # The retired name claimed more than the contract promises.
+    assert "changes_nothing" not in scenario
 
 
 

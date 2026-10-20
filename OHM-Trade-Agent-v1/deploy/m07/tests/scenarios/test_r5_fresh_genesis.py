@@ -101,6 +101,7 @@ def _genesis(
         "live_db": live_db,
         "receipt_out": receipt,
         "imds_url": imds_url,
+        "confirm_destination": str(live_db),
         "authorize": True,
     }
     kwargs.update(overrides)
@@ -208,7 +209,17 @@ def test_fresh_genesis_publishes_an_empty_certified_store(imds, layout) -> None:
 
 
 @LINUX_ONLY
-def test_a_repeated_invocation_refuses_and_changes_nothing(imds, layout) -> None:
+def test_a_repeated_invocation_preserves_the_store_and_receipt_and_adds_only_evidence(
+    imds, layout
+) -> None:
+    """A repeat may add diagnostic evidence; it may never change canonical state.
+
+    The contract is deliberately narrow: the canonical database and the
+    authoritative receipt are immutable across a repeat, while *each* refusal is
+    allowed to publish its own separate ``*.failed.json`` beside the receipt. This
+    test names that contract exactly, so "changes nothing" can never be read as a
+    promise the implementation does not make.
+    """
     live_db, receipt = layout
     assert _genesis(live_db, receipt, imds())["verdict"] == "PASS"
     store_digest = opip_genesis.sha256_file(live_db)
@@ -218,9 +229,14 @@ def test_a_repeated_invocation_refuses_and_changes_nothing(imds, layout) -> None
     repeated = _genesis(live_db, receipt, imds())
     assert repeated["verdict"] == "REFUSED"
     assert "RECEIPT_PRESENT" in _failure_ids(repeated)
-    # The store and the authoritative receipt are byte-identical.
+    # The canonical database and the authoritative receipt are byte-identical.
     assert opip_genesis.sha256_file(live_db) == store_digest
     assert opip_genesis.sha256_file(receipt) == receipt_digest
+    # The authoritative receipt still independently verifies after the repeat.
+    verified = opip_genesis.verify_genesis_receipt(
+        receipt_path=receipt, db=live_db, app_root=CERT_SRC
+    )
+    assert verified["verdict"] == "PASS", verified["problems"]
     # Evidence is never overwritten: a refusal only adds its own diagnostic file.
     added = [
         name for name in sorted(p.name for p in receipt.parent.iterdir())
@@ -231,6 +247,34 @@ def test_a_repeated_invocation_refuses_and_changes_nothing(imds, layout) -> None
     diagnostic = json.loads((receipt.parent / added[0]).read_text(encoding="utf-8"))
     assert diagnostic["verdict"] == "REFUSED"
     assert diagnostic["completed"] is False
+    assert diagnostic["receipt"] == str(receipt.parent / added[0])
+    assert diagnostic["destination_db"] == str(live_db)
+
+
+@LINUX_ONLY
+def test_each_repeated_invocation_adds_its_own_evidence_and_nothing_else(
+    imds, layout
+) -> None:
+    """Repeats accumulate *separate* diagnostics; canonical bytes never move."""
+    live_db, receipt = layout
+    assert _genesis(live_db, receipt, imds())["verdict"] == "PASS"
+    store_digest = opip_genesis.sha256_file(live_db)
+    receipt_digest = opip_genesis.sha256_file(receipt)
+    baseline = sorted(p.name for p in receipt.parent.iterdir())
+
+    for attempt in range(2):
+        repeat = _genesis(live_db, receipt, imds())
+        assert repeat["verdict"] == "REFUSED"
+        assert "RECEIPT_PRESENT" in _failure_ids(repeat)
+        added = [
+            name for name in sorted(p.name for p in receipt.parent.iterdir())
+            if name not in baseline
+        ]
+        # One new diagnostic per attempt, and none of them is the receipt itself.
+        assert len(added) == attempt + 1, added
+        assert receipt.name not in added
+        assert opip_genesis.sha256_file(live_db) == store_digest
+        assert opip_genesis.sha256_file(receipt) == receipt_digest
 
 
 
@@ -301,6 +345,46 @@ def test_a_receipt_inside_the_store_directory_is_refused(imds, layout) -> None:
     assert "RECEIPT_LOCATION" in _failure_ids(result)
     assert not live_db.exists()
     assert not inside.exists()
+
+
+def test_a_missing_receipt_path_is_refused_before_any_store_is_created(
+    imds, layout
+) -> None:
+    """AC-002: no authoritative receipt path means no genesis at all.
+
+    A store without its receipt is an orphan the writer gate can never admit and a
+    retry can never replace, so the receipt path is a precondition: it is refused
+    before the canonical directory, the database or any evidence file exists.
+    """
+    live_db, receipt = layout
+    result = _genesis(live_db, None, imds())
+    assert result["verdict"] == "REFUSED"
+    assert result["completed"] is False
+    assert "RECEIPT_REQUIRED" in _failure_ids(result)
+    detail = _checks(result)["RECEIPT_REQUIRED"]["detail"]
+    assert "--receipt-out" in detail
+    # Nothing at all was created -- including the evidence directory, because
+    # there is no authoritative receipt path to publish evidence beside.
+    assert not live_db.exists()
+    assert not live_db.parent.exists()
+    assert not receipt.exists()
+    assert not receipt.parent.exists()
+    assert list(live_db.parents[3].rglob("*.sqlite3*")) == []
+    assert result.get("receipt") is None
+    assert result.get("receipt_error")
+
+
+def test_a_missing_receipt_path_never_publishes_a_store_even_when_authorized(
+    imds, layout
+) -> None:
+    """AC-002: authorization alone never buys a store without evidence."""
+    live_db, receipt = layout
+    result = _genesis(live_db, None, imds(), authorize=True)
+    assert result["verdict"] == "REFUSED"
+    assert _checks(result)["AUTHORIZATION"]["status"] == "PASS"
+    assert not live_db.exists()
+    assert not live_db.parent.exists()
+    assert not receipt.parent.exists()
 
 
 def test_a_competing_store_lock_refuses_the_genesis(imds, layout) -> None:
@@ -383,6 +467,88 @@ def test_an_unreachable_identity_service_refuses_instead_of_guessing(
     assert not live_db.exists()
 
 
+def test_an_untrusted_metadata_endpoint_cannot_substitute_the_host_identity(
+    layout,
+) -> None:
+    """AC-002: only the pinned endpoint (or a loopback stub) may name this host."""
+    live_db, receipt = layout
+    untrusted = "http://203.0.113.10/metadata/v1/id"
+    trusted, detail = opip_genesis.imds_endpoint_trust(untrusted)
+    assert trusted is False
+    assert "neither the pinned droplet metadata service" in detail
+
+    # Refused before the endpoint is contacted, so no network is required here.
+    result = _genesis(live_db, receipt, untrusted)
+    assert result["verdict"] == "REFUSED"
+    assert "HOST_IDENTITY_ENDPOINT" in _failure_ids(result)
+    assert "HOST_IDENTITY" not in _failure_ids(result)
+    assert "host" not in result
+    assert not live_db.exists()
+    assert not live_db.parent.exists()
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        "http://localhost/metadata/v1/id",  # a resolvable name is self-declared
+        "https://169.254.169.254/metadata/v1/id",  # the pinned service is plain HTTP
+        "http://169.254.169.254/metadata/v1/../v1/id?x=1",  # query string
+        "http://169.254.169.254/",  # not the identity path
+        "http://user:pass@203.0.113.10/metadata/v1/id",  # embedded credentials
+        "http://0.0.0.0/metadata/v1/id",  # not loopback
+        "file:///etc/hostname",  # not an HTTP metadata service
+        "",
+    ],
+)
+def test_only_the_pinned_endpoint_or_a_loopback_stub_may_name_the_host(
+    candidate: str,
+) -> None:
+    """AC-002: the endpoint allowlist is exact, not a prefix or scheme match."""
+    trusted, detail = opip_genesis.imds_endpoint_trust(candidate)
+    assert trusted is False, (candidate, detail)
+    assert detail
+
+
+def test_the_pinned_and_loopback_endpoints_remain_accepted() -> None:
+    """AC-002: production identity and the isolated test stub both still work."""
+    assert opip_genesis.imds_endpoint_trust(opip_genesis.DEFAULT_IMDS_URL)[0] is True
+    assert opip_genesis.imds_endpoint_trust(
+        "http://127.0.0.1:8080/metadata/v1/id"
+    )[0] is True
+    assert opip_genesis.imds_endpoint_trust("http://[::1]:8080/metadata/v1/id")[0] is True
+    loopback_trusted, loopback_detail = opip_genesis.imds_endpoint_trust(
+        "http://127.0.0.1:8080/metadata/v1/id"
+    )
+    assert loopback_trusted is True
+    assert "no production identity authority" in loopback_detail
+
+
+def test_the_production_cli_cannot_select_a_metadata_endpoint(layout) -> None:
+    """AC-002: the identity endpoint is a constant, not an operator option."""
+    live_db, receipt = layout
+    with pytest.raises(SystemExit) as excinfo:
+        opip_genesis.main(
+            [
+                "fresh-genesis",
+                "--app-root",
+                str(CERT_SRC),
+                "--live-db",
+                str(live_db),
+                "--receipt-out",
+                str(receipt),
+                "--confirm-destination",
+                str(live_db),
+                "--authorize",
+                "--imds-url",
+                "http://203.0.113.10/metadata/v1/id",
+            ]
+        )
+    # argparse rejects the unknown option before a single check runs.
+    assert excinfo.value.code == 2
+    assert not live_db.exists()
+    assert not receipt.exists()
+
+
 def test_a_destination_outside_the_certified_layout_is_refused(imds, tmp_path) -> None:
     wrong = tmp_path / "somewhere" / opip_genesis.CANONICAL_DB_NAME
     receipt = tmp_path / "state" / "receipt.json"
@@ -390,6 +556,43 @@ def test_a_destination_outside_the_certified_layout_is_refused(imds, tmp_path) -
     assert result["verdict"] == "REFUSED"
     assert "DESTINATION_LAYOUT" in _failure_ids(result)
     assert not wrong.exists()
+
+
+def test_a_missing_destination_confirmation_is_refused_before_any_mutation(
+    imds, layout
+) -> None:
+    """AC-002: a certified *shape* is not an operator confirmation.
+
+    A path that merely ends in ``data/opip/canonical/opip_canonical_v1.sqlite3``
+    must never be initialized without the operator naming that exact destination,
+    otherwise a wrong runtime root or a mount typo silently creates the wrong
+    canonical store.
+    """
+    live_db, receipt = layout
+    result = _genesis(live_db, receipt, imds(), confirm_destination=None)
+    assert result["verdict"] == "REFUSED"
+    assert "DESTINATION_CONFIRMED" in _failure_ids(result)
+    detail = _checks(result)["DESTINATION_CONFIRMED"]["detail"]
+    assert "an explicit destination confirmation is required" in detail
+    assert "--confirm-destination" in detail
+    # No mutation: the canonical directory, the store and the receipt are absent.
+    assert not live_db.exists()
+    assert not live_db.parent.exists()
+    assert not receipt.exists()
+    assert list(live_db.parents[3].rglob("*.sqlite3*")) == []
+
+
+def test_a_missing_destination_confirmation_refuses_even_at_the_certified_path(
+    imds, layout
+) -> None:
+    """AC-002: the certified layout alone never authorizes a genesis."""
+    live_db, receipt = layout
+    assert opip_genesis.canonical_layout_ok(live_db)[0] is True
+    result = _genesis(live_db, receipt, imds(), confirm_destination=None)
+    assert result["verdict"] == "REFUSED"
+    assert _checks(result)["DESTINATION_LAYOUT"]["status"] == "PASS"
+    assert "DESTINATION_CONFIRMED" in _failure_ids(result)
+    assert not live_db.exists()
 
 
 def test_a_mismatched_destination_confirmation_is_refused(imds, layout, tmp_path) -> None:
