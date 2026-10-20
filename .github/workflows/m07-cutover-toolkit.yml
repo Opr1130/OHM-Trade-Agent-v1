@@ -150,6 +150,7 @@ jobs:
       CERT_SHA: c196dd674678b3b1ee91c351ee97c1c9e2b3938d
       APP_ROOT: /opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1
       STATE: /var/lib/opip-bootstrap
+      HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -545,8 +546,8 @@ jobs:
           cp "$RUNNER_TEMP"/*.log "$EVIDENCE/" 2>/dev/null || true
           {
             echo "# R3-G2 disposable-host rehearsal"
-            echo "commit=$GITHUB_SHA"
-            echo "head_sha=${GITHUB_HEAD_SHA:-$GITHUB_SHA}"
+            echo "checkout_sha=$GITHUB_SHA"
+            echo "head_sha=$HEAD_SHA"
             echo "certified_sha=$CERT_SHA"
             echo "identity_attestation=SIMULATED"
             echo "production_identity=UNPROVEN"
