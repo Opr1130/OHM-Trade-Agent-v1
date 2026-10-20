@@ -552,6 +552,23 @@ PY
     sleep 2
   done
   [[ "$healthy" == "1" ]] || die "core health check failed after start"
+  # --- effective credential authority (release boundary) ---------------------
+  # `env_file: .env` injects the same credential NAMES into this container as
+  # into the running core, so the checked-in Compose `environment:` mapping is
+  # not the whole authority surface. Judge the credential set the container
+  # actually receives, by NAME only, and require the existing Kraken
+  # permission audit to positively confirm read-only permissions for the
+  # bounded query-only pair. Values are never read, printed, passed as an
+  # argument or written into a receipt. FAIL or UNVERIFIED stops the release.
+  local credential_report
+  if ! credential_report="$(compose run --rm --no-deps -e PYTHONPATH=/app \
+        -v "$TOOLS/opip_credential_authority.py:/authority.py:ro" ohm-trade-agent \
+        python /authority.py 2>>"$LOG")"; then
+    log "credential authority: ${credential_report//$'\n'/ }"
+    die "effective credential authority is not a bounded query-only credential"
+  fi
+  log "credential authority: ${credential_report//$'\n'/ }"
+
   # The certified image ships only `app/`, so inside the one-shot gate
   # container `_resolve_repo_root()` cannot see the Compose authority and the
   # gate fails closed with FileNotFoundError. Mount exactly the tracked
