@@ -62,6 +62,10 @@ WRITER_RECEIPT="$STATE/WRITER_ACTIVATED.json"
 SCHEDULER_RECEIPT="$STATE/SCHEDULER_ACTIVATED.json"
 LIVE_ACCEPTANCE="$STATE/LIVE-ACCEPTANCE.json"
 MANIFEST="$STATE/release-manifest.sha256"
+#: Durable incident registry the certified preflight reads at /app/data/<this>.
+#: The read-only preflight must observe the REAL runtime copy under APP_ROOT/data,
+#: never the immutable release tree, and a missing store is never "no incidents".
+INCIDENT_STATE_FILE="system_incidents.json"
 TOOLS=""
 # Filled only for privileged host modes; check/provision and early argument
 # errors must never write to the host log path.
@@ -503,6 +507,9 @@ mode_execute() {
   verify_image
   resolve_toolkit || die "M07 toolkit not found or failed integrity verification: $TOOLKIT_ROOT"
   [[ -s "$AUTHORIZED" ]] || die "no BOOTSTRAP_AUTHORIZED receipt; owner authorisation is required"
+  # Last pre-mutation check: the evidence the authorization was bound to must
+  # still describe the live host.
+  assert_incident_store_unchanged
   local cfg
   cfg="$(config_digest_value)"
   python3 - "$TOOLS/opip_receipts.py" "$PREPARED" "$AUTHORIZED" "$DROPLET_ID" "$SHA" "$IMAGE_ID" "$cfg" <<'PY' || exit 3
@@ -588,6 +595,9 @@ mode_prepare() {
   log "storage check: ${df_kb}KiB free on /"
   # Record the exact release content now; execute/authorize re-verify against it.
   manifest_build "$SRC" "$MANIFEST"
+  # A failed or refused prepare must never leave an earlier PREPARED receipt behind
+  # for authorize to bind against.
+  rm -f "$PREPARED"
   local evaluated ackable="false"
   evaluated="$(preflight_evaluate)"
   if [[ "$(python3 -c 'import json,sys;print(json.loads(sys.argv[1])["fresh_host_only"])' "$evaluated")" == "True" ]]; then
@@ -604,6 +614,9 @@ mode_authorize() {
   verify_image
   resolve_toolkit || die "M07 toolkit not found or failed integrity verification: $TOOLKIT_ROOT"
   [[ -s "$PREPARED" ]] || die "no BOOTSTRAP_PREPARED receipt; run --mode prepare first"
+  # The protection block was derived from a specific incident-store digest; it
+  # must not have moved between observation and authorization.
+  assert_incident_store_unchanged
   [[ "$CONFIRM_SHA" == "$SHA" ]] || die "--confirm-sha must equal $SHA"
   [[ "$CONFIRM_HOST" == "$DROPLET_ID" ]] || die "--confirm-host must equal $DROPLET_ID"
   local cfg
@@ -625,33 +638,290 @@ PY
 
 preflight_evaluate() {
   local receipt="$STATE/protection-preflight.json" pf_rc=0
+  local runtime_data="$APP_ROOT/data"
+  local incident_store="$runtime_data/$INCIDENT_STATE_FILE"
   [[ -s "$ENV_FILE" ]] || die ".env is missing at $ENV_FILE (canonical location, owner-provided)"
+
+  # --- Phase B: observe the REAL runtime data, never the release tree ----------
+  # $SRC is the immutable certified release (an install source, not a runtime
+  # root), so $SRC/data is never V2 evidence. The app writes its durable incident
+  # registry under $APP_ROOT/data.
+  if [[ -L "$runtime_data" ]]; then
+    die "runtime data directory is a symlink; refusing: $runtime_data"
+  fi
+  if [[ ! -d "$runtime_data" ]]; then
+    die "runtime data directory is missing: $runtime_data (prepare creates it before the preflight)"
+  fi
+  if [[ ! -r "$runtime_data" ]]; then
+    die "runtime data directory is not readable: $runtime_data"
+  fi
+  if [[ -L "$incident_store" ]]; then
+    die "incident store is a symlink; refusing: $incident_store"
+  fi
+  if [[ -e "$incident_store" && ! -f "$incident_store" ]]; then
+    die "incident store is not a regular file: $incident_store"
+  fi
+
   # Read-only preflight against the immutable release code; the environment file is
   # ALWAYS the canonical one under APP_ROOT (never a second .env inside the release).
   set +e
-  local mounts=(-v "$SRC/app:/app/app:ro")
-  if [[ -d "$SRC/data" ]]; then
-    mounts+=(-v "$SRC/data:/app/data:ro")
-  fi
   docker run --rm --read-only --tmpfs /tmp:rw,size=32m --pids-limit 64 --memory 384m \
     --env-file "$ENV_FILE" -e PYTHONDONTWRITEBYTECODE=1 \
-    "${mounts[@]}" "$IMAGE_ID" \
+    -v "$SRC/app:/app/app:ro" -v "$runtime_data:/app/data:ro" "$IMAGE_ID" \
     python -m app.jobs.preflight_protection_health \
       --candidate-sha "$SHA" --release-profile EVIDENCE_SHADOW >"$receipt" 2>>"$LOG"
   pf_rc=$?
   set -e
   [[ -s "$receipt" ]] || die "protection preflight produced no receipt (rc=$pf_rc)"
-  log "protection preflight exit=$pf_rc (content evaluated below)"
-  python3 - "$receipt" <<'PY'
-import json, sys
-doc = json.load(open(sys.argv[1], encoding="utf-8"))
-verdict = doc.get("verdict") or {}
-blocking = [c for c in (verdict.get("blocking_incidents") or []) if c]
-reasons = [str(r) for r in (verdict.get("reason_codes") or [])]
-no_incumbent = all(r in {"UNAVAILABLE", "NO_STATE", "NOT_DEPLOYED", "MISSING"} for r in reasons) if reasons else False
-print(json.dumps({"ready": bool(verdict.get("ready")), "reasons": reasons,
-                  "blocking_incidents": blocking, "fresh_host_only": no_incumbent}))
+  log "protection preflight exit=$pf_rc (contract-validated below)"
+
+  local evaluated
+  evaluated="$(python3 - "$receipt" "$pf_rc" "$SHA" "$incident_store" <<'PY'
+# --- M07-PREFLIGHT-CONTRACT-BEGIN ---
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+
+receipt_path, raw_rc, expected_sha, store_raw = sys.argv[1:5]
+store_path = Path(store_raw)
+PROFILE = "EVIDENCE_SHADOW"
+STATE_READY, STATE_BLOCKED = "READY", "BLOCKED"
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def refuse(reason: str) -> None:
+    print(json.dumps({"contract_error": reason}, sort_keys=True))
+    raise SystemExit(4)
+
+
+def string_list(value: object, name: str) -> list:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        refuse(f"{name} is missing or is not a list of strings")
+    return [str(item) for item in value]
+
+
+try:
+    rc = int(raw_rc)
+except (TypeError, ValueError):
+    refuse(f"preflight exit code is not an integer: {raw_rc!r}")
+
+try:
+    document = json.loads(Path(receipt_path).read_text(encoding="utf-8"))
+except Exception as exc:  # noqa: BLE001 - unreadable evidence must refuse
+    refuse(f"preflight receipt is unreadable: {type(exc).__name__}")
+if not isinstance(document, dict):
+    refuse("preflight receipt is not a JSON object")
+
+if document.get("schema_version") != 1:
+    refuse(f"unexpected preflight schema_version={document.get('schema_version')!r}")
+if document.get("candidate_sha") != expected_sha:
+    refuse(f"candidate_sha={document.get('candidate_sha')!r} != expected {expected_sha}")
+if not SHA_RE.fullmatch(str(document.get("candidate_sha"))):
+    refuse("candidate_sha is not a 40-hex SHA")
+if document.get("release_profile") != PROFILE:
+    refuse(f"release_profile={document.get('release_profile')!r} is not {PROFILE}")
+if document.get("read_only") is not True:
+    refuse("preflight document is not marked read_only")
+
+verdict = document.get("verdict")
+if not isinstance(verdict, dict):
+    refuse("verdict missing")
+ready = verdict.get("ready")
+if not isinstance(ready, bool):
+    refuse("verdict.ready is missing or is not a boolean")
+reason = verdict.get("reason")
+if not isinstance(reason, str) or not reason.strip():
+    refuse("verdict.reason is missing or empty")
+
+shadow = document.get("evidence_shadow")
+if not isinstance(shadow, dict):
+    refuse("evidence_shadow missing")
+shadow_ready = shadow.get("ready")
+shadow_state = shadow.get("state")
+if not isinstance(shadow_ready, bool):
+    refuse("evidence_shadow.ready is missing or is not a boolean")
+if shadow_state not in (STATE_READY, STATE_BLOCKED):
+    refuse(f"evidence_shadow.state={shadow_state!r} is not READY/BLOCKED")
+blocking_codes = string_list(
+    shadow.get("blocking_reason_codes"), "evidence_shadow.blocking_reason_codes"
+)
+blocking_incidents = string_list(
+    shadow.get("blocking_incidents"), "evidence_shadow.blocking_incidents"
+)
+
+strict = document.get("strict_f11")
+if not isinstance(strict, dict):
+    refuse("strict_f11 missing")
+strict_codes = string_list(strict.get("reason_codes"), "strict_f11.reason_codes")
+
+if shadow_state == STATE_READY and (not shadow_ready or blocking_codes):
+    refuse("evidence_shadow is READY but not ready or carries blocking codes")
+if shadow_state == STATE_BLOCKED and shadow_ready:
+    refuse("evidence_shadow.state=BLOCKED contradicts evidence_shadow.ready=true")
+if ready and not shadow_ready:
+    refuse("verdict.ready=true contradicts evidence_shadow.ready=false")
+if ready and shadow_state != STATE_READY:
+    refuse("verdict.ready=true contradicts evidence_shadow.state")
+if not ready and shadow_state == STATE_READY and shadow_ready:
+    refuse("verdict.ready=false contradicts a READY evidence_shadow")
+expected_rc = 0 if ready else 76
+if rc != expected_rc:
+    refuse(f"preflight exit {rc} contradicts verdict.ready={ready} (expected {expected_rc})")
+
+# --- durable incident store observation (never "absent means no incidents") ---
+# Aligned with the certified observers:
+#   read_json_without_quarantine() rejects non-finite constants and non-objects;
+#   read_incident_projection() treats a non-dict `incidents` map or any non-dict
+#   row as UNPROVEN, and skips rows whose state is RECOVERED.
+SCHEMA_SUPPORTED = (1, 2)          # system_incidents.SCHEMA_VERSION is 2; 1 is readable
+STATE_RECOVERED = "RECOVERED"
+
+
+def _reject_constant(value):
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
+store_state = "ABSENT"
+store_digest = None
+store_bytes = 0
+store_active = 0
+store_recovered = 0
+
+if store_path.exists() and not store_path.is_file():
+    refuse("incident store is not a regular file")
+if store_path.is_file():
+    try:
+        raw = store_path.read_bytes()
+    except OSError:
+        store_state = "UNREADABLE"
+    else:
+        store_digest = hashlib.sha256(raw).hexdigest()
+        store_bytes = len(raw)
+        try:
+            payload = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant)
+        except Exception:  # noqa: BLE001 - malformed state is never "no incident"
+            store_state = "MALFORMED"
+        else:
+            schema = payload.get("schema_version") if isinstance(payload, dict) else None
+            schema_ok = (
+                isinstance(schema, int)
+                and not isinstance(schema, bool)
+                and schema in SCHEMA_SUPPORTED
+            )
+            if not isinstance(payload, dict) or not schema_ok:
+                store_state = "MALFORMED"
+            elif not isinstance(payload.get("incidents"), dict):
+                store_state = "MALFORMED"
+            else:
+                malformed_row = False
+                for row in payload["incidents"].values():
+                    if not isinstance(row, dict):
+                        malformed_row = True
+                        break
+                    if str(row.get("state") or "") == STATE_RECOVERED:
+                        store_recovered += 1
+                    else:
+                        store_active += 1
+                if malformed_row:
+                    # A structurally corrupt record cannot be proven recovered and
+                    # is never "no incident": the whole store is unproven.
+                    store_state = "MALFORMED"
+                    store_recovered = store_active = 0
+                elif store_active:
+                    store_state = "VALID_OPEN_INCIDENTS"
+                elif store_recovered:
+                    store_state = "VALID_RECOVERED_ONLY"
+                else:
+                    store_state = "VALID_EMPTY"
+
+# --- READY must not contradict host incident evidence -------------------------
+# A READY verdict requires the certified projection to have seen a valid store
+# with no active incident. If the host-side store is absent, unreadable,
+# malformed or holds active rows, the observation and the host disagree and the
+# whole document is refused rather than trusted.
+if ready and store_state not in ("VALID_EMPTY", "VALID_RECOVERED_ONLY"):
+    refuse(
+        "verdict.ready=true contradicts host incident evidence "
+        f"(store={store_state}); refusing to trust the observation"
+    )
+
+# A first-host acknowledgement requires POSITIVE proof: a provably valid, EMPTY
+# incident store (incident state genuinely known) plus a block attributable only
+# to reviewed codes. It is never inferred from absent reason codes, from a generic
+# UNAVAILABLE state, or from a missing store. ACK_ELIGIBLE_BLOCKING is empty, so
+# `--acknowledge-fresh-host` cannot currently bypass any certified block.
+ACK_ELIGIBLE_BLOCKING = frozenset()
+fresh_host_only = bool(
+    not ready
+    and not blocking_incidents
+    and store_state == "VALID_EMPTY"
+    and blocking_codes
+    and set(blocking_codes).issubset(ACK_ELIGIBLE_BLOCKING)
+)
+
+print(json.dumps({
+    "ready": ready,
+    "reason": reason,
+    "reasons": blocking_codes,
+    "blocking_reason_codes": blocking_codes,
+    "blocking_incidents": blocking_incidents,
+    "evidence_shadow_state": shadow_state,
+    "strict_f11_reason_codes": strict_codes,
+    "incident_store": {
+        "state": store_state,
+        "sha256": store_digest,
+        "bytes": store_bytes,
+        "active_records": store_active,
+        "recovered_records": store_recovered,
+    },
+    "fresh_host_only": fresh_host_only,
+}, sort_keys=True))
+# --- M07-PREFLIGHT-CONTRACT-END ---
 PY
+)" || die "protection preflight evidence is malformed or contradictory; refusing to prepare"
+
+  log "protection preflight contract: $evaluated"
+  printf '%s\n' "$evaluated"
+}
+
+# --- incident-store drift protection -----------------------------------------
+# The preflight records the digest of the durable incident store it observed.
+# Authorization and the last pre-mutation check before execute re-derive the live
+# digest and refuse on any drift, so the phases can never silently disagree about
+# the evidence the protection block was based on.
+incident_store_digest() {
+  local store="$APP_ROOT/data/$INCIDENT_STATE_FILE"
+  if [[ -L "$store" ]]; then
+    die "incident store is a symlink; refusing: $store"
+  fi
+  if [[ ! -e "$store" ]]; then
+    printf 'ABSENT\n'
+    return 0
+  fi
+  if [[ ! -f "$store" ]]; then
+    die "incident store is not a regular file: $store"
+  fi
+  sha256sum "$store" | cut -d' ' -f1
+}
+
+assert_incident_store_unchanged() {
+  local recorded current
+  recorded="$(python3 - "$PREPARED" <<'PY2'
+import json
+import sys
+
+document = json.load(open(sys.argv[1], encoding="utf-8"))
+store = (document.get("preflight") or {}).get("incident_store") or {}
+print(store.get("sha256") or "ABSENT")
+PY2
+)"
+  current="$(incident_store_digest)"
+  if [[ "$recorded" != "$current" ]]; then
+    die "incident store drifted since prepare (prepared=$recorded live=$current); re-run prepare"
+  fi
+  log "incident store unchanged since prepare: $current"
 }
 
 config_digest_value() {
