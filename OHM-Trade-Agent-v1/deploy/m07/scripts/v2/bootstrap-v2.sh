@@ -434,11 +434,22 @@ install_release() {
     log "runtime checkout already installed and verified: $APP_ROOT"
     return 0
   fi
-  if [[ -d "$APP_ROOT" ]] && [[ -n "$(find "$APP_ROOT" -mindepth 1 -maxdepth 1 ! -name data -print -quit 2>/dev/null)" ]]; then
-    manifest_verify "$APP_ROOT" "$MANIFEST" \
-      || die "runtime root exists with non-certified content; refusing to overwrite $APP_ROOT"
-    log "runtime root already installed and verified: $APP_ROOT"
-    return 0
+  # `.env` (owner-provided before prepare) and `data` (created by prepare/execute)
+  # are runtime state, never release content. Their presence must not classify the
+  # root as an already-installed release: `prepare` requires `.env` to exist at
+  # APP_ROOT before `execute` can run, so treating it as foreign content deadlocks
+  # the documented sequence. Both entries are also excluded from the install copy,
+  # so `--delete` cannot remove them.
+  if [[ -d "$APP_ROOT" ]]; then
+    local foreign
+    foreign="$(find "$APP_ROOT" -mindepth 1 -maxdepth 1 \
+      ! -name data ! -name .env -print -quit 2>/dev/null)"
+    if [[ -n "$foreign" ]]; then
+      manifest_verify "$APP_ROOT" "$MANIFEST" \
+        || die "runtime root exists with non-certified content; refusing to overwrite $APP_ROOT"
+      log "runtime root already installed and verified: $APP_ROOT"
+      return 0
+    fi
   fi
   install -d -m 0755 "$APP_ROOT"
   run "install release" rsync -a --delete --exclude '.git' --exclude 'data' --exclude '.env' \
