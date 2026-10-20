@@ -218,9 +218,20 @@ def test_a_repeated_invocation_refuses_and_changes_nothing(imds, layout) -> None
     repeated = _genesis(live_db, receipt, imds())
     assert repeated["verdict"] == "REFUSED"
     assert "RECEIPT_PRESENT" in _failure_ids(repeated)
+    # The store and the authoritative receipt are byte-identical.
     assert opip_genesis.sha256_file(live_db) == store_digest
     assert opip_genesis.sha256_file(receipt) == receipt_digest
-    assert sorted(p.name for p in receipt.parent.iterdir()) == evidence_before
+    # Evidence is never overwritten: a refusal only adds its own diagnostic file.
+    added = [
+        name for name in sorted(p.name for p in receipt.parent.iterdir())
+        if name not in evidence_before
+    ]
+    assert len(added) == 1, added
+    assert added[0].startswith(receipt.name) and added[0].endswith(".failed.json")
+    diagnostic = json.loads((receipt.parent / added[0]).read_text(encoding="utf-8"))
+    assert diagnostic["verdict"] == "REFUSED"
+    assert diagnostic["completed"] is False
+
 
 
 
