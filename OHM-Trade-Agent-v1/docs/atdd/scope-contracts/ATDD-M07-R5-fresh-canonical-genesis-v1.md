@@ -129,6 +129,7 @@ AC-006 -> OHM-Trade-Agent-v1/deploy/m07/scripts/v2/bootstrap-v2.sh
 AC-006 -> OHM-Trade-Agent-v1/deploy/m07/scripts/opip_layout.py
 AC-006 -> OHM-Trade-Agent-v1/deploy/m07/tests/scenarios/test_r5_fresh_genesis.py
 AC-006 -> OHM-Trade-Agent-v1/tests/test_atdd_m07_r5_fresh_canonical_genesis_v1.py
+AC-006 -> OHM-Trade-Agent-v1/deploy/m07/tests/scenarios/test_r3_release_gate_repo_root.py
 AC-007 -> OHM-Trade-Agent-v1/deploy/m07/scripts/opip_genesis.py
 AC-007 -> OHM-Trade-Agent-v1/deploy/m07/tests/scenarios/test_r5_fresh_genesis.py
 AC-007 -> OHM-Trade-Agent-v1/tests/test_atdd_m07_r5_fresh_canonical_genesis_v1.py
