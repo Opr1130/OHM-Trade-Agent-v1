@@ -552,8 +552,15 @@ PY
     sleep 2
   done
   [[ "$healthy" == "1" ]] || die "core health check failed after start"
-  run "release gate" compose run --rm --no-deps ohm-trade-agent \
-    python -m app.services.release_profiles --profile EVIDENCE_SHADOW
+  # The certified image ships only `app/`, so inside the one-shot gate
+  # container `_resolve_repo_root()` cannot see the Compose authority and the
+  # gate fails closed with FileNotFoundError. Mount exactly the tracked
+  # production Compose file read-only and point the gate at it. This adds no
+  # overlay and no second Compose source of truth: `docker-compose.yml`
+  # remains the only file and the core project renders unchanged (AC-001).
+  run "release gate" compose run --rm --no-deps \
+    -v "$APP_ROOT/docker-compose.yml:/repo/docker-compose.yml:ro" ohm-trade-agent \
+    python -m app.services.release_profiles --profile EVIDENCE_SHADOW --repo-root /repo
 
   if compose ps --status running --services | grep -qx 'opip-canonical-writer'; then
     die "canonical writer is running before canonical recovery; refusing to continue"
