@@ -126,7 +126,7 @@ try {
                         param($e) ($e -match '128m' -or $e -match '1280m') -and $e -match 'OPIP_PAPER_V2_MODE' -and $e -match 'off' })) { $exit = 1 }
             if (-not (Invoke-PhaseProbe 'VOLUMES' "cd $app && sudo -n docker compose config --volumes" {
                         param($e) $e -match 'data' })) { $exit = 1 }
-            if (-not (Invoke-PhaseProbe 'RELEASE_MODES' "cd $app && sudo -n docker compose run --rm --no-deps ohm-trade-agent python -m app.services.release_profiles --profile EVIDENCE_SHADOW" {
+            if (-not (Invoke-PhaseProbe 'RELEASE_MODES' "cd $app && sudo -n docker compose run --rm --no-deps -v `"$app/docker-compose.yml:/repo/docker-compose.yml:ro`" ohm-trade-agent python -m app.services.release_profiles --profile EVIDENCE_SHADOW --repo-root /repo" {
                         param($e) $e -match 'ARCHITECTURE_GATE=PASS' })) { $exit = 1 }
             Add-R1Check $receipt 'PHASE_SCOPE' 'PASS' 'installed manifest, .env, effective config, volumes and modes verified'
         }
