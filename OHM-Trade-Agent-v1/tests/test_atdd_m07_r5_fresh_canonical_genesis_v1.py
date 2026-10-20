@@ -10,6 +10,8 @@ qualification job; these checks keep that evidence honest and cheap.
 
 from __future__ import annotations
 
+import csv
+import io
 from pathlib import Path
 
 import pytest
@@ -257,6 +259,21 @@ def test_ac_008_fresh_start_route_is_separate_and_prerequisites_are_honest():
     for row in ("SOURCE_IMAGE", "CONFIG_PROTECTION", "RECOVERABLE_BACKUP", "RESOURCE_LIMITS",
                 "HEALTH_EVIDENCE", "HTTPS_TELEGRAM", "LEARNING_EXACT_SHA"):
         assert row in readiness, row
+    # The readiness table must stay machine-readable: six columns, real rows,
+    # and never a status that claims a prerequisite already passed.
+    rows = list(csv.DictReader(io.StringIO(readiness)))
+    assert len(rows) == 7, rows
+    assert {row["status"] for row in rows} <= {"UNPROVEN", "BLOCKED", "OWNER_GATE"}
+    for row in rows:
+        assert set(row) == {
+            "id",
+            "fresh_genesis_prerequisite",
+            "why_it_blocks",
+            "verification_command",
+            "status",
+            "owner_action",
+        }, row
+        assert all(row.values()), row
 
     workflow = _read(WORKFLOW)
     assert "tests/scenarios/test_r5_fresh_genesis.py" in workflow
