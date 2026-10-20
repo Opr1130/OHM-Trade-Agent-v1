@@ -502,7 +502,7 @@ jobs:
             {
               echo "R3_G2_DISPOSITION=FULL_CHAIN_EXECUTED"
               echo "identity=SIMULATED; production identity UNPROVEN"
-            } | tee -a "$GITHUB_STEP_SUMMARY"
+            } | tee -a "$GITHUB_STEP_SUMMARY" "$RUNNER_TEMP/disposition.txt"
           elif grep -q 'preflight is blocked' "$RUNNER_TEMP/authorize.log"; then
             {
               echo "R3_G2_DISPOSITION=UNPROVEN_SUBSET"
@@ -512,7 +512,7 @@ jobs:
               echo "unmet=execute,core-start,postconfiguration,app-root-restore,activate-writer,scheduler,full-rollback"
               echo "identity_attestation=SIMULATED"
               echo "production_identity=UNPROVEN"
-            } | tee -a "$GITHUB_STEP_SUMMARY"
+            } | tee -a "$GITHUB_STEP_SUMMARY" "$RUNNER_TEMP/disposition.txt"
           else
             echo "unexpected authorization failure" >&2
             tail -n 30 "$RUNNER_TEMP/authorize.log" >&2 || true
@@ -540,6 +540,7 @@ jobs:
           {
             echo "# R3-G2 disposable-host rehearsal"
             echo "commit=$GITHUB_SHA"
+            echo "head_sha=${GITHUB_HEAD_SHA:-$GITHUB_SHA}"
             echo "certified_sha=$CERT_SHA"
             echo "identity_attestation=SIMULATED"
             echo "production_identity=UNPROVEN"
