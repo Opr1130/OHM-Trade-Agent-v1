@@ -211,4 +211,3 @@ def test_recovery_script_requires_compatibility_transaction_and_archive():
     assert "learning_lineage_archive" in script
     assert "opip-learning-recovery.lock" in script
     assert "collect_failure" in script
-

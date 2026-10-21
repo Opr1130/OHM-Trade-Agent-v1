@@ -571,4 +571,3 @@ echo "image=$IMAGE"
 echo "timers_enabled=false"
 echo "env_backup=$ENV_BACKUP"
 echo "rollback=install -m 0600 $ENV_BACKUP $ENV_FILE && systemctl daemon-reload"
-

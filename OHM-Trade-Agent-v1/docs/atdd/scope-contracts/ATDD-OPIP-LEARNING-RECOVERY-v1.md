@@ -83,21 +83,21 @@ THEN: the lineages are never merged or relabelled, archival is copy-only with ch
 
 AC-012:
 Recovery configuration changes are transactional and never roll back committed evidence.
-GIVEN recovery replaces the environment, runner scripts and unit definitions before one-shot acceptance
-WHEN any installation, sync, capture, outcomes or receipt stage fails
-THEN verified backups restore configuration only while no new replica generation is active; after generation commit the configuration is preserved, timers remain disabled, diagnostics and an append-only failure receipt are durable, and retry cannot create duplicate active workers.
+GIVEN: recovery replaces the environment, runner scripts and unit definitions before one-shot acceptance
+WHEN: any installation, sync, capture, outcomes or receipt stage fails
+THEN: verified backups restore configuration only while no new replica generation is active; after generation commit the configuration is preserved, timers remain disabled, diagnostics and an append-only failure receipt are durable, and retry cannot create duplicate active workers.
 
 AC-013:
 A new lineage may not be synchronized before the legacy generation is archived.
-GIVEN the outgoing replica generation belongs to LINEAGE-A-LEGACY
-WHEN recovery is about to synchronize a new-lineage generation
-THEN a verified copy-only archive with complete file hashes, durable receipt and adequate disk capacity must already exist; missing, incomplete, corrupted or interrupted archival refuses recovery and never deletes or overwrites the source.
+GIVEN: the outgoing replica generation belongs to LINEAGE-A-LEGACY
+WHEN: recovery is about to synchronize a new-lineage generation
+THEN: a verified copy-only archive with complete file hashes, durable receipt and adequate disk capacity must already exist; missing, incomplete, corrupted or interrupted archival refuses recovery and never deletes or overwrites the source.
 
 AC-014:
 Cross-SHA recovery tooling is compatibility-certified immediately before mutation.
-GIVEN worker code is built from a newer tooling SHA while release identity remains the production SHA
-WHEN any learning consumer, schema, canonical-replica or production-evidence contract differs
-THEN every change must match an owner-approved exact-SHA-pair exception and verified tooling hashes, and current main plus exact-SHA CI are revalidated immediately before the remote mutation; otherwise recovery refuses.
+GIVEN: worker code is built from a newer tooling SHA while release identity remains the production SHA
+WHEN: any learning consumer, schema, canonical-replica or production-evidence contract differs
+THEN: every change must match an owner-approved exact-SHA-pair exception and verified tooling hashes, and current main plus exact-SHA CI are revalidated immediately before the remote mutation; otherwise recovery refuses.
 
 EXPLICITLY OUT OF SCOPE:
 - Deploying, rebuilding, or restarting production containers or systemd units.
