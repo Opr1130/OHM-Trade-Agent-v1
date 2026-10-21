@@ -10,6 +10,7 @@ AUTHORIZED_KEYS="$HOME_DIR/.ssh/authorized_keys"
 EXPORT_ROOT="/var/lib/opip-learning-export"
 READER_STATE_ROOT="/var/lib/opip-learning-reader"
 FORCED_COMMAND="/usr/local/sbin/opip-learning-read-export"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [[ -z "$PUBLIC_KEY" || "$PUBLIC_KEY" != ssh-ed25519\ * || -z "$SOURCE_CIDR" ]]; then
   echo "usage: $0 'ssh-ed25519 AAAA... opip-learning-worker' <learning-private-ip/32>" >&2
@@ -59,6 +60,12 @@ for name in \
     fi
   fi
 done
+
+# Pre-existing nested export directories were created 0700 before this reader
+# group existed; `install -d` above does not retroactively change their mode.
+# Normalize group traversal/read access once so the forced-command reader can
+# actually reach nested artifacts. Write access remains root-only.
+bash "$SCRIPT_DIR/opip-learning-reader-permissions.sh" "$EXPORT_ROOT" "$USER_NAME"
 
 install -d -o "$USER_NAME" -g "$USER_NAME" -m 0700 "$HOME_DIR/.ssh"
 touch "$AUTHORIZED_KEYS"
