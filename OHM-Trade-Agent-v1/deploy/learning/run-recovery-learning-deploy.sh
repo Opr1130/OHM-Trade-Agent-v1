@@ -183,6 +183,8 @@ PYTHONPATH="$SOURCE_APP" python3 -m app.services.learning_recovery_binding \
 BINDING_SHA256="$(sha256sum "$BINDING_REPORT" | awk '{print $1}')"
 
 RECEIPT="$RECEIPT_DIR/$(date -u +%Y%m%dT%H%M%SZ)-${TOOLING_SHA:0:12}-prod-${PRODUCTION_SHA:0:12}.json"
+ENV_BACKUP="$RECEIPT_DIR/$(date -u +%Y%m%dT%H%M%SZ)-opip-learning.env.before-recovery"
+install -o root -g root -m 0600 "$ENV_FILE" "$ENV_BACKUP"
 
 normalized="$(mktemp)"
 awk \
@@ -261,6 +263,7 @@ IMAGE="$IMAGE" \
 IMAGE_ID="$IMAGE_ID" \
 BINDING_REPORT="$BINDING_REPORT" \
 BINDING_SHA256="$BINDING_SHA256" \
+ENV_BACKUP="$ENV_BACKUP" \
 CAPTURE_DISPOSITION="$CAPTURE_DISPOSITION" \
 OUTCOMES_DISPOSITION="$OUTCOMES_DISPOSITION" \
 python3 - <<'PY'
@@ -286,6 +289,7 @@ payload = {
     "image_id": os.environ["IMAGE_ID"],
     "image_revision_label": os.environ["TOOLING_SHA"],
     "binding_report_sha256": os.environ["BINDING_SHA256"],
+    "env_backup_path": os.environ["ENV_BACKUP"],
     "binding_checks": report.get("checks", []),
     "binding_status": report.get("status"),
     "capture_disposition": os.environ["CAPTURE_DISPOSITION"],
@@ -316,4 +320,6 @@ echo "production_sha=$PRODUCTION_SHA"
 echo "tooling_sha=$TOOLING_SHA"
 echo "image=$IMAGE"
 echo "timers_enabled=false"
+echo "env_backup=$ENV_BACKUP"
+echo "rollback=install -m 0600 $ENV_BACKUP $ENV_FILE && systemctl daemon-reload"
 

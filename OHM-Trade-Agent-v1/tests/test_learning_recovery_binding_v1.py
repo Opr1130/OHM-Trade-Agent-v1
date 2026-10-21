@@ -102,3 +102,6 @@ def test_recovery_script_binds_authenticated_manifest_and_never_enables_timers()
     assert "learning_recovery_binding" in script
     assert "systemctl enable" not in script
     assert "timers_enabled_by_recovery" in script
+    assert "before-recovery" in script
+    assert "env_backup_path" in script
+    assert "rollback=install -m 0600" in script
