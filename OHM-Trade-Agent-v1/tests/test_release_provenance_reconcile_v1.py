@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pytest
 
-from app.services import release_provenance_reconcile as rpr
 from app.services.release_provenance_reconcile import (
     ContainerFacts,
     DatabaseFacts,
