@@ -78,6 +78,7 @@ def _settings() -> SimpleNamespace:
 # --- the sanitiser itself --------------------------------------------------
 
 
+@pytest.mark.acceptance
 @pytest.mark.parametrize(
     "exc",
     [
@@ -90,6 +91,7 @@ def _settings() -> SimpleNamespace:
     ],
 )
 def test_safe_error_never_contains_the_token(exc: BaseException) -> None:
+    """ATDD-SEC-TELEGRAM-LOG-REDACTION-v1/AC-001: bounded, non-secret error text."""
     rendered = safe_error(exc)
     assert TOKEN not in rendered
     assert "api.telegram.org" not in rendered
@@ -108,7 +110,9 @@ def test_redact_replaces_embedded_tokens() -> None:
     assert TOKEN_PATTERN.search(redact(URL)) is None
 
 
+@pytest.mark.acceptance
 def test_redaction_filter_scrubs_message_and_arguments() -> None:
+    """ATDD-SEC-TELEGRAM-LOG-REDACTION-v1/AC-003: defence-in-depth redaction."""
     record = logging.LogRecord(
         name="t",
         level=logging.ERROR,
@@ -126,8 +130,9 @@ def test_redaction_filter_scrubs_message_and_arguments() -> None:
 # --- the real handlers must not leak --------------------------------------
 
 
+@pytest.mark.acceptance
 def test_polling_failure_logs_without_the_token(monkeypatch, caplog) -> None:
-    """The exact production path: getUpdates 409 during the poll loop."""
+    """ATDD-SEC-TELEGRAM-LOG-REDACTION-v1/AC-002: the production polling path."""
 
     def _raise(*args, **kwargs):  # noqa: ARG001
         raise _status_error(409)
@@ -213,7 +218,9 @@ def test_processing_failure_logs_without_the_token(monkeypatch, caplog) -> None:
 # --- no structural regression ---------------------------------------------
 
 
+@pytest.mark.acceptance
 def test_listener_uses_no_traceback_logging() -> None:
+    """ATDD-SEC-TELEGRAM-LOG-REDACTION-v1/AC-004: no traceback logging can return."""
     """A reintroduced logger.exception() would bypass every other control."""
     source = Path(listener.__file__).read_text(encoding="utf-8")
     assert "logger.exception(" not in source
