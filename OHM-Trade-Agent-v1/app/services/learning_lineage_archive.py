@@ -22,6 +22,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from app.services.fs_durability import DurabilityError, fsync_dir, fsync_file
+
 SCHEMA = "opip-learning-lineage-archive/v1"
 RECEIPT = "LEARNING_LINEAGE_ARCHIVE"
 RESERVE_BYTES = 256 * 1024 * 1024
@@ -34,26 +36,6 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def _fsync_file(path: Path) -> None:
-    with path.open("rb") as handle:
-        try:
-            os.fsync(handle.fileno())
-        except OSError:
-            # Windows rejects fsync on a read-only descriptor; production is Linux.
-            pass
-
-
-def _fsync_dir(path: Path) -> None:
-    try:
-        fd = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 
 
 def _inventory(root: Path) -> list[dict]:
@@ -101,48 +83,54 @@ def create_archive(
         shutil.rmtree(staging)
     staging.mkdir(parents=True, mode=0o700)
     copied: list[dict] = []
-    for item in source_files:
-        source = source_generation / item["path"]
-        target = staging / item["path"]
-        target.parent.mkdir(parents=True, exist_ok=True)
-        copy_fn(source, target)
-        _fsync_file(target)
-        copied.append(
-            {
-                "path": item["path"],
-                "size": target.stat().st_size,
-                "sha256": _sha256(target),
-            }
-        )
-    if copied != source_files:
-        raise ValueError("copied archive differs from source inventory")
-    for directory in [staging] + [p for p in staging.rglob("*") if p.is_dir()]:
-        os.chmod(directory, 0o750)
-    for path in staging.rglob("*"):
-        if path.is_file():
-            os.chmod(path, 0o640)
+    try:
+        for item in source_files:
+            source = source_generation / item["path"]
+            target = staging / item["path"]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            copy_fn(source, target)
+            fsync_file(target)
+            copied.append(
+                {
+                    "path": item["path"],
+                    "size": target.stat().st_size,
+                    "sha256": _sha256(target),
+                }
+            )
+        if copied != source_files:
+            raise ValueError("copied archive differs from source inventory")
+        for directory in [staging] + [p for p in staging.rglob("*") if p.is_dir()]:
+            os.chmod(directory, 0o750)
+        for path in staging.rglob("*"):
+            if path.is_file():
+                os.chmod(path, 0o640)
 
-    source_manifest = source_generation / "replica_manifest.json"
-    manifest = {
-        "schema": SCHEMA,
-        "lineage_id": lineage_id,
-        "generation_id": source_generation.name,
-        "source_release_sha": source_release_sha,
-        "created_at_utc": datetime.now(timezone.utc)
-        .replace(microsecond=0)
-        .isoformat(),
-        "file_count": len(copied),
-        "total_bytes": total_bytes,
-        "source_manifest_sha256": _sha256(source_manifest),
-        "files": copied,
-    }
-    manifest_path = staging / "archive_manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
-    os.chmod(manifest_path, 0o600)
-    _fsync_file(manifest_path)
-    _fsync_dir(staging)
-    os.replace(staging, archive_root)
-    _fsync_dir(archive_root.parent)
+        source_manifest = source_generation / "replica_manifest.json"
+        manifest = {
+            "schema": SCHEMA,
+            "lineage_id": lineage_id,
+            "generation_id": source_generation.name,
+            "source_release_sha": source_release_sha,
+            "created_at_utc": datetime.now(timezone.utc)
+            .replace(microsecond=0)
+            .isoformat(),
+            "file_count": len(copied),
+            "total_bytes": total_bytes,
+            "source_manifest_sha256": _sha256(source_manifest),
+            "files": copied,
+        }
+        manifest_path = staging / "archive_manifest.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+        os.chmod(manifest_path, 0o600)
+        fsync_file(manifest_path)
+        fsync_dir(staging)
+        os.replace(staging, archive_root)
+        fsync_dir(archive_root.parent)
+    except (DurabilityError, OSError, ValueError):
+        # An unverified copy is discarded; the source generation is untouched.
+        shutil.rmtree(staging, ignore_errors=True)
+        shutil.rmtree(archive_root, ignore_errors=True)
+        raise
     manifest_sha = _sha256(archive_root / "archive_manifest.json")
 
     state_root.mkdir(parents=True, exist_ok=True)
@@ -168,11 +156,21 @@ def create_archive(
         .isoformat(),
     }
     fd = os.open(receipt_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        json.dump(receipt, handle, indent=2, sort_keys=True)
-        handle.flush()
-        os.fsync(handle.fileno())
-    _fsync_dir(state_root)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(receipt, handle, indent=2, sort_keys=True)
+            handle.flush()
+        fsync_file(receipt_path)
+        fsync_dir(state_root)
+    except (DurabilityError, OSError):
+        # No durable receipt means the archive is not VERIFIED. Discard the
+        # unverified copy; the source generation is untouched.
+        try:
+            receipt_path.unlink()
+        except OSError:
+            pass
+        shutil.rmtree(archive_root, ignore_errors=True)
+        raise
     return {"receipt_path": str(receipt_path), "receipt": receipt, "manifest": manifest}
 
 

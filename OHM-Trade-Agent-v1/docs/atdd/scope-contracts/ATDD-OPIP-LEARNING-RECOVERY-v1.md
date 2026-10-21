@@ -159,6 +159,10 @@ AC-012 -> tests/test_learning_recovery_transaction_v1.py::test_tampered_backup_r
 AC-012 -> tests/test_learning_recovery_transaction_v1.py::test_failure_policy_distinguishes_config_from_committed_evidence
 AC-012 -> tests/test_learning_recovery_transaction_v1.py::test_generation_commit_boundary
 AC-012 -> tests/test_learning_recovery_transaction_v1.py::test_receipt_is_append_only
+AC-012 -> tests/test_learning_recovery_transaction_v1.py::test_file_sync_failure_aborts_snapshot
+AC-012 -> tests/test_learning_recovery_transaction_v1.py::test_directory_sync_failure_aborts_snapshot
+AC-012 -> tests/test_learning_recovery_transaction_v1.py::test_insufficient_storage_aborts_snapshot
+AC-012 -> tests/test_learning_recovery_transaction_v1.py::test_restore_sync_failure_is_not_suppressed
 AC-013 -> tests/test_learning_lineage_archive_v1.py::test_verified_archive_passes_and_preserves_source
 AC-013 -> tests/test_learning_lineage_archive_v1.py::test_missing_archive_is_refused
 AC-013 -> tests/test_learning_lineage_archive_v1.py::test_incomplete_archive_is_refused
@@ -168,6 +172,9 @@ AC-013 -> tests/test_learning_lineage_archive_v1.py::test_wrong_lineage_or_sourc
 AC-013 -> tests/test_learning_lineage_archive_v1.py::test_missing_receipt_is_refused
 AC-013 -> tests/test_learning_lineage_archive_v1.py::test_interrupted_copy_leaves_no_verified_archive_or_receipt
 AC-013 -> tests/test_learning_lineage_archive_v1.py::test_insufficient_disk_refuses_before_copy
+AC-013 -> tests/test_learning_lineage_archive_v1.py::test_file_sync_failure_prevents_verified_archive
+AC-013 -> tests/test_learning_lineage_archive_v1.py::test_directory_sync_failure_prevents_verified_archive
+AC-013 -> tests/test_learning_lineage_archive_v1.py::test_receipt_sync_failure_discards_unverified_archive
 AC-014 -> tests/test_learning_recovery_compatibility_v1.py::test_no_critical_changes_pass
 AC-014 -> tests/test_learning_recovery_compatibility_v1.py::test_unreviewed_critical_change_is_refused
 AC-014 -> tests/test_learning_recovery_compatibility_v1.py::test_exact_pair_exception_is_accepted_but_wrong_pair_is_not
@@ -175,6 +182,8 @@ AC-014 -> tests/test_learning_recovery_compatibility_v1.py::test_tooling_hash_mi
 AC-014 -> tests/test_learning_recovery_compatibility_v1.py::test_unreviewed_change_list_in_manifest_is_refused
 AC-014 -> tests/test_learning_recovery_compatibility_v1.py::test_recovery_workflow_revalidates_main_ci_and_ships_compatibility
 AC-014 -> tests/test_learning_recovery_compatibility_v1.py::test_recovery_script_requires_compatibility_transaction_and_archive
+AC-014 -> tests/test_learning_recovery_compatibility_v1.py::test_critical_scope_covers_actual_learning_job_entrypoints
+AC-014 -> tests/test_learning_recovery_compatibility_v1.py::test_actual_outcomes_consumer_change_fails_closed_without_exception
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/deploy/remote/configure-opip-learning-reader.sh
@@ -205,9 +214,11 @@ AC-010 -> OHM-Trade-Agent-v1/tests/test_learning_reader_permissions_v1.py
 AC-011 -> OHM-Trade-Agent-v1/docs/learning/CANONICAL_LINEAGE_BOUNDARY_V1.md
 AC-011 -> OHM-Trade-Agent-v1/tests/test_learning_lineage_policy_v1.py
 AC-012 -> OHM-Trade-Agent-v1/app/services/learning_recovery_transaction.py
+AC-012 -> OHM-Trade-Agent-v1/app/services/fs_durability.py
 AC-012 -> OHM-Trade-Agent-v1/deploy/learning/run-recovery-learning-deploy.sh
 AC-012 -> OHM-Trade-Agent-v1/tests/test_learning_recovery_transaction_v1.py
 AC-013 -> OHM-Trade-Agent-v1/app/services/learning_lineage_archive.py
+AC-013 -> OHM-Trade-Agent-v1/app/services/fs_durability.py
 AC-013 -> OHM-Trade-Agent-v1/docs/learning/CANONICAL_LINEAGE_BOUNDARY_V1.md
 AC-013 -> OHM-Trade-Agent-v1/deploy/learning/run-recovery-learning-deploy.sh
 AC-013 -> OHM-Trade-Agent-v1/tests/test_learning_lineage_archive_v1.py

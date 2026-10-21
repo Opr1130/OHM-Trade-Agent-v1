@@ -26,6 +26,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
+from app.services.fs_durability import fsync_dir, fsync_file
+
 ROLLBACK_CONFIG = "ROLLBACK_CONFIG"
 KEEP_CONFIG_BLOCKED = "KEEP_CONFIG_BLOCKED"
 REFUSE_TIMERS_ENABLED = "REFUSE_TIMERS_ENABLED"
@@ -37,26 +39,6 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def _fsync_dir(path: Path) -> None:
-    try:
-        fd = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-def _fsync_file(path: Path) -> None:
-    try:
-        with path.open("rb") as handle:
-            os.fsync(handle.fileno())
-    except OSError:
-        # Windows rejects fsync on read-only descriptors; production is Linux.
-        pass
 
 
 def utc_stamp() -> str:
@@ -76,7 +58,7 @@ def snapshot(paths: Iterable[Path], transaction_dir: Path) -> dict:
             backup = backups / f"{index:02d}-{path.name}"
             backup.write_bytes(path.read_bytes())
             os.chmod(backup, 0o600)
-            _fsync_file(backup)
+            fsync_file(backup)
             files.append(
                 {
                     "target": str(path),
@@ -96,8 +78,8 @@ def snapshot(paths: Iterable[Path], transaction_dir: Path) -> dict:
                     "sha256": None,
                 }
             )
-    _fsync_dir(backups)
-    _fsync_dir(transaction_dir)
+    fsync_dir(backups)
+    fsync_dir(transaction_dir)
     manifest = {
         "schema": "opip-learning-recovery-transaction/v1",
         "created_at_utc": datetime.now(timezone.utc)
@@ -140,7 +122,7 @@ def restore(manifest: dict, *, dry_run: bool = False) -> list[dict]:
                 target.write_bytes(backup.read_bytes())
                 if entry.get("mode"):
                     os.chmod(target, int(entry["mode"], 8))
-                _fsync_file(target)
+                fsync_file(target)
             actions.append({"target": str(target), "action": "restored"})
         else:
             if target.exists() or target.is_symlink():
@@ -153,7 +135,7 @@ def restore(manifest: dict, *, dry_run: bool = False) -> list[dict]:
         for directory in {
             str(Path(entry["target"]).parent) for entry in manifest.get("files") or []
         }:
-            _fsync_dir(Path(directory))
+            fsync_dir(Path(directory))
     return actions
 
 
@@ -177,11 +159,18 @@ def write_receipt(transaction_dir: Path, payload: dict, *, name: str) -> Path:
     os.chmod(transaction_dir, 0o700)
     path = transaction_dir / name
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-        handle.flush()
-        os.fsync(handle.fileno())
-    _fsync_dir(transaction_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.flush()
+        fsync_file(path)
+        fsync_dir(transaction_dir)
+    except Exception:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
     return path
 
 

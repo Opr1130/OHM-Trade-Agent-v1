@@ -211,3 +211,76 @@ def test_recovery_script_requires_compatibility_transaction_and_archive():
     assert "learning_lineage_archive" in script
     assert "opip-learning-recovery.lock" in script
     assert "collect_failure" in script
+
+
+@pytest.mark.acceptance
+def test_critical_scope_covers_actual_learning_job_entrypoints():
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-014: contract criterion."""
+    from app.services.learning_recovery_compatibility import critical_paths
+
+    paths = set(critical_paths())
+    assert "app/jobs/run_opportunity_intelligence_cycle.py" in paths
+    assert "app/jobs/build_discovery_forward_outcomes.py" in paths
+    assert "app/services/opportunity_accountability.py" in paths
+    assert "app/jobs/reconcile_discovery_accountability_evidence.py" in paths
+    assert "app/services/opip_ml_evidence_capture.py" in paths
+    assert "app/opip/discovery" in paths
+
+
+@pytest.mark.acceptance
+def test_actual_outcomes_consumer_change_fails_closed_without_exception(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-014: contract criterion."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    consumer = repo / "app" / "services" / "opportunity_accountability.py"
+    consumer.parent.mkdir(parents=True)
+    consumer.write_text("VERSION = 1\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "production")
+    production = _git(repo, "rev-parse", "HEAD")
+    consumer.write_text("VERSION = 2\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "tooling")
+    tooling = _git(repo, "rev-parse", "HEAD")
+
+    blocked = prepare(
+        production_sha=production,
+        tooling_sha=tooling,
+        repo_root=repo,
+        exceptions_file=tmp_path / "missing.json",
+    )
+    assert blocked["status"] == "REFUSED"
+    assert blocked["unreviewed_changes"] == [
+        "app/services/opportunity_accountability.py"
+    ]
+
+    exceptions = tmp_path / "exceptions.json"
+    exceptions.write_text(
+        json.dumps(
+            {
+                "pairs": {
+                    f"{production}..{tooling}": {
+                        "paths": ["app/services/opportunity_accountability.py"],
+                        "rationale": "owner-approved outcomes consumer change",
+                    }
+                }
+            }
+        )
+    )
+    approved = prepare(
+        production_sha=production,
+        tooling_sha=tooling,
+        repo_root=repo,
+        exceptions_file=exceptions,
+    )
+    assert approved["status"] == "PASS"
+    checks = verify(
+        manifest=approved,
+        source_app=repo,
+        production_sha=production,
+        tooling_sha=tooling,
+    )
+    assert all(check["passed"] for check in checks)

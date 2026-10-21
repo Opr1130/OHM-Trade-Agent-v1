@@ -21,11 +21,26 @@ import sys
 from pathlib import Path
 
 CRITICAL_PATHS = (
+    # Derived from deploy/learning/opip-learning-job.sh and the modules it runs:
+    # capture/reconcile -> run_opip_ml_capture; outcomes ->
+    # run_opportunity_intelligence_cycle (which drives discovery and Phase-3C
+    # outcomes); readiness -> run_opip_ml_data_readiness.
+    "app/jobs/run_opip_ml_capture.py",
+    "app/jobs/reconcile_discovery_accountability_evidence.py",
+    "app/jobs/run_opportunity_intelligence_cycle.py",
+    "app/jobs/build_discovery_forward_outcomes.py",
+    "app/jobs/build_phase3c_forward_outcomes.py",
+    "app/jobs/run_opip_ml_data_readiness.py",
+    "app/services/opip_ml_evidence_capture.py",
+    "app/services/opportunity_accountability.py",
+    "app/services/phase3c_outcomes.py",
+    "app/services/registry_io.py",
     "app/opip/canonical",
     "app/opip/learning",
-    "app/jobs/run_opip_ml_capture.py",
-    "app/jobs/build_phase3c_forward_outcomes.py",
-    "app/services/phase3c_outcomes.py",
+    "app/opip/discovery",
+    "app/opip/decision/store.py",
+    "app/opip/storage/bounded_jsonl.py",
+    "app/scanner/candidates.py",
     "deploy/remote/export-opip-learning-evidence.sh",
     "deploy/remote/opip-learning-read-export.sh",
     "deploy/learning/opip-learning-job.sh",

@@ -179,3 +179,90 @@ def test_insufficient_disk_refuses_before_copy(tmp_path):
             disk_usage=lambda path: type("D", (), {"free": 1})(),
         )
     assert not archive.exists()
+
+
+@pytest.mark.acceptance
+def test_file_sync_failure_prevents_verified_archive(tmp_path, monkeypatch):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-013: contract criterion."""
+    import app.services.learning_lineage_archive as module
+    from app.services.fs_durability import DurabilityError
+
+    gen = _generation(tmp_path)
+    archive = tmp_path / "archive" / LINEAGE / gen.name
+    state = tmp_path / "state"
+
+    def failing_sync(path):
+        raise DurabilityError("injected file fsync failure")
+
+    monkeypatch.setattr(module, "fsync_file", failing_sync)
+    with pytest.raises(DurabilityError):
+        create_archive(
+            source_generation=gen,
+            archive_root=archive,
+            state_root=state,
+            lineage_id=LINEAGE,
+            source_release_sha=SOURCE_SHA,
+            disk_usage=lambda path: type("D", (), {"free": 10**12})(),
+        )
+    assert not archive.exists()
+    assert not (state / "receipt.json").exists()
+    assert not list(state.glob("*.json")) if state.exists() else True
+    assert (gen / "replica_manifest.json").is_file()
+
+
+@pytest.mark.acceptance
+def test_directory_sync_failure_prevents_verified_archive(tmp_path, monkeypatch):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-013: contract criterion."""
+    import app.services.learning_lineage_archive as module
+    from app.services.fs_durability import DurabilityError
+
+    gen = _generation(tmp_path)
+    archive = tmp_path / "archive" / LINEAGE / gen.name
+    state = tmp_path / "state"
+
+    def failing_sync(path):
+        raise DurabilityError("injected directory fsync failure")
+
+    monkeypatch.setattr(module, "fsync_dir", failing_sync)
+    with pytest.raises(DurabilityError):
+        create_archive(
+            source_generation=gen,
+            archive_root=archive,
+            state_root=state,
+            lineage_id=LINEAGE,
+            source_release_sha=SOURCE_SHA,
+            disk_usage=lambda path: type("D", (), {"free": 10**12})(),
+        )
+    assert not archive.exists()
+    assert not list(state.glob("*.json")) if state.exists() else True
+
+
+@pytest.mark.acceptance
+def test_receipt_sync_failure_discards_unverified_archive(tmp_path, monkeypatch):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-013: contract criterion."""
+    import app.services.learning_lineage_archive as module
+    from app.services.fs_durability import DurabilityError
+
+    gen = _generation(tmp_path)
+    archive = tmp_path / "archive" / LINEAGE / gen.name
+    state = tmp_path / "state"
+    real_sync = module.fsync_file
+
+    def failing_receipt_sync(path):
+        if path.parent == state:
+            raise DurabilityError("injected receipt fsync failure")
+        real_sync(path)
+
+    monkeypatch.setattr(module, "fsync_file", failing_receipt_sync)
+    with pytest.raises(DurabilityError):
+        create_archive(
+            source_generation=gen,
+            archive_root=archive,
+            state_root=state,
+            lineage_id=LINEAGE,
+            source_release_sha=SOURCE_SHA,
+            disk_usage=lambda path: type("D", (), {"free": 10**12})(),
+        )
+    assert not archive.exists()
+    assert not list(state.glob("*.json"))
+

@@ -108,3 +108,79 @@ def test_receipt_is_append_only(tmp_path):
     assert path.read_text()
     with pytest.raises(FileExistsError):
         write_receipt(tx, {"status": "DUPLICATE"}, name="prepared.json")
+
+
+@pytest.mark.acceptance
+def test_file_sync_failure_aborts_snapshot(tmp_path, monkeypatch):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-012: contract criterion."""
+    import app.services.learning_recovery_transaction as module
+    from app.services.fs_durability import DurabilityError
+
+    env = tmp_path / "env"
+    env.write_text("original\n")
+
+    def failing_sync(path):
+        raise DurabilityError("injected file fsync failure")
+
+    monkeypatch.setattr(module, "fsync_file", failing_sync)
+    with pytest.raises(DurabilityError):
+        snapshot([env], _tx(tmp_path))
+    assert not (_tx(tmp_path) / "snapshot.json").exists()
+
+
+@pytest.mark.acceptance
+def test_directory_sync_failure_aborts_snapshot(tmp_path, monkeypatch):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-012: contract criterion."""
+    import app.services.learning_recovery_transaction as module
+    from app.services.fs_durability import DurabilityError
+
+    env = tmp_path / "env"
+    env.write_text("original\n")
+
+    def failing_sync(path):
+        raise DurabilityError("injected directory fsync failure")
+
+    monkeypatch.setattr(module, "fsync_dir", failing_sync)
+    with pytest.raises(DurabilityError):
+        snapshot([env], _tx(tmp_path))
+    assert not (_tx(tmp_path) / "snapshot.json").exists()
+
+
+@pytest.mark.acceptance
+def test_insufficient_storage_aborts_snapshot(tmp_path, monkeypatch):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-012: contract criterion."""
+    from pathlib import Path as PathClass
+
+    env = tmp_path / "env"
+    env.write_text("original\n")
+    real_write = PathClass.write_bytes
+
+    def failing_write(self, data):
+        if self.parent.name == "backups":
+            raise OSError(28, "No space left on device")
+        return real_write(self, data)
+
+    monkeypatch.setattr(PathClass, "write_bytes", failing_write)
+    with pytest.raises(OSError, match="No space left"):
+        snapshot([env], _tx(tmp_path))
+    assert not (_tx(tmp_path) / "snapshot.json").exists()
+
+
+@pytest.mark.acceptance
+def test_restore_sync_failure_is_not_suppressed(tmp_path, monkeypatch):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-012: contract criterion."""
+    import app.services.learning_recovery_transaction as module
+    from app.services.fs_durability import DurabilityError
+
+    env = tmp_path / "env"
+    env.write_text("original\n")
+    manifest = snapshot([env], _tx(tmp_path))
+    env.write_text("mutated\n")
+
+    def failing_sync(path):
+        raise DurabilityError("injected restore fsync failure")
+
+    monkeypatch.setattr(module, "fsync_file", failing_sync)
+    with pytest.raises(DurabilityError):
+        restore(manifest)
+
