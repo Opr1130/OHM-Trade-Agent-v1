@@ -47,39 +47,39 @@ THEN: it names an existing contract file that declares this increment and all re
 
 AC-006:
 The reconciler cannot overwrite a newer release marker.
-GIVEN the production controller may deploy while reconciliation is running
-WHEN reconciliation collects evidence, validates or publishes
-THEN it holds the same non-blocking `/var/lock/ohm-deploy.lock`, refuses a busy lock, refuses a conflicting marker, and never replaces a newer release identity.
+GIVEN: the production controller may deploy while reconciliation is running
+WHEN: reconciliation collects evidence, validates or publishes
+THEN: it holds the same non-blocking `/var/lock/ohm-deploy.lock`, refuses a busy lock, refuses a conflicting marker, and never replaces a newer release identity.
 
 AC-007:
 Live runtime authority must match the approved release posture.
-GIVEN a healthy, correctly labelled core image
-WHEN its running environment has an unsafe, missing or contradictory authority mode
-THEN reconciliation refuses even if historical acceptance receipts still describe the approved posture.
+GIVEN: a healthy, correctly labelled core image
+WHEN: its running environment has an unsafe, missing or contradictory authority mode
+THEN: reconciliation refuses even if historical acceptance receipts still describe the approved posture.
 
 AC-008:
 Authoritative publication requires durable provenance first.
-GIVEN all checks pass and `--apply` is requested
-WHEN the provenance receipt cannot be written, fsynced, or the marker publication is interrupted
-THEN no authoritative marker is published, the pending or failed state remains durably recorded, and historical receipts remain unchanged.
+GIVEN: all checks pass and `--apply` is requested
+WHEN: the provenance receipt cannot be written, fsynced, or the marker publication is interrupted
+THEN: no authoritative marker is published, the pending or failed state remains durably recorded, and historical receipts remain unchanged.
 
 AC-009:
 Recovery binds production identity separately from tooling identity.
-GIVEN production runs an authenticated SHA earlier than merged recovery tooling
-WHEN an owner invokes the recovery-only deployment path
-THEN tooling must equal current main with successful exact-SHA CI, production must equal the authenticated export manifest and be its ancestor, and the worker records both identities without enabling timers.
+GIVEN: production runs an authenticated SHA earlier than merged recovery tooling
+WHEN: an owner invokes the recovery-only deployment path
+THEN: tooling must equal current main with successful exact-SHA CI, production must equal the authenticated export manifest and be its ancestor, and the worker records both identities without enabling timers.
 
 AC-010:
 The reader receives only minimum read and traversal permissions.
-GIVEN existing export directories, nested files, symlinks and repeated configuration
-WHEN reader permissions are normalized
-THEN nested directories are group-traversable, files are group-readable, symlinked roots are refused, symlink targets are never modified, and no group or world write bit is granted.
+GIVEN: existing export directories, nested files, symlinks and repeated configuration
+WHEN: reader permissions are normalized
+THEN: nested directories are group-traversable, files are group-readable, symlinked roots are refused, symlink targets are never modified, and no group or world write bit is granted.
 
 AC-011:
 Canonical lineages are explicitly separated and archived without mutation.
-GIVEN an old 220,721-event canonical replica lineage and a V2 fresh-genesis lineage
-WHEN history is preserved or archived
-THEN the lineages are never merged or relabelled, archival is copy-only with checksummed manifests and append-only receipts, and consumers report lineage-separated counts.
+GIVEN: an old 220,721-event canonical replica lineage and a V2 fresh-genesis lineage
+WHEN: history is preserved or archived
+THEN: the lineages are never merged or relabelled, archival is copy-only with checksummed manifests and append-only receipts, and consumers report lineage-separated counts.
 
 EXPLICITLY OUT OF SCOPE:
 - Deploying, rebuilding, or restarting production containers or systemd units.
