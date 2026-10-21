@@ -15,8 +15,6 @@ from app.services.release_provenance_reconcile import (
     reconcile,
 )
 
-pytestmark = pytest.mark.acceptance
-
 SHA = "a26d664972075b2a220a466215cf71e389decb86"
 CORE_IMAGE = "sha256:aa565b64f89ebc8877dfb17d952b0faa5dbed9058a3c9ecfa4269bf480e069a3"
 WRITER_IMAGE = "sha256:076753a6a41eeffcc23be7bc0173d4ad2a4780b771c47a515c9d12fbb3b5fe01"
@@ -140,7 +138,9 @@ def _failed_names(evidence: Evidence) -> set[str]:
     return {check.name for check in failed_checks(evaluate(evidence))}
 
 
+@pytest.mark.acceptance
 def test_complete_evidence_passes_every_check():
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-002: contract criterion."""
     checks = evaluate(_evidence())
     assert failed_checks(checks) == []
     assert len(checks) >= 20
@@ -159,7 +159,9 @@ def test_core_image_id_must_match_both_receipts():
     assert "core_image_matches_core_upgrade_candidate" in failed
 
 
+@pytest.mark.acceptance
 def test_canonical_writer_drift_is_refused():
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-002: contract criterion."""
     failed = _failed_names(
         _evidence(writer=_writer(image_id="sha256:" + "1" * 64))
     )
@@ -179,7 +181,9 @@ def test_acceptance_release_sha_mismatch_is_refused():
     )
 
 
+@pytest.mark.acceptance
 def test_authority_widening_is_refused():
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-002: contract criterion."""
     live = _live()
     live["authority"]["paper_v2"] = "ON"
     live["authority"]["funded_authority"] = "PRESENT"
@@ -197,11 +201,15 @@ def test_authority_widening_is_refused():
         (_db(event_count=0, max_local_sequence=0), "db_sequence_monotonic"),
     ],
 )
+@pytest.mark.acceptance
 def test_database_integrity_and_continuity_fail_closed(database, expected_check):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-002: contract criterion."""
     assert expected_check in _failed_names(_evidence(database=database))
 
 
+@pytest.mark.acceptance
 def test_release_manifest_mismatch_is_refused():
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-002: contract criterion."""
     failed = _failed_names(_evidence(manifest_mismatches=1))
     assert "release_manifest_verified" in failed
     assert "release_manifest_verified" in _failed_names(
@@ -282,7 +290,9 @@ def _run(tmp_path: Path, *, apply: bool, **overrides):
     return receipt, code, state_dir, bootstrap
 
 
+@pytest.mark.acceptance
 def test_dry_run_passes_without_writing_anything(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-003: contract criterion."""
     receipt, code, state_dir, _ = _run(tmp_path, apply=False)
     assert code == 0
     assert receipt["status"] == "DRY_RUN_PASS"
@@ -290,7 +300,9 @@ def test_dry_run_passes_without_writing_anything(tmp_path):
     assert not state_dir.exists()
 
 
+@pytest.mark.acceptance
 def test_apply_publishes_exact_sha_and_append_only_receipt(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-003: contract criterion."""
     receipt, code, state_dir, _ = _run(tmp_path, apply=True)
     assert code == 0
     assert receipt["status"] == "RECONCILED"
@@ -308,7 +320,9 @@ def test_apply_publishes_exact_sha_and_append_only_receipt(tmp_path):
     assert payload["evidence"]["database"]["max_local_sequence"] == 8980
 
 
+@pytest.mark.acceptance
 def test_idempotent_apply_does_not_change_identical_sha(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-003: contract criterion."""
     state_dir = tmp_path / "state"
     state_dir.mkdir()
     (state_dir / "last-good-sha").write_text(f"{SHA}\n")
@@ -319,7 +333,9 @@ def test_idempotent_apply_does_not_change_identical_sha(tmp_path):
     assert (state_dir / "last-good-sha").read_text() == f"{SHA}\n"
 
 
+@pytest.mark.acceptance
 def test_refused_apply_writes_rejection_and_never_publishes(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-002: contract criterion."""
     receipt, code, state_dir, _ = _run(
         tmp_path, apply=True, core=_core(revision="b" * 40)
     )
@@ -332,7 +348,9 @@ def test_refused_apply_writes_rejection_and_never_publishes(tmp_path):
     assert json.loads(rejected[0].read_text())["status"] == "REFUSED"
 
 
+@pytest.mark.acceptance
 def test_conflicting_last_good_sha_is_never_overwritten(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-003: contract criterion."""
     state_dir = tmp_path / "state"
     state_dir.mkdir()
     (state_dir / "last-good-sha").write_text(f"{'d' * 40}\n")
@@ -343,7 +361,9 @@ def test_conflicting_last_good_sha_is_never_overwritten(tmp_path):
     assert not (state_dir / "provenance" / "reconciled").exists()
 
 
+@pytest.mark.acceptance
 def test_writer_drift_blocks_publication(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-002: contract criterion."""
     receipt, code, state_dir, _ = _run(
         tmp_path, apply=True, writer=_writer(image_id="sha256:" + "9" * 64)
     )

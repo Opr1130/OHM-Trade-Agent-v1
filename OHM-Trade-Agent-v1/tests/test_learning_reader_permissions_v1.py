@@ -18,7 +18,9 @@ def _mode(path: Path) -> int:
     return stat.S_IMODE(path.stat().st_mode)
 
 
+@pytest.mark.acceptance
 def test_pre_existing_nested_export_dirs_become_reader_traversable(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-001: contract criterion."""
     """ATDD-LEARNING-READER-v1: a late reader account can traverse old exports."""
     import grp
 
@@ -63,7 +65,9 @@ def test_pre_existing_nested_export_dirs_become_reader_traversable(tmp_path):
     assert _mode(staging) == 0o700
 
 
+@pytest.mark.acceptance
 def test_permission_normalization_requires_explicit_arguments(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-001: contract criterion."""
     result = subprocess.run(
         ["bash", str(SCRIPT)],
         capture_output=True,
@@ -74,7 +78,21 @@ def test_permission_normalization_requires_explicit_arguments(tmp_path):
     assert "usage:" in result.stderr
 
 
+@pytest.mark.acceptance
 def test_reader_configuration_contract_invokes_permission_normalization():
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-001: contract criterion."""
     text = CONFIGURE.read_text(encoding="utf-8")
     assert "opip-learning-reader-permissions.sh" in text
     assert '"$EXPORT_ROOT" "$USER_NAME"' in text
+
+
+@pytest.mark.acceptance
+def test_ci_syntax_gate_covers_reader_scripts():
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-004: contract criterion."""
+    repo_root = Path(__file__).resolve().parents[2]
+    workflow = (repo_root / ".github" / "workflows" / "pytest.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "bash -n deploy/remote/configure-opip-learning-reader.sh" in workflow
+    assert "bash -n deploy/remote/opip-learning-reader-permissions.sh" in workflow
+
