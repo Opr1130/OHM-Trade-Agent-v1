@@ -34,13 +34,34 @@ import socket
 import sqlite3
 import subprocess
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping
 
+try:  # POSIX-only production lock; Windows test hosts inject a fake lock.
+    import fcntl
+except ImportError:  # pragma: no cover - exercised on Windows only
+    fcntl = None
+
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SCHEMA = "opip-core-release-provenance/v1"
+DEPLOY_LOCK = Path("/var/lock/ohm-deploy.lock")
+SECRET_ENV_HINTS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
+EXPECTED_RUNTIME_ENV = {
+    "OPIP_RELEASE_PROFILE": "EVIDENCE_SHADOW",
+    "OPIP_FEATURE_BUS_MODE": "shadow",
+    "OPIP_CANONICAL_WRITER_MODE": "shadow",
+    "OPIP_TARGET_SPINE_MODE": "shadow",
+    "OPIP_PAPER_V2_MODE": "off",
+    "OPIP_COMMITTEE_MODE": "off",
+}
+FUNDED_AUTHORITY_ENV = re.compile(
+    r"^(OPIP_)?(FUNDED|LIVE_EXECUTION|ORDER_PLACEMENT|ORDER_MODIFICATION|"
+    r"ORDER_CANCEL|EXCHANGE_EXECUTION)[A-Z0-9_]*$"
+)
+TRUTHY = {"1", "true", "yes", "on", "enabled", "active", "live"}
 EXPECTED_AUTHORITY = {
     "canonical_writer_mode": "shadow",
     "committee_mode": "off",
@@ -52,6 +73,47 @@ EXPECTED_AUTHORITY = {
     "target_spine": "shadow",
 }
 MIN_RELEASE_MANIFEST_ENTRIES = 1000
+
+
+class DeployLockBusy(RuntimeError):
+    """The production deploy controller holds the authoritative lock."""
+
+
+class DeployLockUnavailable(RuntimeError):
+    """The host cannot provide the authoritative deploy lock."""
+
+
+class ProvenanceConflict(RuntimeError):
+    """An existing release marker disagrees with the reconciled release."""
+
+
+@contextmanager
+def deploy_lock(path: Path = DEPLOY_LOCK):
+    """Hold the exact lock used by the production deploy controller.
+
+    Non-blocking by design: waiting behind a live deploy would validate a stale
+    snapshot by the time the lock is released. A busy lock is a refusal.
+    """
+    if fcntl is None:
+        raise DeployLockUnavailable("fcntl is unavailable; refusing without lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise DeployLockBusy(f"deploy lock busy: {path}") from exc
+        except OSError as exc:
+            raise DeployLockUnavailable(
+                f"deploy lock unavailable: {path}: {exc}"
+            ) from exc
+        yield path
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
 
 
 @dataclass(frozen=True)
@@ -69,6 +131,7 @@ class ContainerFacts:
     revision: str
     status: str
     health: str
+    env: Mapping[str, str]
 
 
 @dataclass(frozen=True)
@@ -224,6 +287,39 @@ def evaluate(evidence: Evidence) -> tuple[Check, ...]:
         evidence.writer.status == "running" and evidence.writer.health == "healthy",
         f"status={evidence.writer.status} health={evidence.writer.health}",
     )
+    live_env = evidence.core.env or {}
+    runtime_mismatches = {
+        key: live_env.get(key)
+        for key, expected in EXPECTED_RUNTIME_ENV.items()
+        if live_env.get(key) != expected
+    }
+    add(
+        "runtime_authority_modes",
+        not runtime_mismatches,
+        (
+            f"mismatched={runtime_mismatches}"
+            if runtime_mismatches
+            else "EVIDENCE_SHADOW/shadow/off"
+        ),
+    )
+    funded_keys = sorted(
+        key
+        for key, value in live_env.items()
+        if FUNDED_AUTHORITY_ENV.match(key)
+        and str(value).strip().lower() in TRUTHY
+    )
+    add(
+        "runtime_funded_authority_absent",
+        not funded_keys,
+        f"truthy_authority_keys={funded_keys}" if funded_keys else "ABSENT",
+    )
+    writer_env = evidence.writer.env or {}
+    add(
+        "writer_container_not_authority_widened",
+        writer_env.get("OPIP_FEATURE_BUS_MODE") not in {"active", "live"},
+        f"writer_mode={writer_env.get('OPIP_CANONICAL_WRITER_MODE')} "
+        f"writer_bus={writer_env.get('OPIP_FEATURE_BUS_MODE')}",
+    )
     authority = _get(live, "authority", default={}) or {}
     mismatched = {
         key: authority.get(key)
@@ -300,6 +396,15 @@ def container_facts(name: str) -> ContainerFacts:
     state = payload.get("State") or {}
     health = (state.get("Health") or {}).get("Status") or "none"
     labels = (payload.get("Config") or {}).get("Labels") or {}
+    env: dict[str, str] = {}
+    for entry in (payload.get("Config") or {}).get("Env") or []:
+        if not isinstance(entry, str) or "=" not in entry:
+            continue
+        key, _, value = entry.partition("=")
+        if any(hint in key.upper() for hint in SECRET_ENV_HINTS):
+            env[key] = "<redacted>"
+        else:
+            env[key] = value
     return ContainerFacts(
         name=name,
         container_id=str(payload.get("Id") or ""),
@@ -307,6 +412,7 @@ def container_facts(name: str) -> ContainerFacts:
         revision=str(labels.get("org.opencontainers.image.revision") or ""),
         status=str(state.get("Status") or ""),
         health=str(health),
+        env=env,
     )
 
 
@@ -408,9 +514,21 @@ def last_good_value(state_dir: Path) -> str:
 
 
 
+def _fsync_dir(path: Path) -> None:
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _append_receipt(
     directory: Path, status: str, stamp: str, sha: str, payload: dict
 ) -> Path:
+    """Append-only receipt, durable before the caller may publish a marker."""
     directory.mkdir(parents=True, exist_ok=True)
     os.chmod(directory, 0o700)
     base = f"{stamp}-{sha}-{status.lower()}"
@@ -425,16 +543,25 @@ def _append_receipt(
             handle.write(json.dumps(payload, indent=2, sort_keys=True))
             handle.flush()
             os.fsync(handle.fileno())
+        _fsync_dir(directory)
         return path
     raise RuntimeError("could not allocate append-only receipt name")
 
 
 def _publish_last_good(state_dir: Path, sha: str) -> bool:
-    """Publish last-good-sha atomically. Returns True when the value changed."""
+    """Publish last-good-sha atomically. Returns True when the value changed.
+
+    A conflicting existing marker is never replaced, even if the process that
+    validated it lost a race with a newer deployment.
+    """
     state_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(state_dir, 0o700)
     target = state_dir / "last-good-sha"
     current = last_good_value(state_dir)
+    if current and current != sha:
+        raise ProvenanceConflict(
+            f"existing last-good-sha={current} conflicts with reconciled={sha}"
+        )
     if current == sha:
         return False
     tmp = state_dir / f".last-good-sha.tmp.{os.getpid()}"
@@ -444,15 +571,50 @@ def _publish_last_good(state_dir: Path, sha: str) -> bool:
         os.fsync(handle.fileno())
     os.chmod(tmp, 0o600)
     os.replace(tmp, target)
-    try:
-        dir_fd = os.open(state_dir, os.O_RDONLY)
-    except OSError:
-        return True
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
+    _fsync_dir(state_dir)
     return True
+
+
+def _lock_refusal(
+    *,
+    expected_sha: str,
+    apply: bool,
+    state_dir: Path,
+    moment: datetime,
+    reason: str,
+    detail: str,
+    receipt_writer,
+) -> dict:
+    receipt = {
+        "schema": SCHEMA,
+        "receipt": "CORE_RELEASE_PROVENANCE_RECONCILIATION",
+        "recorded_at_utc": moment.isoformat(),
+        "host": socket.gethostname(),
+        "expected_sha": expected_sha,
+        "apply": bool(apply),
+        "status": "REFUSED",
+        "failures": [reason],
+        "detail": detail,
+        "checks": [],
+        "evidence": {"last_good_before": last_good_value(state_dir)},
+        "historical_evidence_modified": False,
+        "trading_authority_changed": False,
+        "deploy_invoked": False,
+        "services_restarted": False,
+    }
+    if apply:
+        try:
+            path = receipt_writer(
+                state_dir / "provenance" / "rejected",
+                "lock-refused",
+                moment.strftime("%Y%m%dT%H%M%SZ"),
+                expected_sha,
+                receipt,
+            )
+            receipt["receipt_path"] = str(path)
+        except OSError as exc:
+            receipt["receipt_write_error"] = type(exc).__name__
+    return receipt
 
 
 def reconcile(
@@ -463,13 +625,79 @@ def reconcile(
     bootstrap_dir: Path,
     manifest: Path,
     apply: bool,
+    lock=deploy_lock,
+    receipt_writer=_append_receipt,
+    publisher=_publish_last_good,
     container_reader=container_facts,
     db_reader=database_facts,
     manifest_verifier=verify_release_manifest,
     receipts_loader=load_receipts,
     now: datetime | None = None,
 ) -> tuple[dict, int]:
+    """Hold the controller lock across collection, validation and publication."""
     moment = (now or datetime.now(timezone.utc)).replace(microsecond=0)
+    try:
+        with lock():
+            return _reconcile_locked(
+                expected_sha=expected_sha,
+                app_root=app_root,
+                state_dir=state_dir,
+                bootstrap_dir=bootstrap_dir,
+                manifest=manifest,
+                apply=apply,
+                receipt_writer=receipt_writer,
+                publisher=publisher,
+                container_reader=container_reader,
+                db_reader=db_reader,
+                manifest_verifier=manifest_verifier,
+                receipts_loader=receipts_loader,
+                moment=moment,
+            )
+    except DeployLockBusy as exc:
+        return (
+            _lock_refusal(
+                expected_sha=expected_sha,
+                apply=apply,
+                state_dir=state_dir,
+                moment=moment,
+                reason="deploy_lock_busy",
+                detail=str(exc),
+                receipt_writer=receipt_writer,
+            ),
+            2,
+        )
+    except DeployLockUnavailable as exc:
+        return (
+            _lock_refusal(
+                expected_sha=expected_sha,
+                apply=apply,
+                state_dir=state_dir,
+                moment=moment,
+                reason="deploy_lock_unavailable",
+                detail=str(exc),
+                receipt_writer=receipt_writer,
+            ),
+            2,
+        )
+
+
+def _reconcile_locked(
+    *,
+    expected_sha: str,
+    app_root: Path,
+    state_dir: Path,
+    bootstrap_dir: Path,
+    manifest: Path,
+    apply: bool,
+    receipt_writer,
+    publisher,
+    container_reader,
+    db_reader,
+    manifest_verifier,
+    receipts_loader,
+    moment: datetime,
+) -> tuple[dict, int]:
+
     live, upgrade, hashes = receipts_loader(bootstrap_dir, expected_sha)
     core = container_reader("ohm-trade-agent")
     writer = container_reader("opip-canonical-writer")
@@ -537,13 +765,14 @@ def reconcile(
         "services_restarted": False,
     }
 
+    stamp = moment.strftime("%Y%m%dT%H%M%SZ")
     if failures:
         receipt["status"] = "REFUSED"
         if apply:
-            path = _append_receipt(
+            path = receipt_writer(
                 state_dir / "provenance" / "rejected",
                 "refused",
-                moment.strftime("%Y%m%dT%H%M%SZ"),
+                stamp,
                 expected_sha,
                 receipt,
             )
@@ -555,19 +784,85 @@ def reconcile(
         receipt["last_good_sha_published"] = False
         return receipt, 0
 
-    changed = _publish_last_good(state_dir, expected_sha)
+    # Write-ahead: provenance must be durable on disk before the authoritative
+    # marker becomes publishable. A crash after this point leaves a marker-less
+    # but fully documented refusal-safe state, never an unexplained marker.
     receipt["status"] = "RECONCILED"
+    receipt["publication_state"] = "PENDING"
+    receipt["last_good_sha_target"] = expected_sha
+    try:
+        pending = receipt_writer(
+            state_dir / "provenance" / "reconciled",
+            "pending",
+            stamp,
+            expected_sha,
+            receipt,
+        )
+    except OSError as exc:
+        receipt["status"] = "PROVENANCE_WRITE_FAILED"
+        receipt["publication_state"] = "BLOCKED"
+        receipt["detail"] = f"{type(exc).__name__}: {exc}"
+        return receipt, 4
+    receipt["provenance_receipt_path"] = str(pending)
+
+    try:
+        changed = publisher(state_dir, expected_sha)
+    except ProvenanceConflict as exc:
+        receipt["status"] = "REFUSED"
+        receipt["publication_state"] = "CONFLICT"
+        receipt["detail"] = str(exc)
+        receipt["failures"] = ["conflicting_release_marker"]
+        path = receipt_writer(
+            state_dir / "provenance" / "rejected",
+            "conflict",
+            stamp,
+            expected_sha,
+            receipt,
+        )
+        receipt["receipt_path"] = str(path)
+        return receipt, 2
+    except OSError as exc:
+        receipt["status"] = "PUBLICATION_FAILED"
+        receipt["publication_state"] = "FAILED"
+        receipt["detail"] = f"{type(exc).__name__}: {exc}"
+        path = receipt_writer(
+            state_dir / "provenance" / "rejected",
+            "publication-failed",
+            stamp,
+            expected_sha,
+            receipt,
+        )
+        receipt["receipt_path"] = str(path)
+        return receipt, 3
+
+    receipt["publication_state"] = "PUBLISHED"
     receipt["last_good_sha_published"] = True
     receipt["last_good_sha_changed"] = changed
     receipt["last_good_sha_after"] = last_good_value(state_dir)
-    path = _append_receipt(
+    confirmation = {
+        "schema": SCHEMA,
+        "receipt": "CORE_RELEASE_PROVENANCE_PUBLICATION",
+        "status": "PUBLISHED",
+        "recorded_at_utc": moment.isoformat(),
+        "expected_sha": expected_sha,
+        "provenance_receipt": str(pending),
+        "last_good_sha": receipt["last_good_sha_after"],
+        "last_good_sha_changed": changed,
+        "marker_sha256": hashlib.sha256(
+            f"{expected_sha}\n".encode("utf-8")
+        ).hexdigest(),
+        "historical_evidence_modified": False,
+        "trading_authority_changed": False,
+    }
+    path = receipt_writer(
         state_dir / "provenance" / "reconciled",
-        "reconciled",
-        moment.strftime("%Y%m%dT%H%M%SZ"),
+        "published",
+        stamp,
         expected_sha,
-        receipt,
+        confirmation,
     )
-    receipt["receipt_path"] = str(path)
+    receipt["publication_receipt_path"] = str(path)
+    receipt["receipt_path"] = str(pending)
     return receipt, 0
 
 

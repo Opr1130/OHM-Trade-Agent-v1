@@ -70,6 +70,7 @@ jobs:
           bash -n deploy/remote/diagnose-opip-learning.sh
           bash -n deploy/learning/opip-learning-sync.sh
           bash -n deploy/learning/opip-learning-job.sh
+          bash -n deploy/learning/run-recovery-learning-deploy.sh
           bash -n deploy/analytics/bootstrap-opip-data-platform.sh
           bash -n deploy/analytics/run-gated-stage.sh
           bash -n deploy/analytics/opip-data-platform-maintenance.sh

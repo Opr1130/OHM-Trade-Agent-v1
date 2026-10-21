@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+import hashlib
 import json
 import os
 import stat
@@ -6,10 +8,13 @@ from pathlib import Path
 
 import pytest
 
+from app.services import release_provenance_reconcile
 from app.services.release_provenance_reconcile import (
     ContainerFacts,
     DatabaseFacts,
     Evidence,
+    DeployLockBusy,
+    deploy_lock,
     failed_checks,
     evaluate,
     reconcile,
@@ -76,6 +81,19 @@ def _upgrade() -> dict:
     }
 
 
+def _runtime_env(**overrides) -> dict:
+    env = {
+        "OPIP_RELEASE_PROFILE": "EVIDENCE_SHADOW",
+        "OPIP_FEATURE_BUS_MODE": "shadow",
+        "OPIP_CANONICAL_WRITER_MODE": "shadow",
+        "OPIP_TARGET_SPINE_MODE": "shadow",
+        "OPIP_PAPER_V2_MODE": "off",
+        "OPIP_COMMITTEE_MODE": "off",
+    }
+    env.update(overrides)
+    return env
+
+
 def _core(**overrides) -> ContainerFacts:
     values = {
         "name": "ohm-trade-agent",
@@ -84,6 +102,7 @@ def _core(**overrides) -> ContainerFacts:
         "revision": SHA,
         "status": "running",
         "health": "healthy",
+        "env": _runtime_env(),
     }
     values.update(overrides)
     return ContainerFacts(**values)
@@ -97,6 +116,7 @@ def _writer(**overrides) -> ContainerFacts:
         "revision": "c196dd674678b3b1ee91c351ee97c1c9e2b3938d",
         "status": "running",
         "health": "healthy",
+        "env": {"OPIP_CANONICAL_WRITER_MODE": "shadow"},
     }
     values.update(overrides)
     return ContainerFacts(**values)
@@ -243,6 +263,11 @@ def _prepare(tmp_path: Path) -> tuple[Path, Path, Path]:
     return bootstrap, app_root, tmp_path / "state"
 
 
+@contextmanager
+def _noop_lock():
+    yield Path("test-deploy.lock")
+
+
 def _run(tmp_path: Path, *, apply: bool, **overrides):
     bootstrap, app_root, state_dir = _prepare(tmp_path)
     calls = {"containers": [], "db": 0, "manifest": 0}
@@ -251,6 +276,9 @@ def _run(tmp_path: Path, *, apply: bool, **overrides):
     database = overrides.pop("database", _db())
     entries = overrides.pop("entries", 1186)
     mismatches = overrides.pop("mismatches", 0)
+    lock = overrides.pop("lock", _noop_lock)
+    receipt_writer = overrides.pop("receipt_writer", None)
+    publisher = overrides.pop("publisher", None)
     before = {
         path.name: path.read_bytes() for path in bootstrap.iterdir() if path.is_file()
     }
@@ -274,6 +302,9 @@ def _run(tmp_path: Path, *, apply: bool, **overrides):
         bootstrap_dir=bootstrap,
         manifest=bootstrap / "release-manifest.sha256",
         apply=apply,
+        lock=lock,
+        receipt_writer=receipt_writer or release_provenance_reconcile._append_receipt,
+        publisher=publisher or release_provenance_reconcile._publish_last_good,
         container_reader=container_reader,
         db_reader=db_reader,
         manifest_verifier=manifest_verifier,
@@ -311,13 +342,24 @@ def test_apply_publishes_exact_sha_and_append_only_receipt(tmp_path):
     if os.name == "posix":
         assert stat.S_IMODE(last_good.stat().st_mode) == 0o600
     reconciled = list((state_dir / "provenance" / "reconciled").glob("*.json"))
-    assert len(reconciled) == 1
-    payload = json.loads(reconciled[0].read_text())
+    assert len(reconciled) == 2
+    pending = next(path for path in reconciled if path.name.endswith("-pending.json"))
+    published = next(
+        path for path in reconciled if path.name.endswith("-published.json")
+    )
+    payload = json.loads(pending.read_text())
     assert payload["status"] == "RECONCILED"
+    assert payload["publication_state"] == "PENDING"
     assert payload["expected_sha"] == SHA
     assert payload["evidence"]["core"]["image_id"] == CORE_IMAGE
     assert payload["evidence"]["writer"]["container_id"] == WRITER_ID
     assert payload["evidence"]["database"]["max_local_sequence"] == 8980
+    confirmation = json.loads(published.read_text())
+    assert confirmation["status"] == "PUBLISHED"
+    assert confirmation["last_good_sha"] == SHA
+    assert confirmation["marker_sha256"] == hashlib.sha256(
+        f"{SHA}\n".encode("utf-8")
+    ).hexdigest()
 
 
 @pytest.mark.acceptance
@@ -370,4 +412,185 @@ def test_writer_drift_blocks_publication(tmp_path):
     assert code == 2
     assert "writer_image_unchanged" in receipt["failures"]
     assert not (state_dir / "last-good-sha").exists()
+
+
+
+@pytest.mark.acceptance
+def test_live_runtime_authority_override_is_refused():
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-007: contract criterion."""
+    env = _runtime_env(OPIP_PAPER_V2_MODE="active")
+    failed = _failed_names(_evidence(core=_core(env=env)))
+    assert "runtime_authority_modes" in failed
+
+
+@pytest.mark.acceptance
+def test_missing_runtime_authority_is_refused():
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-007: contract criterion."""
+    env = _runtime_env()
+    del env["OPIP_RELEASE_PROFILE"]
+    assert "runtime_authority_modes" in _failed_names(
+        _evidence(core=_core(env=env))
+    )
+
+
+@pytest.mark.acceptance
+def test_truthy_funded_authority_key_is_refused():
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-007: contract criterion."""
+    env = _runtime_env(OPIP_FUNDED_TRADING_ENABLED="true")
+    assert "runtime_funded_authority_absent" in _failed_names(
+        _evidence(core=_core(env=env))
+    )
+
+
+@pytest.mark.acceptance
+def test_core_writer_mode_must_stay_shadow():
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-007: contract criterion."""
+    env = _runtime_env(OPIP_CANONICAL_WRITER_MODE="active")
+    assert "runtime_authority_modes" in _failed_names(
+        _evidence(core=_core(env=env))
+    )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fcntl lock is POSIX-only")
+@pytest.mark.acceptance
+def test_busy_deploy_lock_is_detected(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-006: contract criterion."""
+    lock_path = tmp_path / "deploy.lock"
+    with deploy_lock(lock_path):
+        with pytest.raises(DeployLockBusy):
+            with deploy_lock(lock_path):
+                pass
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fcntl lock is POSIX-only")
+@pytest.mark.acceptance
+def test_reconcile_refuses_when_controller_lock_is_held(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-006: contract criterion."""
+    lock_path = tmp_path / "deploy.lock"
+    with deploy_lock(lock_path):
+        receipt, code = reconcile(
+            expected_sha=SHA,
+            app_root=tmp_path,
+            state_dir=tmp_path / "state",
+            bootstrap_dir=tmp_path,
+            manifest=tmp_path / "release-manifest.sha256",
+            apply=True,
+            lock=lambda: deploy_lock(lock_path),
+        )
+    assert code == 2
+    assert receipt["status"] == "REFUSED"
+    assert receipt["failures"] == ["deploy_lock_busy"]
+    assert not (tmp_path / "state" / "last-good-sha").exists()
+
+
+
+@pytest.mark.acceptance
+def test_newer_marker_written_after_validation_is_never_overwritten(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-006: contract criterion."""
+
+    def racing_publisher(state_dir: Path, sha: str) -> bool:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "last-good-sha").write_text(f"{'e' * 40}\n")
+        return release_provenance_reconcile._publish_last_good(state_dir, sha)
+
+    receipt, code, state_dir, _ = _run(
+        tmp_path, apply=True, publisher=racing_publisher
+    )
+    assert code == 2
+    assert receipt["status"] == "REFUSED"
+    assert receipt["failures"] == ["conflicting_release_marker"]
+    assert (state_dir / "last-good-sha").read_text() == f"{'e' * 40}\n"
+    rejected = list((state_dir / "provenance" / "rejected").glob("*.json"))
+    assert any("conflict" in path.name for path in rejected)
+
+
+@pytest.mark.acceptance
+def test_receipt_write_failure_blocks_publication(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-008: contract criterion."""
+
+    def disk_full(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    receipt, code, state_dir, _ = _run(
+        tmp_path, apply=True, receipt_writer=disk_full
+    )
+    assert code == 4
+    assert receipt["status"] == "PROVENANCE_WRITE_FAILED"
+    assert not (state_dir / "last-good-sha").exists()
+
+
+@pytest.mark.acceptance
+def test_publication_failure_leaves_durable_pending_provenance(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-008: contract criterion."""
+
+    def failed_publish(state_dir: Path, sha: str) -> bool:
+        raise OSError(28, "No space left on device")
+
+    receipt, code, state_dir, _ = _run(
+        tmp_path, apply=True, publisher=failed_publish
+    )
+    assert code == 3
+    assert receipt["status"] == "PUBLICATION_FAILED"
+    assert not (state_dir / "last-good-sha").exists()
+    pending = list((state_dir / "provenance" / "reconciled").glob("*-pending.json"))
+    failed = list((state_dir / "provenance" / "rejected").glob("*-failed.json"))
+    assert len(pending) == 1
+    assert len(failed) == 1
+
+
+@pytest.mark.acceptance
+def test_interrupted_replace_never_publishes_marker(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-008: contract criterion."""
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+
+    import app.services.release_provenance_reconcile as module
+
+    original_replace = module.os.replace
+
+    def interrupted(src, dst):
+        raise OSError(5, "Input/output error")
+
+    module.os.replace = interrupted
+    try:
+        with pytest.raises(OSError):
+            module._publish_last_good(state_dir, SHA)
+    finally:
+        module.os.replace = original_replace
+    assert not (state_dir / "last-good-sha").exists()
+
+
+@pytest.mark.acceptance
+def test_receipt_is_fsynced_before_marker_replace(tmp_path, monkeypatch):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-008: contract criterion."""
+    import app.services.release_provenance_reconcile as module
+
+    events: list[str] = []
+    real_fsync = module.os.fsync
+    real_replace = module.os.replace
+
+    def recording_fsync(fd):
+        events.append("fsync")
+        return real_fsync(fd)
+
+    def recording_replace(src, dst):
+        events.append("replace")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(module.os, "fsync", recording_fsync)
+    monkeypatch.setattr(module.os, "replace", recording_replace)
+
+    state_dir = tmp_path / "state"
+    module._append_receipt(
+        state_dir / "provenance" / "reconciled",
+        "pending",
+        "20261021T190000Z",
+        SHA,
+        {"status": "RECONCILED"},
+    )
+    module._publish_last_good(state_dir, SHA)
+
+    assert "fsync" in events
+    assert "replace" in events
+    assert events.index("fsync") < events.index("replace")
 

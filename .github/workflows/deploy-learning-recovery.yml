@@ -1,0 +1,209 @@
+name: deploy-learning-recovery
+
+# Recovery-only owner command. It never merges, never deploys the core, and
+# never enables learning timers. Normal `/deploy-learning <sha>` still requires
+# target == current main and is unchanged.
+#
+#   /deploy-learning-recovery <authenticated-production-sha>
+#
+# The tooling SHA is always the current main, must have successful exact-SHA CI,
+# and must descend from the production SHA. The worker script additionally
+# verifies the production SHA against the authenticated export manifest.
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  actions: read
+  issues: write
+
+concurrency:
+  group: opip-learning
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      github.event.issue.number == 64 &&
+      github.event.comment.user.login == github.repository_owner &&
+      github.event.comment.author_association == 'OWNER' &&
+      startsWith(github.event.comment.body, '/deploy-learning-recovery ')
+    runs-on: ubuntu-latest
+    environment: learning-production
+    steps:
+      - name: Parse production SHA
+        id: production
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          set -euo pipefail
+          if [[ "$COMMENT_BODY" =~ ^/deploy-learning-recovery[[:space:]]+([0-9a-f]{40})[[:space:]]*$ ]]; then
+            echo "sha=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+          else
+            echo "usage: /deploy-learning-recovery <40-char-production-sha>" >&2
+            exit 64
+          fi
+
+      - name: Resolve tooling main and require exact-SHA CI
+        id: tooling
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRODUCTION_SHA: ${{ steps.production.outputs.sha }}
+        run: |
+          set -euo pipefail
+          TOOLING_SHA="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq '.sha')"
+          test "$TOOLING_SHA" != "$PRODUCTION_SHA" || {
+            echo "Refusing recovery: production equals main; use /deploy-learning." >&2
+            exit 65
+          }
+          RESULT="$(gh run list \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow pytest.yml \
+            --branch main \
+            --commit "$TOOLING_SHA" \
+            --limit 1 \
+            --json status,conclusion \
+            --jq '.[0] | [.status,.conclusion] | @tsv')"
+          test "$RESULT" = $'completed\tsuccess' || {
+            echo "Refusing recovery: pytest.yml is not successful for tooling SHA." >&2
+            exit 1
+          }
+          COMPARE="$(gh api "repos/$GITHUB_REPOSITORY/compare/$PRODUCTION_SHA...$TOOLING_SHA" --jq '.status')"
+          case "$COMPARE" in
+            ahead|identical) ;;
+            *) echo "Refusing recovery: production is not an ancestor of tooling ($COMPARE)." >&2; exit 65 ;;
+          esac
+          {
+            echo "sha=$TOOLING_SHA"
+            echo "compare=$COMPARE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check out exact tooling release
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tooling.outputs.sha }}
+          persist-credentials: false
+
+      - name: Validate learning connection secrets
+        env:
+          HOST: ${{ secrets.OPIP_LEARNING_HOST }}
+          USER: ${{ secrets.OPIP_LEARNING_USER }}
+          SSH_KEY_B64: ${{ secrets.OPIP_LEARNING_SSH_KEY_B64 }}
+          KNOWN_HOSTS: ${{ secrets.OPIP_LEARNING_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST"
+          test -n "$USER"
+          test -n "$SSH_KEY_B64"
+          test -n "$KNOWN_HOSTS"
+
+      - name: Configure pinned SSH identity
+        env:
+          SSH_KEY_B64: ${{ secrets.OPIP_LEARNING_SSH_KEY_B64 }}
+          KNOWN_HOSTS: ${{ secrets.OPIP_LEARNING_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s' "$SSH_KEY_B64" | base64 --decode > ~/.ssh/opip_learning
+          chmod 600 ~/.ssh/opip_learning
+          ssh-keygen -y -f ~/.ssh/opip_learning >/dev/null
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Upload exact tooling tree
+        env:
+          HOST: ${{ secrets.OPIP_LEARNING_HOST }}
+          USER: ${{ secrets.OPIP_LEARNING_USER }}
+          PORT: ${{ secrets.OPIP_LEARNING_PORT }}
+          TOOLING_SHA: ${{ steps.tooling.outputs.sha }}
+        run: |
+          set -euo pipefail
+          PORT="${PORT:-22}"
+          SSH=(ssh -i ~/.ssh/opip_learning -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -p "$PORT")
+          REMOTE="$USER@$HOST"
+          RELEASE_DIR="/var/tmp/opip-learning-recovery-$TOOLING_SHA-$GITHUB_RUN_ID"
+          "${SSH[@]}" "$REMOTE" "sudo -n install -d -o root -g root -m 0700 '$RELEASE_DIR'"
+          git archive --format=tar "$TOOLING_SHA" | "${SSH[@]}" "$REMOTE" "sudo -n tar -xf - -C '$RELEASE_DIR'"
+          printf '%s\n' "$TOOLING_SHA" | "${SSH[@]}" "$REMOTE" "sudo -n tee '$RELEASE_DIR/RECOVERY_SOURCE_SHA' >/dev/null"
+
+      - name: Run recovery worker update
+        id: recovery
+        continue-on-error: true
+        env:
+          HOST: ${{ secrets.OPIP_LEARNING_HOST }}
+          USER: ${{ secrets.OPIP_LEARNING_USER }}
+          PORT: ${{ secrets.OPIP_LEARNING_PORT }}
+          PRODUCTION_SHA: ${{ steps.production.outputs.sha }}
+          TOOLING_SHA: ${{ steps.tooling.outputs.sha }}
+          COMPARE: ${{ steps.tooling.outputs.compare }}
+        run: |
+          set +e
+          PORT="${PORT:-22}"
+          RELEASE_DIR="/var/tmp/opip-learning-recovery-$TOOLING_SHA-$GITHUB_RUN_ID"
+          ssh \
+            -i ~/.ssh/opip_learning \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=20 \
+            -p "$PORT" \
+            "$USER@$HOST" \
+            "sudo -n bash '$RELEASE_DIR/OHM-Trade-Agent-v1/deploy/learning/run-recovery-learning-deploy.sh' '$PRODUCTION_SHA' '$TOOLING_SHA' '$TOOLING_SHA' '$COMPARE' 'true' '$RELEASE_DIR'" \
+            2>&1 | tee learning-recovery.log
+          RC=${PIPESTATUS[0]}
+          echo "rc=$RC" >> "$GITHUB_OUTPUT"
+          if [[ "$RC" -eq 0 ]] && grep -q "O'Pip recovery learning deploy succeeded" learning-recovery.log; then
+            echo "result=SUCCESS" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=FAILED" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+
+      - name: Clean remote release
+        if: always() && steps.tooling.outputs.sha != ''
+        continue-on-error: true
+        env:
+          HOST: ${{ secrets.OPIP_LEARNING_HOST }}
+          USER: ${{ secrets.OPIP_LEARNING_USER }}
+          PORT: ${{ secrets.OPIP_LEARNING_PORT }}
+          TOOLING_SHA: ${{ steps.tooling.outputs.sha }}
+        run: |
+          set -euo pipefail
+          PORT="${PORT:-22}"
+          RELEASE_DIR="/var/tmp/opip-learning-recovery-$TOOLING_SHA-$GITHUB_RUN_ID"
+          ssh -i ~/.ssh/opip_learning -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -p "$PORT" "$USER@$HOST" "sudo -n rm -rf -- '$RELEASE_DIR'"
+
+      - name: Publish recovery receipt
+        if: always() && steps.production.outputs.sha != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRODUCTION_SHA: ${{ steps.production.outputs.sha }}
+          TOOLING_SHA: ${{ steps.tooling.outputs.sha }}
+          COMPARE: ${{ steps.tooling.outputs.compare }}
+          RESULT: ${{ steps.recovery.outputs.result }}
+          REMOTE_RC: ${{ steps.recovery.outputs.rc }}
+        run: |
+          set -euo pipefail
+          RUN_URL="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          BODY=$(cat <<EOF
+          ## O'Pip Learning Recovery Deployment Receipt
+          - **Result:** ${RESULT:-FAILED BEFORE REMOTE STAGE}
+          - **Production SHA (authenticated):** \`$PRODUCTION_SHA\`
+          - **Tooling SHA (image):** \`$TOOLING_SHA\`
+          - **Compare:** \`$COMPARE\`
+          - **Remote exit code:** ${REMOTE_RC:-N/A}
+          - **Workflow run:** $RUN_URL
+
+          Timers remain disabled. No core deploy, merge, provenance mutation,
+          Paper V2, Committee or funded authority change is performed here.
+          EOF
+          )
+          gh api --method POST "repos/$GITHUB_REPOSITORY/issues/64/comments" -f body="$BODY" >/dev/null
+
+      - name: Fail unless recovery succeeded
+        if: always() && steps.recovery.outputs.result != 'SUCCESS'
+        run: exit 1
+
