@@ -1,0 +1,5 @@
+{
+  "schema": "opip-learning-recovery-compatibility-exceptions/v1",
+  "pairs": {},
+  "note": "Owner-approved cross-SHA learning-contract exceptions. Each key is '<production-sha>..<tooling-sha>' with an explicit path list and rationale. Empty until a reviewed exception is approved."
+}

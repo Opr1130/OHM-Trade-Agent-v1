@@ -86,6 +86,20 @@ jobs:
           ref: ${{ steps.tooling.outputs.sha }}
           persist-credentials: false
 
+      - name: Certify cross-SHA learning compatibility
+        working-directory: OHM-Trade-Agent-v1
+        env:
+          PRODUCTION_SHA: ${{ steps.production.outputs.sha }}
+          TOOLING_SHA: ${{ steps.tooling.outputs.sha }}
+        run: |
+          set -euo pipefail
+          python3 -m app.services.learning_recovery_compatibility prepare \
+            --production-sha "$PRODUCTION_SHA" \
+            --tooling-sha "$TOOLING_SHA" \
+            --repo-root . \
+            --exceptions-file docs/learning/RECOVERY_COMPATIBILITY_EXCEPTIONS.json \
+            --out "$RUNNER_TEMP/RECOVERY_COMPATIBILITY.json"
+
       - name: Validate learning connection secrets
         env:
           HOST: ${{ secrets.OPIP_LEARNING_HOST }}
@@ -126,7 +140,32 @@ jobs:
           RELEASE_DIR="/var/tmp/opip-learning-recovery-$TOOLING_SHA-$GITHUB_RUN_ID"
           "${SSH[@]}" "$REMOTE" "sudo -n install -d -o root -g root -m 0700 '$RELEASE_DIR'"
           git archive --format=tar "$TOOLING_SHA" | "${SSH[@]}" "$REMOTE" "sudo -n tar -xf - -C '$RELEASE_DIR'"
+          "${SSH[@]}" "$REMOTE" "sudo -n tee '$RELEASE_DIR/RECOVERY_COMPATIBILITY.json' >/dev/null" < "$RUNNER_TEMP/RECOVERY_COMPATIBILITY.json"
           printf '%s\n' "$TOOLING_SHA" | "${SSH[@]}" "$REMOTE" "sudo -n tee '$RELEASE_DIR/RECOVERY_SOURCE_SHA' >/dev/null"
+
+      - name: Revalidate main and exact-SHA CI before mutation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TOOLING_SHA: ${{ steps.tooling.outputs.sha }}
+        run: |
+          set -euo pipefail
+          MAIN_NOW="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq '.sha')"
+          test "$MAIN_NOW" = "$TOOLING_SHA" || {
+            echo "Refusing recovery: main moved after certification." >&2
+            exit 65
+          }
+          RESULT="$(gh run list \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow pytest.yml \
+            --branch main \
+            --commit "$TOOLING_SHA" \
+            --limit 1 \
+            --json status,conclusion \
+            --jq '.[0] | [.status,.conclusion] | @tsv')"
+          test "$RESULT" = $'completed\tsuccess' || {
+            echo "Refusing recovery: exact-SHA CI is no longer successful." >&2
+            exit 1
+          }
 
       - name: Run recovery worker update
         id: recovery

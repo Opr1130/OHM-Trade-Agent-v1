@@ -81,6 +81,24 @@ GIVEN: an old 220,721-event canonical replica lineage and a V2 fresh-genesis lin
 WHEN: history is preserved or archived
 THEN: the lineages are never merged or relabelled, archival is copy-only with checksummed manifests and append-only receipts, and consumers report lineage-separated counts.
 
+AC-012:
+Recovery configuration changes are transactional and never roll back committed evidence.
+GIVEN recovery replaces the environment, runner scripts and unit definitions before one-shot acceptance
+WHEN any installation, sync, capture, outcomes or receipt stage fails
+THEN verified backups restore configuration only while no new replica generation is active; after generation commit the configuration is preserved, timers remain disabled, diagnostics and an append-only failure receipt are durable, and retry cannot create duplicate active workers.
+
+AC-013:
+A new lineage may not be synchronized before the legacy generation is archived.
+GIVEN the outgoing replica generation belongs to LINEAGE-A-LEGACY
+WHEN recovery is about to synchronize a new-lineage generation
+THEN a verified copy-only archive with complete file hashes, durable receipt and adequate disk capacity must already exist; missing, incomplete, corrupted or interrupted archival refuses recovery and never deletes or overwrites the source.
+
+AC-014:
+Cross-SHA recovery tooling is compatibility-certified immediately before mutation.
+GIVEN worker code is built from a newer tooling SHA while release identity remains the production SHA
+WHEN any learning consumer, schema, canonical-replica or production-evidence contract differs
+THEN every change must match an owner-approved exact-SHA-pair exception and verified tooling hashes, and current main plus exact-SHA CI are revalidated immediately before the remote mutation; otherwise recovery refuses.
+
 EXPLICITLY OUT OF SCOPE:
 - Deploying, rebuilding, or restarting production containers or systemd units.
 - Executing the provenance reconciler against production; that remains owner-gated.
@@ -136,6 +154,27 @@ AC-010 -> tests/test_learning_reader_permissions_v1.py::test_symlink_inside_expo
 AC-010 -> tests/test_learning_reader_permissions_v1.py::test_symlinked_export_root_is_refused
 AC-010 -> tests/test_learning_reader_permissions_v1.py::test_normalized_tree_has_no_group_or_world_write_bits
 AC-011 -> tests/test_learning_lineage_policy_v1.py::test_canonical_lineage_boundary_and_archival_policy_is_explicit
+AC-012 -> tests/test_learning_recovery_transaction_v1.py::test_snapshot_restore_round_trip_and_missing_file_removal
+AC-012 -> tests/test_learning_recovery_transaction_v1.py::test_tampered_backup_refuses_restore
+AC-012 -> tests/test_learning_recovery_transaction_v1.py::test_failure_policy_distinguishes_config_from_committed_evidence
+AC-012 -> tests/test_learning_recovery_transaction_v1.py::test_generation_commit_boundary
+AC-012 -> tests/test_learning_recovery_transaction_v1.py::test_receipt_is_append_only
+AC-013 -> tests/test_learning_lineage_archive_v1.py::test_verified_archive_passes_and_preserves_source
+AC-013 -> tests/test_learning_lineage_archive_v1.py::test_missing_archive_is_refused
+AC-013 -> tests/test_learning_lineage_archive_v1.py::test_incomplete_archive_is_refused
+AC-013 -> tests/test_learning_lineage_archive_v1.py::test_corrupted_archive_is_refused
+AC-013 -> tests/test_learning_lineage_archive_v1.py::test_extra_archive_file_is_refused
+AC-013 -> tests/test_learning_lineage_archive_v1.py::test_wrong_lineage_or_source_is_refused
+AC-013 -> tests/test_learning_lineage_archive_v1.py::test_missing_receipt_is_refused
+AC-013 -> tests/test_learning_lineage_archive_v1.py::test_interrupted_copy_leaves_no_verified_archive_or_receipt
+AC-013 -> tests/test_learning_lineage_archive_v1.py::test_insufficient_disk_refuses_before_copy
+AC-014 -> tests/test_learning_recovery_compatibility_v1.py::test_no_critical_changes_pass
+AC-014 -> tests/test_learning_recovery_compatibility_v1.py::test_unreviewed_critical_change_is_refused
+AC-014 -> tests/test_learning_recovery_compatibility_v1.py::test_exact_pair_exception_is_accepted_but_wrong_pair_is_not
+AC-014 -> tests/test_learning_recovery_compatibility_v1.py::test_tooling_hash_mismatch_is_refused
+AC-014 -> tests/test_learning_recovery_compatibility_v1.py::test_unreviewed_change_list_in_manifest_is_refused
+AC-014 -> tests/test_learning_recovery_compatibility_v1.py::test_recovery_workflow_revalidates_main_ci_and_ships_compatibility
+AC-014 -> tests/test_learning_recovery_compatibility_v1.py::test_recovery_script_requires_compatibility_transaction_and_archive
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/deploy/remote/configure-opip-learning-reader.sh
@@ -165,6 +204,18 @@ AC-010 -> OHM-Trade-Agent-v1/deploy/remote/opip-learning-reader-permissions.sh
 AC-010 -> OHM-Trade-Agent-v1/tests/test_learning_reader_permissions_v1.py
 AC-011 -> OHM-Trade-Agent-v1/docs/learning/CANONICAL_LINEAGE_BOUNDARY_V1.md
 AC-011 -> OHM-Trade-Agent-v1/tests/test_learning_lineage_policy_v1.py
+AC-012 -> OHM-Trade-Agent-v1/app/services/learning_recovery_transaction.py
+AC-012 -> OHM-Trade-Agent-v1/deploy/learning/run-recovery-learning-deploy.sh
+AC-012 -> OHM-Trade-Agent-v1/tests/test_learning_recovery_transaction_v1.py
+AC-013 -> OHM-Trade-Agent-v1/app/services/learning_lineage_archive.py
+AC-013 -> OHM-Trade-Agent-v1/docs/learning/CANONICAL_LINEAGE_BOUNDARY_V1.md
+AC-013 -> OHM-Trade-Agent-v1/deploy/learning/run-recovery-learning-deploy.sh
+AC-013 -> OHM-Trade-Agent-v1/tests/test_learning_lineage_archive_v1.py
+AC-014 -> OHM-Trade-Agent-v1/app/services/learning_recovery_compatibility.py
+AC-014 -> OHM-Trade-Agent-v1/docs/learning/RECOVERY_COMPATIBILITY_EXCEPTIONS.json
+AC-014 -> .github/workflows/deploy-learning-recovery.yml
+AC-014 -> OHM-Trade-Agent-v1/deploy/learning/run-recovery-learning-deploy.sh
+AC-014 -> OHM-Trade-Agent-v1/tests/test_learning_recovery_compatibility_v1.py
 
 DEFERRED DISCOVERIES:
 - The production export tree contains historical generations from the previous canonical store (220,721 events) while current production runs a fresh genesis (8,819 events at capture). Retention and archival review remain owner work.
