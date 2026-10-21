@@ -45,6 +45,42 @@ GIVEN: the recovery increment is authorized
 WHEN: the scope control pointer is read
 THEN: it names an existing contract file that declares this increment and all required sections are present.
 
+AC-006:
+The reconciler cannot overwrite a newer release marker.
+GIVEN the production controller may deploy while reconciliation is running
+WHEN reconciliation collects evidence, validates or publishes
+THEN it holds the same non-blocking `/var/lock/ohm-deploy.lock`, refuses a busy lock, refuses a conflicting marker, and never replaces a newer release identity.
+
+AC-007:
+Live runtime authority must match the approved release posture.
+GIVEN a healthy, correctly labelled core image
+WHEN its running environment has an unsafe, missing or contradictory authority mode
+THEN reconciliation refuses even if historical acceptance receipts still describe the approved posture.
+
+AC-008:
+Authoritative publication requires durable provenance first.
+GIVEN all checks pass and `--apply` is requested
+WHEN the provenance receipt cannot be written, fsynced, or the marker publication is interrupted
+THEN no authoritative marker is published, the pending or failed state remains durably recorded, and historical receipts remain unchanged.
+
+AC-009:
+Recovery binds production identity separately from tooling identity.
+GIVEN production runs an authenticated SHA earlier than merged recovery tooling
+WHEN an owner invokes the recovery-only deployment path
+THEN tooling must equal current main with successful exact-SHA CI, production must equal the authenticated export manifest and be its ancestor, and the worker records both identities without enabling timers.
+
+AC-010:
+The reader receives only minimum read and traversal permissions.
+GIVEN existing export directories, nested files, symlinks and repeated configuration
+WHEN reader permissions are normalized
+THEN nested directories are group-traversable, files are group-readable, symlinked roots are refused, symlink targets are never modified, and no group or world write bit is granted.
+
+AC-011:
+Canonical lineages are explicitly separated and archived without mutation.
+GIVEN an old 220,721-event canonical replica lineage and a V2 fresh-genesis lineage
+WHEN history is preserved or archived
+THEN the lineages are never merged or relabelled, archival is copy-only with checksummed manifests and append-only receipts, and consumers report lineage-separated counts.
+
 EXPLICITLY OUT OF SCOPE:
 - Deploying, rebuilding, or restarting production containers or systemd units.
 - Executing the provenance reconciler against production; that remains owner-gated.
@@ -75,6 +111,31 @@ AC-003 -> tests/test_release_provenance_reconcile_v1.py::test_idempotent_apply_d
 AC-003 -> tests/test_release_provenance_reconcile_v1.py::test_conflicting_last_good_sha_is_never_overwritten
 AC-004 -> tests/test_learning_reader_permissions_v1.py::test_ci_syntax_gate_covers_reader_scripts
 AC-005 -> tests/test_learning_recovery_scope_v1.py::test_active_increment_points_to_existing_contract
+AC-006 -> tests/test_release_provenance_reconcile_v1.py::test_busy_deploy_lock_is_detected
+AC-006 -> tests/test_release_provenance_reconcile_v1.py::test_reconcile_refuses_when_controller_lock_is_held
+AC-006 -> tests/test_release_provenance_reconcile_v1.py::test_newer_marker_written_after_validation_is_never_overwritten
+AC-007 -> tests/test_release_provenance_reconcile_v1.py::test_live_runtime_authority_override_is_refused
+AC-007 -> tests/test_release_provenance_reconcile_v1.py::test_missing_runtime_authority_is_refused
+AC-007 -> tests/test_release_provenance_reconcile_v1.py::test_truthy_funded_authority_key_is_refused
+AC-007 -> tests/test_release_provenance_reconcile_v1.py::test_core_writer_mode_must_stay_shadow
+AC-008 -> tests/test_release_provenance_reconcile_v1.py::test_receipt_write_failure_blocks_publication
+AC-008 -> tests/test_release_provenance_reconcile_v1.py::test_publication_failure_leaves_durable_pending_provenance
+AC-008 -> tests/test_release_provenance_reconcile_v1.py::test_interrupted_replace_never_publishes_marker
+AC-008 -> tests/test_release_provenance_reconcile_v1.py::test_receipt_is_fsynced_before_marker_replace
+AC-009 -> tests/test_learning_recovery_binding_v1.py::test_valid_recovery_binding_passes_every_check
+AC-009 -> tests/test_learning_recovery_binding_v1.py::test_manifest_must_bind_the_production_sha
+AC-009 -> tests/test_learning_recovery_binding_v1.py::test_arbitrary_old_tooling_sha_is_refused
+AC-009 -> tests/test_learning_recovery_binding_v1.py::test_normal_deploy_identity_equality_is_refused
+AC-009 -> tests/test_learning_recovery_binding_v1.py::test_tooling_ci_must_be_successful
+AC-009 -> tests/test_learning_recovery_binding_v1.py::test_non_ancestor_compare_is_refused
+AC-009 -> tests/test_learning_recovery_binding_v1.py::test_recovery_requires_timers_already_disabled
+AC-009 -> tests/test_learning_recovery_binding_v1.py::test_recovery_workflow_is_owner_gated_and_separate
+AC-009 -> tests/test_learning_recovery_binding_v1.py::test_recovery_script_binds_authenticated_manifest_and_never_enables_timers
+AC-010 -> tests/test_learning_reader_permissions_v1.py::test_repeat_execution_is_idempotent
+AC-010 -> tests/test_learning_reader_permissions_v1.py::test_symlink_inside_export_is_not_followed
+AC-010 -> tests/test_learning_reader_permissions_v1.py::test_symlinked_export_root_is_refused
+AC-010 -> tests/test_learning_reader_permissions_v1.py::test_normalized_tree_has_no_group_or_world_write_bits
+AC-011 -> tests/test_learning_lineage_policy_v1.py::test_canonical_lineage_boundary_and_archival_policy_is_explicit
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/deploy/remote/configure-opip-learning-reader.sh
@@ -90,6 +151,20 @@ AC-004 -> OHM-Trade-Agent-v1/tests/test_learning_reader_permissions_v1.py
 AC-005 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
 AC-005 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-LEARNING-RECOVERY-v1.md
 AC-005 -> OHM-Trade-Agent-v1/tests/test_learning_recovery_scope_v1.py
+AC-006 -> OHM-Trade-Agent-v1/app/services/release_provenance_reconcile.py
+AC-006 -> OHM-Trade-Agent-v1/tests/test_release_provenance_reconcile_v1.py
+AC-007 -> OHM-Trade-Agent-v1/app/services/release_provenance_reconcile.py
+AC-007 -> OHM-Trade-Agent-v1/tests/test_release_provenance_reconcile_v1.py
+AC-008 -> OHM-Trade-Agent-v1/app/services/release_provenance_reconcile.py
+AC-008 -> OHM-Trade-Agent-v1/tests/test_release_provenance_reconcile_v1.py
+AC-009 -> OHM-Trade-Agent-v1/app/services/learning_recovery_binding.py
+AC-009 -> .github/workflows/deploy-learning-recovery.yml
+AC-009 -> OHM-Trade-Agent-v1/deploy/learning/run-recovery-learning-deploy.sh
+AC-009 -> OHM-Trade-Agent-v1/tests/test_learning_recovery_binding_v1.py
+AC-010 -> OHM-Trade-Agent-v1/deploy/remote/opip-learning-reader-permissions.sh
+AC-010 -> OHM-Trade-Agent-v1/tests/test_learning_reader_permissions_v1.py
+AC-011 -> OHM-Trade-Agent-v1/docs/learning/CANONICAL_LINEAGE_BOUNDARY_V1.md
+AC-011 -> OHM-Trade-Agent-v1/tests/test_learning_lineage_policy_v1.py
 
 DEFERRED DISCOVERIES:
 - The production export tree contains historical generations from the previous canonical store (220,721 events) while current production runs a fresh genesis (8,819 events at capture). Retention and archival review remain owner work.
