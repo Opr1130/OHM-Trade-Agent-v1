@@ -13,8 +13,10 @@ from app.services.pending_setup_registry import terminalize_pending_setup
 from app.services.telegram_command_center import process_command_message, refresh_market_watches
 from app.services.asset_display_identity import display_market_label
 from app.services.telegram_notifier import send_telegram_message
+from app.services.telegram_log_safety import install_redaction_filter, safe_error
 
 logger = logging.getLogger(__name__)
+install_redaction_filter(logger)
 
 _stop_event = threading.Event()
 _thread_lock = threading.Lock()
@@ -58,8 +60,12 @@ def answer_callback_query(
         )
         response.raise_for_status()
 
-    except httpx.HTTPError:
-        logger.exception("Failed to answer Telegram callback query")
+    except httpx.HTTPError as exc:
+        # Never render the HTTPX exception: its message carries the token URL.
+        logger.error(
+            "Failed to answer Telegram callback query error=%s",
+            safe_error(exc),
+        )
 
 
 def _authorized_actor(*, chat_id: str, sender_id: str, settings) -> bool:
@@ -316,8 +322,11 @@ def telegram_command_worker_loop() -> None:
             continue
         try:
             process_command_message(update, settings=settings)
-        except Exception:
-            logger.exception("Telegram command worker failed safely")
+        except Exception as exc:  # noqa: BLE001 - worker must never die
+            logger.error(
+                "Telegram command worker failed safely error=%s",
+                safe_error(exc),
+            )
         finally:
             _command_queue.task_done()
 
@@ -389,20 +398,23 @@ def telegram_callback_loop() -> None:
                 try:
                     process_update(update)
 
-                except Exception:
-                    logger.exception(
-                        "Failed processing Telegram update"
+                except Exception as exc:  # noqa: BLE001 - one bad update must not stop polling
+                    logger.error(
+                        "Failed processing Telegram update error=%s",
+                        safe_error(exc),
                     )
 
-        except httpx.HTTPError:
-            logger.exception(
-                "Telegram polling failed"
+        except httpx.HTTPError as exc:
+            logger.error(
+                "Telegram polling failed error=%s",
+                safe_error(exc),
             )
             _stop_event.wait(5)
 
-        except Exception:
-            logger.exception(
-                "Unexpected Telegram listener error"
+        except Exception as exc:  # noqa: BLE001 - listener must stay alive
+            logger.error(
+                "Unexpected Telegram listener error error=%s",
+                safe_error(exc),
             )
             _stop_event.wait(5)
 
@@ -415,10 +427,13 @@ def telegram_watch_loop() -> None:
     while not _stop_event.wait(30):
         try:
             refresh_market_watches(settings=settings)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - advisory refresh must not terminate the listener
             # Watch refresh is informational/advisory and must never terminate
             # the primary Telegram command/callback listener.
-            logger.exception("Telegram market-watch refresh failed safely")
+            logger.error(
+                "Telegram market-watch refresh failed safely error=%s",
+                safe_error(exc),
+            )
 
 
 def _drain_command_queue() -> None:
