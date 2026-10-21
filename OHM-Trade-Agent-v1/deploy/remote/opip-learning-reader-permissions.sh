@@ -22,10 +22,17 @@ if [[ ! -d "$EXPORT_ROOT" ]]; then
   echo "export root does not exist: $EXPORT_ROOT" >&2
   exit 66
 fi
+if [[ -L "$EXPORT_ROOT" ]]; then
+  echo "refusing symlinked export root: $EXPORT_ROOT" >&2
+  exit 67
+fi
 
 chgrp "$READER_GROUP" "$EXPORT_ROOT"
 chmod 0750 "$EXPORT_ROOT"
 
+# find is intentionally symlink-safe (no -L / -follow): a symlink inside the
+# export tree is never chgrp/chmod'ed and can never grant access to a target
+# outside the export root. Symlinked entries simply remain unreadable.
 while IFS= read -r -d '' dir; do
   chgrp "$READER_GROUP" "$dir"
   chmod 0750 "$dir"

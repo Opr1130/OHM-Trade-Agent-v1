@@ -96,3 +96,106 @@ def test_ci_syntax_gate_covers_reader_scripts():
     assert "bash -n deploy/remote/configure-opip-learning-reader.sh" in workflow
     assert "bash -n deploy/remote/opip-learning-reader-permissions.sh" in workflow
 
+
+
+@pytest.mark.acceptance
+def test_repeat_execution_is_idempotent(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-010: contract criterion."""
+    import grp
+
+    group = grp.getgrgid(os.getgid()).gr_name
+    export_root = tmp_path / "export"
+    nested = export_root / "intelligence_learning"
+    nested.mkdir(parents=True, mode=0o700)
+    events = nested / "events.jsonl"
+    events.write_text("{}\n")
+    events.chmod(0o600)
+
+    for _ in range(2):
+        result = subprocess.run(
+            ["bash", str(SCRIPT), str(export_root), group],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+
+    assert _mode(export_root) == 0o750
+    assert _mode(nested) == 0o750
+    assert _mode(events) == 0o640
+
+
+@pytest.mark.acceptance
+def test_symlink_inside_export_is_not_followed(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-010: contract criterion."""
+    import grp
+
+    group = grp.getgrgid(os.getgid()).gr_name
+    export_root = tmp_path / "export"
+    export_root.mkdir(mode=0o700)
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o700)
+    secret = outside / "secret.txt"
+    secret.write_text("outside\n")
+    secret.chmod(0o600)
+    link = export_root / "escape"
+    link.symlink_to(outside, target_is_directory=True)
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT), str(export_root), group],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert link.is_symlink()
+    # The target outside the export root keeps its original restrictive mode.
+    assert _mode(outside) == 0o700
+    assert _mode(secret) == 0o600
+
+
+@pytest.mark.acceptance
+def test_symlinked_export_root_is_refused(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-010: contract criterion."""
+    import grp
+
+    group = grp.getgrgid(os.getgid()).gr_name
+    real = tmp_path / "real"
+    real.mkdir(mode=0o700)
+    link = tmp_path / "linked"
+    link.symlink_to(real, target_is_directory=True)
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT), str(link), group],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 67
+    assert "symlinked export root" in result.stderr
+    assert _mode(real) == 0o700
+
+
+@pytest.mark.acceptance
+def test_normalized_tree_has_no_group_or_world_write_bits(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-010: contract criterion."""
+    import grp
+
+    group = grp.getgrgid(os.getgid()).gr_name
+    export_root = tmp_path / "export"
+    nested = export_root / "paper_trading"
+    nested.mkdir(parents=True, mode=0o700)
+    event = nested / "events.jsonl"
+    event.write_text("{}\n")
+    event.chmod(0o666)
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT), str(export_root), group],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    for path in (export_root, nested, event):
+        assert _mode(path) & 0o022 == 0
+
