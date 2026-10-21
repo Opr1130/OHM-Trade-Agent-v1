@@ -61,6 +61,7 @@ ACCEPTANCE TEST TRACEABILITY:
 AC-001 -> tests/test_telegram_log_redaction_v1.py::test_safe_error_never_contains_the_token
 AC-002 -> tests/test_telegram_log_redaction_v1.py::test_polling_failure_logs_without_the_token
 AC-003 -> tests/test_telegram_log_redaction_v1.py::test_redaction_filter_scrubs_message_and_arguments
+AC-003 -> tests/test_telegram_log_redaction_v1.py::test_directly_logged_exception_is_redacted
 AC-004 -> tests/test_telegram_log_redaction_v1.py::test_listener_uses_no_traceback_logging
 
 IMPLEMENTATION MAP:

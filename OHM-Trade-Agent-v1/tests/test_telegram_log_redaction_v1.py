@@ -244,3 +244,64 @@ def test_authorization_semantics_are_unchanged() -> None:
         chat_id="1234567890", sender_id="77", settings=restricted
     )
 
+
+
+# --- P1: directly logged exceptions and non-string messages ---------------
+
+
+@pytest.mark.acceptance
+def test_directly_logged_exception_is_redacted(caplog) -> None:
+    """ATDD-SEC-TELEGRAM-LOG-REDACTION-v1/AC-003: logger.error(exc) is covered."""
+    exc = _status_error(409)
+    logger = logging.getLogger("app.services.telegram_callback_listener")
+
+    with caplog.at_level(logging.ERROR):
+        logger.error(exc)
+
+    assert TOKEN not in caplog.text
+    assert TOKEN_PATTERN.search(caplog.text) is None
+    assert REDACTED in caplog.text
+
+
+def test_directly_logged_non_exception_object_is_redacted(caplog) -> None:
+    """Any object whose rendered form carries a token is covered too."""
+    logger = logging.getLogger("app.services.telegram_callback_listener")
+
+    with caplog.at_level(logging.ERROR):
+        logger.error(ValueError(f"bad url {URL}"))
+
+    assert TOKEN not in caplog.text
+    assert REDACTED in caplog.text
+
+
+def test_numeric_log_arguments_keep_their_type(caplog) -> None:
+    """Redaction must not stringify numbers: %d/%f formatting has to keep working."""
+    logger = logging.getLogger("app.services.telegram_callback_listener")
+
+    with caplog.at_level(logging.ERROR):
+        logger.error("count=%d ratio=%.2f name=%s", 3, 1.5, "probe")
+
+    assert caplog.records, "record was not emitted"
+    record = caplog.records[-1]
+    assert record.args == (3, 1.5, "probe")
+    assert isinstance(record.args[0], int) and not isinstance(record.args[0], bool)
+    assert isinstance(record.args[1], float)
+    assert record.getMessage() == "count=3 ratio=1.50 name=probe"
+
+
+def test_token_inside_a_numeric_position_is_still_redacted() -> None:
+    """A token passed as a formatting argument is redacted, number types untouched."""
+    record = logging.LogRecord(
+        name="t",
+        level=logging.ERROR,
+        pathname=__file__,
+        lineno=1,
+        msg="retry=%d url=%s",
+        args=(2, URL),
+        exc_info=None,
+    )
+    RedactionFilter().filter(record)
+    assert TOKEN not in record.getMessage()
+    assert REDACTED in record.getMessage()
+    assert record.args[0] == 2
+

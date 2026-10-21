@@ -54,6 +54,28 @@ def safe_error(exc: BaseException) -> str:
     return name[:_CATEGORY_LIMIT]
 
 
+def _redact_value(value: Any) -> Any:
+    """Redact a log message or argument, preserving its type wherever possible.
+
+    Strings are redacted in place. Exceptions and any other object are only
+    replaced when their *rendered* form actually carries a token, so a numeric
+    or boolean argument keeps its type and ``%d``/``%f`` formatting still works.
+    A non-string message (for example ``logger.error(exc)``) is covered too: the
+    formatter would otherwise call ``str()`` on it after this filter runs, which
+    is exactly how a token-bearing exception escaped redaction.
+    """
+    if isinstance(value, str):
+        return redact(value) if TOKEN_PATTERN.search(value) else value
+    # Fast path: these can never carry a token and must keep their type.
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    try:
+        rendered = str(value)
+    except Exception:  # noqa: BLE001 - a broken __str__ must not break logging
+        return value
+    return redact(rendered) if TOKEN_PATTERN.search(rendered) else value
+
+
 class RedactionFilter(logging.Filter):
     """Redact bot tokens from any log record passing through the attached logger.
 
@@ -65,13 +87,14 @@ class RedactionFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003 - stdlib name
         try:
-            if isinstance(record.msg, str) and TOKEN_PATTERN.search(record.msg):
-                record.msg = redact(record.msg)
+            record.msg = _redact_value(record.msg)
             if record.args:
                 if isinstance(record.args, dict):
-                    record.args = {key: redact(value) for key, value in record.args.items()}
+                    record.args = {
+                        key: _redact_value(value) for key, value in record.args.items()
+                    }
                 elif isinstance(record.args, tuple):
-                    record.args = tuple(redact(value) for value in record.args)
+                    record.args = tuple(_redact_value(value) for value in record.args)
         except Exception:  # noqa: BLE001 - logging must never raise
             return True
         return True
