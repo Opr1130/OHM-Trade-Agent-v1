@@ -84,6 +84,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ steps.tooling.outputs.sha }}
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Certify cross-SHA learning compatibility
