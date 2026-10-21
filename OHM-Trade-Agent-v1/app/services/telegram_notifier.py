@@ -6,9 +6,11 @@ import httpx
 
 from app.models.signal import SignalDecision, TradingSignal
 from app.services.asset_display_identity import display_market_label
+from app.services.telegram_log_safety import install_redaction_filter
 
 
 logger = logging.getLogger(__name__)
+install_redaction_filter(logger)
 
 
 def format_trade_alert(signal: TradingSignal, decision: SignalDecision) -> str:
