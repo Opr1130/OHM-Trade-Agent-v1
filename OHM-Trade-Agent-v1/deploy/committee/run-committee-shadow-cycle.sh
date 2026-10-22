@@ -19,6 +19,8 @@ set -euo pipefail
 APP_ROOT="${OPIP_APP_ROOT:-/opt/opip/app}"
 VENV_PYTHON="${OPIP_VENV_PYTHON:-/opt/opip/venv/bin/python}"
 COMMITTEE_HOME="${OPIP_COMMITTEE_HOME:-/var/lib/opip-committee}"
+EVIDENCE_ROOT="${OPIP_COMMITTEE_EVIDENCE_ROOT:-/var/lib/opip-learning}"
+CASE_INPUTS="${OPIP_COMMITTEE_CASE_INPUTS:-${EVIDENCE_ROOT}/committee_case_inputs.jsonl}"
 
 # The plane ships dark. `off` performs no provider call and creates no case; `shadow`
 # is the only value that permits committee work. Activation is a separate,
@@ -45,6 +47,11 @@ if [[ "${MODE}" == "off" ]]; then
   exit 0
 fi
 
+if [[ "${MODE}" != "shadow" ]]; then
+  echo "committee cycle refused: OPIP_COMMITTEE_MODE must be off or shadow" >&2
+  exit 1
+fi
+
 cd "${APP_ROOT}"
 unset PYTHONPATH
 unset PYTHONHOME
@@ -53,4 +60,5 @@ export PYTHONDONTWRITEBYTECODE=1
 
 exec "${VENV_PYTHON}" -s -m app.opip.committee.cycle_runner \
   --release-sha "${RELEASE_SHA}" \
-  --committee-home "${COMMITTEE_HOME}"
+  --committee-home "${COMMITTEE_HOME}" \
+  --case-inputs "${CASE_INPUTS}"
