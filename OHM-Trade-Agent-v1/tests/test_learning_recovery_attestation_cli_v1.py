@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -105,3 +106,90 @@ def test_verify_manifest_cli_rejects_tampered_attestation(tmp_path):
     result = _run(path)
     assert result.returncode == 2
     assert "attestation_path_digests" in result.stdout
+
+@pytest.mark.acceptance
+def test_fetch_comments_cli_writes_every_page_as_one_array(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-017: real paginated-retrieval CLI."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs, urlparse
+
+    pages = [
+        [
+            {
+                "user": {"login": "Opr1130"},
+                "created_at": "2026-10-22T00:58:00Z",
+                "body": f"noise-{page}-{index}",
+                "html_url": f"https://github.com/Opr1130/OHM-Trade-Agent-v1/issues/64#issuecomment-{page}-{index}",
+            }
+            for index in range(100)
+        ]
+        for page in range(1, 7)
+    ] + [
+        [
+            {
+                "user": {"login": "attacker"},
+                "created_at": "2026-10-22T00:59:00Z",
+                "body": "noise-final",
+                "html_url": "https://github.com/attacker/x",
+            }
+            for index in range(65)
+        ]
+    ]
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            if (
+                parsed.path != "/repos/Opr1130/OHM-Trade-Agent-v1/issues/64/comments"
+                or self.headers.get("Authorization") != "bearer test-token"
+            ):
+                self.send_error(401)
+                return
+            page = int(parse_qs(parsed.query)["page"][0])
+            body = json.dumps(pages[page - 1]).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        out = tmp_path / "comments.json"
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(APP_ROOT)
+        env["GH_TOKEN"] = "test-token"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "app.services.learning_recovery_attestation",
+                "fetch-comments",
+                "--repo",
+                "Opr1130/OHM-Trade-Agent-v1",
+                "--issue",
+                "64",
+                "--out",
+                str(out),
+                "--api-url",
+                f"http://127.0.0.1:{server.server_port}",
+            ],
+            cwd=APP_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+    assert result.returncode == 0, result.stderr
+    comments = json.loads(out.read_text(encoding="utf-8"))
+    assert isinstance(comments, list)
+    assert len(comments) == 665
+    assert json.loads(result.stdout)["comments"] == 665

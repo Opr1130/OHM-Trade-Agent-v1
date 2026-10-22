@@ -6,9 +6,12 @@ name: deploy-learning-recovery
 #
 #   /deploy-learning-recovery <authenticated-production-sha>
 #
-# The tooling SHA is always the current main, must have successful exact-SHA CI,
-# and must descend from the production SHA. The worker script additionally
-# verifies the production SHA against the authenticated export manifest.
+# The tooling SHA is always the current main, must have successful exact-SHA
+# pytest, quality-security and Semgrep runs, and must descend from the production
+# SHA. Semgrep is normally PR/dispatch-triggered, so the owner must ensure an
+# exact-main Semgrep run exists before invoking recovery; absence fails closed.
+# The worker script additionally verifies the production SHA against the
+# authenticated export manifest.
 
 on:
   issue_comment:
@@ -58,18 +61,20 @@ jobs:
             echo "Refusing recovery: production equals main; use /deploy-learning." >&2
             exit 65
           }
-          RESULT="$(gh run list \
-            --repo "$GITHUB_REPOSITORY" \
-            --workflow pytest.yml \
-            --branch main \
-            --commit "$TOOLING_SHA" \
-            --limit 1 \
-            --json status,conclusion \
-            --jq '.[0] | [.status,.conclusion] | @tsv')"
-          test "$RESULT" = $'completed\tsuccess' || {
-            echo "Refusing recovery: pytest.yml is not successful for tooling SHA." >&2
-            exit 1
-          }
+          for WORKFLOW in pytest.yml quality-security.yml semgrep.yml; do
+            RESULT="$(gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow "$WORKFLOW" \
+              --branch main \
+              --commit "$TOOLING_SHA" \
+              --limit 1 \
+              --json status,conclusion \
+              --jq '.[0] | [.status,.conclusion] | @tsv')"
+            test "$RESULT" = $'completed\tsuccess' || {
+              echo "Refusing recovery: $WORKFLOW is not successful for tooling SHA." >&2
+              exit 1
+            }
+          done
           COMPARE="$(gh api "repos/$GITHUB_REPOSITORY/compare/$PRODUCTION_SHA...$TOOLING_SHA" --jq '.status')"
           case "$COMPARE" in
             ahead|identical) ;;
@@ -108,8 +113,10 @@ jobs:
           case "$PREPARE_RC" in
             0) ;;
             2)
-              gh api "repos/$GITHUB_REPOSITORY/issues/64/comments?per_page=100" \
-                > "$RUNNER_TEMP/issue64-comments.json"
+              python3 -m app.services.learning_recovery_attestation fetch-comments \
+                --repo "$GITHUB_REPOSITORY" \
+                --issue 64 \
+                --out "$RUNNER_TEMP/issue64-comments.json"
               python3 -m app.services.learning_recovery_attestation select \
                 --comments "$RUNNER_TEMP/issue64-comments.json" \
                 --compatibility "$RUNNER_TEMP/RECOVERY_COMPATIBILITY.json" \
@@ -180,18 +187,20 @@ jobs:
             echo "Refusing recovery: main moved after certification." >&2
             exit 65
           }
-          RESULT="$(gh run list \
-            --repo "$GITHUB_REPOSITORY" \
-            --workflow pytest.yml \
-            --branch main \
-            --commit "$TOOLING_SHA" \
-            --limit 1 \
-            --json status,conclusion \
-            --jq '.[0] | [.status,.conclusion] | @tsv')"
-          test "$RESULT" = $'completed\tsuccess' || {
-            echo "Refusing recovery: exact-SHA CI is no longer successful." >&2
-            exit 1
-          }
+          for WORKFLOW in pytest.yml quality-security.yml semgrep.yml; do
+            RESULT="$(gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow "$WORKFLOW" \
+              --branch main \
+              --commit "$TOOLING_SHA" \
+              --limit 1 \
+              --json status,conclusion \
+              --jq '.[0] | [.status,.conclusion] | @tsv')"
+            test "$RESULT" = $'completed\tsuccess' || {
+              echo "Refusing recovery: $WORKFLOW is not successful for exact SHA." >&2
+              exit 1
+            }
+          done
 
       - name: Run recovery worker update
         id: recovery

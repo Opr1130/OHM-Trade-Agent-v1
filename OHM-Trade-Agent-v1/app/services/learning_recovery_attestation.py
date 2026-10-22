@@ -14,8 +14,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -143,6 +146,66 @@ def attest_manifest(
     ).hexdigest()
     return manifest
 
+
+def fetch_comments(
+    *,
+    repo: str,
+    issue: int,
+    token: str,
+    api_url: str = "https://api.github.com",
+    per_page: int = 100,
+    max_pages: int = 100,
+    urlopen=urllib.request.urlopen,
+) -> list[dict[str, Any]]:
+    """Fetch every issue-comment page into one array.
+
+    Any failed page aborts the entire retrieval; a partial list is never
+    returned for admission. Author login, timestamps and comment URLs are
+    preserved exactly as GitHub returned them.
+    """
+    if not token:
+        raise AttestationError("GitHub token is required for pagination")
+    if not 1 <= per_page <= 100:
+        raise AttestationError("per_page must be between 1 and 100")
+    if max_pages < 1:
+        raise AttestationError("max_pages must be positive")
+    comments: list[dict[str, Any]] = []
+    for page in range(1, max_pages + 1):
+        url = (
+            f"{api_url.rstrip('/')}/repos/{repo}/issues/{issue}/comments"
+            f"?per_page={per_page}&page={page}"
+        )
+        request = urllib.request.Request(url)
+        request.add_header("Authorization", f"bearer {token}")
+        request.add_header("Accept", "application/vnd.github+json")
+        request.add_header("User-Agent", "opip-recovery-attestation")
+        try:
+            with urlopen(request, timeout=45) as response:
+                payload = json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            raise AttestationError(
+                f"GitHub comment pagination failed on page {page}: HTTP {exc.code}"
+            ) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise AttestationError(
+                f"GitHub comment pagination failed on page {page}: {exc}"
+            ) from exc
+        if not isinstance(payload, list):
+            raise AttestationError(
+                f"GitHub comment page {page} is not a JSON array"
+            )
+        if not all(isinstance(item, dict) for item in payload):
+            raise AttestationError(
+                f"GitHub comment page {page} contains a non-object item"
+            )
+        comments.extend(payload)
+        if len(payload) < per_page:
+            return comments
+    raise AttestationError(
+        f"comment pagination exceeded {max_pages} pages; refusing partial results"
+    )
+
+
 def _attestation_from_comment(body: str) -> dict[str, Any] | None:
     if MARKER not in body:
         return None
@@ -255,7 +318,32 @@ def main(argv: list[str] | None = None) -> int:
     verify_parser.add_argument("--manifest", required=True)
     verify_parser.add_argument("--max-age-seconds", type=int, default=DEFAULT_MAX_AGE_SECONDS)
 
+    fetch_parser = sub.add_parser("fetch-comments")
+    fetch_parser.add_argument("--repo", required=True)
+    fetch_parser.add_argument("--issue", type=int, required=True)
+    fetch_parser.add_argument("--out", required=True)
+    fetch_parser.add_argument("--api-url", default="https://api.github.com")
+    fetch_parser.add_argument("--per-page", type=int, default=100)
+
     args = parser.parse_args(argv)
+    if args.command == "fetch-comments":
+        token = os.getenv("GH_TOKEN") or os.getenv("GITHUB_TOKEN") or ""
+        try:
+            comments = fetch_comments(
+                repo=args.repo,
+                issue=args.issue,
+                token=token,
+                api_url=args.api_url,
+                per_page=args.per_page,
+            )
+        except AttestationError as exc:
+            print(f"attestation retrieval refused: {exc}", file=sys.stderr)
+            return 2
+        Path(args.out).write_text(
+            json.dumps(comments, indent=2, sort_keys=True), encoding="utf-8"
+        )
+        print(json.dumps({"comments": len(comments), "out": args.out}))
+        return 0
     try:
         if args.command == "validate":
             compatibility = json.loads(
