@@ -391,17 +391,9 @@ if [[ "$1" == "api" && "$2" == *"/compare/"* ]]; then
   printf 'ahead\\n'
   exit 0
 fi
-if [[ "$1" == "run" ]]; then
-  shift
-  workflow=""
-  while (($#)); do
-    if [[ "$1" == "--workflow" ]]; then
-      workflow="$2"
-      shift 2
-    else
-      shift
-    fi
-  done
+if [[ "$1" == "api" && "$2" == *"/actions/workflows/"* ]]; then
+  path="${2#*/actions/workflows/}"
+  workflow="${path%%/*}"
   if [[ -n "${FAKE_FAIL_WORKFLOW:-}" && "$workflow" == "$FAKE_FAIL_WORKFLOW" ]]; then
     printf 'completed\\tfailure\\n'
   else
