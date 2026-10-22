@@ -113,6 +113,7 @@ exit 54
 @pytest.mark.acceptance
 @pytest.mark.parametrize("name", STEPS)
 def test_exact_sha_green_ci_accepted_through_workflow_api(tmp_path, name):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-020: exact-SHA workflow CI gate."""
     result, output = _invoke(tmp_path, step_name=name)
     assert result.returncode == 0, result.stderr
     if name == STEPS[0]:
@@ -129,6 +130,7 @@ def test_exact_sha_green_ci_accepted_through_workflow_api(tmp_path, name):
 def test_exact_sha_ci_fail_closed_on_invalid_observation(
     tmp_path, name, workflow, failure
 ):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-020: exact-SHA workflow CI gate."""
     good = _run_entry(workflow)
     if failure == "missing":
         entries = []
@@ -157,12 +159,14 @@ def test_exact_sha_ci_fail_closed_on_invalid_observation(
 @pytest.mark.acceptance
 @pytest.mark.parametrize("name", STEPS)
 def test_ci_lookup_api_error_fails_closed(tmp_path, name):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-020: exact-SHA workflow CI gate."""
     result, _ = _invoke(tmp_path, step_name=name, api_error="pytest.yml")
     assert result.returncode != 0
 
 
 @pytest.mark.acceptance
 def test_gate_queries_workflow_identity_sha_and_branch_in_both_steps():
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-020: exact-SHA workflow CI gate."""
     for name in STEPS:
         script = _step(name)
         assert "actions/workflows/$WORKFLOW/runs?head_sha=$TOOLING_SHA&branch=main" in script
