@@ -54,12 +54,13 @@ def _invoke(tmp_path, *, broken=None, step_name=STEPS[0], api_error=None):
     directory = tmp_path / "responses"
     directory.mkdir()
     broken = broken or {}
+    runs = [_run_entry("unrelated.yml", number=999)]
     for workflow in WORKFLOWS:
-        runs = broken.get(workflow, [_run_entry(workflow)])
-        (directory / (workflow + ".json")).write_text(
-            json.dumps({"total_count": len(runs), "workflow_runs": runs}),
-            encoding="utf-8",
-        )
+        runs.extend(broken.get(workflow, [_run_entry(workflow)]))
+    (directory / "runs.json").write_text(
+        json.dumps({"total_count": len(runs), "workflow_runs": runs}),
+        encoding="utf-8",
+    )
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     fake = bin_dir / "gh"
@@ -75,11 +76,10 @@ if [[ "$2" == *"/compare/"* ]]; then
   printf 'ahead\n'
   exit 0
 fi
-if [[ "$2" == *"/actions/workflows/"*"/runs?"* ]]; then
-  w="$(printf '%s' "$2" | cut -d / -f 6)"
-  [[ "$w" != "$FAKE_API_ERROR" ]] || exit 52
+if [[ "$2" == *"/actions/runs?branch=main&per_page=100" ]]; then
+  [[ -z "$FAKE_API_ERROR" ]] || exit 52
   [[ "$3" == "--jq" ]] || exit 53
-  jq -r "$4" "$FAKE_RUNS_ROOT/$w.json"
+  jq -r "$4" "$FAKE_RUNS_ROOT/runs.json"
   exit $?
 fi
 exit 54
@@ -180,7 +180,8 @@ def test_gate_queries_workflow_identity_sha_and_branch_in_both_steps():
     """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-020: exact-SHA workflow CI gate."""
     for name in STEPS:
         script = _step(name)
-        assert "actions/workflows/$WORKFLOW/runs?head_sha=$TOOLING_SHA&branch=main" in script
+        assert "actions/runs?branch=main&per_page=100" in script
+        assert "head_sha=$TOOLING_SHA" not in script
         assert '.head_sha ==' in script
         assert '.head_branch ==' in script
         assert '.path | split(' in script
@@ -188,3 +189,21 @@ def test_gate_queries_workflow_identity_sha_and_branch_in_both_steps():
         assert "completed" in script
         assert "success" in script
         assert "gh run list" not in script
+
+
+@pytest.mark.acceptance
+@pytest.mark.parametrize("name", STEPS)
+def test_d4_successful_runs_survive_many_unrelated_workflow_results(tmp_path, name):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-020: D4 repo-level discovery ignores noise."""
+    result, _ = _invoke(tmp_path, step_name=name)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.acceptance
+@pytest.mark.parametrize("name", STEPS)
+def test_d4_same_run_newer_attempt_must_not_resurrect_prior_success(tmp_path, name):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-020: latest rerun attempt is authoritative."""
+    r = [_run_entry("pytest.yml", number=2, attempt=1),
+         _run_entry("pytest.yml", number=2, attempt=2, conclusion="failure")]
+    result, _ = _invoke(tmp_path, broken={"pytest.yml": r}, step_name=name)
+    assert result.returncode != 0
