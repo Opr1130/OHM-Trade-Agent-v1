@@ -117,6 +117,18 @@ GIVEN: the tooling commit changes one or more critical consumer paths
 WHEN: recovery compatibility is evaluated
 THEN: approval is an owner-authored attestation record created after the exact tooling commit exists, bound to the exact production/tooling SHA pair, changed-path set, per-path hashes, canonical diff digest, owner identity, GitHub record URL, timestamp, rationale and exact-SHA CI evidence; a missing, stale, malformed, wildcard or mismatched attestation fails closed; and the workflow validates it before any remote mutation.
 
+AC-018:
+A later authenticated owner revocation of exact cross-SHA recovery approval always refuses.
+GIVEN: an owner-authenticated attestation authorizes an exact production/tooling pair
+WHEN: the owner later revokes it, posts a later applicable event that is invalid, or posts a fresh re-approval
+THEN: authorization is resolved from authenticated owner events ordered by timestamp and comment identity with latest-applicable-wins, so a revocation or a later invalid event refuses without resurrecting an older approval, a fresh valid re-approval restores authorization, non-owner comments never authorize or revoke, unscoped events apply only to the evaluated pair, missing timestamps and unorderable ties fail closed, and the workflow re-resolves authorization immediately before the first irreversible mutation.
+
+AC-019:
+The cross-SHA critical-file inventory and canonical digest are deterministic across platforms and trees.
+GIVEN: the tooling commit is inspected on any platform or staged into a release tree without Git metadata
+WHEN: compatibility is prepared, hashed and verified
+THEN: every key is a Git-style POSIX path derived from the exact tracked tree, untracked generated artifacts never participate, tracked executables keep participating regardless of filename, duplicate normalized paths and symlink substitution are refused, every changed critical path must be hashed, and the canonical digest is identical on Windows and Linux.
+
 EXPLICITLY OUT OF SCOPE:
 - Deploying, rebuilding, or restarting production containers or systemd units.
 - Executing the provenance reconciler against production; that remains owner-gated.
@@ -250,6 +262,48 @@ AC-017 -> tests/test_learning_recovery_attestation_cli_v1.py::test_verify_manife
 AC-017 -> tests/test_learning_recovery_attestation_cli_v1.py::test_verify_manifest_cli_rejects_tampered_attestation
 AC-017 -> tests/test_learning_recovery_attestation_cli_v1.py::test_fetch_comments_cli_writes_every_page_as_one_array
 AC-015 -> tests/test_learning_recovery_receipt_v1.py::test_sync_preserves_before_replacing_and_marks_after_commit
+AC-018 -> tests/test_learning_recovery_authorization_state_v1.py::test_t01_valid_exact_owner_attestation_is_accepted
+AC-018 -> tests/test_learning_recovery_authorization_state_v1.py::test_t02_wrong_actor_is_rejected
+AC-018 -> tests/test_learning_recovery_authorization_state_v1.py::test_t02b_owner_identity_inside_body_is_not_trusted
+AC-018 -> tests/test_learning_recovery_authorization_state_v1.py::test_t12_original_revocation_fail_open_reproduction_now_holds
+AC-018 -> tests/test_learning_recovery_authorization_state_v1.py::test_t03_structured_revocation_supersedes_approval
+AC-018 -> tests/test_learning_recovery_authorization_state_v1.py::test_t03b_plaintext_revocation_is_honoured
+AC-018 -> tests/test_learning_recovery_authorization_state_v1.py::test_t04_non_owner_revocation_cannot_modify_authorization
+AC-018 -> tests/test_learning_recovery_authorization_state_v1.py::test_t05_unrelated_owner_comment_does_not_revoke
+AC-018 -> tests/test_learning_recovery_authorization_state_v1.py::test_t06_revocation_for_another_pair_does_not_affect_this_pair
+AC-018 -> tests/test_learning_recovery_authorization_state_v1.py::test_t07_malformed_newer_applicable_event_fails_closed_without_fallback
+AC-018 -> tests/test_learning_recovery_authorization_state_v1.py::test_t07b_malformed_newer_revocation_fails_closed
+AC-018 -> tests/test_learning_recovery_authorization_state_v1.py::test_t07c_invalid_newer_approval_does_not_fall_back_to_valid_older
+AC-018 -> tests/test_learning_recovery_authorization_state_v1.py::test_t08_fresh_reapproval_after_revocation_restores_authorization
+AC-018 -> tests/test_learning_recovery_authorization_state_v1.py::test_t09_timestamp_ambiguity_refuses_authorization
+AC-018 -> tests/test_learning_recovery_authorization_state_v1.py::test_t09b_identical_timestamps_are_ordered_by_comment_id
+AC-018 -> tests/test_learning_recovery_authorization_state_v1.py::test_t09c_missing_timestamp_fails_closed
+AC-018 -> tests/test_learning_recovery_authorization_state_v1.py::test_t09d_missing_authenticated_record_identity_is_refused
+AC-018 -> tests/test_learning_recovery_authorization_state_v1.py::test_t23_exactness_overrides_are_refused
+AC-018 -> tests/test_learning_recovery_authorization_state_v1.py::test_t26_ci_failure_is_refused
+AC-018 -> tests/test_learning_recovery_authorization_state_v1.py::test_wrong_path_hash_is_refused
+AC-018 -> tests/test_learning_recovery_authorization_state_v1.py::test_broader_path_scope_is_refused
+AC-018 -> tests/test_learning_recovery_authorization_state_v1.py::test_backward_compatible_approval_only_history_still_passes
+AC-019 -> tests/test_learning_recovery_inventory_determinism_v1.py::test_t14_inventory_keys_are_posix_on_every_platform
+AC-019 -> tests/test_learning_recovery_inventory_determinism_v1.py::test_t14b_tracked_inventory_matches_release_tree_walk
+AC-019 -> tests/test_learning_recovery_inventory_determinism_v1.py::test_t15_path_traversal_keys_are_refused
+AC-019 -> tests/test_learning_recovery_inventory_determinism_v1.py::test_t16_duplicate_normalized_paths_are_rejected
+AC-019 -> tests/test_learning_recovery_inventory_determinism_v1.py::test_t17_generated_artifacts_do_not_change_the_inventory
+AC-019 -> tests/test_learning_recovery_inventory_determinism_v1.py::test_t18_missing_tracked_file_is_refused
+AC-019 -> tests/test_learning_recovery_inventory_determinism_v1.py::test_t19_tampered_tracked_file_is_refused
+AC-019 -> tests/test_learning_recovery_inventory_determinism_v1.py::test_t20_symlinked_critical_path_is_refused
+AC-019 -> tests/test_learning_recovery_inventory_determinism_v1.py::test_t21_release_tree_without_git_still_verifies
+AC-019 -> tests/test_learning_recovery_inventory_determinism_v1.py::test_t22_changed_critical_scope_cannot_be_silently_dropped
+AC-019 -> tests/test_learning_recovery_inventory_determinism_v1.py::test_inventory_is_stable_across_repeated_prepare_calls
+AC-018 -> tests/test_learning_recovery_authorization_boundary_v1.py::test_t13_authorization_revoked_between_check_and_mutation_blocks
+AC-018 -> tests/test_learning_recovery_authorization_boundary_v1.py::test_t13b_workflow_revalidates_authorization_before_mutation
+AC-018 -> tests/test_learning_recovery_authorization_boundary_v1.py::test_t27_main_movement_is_guarded_before_mutation
+AC-009 -> tests/test_learning_recovery_authorization_boundary_v1.py::test_t28_concurrent_recovery_cannot_overlap
+AC-009 -> tests/test_learning_recovery_authorization_boundary_v1.py::test_t29_protected_environment_remains_enforced
+AC-009 -> tests/test_learning_recovery_authorization_boundary_v1.py::test_t30_recovery_never_enables_learning_timers
+AC-009 -> tests/test_learning_recovery_authorization_boundary_v1.py::test_t31_no_core_deployment_path_is_reachable
+AC-009 -> tests/test_learning_recovery_authorization_boundary_v1.py::test_t32_no_authority_flags_are_touched
+
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/deploy/remote/configure-opip-learning-reader.sh
@@ -312,6 +366,14 @@ AC-017 -> OHM-Trade-Agent-v1/app/services/learning_recovery_attestation.py
 AC-017 -> .github/workflows/deploy-learning-recovery.yml
 AC-017 -> OHM-Trade-Agent-v1/tests/test_learning_recovery_attestation_v1.py
 AC-017 -> OHM-Trade-Agent-v1/tests/test_learning_recovery_attestation_cli_v1.py
+AC-009 -> OHM-Trade-Agent-v1/tests/test_learning_recovery_authorization_boundary_v1.py
+AC-018 -> OHM-Trade-Agent-v1/app/services/learning_recovery_attestation.py
+AC-018 -> .github/workflows/deploy-learning-recovery.yml
+AC-018 -> OHM-Trade-Agent-v1/tests/test_learning_recovery_authorization_state_v1.py
+AC-018 -> OHM-Trade-Agent-v1/tests/test_learning_recovery_authorization_boundary_v1.py
+AC-019 -> OHM-Trade-Agent-v1/app/services/learning_recovery_compatibility.py
+AC-019 -> OHM-Trade-Agent-v1/tests/test_learning_recovery_inventory_determinism_v1.py
+
 
 DEFERRED DISCOVERIES:
 - The production export tree contains historical generations from the previous canonical store (220,721 events) while current production runs a fresh genesis (8,819 events at capture). Retention and archival review remain owner work.

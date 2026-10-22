@@ -93,6 +93,7 @@ jobs:
           persist-credentials: false
 
       - name: Certify cross-SHA learning compatibility
+        id: compat
         working-directory: OHM-Trade-Agent-v1
         env:
           PRODUCTION_SHA: ${{ steps.production.outputs.sha }}
@@ -132,6 +133,8 @@ jobs:
             --source-app . \
             --production-sha "$PRODUCTION_SHA" \
             --tooling-sha "$TOOLING_SHA" >/dev/null
+          ATTESTED="$(python3 -c 'import json,sys; print("true" if json.load(open(sys.argv[1])).get("attestation_required") else "false")' "$RUNNER_TEMP/RECOVERY_COMPATIBILITY.json")"
+          echo "attested=$ATTESTED" >> "$GITHUB_OUTPUT"
 
       - name: Validate learning connection secrets
         env:
@@ -201,6 +204,36 @@ jobs:
               exit 1
             }
           done
+
+      - name: Revalidate owner authorization immediately before mutation
+        if: steps.compat.outputs.attested == 'true'
+        working-directory: OHM-Trade-Agent-v1
+        env:
+          PRODUCTION_SHA: ${{ steps.production.outputs.sha }}
+          TOOLING_SHA: ${{ steps.tooling.outputs.sha }}
+          OWNER_LOGIN: ${{ github.repository_owner }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq '.sha')" = "$TOOLING_SHA" || {
+            echo "Refusing mutation: main moved after certification." >&2
+            exit 65
+          }
+          python3 -m app.services.learning_recovery_attestation fetch-comments \
+            --repo "$GITHUB_REPOSITORY" \
+            --issue 64 \
+            --out "$RUNNER_TEMP/issue64-revalidate.json"
+          python3 -m app.services.learning_recovery_attestation select \
+            --comments "$RUNNER_TEMP/issue64-revalidate.json" \
+            --compatibility "$RUNNER_TEMP/RECOVERY_COMPATIBILITY.json" \
+            --owner-login "$OWNER_LOGIN" \
+            --out "$RUNNER_TEMP/RECOVERY_COMPATIBILITY.revalidated.json"
+          python3 -m app.services.learning_recovery_compatibility verify \
+            --manifest "$RUNNER_TEMP/RECOVERY_COMPATIBILITY.revalidated.json" \
+            --source-app . \
+            --production-sha "$PRODUCTION_SHA" \
+            --tooling-sha "$TOOLING_SHA" >/dev/null
+          echo "Authorization revalidated immediately before the first irreversible mutation."
 
       - name: Run recovery worker update
         id: recovery
