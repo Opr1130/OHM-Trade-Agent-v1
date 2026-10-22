@@ -342,6 +342,86 @@ def test_sidecar_identity_compares_lineage_and_source(tmp_path):
 
 
 @pytest.mark.acceptance
+def test_schema_migration_markers_do_not_block_first_lineage_bind(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-015: empty migrated sidecar is bindable."""
+    data = tmp_path / "data"
+    data.mkdir()
+    write_lineage(data, GENESIS)
+    connection = sqlite3.connect(data / "fresh.sqlite3")
+    try:
+        connection.execute("CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT)")
+        connection.execute("CREATE TABLE latest_outcomes(snapshot_id TEXT PRIMARY KEY)")
+        for key in ("latest_outcomes_index_fields_v1", "latest_outcomes_schema_type_v2"):
+            connection.execute("INSERT INTO metadata VALUES(?, '1')", (key,))
+        connection.commit()
+        identity = bind_state_connection(connection, data, "phase3c_forward_outcomes")
+        assert identity is not None
+        assert (
+            connection.execute(
+                "SELECT value FROM metadata WHERE key='lineage_id'"
+            ).fetchone()[0]
+            == GENESIS.lineage_id
+        )
+        remaining = {row[0] for row in connection.execute("SELECT key FROM metadata")}
+        assert {
+            "latest_outcomes_index_fields_v1",
+            "latest_outcomes_schema_type_v2",
+        } <= remaining
+    finally:
+        connection.close()
+
+
+@pytest.mark.acceptance
+def test_schema_markers_with_real_rows_still_refuse(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-015: real state still needs identity."""
+    data = tmp_path / "data"
+    data.mkdir()
+    write_lineage(data, GENESIS)
+    connection = sqlite3.connect(data / "populated.sqlite3")
+    try:
+        connection.execute("CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT)")
+        connection.execute("CREATE TABLE latest_outcomes(snapshot_id TEXT PRIMARY KEY)")
+        for key in ("latest_outcomes_index_fields_v1", "latest_outcomes_schema_type_v2"):
+            connection.execute("INSERT INTO metadata VALUES(?, '1')", (key,))
+        connection.execute("INSERT INTO latest_outcomes VALUES('s1')")
+        connection.commit()
+        with pytest.raises(StateLineageError, match="STATE_LINEAGE_UNBOUND"):
+            bind_state_connection(connection, data, "phase3c_forward_outcomes")
+    finally:
+        connection.close()
+
+
+@pytest.mark.acceptance
+def test_phase3c_open_binds_after_migration_markers(tmp_path, monkeypatch):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-015: the live recovery shape now binds."""
+    from app.jobs.build_phase3c_forward_outcomes import _open_bounded_state
+
+    data = tmp_path / "data"
+    data.mkdir()
+    write_lineage(data, GENESIS)
+    db = data / ".phase3c_forward_outcomes.jsonl.state.sqlite3"
+    seeded = sqlite3.connect(db)
+    try:
+        seeded.execute("CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT)")
+        for key in ("latest_outcomes_index_fields_v1", "latest_outcomes_schema_type_v2"):
+            seeded.execute("INSERT INTO metadata VALUES(?, '1')", (key,))
+        seeded.commit()
+    finally:
+        seeded.close()
+    monkeypatch.setenv("OPIP_LEARNING_DATA_ROOT", str(data))
+    connection = _open_bounded_state(db)
+    try:
+        assert (
+            connection.execute(
+                "SELECT value FROM metadata WHERE key='lineage_id'"
+            ).fetchone()[0]
+            == GENESIS.lineage_id
+        )
+    finally:
+        connection.close()
+
+
+@pytest.mark.acceptance
 def test_routine_generation_rotation_does_not_invalidate_v2_sidecars(tmp_path):
     """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-015: release-lineage granularity."""
     data = tmp_path / "data"

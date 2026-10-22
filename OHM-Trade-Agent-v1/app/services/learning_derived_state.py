@@ -54,6 +54,26 @@ ARTIFACT_SPECS = (
 
 SQLITE_SUFFIXES = ("", "-wal", "-shm")
 
+# Metadata keys that carry lineage identity rather than consumer state.
+LINEAGE_IDENTITY_KEYS = frozenset(
+    {
+        "lineage_id",
+        "lineage_source_release_sha",
+        "lineage_generation_id",
+        "lineage_observed_generation",
+    }
+)
+
+# Metadata keys written by bounded schema migrations. A sidecar is schema-created
+# before it is bound to a lineage, so these markers legitimately exist on an
+# otherwise empty database and must not be read as legacy consumer state.
+SCHEMA_BOOKKEEPING_KEYS = frozenset(
+    {
+        "latest_outcomes_index_fields_v1",
+        "latest_outcomes_schema_type_v2",
+    }
+)
+
 class DerivedStateError(RuntimeError):
     """Base class for fail-closed derived-state failures."""
 
@@ -783,7 +803,12 @@ def bind_state_connection(
             )
         ]
         metadata_keys = {str(item[0]) for item in connection.execute('SELECT key FROM metadata')}
-        populated = bool(metadata_keys - {'lineage_id', 'lineage_source_release_sha', 'lineage_generation_id', 'lineage_observed_generation'})
+        # Schema bookkeeping is not consumer state: a fresh sidecar is created
+        # and migrated before it is bound, so migration markers alone must not
+        # classify it as an unbound legacy sidecar.
+        populated = bool(
+            metadata_keys - LINEAGE_IDENTITY_KEYS - SCHEMA_BOOKKEEPING_KEYS
+        )
         for table in tables:
             if table == "metadata":
                 continue
