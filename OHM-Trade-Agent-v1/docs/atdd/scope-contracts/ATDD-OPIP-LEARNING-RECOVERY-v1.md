@@ -315,6 +315,7 @@ AC-020 -> tests/test_learning_recovery_ci_discovery_v1.py::test_exact_sha_green_
 AC-020 -> tests/test_learning_recovery_ci_discovery_v1.py::test_exact_sha_ci_fail_closed_on_invalid_observation
 AC-020 -> tests/test_learning_recovery_ci_discovery_v1.py::test_ci_lookup_api_error_fails_closed
 AC-020 -> tests/test_learning_recovery_ci_discovery_v1.py::test_gate_queries_workflow_identity_sha_and_branch_in_both_steps
+AC-020 -> tests/test_learning_recovery_ci_discovery_v1.py::test_workflow_path_with_git_ref_suffix_is_valid
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/deploy/remote/configure-opip-learning-reader.sh
