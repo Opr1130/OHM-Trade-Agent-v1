@@ -246,6 +246,9 @@ AC-015 -> tests/test_learning_derived_state_cli_v1.py::test_fresh_lineage_transi
 AC-015 -> tests/test_learning_derived_state_cli_v1.py::test_partially_committed_resume_cli_preserves_v2_inputs
 AC-015 -> tests/test_learning_derived_state_cli_v1.py::test_cli_refuses_unauthenticated_or_missing_input_provenance
 AC-015 -> tests/test_learning_derived_state_v1.py::test_retry_refuses_changed_active_derived_state
+AC-015 -> tests/test_learning_derived_state_v1.py::test_schema_migration_markers_do_not_block_first_lineage_bind
+AC-015 -> tests/test_learning_derived_state_v1.py::test_schema_markers_with_real_rows_still_refuse
+AC-015 -> tests/test_learning_derived_state_v1.py::test_phase3c_open_binds_after_migration_markers
 
 AC-016 -> tests/test_learning_recovery_receipt_v1.py::test_intent_is_prepared_before_terminal_and_is_not_edited
 AC-016 -> tests/test_learning_recovery_receipt_v1.py::test_blocked_terminal_never_asserts_success
