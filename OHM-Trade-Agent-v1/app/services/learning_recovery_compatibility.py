@@ -20,6 +20,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+from app.services.learning_recovery_attestation import (
+    validate_manifest_attestation,
+)
+
+
 CRITICAL_PATHS = (
     # Derived from deploy/learning/opip-learning-job.sh and the modules it runs:
     # capture/reconcile -> run_opip_ml_capture; outcomes ->
@@ -95,6 +100,32 @@ def evaluate(
     return (not unreviewed), unreviewed
 
 
+def _repo_prefix(repo_root: Path) -> str:
+    """Return the app-root prefix relative to the git top-level, if any."""
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return ""
+    top = Path(result.stdout.strip()).resolve()
+    root = Path(repo_root).resolve()
+    try:
+        relative = root.relative_to(top).as_posix()
+    except ValueError:
+        return ""
+    return "" if relative == "." else f"{relative}/"
+
+
+def _strip_prefix(path: str, prefix: str) -> str:
+    value = path.strip().replace("\\", "/")
+    if prefix and value.startswith(prefix):
+        return value[len(prefix) :]
+    return value
+
+
 def prepare(
     *,
     production_sha: str,
@@ -102,6 +133,7 @@ def prepare(
     repo_root: Path,
     exceptions_file: Path,
 ) -> dict:
+    prefix = _repo_prefix(repo_root)
     result = subprocess.run(
         [
             "git",
@@ -120,8 +152,13 @@ def prepare(
     )
     if result.returncode != 0:
         raise ValueError(f"git diff failed: {result.stderr.strip()}")
-    changed = sorted(line for line in result.stdout.splitlines() if line.strip())
+    changed = sorted(
+        _strip_prefix(line, prefix)
+        for line in result.stdout.splitlines()
+        if line.strip()
+    )
     approved, rationale = _exceptions(exceptions_file, production_sha, tooling_sha)
+    approved = {_strip_prefix(path, prefix) for path in approved}
     passed, unreviewed = evaluate(
         production_sha=production_sha,
         tooling_sha=tooling_sha,
@@ -137,6 +174,7 @@ def prepare(
         "changed_critical_paths": changed,
         "approved_paths": sorted(approved),
         "unreviewed_changes": unreviewed,
+        "attestation_required": not passed,
         "exception_rationale": rationale,
         "tooling_sha256": _expand(repo_root),
     }
@@ -182,6 +220,10 @@ def verify(
         if not path.is_file() or _sha256(path) != digest:
             mismatched.append(relative)
     add("compatibility_hashes_match", not mismatched, f"mismatched={mismatched}")
+    if manifest.get("attestation_required") or (
+        manifest.get("changed_critical_paths") and not manifest.get("approved_paths")
+    ):
+        checks.extend(validate_manifest_attestation(manifest))
     return checks
 
 

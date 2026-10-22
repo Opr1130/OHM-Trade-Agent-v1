@@ -74,6 +74,8 @@ SOURCE_APP="$RELEASE_DIR/OHM-Trade-Agent-v1"
 RECOVERY_LOCK="/var/lock/opip-learning-recovery.lock"
 TX_ROOT="$STATE_ROOT/recovery-transactions"
 TX_DIR="$TX_ROOT/$(date -u +%Y%m%dT%H%M%SZ)-${TOOLING_SHA:0:12}-$$"
+RECEIPT="$RECEIPT_DIR/$(date -u +%Y%m%dT%H%M%SZ)-${TOOLING_SHA:0:12}-prod-${PRODUCTION_SHA:0:12}.json"
+RECEIPT_INTENT="${RECEIPT%.json}.intent.json"
 COMPATIBILITY_MANIFEST="$RELEASE_DIR/RECOVERY_COMPATIBILITY.json"
 LEGACY_SOURCE_SHA="8b3cc2712432ca21007be4db0667301d48b89d97"
 LEGACY_LINEAGE="LINEAGE-A-LEGACY"
@@ -152,6 +154,23 @@ if [[ -n "$CURRENT_GEN" && "$CURRENT_SRC" != "$PRODUCTION_SHA" ]]; then
     exit 65
   }
 fi
+# A partially committed V2 host already has a V2 replica but no lineage marker;
+# its legacy sidecars must be archived/retired by the owner before a retry.
+# A fresh legacy host is allowed to reach sync, where the transition helper
+# performs the verified preservation boundary before replacing inputs.
+if [[ -n "$CURRENT_GEN" && "$CURRENT_SRC" == "$PRODUCTION_SHA" && ! -r "$DATA_ROOT/data/.lineage.json" ]]; then
+  if find "$DATA_ROOT/data" -maxdepth 4 -type f \
+      \( -name '*.state.sqlite3' -o -name '*.dedup.sqlite3' \
+         -o -name 'phase3c_forward_outcomes.jsonl' \
+         -o -name 'forward_outcomes.jsonl' \
+         -o -name 'opportunity_accountability_summary.json' \) \
+      -print -quit | grep -q .; then
+    echo "refusing recovery: unbound legacy derived state remains on a committed V2 replica" >&2
+    echo "run the verified derived-state retirement and mark LINEAGE-B-V2-GENESIS first" >&2
+    exit 65
+  fi
+fi
+
 
 
 # Recovery must start from a stopped plane. It never stops a live timer as a
@@ -315,6 +334,26 @@ finally:
     os.close(dir_fd)
 print(f"failure_receipt={path}")
 PY
+  if [[ -r "$RECEIPT_INTENT" && ! -r "$RECEIPT" ]]; then
+    BLOCKED_RECEIPT="${RECEIPT_INTENT%.json}.blocked.json"
+    PYTHONPATH="$SOURCE_APP" python3 -m app.services.learning_recovery_receipt write-terminal \
+      --intent "$RECEIPT_INTENT" \
+      --status BLOCKED \
+      --detail "recovery failed at stage $stage with exit code $rc" \
+      --failure-receipt "$TX_DIR/failure.json" >/dev/null || true
+    if [[ -r "$BLOCKED_RECEIPT" && -r "$ENV_FILE" ]]; then
+      binding_tmp="$(mktemp)"
+      awk -v receipt="$BLOCKED_RECEIPT" '
+        /^OPIP_LEARNING_RECOVERY_BINDING=/ {
+          print "OPIP_LEARNING_RECOVERY_BINDING=" receipt
+          next
+        }
+        { print }
+      ' "$ENV_FILE" >"$binding_tmp" || true
+      chmod 0600 "$binding_tmp" 2>/dev/null || true
+      mv -f -- "$binding_tmp" "$ENV_FILE" 2>/dev/null || true
+    fi
+  fi
   echo "recovery_failed stage=$stage rc=$rc action=$action rollback=$rollback committed=$committed" >&2
   echo "transaction_dir=$TX_DIR" >&2
   exit "$rc"
@@ -412,7 +451,18 @@ PYTHONPATH="$SOURCE_APP" python3 -m app.services.learning_recovery_binding \
   --json >"$BINDING_REPORT"
 BINDING_SHA256="$(sha256sum "$BINDING_REPORT" | awk '{print $1}')"
 
-RECEIPT="$RECEIPT_DIR/$(date -u +%Y%m%dT%H%M%SZ)-${TOOLING_SHA:0:12}-prod-${PRODUCTION_SHA:0:12}.json"
+# Create the durable PREPARED intent before the environment references it. A
+# failed recovery then always has a truthful binding on disk.
+PYTHONPATH="$SOURCE_APP" python3 -m app.services.learning_recovery_receipt write-intent \
+  --path "$RECEIPT_INTENT" \
+  --transaction-id "$TX_DIR" \
+  --production-sha "$PRODUCTION_SHA" \
+  --tooling-sha "$TOOLING_SHA" \
+  --expected-image "$IMAGE" \
+  --expected-image-id "$IMAGE_ID" \
+  --manifest-sha "$manifest_production_sha" \
+  --binding-report-sha256 "$BINDING_SHA256" >/dev/null
+
 STAGE="ENV"
 ENV_BACKUP="$RECEIPT_DIR/$(date -u +%Y%m%dT%H%M%SZ)-opip-learning.env.before-recovery"
 install -o root -g root -m 0600 "$ENV_FILE" "$ENV_BACKUP"
@@ -422,7 +472,7 @@ awk \
   -v production="$PRODUCTION_SHA" \
   -v tooling="$TOOLING_SHA" \
   -v image="$IMAGE" \
-  -v receipt="$RECEIPT" '
+  -v receipt="$RECEIPT_INTENT" '
   BEGIN { sha=0; code=0; img=0; bind=0 }
   /^OPIP_DEPLOYED_SHA=/ { print "OPIP_DEPLOYED_SHA=" production; sha=1; next }
   /^OPIP_LEARNING_CODE_SHA=/ { print "OPIP_LEARNING_CODE_SHA=" tooling; code=1; next }
@@ -488,6 +538,7 @@ fi
 COMPATIBILITY_SHA256="$(sha256sum "$COMPATIBILITY_MANIFEST" | awk '{print $1}')"
 
 RECEIPT_PATH="$RECEIPT" \
+RECEIPT_INTENT="$RECEIPT_INTENT" \
 PRODUCTION_SHA="$PRODUCTION_SHA" \
 TOOLING_SHA="$TOOLING_SHA" \
 CURRENT_MAIN_SHA="$CURRENT_MAIN_SHA" \
@@ -507,15 +558,22 @@ CAPTURE_DISPOSITION="$CAPTURE_DISPOSITION" \
 OUTCOMES_DISPOSITION="$OUTCOMES_DISPOSITION" \
 python3 - <<'PY'
 import datetime
+import hashlib
 import json
 import os
 from pathlib import Path
 
 report_path = Path(os.environ["BINDING_REPORT"])
 report = json.loads(report_path.read_text(encoding="utf-8"))
+intent_path = Path(os.environ["RECEIPT_INTENT"])
+intent_sha = hashlib.sha256(intent_path.read_bytes()).hexdigest()
 payload = {
     "receipt": "OPIP_LEARNING_RECOVERY_DEPLOY",
     "schema": 1,
+    "status": "CERTIFIED",
+    "success": True,
+    "intent_receipt": str(intent_path),
+    "intent_sha256": intent_sha,
     "recorded_at_utc": datetime.datetime.now(datetime.timezone.utc)
     .replace(microsecond=0)
     .isoformat(),
@@ -563,6 +621,18 @@ finally:
     os.close(dir_fd)
 print(f"receipt={path}")
 PY
+
+# The final CERTIFIED receipt now exists, so the environment can point at it.
+binding_tmp="$(mktemp)"
+awk -v receipt="$RECEIPT" '
+  /^OPIP_LEARNING_RECOVERY_BINDING=/ {
+    print "OPIP_LEARNING_RECOVERY_BINDING=" receipt
+    next
+  }
+  { print }
+' "$ENV_FILE" >"$binding_tmp"
+chmod 0600 "$binding_tmp"
+mv -f -- "$binding_tmp" "$ENV_FILE"
 
 echo "O'Pip recovery learning deploy succeeded"
 echo "production_sha=$PRODUCTION_SHA"

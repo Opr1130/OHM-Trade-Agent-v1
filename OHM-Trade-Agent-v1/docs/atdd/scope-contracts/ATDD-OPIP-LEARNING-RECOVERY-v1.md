@@ -99,6 +99,24 @@ GIVEN: worker code is built from a newer tooling SHA while release identity rema
 WHEN: any learning consumer, schema, canonical-replica or production-evidence contract differs
 THEN: every change must match an owner-approved exact-SHA-pair exception and verified tooling hashes, and current main plus exact-SHA CI are revalidated immediately before the remote mutation; otherwise recovery refuses.
 
+AC-015:
+Legacy derived state and replaced inputs are preserved before a lineage transition.
+GIVEN: a V2 input filename collides with a legacy sidecar or ledger whose offsets belong to LINEAGE-A-LEGACY
+WHEN: sync replaces inputs or a consumer opens its sidecar
+THEN: known derived artifacts and replaced inputs are copied to a verified, append-only namespace before replacement; SQLite state is snapshotted with the backup API; only derived active state is retired after a fresh VERIFIED receipt and manifest/payload re-verification; inputs remain; mixed legacy-derived/V2-input archives carry separate artifact-level provenance; and an unbound or mismatched legacy sidecar fails closed.
+
+AC-016:
+Recovery binding receipts exist before they are referenced and never fabricate success.
+GIVEN: a recovery transaction creates a binding path and then fails at any stage
+WHEN: the environment is updated or the terminal receipt is written
+THEN: a durable PREPARED intent exists before `OPIP_LEARNING_RECOVERY_BINDING` references it, CERTIFIED and BLOCKED terminals are separate O_EXCL records, failure leaves a truthful BLOCKED or pending state, and a prior missing binding is materialized only as BLOCKED from existing failure evidence.
+
+AC-017:
+Cross-SHA compatibility approval is external, exact and owner-authenticated.
+GIVEN: the tooling commit changes one or more critical consumer paths
+WHEN: recovery compatibility is evaluated
+THEN: approval is an owner-authored attestation record created after the exact tooling commit exists, bound to the exact production/tooling SHA pair, changed-path set, per-path hashes, canonical diff digest, owner identity, GitHub record URL, timestamp, rationale and exact-SHA CI evidence; a missing, stale, malformed, wildcard or mismatched attestation fails closed; and the workflow validates it before any remote mutation.
+
 EXPLICITLY OUT OF SCOPE:
 - Deploying, rebuilding, or restarting production containers or systemd units.
 - Executing the provenance reconciler against production; that remains owner-gated.
@@ -184,6 +202,54 @@ AC-014 -> tests/test_learning_recovery_compatibility_v1.py::test_recovery_workfl
 AC-014 -> tests/test_learning_recovery_compatibility_v1.py::test_recovery_script_requires_compatibility_transaction_and_archive
 AC-014 -> tests/test_learning_recovery_compatibility_v1.py::test_critical_scope_covers_actual_learning_job_entrypoints
 AC-014 -> tests/test_learning_recovery_compatibility_v1.py::test_actual_outcomes_consumer_change_fails_closed_without_exception
+AC-015 -> tests/test_learning_derived_state_v1.py::test_legacy_offsets_are_archived_before_v2_inputs_are_used
+AC-015 -> tests/test_learning_derived_state_v1.py::test_new_consumer_state_is_empty_and_bound_to_v2
+AC-015 -> tests/test_learning_derived_state_v1.py::test_unbound_legacy_sidecar_fails_closed
+AC-015 -> tests/test_learning_derived_state_v1.py::test_empty_new_sidecar_is_bound_and_mismatch_is_refused
+AC-015 -> tests/test_learning_derived_state_v1.py::test_interrupted_archive_is_not_verified_and_preserves_source
+AC-015 -> tests/test_learning_derived_state_v1.py::test_corrupted_archive_payload_is_not_verified
+AC-015 -> tests/test_learning_derived_state_v1.py::test_equal_size_different_content_is_recorded_with_hash
+AC-015 -> tests/test_learning_derived_state_v1.py::test_insufficient_disk_refuses_before_copy
+AC-015 -> tests/test_learning_derived_state_v1.py::test_partial_archive_destination_is_refused
+AC-015 -> tests/test_learning_derived_state_v1.py::test_corrupted_archive_payload_is_not_verified
+AC-015 -> tests/test_learning_derived_state_v1.py::test_phase3c_open_refuses_legacy_offset_under_v2_marker
+AC-015 -> tests/test_learning_derived_state_v1.py::test_sidecar_identity_compares_lineage_and_source
+AC-015 -> tests/test_learning_derived_state_v1.py::test_routine_generation_rotation_does_not_invalidate_v2_sidecars
+AC-015 -> tests/test_learning_derived_state_v1.py::test_generation_rotation_requires_verified_manifest
+AC-015 -> tests/test_learning_derived_state_v1.py::test_generation_rotation_cannot_change_release_identity
+AC-015 -> tests/test_learning_derived_state_v1.py::test_sidecar_stable_generation_mismatch_fails_closed
+AC-015 -> tests/test_learning_derived_state_v1.py::test_checkpoint_anchor_validation_accepts_current_input
+AC-015 -> tests/test_learning_derived_state_v1.py::test_checkpoint_anchor_validation_rejects_truncation
+AC-015 -> tests/test_learning_derived_state_v1.py::test_mixed_lineage_archive_requires_input_provenance
+AC-015 -> tests/test_learning_derived_state_v1.py::test_mixed_lineage_receipt_separates_derived_and_input_provenance
+AC-015 -> tests/test_learning_derived_state_v1.py::test_existing_archive_is_freshly_verified_before_retirement
+AC-015 -> tests/test_learning_derived_state_v1.py::test_existing_archive_retry_is_idempotent
+AC-015 -> tests/test_learning_derived_state_cli_v1.py::test_fresh_lineage_transition_cli_archives_verified_outgoing_inputs
+AC-015 -> tests/test_learning_derived_state_cli_v1.py::test_partially_committed_resume_cli_preserves_v2_inputs
+AC-015 -> tests/test_learning_derived_state_cli_v1.py::test_cli_refuses_unauthenticated_or_missing_input_provenance
+AC-015 -> tests/test_learning_derived_state_v1.py::test_retry_refuses_changed_active_derived_state
+
+AC-016 -> tests/test_learning_recovery_receipt_v1.py::test_intent_is_prepared_before_terminal_and_is_not_edited
+AC-016 -> tests/test_learning_recovery_receipt_v1.py::test_blocked_terminal_never_asserts_success
+AC-016 -> tests/test_learning_recovery_receipt_v1.py::test_duplicate_intent_is_idempotent_but_foreign_transaction_is_refused
+AC-016 -> tests/test_learning_recovery_receipt_v1.py::test_missing_binding_is_materialized_as_blocked_from_failure
+AC-016 -> tests/test_learning_recovery_receipt_v1.py::test_recovery_script_creates_intent_before_binding_reference
+AC-017 -> tests/test_learning_recovery_attestation_v1.py::test_exact_owner_attestation_is_accepted
+AC-017 -> tests/test_learning_recovery_attestation_v1.py::test_attestation_rejects_wrong_pair_path_digest_and_owner
+AC-017 -> tests/test_learning_recovery_attestation_v1.py::test_attestation_rejects_stale_and_missing_ci
+AC-017 -> tests/test_learning_recovery_attestation_v1.py::test_attested_manifest_without_attestation_is_refused
+AC-017 -> tests/test_learning_recovery_attestation_v1.py::test_comment_selection_uses_owner_and_latest_valid_attestation
+AC-017 -> tests/test_learning_recovery_attestation_v1.py::test_recovery_workflow_authenticates_issue64_attestation
+AC-017 -> tests/test_learning_recovery_attestation_v1.py::test_paginates_more_than_600_comments_and_accepts_final_owner_attestation
+AC-017 -> tests/test_learning_recovery_attestation_v1.py::test_pagination_failure_returns_no_partial_admission
+AC-017 -> tests/test_learning_recovery_attestation_v1.py::test_incomplete_pagination_refuses_partial_results
+AC-017 -> tests/test_learning_recovery_attestation_v1.py::test_pagination_rejects_malformed_pages_and_missing_token
+AC-017 -> tests/test_learning_recovery_attestation_v1.py::test_recovery_workflow_refuses_exact_sha_ci_failure
+AC-017 -> tests/test_learning_recovery_attestation_cli_v1.py::test_verify_manifest_cli_accepts_valid_attestation
+AC-017 -> tests/test_learning_recovery_attestation_cli_v1.py::test_verify_manifest_cli_rejects_missing_attestation
+AC-017 -> tests/test_learning_recovery_attestation_cli_v1.py::test_verify_manifest_cli_rejects_tampered_attestation
+AC-017 -> tests/test_learning_recovery_attestation_cli_v1.py::test_fetch_comments_cli_writes_every_page_as_one_array
+AC-015 -> tests/test_learning_recovery_receipt_v1.py::test_sync_preserves_before_replacing_and_marks_after_commit
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/deploy/remote/configure-opip-learning-reader.sh
@@ -227,6 +293,25 @@ AC-014 -> OHM-Trade-Agent-v1/docs/learning/RECOVERY_COMPATIBILITY_EXCEPTIONS.jso
 AC-014 -> .github/workflows/deploy-learning-recovery.yml
 AC-014 -> OHM-Trade-Agent-v1/deploy/learning/run-recovery-learning-deploy.sh
 AC-014 -> OHM-Trade-Agent-v1/tests/test_learning_recovery_compatibility_v1.py
+AC-015 -> OHM-Trade-Agent-v1/app/services/learning_derived_state.py
+AC-015 -> OHM-Trade-Agent-v1/deploy/learning/opip-learning-sync.sh
+AC-015 -> OHM-Trade-Agent-v1/deploy/learning/README.md
+AC-015 -> OHM-Trade-Agent-v1/docs/learning/DERIVED_STATE_LINEAGE_TRANSITION_V1.md
+AC-015 -> OHM-Trade-Agent-v1/app/jobs/build_phase3c_forward_outcomes.py
+AC-015 -> OHM-Trade-Agent-v1/app/opip/discovery/maturation.py
+AC-015 -> OHM-Trade-Agent-v1/app/services/opportunity_accountability.py
+AC-015 -> OHM-Trade-Agent-v1/tests/test_learning_derived_state_v1.py
+AC-015 -> OHM-Trade-Agent-v1/tests/test_learning_derived_state_cli_v1.py
+AC-016 -> OHM-Trade-Agent-v1/app/services/learning_recovery_receipt.py
+AC-016 -> OHM-Trade-Agent-v1/app/services/learning_recovery_attestation.py
+AC-016 -> .github/workflows/deploy-learning-recovery.yml
+AC-016 -> OHM-Trade-Agent-v1/deploy/learning/run-recovery-learning-deploy.sh
+AC-016 -> OHM-Trade-Agent-v1/tests/test_learning_recovery_receipt_v1.py
+AC-016 -> OHM-Trade-Agent-v1/tests/test_learning_recovery_attestation_v1.py
+AC-017 -> OHM-Trade-Agent-v1/app/services/learning_recovery_attestation.py
+AC-017 -> .github/workflows/deploy-learning-recovery.yml
+AC-017 -> OHM-Trade-Agent-v1/tests/test_learning_recovery_attestation_v1.py
+AC-017 -> OHM-Trade-Agent-v1/tests/test_learning_recovery_attestation_cli_v1.py
 
 DEFERRED DISCOVERIES:
 - The production export tree contains historical generations from the previous canonical store (220,721 events) while current production runs a fresh genesis (8,819 events at capture). Retention and archival review remain owner work.

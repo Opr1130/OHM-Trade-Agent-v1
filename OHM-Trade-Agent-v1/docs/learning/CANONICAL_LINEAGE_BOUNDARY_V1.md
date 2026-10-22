@@ -47,6 +47,46 @@ must be archived:
 An interrupted archive is never treated as complete and never authorises
 pruning.
 
+## Derived-state isolation
+
+Canonical replica archival alone does not protect learning consumers. Their
+sidecar databases and output ledgers are also lineage-bound. A schema-4 V2 file
+can have the same name as a legacy file while carrying unrelated content, so a
+stored byte offset must never be applied by filename alone.
+
+Before a lineage-changing sync replaces an input, the worker must:
+
+1. Enumerate the reviewed artifacts in
+   `app/services/learning_derived_state.py` (SQLite sidecars, output ledgers,
+   consumption/coverage state, checkpoints, and the inputs about to be replaced).
+2. Snapshot SQLite through the SQLite backup API, recording source WAL/SHM
+   presence and hashes without treating raw WAL as a standalone archive.
+3. Copy and hash every selected artifact into a unique staging directory, write
+   a `PREPARED` manifest, re-verify it, and atomically publish the archive.
+4. Write a `VERIFIED` append-only receipt, then retire **derived** active files
+   only. Inputs remain until sync replaces them. A failed or interrupted archive
+   is never `VERIFIED` and never authorises retirement.
+5. Write `data/.lineage.json` only after the new manifest and replica pointer are
+   committed. Replica generation is operational evidence: rotation for the same
+   `(lineage_id, source_release_sha)` is permitted via `--rotate-generation`,
+   while a cross-lineage or cross-release replacement is refused. New sidecars
+   record `lineage_id` and source release as the complete identity tuple;
+   `lineage_observed_generation` is audit metadata and does not invalidate state
+   on routine rotation. A populated legacy sidecar with no identity, or one bound
+   to another lineage/source release, fails closed.
+
+Known unrecoverable gaps are recorded in the receipt with artifact identity,
+last-known size/hash when available, and downstream impact. Missing bytes are
+never reconstructed from offsets or counts.
+
+## Partially committed recovery
+
+When a V2 replica is already current but legacy derived state remains, the host
+is a partially committed recovery. It must not be forced through the
+first-transition path. The owner archives/retires the enumerated legacy derived
+state against the already-committed V2 identity, writes the V2 lineage marker,
+and only then retries the one-shot recovery. Timers remain disabled throughout.
+
 ## Consumer rules
 
 - Every replica generation carries `lineage_id` and `source_release_sha`.
