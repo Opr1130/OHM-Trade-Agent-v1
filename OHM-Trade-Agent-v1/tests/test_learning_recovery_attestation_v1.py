@@ -391,10 +391,8 @@ if [[ "$1" == "api" && "$2" == *"/compare/"* ]]; then
   printf 'ahead\\n'
   exit 0
 fi
-if [[ "$1" == "api" && "$2" == *"/actions/workflows/"* ]]; then
-  path="${2#*/actions/workflows/}"
-  workflow="${path%%/*}"
-  if [[ -n "${FAKE_FAIL_WORKFLOW:-}" && "$workflow" == "$FAKE_FAIL_WORKFLOW" ]]; then
+if [[ "$1" == "api" && "$2" == *"/actions/runs?branch=main&per_page=100" ]]; then
+  if [[ -n "${FAKE_FAIL_WORKFLOW:-}" && "$4" == *".github/workflows/$FAKE_FAIL_WORKFLOW"* ]]; then
     printf 'completed\\tfailure\\n'
   else
     printf 'completed\\tsuccess\\n'
