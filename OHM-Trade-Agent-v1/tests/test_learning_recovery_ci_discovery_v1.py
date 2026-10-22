@@ -164,6 +164,17 @@ def test_ci_lookup_api_error_fails_closed(tmp_path, name):
     assert result.returncode != 0
 
 
+
+@pytest.mark.acceptance
+@pytest.mark.parametrize("name", STEPS)
+@pytest.mark.parametrize("suffix", ["@main", "@refs/heads/main", "@" + SHA])
+def test_workflow_path_with_git_ref_suffix_is_valid(tmp_path, name, suffix):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-020: GitHub path @ref form remains valid."""
+    entries = {w: [_run_entry(w, path=".github/workflows/" + w + suffix)]
+               for w in WORKFLOWS}
+    result, _ = _invoke(tmp_path, broken=entries, step_name=name)
+    assert result.returncode == 0, result.stderr
+
 @pytest.mark.acceptance
 def test_gate_queries_workflow_identity_sha_and_branch_in_both_steps():
     """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-020: exact-SHA workflow CI gate."""
@@ -172,7 +183,7 @@ def test_gate_queries_workflow_identity_sha_and_branch_in_both_steps():
         assert "actions/workflows/$WORKFLOW/runs?head_sha=$TOOLING_SHA&branch=main" in script
         assert '.head_sha ==' in script
         assert '.head_branch ==' in script
-        assert '.path ==' in script
+        assert '.path | split(' in script
         assert "sort_by(.run_number, .run_attempt)" in script
         assert "completed" in script
         assert "success" in script
