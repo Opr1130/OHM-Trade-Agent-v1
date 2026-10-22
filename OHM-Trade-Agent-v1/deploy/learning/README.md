@@ -33,7 +33,19 @@ Production exports copy-only, non-authoritative JSON/JSONL evidence:
 - `opip_trade_quality_evidence_v1.jsonl`
 - `candidate_trace.jsonl`
 
-## Canonical learning replica (PR-A)
+## Derived-state lineage boundary
+
+Sidecar SQLite databases and local output ledgers are lineage-bound. Before a
+sync whose authenticated source release differs from the active lineage, the
+worker invokes `app.services.learning_derived_state` to snapshot SQLite through
+the backup API, copy and hash the reviewed derived/input inventory, publish a
+`VERIFIED` archive, and retire only derived active state. Inputs remain until
+sync replaces them. A partially committed V2 host with no lineage marker is
+refused until the owner runs the same retirement against the already-current V2
+replica and writes `data/.lineage.json`; it is never forced through the
+first-transition path. Consumers reject a populated sidecar with no lineage
+identity instead of applying a legacy offset by filename.
+
 
 The JSON/JSONL artifacts above are **not** the authority for terminal paper
 outcomes. Canonical terminal paper economic truth lives in the production

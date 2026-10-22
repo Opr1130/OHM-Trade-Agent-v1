@@ -13,6 +13,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
 from typing import Any, Iterable, Mapping, Sequence
@@ -37,6 +38,7 @@ from app.opip.discovery.store import (
 )
 from app.opip.early.point_in_time import parse_timestamp
 from app.opip.storage.bounded_jsonl import repair_truncated_tail
+from app.services.learning_derived_state import bind_state_connection
 from app.services.registry_io import registry_lock
 from app.services.signal_quality_phase2 import build_timelines, read_observations
 
@@ -161,6 +163,15 @@ def open_discovery_state(path: Path) -> sqlite3.Connection:
         "CREATE INDEX IF NOT EXISTS idx_discovery_queue_venue "
         "ON observation_queue(venue_instrument_id)"
     )
+    try:
+        bind_state_connection(
+            connection,
+            Path(os.getenv("OPIP_LEARNING_DATA_ROOT", "/app/data")),
+            "discovery_forward_outcomes",
+        )
+    except Exception:
+        connection.close()
+        raise
     connection.commit()
     return connection
 

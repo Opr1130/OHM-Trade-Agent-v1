@@ -34,7 +34,7 @@ source "$ENV_FILE"
   exit 78
 }
 
-for cmd in ssh tar install flock mv date sha256sum stat awk rm find sort xargs docker realpath; do
+for cmd in ssh tar install flock mv date sha256sum stat awk rm find sort xargs docker realpath python3; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "missing learning sync command: $cmd" >&2
     exit 69
@@ -256,6 +256,28 @@ replica_helper() {
     python -m app.opip.learning.canonical_replica "$@"
 }
 
+# Derived-state evidence helper. The whole data root and state root are mounted
+# because the archive is the trusted administrative boundary; learning job
+# containers never receive this writable view.
+derived_state_helper() {
+  docker run --rm \
+    --network none \
+    --read-only \
+    --cap-drop ALL \
+    --security-opt no-new-privileges:true \
+    --pids-limit 128 \
+    --memory 384m \
+    --memory-swap 384m \
+    --cpus 0.60 \
+    --oom-score-adj 700 \
+    --tmpfs /tmp:rw,noexec,nosuid,size=96m \
+    -e PYTHONDONTWRITEBYTECODE=1 \
+    -v "$DATA_ROOT:/app/data" \
+    -v "$STATE_ROOT:/app/state" \
+    "$OPIP_LEARNING_IMAGE" \
+    python -m app.services.learning_derived_state "$@"
+}
+
 validate_canonical_replica_outer() {
   local bundle="$INCOMING/$CANONICAL_REPLICA_INCOMING_NAME"
   [[ -d "$bundle" ]] || {
@@ -438,11 +460,78 @@ if (( CANONICAL_REPLICA_REQUIRED )); then
   validate_canonical_replica_outer
   validate_canonical_replica_inner
 fi
+# A lineage change must cross a durable preservation boundary before sync
+# replaces any input. The helper archives the known legacy derived state and the
+# inputs that are about to be replaced, verifies the archive, and only then
+# removes derived active state. Inputs remain until sync replaces them.
+lineage_id_for_sha() {
+  case "$1" in
+    8b3cc2712432ca21007be4db0667301d48b89d97) printf 'LINEAGE-A-LEGACY\n' ;;
+    a26d664972075b2a220a466215cf71e389decb86) printf 'LINEAGE-B-V2-GENESIS\n' ;;
+    *) printf 'LINEAGE-%s\n' "${1:0:12}" ;;
+  esac
+}
+
+previous_sha=""
+previous_lineage=""
+previous_generation=""
+if [[ -r "$DATA_ROOT/.lineage.json" ]]; then
+  previous_sha="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("source_release_sha",""))' "$DATA_ROOT/.lineage.json")"
+  previous_lineage="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("lineage_id",""))' "$DATA_ROOT/.lineage.json")"
+  previous_generation="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("generation_id",""))' "$DATA_ROOT/.lineage.json")"
+else
+  previous_sha="$(state_value "$DATA_ROOT/manifest.env" production_deployed_sha)"
+  previous_lineage="$(lineage_id_for_sha "${previous_sha:-}")"
+  if [[ -r "$CANONICAL_REPLICA_ROOT/current" ]]; then
+    previous_generation="$(tr -d '[:space:]' <"$CANONICAL_REPLICA_ROOT/current")"
+  fi
+fi
+
+if [[ -n "$previous_sha" && "$previous_sha" != "$production_sha" ]]; then
+  [[ "$previous_generation" =~ ^gen-[0-9a-f]{16}$ ]] || {
+    echo "O'Pip learning sync: refusing lineage transition without a known outgoing generation" >&2
+    exit 65
+  }
+  [[ "$previous_lineage" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
+    echo "O'Pip learning sync: refusing lineage transition without a known outgoing lineage" >&2
+    exit 65
+  }
+  active_lineage="$(lineage_id_for_sha "$production_sha")"
+  transition_stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  transition_archive="/app/state/derived-lineages/$previous_lineage/${transition_stamp}-$previous_generation"
+  echo "O'Pip learning sync: preserving $previous_lineage derived state before $production_sha" >&2
+  derived_state_helper retire \
+    --data-root /app/data \
+    --archive-root "$transition_archive" \
+    --lineage-id "$previous_lineage" \
+    --source-sha "$previous_sha" \
+    --generation-id "$previous_generation" \
+    --active-lineage "$active_lineage" \
+    --reason LINEAGE_TRANSITION \
+    --preserve-inputs >/dev/null
+fi
+
 
 rm -f -- \
   "$DATA_ROOT/p1_shadow_outbox.jsonl" \
   "$DATA_ROOT/p1_shadow_outbox_checkpoint.json" \
   "$DATA_ROOT/p1_shadow_outbox_dead_letter.jsonl"
+
+# A partially committed V1->V2 host has no lineage marker but already carries
+# V2 inputs. Its legacy sidecars cannot be adopted; refuse until the owner has
+# run the verified derived-state retirement and marked the active lineage.
+if [[ ! -r "$DATA_ROOT/.lineage.json" && -n "$previous_sha" && "$previous_sha" == "$production_sha" ]]; then
+  if find "$DATA_ROOT" -maxdepth 4 -type f \
+      \( -name '*.state.sqlite3' -o -name '*.dedup.sqlite3' \
+         -o -name 'phase3c_forward_outcomes.jsonl' \
+         -o -name 'forward_outcomes.jsonl' \
+         -o -name 'opportunity_accountability_summary.json' \) \
+      -print -quit | grep -q .; then
+    echo "O'Pip learning sync: refusing to reuse unbound legacy derived state" >&2
+    echo "O'Pip learning sync: archive/retire it and mark the active lineage first" >&2
+    exit 65
+  fi
+fi
 
 for name in \
   full_market_observations.jsonl \
@@ -477,6 +566,23 @@ mv -f -- "$INCOMING/manifest.env" "$DATA_ROOT/manifest.env"
 if (( CANONICAL_REPLICA_REQUIRED )); then
   install_canonical_replica
 fi
+# Bind all subsequently created consumer sidecars to the newly installed
+# lineage. This is written only after the data manifest and replica pointer are
+# committed; a failed marker write leaves no ambiguous active lineage because
+# the next sync retries before jobs are allowed to run.
+if (( CANONICAL_REPLICA_REQUIRED )); then
+  AFTER_GENERATION="$(tr -d '[:space:]' <"$CANONICAL_REPLICA_ROOT/current")"
+  [[ "$AFTER_GENERATION" =~ ^gen-[0-9a-f]{16}$ ]] || {
+    echo "O'Pip learning sync: committed replica generation is invalid" >&2
+    exit 65
+  }
+  derived_state_helper mark-lineage \
+    --data-root /app/data \
+    --lineage-id "$(lineage_id_for_sha "$production_sha")" \
+    --source-sha "$production_sha" \
+    --generation-id "$AFTER_GENERATION" >/dev/null
+fi
+
 
 rm -f "$ARCHIVE"
 # Clear attempt-scoped incoming data so failed or repeated syncs cannot

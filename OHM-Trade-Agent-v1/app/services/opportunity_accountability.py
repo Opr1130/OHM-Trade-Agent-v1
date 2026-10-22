@@ -43,6 +43,7 @@ from app.opip.learning.coverage_discontinuity import (
 )
 from app.opip.discovery.admission import observation_join_id
 from app.opip.storage.bounded_jsonl import ArchiveWindowSelection
+from app.services.learning_derived_state import bind_state_connection
 from app.scanner.candidates import MIN_TECHNICAL_SCORE
 
 
@@ -801,6 +802,15 @@ def _open_state(path: Path) -> sqlite3.Connection:
         connection.execute(
             "ALTER TABLE latest ADD COLUMN range_consumed_proxy REAL"
         )
+    try:
+        bind_state_connection(
+            connection,
+            Path(os.getenv("OPIP_LEARNING_DATA_ROOT", "/app/data")),
+            "opportunity_accountability",
+        )
+    except Exception:
+        connection.close()
+        raise
     connection.commit()
     return connection
 

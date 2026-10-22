@@ -17,6 +17,7 @@ from pathlib import Path
 import sqlite3
 from typing import Any
 
+from app.services.learning_derived_state import bind_state_connection
 from app.services.phase3c_outcomes import (
     FORWARD_OUTCOME_LABEL_SCHEMA_VERSION,
     build_forward_outcome_labels,
@@ -378,6 +379,15 @@ def _open_bounded_state(path: Path) -> sqlite3.Connection:
     # migration is an explicit bounded maintenance operation
     # (advance_accountability_handoff_backfill). Opening the DB repeatedly
     # during one outcomes cycle must not silently advance multiple batches.
+    try:
+        bind_state_connection(
+            connection,
+            Path(os.getenv("OPIP_LEARNING_DATA_ROOT", "/app/data")),
+            "phase3c_forward_outcomes",
+        )
+    except Exception:
+        connection.close()
+        raise
     connection.commit()
     return connection
 
