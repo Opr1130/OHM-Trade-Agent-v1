@@ -199,7 +199,10 @@ AC-014 -> tests/test_learning_recovery_compatibility_v1.py::test_actual_outcomes
 AC-015 -> tests/test_learning_derived_state_v1.py::test_legacy_offsets_are_archived_before_v2_inputs_are_used
 AC-015 -> tests/test_learning_derived_state_v1.py::test_new_consumer_state_is_empty_and_bound_to_v2
 AC-015 -> tests/test_learning_derived_state_v1.py::test_unbound_legacy_sidecar_fails_closed
+AC-015 -> tests/test_learning_derived_state_v1.py::test_empty_new_sidecar_is_bound_and_mismatch_is_refused
 AC-015 -> tests/test_learning_derived_state_v1.py::test_interrupted_archive_is_not_verified_and_preserves_source
+AC-015 -> tests/test_learning_derived_state_v1.py::test_corrupted_archive_payload_is_not_verified
+AC-015 -> tests/test_learning_derived_state_v1.py::test_equal_size_different_content_is_recorded_with_hash
 AC-015 -> tests/test_learning_derived_state_v1.py::test_insufficient_disk_refuses_before_copy
 AC-015 -> tests/test_learning_derived_state_v1.py::test_partial_archive_destination_is_refused
 AC-015 -> tests/test_learning_derived_state_v1.py::test_corrupted_archive_payload_is_not_verified
@@ -255,6 +258,8 @@ AC-014 -> OHM-Trade-Agent-v1/deploy/learning/run-recovery-learning-deploy.sh
 AC-014 -> OHM-Trade-Agent-v1/tests/test_learning_recovery_compatibility_v1.py
 AC-015 -> OHM-Trade-Agent-v1/app/services/learning_derived_state.py
 AC-015 -> OHM-Trade-Agent-v1/deploy/learning/opip-learning-sync.sh
+AC-015 -> OHM-Trade-Agent-v1/deploy/learning/README.md
+AC-015 -> OHM-Trade-Agent-v1/docs/learning/DERIVED_STATE_LINEAGE_TRANSITION_V1.md
 AC-015 -> OHM-Trade-Agent-v1/app/jobs/build_phase3c_forward_outcomes.py
 AC-015 -> OHM-Trade-Agent-v1/app/opip/discovery/maturation.py
 AC-015 -> OHM-Trade-Agent-v1/app/services/opportunity_accountability.py
