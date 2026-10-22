@@ -65,7 +65,7 @@ jobs:
             # GitHub's workflow-specific REST endpoint filters by the exact commit and branch.
             # Re-check returned identities; never trust an empty/stale/other-SHA match.
             RESULT="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$WORKFLOW/runs?head_sha=$TOOLING_SHA&branch=main&per_page=100" \
-              --jq ".workflow_runs | map(select(.head_sha == \"$TOOLING_SHA\" and .head_branch == \"main\" and .path == \".github/workflows/$WORKFLOW\")) | sort_by(.run_number, .run_attempt) | last | if . == null then [\"missing\", \"missing\"] else [.status, .conclusion] end | @tsv")"
+              --jq ".workflow_runs | map(select(.head_sha == \"$TOOLING_SHA\" and .head_branch == \"main\" and (.path | split(\"@\")[0]) == \".github/workflows/$WORKFLOW\")) | sort_by(.run_number, .run_attempt) | last | if . == null then [\"missing\", \"missing\"] else [.status, .conclusion] end | @tsv")"
             test "$RESULT" = $'completed\tsuccess' || {
               echo "Refusing recovery: $WORKFLOW is not successful for tooling SHA (observed=$RESULT)." >&2
               exit 1
@@ -190,7 +190,7 @@ jobs:
             # GitHub's workflow-specific REST endpoint filters by the exact commit and branch.
             # Re-check returned identities; never trust an empty/stale/other-SHA match.
             RESULT="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$WORKFLOW/runs?head_sha=$TOOLING_SHA&branch=main&per_page=100" \
-              --jq ".workflow_runs | map(select(.head_sha == \"$TOOLING_SHA\" and .head_branch == \"main\" and .path == \".github/workflows/$WORKFLOW\")) | sort_by(.run_number, .run_attempt) | last | if . == null then [\"missing\", \"missing\"] else [.status, .conclusion] end | @tsv")"
+              --jq ".workflow_runs | map(select(.head_sha == \"$TOOLING_SHA\" and .head_branch == \"main\" and (.path | split(\"@\")[0]) == \".github/workflows/$WORKFLOW\")) | sort_by(.run_number, .run_attempt) | last | if . == null then [\"missing\", \"missing\"] else [.status, .conclusion] end | @tsv")"
             test "$RESULT" = $'completed\tsuccess' || {
               echo "Refusing recovery: $WORKFLOW is not successful for tooling SHA (observed=$RESULT)." >&2
               exit 1
