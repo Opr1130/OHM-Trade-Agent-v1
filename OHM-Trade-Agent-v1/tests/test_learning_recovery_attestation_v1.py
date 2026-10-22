@@ -392,8 +392,8 @@ if [[ "$1" == "api" && "$2" == *"/compare/"* ]]; then
   exit 0
 fi
 if [[ "$1" == "api" && "$2" == *"/actions/workflows/"* ]]; then
-  path="${2%%\\?*}"
-  workflow="${path##*/}"
+  path="${2#*/actions/workflows/}"
+  workflow="${path%%/*}"
   if [[ -n "${FAKE_FAIL_WORKFLOW:-}" && "$workflow" == "$FAKE_FAIL_WORKFLOW" ]]; then
     printf 'completed\\tfailure\\n'
   else
