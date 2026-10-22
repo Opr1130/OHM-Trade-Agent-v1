@@ -76,7 +76,8 @@ def validate(
     approved_at = None
     try:
         approved_at = _parse_utc(str(attestation.get("approved_at_utc") or ""))
-        age_ok = (now or datetime.now(timezone.utc)) - approved_at <= timedelta(
+        current = now or datetime.now(timezone.utc)
+        age_ok = approved_at <= current + timedelta(minutes=5) and current - approved_at <= timedelta(
             seconds=max_age_seconds
         )
         add("attestation_fresh", age_ok, approved_at.isoformat())
