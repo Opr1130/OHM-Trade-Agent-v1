@@ -95,6 +95,32 @@ def evaluate(
     return (not unreviewed), unreviewed
 
 
+def _repo_prefix(repo_root: Path) -> str:
+    """Return the app-root prefix relative to the git top-level, if any."""
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return ""
+    top = Path(result.stdout.strip()).resolve()
+    root = Path(repo_root).resolve()
+    try:
+        relative = root.relative_to(top).as_posix()
+    except ValueError:
+        return ""
+    return "" if relative == "." else f"{relative}/"
+
+
+def _strip_prefix(path: str, prefix: str) -> str:
+    value = path.strip().replace("\\", "/")
+    if prefix and value.startswith(prefix):
+        return value[len(prefix) :]
+    return value
+
+
 def prepare(
     *,
     production_sha: str,
@@ -102,6 +128,7 @@ def prepare(
     repo_root: Path,
     exceptions_file: Path,
 ) -> dict:
+    prefix = _repo_prefix(repo_root)
     result = subprocess.run(
         [
             "git",
@@ -120,8 +147,13 @@ def prepare(
     )
     if result.returncode != 0:
         raise ValueError(f"git diff failed: {result.stderr.strip()}")
-    changed = sorted(line for line in result.stdout.splitlines() if line.strip())
+    changed = sorted(
+        _strip_prefix(line, prefix)
+        for line in result.stdout.splitlines()
+        if line.strip()
+    )
     approved, rationale = _exceptions(exceptions_file, production_sha, tooling_sha)
+    approved = {_strip_prefix(path, prefix) for path in approved}
     passed, unreviewed = evaluate(
         production_sha=production_sha,
         tooling_sha=tooling_sha,
