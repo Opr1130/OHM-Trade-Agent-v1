@@ -20,6 +20,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+from app.services.learning_recovery_attestation import (
+    validate_manifest_attestation,
+)
+
+
 CRITICAL_PATHS = (
     # Derived from deploy/learning/opip-learning-job.sh and the modules it runs:
     # capture/reconcile -> run_opip_ml_capture; outcomes ->
@@ -169,6 +174,7 @@ def prepare(
         "changed_critical_paths": changed,
         "approved_paths": sorted(approved),
         "unreviewed_changes": unreviewed,
+        "attestation_required": not passed,
         "exception_rationale": rationale,
         "tooling_sha256": _expand(repo_root),
     }
@@ -214,6 +220,10 @@ def verify(
         if not path.is_file() or _sha256(path) != digest:
             mismatched.append(relative)
     add("compatibility_hashes_match", not mismatched, f"mismatched={mismatched}")
+    if manifest.get("attestation_required") or (
+        manifest.get("changed_critical_paths") and not manifest.get("approved_paths")
+    ):
+        checks.extend(validate_manifest_attestation(manifest))
     return checks
 
 

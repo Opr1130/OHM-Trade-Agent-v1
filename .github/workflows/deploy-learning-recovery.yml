@@ -92,14 +92,39 @@ jobs:
         env:
           PRODUCTION_SHA: ${{ steps.production.outputs.sha }}
           TOOLING_SHA: ${{ steps.tooling.outputs.sha }}
+          OWNER_LOGIN: ${{ github.repository_owner }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          set +e
           python3 -m app.services.learning_recovery_compatibility prepare \
             --production-sha "$PRODUCTION_SHA" \
             --tooling-sha "$TOOLING_SHA" \
             --repo-root . \
             --exceptions-file docs/learning/RECOVERY_COMPATIBILITY_EXCEPTIONS.json \
             --out "$RUNNER_TEMP/RECOVERY_COMPATIBILITY.json"
+          PREPARE_RC=$?
+          set -e
+          case "$PREPARE_RC" in
+            0) ;;
+            2)
+              gh api "repos/$GITHUB_REPOSITORY/issues/64/comments?per_page=100" \
+                > "$RUNNER_TEMP/issue64-comments.json"
+              python3 -m app.services.learning_recovery_attestation select \
+                --comments "$RUNNER_TEMP/issue64-comments.json" \
+                --compatibility "$RUNNER_TEMP/RECOVERY_COMPATIBILITY.json" \
+                --owner-login "$OWNER_LOGIN" \
+                --out "$RUNNER_TEMP/RECOVERY_COMPATIBILITY.attested.json"
+              mv "$RUNNER_TEMP/RECOVERY_COMPATIBILITY.attested.json" \
+                "$RUNNER_TEMP/RECOVERY_COMPATIBILITY.json"
+              ;;
+            *) exit "$PREPARE_RC" ;;
+          esac
+          python3 -m app.services.learning_recovery_compatibility verify \
+            --manifest "$RUNNER_TEMP/RECOVERY_COMPATIBILITY.json" \
+            --source-app . \
+            --production-sha "$PRODUCTION_SHA" \
+            --tooling-sha "$TOOLING_SHA" >/dev/null
 
       - name: Validate learning connection secrets
         env:

@@ -171,11 +171,18 @@ def lineage_for_sha(source_release_sha: str) -> str:
     }
     return known.get(source_release_sha, f"LINEAGE-{source_release_sha[:12]}")
 
-def read_lineage(data_root: Path) -> LineageIdentity | None:
+def _read_lineage_payload(data_root: Path) -> dict[str, Any] | None:
     marker = Path(data_root) / LINEAGE_FILE
     if not marker.is_file():
         return None
-    payload = _read_json(marker)
+    return _read_json(marker)
+
+
+def read_lineage(data_root: Path) -> LineageIdentity | None:
+    payload = _read_lineage_payload(data_root)
+    if payload is None:
+        return None
+    marker = Path(data_root) / LINEAGE_FILE
     if payload.get("schema") != LINEAGE_SCHEMA:
         raise StateLineageError(f"unsupported lineage marker: {marker}")
     identity = LineageIdentity(
@@ -188,21 +195,54 @@ def read_lineage(data_root: Path) -> LineageIdentity | None:
 
 
 def write_lineage(
-    data_root: Path, identity: LineageIdentity, *, replace: bool = False
+    data_root: Path,
+    identity: LineageIdentity,
+    *,
+    replace: bool = False,
+    rotate_generation: bool = False,
+    verified_generation_manifest: Path | None = None,
 ) -> Path:
     identity.validate()
     marker = Path(data_root) / LINEAGE_FILE
     existing = read_lineage(data_root)
     if existing is not None and existing != identity and not replace:
-        raise StateLineageError(
-            "refusing to overwrite a different lineage marker: "
-            f"{existing.lineage_id} -> {identity.lineage_id}"
+        same_release = (
+            existing.lineage_id == identity.lineage_id
+            and existing.source_release_sha == identity.source_release_sha
+        )
+        if not (rotate_generation and same_release):
+            raise StateLineageError(
+                "refusing to overwrite a different lineage marker: "
+                f"{existing.lineage_id}/{existing.source_release_sha} -> "
+                f"{identity.lineage_id}/{identity.source_release_sha}"
+            )
+        if verified_generation_manifest is None:
+            raise StateLineageError(
+                "generation rotation requires a verified replica manifest"
+            )
+        replica = _read_json(Path(verified_generation_manifest))
+        if (
+            str(replica.get("generation_id") or "") != identity.generation_id
+            or str(replica.get("source_release_sha") or "")
+            != identity.source_release_sha
+        ):
+            raise StateLineageError(
+                "verified replica manifest does not match the rotated identity"
+            )
+    existing_payload = _read_lineage_payload(data_root) or {}
+    stable_generation = identity.generation_id
+    if rotate_generation and not replace:
+        stable_generation = str(
+            existing_payload.get("lineage_generation_id")
+            or existing_payload.get("generation_id")
+            or identity.generation_id
         )
     _write_json_durable(
         marker,
         {
             "schema": LINEAGE_SCHEMA,
             "recorded_at_utc": _utc_now(),
+            "lineage_generation_id": stable_generation,
             **identity.as_dict(),
         },
     )
@@ -362,28 +402,40 @@ def _manifest_path(archive_root: Path) -> Path:
 
 
 def _remove_derived(data_root: Path, entries: Iterable[Mapping[str, Any]]) -> list[str]:
+    """Remove only archived derived paths whose source hash is unchanged."""
     removed: list[str] = []
-    root = Path(data_root)
+    root = Path(data_root).resolve()
     for entry in entries:
         if entry.get("category") != "derived":
             continue
-        relative = str(entry.get("spec_path") or entry.get("path"))
+        relative = str(entry.get("path") or entry.get("spec_path"))
         target = _safe_path(root, relative)
+        expected = str(entry.get("sha256") or "")
         kind = str(entry.get("spec_kind") or entry.get("kind"))
+        if target.exists():
+            if expected and _sha256(target) != expected:
+                raise DerivedStateError(
+                    f"DERIVED_STATE_CHANGED_SINCE_ARCHIVE: {relative}"
+                )
+            target.unlink()
+            removed.append(str(target.relative_to(root)))
         if kind == "sqlite":
-            for suffix in SQLITE_SUFFIXES:
+            for suffix in ("-wal", "-shm"):
                 candidate = Path(str(target) + suffix)
                 if candidate.exists():
                     candidate.unlink()
                     removed.append(str(candidate.relative_to(root)))
-        elif kind == "dir":
-            if target.is_dir():
-                shutil.rmtree(target)
-                removed.append(str(target.relative_to(root)))
-        elif target.exists():
-            target.unlink()
-            removed.append(str(target.relative_to(root)))
+        if kind == "dir":
+            parent = target.parent
+            spec_dir = _safe_path(root, str(entry.get("spec_path") or relative))
+            while parent != root and parent != spec_dir.parent:
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = parent.parent
     return removed
+
 
 def archive_derived_state(
     *,
@@ -395,6 +447,9 @@ def archive_derived_state(
     retire: bool = False,
     preserve_inputs: bool = True,
     known_gaps: Sequence[Mapping[str, Any]] = (),
+    input_lineage: str = "",
+    input_source_release_sha: str = "",
+    input_manifest: Path | None = None,
     disk_usage: Callable[[Path], Any] = shutil.disk_usage,
     copy_hook: Callable[[Path, Path], None] | None = None,
 ) -> dict[str, Any]:
@@ -404,29 +459,73 @@ def archive_derived_state(
     archive_root = Path(archive_root).resolve()
     if archive_root == data_root or data_root in archive_root.parents:
         raise DerivedStateError('archive root must be outside the writable data root')
+    if input_manifest is not None:
+        manifest_path = Path(input_manifest)
+        if not manifest_path.is_file():
+            raise DerivedStateError(f"input manifest is missing: {manifest_path}")
+        manifest_values: dict[str, str] = {}
+        for line in manifest_path.read_text(encoding="utf-8").splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                manifest_values[key.strip()] = value.strip()
+        if manifest_values.get("production_deployed_sha") != input_source_release_sha:
+            raise DerivedStateError(
+                "input manifest source release does not match the declared input"
+            )
+        input_manifest_sha256 = _sha256(manifest_path)
     if archive_root.exists():
-        receipt = _receipt_path(archive_root)
-        if receipt.is_file():
-            existing = _read_json(receipt)
-            if (
-                existing.get("status") == "VERIFIED"
-                and existing.get("lineage_id") == lineage.lineage_id
-                and existing.get("source_release_sha") == lineage.source_release_sha
-            ):
-                removed = (
-                    _remove_derived(data_root, existing.get("artifacts") or [])
-                    if retire
-                    else []
-                )
-                return {
-                    "status": "ALREADY_VERIFIED",
-                    "archive_root": str(archive_root),
-                    "receipt_path": str(receipt),
-                    "removed": removed,
-                }
-        raise IncompleteArchiveError(
-            f"archive exists without matching VERIFIED receipt: {archive_root}"
+        checks = verify_archive(archive_root)
+        if checks["failures"]:
+            raise IncompleteArchiveError(
+                f"existing archive failed fresh verification: {checks['failures']}"
+            )
+        receipt = _read_json(_receipt_path(archive_root))
+        manifest = _read_json(_manifest_path(archive_root))
+        manifest_has_inputs = any(
+            entry.get("category") == "input"
+            for entry in manifest.get("artifacts") or []
         )
+        if (
+            receipt.get("status") != "VERIFIED"
+            or receipt.get("lineage_id") != lineage.lineage_id
+            or receipt.get("source_release_sha") != lineage.source_release_sha
+            or receipt.get("generation_id") != lineage.generation_id
+            or manifest.get("lineage_id") != lineage.lineage_id
+            or manifest.get("source_release_sha") != lineage.source_release_sha
+            or manifest.get("generation_id") != lineage.generation_id
+        ):
+            raise IncompleteArchiveError(
+                f"existing archive identity does not match: {archive_root}"
+            )
+        if int(receipt.get("artifact_count") or -1) != len(
+            manifest.get("artifacts") or []
+        ):
+            raise IncompleteArchiveError(
+                f"existing archive inventory count mismatch: {archive_root}"
+            )
+        if receipt.get("known_gaps") != manifest.get("known_gaps"):
+            raise IncompleteArchiveError(
+                f"existing archive evidence-gap classification mismatch: {archive_root}"
+            )
+        if manifest_has_inputs and (
+            receipt.get("input_lineage_id") != input_lineage
+            or receipt.get("input_source_release_sha") != input_source_release_sha
+            or receipt.get("input_manifest_sha256") != input_manifest_sha256
+        ):
+            raise IncompleteArchiveError(
+                f"existing archive input provenance mismatch: {archive_root}"
+            )
+        removed = (
+            _remove_derived(data_root, manifest.get("artifacts") or [])
+            if retire
+            else []
+        )
+        return {
+            "status": "ALREADY_VERIFIED",
+            "archive_root": str(archive_root),
+            "receipt_path": str(_receipt_path(archive_root)),
+            "removed": removed,
+        }
 
     current = inventory(data_root, known_gaps=known_gaps)
     selected = [
@@ -435,6 +534,40 @@ def archive_derived_state(
         if entry["category"] == "derived"
         or (preserve_inputs and entry["category"] == "input")
     ]
+    has_inputs = any(entry["category"] == "input" for entry in selected)
+    if has_inputs and (
+        not input_lineage
+        or not input_source_release_sha
+        or input_manifest is None
+    ):
+        raise DerivedStateError(
+            "INPUT_PROVENANCE_REQUIRED: mixed-lineage archive must name the "
+            "input lineage, source release and authenticated manifest"
+        )
+    if has_inputs:
+        if not all(ch.isalnum() or ch in "._-" for ch in input_lineage):
+            raise DerivedStateError(f"invalid input_lineage: {input_lineage!r}")
+        if len(input_source_release_sha) != 40 or any(
+            ch not in "0123456789abcdef" for ch in input_source_release_sha
+        ):
+            raise DerivedStateError(
+                f"invalid input_source_release_sha: {input_source_release_sha!r}"
+            )
+    input_manifest_sha256 = ""
+    if input_manifest is not None:
+        manifest_path = Path(input_manifest)
+        if not manifest_path.is_file():
+            raise DerivedStateError(f"input manifest is missing: {manifest_path}")
+        manifest_values: dict[str, str] = {}
+        for line in manifest_path.read_text(encoding="utf-8").splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                manifest_values[key.strip()] = value.strip()
+        if manifest_values.get("production_deployed_sha") != input_source_release_sha:
+            raise DerivedStateError(
+                "input manifest source release does not match the declared input"
+            )
+        input_manifest_sha256 = _sha256(manifest_path)
     required = sum(int(entry["size"]) for entry in selected)
     required += max(64 * 1024 * 1024, required // 10)
     archive_root.parent.mkdir(parents=True, exist_ok=True)
@@ -460,6 +593,12 @@ def archive_derived_state(
             item["archived_size"] = destination.stat().st_size
             item["archived_sha256"] = _sha256(destination)
             item["snapshot"] = "sqlite_backup" if kind == "sqlite" else "copy"
+            if entry["category"] == "derived":
+                item["artifact_lineage_id"] = lineage.lineage_id
+                item["artifact_source_release_sha"] = lineage.source_release_sha
+            else:
+                item["artifact_lineage_id"] = input_lineage
+                item["artifact_source_release_sha"] = input_source_release_sha
             archived.append(item)
         payload = {
             "schema": SCHEMA,
@@ -469,6 +608,11 @@ def archive_derived_state(
             "lineage_id": lineage.lineage_id,
             "source_release_sha": lineage.source_release_sha,
             "generation_id": lineage.generation_id,
+            "derived_lineage_id": lineage.lineage_id,
+            "derived_source_release_sha": lineage.source_release_sha,
+            "input_lineage_id": input_lineage or None,
+            "input_source_release_sha": input_source_release_sha or None,
+            "input_manifest_sha256": input_manifest_sha256 or None,
             "active_lineage": active_lineage,
             "artifacts": archived,
             "known_gaps": [dict(gap) for gap in known_gaps],
@@ -499,6 +643,11 @@ def archive_derived_state(
         "status": "VERIFIED",
         "recorded_at_utc": _utc_now(),
         **lineage.as_dict(),
+        "derived_lineage_id": lineage.lineage_id,
+        "derived_source_release_sha": lineage.source_release_sha,
+        "input_lineage_id": input_lineage or None,
+        "input_source_release_sha": input_source_release_sha or None,
+        "input_manifest_sha256": input_manifest_sha256 or None,
         "active_lineage": active_lineage,
         "reason": reason,
         "archive_manifest_sha256": manifest_sha,
@@ -609,8 +758,12 @@ def bind_state_connection(
 ) -> LineageIdentity | None:
     """Bind a new sidecar to the active lineage, or fail closed."""
     identity = read_lineage(data_root)
-    if identity is None:
+    payload = _read_lineage_payload(data_root)
+    if identity is None or payload is None:
         return None
+    stable_generation = str(
+        payload.get("lineage_generation_id") or identity.generation_id
+    )
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS metadata (
@@ -630,7 +783,7 @@ def bind_state_connection(
             )
         ]
         metadata_keys = {str(item[0]) for item in connection.execute('SELECT key FROM metadata')}
-        populated = bool(metadata_keys - {'lineage_id', 'lineage_source_release_sha', 'lineage_generation_id'})
+        populated = bool(metadata_keys - {'lineage_id', 'lineage_source_release_sha', 'lineage_generation_id', 'lineage_observed_generation'})
         for table in tables:
             if table == "metadata":
                 continue
@@ -645,22 +798,144 @@ def bind_state_connection(
                 f"STATE_LINEAGE_UNBOUND:{consumer}: legacy sidecar has state "
                 "but no lineage identity"
             )
+        # Stable consumer identity is the logical lineage, the authenticated
+        # source release and the lineage's genesis generation. The marker's
+        # current snapshot generation rotates routinely and is deliberately not
+        # part of checkpoint identity.
         for key, value in (
             ("lineage_id", identity.lineage_id),
             ("lineage_source_release_sha", identity.source_release_sha),
-            ("lineage_generation_id", identity.generation_id),
+            ("lineage_generation_id", stable_generation),
         ):
             connection.execute(
                 "INSERT INTO metadata(key, value) VALUES (?, ?)", (key, value)
             )
         connection.commit()
         return identity
-    if str(row[0]) != identity.lineage_id:
+    source_row = connection.execute(
+        "SELECT value FROM metadata WHERE key = 'lineage_source_release_sha'"
+    ).fetchone()
+    generation_row = connection.execute(
+        "SELECT value FROM metadata WHERE key = 'lineage_generation_id'"
+    ).fetchone()
+    if source_row is None or generation_row is None:
+        raise StateLineageError(
+            f"STATE_LINEAGE_UNBOUND:{consumer}: sidecar has incomplete identity"
+        )
+    if (
+        str(row[0]) != identity.lineage_id
+        or str(source_row[0]) != identity.source_release_sha
+        or str(generation_row[0]) != stable_generation
+    ):
         raise StateLineageError(
             f"STATE_LINEAGE_MISMATCH:{consumer}: "
-            f"state={row[0]} active={identity.lineage_id}"
+            f"state={row[0]}/{source_row[0]}/{generation_row[0]} "
+            f"active={identity.lineage_id}/{identity.source_release_sha}/"
+            f"{stable_generation}"
         )
     return identity
+
+ANCHORED_INPUTS = {
+    "snapshot": "p1_evidence_ledger.jsonl",
+    "output": "phase3c_forward_outcomes.jsonl",
+    "screening": "opip/qualification/screening_evaluations.jsonl",
+    "indexed": "p1_evidence_ledger.jsonl",
+}
+
+
+def verify_checkpoint_anchors(data_root: Path) -> dict[str, Any]:
+    """Validate persisted byte-offset anchors against the active inputs."""
+    root = Path(data_root).resolve()
+    checks: list[dict[str, Any]] = []
+    failures: list[str] = []
+    for spec in ARTIFACT_SPECS:
+        if spec["kind"] != "sqlite":
+            continue
+        path = root / spec["path"]
+        if not path.is_file():
+            continue
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            metadata: dict[str, str] = {}
+            if "metadata" in tables:
+                metadata = {
+                    str(key): str(value)
+                    for key, value in connection.execute(
+                        "SELECT key, value FROM metadata"
+                    )
+                }
+        finally:
+            connection.close()
+        for prefix, input_relative in ANCHORED_INPUTS.items():
+            offset_key = (
+                "indexed_offset"
+                if prefix == "indexed"
+                else f"{prefix}_indexed_offset"
+            )
+            try:
+                offset = int(metadata.get(offset_key, "0"))
+            except ValueError:
+                checks.append(
+                    {
+                        "name": f"{spec['path']}:{offset_key}:numeric",
+                        "passed": False,
+                        "detail": metadata.get(offset_key),
+                    }
+                )
+                failures.append(f"{spec['path']}:{offset_key}")
+                continue
+            if offset <= 0:
+                continue
+            input_path = root / input_relative
+            name = f"{spec['path']}:{offset_key}"
+            if not input_path.is_file():
+                checks.append(
+                    {"name": name, "passed": False, "detail": "input missing"}
+                )
+                failures.append(name)
+                continue
+            if offset > input_path.stat().st_size:
+                checks.append(
+                    {
+                        "name": name,
+                        "passed": False,
+                        "detail": f"offset={offset} size={input_path.stat().st_size}",
+                    }
+                )
+                failures.append(name)
+                continue
+            try:
+                start = int(metadata[f"{prefix}_anchor_start"])
+                size = int(metadata[f"{prefix}_anchor_size"])
+                expected = metadata[f"{prefix}_anchor_sha256"]
+            except (KeyError, ValueError):
+                checks.append(
+                    {"name": name, "passed": False, "detail": "anchor missing"}
+                )
+                failures.append(name)
+                continue
+            with input_path.open("rb") as handle:
+                handle.seek(start)
+                payload = handle.read(size)
+            actual = hashlib.sha256(payload).hexdigest()
+            passed = len(payload) == size and actual == expected
+            checks.append(
+                {
+                    "name": name,
+                    "passed": passed,
+                    "detail": f"start={start} size={size}",
+                }
+            )
+            if not passed:
+                failures.append(name)
+    return {"checks": checks, "failures": failures}
+
 
 def _known_gaps(values: Sequence[str]) -> list[dict[str, Any]]:
     gaps: list[dict[str, Any]] = []
@@ -709,12 +984,17 @@ def main(argv: list[str] | None = None) -> int:
     verify = sub.add_parser("verify")
     verify.add_argument("--archive-root", required=True)
 
+    anchors = sub.add_parser("verify-anchors")
+    anchors.add_argument("--data-root", default=str(DEFAULT_DATA_ROOT))
+
     mark = sub.add_parser("mark-lineage")
     mark.add_argument("--data-root", default=str(DEFAULT_DATA_ROOT))
     mark.add_argument("--lineage-id", required=True)
     mark.add_argument("--source-sha", required=True)
     mark.add_argument("--generation-id", required=True)
     mark.add_argument("--replace", action="store_true")
+    mark.add_argument("--rotate-generation", action="store_true")
+    mark.add_argument("--verified-generation-manifest", default="")
 
     args = parser.parse_args(argv)
     if args.command == "inspect":
@@ -737,7 +1017,21 @@ def main(argv: list[str] | None = None) -> int:
         result = verify_archive(Path(args.archive_root))
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0 if not result["failures"] else 2
-    marker = write_lineage(Path(args.data_root), _identity(args), replace=args.replace)
+    if args.command == "verify-anchors":
+        result = verify_checkpoint_anchors(Path(args.data_root))
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0 if not result["failures"] else 2
+    marker = write_lineage(
+        Path(args.data_root),
+        _identity(args),
+        replace=args.replace,
+        rotate_generation=args.rotate_generation,
+        verified_generation_manifest=(
+            Path(args.verified_generation_manifest)
+            if args.verified_generation_manifest
+            else None
+        ),
+    )
     print(json.dumps({"marker": str(marker)}, indent=2, sort_keys=True))
     return 0
 

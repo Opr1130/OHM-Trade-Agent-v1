@@ -274,6 +274,7 @@ derived_state_helper() {
     -e PYTHONDONTWRITEBYTECODE=1 \
     -v "$DATA_ROOT:/app/data" \
     -v "$STATE_ROOT:/app/state" \
+    -v "$CANONICAL_REPLICA_ROOT:/app/canonical-replica:ro" \
     "$OPIP_LEARNING_IMAGE" \
     python -m app.services.learning_derived_state "$@"
 }
@@ -576,11 +577,15 @@ if (( CANONICAL_REPLICA_REQUIRED )); then
     echo "O'Pip learning sync: committed replica generation is invalid" >&2
     exit 65
   }
+  derived_state_helper verify-anchors --data-root /app/data >/dev/null
   derived_state_helper mark-lineage \
     --data-root /app/data \
     --lineage-id "$(lineage_id_for_sha "$production_sha")" \
     --source-sha "$production_sha" \
-    --generation-id "$AFTER_GENERATION" >/dev/null
+    --generation-id "$AFTER_GENERATION" \
+    --verified-generation-manifest \
+      "/app/canonical-replica/generations/$AFTER_GENERATION/replica_manifest.json" \
+    --rotate-generation >/dev/null
 fi
 
 

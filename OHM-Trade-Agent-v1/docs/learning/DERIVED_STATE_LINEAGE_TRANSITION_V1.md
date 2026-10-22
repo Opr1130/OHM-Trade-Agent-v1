@@ -81,9 +81,11 @@ replica.
 - `retire` removes only derived active artifacts after the verified receipt;
   inputs are archived only for preservation and remain until sync replaces them.
 - `data/.lineage.json` binds the active source release and replica generation.
-- Consumer sidecars persist `lineage_id`, `lineage_source_release_sha` and
-  `lineage_generation_id`. A populated legacy sidecar without identity fails
-  closed; a mismatched identity fails closed.
+- Consumer checkpoints persist `lineage_id`, `lineage_source_release_sha` and
+  the stable lineage `lineage_generation_id`. The marker's current snapshot
+  generation may rotate for the same release; sidecars are not invalidated.
+  A populated legacy sidecar without identity, or a mismatched lineage/source/
+  stable-generation tuple, fails closed.
 
 `deploy/learning/opip-learning-sync.sh` invokes `retire` before replacing inputs
 when the incoming source release differs from the marker, and writes
@@ -145,9 +147,11 @@ replica.
 - `retire` removes only derived active artifacts after the verified receipt;
   inputs are archived only for preservation and remain until sync replaces them.
 - `data/.lineage.json` binds the active source release and replica generation.
-- Consumer sidecars persist `lineage_id`, `lineage_source_release_sha` and
-  `lineage_generation_id`. A populated legacy sidecar without identity fails
-  closed; a mismatched identity fails closed.
+- Consumer checkpoints persist `lineage_id`, `lineage_source_release_sha` and
+  the stable lineage `lineage_generation_id`. The marker's current snapshot
+  generation may rotate for the same release; sidecars are not invalidated.
+  A populated legacy sidecar without identity, or a mismatched lineage/source/
+  stable-generation tuple, fails closed.
 
 `deploy/learning/opip-learning-sync.sh` invokes `retire` before replacing inputs
 when the incoming source release differs from the marker, and writes
@@ -223,3 +227,16 @@ anchors, empty V2 streams, pending accountability, unknown lineage, missing
 manifest, interrupted and partial archives, checksums, insufficient disk, WAL
 snapshot, consumer binding, crash boundaries, idempotency, and receipt ordering.
 Linux CI is the authoritative full-suite gate.
+
+
+## External compatibility attestation
+
+The compatibility exception file cannot key approve the commit that contains it,
+because adding the file changes the tooling SHA. Approval is therefore an
+owner-authored comment on issue #64, created after the exact tooling commit
+exists. It binds the production/tooling pair, changed paths, per-path hashes,
+canonical diff digest, owner login, record URL, timestamp, rationale and
+exact-SHA CI evidence. The recovery workflow reads issue #64, rejects non-owner
+or stale records, verifies the exact tuple, and writes an attested manifest
+before any remote upload. The worker revalidates the attestation digest and
+fields. No wildcard or in-commit exception is accepted for a new pair.

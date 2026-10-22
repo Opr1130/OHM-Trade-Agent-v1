@@ -67,9 +67,13 @@ Before a lineage-changing sync replaces an input, the worker must:
    only. Inputs remain until sync replaces them. A failed or interrupted archive
    is never `VERIFIED` and never authorises retirement.
 5. Write `data/.lineage.json` only after the new manifest and replica pointer are
-   committed. New sidecars record `lineage_id`, source release and generation in
-   their `metadata` table. A populated legacy sidecar with no lineage identity,
-   or one bound to another lineage, fails closed.
+   committed. Replica generation is operational evidence: rotation for the same
+   `(lineage_id, source_release_sha)` is permitted via `--rotate-generation`,
+   while a cross-lineage or cross-release replacement is refused. New sidecars
+   record `lineage_id` and source release as the complete identity tuple;
+   `lineage_observed_generation` is audit metadata and does not invalidate state
+   on routine rotation. A populated legacy sidecar with no identity, or one bound
+   to another lineage/source release, fails closed.
 
 Known unrecoverable gaps are recorded in the receipt with artifact identity,
 last-known size/hash when available, and downstream impact. Missing bytes are
