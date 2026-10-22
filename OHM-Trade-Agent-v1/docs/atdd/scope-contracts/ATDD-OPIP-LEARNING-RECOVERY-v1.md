@@ -133,7 +133,7 @@ AC-020:
 Learning recovery CI must resolve exact-SHA successful workflow runs without false refusal or false admission.
 GIVEN: main has an immutable tooling SHA with required pytest, quality-security and Semgrep workflows, including workflow-dispatch or push runs
 WHEN: the initial and pre-mutation recovery gates query GitHub Actions CI
-THEN: they use workflow-identity-scoped GitHub REST runs filtered by the exact SHA and main branch, independently verify returned workflow path/SHA/branch, select the newest run and attempt, require completed/success, refuse missing, stale, failed, pending, wrong-SHA, wrong-workflow, wrong-branch or API-error results, and retain the protected environment and owner-attestation gates.
+THEN: they query the repository-level GitHub Actions runs on main (avoiding unreliable workflow-scoped head_sha query filters), independently filter returned exact SHA/branch/workflow path, select the newest run and attempt, require completed/success, refuse missing, stale, failed, pending, wrong-SHA, wrong-workflow, wrong-branch or API-error results, and retain the protected environment and owner-attestation gates.
 
 EXPLICITLY OUT OF SCOPE:
 - Deploying, rebuilding, or restarting production containers or systemd units.
@@ -316,6 +316,8 @@ AC-020 -> tests/test_learning_recovery_ci_discovery_v1.py::test_exact_sha_ci_fai
 AC-020 -> tests/test_learning_recovery_ci_discovery_v1.py::test_ci_lookup_api_error_fails_closed
 AC-020 -> tests/test_learning_recovery_ci_discovery_v1.py::test_gate_queries_workflow_identity_sha_and_branch_in_both_steps
 AC-020 -> tests/test_learning_recovery_ci_discovery_v1.py::test_workflow_path_with_git_ref_suffix_is_valid
+AC-020 -> tests/test_learning_recovery_ci_discovery_v1.py::test_d4_successful_runs_survive_many_unrelated_workflow_results
+AC-020 -> tests/test_learning_recovery_ci_discovery_v1.py::test_d4_same_run_newer_attempt_must_not_resurrect_prior_success
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/deploy/remote/configure-opip-learning-reader.sh

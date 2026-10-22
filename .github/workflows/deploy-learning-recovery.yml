@@ -62,9 +62,10 @@ jobs:
             exit 65
           }
           for WORKFLOW in pytest.yml quality-security.yml semgrep.yml; do
-            # GitHub's workflow-specific REST endpoint filters by the exact commit and branch.
-            # Re-check returned identities; never trust an empty/stale/other-SHA match.
-            RESULT="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$WORKFLOW/runs?head_sha=$TOOLING_SHA&branch=main&per_page=100" \
+            # D-4: repo-level Actions runs with branch=main; workflow-level head_sha filtering
+            # is unreliable. Apply exact tooling SHA, branch, and workflow path checks locally.
+            # First-page omission fails closed; no stale/foreign run may authorize recovery.
+            RESULT="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?branch=main&per_page=100" \
               --jq ".workflow_runs | map(select(.head_sha == \"$TOOLING_SHA\" and .head_branch == \"main\" and (.path | split(\"@\")[0]) == \".github/workflows/$WORKFLOW\")) | sort_by(.run_number, .run_attempt) | last | if . == null then [\"missing\", \"missing\"] else [.status, .conclusion] end | @tsv")"
             test "$RESULT" = $'completed\tsuccess' || {
               echo "Refusing recovery: $WORKFLOW is not successful for tooling SHA (observed=$RESULT)." >&2
@@ -187,9 +188,10 @@ jobs:
             exit 65
           }
           for WORKFLOW in pytest.yml quality-security.yml semgrep.yml; do
-            # GitHub's workflow-specific REST endpoint filters by the exact commit and branch.
-            # Re-check returned identities; never trust an empty/stale/other-SHA match.
-            RESULT="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$WORKFLOW/runs?head_sha=$TOOLING_SHA&branch=main&per_page=100" \
+            # D-4: repo-level Actions runs with branch=main; workflow-level head_sha filtering
+            # is unreliable. Apply exact tooling SHA, branch, and workflow path checks locally.
+            # First-page omission fails closed; no stale/foreign run may authorize recovery.
+            RESULT="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?branch=main&per_page=100" \
               --jq ".workflow_runs | map(select(.head_sha == \"$TOOLING_SHA\" and .head_branch == \"main\" and (.path | split(\"@\")[0]) == \".github/workflows/$WORKFLOW\")) | sort_by(.run_number, .run_attempt) | last | if . == null then [\"missing\", \"missing\"] else [.status, .conclusion] end | @tsv")"
             test "$RESULT" = $'completed\tsuccess' || {
               echo "Refusing recovery: $WORKFLOW is not successful for tooling SHA (observed=$RESULT)." >&2
