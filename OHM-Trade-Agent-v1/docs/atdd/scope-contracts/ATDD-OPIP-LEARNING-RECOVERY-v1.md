@@ -129,6 +129,12 @@ GIVEN: the tooling commit is inspected on any platform or staged into a release 
 WHEN: compatibility is prepared, hashed and verified
 THEN: every key is a Git-style POSIX path derived from the exact tracked tree, untracked generated artifacts never participate, tracked executables keep participating regardless of filename, duplicate normalized paths and symlink substitution are refused, every changed critical path must be hashed, and the canonical digest is identical on Windows and Linux.
 
+AC-020:
+Learning recovery CI must resolve exact-SHA successful workflow runs without false refusal or false admission.
+GIVEN: main has an immutable tooling SHA with required pytest, quality-security and Semgrep workflows, including workflow-dispatch or push runs
+WHEN: the initial and pre-mutation recovery gates query GitHub Actions CI
+THEN: they use workflow-identity-scoped GitHub REST runs filtered by the exact SHA and main branch, independently verify returned workflow path/SHA/branch, select the newest run and attempt, require completed/success, refuse missing, stale, failed, pending, wrong-SHA, wrong-workflow, wrong-branch or API-error results, and retain the protected environment and owner-attestation gates.
+
 EXPLICITLY OUT OF SCOPE:
 - Deploying, rebuilding, or restarting production containers or systemd units.
 - Executing the provenance reconciler against production; that remains owner-gated.
@@ -305,6 +311,11 @@ AC-009 -> tests/test_learning_recovery_authorization_boundary_v1.py::test_t31_no
 AC-009 -> tests/test_learning_recovery_authorization_boundary_v1.py::test_t32_no_authority_flags_are_touched
 
 
+AC-020 -> tests/test_learning_recovery_ci_discovery_v1.py::test_exact_sha_green_ci_accepted_through_workflow_api
+AC-020 -> tests/test_learning_recovery_ci_discovery_v1.py::test_exact_sha_ci_fail_closed_on_invalid_observation
+AC-020 -> tests/test_learning_recovery_ci_discovery_v1.py::test_ci_lookup_api_error_fails_closed
+AC-020 -> tests/test_learning_recovery_ci_discovery_v1.py::test_gate_queries_workflow_identity_sha_and_branch_in_both_steps
+
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/deploy/remote/configure-opip-learning-reader.sh
 AC-001 -> OHM-Trade-Agent-v1/deploy/remote/opip-learning-reader-permissions.sh
@@ -374,6 +385,11 @@ AC-018 -> OHM-Trade-Agent-v1/tests/test_learning_recovery_authorization_boundary
 AC-019 -> OHM-Trade-Agent-v1/app/services/learning_recovery_compatibility.py
 AC-019 -> OHM-Trade-Agent-v1/tests/test_learning_recovery_inventory_determinism_v1.py
 
+
+AC-020 -> .github/workflows/deploy-learning-recovery.yml
+AC-020 -> OHM-Trade-Agent-v1/tests/test_learning_recovery_ci_discovery_v1.py
+AC-020 -> OHM-Trade-Agent-v1/tests/test_learning_recovery_attestation_v1.py
+AC-020 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-LEARNING-RECOVERY-v1.md
 
 DEFERRED DISCOVERIES:
 - The production export tree contains historical generations from the previous canonical store (220,721 events) while current production runs a fresh genesis (8,819 events at capture). Retention and archival review remain owner work.
