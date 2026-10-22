@@ -224,6 +224,9 @@ AC-015 -> tests/test_learning_derived_state_v1.py::test_mixed_lineage_archive_re
 AC-015 -> tests/test_learning_derived_state_v1.py::test_mixed_lineage_receipt_separates_derived_and_input_provenance
 AC-015 -> tests/test_learning_derived_state_v1.py::test_existing_archive_is_freshly_verified_before_retirement
 AC-015 -> tests/test_learning_derived_state_v1.py::test_existing_archive_retry_is_idempotent
+AC-015 -> tests/test_learning_derived_state_cli_v1.py::test_fresh_lineage_transition_cli_archives_verified_outgoing_inputs
+AC-015 -> tests/test_learning_derived_state_cli_v1.py::test_partially_committed_resume_cli_preserves_v2_inputs
+AC-015 -> tests/test_learning_derived_state_cli_v1.py::test_cli_refuses_unauthenticated_or_missing_input_provenance
 AC-015 -> tests/test_learning_derived_state_v1.py::test_retry_refuses_changed_active_derived_state
 
 AC-016 -> tests/test_learning_recovery_receipt_v1.py::test_intent_is_prepared_before_terminal_and_is_not_edited
@@ -237,6 +240,9 @@ AC-017 -> tests/test_learning_recovery_attestation_v1.py::test_attestation_rejec
 AC-017 -> tests/test_learning_recovery_attestation_v1.py::test_attested_manifest_without_attestation_is_refused
 AC-017 -> tests/test_learning_recovery_attestation_v1.py::test_comment_selection_uses_owner_and_latest_valid_attestation
 AC-017 -> tests/test_learning_recovery_attestation_v1.py::test_recovery_workflow_authenticates_issue64_attestation
+AC-017 -> tests/test_learning_recovery_attestation_cli_v1.py::test_verify_manifest_cli_accepts_valid_attestation
+AC-017 -> tests/test_learning_recovery_attestation_cli_v1.py::test_verify_manifest_cli_rejects_missing_attestation
+AC-017 -> tests/test_learning_recovery_attestation_cli_v1.py::test_verify_manifest_cli_rejects_tampered_attestation
 AC-015 -> tests/test_learning_recovery_receipt_v1.py::test_sync_preserves_before_replacing_and_marks_after_commit
 
 IMPLEMENTATION MAP:
@@ -289,6 +295,7 @@ AC-015 -> OHM-Trade-Agent-v1/app/jobs/build_phase3c_forward_outcomes.py
 AC-015 -> OHM-Trade-Agent-v1/app/opip/discovery/maturation.py
 AC-015 -> OHM-Trade-Agent-v1/app/services/opportunity_accountability.py
 AC-015 -> OHM-Trade-Agent-v1/tests/test_learning_derived_state_v1.py
+AC-015 -> OHM-Trade-Agent-v1/tests/test_learning_derived_state_cli_v1.py
 AC-016 -> OHM-Trade-Agent-v1/app/services/learning_recovery_receipt.py
 AC-016 -> OHM-Trade-Agent-v1/app/services/learning_recovery_attestation.py
 AC-016 -> .github/workflows/deploy-learning-recovery.yml
@@ -298,6 +305,7 @@ AC-016 -> OHM-Trade-Agent-v1/tests/test_learning_recovery_attestation_v1.py
 AC-017 -> OHM-Trade-Agent-v1/app/services/learning_recovery_attestation.py
 AC-017 -> .github/workflows/deploy-learning-recovery.yml
 AC-017 -> OHM-Trade-Agent-v1/tests/test_learning_recovery_attestation_v1.py
+AC-017 -> OHM-Trade-Agent-v1/tests/test_learning_recovery_attestation_cli_v1.py
 
 DEFERRED DISCOVERIES:
 - The production export tree contains historical generations from the previous canonical store (220,721 events) while current production runs a fresh genesis (8,819 events at capture). Retention and archival review remain owner work.

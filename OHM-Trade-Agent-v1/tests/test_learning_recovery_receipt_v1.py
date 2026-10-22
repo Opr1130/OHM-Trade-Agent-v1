@@ -126,3 +126,7 @@ def test_sync_preserves_before_replacing_and_marks_after_commit():
     mark = script.index("derived_state_helper mark-lineage")
     assert preserve < replace < mark
     assert "refusing to reuse unbound legacy derived state" in script
+    assert "--input-lineage \"$previous_lineage\"" in script
+    assert "--input-source-sha \"$previous_sha\"" in script
+    assert "--input-manifest /app/data/manifest.env" in script
+    assert "outgoing manifest does not authenticate source inputs" in script

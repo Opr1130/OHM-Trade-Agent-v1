@@ -497,6 +497,16 @@ if [[ -n "$previous_sha" && "$previous_sha" != "$production_sha" ]]; then
     echo "O'Pip learning sync: refusing lineage transition without a known outgoing lineage" >&2
     exit 65
   }
+  [[ -r "$DATA_ROOT/manifest.env" ]] || {
+    echo "O'Pip learning sync: refusing transition without outgoing input manifest" >&2
+    exit 65
+  }
+  outgoing_manifest_sha="$(state_value "$DATA_ROOT/manifest.env" production_deployed_sha)"
+  [[ "$outgoing_manifest_sha" == "$previous_sha" ]] || {
+    echo "O'Pip learning sync: outgoing manifest does not authenticate source inputs" >&2
+    echo "manifest=${outgoing_manifest_sha:-MISSING} previous=${previous_sha}" >&2
+    exit 65
+  }
   active_lineage="$(lineage_id_for_sha "$production_sha")"
   transition_stamp="$(date -u +%Y%m%dT%H%M%SZ)"
   transition_archive="/app/state/derived-lineages/$previous_lineage/${transition_stamp}-$previous_generation"
@@ -508,6 +518,9 @@ if [[ -n "$previous_sha" && "$previous_sha" != "$production_sha" ]]; then
     --source-sha "$previous_sha" \
     --generation-id "$previous_generation" \
     --active-lineage "$active_lineage" \
+    --input-lineage "$previous_lineage" \
+    --input-source-sha "$previous_sha" \
+    --input-manifest /app/data/manifest.env \
     --reason LINEAGE_TRANSITION \
     --preserve-inputs >/dev/null
 fi

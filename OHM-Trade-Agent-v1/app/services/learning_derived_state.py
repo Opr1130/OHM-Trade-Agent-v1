@@ -976,6 +976,9 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("--source-sha", required=True)
         command.add_argument("--generation-id", required=True)
         command.add_argument("--active-lineage", required=True)
+        command.add_argument("--input-lineage", default="")
+        command.add_argument("--input-source-sha", default="")
+        command.add_argument("--input-manifest", default="")
         command.add_argument("--reason", default=name)
         command.add_argument("--preserve-inputs", action="store_true", default=True)
         command.add_argument("--no-preserve-inputs", dest="preserve_inputs", action="store_false")
@@ -1010,6 +1013,11 @@ def main(argv: list[str] | None = None) -> int:
             retire=args.command == "retire",
             preserve_inputs=args.preserve_inputs,
             known_gaps=_known_gaps(args.known_gap),
+            input_lineage=args.input_lineage,
+            input_source_release_sha=args.input_source_sha,
+            input_manifest=(
+                Path(args.input_manifest) if args.input_manifest else None
+            ),
         )
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0

@@ -256,9 +256,11 @@ def main(argv: list[str] | None = None) -> int:
     verify_parser.add_argument("--max-age-seconds", type=int, default=DEFAULT_MAX_AGE_SECONDS)
 
     args = parser.parse_args(argv)
-    compatibility = json.loads(Path(args.compatibility).read_text(encoding="utf-8"))
     try:
         if args.command == "validate":
+            compatibility = json.loads(
+                Path(args.compatibility).read_text(encoding="utf-8")
+            )
             attestation = json.loads(Path(args.attestation).read_text(encoding="utf-8"))
             manifest = attest_manifest(
                 compatibility,
@@ -267,6 +269,9 @@ def main(argv: list[str] | None = None) -> int:
                 max_age_seconds=args.max_age_seconds,
             )
         elif args.command == "select":
+            compatibility = json.loads(
+                Path(args.compatibility).read_text(encoding="utf-8")
+            )
             comments = json.loads(Path(args.comments).read_text(encoding="utf-8"))
             manifest = select_from_comments(
                 comments,
