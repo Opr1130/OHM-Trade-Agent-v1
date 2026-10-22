@@ -240,9 +240,15 @@ AC-017 -> tests/test_learning_recovery_attestation_v1.py::test_attestation_rejec
 AC-017 -> tests/test_learning_recovery_attestation_v1.py::test_attested_manifest_without_attestation_is_refused
 AC-017 -> tests/test_learning_recovery_attestation_v1.py::test_comment_selection_uses_owner_and_latest_valid_attestation
 AC-017 -> tests/test_learning_recovery_attestation_v1.py::test_recovery_workflow_authenticates_issue64_attestation
+AC-017 -> tests/test_learning_recovery_attestation_v1.py::test_paginates_more_than_600_comments_and_accepts_final_owner_attestation
+AC-017 -> tests/test_learning_recovery_attestation_v1.py::test_pagination_failure_returns_no_partial_admission
+AC-017 -> tests/test_learning_recovery_attestation_v1.py::test_incomplete_pagination_refuses_partial_results
+AC-017 -> tests/test_learning_recovery_attestation_v1.py::test_pagination_rejects_malformed_pages_and_missing_token
+AC-017 -> tests/test_learning_recovery_attestation_v1.py::test_recovery_workflow_refuses_exact_sha_ci_failure
 AC-017 -> tests/test_learning_recovery_attestation_cli_v1.py::test_verify_manifest_cli_accepts_valid_attestation
 AC-017 -> tests/test_learning_recovery_attestation_cli_v1.py::test_verify_manifest_cli_rejects_missing_attestation
 AC-017 -> tests/test_learning_recovery_attestation_cli_v1.py::test_verify_manifest_cli_rejects_tampered_attestation
+AC-017 -> tests/test_learning_recovery_attestation_cli_v1.py::test_fetch_comments_cli_writes_every_page_as_one_array
 AC-015 -> tests/test_learning_recovery_receipt_v1.py::test_sync_preserves_before_replacing_and_marks_after_commit
 
 IMPLEMENTATION MAP:

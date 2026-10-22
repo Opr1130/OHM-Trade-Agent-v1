@@ -366,6 +366,7 @@ def test_pagination_rejects_malformed_pages_and_missing_token():
         )
 
 
+@pytest.mark.acceptance
 @pytest.mark.skipif(shutil.which("bash") is None, reason="workflow shell test requires bash")
 def test_recovery_workflow_refuses_exact_sha_ci_failure(tmp_path):
     """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-017: exact-SHA CI is enforced."""
