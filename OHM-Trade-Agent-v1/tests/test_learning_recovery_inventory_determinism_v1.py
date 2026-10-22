@@ -81,7 +81,7 @@ def _exceptions(tmp_path: Path, production: str, tooling: str, paths) -> Path:
 
 @pytest.mark.acceptance
 def test_t14_inventory_keys_are_posix_on_every_platform(tmp_path):
-    """T14: directory-expanded keys must never carry OS-specific separators."""
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-019: T14: directory-expanded keys must never carry OS-specific separators."""
     repo, _, tooling = _repo(tmp_path)
     inventory = _expand_tracked(repo, tooling)
     assert inventory
@@ -92,14 +92,14 @@ def test_t14_inventory_keys_are_posix_on_every_platform(tmp_path):
 
 @pytest.mark.acceptance
 def test_t14b_tracked_inventory_matches_release_tree_walk(tmp_path):
-    """T14b: Windows and POSIX expansion agree for the same content."""
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-019: T14b: Windows and POSIX expansion agree for the same content."""
     repo, _, tooling = _repo(tmp_path)
     assert _expand_fs(repo) == _expand_tracked(repo, tooling)
 
 
 @pytest.mark.acceptance
 def test_t15_path_traversal_keys_are_refused(tmp_path):
-    """T15: a manifest key escaping the release root can never verify."""
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-019: T15: a manifest key escaping the release root can never verify."""
     repo, production, tooling = _repo(tmp_path)
     manifest = prepare(
         production_sha=production,
@@ -125,7 +125,7 @@ def test_t15_path_traversal_keys_are_refused(tmp_path):
 
 @pytest.mark.acceptance
 def test_t16_duplicate_normalized_paths_are_rejected():
-    """T16: two spellings colliding on one canonical key must not merge silently."""
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-019: T16: two spellings colliding on one canonical key must not merge silently."""
     hashes: dict[str, str] = {}
     _record(hashes, "app/opip/learning/consumer.py", "a" * 64)
     with pytest.raises(ValueError, match="duplicate normalized critical path"):
@@ -134,7 +134,7 @@ def test_t16_duplicate_normalized_paths_are_rejected():
 
 @pytest.mark.acceptance
 def test_t17_generated_artifacts_do_not_change_the_inventory(tmp_path):
-    """T17: pytest/bytecode output must not move the compatibility hash surface."""
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-019: T17: pytest/bytecode output must not move the compatibility hash surface."""
     repo, _, tooling = _repo(tmp_path)
     before = _expand_tracked(repo, tooling)
     cache = repo / "app" / "opip" / "learning" / "__pycache__"
@@ -149,7 +149,7 @@ def test_t17_generated_artifacts_do_not_change_the_inventory(tmp_path):
 
 @pytest.mark.acceptance
 def test_t18_missing_tracked_file_is_refused(tmp_path):
-    """T18: a critical file that vanishes from the release tree cannot verify."""
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-019: T18: a critical file that vanishes from the release tree cannot verify."""
     repo, production, tooling = _repo(tmp_path)
     manifest = prepare(
         production_sha=production,
@@ -171,7 +171,7 @@ def test_t18_missing_tracked_file_is_refused(tmp_path):
 
 @pytest.mark.acceptance
 def test_t19_tampered_tracked_file_is_refused(tmp_path):
-    """T19: byte-level tampering of a critical file fails verification."""
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-019: T19: byte-level tampering of a critical file fails verification."""
     repo, production, tooling = _repo(tmp_path)
     manifest = prepare(
         production_sha=production,
@@ -193,7 +193,7 @@ def test_t19_tampered_tracked_file_is_refused(tmp_path):
 
 @pytest.mark.acceptance
 def test_t20_symlinked_critical_path_is_refused(tmp_path):
-    """T20: symlink substitution into a critical path is rejected."""
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-019: T20: symlink substitution into a critical path is rejected."""
     repo, production, tooling = _repo(tmp_path)
     manifest = prepare(
         production_sha=production,
@@ -229,7 +229,7 @@ def test_t20_symlinked_critical_path_is_refused(tmp_path):
 
 @pytest.mark.acceptance
 def test_t21_release_tree_without_git_still_verifies(tmp_path):
-    """T21: the staged archive has no .git and must still verify exactly."""
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-019: T21: the staged archive has no .git and must still verify exactly."""
     repo, production, tooling = _repo(tmp_path)
     manifest = prepare(
         production_sha=production,
@@ -261,7 +261,7 @@ def test_t21_release_tree_without_git_still_verifies(tmp_path):
 
 @pytest.mark.acceptance
 def test_t22_changed_critical_scope_cannot_be_silently_dropped(tmp_path):
-    """T22: emptying the hash map must not let a changed path pass unhashed."""
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-019: T22: emptying the hash map must not let a changed path pass unhashed."""
     repo, production, tooling = _repo(tmp_path)
     manifest = prepare(
         production_sha=production,
@@ -283,7 +283,7 @@ def test_t22_changed_critical_scope_cannot_be_silently_dropped(tmp_path):
 
 @pytest.mark.acceptance
 def test_inventory_is_stable_across_repeated_prepare_calls(tmp_path):
-    """Determinism: repeated prepare runs must yield byte-identical hash maps."""
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-019: Determinism: repeated prepare runs must yield byte-identical hash maps."""
     repo, production, tooling = _repo(tmp_path)
     exceptions = _exceptions(tmp_path, production, tooling, [CONSUMER])
     first = prepare(

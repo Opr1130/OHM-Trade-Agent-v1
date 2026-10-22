@@ -90,7 +90,7 @@ def _index(name: str) -> int:
 
 @pytest.mark.acceptance
 def test_t13_authorization_revoked_between_check_and_mutation_blocks():
-    """T13: the same resolver run again after a revocation must refuse."""
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-018: T13: the same resolver run again after a revocation must refuse."""
     comments = [_comment(OWNER, _approval_body(), "2026-10-22T00:59:00Z", 1)]
     first = select_from_comments(
         comments, compatibility=_compat(), owner_login=OWNER, now=NOW
@@ -108,7 +108,7 @@ def test_t13_authorization_revoked_between_check_and_mutation_blocks():
 
 @pytest.mark.acceptance
 def test_t13b_workflow_revalidates_authorization_before_mutation():
-    """T13b: a fresh fetch+select step must precede the mutating step."""
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-018: T13b: a fresh fetch+select step must precede the mutating step."""
     revalidate = _index("Revalidate owner authorization immediately before mutation")
     mutate = _index("Run recovery worker update")
     assert revalidate < mutate
@@ -122,7 +122,7 @@ def test_t13b_workflow_revalidates_authorization_before_mutation():
 
 @pytest.mark.acceptance
 def test_t27_main_movement_is_guarded_before_mutation():
-    """T27: main is re-resolved after certification and before mutation."""
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-018: T27: main is re-resolved after certification and before mutation."""
     revalidate = _index("Revalidate main and exact-SHA CI before mutation")
     mutate = _index("Run recovery worker update")
     assert revalidate < mutate
@@ -131,7 +131,7 @@ def test_t27_main_movement_is_guarded_before_mutation():
 
 @pytest.mark.acceptance
 def test_t28_concurrent_recovery_cannot_overlap():
-    """T28: the learning workflow is serialized by a shared concurrency group."""
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-009: T28: the learning workflow is serialized by a shared concurrency group."""
     workflow = _workflow()
     assert workflow["concurrency"]["group"] == "opip-learning"
     assert workflow["concurrency"]["cancel-in-progress"] is False
@@ -139,13 +139,13 @@ def test_t28_concurrent_recovery_cannot_overlap():
 
 @pytest.mark.acceptance
 def test_t29_protected_environment_remains_enforced():
-    """T29: the learning-production environment gate is still declared."""
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-009: T29: the learning-production environment gate is still declared."""
     assert _workflow()["jobs"]["deploy"]["environment"] == "learning-production"
 
 
 @pytest.mark.acceptance
 def test_t30_recovery_never_enables_learning_timers():
-    """T30: the recovery workflow must not enable timers."""
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-009: T30: the recovery workflow must not enable timers."""
     text = WORKFLOW.read_text(encoding="utf-8")
     enabling = [
         line
@@ -158,7 +158,7 @@ def test_t30_recovery_never_enables_learning_timers():
 
 @pytest.mark.acceptance
 def test_t31_no_core_deployment_path_is_reachable():
-    """T31: the recovery workflow can never invoke the core deploy."""
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-009: T31: the recovery workflow can never invoke the core deploy."""
     text = WORKFLOW.read_text(encoding="utf-8")
     assert "deploy-production" not in text
     assert "ohm-deploy" not in text
@@ -168,7 +168,7 @@ def test_t31_no_core_deployment_path_is_reachable():
 
 @pytest.mark.acceptance
 def test_t32_no_authority_flags_are_touched():
-    """T32: recovery may not flip Paper V2, Committee, funded or AI authority."""
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-009: T32: recovery may not flip Paper V2, Committee, funded or AI authority."""
     text = WORKFLOW.read_text(encoding="utf-8")
     for forbidden in (
         "OPIP_PAPER_V2_MODE",
