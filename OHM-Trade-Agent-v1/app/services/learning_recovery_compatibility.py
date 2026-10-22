@@ -64,17 +64,111 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _expand(root: Path) -> dict[str, str]:
+GENERATED_DIR_NAMES = frozenset({"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"})
+GENERATED_SUFFIXES = (".pyc", ".pyo")
+
+
+def _posix(value: str) -> str:
+    """Normalize a relative path to Git-style POSIX form on every platform."""
+    text = value.replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    return text
+
+
+def _is_generated(relative: str) -> bool:
+    parts = relative.split("/")
+    if any(part in GENERATED_DIR_NAMES for part in parts[:-1]):
+        return True
+    return relative.endswith(GENERATED_SUFFIXES)
+
+
+def _record(hashes: dict[str, str], relative: str, digest: str) -> None:
+    key = _posix(relative)
+    if key in hashes and hashes[key] != digest:
+        raise ValueError(f"duplicate normalized critical path: {key}")
+    hashes[key] = digest
+
+
+def _expand_fs(root: Path) -> dict[str, str]:
+    """Walk a release tree that has no Git metadata (staged archive)."""
     hashes: dict[str, str] = {}
     for entry in CRITICAL_PATHS:
         path = root / entry
+        if path.is_symlink():
+            raise ValueError(f"refusing symlinked critical path: {entry}")
         if path.is_file():
-            hashes[entry] = _sha256(path)
+            _record(hashes, entry, _sha256(path))
         elif path.is_dir():
             for child in sorted(path.rglob("*")):
-                if child.is_file() and not child.is_symlink():
-                    hashes[str(child.relative_to(root))] = _sha256(child)
+                if child.is_symlink():
+                    if child.is_file():
+                        raise ValueError(f"refusing symlinked critical file: {child}")
+                    continue
+                if not child.is_file():
+                    continue
+                relative = _posix(str(child.relative_to(root)))
+                if _is_generated(relative):
+                    continue
+                _record(hashes, relative, _sha256(child))
     return hashes
+
+
+def _expand_tracked(repo_root: Path, git_sha: str) -> dict[str, str]:
+    """Build the authoritative inventory from the exact tracked Git tree.
+
+    Untracked and generated artifacts cannot enter the hash surface because the
+    object database is the only source. Tracked executables keep participating
+    regardless of filename.
+    """
+    listing = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "ls-tree",
+            "-r",
+            "-z",
+            git_sha,
+            "--",
+            *CRITICAL_PATHS,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if listing.returncode != 0:
+        raise ValueError(f"git ls-tree failed: {listing.stderr.strip()}")
+    prefix = _repo_prefix(repo_root)
+    hashes: dict[str, str] = {}
+    for record in listing.stdout.split("\0"):
+        if not record.strip():
+            continue
+        meta, _, raw_path = record.partition("\t")
+        fields = meta.split()
+        if len(fields) < 3:
+            raise ValueError(f"unparseable ls-tree record: {record!r}")
+        mode, kind, object_id = fields[0], fields[1], fields[2]
+        if kind != "blob":
+            raise ValueError(f"refusing non-blob critical entry: {raw_path}")
+        if mode == "120000":
+            raise ValueError(f"refusing symlinked critical entry: {raw_path}")
+        relative = _strip_prefix(raw_path, prefix)
+        blob = subprocess.run(
+            ["git", "-C", str(repo_root), "cat-file", "blob", object_id],
+            capture_output=True,
+            check=False,
+        )
+        if blob.returncode != 0:
+            raise ValueError(f"git cat-file failed for {relative}")
+        _record(hashes, relative, hashlib.sha256(blob.stdout).hexdigest())
+    return hashes
+
+
+def _expand(root: Path, *, git_sha: str = "") -> dict[str, str]:
+    if git_sha:
+        return _expand_tracked(root, git_sha)
+    return _expand_fs(root)
 
 
 def _exceptions(
@@ -176,7 +270,8 @@ def prepare(
         "unreviewed_changes": unreviewed,
         "attestation_required": not passed,
         "exception_rationale": rationale,
-        "tooling_sha256": _expand(repo_root),
+        "inventory_source": "git-tree",
+        "tooling_sha256": _expand(repo_root, git_sha=tooling_sha),
     }
 
 
@@ -214,10 +309,31 @@ def verify(
     )
     expected = manifest.get("tooling_sha256") or {}
     add("compatibility_hash_manifest_present", bool(expected), f"files={len(expected)}")
+    unsafe = sorted(
+        key
+        for key in expected
+        if key.startswith("/")
+        or "\\" in key
+        or ".." in key.split("/")
+        or not key
+    )
+    add("compatibility_paths_safe", not unsafe, f"unsafe={unsafe}")
+    unhashed = sorted(
+        str(path)
+        for path in (manifest.get("changed_critical_paths") or [])
+        if str(path) not in expected
+    )
+    add(
+        "compatibility_changed_paths_hashed",
+        not unhashed,
+        f"unhashed={unhashed}",
+    )
     mismatched = []
     for relative, digest in expected.items():
+        if relative in unsafe:
+            continue
         path = source_app / relative
-        if not path.is_file() or _sha256(path) != digest:
+        if path.is_symlink() or not path.is_file() or _sha256(path) != digest:
             mismatched.append(relative)
     add("compatibility_hashes_match", not mismatched, f"mismatched={mismatched}")
     if manifest.get("attestation_required") or (

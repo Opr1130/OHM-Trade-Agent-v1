@@ -19,14 +19,19 @@ import re
 import sys
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 SCHEMA = "opip-learning-recovery-attestation/v1"
 MARKER = "<!-- opip-recovery-attestation:v1"
+REVOCATION_SCHEMA = "opip-learning-recovery-revocation/v1"
+REVOCATION_MARKER = "<!-- opip-recovery-revocation:v1"
+PLAINTEXT_REVOCATION = re.compile(r"(?im)^\s*REVOKED:\s*do not proceed\s*\.?\s*$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 DEFAULT_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
+
 
 
 class AttestationError(RuntimeError):
@@ -220,6 +225,157 @@ def _attestation_from_comment(body: str) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+@dataclass(frozen=True)
+class _AuthEvent:
+    """One owner-authored authorization event, already scoped to the pair."""
+
+    kind: str  # approval | approval_invalid | revocation | revocation_invalid
+    when: datetime
+    order: int | None
+    payload: Mapping[str, Any] | None
+    comment: Mapping[str, Any]
+    reason: str
+
+
+def _payload_between(body: str, marker: str) -> tuple[bool, dict[str, Any] | None]:
+    """Return (marker_present, parsed_object_or_None)."""
+    if marker not in body:
+        return False, None
+    start = body.index(marker) + len(marker)
+    end = body.find("-->", start)
+    if end < 0:
+        return True, None
+    try:
+        value = json.loads(body[start:end].strip())
+    except ValueError:
+        return True, None
+    return True, value if isinstance(value, dict) else None
+
+
+def _scope(payload: Mapping[str, Any] | None) -> tuple[str, str]:
+    if not isinstance(payload, Mapping):
+        return "", ""
+    return (
+        str(payload.get("production_sha") or ""),
+        str(payload.get("tooling_sha") or ""),
+    )
+
+
+def _applies(production: str, tooling: str, pair_production: str, pair_tooling: str) -> bool:
+    """An event with no explicit scope applies to the pair under evaluation."""
+    if production and production != pair_production:
+        return False
+    if tooling and tooling != pair_tooling:
+        return False
+    return True
+
+
+def _event_order(comment: Mapping[str, Any]) -> tuple[datetime, int | None]:
+    when = _parse_utc(str(comment.get("created_at") or ""))
+    raw = comment.get("id")
+    if isinstance(raw, bool):
+        return when, None
+    if isinstance(raw, int):
+        return when, raw
+    if isinstance(raw, str) and raw.isdigit():
+        return when, int(raw)
+    return when, None
+
+
+def authorization_events(
+    comments: Sequence[Mapping[str, Any]],
+    *,
+    compatibility: Mapping[str, Any],
+    owner_login: str,
+) -> list[_AuthEvent]:
+    """Classify owner-authored authorization events applicable to this exact pair.
+
+    Non-owner comments can never authorize or revoke. Events explicitly scoped to
+    another SHA pair are ignored. Anything relevant whose scope cannot be read is
+    treated as applicable so the caller fails closed.
+    """
+    pair_production = str(compatibility.get("production_sha") or "")
+    pair_tooling = str(compatibility.get("tooling_sha") or "")
+    events: list[_AuthEvent] = []
+    for comment in comments:
+        if str((comment.get("user") or {}).get("login") or "") != owner_login:
+            continue
+        body = str(comment.get("body") or "")
+        has_approval, approval = _payload_between(body, MARKER)
+        has_revocation, revocation = _payload_between(body, REVOCATION_MARKER)
+        if not has_approval and not has_revocation:
+            if PLAINTEXT_REVOCATION.search(body):
+                when, order = _event_order(comment)
+                events.append(
+                    _AuthEvent(
+                        "revocation", when, order, None, comment, "plaintext owner revocation"
+                    )
+                )
+            continue
+        if has_revocation:
+            production, tooling = _scope(revocation)
+            if not _applies(production, tooling, pair_production, pair_tooling):
+                continue
+            when, order = _event_order(comment)
+            if revocation is None:
+                events.append(
+                    _AuthEvent(
+                        "revocation_invalid",
+                        when,
+                        order,
+                        None,
+                        comment,
+                        "malformed revocation event",
+                    )
+                )
+            else:
+                events.append(
+                    _AuthEvent(
+                        "revocation",
+                        when,
+                        order,
+                        revocation,
+                        comment,
+                        str(revocation.get("reason") or "owner revocation"),
+                    )
+                )
+            continue
+        production, tooling = _scope(approval)
+        if approval is not None and not _applies(
+            production, tooling, pair_production, pair_tooling
+        ):
+            continue
+        when, order = _event_order(comment)
+        if approval is None:
+            events.append(
+                _AuthEvent(
+                    "approval_invalid",
+                    when,
+                    order,
+                    None,
+                    comment,
+                    "malformed attestation event",
+                )
+            )
+        else:
+            events.append(_AuthEvent("approval", when, order, approval, comment, ""))
+    return events
+
+
+def _reject_ambiguous_ordering(events: Sequence[_AuthEvent]) -> None:
+    for previous, current in zip(events, events[1:]):
+        if previous.when != current.when:
+            continue
+        if (
+            previous.order is None
+            or current.order is None
+            or previous.order == current.order
+        ):
+            raise AttestationError(
+                "ambiguous authorization event ordering; refusing to resolve"
+            )
+
+
 def select_from_comments(
     comments: Sequence[Mapping[str, Any]],
     *,
@@ -228,34 +384,79 @@ def select_from_comments(
     now: datetime | None = None,
     max_age_seconds: int = DEFAULT_MAX_AGE_SECONDS,
 ) -> dict[str, Any]:
-    candidates: list[tuple[str, Mapping[str, Any], dict[str, Any]]] = []
-    for comment in comments:
-        if str((comment.get("user") or {}).get("login") or "") != owner_login:
-            continue
-        payload = _attestation_from_comment(str(comment.get("body") or ""))
-        if payload is None:
-            continue
-        candidates.append(
-            (str(comment.get("created_at") or ""), comment, payload)
-        )
-    if not candidates:
-        raise AttestationError("no owner-authored attestation comment found")
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    for _, comment, payload in candidates:
-        payload = dict(payload)
-        # The authenticated comment URL is authoritative; ignore a URL embedded in the body.
-        payload["record_identity"] = str(comment.get("html_url") or "")
-        try:
-            return attest_manifest(
-                compatibility,
-                payload,
-                owner_login=owner_login,
-                now=now,
-                max_age_seconds=max_age_seconds,
+    """Resolve the exact-pair authorization state from authenticated owner events.
+
+    Events are applied chronologically with last-applicable-wins semantics: a later
+    revocation always supersedes an earlier approval, a later invalid applicable
+    event never silently falls back to an older approval, and a fresh valid
+    re-approval after revocation restores authorization.
+    """
+    events = authorization_events(
+        comments, compatibility=compatibility, owner_login=owner_login
+    )
+    if not events:
+        marker_seen = any(
+            str((comment.get("user") or {}).get("login") or "") == owner_login
+            and (
+                MARKER in str(comment.get("body") or "")
+                or REVOCATION_MARKER in str(comment.get("body") or "")
             )
-        except AttestationError:
-            continue
-    raise AttestationError("no valid owner attestation for this exact pair")
+            for comment in comments
+        )
+        if marker_seen:
+            raise AttestationError("no valid owner attestation for this exact pair")
+        raise AttestationError("no owner-authored attestation comment found")
+    events.sort(
+        key=lambda event: (event.when, event.order if event.order is not None else -1)
+    )
+    _reject_ambiguous_ordering(events)
+
+    state: tuple[str, Mapping[str, Any] | None, str] | None = None
+    for event in events:
+        if event.kind == "approval":
+            payload = dict(event.payload or {})
+            # The authenticated comment URL is authoritative; ignore any URL in the body.
+            payload["record_identity"] = str(event.comment.get("html_url") or "")
+            try:
+                checks = validate(
+                    attestation=payload,
+                    compatibility=compatibility,
+                    owner_login=owner_login,
+                    now=now,
+                    max_age_seconds=max_age_seconds,
+                )
+            except AttestationError as exc:
+                state = ("invalid", None, str(exc))
+                continue
+            failures = [check["name"] for check in checks if not check["passed"]]
+            if failures:
+                state = ("invalid", None, f"failed checks {failures}")
+            else:
+                state = ("approved", payload, "")
+        elif event.kind == "revocation":
+            state = ("revoked", event.payload, event.reason)
+        else:
+            state = ("invalid", None, event.reason)
+
+    if state is None:
+        raise AttestationError("no valid owner attestation for this exact pair")
+    kind, payload, detail = state
+    if kind == "revoked":
+        raise AttestationError(
+            f"no valid owner attestation: authorization revoked ({detail})"
+        )
+    if kind == "invalid" or payload is None:
+        raise AttestationError(
+            "no valid owner attestation: latest applicable authorization event "
+            f"is invalid ({detail})"
+        )
+    return attest_manifest(
+        compatibility,
+        payload,
+        owner_login=owner_login,
+        now=now,
+        max_age_seconds=max_age_seconds,
+    )
 
 
 def validate_manifest_attestation(
