@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import gzip
 import hashlib
+import json
 from pathlib import Path
 
 
@@ -69,7 +70,7 @@ class StreamFrame:
                     "stream overlap" if part.start < next_byte else "stream gap"
                 )
             if part.sha256 in seen:
-                raise StreamContinuityError("duplicate stream part")
+                raise StreamContinuityError("DUPLICATE_CONTENT: repeated part digest")
             seen.add(part.sha256)
             if index != len(ordered) - 1 and not part.archived:
                 raise StreamContinuityError("nonterminal hot file")
@@ -151,13 +152,54 @@ def _read_absolute(frame: StreamFrame, start: int, end: int) -> bytes:
     return result
 
 
+def frame_sha256(frame: StreamFrame) -> str:
+    """Digest a portable, canonical stream frame.
+
+    The expected digest MUST come from the independently authenticated export
+    manifest. This local digest alone does not establish producer provenance.
+    Archive path names are logical identities; host-specific parent paths are
+    intentionally excluded so staging and worker copies produce the same hash.
+    """
+    parts = frame.verify_layout()
+    document = {
+        "schema_version": 1,
+        "stream_id": frame.stream_id,
+        "retained_start": frame.retained_start,
+        "end": frame.end,
+        "parts": [
+            {
+                "name": part.path.name,
+                "start": part.start,
+                "end": part.end,
+                "sha256": part.sha256,
+                "raw_sha256": part.raw_sha256,
+                "archived": part.archived,
+                "row_count": part.row_count,
+            }
+            for part in parts
+        ],
+    }
+    return _sha(json.dumps(
+        document, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8"))
+
+
 def plan_resume(
     frame: StreamFrame,
     checkpoint: StreamCheckpoint,
     *,
+    expected_frame_sha256: str,
     verify_bytes: bool = True,
 ) -> tuple[tuple[StreamPart, int], ...]:
-    """Locate a proven checkpoint; never guess a legacy hot-file origin."""
+    """Locate a proven checkpoint using a trusted, manifest-bound frame hash.
+
+    expected_frame_sha256 MUST be supplied from the verified export manifest,
+    not calculated by the caller from the untrusted frame itself.
+    """
+    _require_digest(expected_frame_sha256, "expected_frame_sha256")
+    actual_frame_sha256 = frame_sha256(frame)
+    if actual_frame_sha256 != expected_frame_sha256:
+        raise StreamContinuityError("FRAME_AUTHENTICITY_MISMATCH")
     parts = frame.verify_layout()
     if checkpoint.stream_id != frame.stream_id:
         raise StreamContinuityError("stream identity mismatch")
