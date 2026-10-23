@@ -450,6 +450,63 @@ def _run_target_spine_fail_open() -> None:
         )
 
 
+def _run_tradevisor_fail_open() -> None:
+    """Drain the Tradevisor advisory inbox - after every protection phase.
+
+    Tradevisor is external advisory evidence. This phase is off unless
+    ``OPIP_TRADEVISOR_ENABLED`` is true, it runs LAST so it can never delay or
+    starve active-position protection, and it admits nothing into native
+    selection. It only evaluates already-received alerts against the existing
+    F5/F7/R4 owners and, when policy allows, delivers an advisory alert. A
+    failure here is reported and never aborts the cycle.
+    """
+    try:
+        settings = get_settings()
+        if not bool(getattr(settings, "opip_tradevisor_enabled", False)):
+            return
+        from app.services.tradevisor_inbox import process_queued_events, pending_count
+        from app.services.tradevisor_pipeline import (
+            evaluate_and_notify,
+            retry_undelivered_notifications,
+        )
+
+        if pending_count() == 0:
+            print("Tradevisor advisory drain: no queued events")
+        batches = 0
+        total = {
+            "checked": 0,
+            "processed": 0,
+            "rejected": 0,
+            "retried": 0,
+            "poisoned": 0,
+            "reclaimed": 0,
+            "qualified": 0,
+        }
+        while pending_count() > 0 and batches < 4:
+            summary = process_queued_events(
+                evaluator=lambda signal: evaluate_and_notify(signal, settings=settings)
+            )
+            for key in total:
+                total[key] += int(summary.get(key, 0) or 0)
+            batches += 1
+            if int(summary.get("checked", 0) or 0) == 0:
+                break
+        # Undelivered actionable alerts are re-evaluated, never re-sent stale.
+        retry = retry_undelivered_notifications(settings=settings, limit=2)
+        print("Tradevisor advisory drain (non-authoritative)")
+        for key, value in total.items():
+            print(f"  {key}: {value}")
+        print(f"  notification_retry_candidates: {retry['candidates']}")
+        print(f"  notification_retry_delivered: {retry['delivered']}")
+        print(f"  notification_retry_not_actionable: {retry['not_actionable']}")
+        print("  trade_authority_changed: False")
+    except Exception as exc:  # noqa: BLE001 - advisory work must not abort the cycle
+        print(
+            "Tradevisor advisory drain unavailable; production unaffected:",
+            f"{type(exc).__name__}: {exc}",
+        )
+
+
 def _run_broad_discovery_if_due(*, decision, entry_watch_ready: bool, settings) -> bool:
     """Run the authoritative broad discovery pass before optional workloads."""
     if decision.effective_mode != "SEARCH":
@@ -629,6 +686,11 @@ def _run_cycle_once() -> bool:
     # non-authoritative workload above. It is inert when the gate is off.
     _cycle_phase("TARGET_SPINE")
     _run_target_spine_fail_open()
+    # Tradevisor advisory ingress: strictly last, after protection and after the
+    # dormant spine, and inert unless explicitly enabled. It has no admission,
+    # order, or execution authority.
+    _cycle_phase("TRADEVISOR_ADVISORY")
+    _run_tradevisor_fail_open()
     _cycle_phase("WORKLOAD_COMPLETE")
     return True
 
