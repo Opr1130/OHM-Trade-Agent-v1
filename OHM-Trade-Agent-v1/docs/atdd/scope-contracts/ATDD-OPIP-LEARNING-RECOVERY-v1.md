@@ -272,6 +272,7 @@ AC-015 -> tests/test_producer_stream_epoch_v1.py::test_uncommitted_compaction_wi
 AC-015 -> tests/test_producer_stream_epoch_v1.py::test_post_rewrite_crash_recovers_with_verified_archive
 AC-015 -> tests/test_producer_stream_epoch_v1.py::test_ambiguous_partial_rewrite_refuses_checkpoint_advance
 AC-015 -> tests/test_producer_stream_epoch_v1.py::test_snapshot_refuses_pending_compaction
+AC-015 -> tests/test_producer_stream_epoch_v1.py::test_export_snapshot_refuses_missing_verified_archive
 
 AC-016 -> tests/test_learning_recovery_receipt_v1.py::test_intent_is_prepared_before_terminal_and_is_not_edited
 AC-016 -> tests/test_learning_recovery_receipt_v1.py::test_blocked_terminal_never_asserts_success
