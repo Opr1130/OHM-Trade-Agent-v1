@@ -34,7 +34,7 @@ never closes a funded position, and never suppresses a protective alert.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
 from app.scanner.market_scanner import analyze_symbol
@@ -764,17 +764,35 @@ def _finalize_qualified_buy(
             evidence=evidence,
         )
 
-    decision = DECISION_ENTER_NOW if plan.valid_now else DECISION_SET_LIMIT_ENTRY
+    proposed_action = DECISION_ENTER_NOW if plan.valid_now else DECISION_SET_LIMIT_ENTRY
+    # G-02 owner decision (2026-10-23): no trusted F6 production forecast and
+    # no approved deterministic fallback exist. The calculated trade is a
+    # shadow hypothesis, *never* an actionable recommendation. This explicit
+    # blocker must be revisited in an independently approved increment; merely
+    # changing a forecast status string cannot grant actionable authority.
+    missing = ["F6_TRUSTED_FORECAST"]
+    # G-04: a SWING requires completed, trusted higher-timeframe context.
+    # The existing path only has a native completed 1H snapshot. Do not infer
+    # a 4H close from the alert or allow a 1H proxy to stand in for it.
+    if horizon == HORIZON_SWING:
+        missing.append("SWING_4H_CLOSED_CONTEXT")
+    if active_trades is None:
+        missing.append("PORTFOLIO_EXPOSURE")
+    evidence["shadow_proposed_action"] = proposed_action
+    evidence["advisory_qualification"] = {
+        "status": "SHADOW_ONLY",
+        "missing": missing,
+        "policy": "OWNER_APPROVED_G02_G04_2026-10-23",
+    }
     return _finalize(
         signal,
         now=evaluated_at,
-        decision=decision,
-        code=None,
+        decision=DECISION_WATCH,
+        code="ADVISORY_EVIDENCE_INCOMPLETE",
         reason=(
-            f"Native evidence corroborates a {horizon.lower()} LONG: "
-            f"{plan.entry_style.replace('_', ' ')} entry, "
-            f"{plan.reward_to_risk_2:.2f}:1 reward/risk at Target 2, inside the "
-            f"{PRODUCTION_MAX_CAPITAL_FRACTION * 100:.0f}% capital envelope."
+            f"Shadow-only {horizon.lower()} LONG hypothesis ({proposed_action}); "
+            f"actionable qualification withheld pending {', '.join(missing)}. "
+            "No approved F6 fallback or 4H inference is permitted."
         ),
         horizon=horizon,
         regime=regime,
@@ -784,6 +802,5 @@ def _finalize_qualified_buy(
         attainability=attainability,
         allocation=allocation,
         portfolio=portfolio,
-        expires_at=evaluated_at + timedelta(minutes=expiry_minutes),
         evidence=evidence,
     )

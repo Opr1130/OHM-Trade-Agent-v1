@@ -3,7 +3,7 @@
 Covers the defects found during independent review:
 - an actionable alert the transport refused had no production retry path;
 - persisted decision evidence had no consumer (orphaned learning evidence);
-- degraded evidence (F6 / 4H) was recorded but not disclosed.
+- degraded F6 / 4H evidence must not permit notification on retry.
 """
 from __future__ import annotations
 
@@ -227,7 +227,7 @@ def test_retry_counts_an_unreadable_row_and_leaves_it_untouched(monkeypatch):
     assert int(row["notification"].get("retry_count", 0)) == 0
 
 
-def test_retry_re_evaluates_and_delivers_a_fresh_recommendation():
+def test_retry_re_evaluates_and_withholds_delivery_without_f6_and_4h():
     _settle_failed()
     sender = Sender()
     summary = pipeline.retry_undelivered_notifications(
@@ -238,17 +238,17 @@ def test_retry_re_evaluates_and_delivers_a_fresh_recommendation():
     )
     assert summary == {
         "candidates": 1,
-        "delivered": 1,
+        "delivered": 0,
         "still_undelivered": 0,
-        "not_actionable": 0,
+        "not_actionable": 1,
         "unreadable": 0,
     }
-    assert len(sender.calls) == 1
-    # The delivered message was produced from fresh evidence, not a stored plan.
-    assert "TRADEVISOR ALERTS" in sender.calls[0]["message"]
+    # A legacy undelivered actionable row must never bypass today's stricter
+    # F6/4H policy. Retry re-evaluates fresh evidence and sends no message.
+    assert sender.calls == []
     row = inbox.iter_records()[0]
     assert row["notification"]["retry_count"] == 1
-    assert row["notification"]["status"] == "DELIVERED"
+    assert row["notification"]["status"] == "RETRY_NOT_ACTIONABLE"
 
 
 def test_retry_records_a_non_actionable_outcome_without_sending():
@@ -287,6 +287,8 @@ def test_retry_is_bounded_and_skips_expired_rows():
         snapshot_provider=lambda _m: ("ok", market(), None),
         sender=Sender(),
     )
+    assert summary["candidates"] == 0
+    assert summary["delivered"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -312,10 +314,11 @@ def test_inbox_declares_its_evidence_class_and_consumer():
 def test_learning_job_measures_persisted_records():
     _settle_failed()
     later = NOW + timedelta(days=2)
-    provider = lambda market, decided_at: [
-        _Candle(decided_at + timedelta(hours=1), 101.0, 99.5),
-        _Candle(decided_at + timedelta(hours=2), 106.0, 100.5),
-    ]
+    def provider(_market, decided_at):
+        return [
+            _Candle(decided_at + timedelta(hours=1), 101.0, 99.5),
+            _Candle(decided_at + timedelta(hours=2), 106.0, 100.5),
+        ]
     result = learning_job.build_report(
         now=later,
         deployed_sha=SHA_A,

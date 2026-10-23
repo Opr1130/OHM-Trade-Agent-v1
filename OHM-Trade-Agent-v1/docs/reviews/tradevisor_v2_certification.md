@@ -1,5 +1,32 @@
 # Tradevisor V2 — Independent Engineering Certification
 
+## Owner-policy addendum — 2026-10-23 (supersedes G-02/G-03/G-04 pending status below)
+
+The sections below document the **original pre-policy certification** at
+`8100e6b5` and must not be read as a current qualification-policy claim.
+Owner decisions subsequently authorized the following corrections in PR #444:
+
+| Gate | Policy disposition | Evidence / remaining limit |
+| --- | --- | --- |
+| G-02 / ATDD-29 | **DECIDED:** F6 absence blocks actionable qualification; shadow evidence is permitted | Evaluator emits `WATCH` / `ADVISORY_EVIDENCE_INCOMPLETE` even after R4/F5/F7 pass. AC-015 and evaluator ATDD-29 tests prove no alert; no trusted model or deterministic actionable fallback exists |
+| G-03 / ATDD-38 | **DECIDED:** retain separately classified noncanonical shadow observations and learning, with no admission or execution authority | Approved architecture exception, **not** a PASS of the canonical-writer-outage test; no canonical handoff exists |
+| G-04 | **DECIDED:** completed trusted 4H regime required for actionable SWING | Native completed 1H remains the only regime input, so an otherwise qualified SWING stays `WATCH`; 4H integration is deferred |
+| G-01 | **OPEN** | Genuine TradingView delivery / certificate / body-secret verification in staging not performed |
+| G-05 / ATDD-43 | **OPEN / PARTIAL** | No 10x burst, latency injection or soak proof; F11 protection independence is structural only |
+
+Hypothetical stop, target, economics and F7 allocation remain frozen as
+measurement evidence (`shadow_proposed_action`) but are never actionable
+recommendations; no expiry or Telegram send is attached to `WATCH`. Only
+explicit `SHADOW_ONLY` hypotheses can be scored from forward candles as
+`SHADOW_HYPOTHESIS` with `fill_attribution=NONE`; ordinary rejected WATCH rows
+are not counted as hypothetical trades. These
+changes create no trade, deployment, credential or production-alert authority.
+The historical test counts below predate this addendum; current exact-head
+verification must be reported separately after the new commit and CI.
+
+**Current disposition: POLICY CORRECTION IMPLEMENTED LOCALLY; EXACT-HEAD CI AND
+INDEPENDENT MERGE REVIEW PENDING — PRODUCTION NOT AUTHORIZED.**
+
 Worktree: `feature/tradevisor-v2-ingress` @ baseline `8100e6b5`
 Scope: Tradevisor V2 advisory ingress, evaluation, notification, learning.
 Verdict: **DEVELOPMENT COMPLETE — PRODUCTION NOT AUTHORIZED.**

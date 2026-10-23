@@ -4,13 +4,26 @@ Status: **implementation complete, deployment NOT authorized.**
 `OPIP_TRADEVISOR_ENABLED=false` (the default) means the webhook answers `404`
 and the cycle phase is inert.
 
+**Owner policy disposition (2026-10-23): shadow-only until further approval.**
+G-02 requires trusted F6 evidence or a separately owner-approved deterministic
+fallback before any actionable qualification; neither exists today. G-04 also
+requires independently trusted **completed 4H context for SWING**; it is not
+available and 1H is never a substitute. The full R4/F5/F7 hypothetical plan is
+retained for measurement, but a qualifying BUY currently returns `WATCH` with
+`ADVISORY_EVIDENCE_INCOMPLETE` and is **never sent as an actionable Telegram
+alert**. G-03 accepts the existing `ADVISORY_NON_CANONICAL` inbox exclusively
+for shadow observation and learning: it has no admission or execution authority,
+and the original canonical-outage scenario is not claimed as tested. Enabling
+webhook ingestion in a future approved staging run does not waive these gates.
+
 ## What this is
 
 A versioned webhook that lets the invite-only **Tradevisor V2** TradingView
 indicator hand O'Pip a BUY/SELL observation, and a pipeline that answers one
 question: *does this BUY correspond to a defensibly tradable opportunity right
-now?* The answer is an actionable, fully-priced advisory recommendation or an
-explicit abstention.
+now?* It builds a costed hypothetical plan when the deterministic gates pass,
+then returns a nonactionable `WATCH` while the mandatory F6/4H evidence is
+unavailable; the notifier is gated on actual actionable qualification.
 
 ## What this is NOT
 
@@ -242,12 +255,19 @@ freshness window independently reject an unfinished or stale bar.
    then the existing R4 geometry kernel, F5 target attainability, F5 economic
    quality, F7 capital allocation and exposure capacity.
 4. **Decide** — `ENTER NOW`, `SET LIMIT ENTRY`, `WATCH`, `NO TRADE` or
-   `EXPIRED`. Only the first two are actionable.
+   `EXPIRED`. Only the first two would be actionable, but no path currently
+   reaches them: missing F6 always forces `WATCH` and missing completed 4H
+   additionally blocks SWING. The proposed entry decision is frozen as
+`shadow_proposed_action`, not presented to the operator as authorization.
 5. **Notify** — actionable recommendations are rendered and delivered through
    the existing Telegram transport and notification policy. Non-actionable
    observations are recorded, not broadcast.
-6. **Learn** — the frozen decision record is measured prospectively. No policy
-   is promoted automatically.
+6. **Learn** — the frozen decision record is measured prospectively. An
+   explicitly tagged `SHADOW_ONLY` hypothesis may be measured using later
+   candles as `SHADOW_HYPOTHESIS`, with `fill_attribution=NONE`; arbitrary WATCH
+   rejections are not treated as hypothetical trades. Neither candle touches
+   nor estimated net results are realized executions or permission to trade.
+   No policy is promoted automatically.
 
 ### SELL semantics
 

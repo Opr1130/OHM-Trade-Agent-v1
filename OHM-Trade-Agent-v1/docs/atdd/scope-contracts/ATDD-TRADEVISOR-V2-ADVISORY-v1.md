@@ -2,7 +2,7 @@ INCREMENT:
 ATDD-TRADEVISOR-V2-ADVISORY-v1
 
 OWNER-APPROVED INTENT:
-Authorize, and only authorize, the Tradevisor V2 advisory integration already implemented on `feature/tradevisor-v2-ingress`: a default-disabled webhook ingress for the invite-only Tradevisor V2 TradingView indicator, plus an advisory evaluation, notification and learning pipeline that reuses the existing deterministic owners unchanged. The owner approved this increment specifically to resolve the `atdd scope` pull-request gate for PR #444 by establishing the missing scope contract, to record the three acceptance deviations honestly, and to keep F6 (G-02), canonical admission (G-03) and 4H regime (G-04) as PENDING OWNER POLICY DECISIONS. This contract grants no trading authority, changes no risk default, no fixed sizing, no minimum reward-to-risk, no order path, no canonical writer, no selector, no release-profile key and no production configuration. It does not authorize deployment, activation, credentials, Telegram production delivery, paper or funded execution, or merging PR #444. Success is that the authorized file set is exactly mapped, the acceptance criteria are proven by registered acceptance tests, and the deviations are visible rather than converted into passes.
+Authorize, and only authorize, the Tradevisor V2 advisory integration on `feature/tradevisor-v2-ingress`: default-disabled Tradevisor TradingView webhook ingress, deterministic evaluation, notifications and learning. The owner subsequently approved three *policy dispositions* on 2026-10-23: G-02, unavailable F6 permits a recorded shadow hypothesis but never actionable qualification without an independently approved trusted forecast or deterministic fallback; G-03, the explicitly classified noncanonical inbox is an approved shadow-observation/learning exception with no canonical admission or execution rights; and G-04, actionable SWING qualification requires independently trusted completed 4H context, never inferred from 1H. This increment implements fail-closed qualification and retains shadow plan evidence. No F6 model or fallback, no 4H data provider and no canonical handoff are authorized or created. ATDD-29 is now exercised by an explicit F6 abstention gate; ATDD-38 is an approved scope exception **not an outage PASS**; ATDD-43 remains structurally partial pending soak. This contract grants no trading authority, changes no risk default, no fixed sizing, no minimum reward-to-risk, no order path, no canonical writer, no selector, no release-profile key and no production configuration. It does not authorize deployment, activation, credentials, Telegram production delivery, paper or funded execution, or merging PR #444.
 
 ARCHITECTURE REFERENCES:
 - OHM-Trade-Agent-v1/docs/atdd/README.md: the ATDD scope-control mechanism, its precedence, the required contract sections and the movable `ACTIVE_INCREMENT` pointer.
@@ -125,14 +125,22 @@ the durable advisory store and the integration's documentation
 WHEN:
 the evidence disposition is read
 THEN:
-it declares evidence_class ADVISORY_NON_CANONICAL, canonical_handoff NOT_PERFORMED and consumption app.jobs.report_tradevisor_learning with no admission or execution authority, and the recorded deviations stand: ATDD-29 F6 is advisory rather than an abstention gate, ATDD-38 no canonical handoff exists so that failure scenario is unexercised, and ATDD-43 overload proof is pending
+it declares evidence_class ADVISORY_NON_CANONICAL, canonical_handoff NOT_PERFORMED and consumption app.jobs.report_tradevisor_learning with no admission or execution authority; the owner-approved G-03 shadow exception is explicit, ATDD-38's canonical-outage scenario remains UNEXERCISED (not PASS), and ATDD-43 overload proof is pending
+
+AC-015:
+GIVEN:
+an otherwise qualifying BUY with native 1H, R4, F5, F7 and known exposure, but no trusted F6 forecast/approved fallback or completed trusted SWING 4H context
+WHEN:
+the evaluator finishes the proposed trade hypothesis and the notifier receives the decision
+THEN:
+the decision is WATCH and nonactionable, records ADVISORY_EVIDENCE_INCOMPLETE with explicit F6 and (for SWING only) 4H blockers, preserves a frozen hypothetical plan for prospective shadow measurement without an actionable expiry, and emits no actionable Telegram notification; forward-only candle observations are measured as SHADOW_HYPOTHESIS with no fill attribution, but unrelated WATCH rejections are not treated as trade hypotheses; no 1H approximation or missing-status substitution creates an authorization
 
 EXPLICITLY OUT OF SCOPE:
 - Any order placement, modification, cancellation or confirmation path, and any execution authority
 - Any change to fixed risk sizing, minimum reward-to-risk, position verification or execution safeguards
-- Registering a trusted forecast model, or making F6 a blocking gate (G-02 stays a pending owner policy decision)
-- Introducing a canonical handoff for advisory evidence (G-03 stays a pending owner policy decision)
-- Deriving 4H regime context or changing the recorded regime basis (G-04 stays a pending owner policy decision)
+- Registering a trusted F6 forecast, approving a deterministic F6 actionable fallback, or activating a forecast-dependent qualification pathway (G-02's fail-closed policy *is* approved)
+- Introducing a canonical handoff or promoting this shadow observation to canonical admission/execution (G-03's noncanonical shadow exception *is* approved)
+- Fetching or deriving trustworthy completed 4H data, or changing the native 1H regime basis (G-04's SWING fail-closed policy *is* approved)
 - Enabling the ingress in any environment, activating TradingView alerts, creating or rotating credentials, enabling Telegram production delivery, or enabling paper or funded execution
 - Deployment, production configuration, branch protection, rulesets or workflow changes
 - Any change to the Wave 8.2 TradingView bridge, the release-profile key set, the canonical writer, the selector or the learning-worker SHA contract
@@ -145,7 +153,7 @@ FROZEN BOUNDARIES:
 - `ATDD-OPIP-LEARNING-RECOVERY-v1` remains a valid, complete, unmodified contract whose acceptance tests continue to pass; its AC-005 expression of the pointer rule is the movable form and is not weakened by this handoff.
 - `OPIP_TRADEVISOR_ENABLED` stays false unless an operator explicitly sets it; no committed environment may set it.
 - Advisory evidence never acquires admission, execution, Telegram-production or canonical-writer authority.
-- ATDD-29, ATDD-38 and ATDD-43 remain recorded as deviations in `docs/atdd/tradevisor_v2_atdd.md` and are not reclassified as passes.
+- ATDD-29 is an exercised fail-closed F6 abstention check; ATDD-38 remains an **owner-approved shadow-only scope exception**, not a successful canonical outage test; ATDD-43 remains partial, without load/soak certification.
 - No production, trading, Feature Bus, paper or deployment authority is created, widened or transferred by this increment.
 
 
@@ -164,6 +172,7 @@ AC-011 -> tests/test_tradevisor_v2_advisory_acceptance_v1.py::test_ac_011_expire
 AC-012 -> tests/test_tradevisor_v2_advisory_acceptance_v1.py::test_ac_012_learning_fails_closed_on_release_drift
 AC-013 -> tests/test_tradevisor_v2_advisory_acceptance_v1.py::test_ac_013_advisory_phase_is_last_inert_and_contained
 AC-014 -> tests/test_tradevisor_v2_advisory_acceptance_v1.py::test_ac_014_evidence_is_noncanonical_and_has_a_consumer
+AC-015 -> tests/test_tradevisor_v2_advisory_acceptance_v1.py::test_ac_015_untrusted_f6_and_missing_swing_4h_never_send_actionable_alert
 
 
 IMPLEMENTATION MAP:
@@ -230,12 +239,20 @@ AC-014 -> OHM-Trade-Agent-v1/docs/reviews/tradevisor_v2_certification.md
 AC-014 -> OHM-Trade-Agent-v1/tests/test_tradevisor_inbox_v1.py
 AC-014 -> OHM-Trade-Agent-v1/tests/test_tradevisor_recovery_v1.py
 AC-014 -> OHM-Trade-Agent-v1/tests/test_tradevisor_v2_advisory_acceptance_v1.py
+AC-015 -> OHM-Trade-Agent-v1/app/services/tradevisor_evaluation.py
+AC-015 -> OHM-Trade-Agent-v1/app/services/tradevisor_learning.py
+AC-015 -> OHM-Trade-Agent-v1/TRADEVISOR_V2.md
+AC-015 -> OHM-Trade-Agent-v1/docs/atdd/tradevisor_v2_atdd.md
+AC-015 -> OHM-Trade-Agent-v1/docs/reviews/tradevisor_v2_certification.md
+AC-015 -> OHM-Trade-Agent-v1/tests/test_tradevisor_evaluation_v1.py
+AC-015 -> OHM-Trade-Agent-v1/tests/test_tradevisor_learning_v1.py
+AC-015 -> OHM-Trade-Agent-v1/tests/test_tradevisor_v2_advisory_acceptance_v1.py
 
 DEFERRED DISCOVERIES:
 - G-01: no genuine TradingView to O'Pip delivery has been observed; the source-to-production certification remains open and blocks activation, not this increment.
-- G-02: F6 forecast evidence is advisory, not blocking. Making it a gate, or formally amending ATDD-29 to an advisory requirement, is a pending owner policy decision.
-- G-03: advisory evidence performs no canonical handoff. Either accepting non-canonical advisory evidence permanently (amending ATDD-38) or authorizing a canonical handoff contract is a pending owner policy decision.
-- G-04: 4H regime context is recorded as UNAVAILABLE because only the completed 1H series is used. Requiring 4H retrieval is a pending owner policy decision.
+- G-02 POLICY RESOLVED 2026-10-23: F6 is missing; no unapproved actionable fallback. This increment blocks actionable qualification and preserves shadow hypotheses. A trusted model/fallback and validation remain future work.
+- G-03 POLICY RESOLVED 2026-10-23: explicitly noncanonical shadow observation and learning are permitted. The original ATDD-38 canonical-outage scenario is not exercised and cannot be claimed PASS; any promotion needs separate approval.
+- G-04 POLICY RESOLVED 2026-10-23: a SWING needs completed trusted 4H regime context to become actionable. No 4H provider exists yet; all current otherwise qualified SWING proposals remain WATCH, independently of the F6 block.
 - G-05: F11 independence is proven structurally; no overload, burst or soak measurement exists, so ATDD-43 stays partial.
 - TradingView documents an SSL client certificate that the recipient may verify. This integration does not verify it; adopting recipient-side verification is an edge change plus a staging verification, tracked as a security follow-up.
 - Whether the Tradevisor scenario suite should carry acceptance markers per scenario, rather than the grouped criteria used here, is a documentation question for a future increment.

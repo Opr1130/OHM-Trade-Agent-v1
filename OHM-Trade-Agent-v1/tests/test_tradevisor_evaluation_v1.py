@@ -11,8 +11,6 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
-import pytest
-
 from app.core.config import Settings
 from app.scanner.execution_validation import ExecutionValidation
 from app.scanner.models import MarketSnapshot
@@ -141,17 +139,23 @@ def evaluate(sig=None, **kwargs):
 # ---------------------------------------------------------------------------
 
 
-def test_atdd06_qualified_buy_produces_an_actionable_plan():
+def test_atdd06_qualified_buy_is_shadow_only_without_f6_and_4h():
     decision = evaluate()
-    assert decision.decision == te.DECISION_ENTER_NOW
-    assert decision.actionable is True
+    assert decision.decision == te.DECISION_WATCH
+    assert decision.actionable is False
+    assert decision.rejection_code == "ADVISORY_EVIDENCE_INCOMPLETE"
+    assert decision.evidence["advisory_qualification"]["missing"] == [
+        "F6_TRUSTED_FORECAST",
+        "SWING_4H_CLOSED_CONTEXT",
+    ]
+    assert decision.evidence["shadow_proposed_action"] == te.DECISION_ENTER_NOW
     plan = decision.plan
     assert plan is not None
     assert plan.stop_price < plan.entry_low <= plan.entry_high
     assert plan.entry_high < plan.target_1 < plan.target_2
     assert decision.allocation is not None and decision.allocation.recommended_capital > 0
     assert decision.economics is not None and decision.economics.qualified is True
-    assert decision.expires_at == NOW + timedelta(minutes=90)
+    assert decision.expires_at is None
 
 
 def test_atdd07_native_corroboration_is_recorded_not_invented():
@@ -167,6 +171,27 @@ def test_atdd07_native_corroboration_is_recorded_not_invented():
     assert evidence["native_snapshot_status"] == "AVAILABLE"
     assert decision.attainability is not None
     assert decision.attainability.qualified is True
+
+
+def test_atdd29_f6_blocks_actionable_even_when_4h_is_not_required():
+    tactical = evaluate(snapshot_provider=provider(atr=2.0, atr_pct=5.0))
+    assert tactical.horizon == te.HORIZON_TACTICAL
+    assert tactical.decision == te.DECISION_WATCH
+    assert tactical.actionable is False
+    assert tactical.evidence["advisory_qualification"]["missing"] == [
+        "F6_TRUSTED_FORECAST"
+    ]
+    assert tactical.evidence["shadow_proposed_action"] == te.DECISION_ENTER_NOW
+
+
+def test_atdd29_position_stays_shadow_only_without_trusted_f6():
+    quiet = evaluate(snapshot_provider=provider(atr=2.0, atr_pct=0.8))
+    assert quiet.horizon == te.HORIZON_POSITION
+    assert quiet.decision == te.DECISION_WATCH
+    assert quiet.actionable is False
+    assert "SWING_4H_CLOSED_CONTEXT" not in quiet.evidence[
+        "advisory_qualification"
+    ]["missing"]
 
 
 def test_atdd51_replay_of_the_same_frozen_inputs_is_identical():
@@ -282,7 +307,8 @@ def test_atdd30_exposure_capacity_rejects_a_full_book():
 
 def test_exposure_not_evaluated_is_recorded_as_unknown():
     decision = evaluate(active_trades=None)
-    assert decision.decision == te.DECISION_ENTER_NOW
+    assert decision.decision == te.DECISION_WATCH
+    assert "PORTFOLIO_EXPOSURE" in decision.evidence["advisory_qualification"]["missing"]
     assert decision.evidence["exposure"] == {"status": "EXPOSURE_NOT_EVALUATED"}
 
 

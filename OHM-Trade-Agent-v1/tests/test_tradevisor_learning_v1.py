@@ -139,6 +139,41 @@ def test_non_actionable_records_are_not_measured_as_trades():
         now=DECIDED + timedelta(days=3),
         candles_provider=lambda *_: candles(),
     )
+    assert outcome["status"] == learning.OUTCOME_NO_ENTRY_TOUCH
+    assert outcome["reason"] == "non-actionable evidence only"
+
+
+def test_owner_approved_shadow_hypothesis_is_measured_without_a_fill():
+    hypothesis = record(decision="WATCH", dedup_id="shadow-f6-g04")
+    frozen = hypothesis["decision_record"]
+    frozen["rejection_code"] = "ADVISORY_EVIDENCE_INCOMPLETE"
+    frozen["evidence"] = {
+        "shadow_proposed_action": "ENTER_NOW",
+        "advisory_qualification": {
+            "status": "SHADOW_ONLY",
+            "missing": ["F6_TRUSTED_FORECAST", "SWING_4H_CLOSED_CONTEXT"],
+        },
+    }
+    forward = [
+        Candle(DECIDED - timedelta(hours=1), 200.0, 150.0),
+        Candle(DECIDED + timedelta(hours=1), 101.0, 99.5),
+        Candle(DECIDED + timedelta(hours=2), 106.0, 100.5),
+    ]
+    outcome = learning.evaluate_outcome(
+        hypothesis,
+        now=DECIDED + timedelta(days=2),
+        candles_provider=lambda *_: forward,
+    )
+    assert outcome["status"] == learning.OUTCOME_MEASURED
+    assert outcome["measurement_subject"] == "SHADOW_HYPOTHESIS"
+    assert outcome["fill_attribution"] == learning.FILL_ATTRIBUTION_NONE
+    assert outcome["target_1_touched"] is True
+    assert outcome["target_2_touched"] is False
+    cohort = learning.summarize_cohorts(
+        [hypothesis], outcomes={"shadow-f6-g04": outcome}
+    )[learning.COHORT_SHADOW]
+    assert cohort["actionable"] == 0
+    assert cohort["measured"] == 1
 
 
 def test_outcome_measures_forward_path_only():

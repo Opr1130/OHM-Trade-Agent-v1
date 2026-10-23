@@ -10,9 +10,10 @@ These are contract-level proofs, not a second copy of the scenario suite. The
 scenario suite (``tests/test_tradevisor_*_v1.py``) owns the detailed matrix;
 this module proves that each approved criterion's observable outcome holds.
 
-Recorded deviations are asserted as deviations, never as passes:
-ATDD-29 (F6 is advisory, not an abstention gate), ATDD-38 (no canonical
-handoff exists) and ATDD-43 (structural, not overload, evidence).
+Approved policy: F6 cannot qualify a trade without a trusted forecast or an
+owner-approved fallback; SWING also needs completed 4H context. ATDD-38 has an
+approved noncanonical shadow-only exception, not a tested canonical outage.
+ATDD-43 remains structural, not overload, evidence.
 
 No live TradingView, AI, Telegram or exchange call is made.
 """
@@ -20,6 +21,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -709,8 +711,7 @@ def test_ac_014_evidence_is_noncanonical_and_has_a_consumer():
     assert status["authority"]["admission_authority"] is False
     assert status["authority"]["execution_authority"] is False
 
-    # ATDD-29 / ATDD-43 deviations: F6 and 4H are recorded as unavailable
-    # rather than gating the decision, and no overload claim is made.
+    # Missing native evidence is still recorded without invented 4H or F6.
     decision = evaluation.evaluate_signal(
         signal(),
         now=NOW,
@@ -720,4 +721,67 @@ def test_ac_014_evidence_is_noncanonical_and_has_a_consumer():
     )
     assert decision.evidence["f6_forecast_status"] == "UNAVAILABLE_NO_TRUSTED_MODEL"
     assert decision.evidence["regime_4h"] == "UNAVAILABLE"
+
+
+# ---------------------------------------------------------------------------
+# AC-015 — owner-approved F6/4H qualification policy, shadow-only learning
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.acceptance
+def test_ac_015_untrusted_f6_and_missing_swing_4h_never_send_actionable_alert():
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-015: fail-closed qualification."""
+    from app.services import tradevisor_notifier as notifier
+
+    result = evaluation.evaluate_signal(
+        signal(),
+        now=NOW,
+        settings=make_settings(),
+        snapshot_provider=lambda _market: ("ok", market(), None),
+        account_equity=10_000.0,
+        active_trades=[],
+    )
+    assert result.horizon == evaluation.HORIZON_SWING
+    assert result.decision == evaluation.DECISION_WATCH
+    assert result.rejection_code == "ADVISORY_EVIDENCE_INCOMPLETE"
+    assert result.actionable is False
+    assert result.evidence["shadow_proposed_action"] == "ENTER_NOW"
+    assert result.evidence["advisory_qualification"]["missing"] == [
+        "F6_TRUSTED_FORECAST", "SWING_4H_CLOSED_CONTEXT"
+    ]
+    assert result.plan is not None  # frozen hypothetical; no execution authority
+    assert result.expires_at is None
+    assert result.as_record()["execution_authority"] is False
+
+    sends: list[str] = []
+    delivery = notifier.notify_tradevisor_decision(
+        result,
+        settings=make_settings(),
+        now=NOW,
+        sender=lambda message: sends.append(message),
+    )
+    assert delivery.status == notifier.STATUS_NOT_ACTIONABLE
+    assert sends == []
+
+    # A nonactionable WATCH still contributes a measured *hypothesis* when
+    # forward candles become available; no bar before the decision is read.
+    frozen_row = {
+        "dedup_id": result.dedup_id,
+        "decision": result.decision,
+        "decision_record": result.as_record(),
+    }
+    outcome = learning.evaluate_outcome(
+        frozen_row,
+        now=NOW + timedelta(days=2),
+        candles_provider=lambda *_: [
+            SimpleNamespace(
+                open_time=NOW + timedelta(hours=1),
+                low=result.plan.entry_low,
+                high=result.plan.target_1,
+            )
+        ],
+    )
+    assert outcome["status"] == learning.OUTCOME_MEASURED
+    assert outcome["measurement_subject"] == "SHADOW_HYPOTHESIS"
+    assert outcome["fill_attribution"] == learning.FILL_ATTRIBUTION_NONE
 

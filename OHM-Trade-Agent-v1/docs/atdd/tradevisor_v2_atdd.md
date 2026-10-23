@@ -27,11 +27,11 @@ Test files:
 | ATDD-03 | 1H bar-close timing | `ingress::test_atdd03_trigger_before_bar_close_refused`, `ingress::test_atdd03_trigger_just_after_close_accepted` | PASS |
 | ATDD-04 | Coinbase source accepted | `ingress::test_atdd04_coinbase_source_accepted` | PASS |
 | ATDD-05 | Binance source accepted | `ingress::test_atdd05_binance_source_accepted` | PASS |
-| ATDD-06 | Source instrument → execution market | `ingress::test_atdd06_source_instrument_mapped_to_market`, `evaluation::test_atdd06_qualified_buy_produces_an_actionable_plan` | PASS |
+| ATDD-06 | Source instrument → execution market | `ingress::test_atdd06_source_instrument_mapped_to_market`, `evaluation::test_atdd06_qualified_buy_is_shadow_only_without_f6_and_4h` | PASS (mapping and shadow plan; not actionable) |
 | ATDD-07 | Native corroboration retained | `evaluation::test_atdd07_native_corroboration_is_recorded_not_invented` | PASS |
-| ATDD-08 | Exact actionable Telegram content | `notifier::test_atdd08_actionable_message_contains_every_required_field` | PASS |
-| ATDD-09 | Limit entry has expiration + chase limit | `notifier::test_atdd09_limit_entry_message_carries_the_limit_price` | PASS |
-| ATDD-10 | Shadow outcome evidence, no live authority | `learning::test_atdd10_shadow_observation_is_measurable_without_live_authority`, `recovery::test_learning_job_measures_persisted_records` | PASS |
+| ATDD-08 | Exact actionable Telegram content | `notifier::test_atdd08_actionable_message_contains_every_required_field` (isolated synthetic notifier contract, not a live authorized alert) | PASS (formatter only) |
+| ATDD-09 | Limit entry has expiration + chase limit | `notifier::test_atdd09_limit_entry_message_carries_the_limit_price` (isolated synthetic input) | PASS (formatter only) |
+| ATDD-10 | Shadow outcome evidence, no live authority | `learning::test_atdd10_shadow_observation_is_measurable_without_live_authority`, `learning::test_owner_approved_shadow_hypothesis_is_measured_without_a_fill`, `recovery::test_learning_job_measures_persisted_records` | PASS (forward-only shadow measurement; no fill) |
 
 ## Negative and security scenarios
 
@@ -55,7 +55,7 @@ Test files:
 | ATDD-26 | Cross-venue reference-price divergence | `evaluation::test_atdd26_cross_venue_divergence_is_refused` | PASS |
 | ATDD-27 | Missing required market features | `evaluation::test_atdd27_missing_native_market_evidence_is_an_abstention` | PASS |
 | ATDD-28 | F5 feasibility rejection | `evaluation::test_atdd28_target_attainability_rejection_abstains` | PASS |
-| ATDD-29 | F6 evidence unavailable | `evaluation::test_atdd29_missing_execution_evidence_abstains` (execution evidence only), `evaluation::test_atdd07_*` (`f6_forecast_status` recorded) | **NOT MET — DEVIATION** (see §"Deviations"; G-02) |
+| ATDD-29 | F6 evidence unavailable | `evaluation::test_atdd06_qualified_buy_is_shadow_only_without_f6_and_4h`, `evaluation::test_atdd29_f6_blocks_actionable_even_when_4h_is_not_required`, `evaluation::test_atdd29_position_stays_shadow_only_without_trusted_f6`, acceptance AC-015 | **PASS for F6-driven nonactionable abstention** (G-02; no trusted model or approved fallback) |
 | ATDD-30 | F7 capital / exposure rejection | `evaluation::test_atdd30_undersized_capital_is_rejected`, `evaluation::test_atdd30_exposure_capacity_rejects_a_full_book` | PASS |
 | ATDD-31 | Invalid stop or target geometry | `evaluation::test_atdd31_invalid_geometry_is_rejected` | PASS |
 | ATDD-32 | Economic after-cost rejection | `evaluation::test_atdd32_after_cost_economics_reject_a_thin_account` | PASS |
@@ -69,10 +69,10 @@ Test files:
 | --- | --- | --- | --- |
 | ATDD-36 | Crash before durable acknowledgement / mid-processing | `inbox::test_crash_during_processing_is_reclaimed_not_lost` | PASS |
 | ATDD-37 | Crash after receipt, before handoff | `inbox::test_durable_receipt_survives_a_crash_before_handoff` | PASS |
-| ATDD-38 | Canonical writer unavailable | `boundaries::test_every_tradevisor_module_parses_and_imports_no_execution_surface` (no `canonical` import), `recovery::test_inbox_declares_its_evidence_class_and_consumer` | **NOT EXERCISED AS SPECIFIED — DEVIATION** (no canonical handoff exists; G-03) |
+| ATDD-38 | Canonical writer unavailable | `boundaries::test_every_tradevisor_module_parses_and_imports_no_execution_surface` (no `canonical` import), `recovery::test_inbox_declares_its_evidence_class_and_consumer` | **OWNER-APPROVED SHADOW EXCEPTION — NOT EXERCISED** (no canonical handoff, no outage test; G-03) |
 | ATDD-39 | Queue at capacity / backpressure | `webhook::test_atdd39_inbox_capacity_pressure_backs_off_with_503`, `inbox::test_capacity_is_bounded_and_raises_backpressure` | PASS |
 | ATDD-40 | Duplicate worker processing | `inbox::test_settle_is_a_noop_when_a_duplicate_worker_lost_the_lease` | PASS |
-| ATDD-41 | Telegram delivery failure and retry | `notifier::test_atdd41_failed_delivery_releases_the_reservation_for_retry`, `recovery::test_retry_re_evaluates_and_delivers_a_fresh_recommendation` | PASS |
+| ATDD-41 | Telegram delivery failure and retry | `notifier::test_atdd41_failed_delivery_releases_the_reservation_for_retry` (isolated synthetic transport test), `recovery::test_retry_re_evaluates_and_withholds_delivery_without_f6_and_4h` | PASS (retry + policy preservation; no production send) |
 | ATDD-42 | Plan expiry during notification retry | `notifier::test_atdd42_expired_plan_is_never_delivered` | PASS |
 | ATDD-43 | F11 protection independent under overload | `boundaries::test_atdd43_*` (3 cases: phase ordering, inert-when-disabled, failure containment) | **PARTIAL — STRUCTURAL ONLY; OVERLOAD/SOAK NOT CERTIFIED** (G-05) |
 | ATDD-44 | Learning worker SHA mismatch fails closed | `learning::test_atdd44_release_drift_fails_closed_and_publishes_no_metrics`, `learning::test_release_compatibility_mirrors_the_learning_job_contract`, `learning::test_unverified_release_also_fails_closed` | PASS |
@@ -98,7 +98,7 @@ Test files:
 | ATDD-54 | "Exposure not evaluated" is recorded, never treated as clear | `evaluation::test_exposure_not_evaluated_is_recorded_as_unknown` | PASS |
 | ATDD-55 | Horizon is decided by volatility, not by the source timeframe | `evaluation::test_swing_classification_uses_volatility_not_the_source_timeframe` | PASS |
 | ATDD-56 | No evaluator configured cannot imply approval | `inbox::test_missing_evaluator_never_implies_approval` | PASS |
-| ATDD-57 | Entry, stop and target ordering validated independently of the gate | `evaluation::test_atdd06_qualified_buy_produces_an_actionable_plan` | PASS |
+| ATDD-57 | Entry, stop and target ordering validated independently of the gate | `evaluation::test_atdd06_qualified_buy_is_shadow_only_without_f6_and_4h` | PASS (frozen shadow hypothesis) |
 | ATDD-58 | Learning cannot fabricate an outcome when candles are unreadable | `learning::test_outcome_failure_to_read_candles_never_fabricates_a_result` | PASS |
 | ATDD-59 | Measured outcome excludes pre-decision bars (no look-ahead) | `learning::test_outcome_measures_forward_path_only` | PASS |
 | ATDD-60 | A touch is recorded as a touch, never a fill | `learning::test_outcome_measures_forward_path_only` (`fill_attribution`) | PASS |
@@ -107,7 +107,7 @@ Test files:
 
 | ID | Defect found | Correction | Test |
 | --- | --- | --- | --- |
-| R-01 | `SEND_FAILED` was recorded but nothing re-attempted delivery: ATDD-41 was only reservation-level | Bounded retry pass in the cycle; retries **re-evaluate** instead of re-sending a frozen plan | `recovery::test_retry_re_evaluates_and_delivers_a_fresh_recommendation`, `test_retry_records_a_non_actionable_outcome_without_sending` |
+| R-01 | `SEND_FAILED` was recorded but nothing re-attempted delivery: ATDD-41 was only reservation-level | Bounded retry pass in the cycle; retries **re-evaluate** instead of re-sending a frozen plan, and cannot bypass new F6/4H blockers | `recovery::test_retry_re_evaluates_and_withholds_delivery_without_f6_and_4h`, `test_retry_records_a_non_actionable_outcome_without_sending` |
 | R-02 | A retry could have delivered a plan frozen up to 90 minutes earlier | Retry candidates are excluded once the frozen plan expires | `recovery::test_retry_is_bounded_and_skips_expired_rows`, `test_undelivered_rows_are_retry_candidates_only_while_unexpired` |
 | R-03 | Retrying could have rewritten the decision or its evidence | Only the `notification` sub-record is mutable; the frozen record and terminal status are immutable | `recovery::test_retry_leaves_the_frozen_decision_immutable` |
 | R-04 | Persisted decision evidence had **no consumer** (orphaned learning artifact, governance principle 21) | `app/jobs/report_tradevisor_learning.py` consumes it under the exact-SHA gate | `recovery::test_learning_job_*` (5 cases) |
@@ -134,25 +134,25 @@ Tradevisor tests (some scenarios have more than one test; none share a test):
 | **Total** | **156** |
 
 
-## Deviations from the requested acceptance contract
+## Approved policy dispositions and remaining deviations (2026-10-23)
 
-These rows are recorded as **deviations**, not as passes. In each case the
-implemented behaviour differs from what the original requirement asked for. The
-behaviour is deliberate, disclosed, and no more permissive than the
-`8100e6b5` baseline — but it does not satisfy the requirement as written, and
-closing it is an **owner policy decision**, not a defect fix.
+The owner resolved G-02/G-03/G-04 on 2026-10-23. F6 unavailability now blocks
+actionable qualification; SWING also requires completed trusted 4H context.
+The existing separate inbox remains explicitly noncanonical for shadow
+observation and learning. Only ATDD-29's tested abstention property is now
+satisfied. An approved exception is **not** an outage test, and structural
+isolation is **not** overload certification.
 
-| ID | Originally required | Implemented | Why this is not a pass |
+| ID | Originally required | Current disposition | Qualification |
 | --- | --- | --- | --- |
-| ATDD-29 | Abstain when **F6** (forecast) evidence is unavailable | F6 is never consulted. `f6_forecast_status` is a constant `UNAVAILABLE_NO_TRUSTED_MODEL`; evaluation continues and may return an actionable plan | The cited test `test_atdd29_missing_execution_evidence_abstains` covers **execution** (spread/depth) evidence, not F6, and its outcome is `WATCH` / `EXECUTION_EVIDENCE_UNAVAILABLE`. `test_atdd07_*` only asserts the constant string is recorded. No test proves F6-driven abstention, because no such path exists |
-| ATDD-38 | Fail closed when the **canonical writer** is unavailable, i.e. a canonical handoff exists and its outage is handled | No canonical handoff exists at all; the inbox is `evidence_class = ADVISORY_NON_CANONICAL`, `canonical_handoff = NOT_PERFORMED` | The scenario presupposes a handoff that was never built. The tests prove *absence of a dependency*, which is weaker than *correct behaviour when a dependency fails*. The requirement is unexercised, not satisfied |
+| ATDD-29 | Abstain when **F6** (forecast) evidence is unavailable | `WATCH` / `ADVISORY_EVIDENCE_INCOMPLETE`; retained `shadow_proposed_action`, no expiry or actionable notification; AC-015 covers forward-only `SHADOW_HYPOTHESIS` measurement without fills | **PASS for F6-driven abstention only**, not for model calibration, fallback approval or activation |
+| ATDD-38 | Fail closed when the **canonical writer** is unavailable, i.e. a canonical handoff exists and its outage is handled | Owner-approved `ADVISORY_NON_CANONICAL` shadow-only exception, `canonical_handoff = NOT_PERFORMED` | **NOT EXERCISED — APPROVED EXCEPTION.** There is no canonical dependency to fail, hence no outage claim or execution authority |
 | ATDD-43 | F11 protection stays independent **under overload** | Confirmed structurally only: phase ordering (runs last), inert-when-disabled, failure containment | No overload, burst or soak test was run. Structural ordering does not show that protection holds at 10x load, under latency injection or with a saturated queue. Overload behaviour is **uncertified** |
 
-Consistency note: F6 dormancy is not a relaxation introduced by this change.
-`evaluate_forecast` has **no production caller** at `8100e6b5`, so the
-Tradevisor path matches production rather than loosening it. The deviation is
-between the *requested contract* and *production reality*; resolving it requires
-a registered trusted model (G-02).
+F6 has **no registered trusted production model**, and no deterministic
+actionable fallback is approved. The evaluator explicitly fails closed after
+building an otherwise qualified shadow hypothesis; a forecast status change
+alone cannot bypass this blocker. 4H cannot be inferred from the 1H series.
 
 ## Explicitly NOT VERIFIED / BLOCKED
 
@@ -165,48 +165,34 @@ a registered trusted model (G-02).
 | Production secret values | Generating or rotating production credentials is owner-gated | Generate the ingestion token and edge verification value through the approved secret mechanism |
 | Cross-venue execution fidelity on live books | All execution evidence in tests is synthetic | Observe with `OPIP_TRADEVISOR_ENABLED=true` against a staging deployment |
 | **Overload / soak / latency behaviour** | No soak environment; F11 independence is structural only | Run a burst (≥10x) and a sustained soak against staging and record p99 |
-| F6 forecast contribution | No trusted forecast model is registered in production (`PRODUCTION_MODEL_REGISTRY` empty) | **Pending owner policy decision (G-02)** |
-| 4H regime context | Only the completed 1H series is used; `regime_4h` is `UNAVAILABLE` | **Pending owner policy decision (G-04)** |
-| Canonical promotion of advisory evidence | No canonical handoff is performed; evidence is classified non-canonical | **Pending owner policy decision (G-03)** |
+| F6 trusted forecast / actionable fallback | No trusted forecast model registered; no fallback approved; `WATCH` required | Policy decided G-02; model/fallback implementation still deferred |
+| Completed trusted 4H regime context | Only completed 1H used; `regime_4h` is `UNAVAILABLE`; SWING `WATCH` required | Policy decided G-04; 4H evidence integration deferred |
+| Canonical promotion of advisory evidence | No canonical handoff; explicitly noncanonical and shadow-only | G-03 exception approved; canonical promotion remains out of scope |
 
 ## Recorded gaps
 
-The items below are **open**. G-02, G-03 and G-04 are recorded as **PENDING
-OWNER POLICY DECISIONS**. The Git authorization that permits committing this
-branch and opening a draft pull request says **nothing** about them: committing
-code is not approval of a policy, and none of these three may be read as
-decided, accepted or waived.
+G-01 and G-05 remain open evidence/activation gates. G-02, G-03 and G-04 have
+explicit owner policy decisions dated 2026-10-23; their unbuilt dependencies
+stay visible and no trading or production authority follows from approval.
 
 - **G-01 — Genuine source-to-production certification.** *Status: OPEN
   (evidence).* All evidence here is synthetic. Source→production certification
   requires a real Tradevisor alert delivered through the approved deployment
   channel.
-- **G-02 — F6 (forecast) is advisory, not blocking.** *Status: PENDING OWNER
-  POLICY DECISION.* The pipeline records
-  `f6_forecast_status = UNAVAILABLE_NO_TRUSTED_MODEL` and never fabricates a
-  forecast. ATDD-29's original requirement — abstain when F6 is unavailable — is
-  therefore **unmet**. Two mutually exclusive owner options remain open:
-  (a) keep F6 advisory and formally amend ATDD-29 to an advisory requirement, or
-  (b) register a trusted forecast model and make F6 a blocking gate. Until the
-  owner chooses, the deviation stands and the default stays advisory.
-- **G-03 — No canonical-writer handoff (classified, consumed).** *Status:
-  PENDING OWNER POLICY DECISION.* The canonical writer owns *admission/execution*
-  facts (its client surface is paper-admission/execution/protection only); it is
-  not the store for external advisory observations. The reviewed precedent is the
-  Wave 8.2 TradingView inbox, which likewise performs no canonical handoff.
-  Tradevisor evidence is therefore explicitly classified
-  `evidence_class = ADVISORY_NON_CANONICAL`, `canonical_handoff = NOT_PERFORMED`,
-  and consumed by `app/jobs/report_tradevisor_learning.py`, so it is not orphaned
-  (governance principle 21). Promoting it to canonical evidence would be a new
-  owner-approved architecture change, not a bug fix. Owner options: (a) accept
-  non-canonical advisory evidence permanently and amend ATDD-38, or
-  (b) authorize a canonical handoff contract.
-- **G-04 — 4H regime context.** *Status: PENDING OWNER POLICY DECISION.* The
-  native regime recorded in evidence comes from the completed 1H series
-  (`regime_basis = NATIVE_1H_EMA_STACK`); `regime_4h` is recorded as
-  `UNAVAILABLE` rather than inferred. Owner options: (a) accept 1H-only regime
-  context as sufficient for an advisory product, or (b) require 4H-close series
-  retrieval and record it as a first-class input.
+- **G-02 — F6 actionable qualification.** *Status: POLICY RESOLVED;
+  implementation dependency OPEN.* A missing trusted model or approved fallback
+  always yields `WATCH`. A hypothetical entry remains available for shadow
+  learning only. ATDD-29 abstention is tested, and an actionable fallback is
+  not implied or authorized.
+- **G-03 — Noncanonical shadow evidence.** *Status: POLICY RESOLVED;
+  approved exception.* The Wave 8.2 precedent and `ADVISORY_NON_CANONICAL` /
+  `NOT_PERFORMED` / `app.jobs.report_tradevisor_learning` disposition remain.
+  No canonical admission, execution rights or writer change is granted. The
+  original ATDD-38 outage scenario is **not exercised** and **not PASS**.
+- **G-04 — Completed 4H SWING regime.** *Status: POLICY RESOLVED;
+  evidence integration OPEN.* The native 1H basis stays unchanged and `regime_4h`
+  remains `UNAVAILABLE`; any otherwise qualified SWING is `WATCH` pending
+  separately approved completed trusted higher-timeframe evidence.
 - **G-05 — Load/soak evidence.** *Status: OPEN (evidence).* F11 independence is
   proven structurally (phase ordering, inert-when-disabled, failure
   containment), not by a 10x burst soak test. No soak environment was available,

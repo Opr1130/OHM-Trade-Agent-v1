@@ -125,8 +125,25 @@ def decision(**over):
         account_equity=10_000.0,
         active_trades=[],
     )
-    assert resolved.actionable is True
-    return resolved
+    # Isolate formatter/transport mechanics from the qualification policy.
+    # Production evaluation correctly returns WATCH while F6 and trusted 4H
+    # are missing. This synthetic, future-eligible object is used ONLY to
+    # exercise the notifier's formatting, expiry, ledger and retry contracts.
+    assert resolved.decision == te.DECISION_WATCH
+    assert resolved.evidence["advisory_qualification"]["status"] == "SHADOW_ONLY"
+    return replace(
+        resolved,
+        decision=te.DECISION_ENTER_NOW,
+        rejection_code=None,
+        reason="Synthetic notifier contract fixture; no production authorization.",
+        expires_at=NOW + timedelta(minutes=90),
+        evidence={
+            **resolved.evidence,
+            "f6_forecast_status": "SYNTHETIC_TRUSTED_FOR_NOTIFIER_TEST",
+            "regime_4h": "SYNTHETIC_COMPLETED_4H_FOR_NOTIFIER_TEST",
+            "advisory_qualification": {"status": "SYNTHETIC_TEST_ONLY"},
+        },
+    )
 
 
 def telegram_settings(**over) -> SimpleNamespace:
@@ -316,7 +333,18 @@ def test_atdd41_failed_delivery_releases_the_reservation_for_retry():
 
 
 def test_message_names_the_evidence_it_does_not_have():
-    message = notifier.format_tradevisor_alert(decision())
-    assert "Evidence: native 1H structure, Kraken execution book" in message
-    # Degraded evidence is disclosed, not silently omitted.
-    assert "unavailable: 4H regime, trusted forecast" in message
+    # Missing F6/4H no longer produce an actionable message. We still test
+    # the evidence helper without fabricating a real qualified recommendation.
+    degraded = replace(
+        decision(),
+        evidence={
+            "regime_4h": "UNAVAILABLE",
+            "f6_forecast_status": "UNAVAILABLE_NO_TRUSTED_MODEL",
+        },
+        decision=te.DECISION_WATCH,
+    )
+    line = notifier._evidence_line(degraded)
+    assert "Evidence: native 1H structure, Kraken execution book" in line
+    assert "unavailable: 4H regime, trusted forecast" in line
+    with pytest.raises(ValueError):
+        notifier.format_tradevisor_alert(degraded)

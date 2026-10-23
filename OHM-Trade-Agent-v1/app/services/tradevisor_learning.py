@@ -125,6 +125,22 @@ def evaluate_outcome(
     decided_at = _parse(frozen.get("evaluated_at")) or _parse(record.get("processed_at"))
     decision = _decision_of(record)
     plan = frozen.get("plan") if isinstance(frozen.get("plan"), Mapping) else None
+    evidence = frozen.get("evidence") if isinstance(frozen.get("evidence"), Mapping) else {}
+    qualification = (
+        evidence.get("advisory_qualification")
+        if isinstance(evidence.get("advisory_qualification"), Mapping)
+        else {}
+    )
+    # G-02/G-04: a WATCH is eligible for prospective *hypothesis* measurement
+    # only when the evaluator explicitly froze an otherwise-qualified entry
+    # and withheld actionable authority. An arbitrary rejected WATCH with a
+    # plan must never be silently counted as a hypothetical trade.
+    shadow_hypothesis = (
+        decision == "WATCH"
+        and frozen.get("rejection_code") == "ADVISORY_EVIDENCE_INCOMPLETE"
+        and qualification.get("status") == "SHADOW_ONLY"
+        and evidence.get("shadow_proposed_action") in ACTIONABLE_DECISIONS
+    )
     signal = record.get("signal") if isinstance(record.get("signal"), Mapping) else {}
     market = str(frozen.get("market") or signal.get("market") or "")
 
@@ -140,12 +156,16 @@ def evaluate_outcome(
         "decided_at": decided_at.isoformat() if decided_at else None,
         "fill_attribution": FILL_ATTRIBUTION_NONE,
         "measurement_hours": measurement_hours,
+        "measurement_subject": (
+            "SHADOW_HYPOTHESIS" if shadow_hypothesis else "ACTIONABLE_RECOMMENDATION"
+            if decision in ACTIONABLE_DECISIONS else "NON_ACTIONABLE_OBSERVATION"
+        ),
     }
 
     if decided_at is None or not isinstance(plan, Mapping):
         base.update(status=OUTCOME_PENDING, reason="no frozen actionable plan")
         return base
-    if decision not in ACTIONABLE_DECISIONS:
+    if decision not in ACTIONABLE_DECISIONS and not shadow_hypothesis:
         base.update(status=OUTCOME_NO_ENTRY_TOUCH, reason="non-actionable evidence only")
         return base
     if candles_provider is None:
