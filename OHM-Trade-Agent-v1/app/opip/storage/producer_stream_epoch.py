@@ -236,6 +236,25 @@ def snapshot_locked(hot: Path, archive_dir: Path, stream_name: str) -> dict[str,
         raise StreamEpochError("STREAM_EPOCH_NOT_ESTABLISHED")
     if state["pending"] is not None:
         raise StreamEpochError("STREAM_COMPACTION_NOT_COMMITTED")
+    # Do not emit a frame from stale bookkeeping. The live manifest is the
+    # authority for WARM/COLD location after tier migration, and its detached
+    # digest must match. The export then authenticates this whole snapshot.
+    manifest_entries: dict[str, Any] = {}
+    if state["segments"]:
+        manifest = archive_dir / "manifest.json"
+        signature = manifest.with_suffix(".json.sha256")
+        if not manifest.is_file() or not signature.is_file():
+            raise StreamEpochError("STREAM_ARCHIVE_MANIFEST_MISSING")
+        tokens = signature.read_text(encoding="utf-8").split()
+        if not tokens or tokens[0] != sha256_file(manifest):
+            raise StreamEpochError("STREAM_ARCHIVE_MANIFEST_DIGEST_MISMATCH")
+        try:
+            parsed = json.loads(manifest.read_text(encoding="utf-8"))
+            manifest_entries = parsed["segments"]
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            raise StreamEpochError("STREAM_ARCHIVE_MANIFEST_INVALID") from exc
+        if not isinstance(manifest_entries, dict):
+            raise StreamEpochError("STREAM_ARCHIVE_MANIFEST_INVALID")
     offset = 0
     segments = []
     for entry in state["segments"]:
@@ -245,7 +264,22 @@ def snapshot_locked(hot: Path, archive_dir: Path, stream_name: str) -> dict[str,
             raise StreamEpochError("STREAM_SEGMENT_RANGE_INVALID")
         if entry["end"] - offset != entry.get("uncompressed_bytes"):
             raise StreamEpochError("STREAM_SEGMENT_SIZE_INVALID")
-        segments.append(dict(entry))
+        sha = entry.get("sha256")
+        live = manifest_entries.get(sha)
+        if not isinstance(live, dict) or live.get("sha256") != sha:
+            raise StreamEpochError("STREAM_SEGMENT_MANIFEST_MISSING")
+        if live.get("row_count") != entry.get("row_count"):
+            raise StreamEpochError("STREAM_SEGMENT_ROW_COUNT_DIVERGED")
+        rel = live.get("archive")
+        if not isinstance(rel, str):
+            raise StreamEpochError("STREAM_SEGMENT_LOCATION_INVALID")
+        path = archive_dir / rel
+        if (not path.resolve().is_relative_to(archive_dir.resolve())
+                or path.is_symlink() or not path.is_file()):
+            raise StreamEpochError("STREAM_SEGMENT_FILE_UNAVAILABLE")
+        if sha256_file(path) != sha:
+            raise StreamEpochError("STREAM_SEGMENT_DIGEST_MISMATCH")
+        segments.append({**entry, "archive": rel})
         offset = entry["end"]
     if offset != state["hot_base"]:
         raise StreamEpochError("STREAM_HOT_BASE_DIVERGED")
