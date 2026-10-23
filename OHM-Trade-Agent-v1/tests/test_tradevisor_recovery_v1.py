@@ -200,6 +200,33 @@ def test_undelivered_rows_are_retry_candidates_only_while_unexpired():
     assert inbox.undelivered_notification_rows(limit=5, now=later) == []
 
 
+def test_retry_counts_an_unreadable_row_and_leaves_it_untouched(monkeypatch):
+    """An unreadable stored signal is counted, not silently dropped."""
+    _settle_failed()
+
+    def corrupt(_row):
+        raise ValueError("unreadable stored signal")
+
+    monkeypatch.setattr(pipeline, "rebuild_signal", corrupt)
+    sender = Sender()
+    summary = pipeline.retry_undelivered_notifications(
+        settings=telegram_settings(),
+        now=NOW + timedelta(minutes=2),
+        sender=sender,
+    )
+    assert summary == {
+        "candidates": 1,
+        "delivered": 0,
+        "still_undelivered": 0,
+        "not_actionable": 0,
+        "unreadable": 1,
+    }
+    assert sender.calls == []
+    row = inbox.iter_records()[0]
+    # The retry pass does not consume the row; lease reclaim owns it.
+    assert int(row["notification"].get("retry_count", 0)) == 0
+
+
 def test_retry_re_evaluates_and_delivers_a_fresh_recommendation():
     _settle_failed()
     sender = Sender()
@@ -214,6 +241,7 @@ def test_retry_re_evaluates_and_delivers_a_fresh_recommendation():
         "delivered": 1,
         "still_undelivered": 0,
         "not_actionable": 0,
+        "unreadable": 0,
     }
     assert len(sender.calls) == 1
     # The delivered message was produced from fresh evidence, not a stored plan.

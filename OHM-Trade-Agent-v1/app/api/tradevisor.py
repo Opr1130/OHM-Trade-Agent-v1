@@ -49,7 +49,7 @@ router = APIRouter()
 TRADEVISOR_VERIFICATION_HEADER = "x-ohm-tradevisor-verification"
 #: The ingestion credential rides inside the body because TradingView cannot
 #: send a header. It is removed before validation and never persisted.
-TRADEVISOR_TOKEN_FIELD = "ingest_token"
+TRADEVISOR_TOKEN_FIELD = "ingest_token"  # nosec B105 - a JSON field name, not a credential value
 
 RATE_LIMIT_WINDOW_SECONDS = 60.0
 MAX_TRACKED_SOURCES = 512

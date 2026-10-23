@@ -39,10 +39,14 @@ from typing import Any, Callable, Iterable, Mapping
 
 #: Single Python owner of exact-SHA learning compatibility. Re-exported, not
 #: duplicated: a second implementation could silently drift from the shell gate.
+#: ``RELEASE_DRIFT`` and ``RELEASE_UNVERIFIED`` are explicit re-exports (the
+#: redundant alias form), because callers import them from this module and
+#: ``test_release_classification_is_the_learning_plane_owner_not_a_copy`` asserts
+#: their identity against the owner module.
 from app.opip.learning.job_disposition import (
     RELEASE_CURRENT,
-    RELEASE_DRIFT,
-    RELEASE_UNVERIFIED,
+    RELEASE_DRIFT as RELEASE_DRIFT,
+    RELEASE_UNVERIFIED as RELEASE_UNVERIFIED,
     classify_release_compatibility as _owner_classify_release_compatibility,
 )
 from app.services.tradevisor_evaluation import ACTIONABLE_DECISIONS

@@ -194,7 +194,7 @@ def format_tradevisor_alert(decision: TradevisorDecision) -> str:
             f"Why now: {decision.reason}",
             f"Market regime: {regime} (native 1H structure)",
             _evidence_line(decision),
-            f"O'Pip qualification: attainability + economic + capital gates passed",
+            "O'Pip qualification: attainability + economic + capital gates passed",
             "Estimates are after modeled fees/slippage, not guaranteed profits.",
             "Execution: Human approval required",
         ]

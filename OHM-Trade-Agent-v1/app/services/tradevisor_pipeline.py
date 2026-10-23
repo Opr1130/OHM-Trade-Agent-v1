@@ -103,7 +103,13 @@ def retry_undelivered_notifications(
     from app.services import tradevisor_inbox as inbox
 
     retried_at = now or datetime.now(timezone.utc)
-    summary = {"candidates": 0, "delivered": 0, "still_undelivered": 0, "not_actionable": 0}
+    summary = {
+        "candidates": 0,
+        "delivered": 0,
+        "still_undelivered": 0,
+        "not_actionable": 0,
+        "unreadable": 0,
+    }
     try:
         rows = inbox.undelivered_notification_rows(limit=limit, now=retried_at)
     except Exception:  # noqa: BLE001 - a read failure must not abort the cycle
@@ -114,6 +120,11 @@ def retry_undelivered_notifications(
         try:
             signal = rebuild_signal(row)
         except Exception:  # noqa: BLE001 - unreadable rows are left untouched
+            signal = None
+        if signal is None:
+            # Counted rather than silently dropped: the row itself is left
+            # untouched so the lease reclaim path, not this retry pass, owns it.
+            summary["unreadable"] += 1
             continue
         result = evaluate_and_notify(
             signal,
