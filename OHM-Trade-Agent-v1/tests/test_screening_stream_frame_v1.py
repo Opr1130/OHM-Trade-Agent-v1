@@ -15,6 +15,7 @@ from app.opip.storage.screening_stream_frame import (
     StreamContinuityError,
     StreamFrame,
     StreamPart,
+    frame_sha256,
     plan_resume,
 )
 
@@ -57,11 +58,19 @@ def _cp(frame: StreamFrame, pos: int, raw: bytes) -> StreamCheckpoint:
     )
 
 
+def _plan(frame: StreamFrame, checkpoint: StreamCheckpoint):
+    # This helper models a trusted export manifest supplying the expected
+    # digest; negative tests below exercise the non-matching manifest case.
+    return plan_resume(
+        frame, checkpoint, expected_frame_sha256=frame_sha256(frame)
+    )
+
+
 @pytest.mark.acceptance
 def test_archive_to_archive_transition(tmp_path):
     """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-015: verify framed input safety."""
     frame, data, blocks = _evidence(tmp_path)
-    plan = plan_resume(frame, _cp(frame, len(blocks[0]), data))
+    plan = _plan(frame, _cp(frame, len(blocks[0]), data))
     assert [p.path.name for p, _ in plan] == ["two.gz", "hot.jsonl"]
     assert plan[0][1] == 0
 
@@ -70,7 +79,7 @@ def test_archive_to_archive_transition(tmp_path):
 def test_archive_to_hot_transition(tmp_path):
     """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-015: verify framed input safety."""
     frame, data, blocks = _evidence(tmp_path)
-    plan = plan_resume(frame, _cp(frame, len(blocks[0]) + len(blocks[1]), data))
+    plan = _plan(frame, _cp(frame, len(blocks[0]) + len(blocks[1]), data))
     assert len(plan) == 1
     assert plan[0][0].path.name == "hot.jsonl" and plan[0][1] == 0
 
@@ -79,7 +88,7 @@ def test_archive_to_hot_transition(tmp_path):
 def test_checkpoint_at_end_is_idempotent(tmp_path):
     """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-015: verify framed input safety."""
     frame, data, _ = _evidence(tmp_path)
-    assert plan_resume(frame, _cp(frame, len(data), data)) == ()
+    assert _plan(frame, _cp(frame, len(data), data)) == ()
 
 
 @pytest.mark.acceptance
@@ -88,7 +97,7 @@ def test_unframed_legacy_offset_cannot_be_promoted(tmp_path):
     frame, data, _ = _evidence(tmp_path)
     bad = StreamCheckpoint("", 10, _sha(data[6:10]), 4)
     with pytest.raises(StreamContinuityError, match="identity mismatch"):
-        plan_resume(frame, bad)
+        _plan(frame, bad)
 
 
 @pytest.mark.acceptance
@@ -97,7 +106,7 @@ def test_pruned_checkpoint_fails_closed(tmp_path):
     frame, data, blocks = _evidence(tmp_path)
     retained = StreamFrame(frame.stream_id, len(blocks[0]), frame.end, frame.parts[1:])
     with pytest.raises(StreamContinuityError, match="EVIDENCE_PRUNED"):
-        plan_resume(retained, _cp(frame, 4, data))
+        _plan(retained, _cp(frame, 4, data))
 
 
 @pytest.mark.acceptance
@@ -106,7 +115,7 @@ def test_missing_segment_fails_closed(tmp_path):
     frame, _, _ = _evidence(tmp_path)
     frame = StreamFrame(frame.stream_id, 0, frame.end, (frame.parts[0], frame.parts[2]))
     with pytest.raises(StreamContinuityError, match="gap"):
-        plan_resume(frame, StreamCheckpoint(frame.stream_id, 0, "", 0))
+        _plan(frame, StreamCheckpoint(frame.stream_id, 0, "", 0))
 
 
 @pytest.mark.acceptance
@@ -117,7 +126,7 @@ def test_overlapping_segments_fail_closed(tmp_path):
     p = StreamPart(p.path, p.start - 1, p.end, p.sha256, p.raw_sha256, True, p.row_count)
     overlapping = StreamFrame(frame.stream_id, 0, frame.end, (frame.parts[0], p, frame.parts[2]))
     with pytest.raises(StreamContinuityError, match="overlap"):
-        plan_resume(overlapping, StreamCheckpoint(frame.stream_id, 0, "", 0))
+        _plan(overlapping, StreamCheckpoint(frame.stream_id, 0, "", 0))
 
 
 @pytest.mark.acceptance
@@ -126,7 +135,7 @@ def test_corrupt_archive_fails_before_consume(tmp_path):
     frame, _, _ = _evidence(tmp_path)
     frame.parts[0].path.write_bytes(b"corrupt")
     with pytest.raises(StreamContinuityError, match="digest mismatch"):
-        plan_resume(frame, StreamCheckpoint(frame.stream_id, 0, "", 0))
+        _plan(frame, StreamCheckpoint(frame.stream_id, 0, "", 0))
 
 
 @pytest.mark.acceptance
@@ -135,7 +144,7 @@ def test_anchor_mismatch_refuses_rebaseline(tmp_path):
     frame, data, blocks = _evidence(tmp_path)
     cp = StreamCheckpoint(frame.stream_id, len(blocks[0]), _sha(b"wrong"), 4)
     with pytest.raises(StreamContinuityError, match="anchor mismatch"):
-        plan_resume(frame, cp)
+        _plan(frame, cp)
 
 
 @pytest.mark.acceptance
@@ -143,7 +152,7 @@ def test_checkpoint_must_be_complete_record(tmp_path):
     """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-015: verify framed input safety."""
     frame, data, blocks = _evidence(tmp_path)
     with pytest.raises(StreamContinuityError, match="row aligned"):
-        plan_resume(frame, _cp(frame, len(blocks[0]) - 1, data))
+        _plan(frame, _cp(frame, len(blocks[0]) - 1, data))
 
 
 @pytest.mark.acceptance
@@ -151,7 +160,7 @@ def test_checkpoint_beyond_end_fails(tmp_path):
     """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-015: verify framed input safety."""
     frame, _, _ = _evidence(tmp_path)
     with pytest.raises(StreamContinuityError, match="beyond end"):
-        plan_resume(frame, StreamCheckpoint(frame.stream_id, frame.end + 1, _sha(b"abc"), 3))
+        _plan(frame, StreamCheckpoint(frame.stream_id, frame.end + 1, _sha(b"abc"), 3))
 
 
 @pytest.mark.acceptance
@@ -159,3 +168,35 @@ def test_stable_identity_not_derived_from_mutable_contents(tmp_path):
     """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-015: verify framed input safety."""
     frame, raw, _ = _evidence(tmp_path)
     assert frame.stream_id != _sha(raw)
+
+
+@pytest.mark.acceptance
+def test_untrusted_frame_digest_rejected(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-015: unbound frame cannot resume."""
+    frame, _, _ = _evidence(tmp_path)
+    with pytest.raises(StreamContinuityError, match="FRAME_AUTHENTICITY_MISMATCH"):
+        plan_resume(
+            frame, StreamCheckpoint(frame.stream_id, 0, "", 0),
+            expected_frame_sha256=_sha(b"unrelated authenticated export frame")
+        )
+
+
+@pytest.mark.acceptance
+def test_mutated_frame_hash_refuses_trusted_manifest(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-015: changed metadata refuses."""
+    frame, _, _ = _evidence(tmp_path)
+    bound_sha = frame_sha256(frame)
+    part = frame.parts[0]
+    changed = StreamPart(
+        part.path, part.start, part.end, part.sha256,
+        _sha(b"wrong expected raw contents"), part.archived, part.row_count,
+    )
+    altered = StreamFrame(
+        frame.stream_id, frame.retained_start, frame.end,
+        (changed, *frame.parts[1:]),
+    )
+    with pytest.raises(StreamContinuityError, match="FRAME_AUTHENTICITY_MISMATCH"):
+        plan_resume(
+            altered, StreamCheckpoint(frame.stream_id, 0, "", 0),
+            expected_frame_sha256=bound_sha
+        )
