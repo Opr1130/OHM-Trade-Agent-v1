@@ -454,6 +454,77 @@ def _observation_id_from_screening(row: Mapping[str, Any]) -> str:
     return str((metadata or {}).get("observation_id") or "").strip()
 
 
+def apply_screening_snapshot_line(
+    connection: sqlite3.Connection,
+    raw: bytes,
+    *,
+    now: datetime,
+) -> None:
+    """Apply one complete screening record to the observation queue.
+
+    Shared by the legacy hot-offset reader and the framed absolute-coordinate
+    reader so both paths can never drift. Position advancement is the caller's
+    responsibility: this returns after every complete line, including records
+    that are intentionally filtered out.
+    """
+    try:
+        snapshot = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return
+    if not isinstance(snapshot, dict):
+        return
+    if str(snapshot.get("scanner_type") or "") != "BROAD_SEARCH":
+        return
+    if str(snapshot.get("outcome") or "") == PENDING_FINALIZATION:
+        return
+    metadata = snapshot.get("metadata")
+    if isinstance(metadata, Mapping) and str(
+        metadata.get("production_admission_result") or ""
+    ) == PENDING_FINALIZATION:
+        return
+    observation_id = _observation_id_from_screening(snapshot)
+    observed_at = parse_timestamp(snapshot.get("observed_at"))
+    if not observation_id or observed_at is None:
+        return
+    prior = latest_discovery_outcome_row(connection, observation_id)
+    if prior is not None and discovery_window_complete(prior):
+        connection.execute(
+            "DELETE FROM observation_queue WHERE observation_id = ?",
+            (observation_id,),
+        )
+        return
+    next_due = (
+        next_discovery_due_at(prior, evaluated_at=now)
+        if prior is not None
+        else observed_at
+    )
+    if next_due is None:
+        connection.execute(
+            "DELETE FROM observation_queue WHERE observation_id = ?",
+            (observation_id,),
+        )
+        return
+    connection.execute(
+        """
+        INSERT INTO observation_queue(
+            observation_id, observed_at, next_due_at,
+            venue_instrument_id, row_json
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(observation_id) DO UPDATE SET
+            row_json = excluded.row_json,
+            observed_at = excluded.observed_at,
+            venue_instrument_id = excluded.venue_instrument_id
+        """,
+        (
+            observation_id,
+            observed_at.isoformat(),
+            next_due.isoformat(),
+            str(snapshot.get("venue_instrument_id") or ""),
+            json.dumps(snapshot, sort_keys=True, allow_nan=False),
+        ),
+    )
+
+
 def reconcile_screening_queue(
     connection: sqlite3.Connection,
     screening_path: Path,

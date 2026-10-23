@@ -249,6 +249,30 @@ AC-015 -> tests/test_learning_derived_state_v1.py::test_retry_refuses_changed_ac
 AC-015 -> tests/test_learning_derived_state_v1.py::test_schema_migration_markers_do_not_block_first_lineage_bind
 AC-015 -> tests/test_learning_derived_state_v1.py::test_schema_markers_with_real_rows_still_refuse
 AC-015 -> tests/test_learning_derived_state_v1.py::test_phase3c_open_binds_after_migration_markers
+AC-015 -> tests/test_screening_stream_frame_v1.py::test_archive_to_archive_transition
+AC-015 -> tests/test_screening_stream_frame_v1.py::test_archive_to_hot_transition
+AC-015 -> tests/test_screening_stream_frame_v1.py::test_checkpoint_at_end_is_idempotent
+AC-015 -> tests/test_screening_stream_frame_v1.py::test_unframed_legacy_offset_cannot_be_promoted
+AC-015 -> tests/test_screening_stream_frame_v1.py::test_pruned_checkpoint_fails_closed
+AC-015 -> tests/test_screening_stream_frame_v1.py::test_missing_segment_fails_closed
+AC-015 -> tests/test_screening_stream_frame_v1.py::test_overlapping_segments_fail_closed
+AC-015 -> tests/test_screening_stream_frame_v1.py::test_corrupt_archive_fails_before_consume
+AC-015 -> tests/test_screening_stream_frame_v1.py::test_anchor_mismatch_refuses_rebaseline
+AC-015 -> tests/test_screening_stream_frame_v1.py::test_checkpoint_must_be_complete_record
+AC-015 -> tests/test_screening_stream_frame_v1.py::test_checkpoint_beyond_end_fails
+AC-015 -> tests/test_screening_stream_frame_v1.py::test_stable_identity_not_derived_from_mutable_contents
+AC-015 -> tests/test_screening_stream_frame_v1.py::test_untrusted_frame_digest_rejected
+AC-015 -> tests/test_screening_stream_frame_v1.py::test_mutated_frame_hash_refuses_trusted_manifest
+AC-015 -> tests/test_screening_stream_frame_v1.py::test_repeated_archive_digest_is_distinguished_from_range_overlap
+AC-015 -> tests/test_producer_stream_epoch_v1.py::test_nonempty_legacy_stream_refuses_implicit_epoch
+AC-015 -> tests/test_producer_stream_epoch_v1.py::test_existing_archive_refuses_implicit_epoch
+AC-015 -> tests/test_producer_stream_epoch_v1.py::test_stream_epoch_identity_is_stable_on_repeated_initialization
+AC-015 -> tests/test_producer_stream_epoch_v1.py::test_two_rotations_preserve_absolute_position_and_raw_evidence
+AC-015 -> tests/test_producer_stream_epoch_v1.py::test_uncommitted_compaction_with_original_hot_can_retry
+AC-015 -> tests/test_producer_stream_epoch_v1.py::test_post_rewrite_crash_recovers_with_verified_archive
+AC-015 -> tests/test_producer_stream_epoch_v1.py::test_ambiguous_partial_rewrite_refuses_checkpoint_advance
+AC-015 -> tests/test_producer_stream_epoch_v1.py::test_snapshot_refuses_pending_compaction
+AC-015 -> tests/test_producer_stream_epoch_v1.py::test_export_snapshot_refuses_missing_verified_archive
 
 AC-016 -> tests/test_learning_recovery_receipt_v1.py::test_intent_is_prepared_before_terminal_and_is_not_edited
 AC-016 -> tests/test_learning_recovery_receipt_v1.py::test_blocked_terminal_never_asserts_success
@@ -373,6 +397,12 @@ AC-015 -> OHM-Trade-Agent-v1/app/opip/discovery/maturation.py
 AC-015 -> OHM-Trade-Agent-v1/app/services/opportunity_accountability.py
 AC-015 -> OHM-Trade-Agent-v1/tests/test_learning_derived_state_v1.py
 AC-015 -> OHM-Trade-Agent-v1/tests/test_learning_derived_state_cli_v1.py
+AC-015 -> OHM-Trade-Agent-v1/app/opip/storage/screening_stream_frame.py
+AC-015 -> OHM-Trade-Agent-v1/app/opip/storage/producer_stream_epoch.py
+AC-015 -> OHM-Trade-Agent-v1/app/opip/storage/bounded_jsonl.py
+AC-015 -> OHM-Trade-Agent-v1/app/opip/decision/store.py
+AC-015 -> OHM-Trade-Agent-v1/tests/test_producer_stream_epoch_v1.py
+AC-015 -> OHM-Trade-Agent-v1/tests/test_screening_stream_frame_v1.py
 AC-016 -> OHM-Trade-Agent-v1/app/services/learning_recovery_receipt.py
 AC-016 -> OHM-Trade-Agent-v1/app/services/learning_recovery_attestation.py
 AC-016 -> .github/workflows/deploy-learning-recovery.yml
@@ -396,6 +426,25 @@ AC-020 -> .github/workflows/deploy-learning-recovery.yml
 AC-020 -> OHM-Trade-Agent-v1/tests/test_learning_recovery_ci_discovery_v1.py
 AC-020 -> OHM-Trade-Agent-v1/tests/test_learning_recovery_attestation_v1.py
 AC-020 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-LEARNING-RECOVERY-v1.md
+
+AC-015 -> OHM-Trade-Agent-v1/app/opip/discovery/stream_ingest.py
+AC-015 -> OHM-Trade-Agent-v1/app/services/screening_stream_transition.py
+AC-015 -> OHM-Trade-Agent-v1/deploy/remote/export-opip-learning-evidence.sh
+AC-015 -> OHM-Trade-Agent-v1/tests/test_screening_stream_ingest_v1.py
+AC-015 -> OHM-Trade-Agent-v1/tests/test_screening_stream_transition_v1.py
+AC-015 -> OHM-Trade-Agent-v1/tests/test_screening_stream_ingest_v1.py::test_archived_evidence_is_consumed_before_hot
+AC-015 -> OHM-Trade-Agent-v1/tests/test_screening_stream_ingest_v1.py::test_rotation_after_consumption_resumes_at_absolute_position
+AC-015 -> OHM-Trade-Agent-v1/tests/test_screening_stream_ingest_v1.py::test_replay_is_idempotent
+AC-015 -> OHM-Trade-Agent-v1/tests/test_screening_stream_ingest_v1.py::test_legacy_offset_is_never_promoted
+AC-015 -> OHM-Trade-Agent-v1/tests/test_screening_stream_ingest_v1.py::test_retention_floor_prunes_checkpoint
+AC-015 -> OHM-Trade-Agent-v1/tests/test_screening_stream_ingest_v1.py::test_equal_length_hot_replacement_is_refused
+AC-015 -> OHM-Trade-Agent-v1/tests/test_screening_stream_ingest_v1.py::test_untrusted_frame_digest_is_refused
+
+AC-016 -> OHM-Trade-Agent-v1/tests/test_screening_stream_transition_v1.py::test_transition_requires_explicit_authorization
+AC-016 -> OHM-Trade-Agent-v1/tests/test_screening_stream_transition_v1.py::test_transition_records_gap_and_sets_framed_checkpoint
+AC-016 -> OHM-Trade-Agent-v1/tests/test_screening_stream_transition_v1.py::test_transition_is_idempotent
+
+
 
 DEFERRED DISCOVERIES:
 - The production export tree contains historical generations from the previous canonical store (220,721 events) while current production runs a fresh genesis (8,819 events at capture). Retention and archival review remain owner work.
