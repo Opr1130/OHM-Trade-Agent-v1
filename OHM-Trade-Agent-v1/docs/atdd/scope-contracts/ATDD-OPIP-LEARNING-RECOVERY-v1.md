@@ -264,6 +264,14 @@ AC-015 -> tests/test_screening_stream_frame_v1.py::test_stable_identity_not_deri
 AC-015 -> tests/test_screening_stream_frame_v1.py::test_untrusted_frame_digest_rejected
 AC-015 -> tests/test_screening_stream_frame_v1.py::test_mutated_frame_hash_refuses_trusted_manifest
 AC-015 -> tests/test_screening_stream_frame_v1.py::test_repeated_archive_digest_is_distinguished_from_range_overlap
+AC-015 -> tests/test_producer_stream_epoch_v1.py::test_nonempty_legacy_stream_refuses_implicit_epoch
+AC-015 -> tests/test_producer_stream_epoch_v1.py::test_existing_archive_refuses_implicit_epoch
+AC-015 -> tests/test_producer_stream_epoch_v1.py::test_stream_epoch_identity_is_stable_on_repeated_initialization
+AC-015 -> tests/test_producer_stream_epoch_v1.py::test_two_rotations_preserve_absolute_position_and_raw_evidence
+AC-015 -> tests/test_producer_stream_epoch_v1.py::test_uncommitted_compaction_with_original_hot_can_retry
+AC-015 -> tests/test_producer_stream_epoch_v1.py::test_post_rewrite_crash_recovers_with_verified_archive
+AC-015 -> tests/test_producer_stream_epoch_v1.py::test_ambiguous_partial_rewrite_refuses_checkpoint_advance
+AC-015 -> tests/test_producer_stream_epoch_v1.py::test_snapshot_refuses_pending_compaction
 
 AC-016 -> tests/test_learning_recovery_receipt_v1.py::test_intent_is_prepared_before_terminal_and_is_not_edited
 AC-016 -> tests/test_learning_recovery_receipt_v1.py::test_blocked_terminal_never_asserts_success
@@ -389,6 +397,10 @@ AC-015 -> OHM-Trade-Agent-v1/app/services/opportunity_accountability.py
 AC-015 -> OHM-Trade-Agent-v1/tests/test_learning_derived_state_v1.py
 AC-015 -> OHM-Trade-Agent-v1/tests/test_learning_derived_state_cli_v1.py
 AC-015 -> OHM-Trade-Agent-v1/app/opip/storage/screening_stream_frame.py
+AC-015 -> OHM-Trade-Agent-v1/app/opip/storage/producer_stream_epoch.py
+AC-015 -> OHM-Trade-Agent-v1/app/opip/storage/bounded_jsonl.py
+AC-015 -> OHM-Trade-Agent-v1/app/opip/decision/store.py
+AC-015 -> OHM-Trade-Agent-v1/tests/test_producer_stream_epoch_v1.py
 AC-015 -> OHM-Trade-Agent-v1/tests/test_screening_stream_frame_v1.py
 AC-016 -> OHM-Trade-Agent-v1/app/services/learning_recovery_receipt.py
 AC-016 -> OHM-Trade-Agent-v1/app/services/learning_recovery_attestation.py
