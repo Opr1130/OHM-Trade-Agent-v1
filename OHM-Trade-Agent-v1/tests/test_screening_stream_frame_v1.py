@@ -59,6 +59,7 @@ def _cp(frame: StreamFrame, pos: int, raw: bytes) -> StreamCheckpoint:
 
 @pytest.mark.acceptance
 def test_archive_to_archive_transition(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-015: verify framed input safety."""
     frame, data, blocks = _evidence(tmp_path)
     plan = plan_resume(frame, _cp(frame, len(blocks[0]), data))
     assert [p.path.name for p, _ in plan] == ["two.gz", "hot.jsonl"]
@@ -67,6 +68,7 @@ def test_archive_to_archive_transition(tmp_path):
 
 @pytest.mark.acceptance
 def test_archive_to_hot_transition(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-015: verify framed input safety."""
     frame, data, blocks = _evidence(tmp_path)
     plan = plan_resume(frame, _cp(frame, len(blocks[0]) + len(blocks[1]), data))
     assert len(plan) == 1
@@ -75,12 +77,14 @@ def test_archive_to_hot_transition(tmp_path):
 
 @pytest.mark.acceptance
 def test_checkpoint_at_end_is_idempotent(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-015: verify framed input safety."""
     frame, data, _ = _evidence(tmp_path)
     assert plan_resume(frame, _cp(frame, len(data), data)) == ()
 
 
 @pytest.mark.acceptance
 def test_unframed_legacy_offset_cannot_be_promoted(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-015: verify framed input safety."""
     frame, data, _ = _evidence(tmp_path)
     bad = StreamCheckpoint("", 10, _sha(data[6:10]), 4)
     with pytest.raises(StreamContinuityError, match="identity mismatch"):
@@ -89,6 +93,7 @@ def test_unframed_legacy_offset_cannot_be_promoted(tmp_path):
 
 @pytest.mark.acceptance
 def test_pruned_checkpoint_fails_closed(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-015: verify framed input safety."""
     frame, data, blocks = _evidence(tmp_path)
     retained = StreamFrame(frame.stream_id, len(blocks[0]), frame.end, frame.parts[1:])
     with pytest.raises(StreamContinuityError, match="EVIDENCE_PRUNED"):
@@ -97,6 +102,7 @@ def test_pruned_checkpoint_fails_closed(tmp_path):
 
 @pytest.mark.acceptance
 def test_missing_segment_fails_closed(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-015: verify framed input safety."""
     frame, _, _ = _evidence(tmp_path)
     frame = StreamFrame(frame.stream_id, 0, frame.end, (frame.parts[0], frame.parts[2]))
     with pytest.raises(StreamContinuityError, match="gap"):
@@ -105,6 +111,7 @@ def test_missing_segment_fails_closed(tmp_path):
 
 @pytest.mark.acceptance
 def test_overlapping_segments_fail_closed(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-015: verify framed input safety."""
     frame, _, _ = _evidence(tmp_path)
     p = frame.parts[1]
     p = StreamPart(p.path, p.start - 1, p.end, p.sha256, p.raw_sha256, True, p.row_count)
@@ -115,6 +122,7 @@ def test_overlapping_segments_fail_closed(tmp_path):
 
 @pytest.mark.acceptance
 def test_corrupt_archive_fails_before_consume(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-015: verify framed input safety."""
     frame, _, _ = _evidence(tmp_path)
     frame.parts[0].path.write_bytes(b"corrupt")
     with pytest.raises(StreamContinuityError, match="digest mismatch"):
@@ -123,6 +131,7 @@ def test_corrupt_archive_fails_before_consume(tmp_path):
 
 @pytest.mark.acceptance
 def test_anchor_mismatch_refuses_rebaseline(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-015: verify framed input safety."""
     frame, data, blocks = _evidence(tmp_path)
     cp = StreamCheckpoint(frame.stream_id, len(blocks[0]), _sha(b"wrong"), 4)
     with pytest.raises(StreamContinuityError, match="anchor mismatch"):
@@ -131,6 +140,7 @@ def test_anchor_mismatch_refuses_rebaseline(tmp_path):
 
 @pytest.mark.acceptance
 def test_checkpoint_must_be_complete_record(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-015: verify framed input safety."""
     frame, data, blocks = _evidence(tmp_path)
     with pytest.raises(StreamContinuityError, match="row aligned"):
         plan_resume(frame, _cp(frame, len(blocks[0]) - 1, data))
@@ -138,6 +148,7 @@ def test_checkpoint_must_be_complete_record(tmp_path):
 
 @pytest.mark.acceptance
 def test_checkpoint_beyond_end_fails(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-015: verify framed input safety."""
     frame, _, _ = _evidence(tmp_path)
     with pytest.raises(StreamContinuityError, match="beyond end"):
         plan_resume(frame, StreamCheckpoint(frame.stream_id, frame.end + 1, _sha(b"abc"), 3))
@@ -145,5 +156,6 @@ def test_checkpoint_beyond_end_fails(tmp_path):
 
 @pytest.mark.acceptance
 def test_stable_identity_not_derived_from_mutable_contents(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-015: verify framed input safety."""
     frame, raw, _ = _evidence(tmp_path)
     assert frame.stream_id != _sha(raw)
