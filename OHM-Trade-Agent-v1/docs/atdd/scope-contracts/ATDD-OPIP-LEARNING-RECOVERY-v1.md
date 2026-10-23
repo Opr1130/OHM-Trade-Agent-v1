@@ -249,6 +249,18 @@ AC-015 -> tests/test_learning_derived_state_v1.py::test_retry_refuses_changed_ac
 AC-015 -> tests/test_learning_derived_state_v1.py::test_schema_migration_markers_do_not_block_first_lineage_bind
 AC-015 -> tests/test_learning_derived_state_v1.py::test_schema_markers_with_real_rows_still_refuse
 AC-015 -> tests/test_learning_derived_state_v1.py::test_phase3c_open_binds_after_migration_markers
+AC-015 -> tests/test_screening_stream_frame_v1.py::test_archive_to_archive_transition
+AC-015 -> tests/test_screening_stream_frame_v1.py::test_archive_to_hot_transition
+AC-015 -> tests/test_screening_stream_frame_v1.py::test_checkpoint_at_end_is_idempotent
+AC-015 -> tests/test_screening_stream_frame_v1.py::test_unframed_legacy_offset_cannot_be_promoted
+AC-015 -> tests/test_screening_stream_frame_v1.py::test_pruned_checkpoint_fails_closed
+AC-015 -> tests/test_screening_stream_frame_v1.py::test_missing_segment_fails_closed
+AC-015 -> tests/test_screening_stream_frame_v1.py::test_overlapping_segments_fail_closed
+AC-015 -> tests/test_screening_stream_frame_v1.py::test_corrupt_archive_fails_before_consume
+AC-015 -> tests/test_screening_stream_frame_v1.py::test_anchor_mismatch_refuses_rebaseline
+AC-015 -> tests/test_screening_stream_frame_v1.py::test_checkpoint_must_be_complete_record
+AC-015 -> tests/test_screening_stream_frame_v1.py::test_checkpoint_beyond_end_fails
+AC-015 -> tests/test_screening_stream_frame_v1.py::test_stable_identity_not_derived_from_mutable_contents
 
 AC-016 -> tests/test_learning_recovery_receipt_v1.py::test_intent_is_prepared_before_terminal_and_is_not_edited
 AC-016 -> tests/test_learning_recovery_receipt_v1.py::test_blocked_terminal_never_asserts_success
