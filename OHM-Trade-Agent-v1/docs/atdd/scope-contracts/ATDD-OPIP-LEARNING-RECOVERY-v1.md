@@ -263,6 +263,7 @@ AC-015 -> tests/test_screening_stream_frame_v1.py::test_checkpoint_beyond_end_fa
 AC-015 -> tests/test_screening_stream_frame_v1.py::test_stable_identity_not_derived_from_mutable_contents
 AC-015 -> tests/test_screening_stream_frame_v1.py::test_untrusted_frame_digest_rejected
 AC-015 -> tests/test_screening_stream_frame_v1.py::test_mutated_frame_hash_refuses_trusted_manifest
+AC-015 -> tests/test_screening_stream_frame_v1.py::test_repeated_archive_digest_is_distinguished_from_range_overlap
 
 AC-016 -> tests/test_learning_recovery_receipt_v1.py::test_intent_is_prepared_before_terminal_and_is_not_edited
 AC-016 -> tests/test_learning_recovery_receipt_v1.py::test_blocked_terminal_never_asserts_success
