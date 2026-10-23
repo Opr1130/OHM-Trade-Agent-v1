@@ -163,3 +163,25 @@ def test_snapshot_refuses_pending_compaction(tmp_path):
     prepare_compaction_locked(hot, archive_bytes=b'{"id":1}\n', tail_bytes=b'{"id":2}\n')
     with pytest.raises(StreamEpochError, match="NOT_COMMITTED"):
         snapshot_locked(hot, archive, hot.stem)
+
+
+@pytest.mark.acceptance
+def test_export_snapshot_refuses_missing_verified_archive(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-015: no frame for lost history."""
+    hot = tmp_path / "screening_evaluations.jsonl"
+    archive_dir = tmp_path / "screening_evaluations_archive"
+    initialize_empty_locked(hot, archive_dir)
+    rows = [
+        {"observation_id": str(i), "observed_at": "2026-10-23T00:00:00Z"}
+        for i in range(5)
+    ]
+    assert _append_rows(
+        hot, rows, max_bytes=350, keep_lines=2,
+        dead_letter_path=tmp_path / "dead.jsonl",
+    ) == 5
+    state = load(hot)
+    assert state["segments"]
+    archived = archive_dir / state["segments"][0]["archive"]
+    archived.unlink()
+    with pytest.raises(StreamEpochError, match="STREAM_SEGMENT_FILE_UNAVAILABLE"):
+        snapshot_locked(hot, archive_dir, hot.stem)
