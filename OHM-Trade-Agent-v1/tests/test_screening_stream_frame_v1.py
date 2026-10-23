@@ -200,3 +200,19 @@ def test_mutated_frame_hash_refuses_trusted_manifest(tmp_path):
             altered, StreamCheckpoint(frame.stream_id, 0, "", 0),
             expected_frame_sha256=bound_sha
         )
+
+
+@pytest.mark.acceptance
+def test_repeated_archive_digest_is_distinguished_from_range_overlap(tmp_path):
+    """ATDD-OPIP-LEARNING-RECOVERY-v1/AC-015: classify repeated segment content."""
+    frame, _, _ = _evidence(tmp_path)
+    first, second, hot = frame.parts
+    # Repeated archived payload bytes in a different position are a content
+    # ambiguity even though the ranges themselves are contiguous.
+    duplicate = StreamPart(
+        second.path, second.start, second.end,
+        first.sha256, first.raw_sha256, True, first.row_count,
+    )
+    altered = StreamFrame(frame.stream_id, 0, frame.end, (first, duplicate, hot))
+    with pytest.raises(StreamContinuityError, match="DUPLICATE_CONTENT"):
+        altered.verify_layout()
