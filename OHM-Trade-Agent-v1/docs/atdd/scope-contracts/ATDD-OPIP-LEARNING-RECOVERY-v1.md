@@ -427,6 +427,28 @@ AC-020 -> OHM-Trade-Agent-v1/tests/test_learning_recovery_ci_discovery_v1.py
 AC-020 -> OHM-Trade-Agent-v1/tests/test_learning_recovery_attestation_v1.py
 AC-020 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-LEARNING-RECOVERY-v1.md
 
+AC-015 (rotation-aware absolute ingestion; additive, does not relax AC-015):
+AC-015 -> OHM-Trade-Agent-v1/app/opip/discovery/stream_ingest.py
+AC-015 -> OHM-Trade-Agent-v1/app/services/screening_stream_transition.py
+AC-015 -> OHM-Trade-Agent-v1/tests/test_screening_stream_ingest_v1.py::test_archived_evidence_is_consumed_before_hot
+AC-015 -> OHM-Trade-Agent-v1/tests/test_screening_stream_ingest_v1.py::test_rotation_after_consumption_resumes_at_absolute_position
+AC-015 -> OHM-Trade-Agent-v1/tests/test_screening_stream_ingest_v1.py::test_replay_is_idempotent
+AC-015 -> OHM-Trade-Agent-v1/tests/test_screening_stream_ingest_v1.py::test_legacy_offset_is_never_promoted
+AC-015 -> OHM-Trade-Agent-v1/tests/test_screening_stream_ingest_v1.py::test_retention_floor_prunes_checkpoint
+AC-015 -> OHM-Trade-Agent-v1/tests/test_screening_stream_ingest_v1.py::test_equal_length_hot_replacement_is_refused
+AC-015 -> OHM-Trade-Agent-v1/tests/test_screening_stream_ingest_v1.py::test_untrusted_frame_digest_is_refused
+
+AC-016 (immutable gap receipt for an unprovable legacy coordinate):
+AC-016 -> OHM-Trade-Agent-v1/tests/test_screening_stream_transition_v1.py::test_transition_requires_explicit_authorization
+AC-016 -> OHM-Trade-Agent-v1/tests/test_screening_stream_transition_v1.py::test_transition_records_gap_and_sets_framed_checkpoint
+AC-016 -> OHM-Trade-Agent-v1/tests/test_screening_stream_transition_v1.py::test_transition_is_idempotent
+
+NOTE: the legacy discovery checkpoint (offset 61,049,583) is never
+converted by arithmetic. It is archived and recorded as an explicit
+LEGACY_COORDINATE_UNPROVEN gap; continuity is claimed only from the verified
+cutover forward.
+
+
 DEFERRED DISCOVERIES:
 - The production export tree contains historical generations from the previous canonical store (220,721 events) while current production runs a fresh genesis (8,819 events at capture). Retention and archival review remain owner work.
 - Learning timers are disabled during recovery and require one-shot acceptance before re-enabling.

@@ -216,20 +216,166 @@ def plan_resume(
         _require_digest(checkpoint.anchor_sha256, "checkpoint.anchor_sha256")
         if checkpoint.position - checkpoint.anchor_bytes < frame.retained_start:
             raise StreamContinuityError("checkpoint anchor pruned")
+    # The 4 KiB anchor is cheap and is what detects an equal-length or
+    # in-place replacement of the HOT file, so it is ALWAYS verified.
+    # verify_bytes only gates the expensive full-segment decompression.
+    if checkpoint.position:
+        anchor = _read_absolute(
+            frame,
+            checkpoint.position - checkpoint.anchor_bytes,
+            checkpoint.position,
+        )
+        if _sha(anchor) != checkpoint.anchor_sha256:
+            raise StreamContinuityError("anchor mismatch")
+        if anchor[-1:] != b"\n":
+            raise StreamContinuityError("checkpoint not row aligned")
     if verify_bytes:
         for part in parts:
             verify_part_bytes(part)
-        if checkpoint.position:
-            anchor = _read_absolute(
-                frame,
-                checkpoint.position - checkpoint.anchor_bytes,
-                checkpoint.position,
-            )
-            if _sha(anchor) != checkpoint.anchor_sha256:
-                raise StreamContinuityError("anchor mismatch")
-            if anchor[-1:] != b"\n":
-                raise StreamContinuityError("checkpoint not row aligned")
     return tuple(
         (part, max(0, checkpoint.position - part.start))
         for part in parts if part.end > checkpoint.position
     )
+
+
+def read_absolute(frame: StreamFrame, start: int, end: int) -> bytes:
+    """Public wrapper: read a proven absolute byte range from the frame."""
+    return _read_absolute(frame, start, end)
+
+
+def build_frame_from_snapshot(
+    *,
+    stream_name: str,
+    state_bytes: bytes,
+    archive_dir: Path,
+    hot_path: Path,
+    hot_bytes: bytes,
+    expected_state_sha256: str,
+    expected_hot_sha256: str,
+    expected_archive_manifest_sha256: str | None,
+) -> StreamFrame:
+    """Rebuild the producer frame from one authenticated export snapshot.
+
+    Every input is bound by the signed export manifest: the producer state
+    document, the HOT bytes and (when segments exist) the archive manifest.
+    The resulting frame digest is therefore a pure function of authenticated
+    data instead of a self-asserted claim, and the caller can hand
+    ``frame_sha256(frame)`` to :func:`plan_resume`.
+
+    Nothing here rewrites evidence. A frame that cannot be rebuilt from the
+    snapshot fails closed with :class:`StreamContinuityError`.
+    """
+    _require_digest(expected_state_sha256, "expected_state_sha256")
+    _require_digest(expected_hot_sha256, "expected_hot_sha256")
+    if _sha(state_bytes) != expected_state_sha256:
+        raise StreamContinuityError("STREAM_STATE_DIGEST_MISMATCH")
+    if not stream_name or "/" in stream_name or "\\" in stream_name:
+        raise StreamContinuityError("STREAM_NAME_INVALID")
+    try:
+        state = json.loads(state_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise StreamContinuityError("STREAM_STATE_UNREADABLE") from exc
+    if not isinstance(state, dict) or state.get("schema_version") != 1:
+        raise StreamContinuityError("STREAM_STATE_SCHEMA_INVALID")
+    epoch = state.get("epoch_uuid")
+    if not isinstance(epoch, str) or not epoch:
+        raise StreamContinuityError("STREAM_EPOCH_UUID_INVALID")
+    if state.get("pending") is not None:
+        raise StreamContinuityError("STREAM_COMPACTION_NOT_COMMITTED")
+    hot_base = state.get("hot_base")
+    if type(hot_base) is not int or hot_base < 0:
+        raise StreamContinuityError("STREAM_HOT_BASE_INVALID")
+    entries = state.get("segments")
+    if not isinstance(entries, list):
+        raise StreamContinuityError("STREAM_SEGMENTS_INVALID")
+    if _sha(hot_bytes) != expected_hot_sha256:
+        raise StreamContinuityError("STREAM_HOT_DIGEST_MISMATCH")
+    if hot_bytes and hot_bytes[-1:] != b"\n":
+        raise StreamContinuityError("STREAM_HOT_INCOMPLETE_RECORD")
+
+    manifest_entries: dict[str, dict] = {}
+    if entries:
+        if expected_archive_manifest_sha256 is None:
+            raise StreamContinuityError("STREAM_ARCHIVE_MANIFEST_UNBOUND")
+        _require_digest(
+            expected_archive_manifest_sha256, "expected_archive_manifest_sha256"
+        )
+        manifest_path = archive_dir / "manifest.json"
+        signature_path = archive_dir / "manifest.json.sha256"
+        if not manifest_path.is_file() or not signature_path.is_file():
+            raise StreamContinuityError("STREAM_ARCHIVE_MANIFEST_MISSING")
+        if _sha(manifest_path.read_bytes()) != expected_archive_manifest_sha256:
+            raise StreamContinuityError("STREAM_ARCHIVE_MANIFEST_DIGEST_MISMATCH")
+        try:
+            parsed = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest_entries = parsed["segments"]
+        except (OSError, KeyError, ValueError, TypeError) as exc:
+            raise StreamContinuityError("STREAM_ARCHIVE_MANIFEST_INVALID") from exc
+        if not isinstance(manifest_entries, dict):
+            raise StreamContinuityError("STREAM_ARCHIVE_MANIFEST_INVALID")
+
+    root = archive_dir.resolve()
+    parts: list[StreamPart] = []
+    offset = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise StreamContinuityError("STREAM_SEGMENTS_INVALID")
+        if entry.get("start") != offset:
+            raise StreamContinuityError("STREAM_SEGMENT_RANGE_GAP")
+        end = entry.get("end")
+        if type(end) is not int or end <= offset:
+            raise StreamContinuityError("STREAM_SEGMENT_RANGE_INVALID")
+        if end - offset != entry.get("uncompressed_bytes"):
+            raise StreamContinuityError("STREAM_SEGMENT_SIZE_INVALID")
+        digest = entry.get("sha256")
+        raw_digest = entry.get("raw_sha256")
+        _require_digest(digest, "segment.sha256")
+        _require_digest(raw_digest, "segment.raw_sha256")
+        live = manifest_entries.get(digest)
+        if not isinstance(live, dict) or live.get("sha256") != digest:
+            raise StreamContinuityError("STREAM_SEGMENT_MANIFEST_MISSING")
+        row_count = entry.get("row_count")
+        if live.get("row_count") != row_count:
+            raise StreamContinuityError("STREAM_SEGMENT_ROW_COUNT_DIVERGED")
+        relative = live.get("archive")
+        if not isinstance(relative, str):
+            raise StreamContinuityError("STREAM_SEGMENT_LOCATION_INVALID")
+        path = archive_dir / relative
+        if (
+            not path.resolve().is_relative_to(root)
+            or path.is_symlink()
+            or not path.is_file()
+        ):
+            raise StreamContinuityError("STREAM_SEGMENT_FILE_UNAVAILABLE")
+        parts.append(
+            StreamPart(
+                path=path,
+                start=offset,
+                end=end,
+                sha256=digest,
+                raw_sha256=raw_digest,
+                archived=True,
+                row_count=row_count,
+            )
+        )
+        offset = end
+
+    if offset != hot_base:
+        raise StreamContinuityError("STREAM_HOT_BASE_DIVERGED")
+    parts.append(
+        StreamPart(
+            path=hot_path,
+            start=offset,
+            end=offset + len(hot_bytes),
+            sha256=_sha(hot_bytes),
+            raw_sha256=_sha(hot_bytes),
+            archived=False,
+        )
+    )
+    return StreamFrame(
+        stream_id=_sha(f"opip:v1:{stream_name}:{epoch}".encode("ascii")),
+        retained_start=0,
+        end=offset + len(hot_bytes),
+        parts=tuple(parts),
+    )
+

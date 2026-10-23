@@ -547,6 +547,16 @@ if [[ ! -r "$DATA_ROOT/.lineage.json" && -n "$previous_sha" && "$previous_sha" =
   fi
 fi
 
+# Stream Frame v1 producer state travels with the HOT file it describes. It is
+# installed before the HOT move so an interrupted sync leaves state newer than
+# evidence (fail-closed digest mismatch) rather than a stale frame that could
+# be mistaken for the current one. Absent for legacy unframed production.
+SCREENING_STREAM_STATE="opip/qualification/screening_evaluations.jsonl.stream_state_v1.json"
+if [[ -f "$INCOMING/$SCREENING_STREAM_STATE" ]]; then
+  install -d -o root -g root -m 0755 "$(dirname "$DATA_ROOT/$SCREENING_STREAM_STATE")"
+  mv -f -- "$INCOMING/$SCREENING_STREAM_STATE" "$DATA_ROOT/$SCREENING_STREAM_STATE"
+fi
+
 for name in \
   full_market_observations.jsonl \
   p1_evidence_ledger.jsonl \

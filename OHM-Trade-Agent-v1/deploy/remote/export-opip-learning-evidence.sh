@@ -136,9 +136,15 @@ copy_locked_jsonl() {
   local name="$2"
   local archive_source="${3:-}"
   local archive_name="${4:-}"
+  # Optional Stream Frame v1 producer state. It is copied inside the SAME
+  # shared lock acquisition as HOT and the archive so the three files can only
+  # ever describe one producer instant.
+  local state_source="${5:-}"
   local source_lock="$(dirname "$source")/.$(basename "$source").lock"
   local temp="$EXPORT_ROOT/.$name.tmp.$$"
   local target="$EXPORT_ROOT/$name"
+  local state_temp=""
+  local state_target=""
   local archive_temp=""
   local archive_target=""
 
@@ -160,12 +166,20 @@ copy_locked_jsonl() {
     fi
   fi
 
+  if [[ -n "$state_source" ]]; then
+    state_temp="$EXPORT_ROOT/.$name.stream_state_v1.json.tmp.$$"
+    state_target="$EXPORT_ROOT/$name.stream_state_v1.json"
+  fi
+
   exec {source_fd}>>"$source_lock"
   flock -s "$source_fd"
   if [[ -e "$source" ]]; then
     cp -- "$source" "$temp"
   else
     : > "$temp"
+  fi
+  if [[ -n "$state_temp" && -e "$state_source" ]]; then
+    cp -- "$state_source" "$state_temp"
   fi
   if [[ -n "$archive_name" && -d "$archive_source" ]]; then
     cp -a -- "$archive_source/." "$archive_temp/"
@@ -188,6 +202,18 @@ copy_locked_jsonl() {
     chmod 0600 "$temp"
   fi
   mv -f -- "$temp" "$target"
+  # Publish the stream state only after the HOT bytes it describes are in
+  # place, so a reader can never see new state next to old evidence.
+  if [[ -n "$state_temp" && -e "$state_temp" ]]; then
+    if getent group "$READER_GROUP" >/dev/null 2>&1; then
+      chown root:"$READER_GROUP" "$state_temp"
+      chmod 0640 "$state_temp"
+    else
+      chown root:root "$state_temp"
+      chmod 0600 "$state_temp"
+    fi
+    mv -f -- "$state_temp" "$state_target"
+  fi
   if [[ -n "$archive_name" ]]; then
     if getent group "$READER_GROUP" >/dev/null 2>&1; then
       chown -R root:"$READER_GROUP" "$archive_temp"
@@ -211,7 +237,7 @@ rm -f -- "$EXPORT_ROOT/p1_shadow_outbox.jsonl"
 copy_locked_jsonl "$DATA_ROOT/full_market_observations.jsonl" "full_market_observations.jsonl"
 copy_locked_jsonl "$DATA_ROOT/p1_evidence_ledger.jsonl" "p1_evidence_ledger.jsonl"
 copy_locked_jsonl "$DATA_ROOT/intelligence_learning/events.jsonl" "intelligence_learning/events.jsonl"
-copy_locked_jsonl "$DATA_ROOT/opip/qualification/screening_evaluations.jsonl" "opip/qualification/screening_evaluations.jsonl" "$DATA_ROOT/opip/qualification/screening_evaluations_archive" "opip/qualification/screening_evaluations_archive"
+copy_locked_jsonl "$DATA_ROOT/opip/qualification/screening_evaluations.jsonl" "opip/qualification/screening_evaluations.jsonl" "$DATA_ROOT/opip/qualification/screening_evaluations_archive" "opip/qualification/screening_evaluations_archive" "$DATA_ROOT/opip/qualification/screening_evaluations.jsonl.stream_state_v1.json"
 copy_locked_jsonl "$DATA_ROOT/opip/qualification/funnel_events.jsonl" "opip/qualification/funnel_events.jsonl" "$DATA_ROOT/opip/qualification/funnel_events_archive" "opip/qualification/funnel_events_archive"
 copy_locked_jsonl "$DATA_ROOT/opip/qualification/scan_summaries.jsonl" "opip/qualification/scan_summaries.jsonl" "$DATA_ROOT/opip/qualification/scan_summaries_archive" "opip/qualification/scan_summaries_archive"
 copy_locked_jsonl "$DATA_ROOT/paper_trading/events.jsonl" "paper_trading/events.jsonl"
@@ -381,6 +407,21 @@ opip/qualification/screening_evaluations_archive|opip_qualification_screening_ar
 opip/qualification/funnel_events_archive|opip_qualification_funnel_archive
 opip/qualification/scan_summaries_archive|opip_qualification_summaries_archive
 ARCHIVES
+  # Stream Frame v1 (additive). Present only after the producer has established
+  # a durable coordinate epoch, so a legacy schema-4 reader sees exactly the
+  # keys it saw before. Every value below is the digest of a file already
+  # copied into this same export generation under the same source lock, which
+  # is what lets a worker rebuild and authenticate the frame locally.
+  screening_state="$EXPORT_ROOT/opip/qualification/screening_evaluations.jsonl.stream_state_v1.json"
+  if [[ -f "$screening_state" ]]; then
+    printf 'opip_qualification_screening_stream_contract_version=1\n'
+    printf 'opip_qualification_screening_stream_state_bytes=%s\n' "$(stat -c '%s' "$screening_state")"
+    printf 'opip_qualification_screening_stream_state_sha256=%s\n' "$(sha256sum "$screening_state" | awk '{print $1}')"
+    screening_manifest="$EXPORT_ROOT/opip/qualification/screening_evaluations_archive/manifest.json"
+    if [[ -f "$screening_manifest" ]]; then
+      printf 'opip_qualification_screening_archive_manifest_sha256=%s\n' "$(sha256sum "$screening_manifest" | awk '{print $1}')"
+    fi
+  fi
 } > "$manifest_tmp"
 
 if getent group "$READER_GROUP" >/dev/null 2>&1; then
