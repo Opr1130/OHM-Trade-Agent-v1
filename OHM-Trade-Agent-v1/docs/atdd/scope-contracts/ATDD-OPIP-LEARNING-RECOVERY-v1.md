@@ -385,6 +385,8 @@ AC-015 -> OHM-Trade-Agent-v1/app/opip/discovery/maturation.py
 AC-015 -> OHM-Trade-Agent-v1/app/services/opportunity_accountability.py
 AC-015 -> OHM-Trade-Agent-v1/tests/test_learning_derived_state_v1.py
 AC-015 -> OHM-Trade-Agent-v1/tests/test_learning_derived_state_cli_v1.py
+AC-015 -> OHM-Trade-Agent-v1/app/opip/storage/screening_stream_frame.py
+AC-015 -> OHM-Trade-Agent-v1/tests/test_screening_stream_frame_v1.py
 AC-016 -> OHM-Trade-Agent-v1/app/services/learning_recovery_receipt.py
 AC-016 -> OHM-Trade-Agent-v1/app/services/learning_recovery_attestation.py
 AC-016 -> .github/workflows/deploy-learning-recovery.yml
