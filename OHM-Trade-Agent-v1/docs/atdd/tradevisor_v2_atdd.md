@@ -115,23 +115,71 @@ Test files:
 | R-06 | The store's status did not state that it is not the canonical ledger | `inbox_status()` publishes `evidence_class`, `canonical_handoff`, `consumption` | `recovery::test_inbox_declares_its_evidence_class_and_consumer` |
 | R-07 | The ack-path import test asserted source text, not the import graph | Strengthened to an AST allowlist that names the single reviewed coupling | `boundaries::test_atdd35_webhook_ack_path_performs_no_downstream_io` |
 | R-08 | The exact-SHA classifier was **re-implemented** although `app.opip.learning.job_disposition` already owns it | Re-exported the owner's function object; consumption now writes the learning plane's own `CONSUMED_OK`/`CONSUMED_EMPTY`/`BLOCKED_RELEASE_DRIFT` summary | `learning::test_release_classification_is_the_learning_plane_owner_not_a_copy`, `recovery::test_consumption_summary_is_written_with_no_policy_authority` |
+| R-09 | Settlement was fenced only by `status == PROCESSING`, so a worker whose lease expired could settle the row a *different* worker had already reclaimed and re-claimed | Each claim mints a persisted unique `claim_token`; `_settle` requires the exact token it holds, and reclamation voids the previous token. Whole check-and-write stays inside the existing registry lock — no new store or lock service | `inbox::test_stale_worker_cannot_settle_a_reclaimed_row`, `inbox::test_stale_worker_cannot_poison_a_reclaimed_row`, `inbox::test_reclaimed_row_is_settled_by_its_new_owner` |
+| R-10 | A worker that died after claiming left the row in `PROCESSING`, which `pending_count()` does not count; reclamation only ran inside `process_queued_events()`, so the cycle skipped it entirely and the row stranded | The advisory phase always attempts at least one drain pass, which reclaims expired leases before claiming. Still bounded to four batches; healthy leases are never stolen; protection phases still run first; failures still never abort the cycle | `recovery::test_normal_cycle_recovers_an_expired_processing_row`, `recovery::test_normal_cycle_leaves_a_healthy_processing_row_alone` |
+| R-11 | `build_report()` computed every outcome (invoking the candle provider) before `build_learning_report()` applied the exact-SHA gate; the gate cleared cohorts but the computed outcomes were still returned and their measured count persisted | Release compatibility is classified with the existing `classify_release_compatibility` **before** any row is measured. On `RELEASE_DRIFT`/`RELEASE_UNVERIFIED` no provider is called, no outcome is produced or exposed, and consumption records the blocked disposition with a measured count of zero | `recovery::test_release_drift_never_invokes_the_candle_provider`, `recovery::test_unverified_release_never_invokes_the_candle_provider`, `recovery::test_current_release_still_measures_outcomes` |
+| R-12 | The forward-only filter admitted a candle opening exactly at `window_end`, a candle opening before but *closing* after it, and the still-forming candle Kraken returns last; their highs/lows could create touches and change MFE/MAE outside the declared window | A candle is admissible only when it opens before `window_end`, its full interval closes at or before `window_end` **and** at or before the measurement instant, and it is provably complete (explicit completion flag, or `open + interval`). Completeness that cannot be established is excluded rather than guessed; pre-decision and touch-versus-fill semantics are unchanged | `learning::test_candle_opening_at_window_end_is_excluded`, `learning::test_candle_closing_after_window_end_is_excluded`, `learning::test_unfinished_candle_is_excluded`, `learning::test_explicitly_incomplete_candle_is_excluded`, `learning::test_completed_candles_inside_the_window_are_measured_without_a_fill` |
+
+## Post-review remediation semantics
+
+These four corrections came from an independent PR review. They change *how*
+the existing guarantees are enforced, not what the product is allowed to do.
+
+**Lease ownership (R-09).** A claim is `status = PROCESSING` **plus** a unique
+`claim_token`. `_reclaim_stale` returns an expired row to `RETRY` and clears the
+token, so the claim it represented can never be settled. `_settle` therefore
+requires the caller's own token: a late worker whose lease expired is a no-op,
+whether it returns success, failure or poison. The read-check-write remains a
+single critical section under `registry.lock`, so no new coordination service
+is introduced. Retry bounding (`attempts` → `max_attempts` → `POISONED`) and the
+existing notification reservation/dedup controls are unchanged, so a reclaimed
+row cannot double-deliver.
+
+**Cycle recovery (R-10).** Because `pending_count()` counts only `QUEUED` and
+`RETRY`, an all-`PROCESSING` inbox looks empty. The advisory phase now always
+attempts one drain pass — the only place reclamation happens — so acknowledged
+evidence is recoverable without a new webhook or an operator drain. The phase
+stays last, stays inert when disabled, stays bounded to four batches, and its
+failures are still swallowed by the surrounding handler.
+
+**SHA fail-closed ordering (R-11).** The exact-SHA gate is a *precondition* of
+measurement. A drifted or unverifiable worker performs no candle read at all, so
+it cannot compute, return or persist outcome evidence. The classifier is the
+learning plane's own `classify_release_compatibility` — there is still exactly
+one release-classification implementation.
+
+**Candle-window semantics (R-12).** Measurement is bounded to completed candles
+whose whole interval lies inside `[decided_at, window_end]`. Concretely:
+a candle opening at or after `window_end` is excluded; a candle closing after
+`window_end` is excluded; a candle that has not finished forming (closing after
+the measurement instant, or flagged incomplete by its source) is excluded; when
+completeness cannot be established the candle is excluded rather than assumed.
+The frozen decision and the entry/stop/target geometry are untouched, and a
+price touch remains evidence about price — never a fill
+(`fill_attribution = NONE_TOUCH_INFERRED`).
+
 
 ## Reconciled test totals
 
-No group is double-counted. The 52-scenario matrix maps onto **156** distinct
-Tradevisor tests (some scenarios have more than one test; none share a test):
+No group is double-counted. The 52-scenario matrix maps onto **188** distinct
+Tradevisor tests (some scenarios have more than one test; none share a test).
+``test_tradevisor_v2_advisory_acceptance_v1.py`` is the ATDD acceptance
+traceability module for the scope contract, not a duplicate of the scenario
+suite.
 
 | File | Tests |
 | --- | --- |
 | `test_tradevisor_ingress_v1.py` | 29 |
 | `test_tradevisor_webhook_v1.py` | 32 |
-| `test_tradevisor_inbox_v1.py` | 12 |
-| `test_tradevisor_evaluation_v1.py` | 18 |
+| `test_tradevisor_inbox_v1.py` | 15 |
+| `test_tradevisor_evaluation_v1.py` | 20 |
 | `test_tradevisor_notifier_v1.py` | 12 |
-| `test_tradevisor_learning_v1.py` | 16 |
-| `test_tradevisor_recovery_v1.py` | 14 |
+| `test_tradevisor_learning_v1.py` | 22 |
+| `test_tradevisor_recovery_v1.py` | 20 |
 | `test_tradevisor_boundaries_v1.py` | 23 |
-| **Total** | **156** |
+| `test_tradevisor_v2_advisory_acceptance_v1.py` | 15 |
+| **Total** | **188** |
+
 
 
 ## Approved policy dispositions and remaining deviations (2026-10-23)

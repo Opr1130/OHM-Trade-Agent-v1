@@ -283,3 +283,92 @@ def test_incremental_value_compares_when_both_sides_exist():
     assert report.incremental_value["status"] == "COMPARABLE"
     assert report.incremental_value["tradevisor_corroborated_net_usd"] == 50.0
     assert "never promotes policy" in report.incremental_value["note"]
+
+
+# ---------------------------------------------------------------------------
+# P2-04: outcome candles must be completed and fully inside the window
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class MarkedCandle:
+    """A candle that carries explicit completion evidence."""
+
+    open_time: datetime
+    high: float
+    low: float
+    complete: bool
+
+
+def _measured(bars, *, measurement_hours: int = 3, now: datetime | None = None) -> dict:
+    return learning.evaluate_outcome(
+        record(),
+        now=now or (DECIDED + timedelta(hours=measurement_hours)),
+        candles_provider=lambda *_: list(bars),
+        measurement_hours=measurement_hours,
+    )
+
+
+def _entry_and_target_1() -> list:
+    """Two completed candles that fill the entry and touch Target 1 only."""
+    return [
+        Candle(DECIDED + timedelta(hours=1), 101.0, 99.5),
+        Candle(DECIDED + timedelta(hours=2), 106.0, 100.5),
+    ]
+
+
+def test_candle_opening_at_window_end_is_excluded():
+    # measurement window is DECIDED+3h, so this candle opens exactly at the end
+    # and its high would otherwise touch Target 2 and inflate MFE.
+    bars = _entry_and_target_1() + [
+        Candle(DECIDED + timedelta(hours=3), 500.0, 400.0)
+    ]
+    outcome = _measured(bars)
+
+    assert outcome["status"] == learning.OUTCOME_MEASURED
+    assert outcome["target_1_touched"] is True
+    assert outcome["target_2_touched"] is False
+    assert outcome["mfe_pct"] < 20.0
+
+
+def test_candle_closing_after_window_end_is_excluded():
+    # Opens before the end but its one-hour interval closes after it.
+    bars = _entry_and_target_1() + [
+        Candle(DECIDED + timedelta(hours=2, minutes=30), 500.0, 400.0)
+    ]
+    outcome = _measured(bars)
+
+    assert outcome["target_2_touched"] is False
+    assert outcome["mfe_pct"] < 20.0
+
+
+def test_unfinished_candle_is_excluded():
+    # The measurement instant is the window end; this candle is still forming.
+    bars = _entry_and_target_1() + [
+        Candle(DECIDED + timedelta(hours=2, minutes=45), 500.0, 400.0)
+    ]
+    outcome = _measured(bars, now=DECIDED + timedelta(hours=3))
+
+    assert outcome["target_2_touched"] is False
+    assert outcome["mfe_pct"] < 20.0
+
+
+def test_explicitly_incomplete_candle_is_excluded():
+    # Full interval inside the window, but the source says it is not complete.
+    bars = _entry_and_target_1() + [
+        MarkedCandle(DECIDED + timedelta(hours=1, minutes=15), 500.0, 400.0, False)
+    ]
+    outcome = _measured(bars)
+
+    assert outcome["target_2_touched"] is False
+
+
+def test_completed_candles_inside_the_window_are_measured_without_a_fill():
+    outcome = _measured(_entry_and_target_1())
+
+    assert outcome["status"] == learning.OUTCOME_MEASURED
+    assert outcome["target_1_touched"] is True
+    assert outcome["target_2_touched"] is False
+    # A touch is evidence about price, never an executed fill.
+    assert outcome["fill_attribution"] == learning.FILL_ATTRIBUTION_NONE
+    assert outcome["measurement_subject"] == "ACTIONABLE_RECOMMENDATION"

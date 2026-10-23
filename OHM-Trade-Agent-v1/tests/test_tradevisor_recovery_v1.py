@@ -433,3 +433,171 @@ def test_missing_data_root_records_nothing_and_does_not_raise(tmp_path):
         now=NOW + timedelta(days=2), deployed_sha=SHA_A, expected_sha=SHA_A
     )
     assert learning_job.record_consumption(result["report"], data_root=None) is None
+
+
+# ---------------------------------------------------------------------------
+# P1-02: a stranded PROCESSING row must be recovered by the normal cycle
+# ---------------------------------------------------------------------------
+
+
+def test_normal_cycle_recovers_an_expired_processing_row(isolated, monkeypatch):
+    """A dead worker's PROCESSING row is invisible to queue depth, not to the cycle."""
+    from app.jobs import run_cycle
+
+    inbox.enqueue(signal(), now=NOW)
+    registry = inbox.load_json(inbox.INBOX_FILE)
+    key = next(iter(registry["events"]))
+    registry["events"][key]["status"] = inbox.STATUS_PROCESSING
+    registry["events"][key]["processing_started_at"] = (
+        NOW - timedelta(minutes=10)
+    ).isoformat()
+    inbox.save_json_atomic(inbox.INBOX_FILE, registry)
+
+    # The queue-depth check cannot see it: no QUEUED and no RETRY rows exist.
+    assert inbox.pending_count() == 0
+
+    monkeypatch.setattr(
+        run_cycle,
+        "get_settings",
+        lambda: Settings(
+            _env_file=None,
+            webhook_secret="x" * 12,
+            opip_tradevisor_enabled=True,
+            opip_tradevisor_webhook_token="T" * 43,
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "evaluate_and_notify",
+        lambda _signal, settings=None, **_kwargs: {
+            "decision": "NO_TRADE",
+            "reason": "recovered by the normal cycle",
+        },
+    )
+
+    run_cycle._run_tradevisor_fail_open()
+
+    stored = next(iter(inbox.load_json(inbox.INBOX_FILE)["events"].values()))
+    assert stored["status"] == inbox.STATUS_PROCESSED
+    assert stored["final_disposition"] == "EVALUATED"
+
+
+def test_normal_cycle_leaves_a_healthy_processing_row_alone(isolated, monkeypatch):
+    """A live lease is not stolen by the cycle."""
+    from app.jobs import run_cycle
+
+    inbox.enqueue(signal(), now=NOW)
+    registry = inbox.load_json(inbox.INBOX_FILE)
+    key = next(iter(registry["events"]))
+    registry["events"][key]["status"] = inbox.STATUS_PROCESSING
+    registry["events"][key]["processing_started_at"] = datetime.now(
+        timezone.utc
+    ).isoformat()
+    inbox.save_json_atomic(inbox.INBOX_FILE, registry)
+
+    monkeypatch.setattr(
+        run_cycle,
+        "get_settings",
+        lambda: Settings(
+            _env_file=None,
+            webhook_secret="x" * 12,
+            opip_tradevisor_enabled=True,
+            opip_tradevisor_webhook_token="T" * 43,
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "evaluate_and_notify",
+        lambda _signal, settings=None, **_kwargs: {
+            "decision": "NO_TRADE",
+            "reason": "must not run",
+        },
+    )
+
+    run_cycle._run_tradevisor_fail_open()
+
+    stored = next(iter(inbox.load_json(inbox.INBOX_FILE)["events"].values()))
+    assert stored["status"] == inbox.STATUS_PROCESSING
+
+
+# ---------------------------------------------------------------------------
+# P1-03: the exact-SHA gate must run before any outcome is computed
+# ---------------------------------------------------------------------------
+
+
+def test_release_drift_never_invokes_the_candle_provider(isolated):
+    """A drifted worker must not read candles or expose outcomes."""
+    _settle_failed()
+    calls: list[tuple[str, datetime]] = []
+
+    def provider(market, decided_at):
+        calls.append((market, decided_at))
+        return []
+
+    result = learning_job.build_report(
+        now=NOW + timedelta(days=2),
+        deployed_sha=SHA_A,
+        expected_sha=SHA_B,
+        candles_provider=provider,
+    )
+
+    assert calls == []
+    assert result["outcomes"] == {}
+    assert result["report"]["status"] == learning.RELEASE_DRIFT
+    assert result["report"]["cohorts"] == {}
+    assert result["report"]["policy_promotion"] == "NONE"
+
+    disposition = learning_job.record_consumption(
+        result["report"], data_root=isolated, outcomes=result["outcomes"]
+    )
+    assert disposition == learning_job.BLOCKED_RELEASE_DRIFT
+
+
+def test_unverified_release_never_invokes_the_candle_provider(isolated):
+    """An unverifiable worker fails closed before measuring too."""
+    _settle_failed()
+    calls: list[str] = []
+
+    def provider(market, decided_at):
+        calls.append(market)
+        return []
+
+    result = learning_job.build_report(
+        now=NOW + timedelta(days=2),
+        deployed_sha="",
+        expected_sha=SHA_A,
+        candles_provider=provider,
+    )
+
+    assert calls == []
+    assert result["outcomes"] == {}
+    assert result["report"]["status"] == learning.RELEASE_UNVERIFIED
+
+
+def test_current_release_still_measures_outcomes(isolated):
+    """The gate must not suppress measurement for the exact trusted SHA."""
+    _settle_failed()
+    calls: list[str] = []
+
+    def provider(market, decided_at):
+        calls.append(market)
+        return [
+            _Candle(decided_at + timedelta(hours=1), 101.0, 99.5),
+            _Candle(decided_at + timedelta(hours=2), 106.0, 100.5),
+        ]
+
+    result = learning_job.build_report(
+        now=NOW + timedelta(days=2),
+        deployed_sha=SHA_A,
+        expected_sha=SHA_A,
+        candles_provider=provider,
+    )
+
+    assert calls == ["BTCUSD"]
+    assert result["report"]["status"] == learning.RELEASE_CURRENT
+    measured = [
+        outcome
+        for outcome in result["outcomes"].values()
+        if outcome["status"] == learning.OUTCOME_MEASURED
+    ]
+    assert len(measured) == 1

@@ -471,7 +471,11 @@ def _run_tradevisor_fail_open() -> None:
         )
 
         if pending_count() == 0:
-            print("Tradevisor advisory drain: no queued events")
+            # Not an early return: a worker that died after claiming leaves rows
+            # in PROCESSING, which pending_count() does not count. Reclamation
+            # only happens inside process_queued_events(), so the drain must
+            # still run once even when the queue looks empty.
+            print("Tradevisor advisory drain: no queued events; checking expired leases")
         batches = 0
         total = {
             "checked": 0,
@@ -482,7 +486,7 @@ def _run_tradevisor_fail_open() -> None:
             "reclaimed": 0,
             "qualified": 0,
         }
-        while pending_count() > 0 and batches < 4:
+        while batches < 4:
             summary = process_queued_events(
                 evaluator=lambda signal: evaluate_and_notify(signal, settings=settings)
             )
@@ -490,6 +494,8 @@ def _run_tradevisor_fail_open() -> None:
                 total[key] += int(summary.get(key, 0) or 0)
             batches += 1
             if int(summary.get("checked", 0) or 0) == 0:
+                break
+            if pending_count() == 0:
                 break
         # Undelivered actionable alerts are re-evaluated, never re-sent stale.
         retry = retry_undelivered_notifications(settings=settings, limit=2)

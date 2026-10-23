@@ -129,6 +129,21 @@ def build_report(
     )
 
     outcomes: dict[str, dict] = {}
+    # The exact-SHA gate runs BEFORE any measurement. A drifted or unverifiable
+    # worker must not read candles, compute outcomes, or expose them: previously
+    # the gate ran inside build_learning_report(), which cleared the cohorts but
+    # still returned (and persisted) computed outcome evidence.
+    release = learning.classify_release_compatibility(deployed, expected)
+    if release != learning.RELEASE_CURRENT:
+        report = learning.build_learning_report(
+            rows,
+            deployed_sha=deployed,
+            expected_sha=expected,
+            outcomes={},
+            native_metrics=native_metrics,
+        )
+        return {"report": report.as_dict(), "outcomes": {}}
+
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -141,6 +156,7 @@ def build_report(
             now=evaluated_at,
             candles_provider=candles_provider,
             measurement_hours=measurement_hours,
+            candle_interval=timedelta(minutes=CANDLE_INTERVAL_MINUTES),
         )
 
     report = learning.build_learning_report(

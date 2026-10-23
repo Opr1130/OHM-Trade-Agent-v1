@@ -25,6 +25,7 @@ successful webhook acknowledgement means "durably received", never
 from __future__ import annotations
 
 import logging
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -88,6 +89,9 @@ def _row_from_signal(signal: TradevisorSignal, now: datetime) -> dict:
         "received_at": signal.received_at.isoformat(),
         "enqueued_at": now.isoformat(),
         "processing_started_at": None,
+        #: Fencing token for the worker that currently owns settlement. A claim
+        #: is only queued/retry until a drain mints a token for itself.
+        "claim_token": None,  # nosec B105 - a claim fence, not a credential
         "processed_at": None,
         "final_disposition": None,
         "failure_reason": None,
@@ -171,11 +175,18 @@ def enqueue(signal: TradevisorSignal, *, now: datetime | None = None) -> tuple[d
         return dict(row), True
 
 
+def _new_claim_token() -> str:
+    """Mint a unique fencing token for one claim attempt."""
+    return uuid.uuid4().hex
+
+
 def _reclaim_stale(registry: dict, *, now: datetime, timeout_seconds: int) -> int:
     """Return crashed ``PROCESSING`` rows to the retry queue.
 
     A process kill between "claimed" and "settled" must not strand durable
-    evidence forever (ATDD-36 / ATDD-40).
+    evidence forever (ATDD-36 / ATDD-40). Reclaiming also voids the previous
+    owner's fencing token, so a worker that returns late cannot settle a claim
+    it no longer holds.
     """
     reclaimed = 0
     for row in registry.get("events", {}).values():
@@ -186,6 +197,7 @@ def _reclaim_stale(registry: dict, *, now: datetime, timeout_seconds: int) -> in
             row["status"] = STATUS_RETRY
             row["failure_reason"] = "PROCESSING_LEASE_EXPIRED"
             row["processing_started_at"] = None
+            row["claim_token"] = None
             reclaimed += 1
     return reclaimed
 
@@ -241,12 +253,14 @@ def _settle(
     record: object = None,
     notification: object = None,
     attempts: int | None = None,
+    claim_token: str | None = None,
 ) -> bool:
     """Persist a terminal or retry disposition exactly once.
 
-    The write only applies while the row is still owned by this worker
-    (``PROCESSING``). If the lease was reclaimed and another worker settled it
-    first, this is a no-op: duplicate processing cannot overwrite a settled
+    The write applies only while this worker still owns the claim: the row must
+    be ``PROCESSING`` *and* carry the fencing token minted for this worker. A
+    row that was reclaimed and re-claimed by another worker carries a different
+    token, so a late settle is a no-op and cannot overwrite the new owner's
     decision (ATDD-40).
     """
     with registry_lock(LOCK_FILE):
@@ -254,11 +268,16 @@ def _settle(
         row = registry.setdefault("events", {}).get(key)
         if not isinstance(row, dict) or row.get("status") != STATUS_PROCESSING:
             return False
+        if not claim_token or row.get("claim_token") != claim_token:
+            # A status-only check is not ownership: after a lease expiry the row
+            # returns to PROCESSING under a different token.
+            return False
         row["status"] = status
         row["final_disposition"] = disposition
         row["failure_reason"] = reason or None
         row["processed_at"] = now.isoformat()
         row["processing_started_at"] = None
+        row["claim_token"] = None
         if attempts is not None:
             row["attempts"] = attempts
         if decision is not None:
@@ -309,7 +328,7 @@ def process_queued_events(
         "qualified": 0,
     }
 
-    claimed: list[tuple[str, dict]] = []
+    claimed: list[tuple[str, dict, str]] = []
     with registry_lock(LOCK_FILE):
         registry = load_json(INBOX_FILE) or _empty_registry()
         summary["reclaimed"] = _reclaim_stale(
@@ -325,13 +344,16 @@ def process_queued_events(
         ]
         candidates.sort(key=lambda item: str(item[1].get("enqueued_at") or ""))
         for key, row in candidates[:batch_limit]:
+            token = _new_claim_token()
             row["status"] = STATUS_PROCESSING
             row["processing_started_at"] = now.isoformat()
+            # Ownership is proven by this token, not by the status field.
+            row["claim_token"] = token
             events[key] = row
-            claimed.append((key, row))
+            claimed.append((key, row, token))
         save_json_atomic(INBOX_FILE, registry)
 
-    for key, row in claimed:
+    for key, row, claim_token in claimed:
         summary["checked"] += 1
         try:
             signal = signal_from_record(row.get("signal") or {})
@@ -342,6 +364,7 @@ def process_queued_events(
                 disposition="MALFORMED_RECORD",
                 reason=f"{type(exc).__name__} while rebuilding the signal",
                 now=now,
+                claim_token=claim_token,
             )
             summary["poisoned"] += 1
             continue
@@ -355,6 +378,7 @@ def process_queued_events(
                     reason="no evaluator configured",
                     now=now,
                     decision="NO_TRADE",
+                    claim_token=claim_token,
                 )
                 summary["processed"] += 1
                 continue
@@ -375,6 +399,7 @@ def process_queued_events(
                 decision=decision,
                 record=result.get("record"),
                 notification=result.get("notification"),
+                claim_token=claim_token,
             )
             if terminal_status == STATUS_REJECTED:
                 summary["rejected"] += 1
@@ -394,6 +419,7 @@ def process_queued_events(
                 reason=f"{type(exc).__name__} during evaluation (see application logs)",
                 now=now,
                 attempts=attempts,
+                claim_token=claim_token,
             )
             if exhausted:
                 summary["poisoned"] += 1

@@ -223,3 +223,130 @@ def test_missing_evaluator_never_implies_approval(store):
     assert stored["status"] == inbox.STATUS_PROCESSED
     assert stored["final_disposition"] == "EVALUATION_NOT_CONFIGURED"
     assert stored["decision"] == "NO_TRADE"
+
+
+# ---------------------------------------------------------------------------
+# P1-01: claim fencing. An expired lease must transfer settlement ownership.
+# ---------------------------------------------------------------------------
+
+
+def _claim(store, key: str, row: dict, *, token: str, at: datetime) -> None:
+    """Persist one worker's claim in the shape the drain uses."""
+    row["status"] = inbox.STATUS_PROCESSING
+    row["processing_started_at"] = at.isoformat()
+    row["claim_token"] = token
+    registry = inbox.load_json(inbox.INBOX_FILE) or {}
+    registry["events"][key] = row
+    inbox.save_json_atomic(inbox.INBOX_FILE, registry)
+
+
+def test_stale_worker_cannot_settle_a_reclaimed_row(store):
+    """A worker whose lease lapsed must not settle another worker's claim."""
+    inbox.enqueue(signal(), now=NOW)
+    registry = inbox.load_json(inbox.INBOX_FILE)
+    key, row = next(iter(registry["events"].items()))
+    _claim(store, key, row, token="claim-a", at=NOW)
+
+    # A's lease expires; B reclaims and claims. B is still evaluating.
+    later = NOW + timedelta(
+        seconds=store.opip_tradevisor_processing_timeout_seconds + 30
+    )
+    registry = inbox.load_json(inbox.INBOX_FILE)
+    reclaimed = inbox._reclaim_stale(
+        registry,
+        now=later,
+        timeout_seconds=store.opip_tradevisor_processing_timeout_seconds,
+    )
+    assert reclaimed == 1
+    reclaimed_row = registry["events"][key]
+    assert reclaimed_row["status"] == inbox.STATUS_RETRY
+    assert not reclaimed_row.get("claim_token")
+    inbox.save_json_atomic(inbox.INBOX_FILE, registry)
+    _claim(store, key, reclaimed_row, token="claim-b", at=later)
+
+    # A returns late and tries to settle its expired claim.
+    applied = inbox._settle(
+        key,
+        status=inbox.STATUS_PROCESSED,
+        disposition="EVALUATED",
+        reason="worker A stale result",
+        now=later,
+        decision="ENTER_NOW",
+        record={"dedup_id": "a", "decision": "ENTER_NOW"},
+        claim_token="claim-a",
+    )
+
+    assert applied is False
+    stored = inbox.load_json(inbox.INBOX_FILE)["events"][key]
+    assert stored["status"] == inbox.STATUS_PROCESSING
+    assert stored["claim_token"] == "claim-b"
+    assert stored.get("decision_record") is None
+
+    # B still owns settlement.
+    assert inbox._settle(
+        key,
+        status=inbox.STATUS_PROCESSED,
+        disposition="EVALUATED",
+        reason="worker B result",
+        now=later,
+        decision="NO_TRADE",
+        record={"dedup_id": "b", "decision": "NO_TRADE"},
+        claim_token="claim-b",
+    ) is True
+    final = inbox.load_json(inbox.INBOX_FILE)["events"][key]
+    assert final["decision_record"]["dedup_id"] == "b"
+
+
+def test_stale_worker_cannot_poison_a_reclaimed_row(store):
+    """Poison disposition obeys the same ownership guarantee."""
+    inbox.enqueue(signal(), now=NOW)
+    registry = inbox.load_json(inbox.INBOX_FILE)
+    key, row = next(iter(registry["events"].items()))
+    _claim(store, key, row, token="claim-a", at=NOW)
+    later = NOW + timedelta(
+        seconds=store.opip_tradevisor_processing_timeout_seconds + 30
+    )
+    registry = inbox.load_json(inbox.INBOX_FILE)
+    inbox._reclaim_stale(
+        registry,
+        now=later,
+        timeout_seconds=store.opip_tradevisor_processing_timeout_seconds,
+    )
+    _claim(store, key, registry["events"][key], token="claim-b", at=later)
+
+    applied = inbox._settle(
+        key,
+        status=inbox.STATUS_POISONED,
+        disposition="POISONED",
+        reason="worker A stale failure",
+        now=later,
+        attempts=99,
+        claim_token="claim-a",
+    )
+
+    assert applied is False
+    stored = inbox.load_json(inbox.INBOX_FILE)["events"][key]
+    assert stored["status"] == inbox.STATUS_PROCESSING
+    assert stored["final_disposition"] is None
+    assert stored.get("attempts", 0) < 99
+
+
+def test_reclaimed_row_is_settled_by_its_new_owner(store):
+    """Ownership transfer still lets the new owner settle (existing recovery)."""
+
+    def dies(_signal):
+        raise KeyboardInterrupt
+
+    inbox.enqueue(signal(), now=NOW)
+    with pytest.raises(KeyboardInterrupt):
+        inbox.process_queued_events(evaluator=dies, now=NOW)
+
+    later = NOW + timedelta(
+        seconds=store.opip_tradevisor_processing_timeout_seconds + 5
+    )
+    summary = inbox.process_queued_events(evaluator=evaluate_ok, now=later)
+
+    assert summary["reclaimed"] == 1
+    assert summary["checked"] == 1
+    stored = next(iter(inbox.load_json(inbox.INBOX_FILE)["events"].values()))
+    assert stored["status"] == inbox.STATUS_PROCESSED

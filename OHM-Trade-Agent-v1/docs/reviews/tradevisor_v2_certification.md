@@ -328,3 +328,44 @@ granting any of those.
 
 
 
+
+
+## 11. Independent review remediation (post-certification pass)
+
+Four findings were raised against the certified head. Each was reproduced with a
+failing test first, then fixed with the smallest production change. This pass
+**narrows** behaviour; it adds no authority and changes no owner-approved policy.
+
+| ID | Finding | Before | After |
+| --- | --- | --- | --- |
+| **P1-01** | Settlement was fenced only by `status == PROCESSING` | After a lease expiry the row returns to `PROCESSING` under a new owner, so the previous worker's status-only check still passed and it could overwrite the new owner's decision, notification state or poison disposition | Every claim mints a persisted unique `claim_token`. `_reclaim_stale` clears it on reclaim; `_settle` requires the caller's exact token and clears it on success. A late, success, failure or poison settle from a lapsed owner is a no-op. The check-and-write stays inside the existing registry lock — no new store, queue or lock service. Retry bounding and notification reservation/dedup are unchanged |
+| **P1-02** | Expired `PROCESSING` rows stranded | `pending_count()` counts only `QUEUED`/`RETRY`, and reclamation runs only inside `process_queued_events()`; with an all-`PROCESSING` inbox the phase skipped the drain entirely and the row was unrecoverable without a new webhook or an operator drain | The advisory phase always attempts at least one drain pass, which reclaims expired leases before claiming. Healthy leases are not stolen, work stays bounded to four batches, protection still runs first, and failures still never abort the cycle |
+| **P1-03** | Exact-SHA gate executed too late | `build_report()` invoked the candle provider and computed every outcome, then `build_learning_report()` applied the gate; cohorts were cleared but the computed outcomes were still returned and their measured count persisted | Compatibility is classified with the existing `classify_release_compatibility` **before** any measurement. Under `RELEASE_DRIFT`/`RELEASE_UNVERIFIED` no provider is called, `outcomes == {}`, the consumption disposition stays `BLOCKED_RELEASE_DRIFT`, and the measured count is zero. No second classifier was added |
+| **P2-04** | Candle window admitted out-of-window prices | A candle opening exactly at `window_end` was admitted, a candle opening before but closing after it was admitted, and the still-forming Kraken candle was admitted; their highs/lows could create touches, stops and MFE/MAE outside the declared 24-hour window | A candle is admissible only if it opens before `window_end`, its full interval closes at or before `window_end` **and** at or before the measurement instant, and it is provably complete (explicit completion flag, or `open + interval`). Unprovable completeness is excluded rather than guessed. Frozen decision, geometry, and touch-versus-fill semantics are unchanged |
+
+### Regression evidence (executed at the corrected head)
+
+| Scenario group | Tests | Result |
+| --- | --- | --- |
+| P1-01 lease fencing | 3 | pass |
+| P1-02 cycle recovery | 2 | pass |
+| P1-03 SHA ordering | 3 | pass |
+| P2-04 candle window | 5 | pass |
+| All Tradevisor modules | 188 collected | **188 passed** |
+
+Static analysis was held at the pre-change baseline: Ruff **87** errors (0 in
+Tradevisor files) and Bandit **73** findings (59 low / 14 medium / 0 high, 0 in
+Tradevisor files). One `B105` false positive introduced by the new
+`claim_token` field name was dispositioned with the repository's documented
+`# nosec B105` convention for identifier constants.
+
+### Boundary confirmation
+
+No trading authority was added or widened. `OPIP_TRADEVISOR_ENABLED` remains
+false by default; the F6 fail-closed `WATCH` policy, the trusted-4H SWING
+requirement, the G-03 noncanonical shadow exception, the R4/F5/F7 owners, the
+notification policy and Telegram ledger, canonical-writer isolation, the
+learning-worker exact-SHA contract, F11 protection priority, the Wave 8.2
+bridge and paper/live isolation are all unchanged. Nothing was deployed or
+activated.
+

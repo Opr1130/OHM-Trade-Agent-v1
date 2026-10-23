@@ -70,6 +70,10 @@ EXPECTANCY_BASIS = "TOUCH_BASED_ESTIMATE_NOT_REALIZED"
 
 DEFAULT_MEASUREMENT_HOURS = 24
 
+#: Interval used to derive a candle's close when the source does not report one.
+#: ``None`` makes completeness unprovable, which fails closed.
+DEFAULT_CANDLE_INTERVAL = timedelta(hours=1)
+
 
 def cohort_for(record: Mapping[str, Any]) -> str:
     decision = _decision_of(record)
@@ -113,12 +117,37 @@ def _candle_time(candle: Any) -> datetime | None:
     return None
 
 
+def _candle_close(candle: Any) -> datetime | None:
+    """Explicit close time when the source reports one.
+
+    ``close`` is deliberately not consulted: on the Kraken candle model that
+    attribute is a price, not a timestamp.
+    """
+    for attribute in ("close_time", "close_at", "closed_at"):
+        value = getattr(candle, attribute, None)
+        if isinstance(value, datetime):
+            return value.astimezone(timezone.utc)
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+    return None
+
+
+def _candle_is_incomplete(candle: Any) -> bool:
+    """True when the source explicitly reports a still-forming candle."""
+    for attribute in ("complete", "is_complete", "closed"):
+        value = getattr(candle, attribute, None)
+        if isinstance(value, bool):
+            return not value
+    return False
+
+
 def evaluate_outcome(
     record: Mapping[str, Any],
     *,
     now: datetime,
     candles_provider: Callable[[str, datetime], Iterable[Any]] | None = None,
     measurement_hours: int = DEFAULT_MEASUREMENT_HOURS,
+    candle_interval: timedelta | None = DEFAULT_CANDLE_INTERVAL,
 ) -> dict[str, Any]:
     """Measure one frozen record, strictly forward in time."""
     frozen = _frozen(record)
@@ -197,15 +226,30 @@ def evaluate_outcome(
         base.update(status=OUTCOME_PENDING, reason="frozen plan is not measurable")
         return base
 
-    # Only candles that OPEN at or after the decision instant are admissible:
-    # the decision bar itself is excluded so the outcome cannot see the price
-    # that produced the decision.
+    # A candle is admissible only when it opens strictly forward of the decision,
+    # its FULL interval finishes inside the measurement window, and it is
+    # provably complete. Prices outside the window - including the still-forming
+    # candle Kraken returns last, and one that merely starts before the boundary
+    # but finishes after it - must never change an outcome.
+    interval = (
+        candle_interval
+        if candle_interval and candle_interval > timedelta(0)
+        else None
+    )
     admissible = []
     for candle in candles:
-        when = _candle_time(candle)
-        if when is None or when < decided_at or when > window_end:
+        opened = _candle_time(candle)
+        if opened is None or opened < decided_at or opened >= window_end:
             continue
-        admissible.append((when, candle))
+        closes = _candle_close(candle) or (opened + interval if interval else None)
+        if closes is None:
+            # Completeness cannot be established: fail closed rather than guess.
+            continue
+        if closes > window_end or closes > now:
+            continue
+        if _candle_is_incomplete(candle):
+            continue
+        admissible.append((opened, candle))
     if not admissible:
         base.update(status=OUTCOME_PENDING, reason="no admissible forward candles")
         return base
