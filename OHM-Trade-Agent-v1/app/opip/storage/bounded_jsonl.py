@@ -1378,6 +1378,19 @@ class BoundedJsonlArchive:
         if not archive_lines:
             return None
 
+        # Framed streams record the planned origin shift BEFORE the verified
+        # archive/atomic HOT replacement. The opt-in state file is absent on
+        # legacy production, so existing producer behavior stays unchanged.
+        from app.opip.storage.producer_stream_epoch import (
+            finish_compaction_locked,
+            prepare_compaction_locked,
+        )
+        framed = prepare_compaction_locked(
+            self.data_file,
+            archive_bytes=b"".join(archive_lines),
+            tail_bytes=b"".join(hot_lines),
+        )
+
         self.archive_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         content_digest = hashlib.sha256(b"".join(archive_lines)).hexdigest()[:12]
@@ -1414,6 +1427,8 @@ class BoundedJsonlArchive:
             # a duplicate segment for the same evidence on every retry.
             self.update_manifest_locked(verification)
             write_atomic_lines(self.data_file, hot_lines)
+            if framed:
+                finish_compaction_locked(self.data_file, self.archive_dir)
             try:
                 self.tier_warm_archives_locked(
                     now=datetime.now(timezone.utc),
@@ -1469,6 +1484,8 @@ class BoundedJsonlArchive:
             # Only after an immutable, verified archive, checksum and manifest
             # entry are final may HOT evidence be compacted.
             write_atomic_lines(self.data_file, hot_lines)
+            if framed:
+                finish_compaction_locked(self.data_file, self.archive_dir)
             try:
                 self.tier_warm_archives_locked(
                     now=datetime.now(timezone.utc),
