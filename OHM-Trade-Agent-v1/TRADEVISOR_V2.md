@@ -35,8 +35,80 @@ unavailable; the notifier is gated on actual actionable qualification.
 - Not an automatic execution system. Every recommendation ends with
   `Execution: Human approval required`.
 
-## Verified external facts (not assumptions)
+## Observation provenance, native context and advisory observations
 
+### Provenance: what O'Pip can and cannot claim
+
+The Tradevisor V2 indicator is an **external, invite-only TradingView script**.
+Its Pine source is not in this repository and is not available to O'Pip, so no
+inbound field can prove what it computed.
+
+| Recorded field | Meaning |
+| --- | --- |
+| `integration_version` | Version of **this** integration contract, from `OPIP_TRADEVISOR_INTEGRATION_VERSION` (default `tradevisor-ingress-v1`). Ours, operator-declared. |
+| `external_indicator` | The vendor identity the alert asserts (`TRADEVISOR_V2`, a literal in the schema). |
+| `declared_indicator_version` | Optional `indicator_version` string from the alert body. |
+| `declared_version_verified` | Always `false`: a body string is a claim, not evidence. |
+| `algorithm_verification` | Always `UNVERIFIED_EXTERNAL_SCRIPT`. |
+
+Provenance is **never** part of the replay identity: `dedup_id` is computed from
+source facts (source, indicator, exchange, symbol, timeframe, direction, bar
+open) only, so a re-delivery cannot create a second observation and a changed
+version string cannot defeat idempotency. Adding `indicator_version` is
+backward compatible — existing alerts without it keep working, and an invalid
+value is refused by the schema before any row is written.
+
+### Native context (read-only)
+
+Every evaluation attaches a `native_context` block. Each field records its
+`source`, `status`, `observed_at`, `freshness_seconds`, `reason` and
+`limitations`; an unavailable component is never reported as corroboration.
+
+| Field | Owner | Notes |
+| --- | --- | --- |
+| `btc_regime` | `app.scanner.market_scanner.analyze_symbol` | BTC's own completed-1H EMA stack (`OPIP_TRADEVISOR_BTC_MARKET`, default `XBTUSD`). Not broad-market breadth. |
+| `market_breadth` | `app.scanner.market_regime.evaluate_market_regime` | Refuses below 30 validated snapshots, so a single-symbol evaluation reports `UNAVAILABLE` with that reason. |
+| `chase_risk` | `app.services.chase_risk.assess_chase_risk` | Band/score/late-entry; unsupplied inputs are disclosed as `INPUT_NOT_SUPPLIED:*` limitations. Advisory only. |
+| `liquidity` | `app.scanner.execution_validation.evaluate_execution` | Executable spread, depth coverage and round-trip drag already measured for this evaluation. |
+| `signal_quality` | `app.services.signal_scoring` | **Incompatible**: needs the scan's `SymbolFeatures`, so it reports `UNAVAILABLE` rather than an approximation. |
+| `opportunity_ranking` | `app.scanner.intelligence_ranking` | **Incompatible**: ranks a candidate set, not one observation. |
+
+`instrument_coverage()` classifies each configured symbol as `SUPPORTED`,
+`UNSUPPORTED` or `UNVERIFIED_NO_VENUE_CATALOGUE`. No exchange client is created
+for it, so support is never assumed; a mistyped mapping stays visible instead of
+silently becoming a permanent `MARKET_DATA_UNAVAILABLE`.
+
+### Economic qualification uses the permitted allocation
+
+The F5 economic gate is evaluated at the account envelope
+(`equity × 20%`) to size the candidate, and then **re-evaluated by the same F5
+owner at the F7-permitted allocation**. The number that qualifies is the number
+that is displayed; no threshold, fee or ratio changes. A candidate that clears
+the minimum net profit only at capital F7 will not permit is withheld with
+`ECONOMIC_REJECT_AT_FINAL_ALLOCATION` and reports no economic pass. Determinism
+is unchanged (the same inputs replay byte-identically).
+
+### Advisory observations (opt-in)
+
+A candidate that passes the market, attainability and economic gates but is
+withheld by the F6 or 4H authority gate is reported as a **separate message
+class** rather than silence:
+
+```
+TRADEVISOR OBSERVATION — WATCH / NO TRADE
+...
+NO TRADE RECOMMENDATION — no entry, stop, target or size is implied.
+```
+
+Properties: one bounded digest per drain run (max 5 items, remainder counted),
+deduplicated and rate-limited by the existing notification policy, delivered
+through the existing Telegram transport and ledger, never labelled qualified, and
+structurally unable to carry an entry/stop/target because the formatter refuses
+any instruction-like phrase. It is **disabled by default**
+(`OPIP_TRADEVISOR_OBSERVATION_ENABLED=false`) and does not affect F11 protection
+priority.
+
+## Verified external facts (not assumptions)
 Checked against TradingView's own help centre:
 
 | Fact | Value |
@@ -342,3 +414,197 @@ Existing rows written before this change carry no `consumption` field. They are
 treated as **not consumed** and remain protected — missing metadata never
 defaults to "consumed".
 
+
+## Addendum - presentation, allocation and discovery hardening (2026-10-24)
+
+### An observation never quotes an internal instruction
+
+Internal decision text names its own proposal (`ENTER_NOW`, `SET_LIMIT_ENTRY`).
+That vocabulary is correct in the durable record and wrong in an operator
+message, so the observation is rendered from neutralised operator language
+(`_operator_language`) and a guard refuses any text that still contains an
+instruction phrase. The durable `decision_record` and
+`evidence.shadow_proposed_action` are untouched: only the presentation copy
+differs, and the replay identity is unchanged.
+
+### The final-allocation economic call is bounded, and proved to be
+
+Re-running F5 at the F7 allocation with `max_capital_fraction=1.0` is safe
+because the value handed in is F7's own output, which is already capped by
+`max_position_pct` (the same 20% constant) and by the fixed per-trade risk
+budget. The composition does not trust that contract: it asserts it. A
+`capital_consistency` block records the status, allocation, risk, position-cap
+limit and risk budget, and anything unusable is rejected explicitly:
+
+| Situation | Rejection |
+| --- | --- |
+| Allocation exceeds the position cap or the risk budget | `CAPITAL_INCONSISTENT` |
+| Allocation is NaN or infinite | `CAPITAL_INCONSISTENT` (no exception escapes) |
+| Allocation is zero or negative | `CAPITAL_REJECT` |
+| Allocation is below the executable minimum | `CAPITAL_BELOW_EXECUTABLE_MINIMUM` |
+| Final net profit below the unchanged minimum | `ECONOMIC_REJECT_AT_FINAL_ALLOCATION` |
+
+No economic PASS is ever reported when there is no usable allocation to
+qualify against; the reported `economics.qualified` is false in every rejected
+case above.
+
+### Discovery coverage, and why ranking is not reused
+
+`discovery_coverage()` reports four separate populations from data the operator
+already has:
+
+| Population | Source |
+| --- | --- |
+| Discovered by O'Pip | eligible markets from the native scan universe, passed in |
+| Configured for an external alert | `OPIP_TRADEVISOR_INSTRUMENTS` |
+| Actually observed | markets in durable Tradevisor inbox rows |
+| Native with no TradingView coverage | universe minus configured |
+
+It performs no network call and never creates a signal: `native_markets` is
+supplied, and `observed_markets_from_records()` reads only what the inbox
+already holds. A missing universe is reported as `UNAVAILABLE`, not assumed.
+
+Native opportunity ranking (`app.scanner.intelligence_ranking`) is **not**
+reused and is reported as `UNAVAILABLE` with reason
+`REQUIRES_SCAN_CANDIDATE_SET`. Ranking orders the native scan's candidate set;
+placing an externally claimed observation into that ordering would let it
+compete for native admission. That is an authority decision for the owner, not
+an integration detail, so it is documented here and was not implemented.
+
+## Addendum - durable advisory delivery and evidence hardening (2026-10-24)
+
+### Observations are delivered from durable rows, not from memory
+
+A settled inbox row already holds the frozen decision, so it is the queue. The
+drain no longer carries candidates in memory between settlement and send:
+
+1. `pending_observations()` re-derives eligible, unreported observations from the
+   existing durable rows (read-only, bounded recovery window).
+2. `send_observation_digest()` sends at most one bounded digest.
+3. Only a confirmed delivery writes a durable per-row acknowledgement
+   (`TRADEVISOR:OBSERVED:<dedup_id>`) into the existing notification-policy
+   state file.
+
+Consequences: a crash after settlement, a refused transport, a transport
+exception and a cooldown suppression all leave the rows eligible, so the next
+cycle recovers them; a confirmed delivery can never be repeated; more items than
+one digest carries roll forward after the cooldown. No new queue, database or
+scheduler is introduced, and the row's learning-consumption and retention
+semantics are untouched.
+
+### Provenance survives the durable round trip
+
+The inbox serializer now persists `signal.provenance`. A row reloaded for worker
+evaluation or crash reclamation reproduces the provenance exactly, a legacy row
+written before this change reloads as unknown provenance (never as a verified
+claim), and the dedup identity is unchanged.
+
+### BTC context needs identity and verified freshness
+
+A returned trend is not evidence. The BTC field is AVAILABLE only when the
+snapshot's symbol matches the requested market, market-data validation is present
+and qualified, and that validation carries a source candle timestamp. The
+reported observation time is that candle time - evaluation time is never
+substituted. Anything else is `UNAVAILABLE` with a specific reason
+(`MARKET_IDENTITY_MISMATCH`, `NO_MARKET_DATA_VALIDATION`,
+`MARKET_DATA_UNQUALIFIED`, `NO_SOURCE_TIMESTAMP`).
+
+### Chase risk discloses partial inputs
+
+The native chase-risk owner remains authoritative and its formulas are not
+reimplemented. When only part of its input set is supplied, the record now
+carries `input_completeness` (provided/total/missing groups), marks the
+conclusion `INDETERMINATE_PARTIAL_INPUTS` and the band indicative-only, and the
+operator line says `partial inputs N/M - indicative only`. A partial low band is
+never presented as a complete clearance.
+
+### Observation cadence is reconciled with the notification policy
+
+`OPIP_TRADEVISOR_OBSERVATION_MIN_INTERVAL_MINUTES` is now applied as the digest
+cooldown, and the stricter of that value and the shared policy cooldown always
+wins: an operator can lengthen the cadence but can never make O'Pip chattier
+than the shared policy allows. A suppressed attempt reports
+`retry_after_seconds` and marks nothing, so the observation stays eligible.
+
+### Every unusable F7 result fails closed
+
+The composition reads F7's output without trusting its shape and reports a
+machine-readable `reason_code`:
+
+| Condition | Status | Reason code |
+| --- | --- | --- |
+| Missing required fields, or the owner returned `None`/raised | `CAPITAL_INCONSISTENT` | `MISSING_ALLOCATION_FIELDS` |
+| Non-numeric field | `CAPITAL_INCONSISTENT` | `NON_NUMERIC_ALLOCATION` |
+| NaN or infinite value | `CAPITAL_INCONSISTENT` | `NON_FINITE_ALLOCATION` |
+| Negative risk dollars | `CAPITAL_INCONSISTENT` | `NEGATIVE_RISK` |
+| Over the position cap or the risk budget | `CAPITAL_INCONSISTENT` | `OVERSIZED_ALLOCATION` |
+| Position percentage disagrees with the capital | `CAPITAL_INCONSISTENT` | `POSITION_PCT_INCONSISTENT` |
+| Zero or negative capital | `CAPITAL_REJECT` | `NON_POSITIVE_CAPITAL` |
+| Below the executable minimum | `CAPITAL_BELOW_EXECUTABLE_MINIMUM` | `BELOW_EXECUTABLE_MINIMUM` |
+
+No exception escapes the evaluator, no economic PASS is reported in any of
+these cases, and no F5 or F7 algorithm, threshold or risk limit is changed.
+
+## Addendum - delivery guarantee, recovery horizon and marker lifecycle (2026-10-24)
+
+### Stated delivery guarantee
+
+The observation lane is **at-least-once for unknown outcomes, and at-most-once
+for content already confirmed as delivered**. It is **not** exactly-once: the
+Telegram transport offers no idempotency key that the receiver honours, so an
+outcome of "request written, response lost" cannot be distinguished from "never
+written". The implementation chooses the safe side of that ambiguity:
+
+| Outcome | Behaviour | Consequence |
+| --- | --- | --- |
+| Crash before the transport call | Row stays unacknowledged, recovered next cycle | delivered once |
+| Transport refused (`delivered=false`) | Reservation released, row pending | retried |
+| Transport raised (timeout, network) | `SEND_FAILED`, row pending | retried, **may duplicate** |
+| Delivered, acknowledgement lost | Next cycle recognises the confirmed emission from the policy state, repairs the marker, sends nothing | delivered once |
+| Cooldown or budget suppression | Nothing marked, row pending | retried after the window |
+| Reservation holder died | Lease expires, next worker proceeds | delivered once |
+
+`STATUS_ALREADY_DELIVERED` is the observable signal for the repair path: the
+content was already confirmed as sent, so the missing per-row acknowledgement is
+written and no second message is emitted.
+
+### Recovery horizon is sized to the drain, not to a guess
+
+A backlog can only drain one digest per cooldown, carrying at most five rows. The
+horizon is therefore `max(6h, 5 x cooldown)` - enough for a full per-call backlog
+(four digests) plus one cycle of slack. The previous `2 x cooldown + 1h` horizon
+(13h by default) was **shorter than the 14h a twelve-row backlog needs**, so the
+tail of a sustained backlog expired before it could be delivered.
+
+`observation_backlog()` reports, read-only, how every durable row is accounted
+for: `eligible`, `already_reported`, `aged_out`, `undated`, `not_observable`,
+`total_rows` and the active `window_minutes`. A non-zero `aged_out` is the signal
+that evidence is outrunning the drain; nothing is ever dropped silently.
+
+### Marker lifecycle
+
+Acknowledgement markers are pruned on the acknowledgement path itself (and by
+`compact_markers()`), keeping 30 days of history. Only marker keys are touched -
+digest, alert and budget entries in the same state file are never modified. A
+digest of N rows still consumes exactly **one** noncritical attention slot,
+because acknowledgements are bookkeeping rather than new cards.
+
+### Lookup cost, and the shared-state limit
+
+The recovery scan reads the notification state **once per pass** and filters rows
+by membership, so its cost is `O(rows + state)` rather than `O(rows × state)`.
+Measured on a developer host (median of repeated runs): with 3,600 markers a
+2,000-row scan takes ~25 ms instead of ~10.5 s; with 20,000 markers ~52 ms
+instead of ~56 s. There is no zero-overhead claim: a scan still builds one
+candidate per row, and the single state parse still costs ~0.1 ms (empty),
+~4.9 ms (3,600 markers) and ~31 ms (20,000 markers).
+
+The markers deliberately live in the existing notification-policy state, so the
+protection path still parses that file per decision. At the governed cadence the
+population is bounded by roughly 120 acknowledgements/day over the 30-day
+retention (~3,600 keys, ~400 KB). **Known limit:** if observation volume grows
+well beyond that, every protection decision inherits the larger parse. Isolating
+observation markers into their own store is a real design change and is
+deliberately **not** implemented here: it would need its own owner-approved
+increment, its own durability/lock contract and its own fail-closed review. No
+new persistence subsystem was introduced by this integration.

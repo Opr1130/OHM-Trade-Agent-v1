@@ -33,7 +33,8 @@ never closes a funded position, and never suppresses a protective alert.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+import math
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
@@ -54,6 +55,7 @@ from app.services.target_attainability import (
 )
 from app.services.tradevisor_ingress import TradevisorSignal
 from app.services.tradevisor_market import attach_execution_evidence
+from app.services.tradevisor_native_context import build_native_context
 
 #: Source attribution. A measurement/policy identifier, never an authority.
 STRATEGY_FAMILY = "TRADEVISOR_SWING_V1"
@@ -84,6 +86,13 @@ TACTICAL_MIN_ATR_PCT = 4.0
 SWING_MIN_ATR_PCT = 1.5
 
 DEFAULT_ACCOUNT_EQUITY = 1_000.0
+
+#: Tolerance for comparing F7's rounded allocation with a re-derived notional.
+ALLOCATION_TOLERANCE = 0.01
+
+#: Tolerance, in percentage points, between F7's reported position percentage
+#: and the capital it says it will deploy.
+POSITION_PCT_TOLERANCE_PP = 0.5
 
 
 @dataclass(frozen=True)
@@ -387,6 +396,14 @@ def _base_evidence(
 ) -> dict[str, Any]:
     return {
         "source": signal.as_evidence(),
+        # What the external alert claimed, and what O'Pip could verify about it.
+        "provenance": dict(signal.provenance or {}),
+        "timing": {
+            "source_bar_opened_at": signal.bar_opened_at.isoformat(),
+            "source_bar_closed_at": signal.bar_closed_at.isoformat(),
+            "source_triggered_at": signal.triggered_at.isoformat(),
+            "received_at": signal.received_at.isoformat(),
+        },
         "strategy_family": STRATEGY_FAMILY,
         "account_equity": equity,
         "native_snapshot_status": "AVAILABLE" if snapshot is not None else "UNAVAILABLE",
@@ -417,6 +434,25 @@ def _executable_price(snapshot: MarketSnapshot) -> float:
     return 0.0
 
 
+def _read_allocation_fields(allocation: Any) -> tuple[float, float, float, str | None]:
+    """Read F7's numeric output without trusting its shape.
+
+    Returns ``(capital, risk, position_pct, malformed_reason)``. A missing or
+    non-numeric field is reported instead of raised, so a replaced or broken
+    owner fails closed rather than crashing the evaluator.
+    """
+    try:
+        raw_capital = getattr(allocation, "recommended_capital")
+        raw_risk = getattr(allocation, "risk_dollars")
+        raw_pct = getattr(allocation, "position_pct")
+    except AttributeError:
+        return math.nan, math.nan, math.nan, "MISSING_ALLOCATION_FIELDS"
+    try:
+        return float(raw_capital), float(raw_risk), float(raw_pct), None
+    except (TypeError, ValueError):
+        return math.nan, math.nan, math.nan, "NON_NUMERIC_ALLOCATION"
+
+
 def _geometry_is_sane(plan: EntryExitPlan) -> bool:
     """Structural validation of an already-computed plan.
 
@@ -424,8 +460,6 @@ def _geometry_is_sane(plan: EntryExitPlan) -> bool:
     sole geometry owner; this rejects a plan whose numbers cannot describe a
     LONG trade rather than re-deriving them.
     """
-    import math
-
     values = (
         plan.entry_low,
         plan.entry_high,
@@ -514,6 +548,7 @@ def evaluate_signal(
     execution_provider: Callable[..., Any] | None = None,
     account_equity: float | None = None,
     active_trades: list[Any] | None = None,
+    btc_context_provider: Callable[[str], Any] | None = None,
 ) -> TradevisorDecision:
     """Evaluate one validated Tradevisor signal against native O'Pip evidence.
 
@@ -651,6 +686,18 @@ def evaluate_signal(
         ),
         "warnings": list(getattr(execution, "warnings", []) or []),
     }
+    # Independent native context (BTC regime, chase risk, breadth, ranking).
+    # Read-only: it informs the operator and never grants authority.
+    btc_market = str(
+        getattr(resolved, "opip_tradevisor_btc_market", "XBTUSD") or ""
+    ).strip().upper()
+    evidence["native_context"] = build_native_context(
+        snapshot=snapshot,
+        execution=execution,
+        now=evaluated_at,
+        btc_provider=btc_context_provider or provider,
+        btc_market=btc_market,
+    )
     return _evaluate_buy_plans(
         signal,
         snapshot=snapshot,
@@ -692,35 +739,176 @@ def _finalize_qualified_buy(
     net_edge_pct = (
         float(economics.target_2_net_profit) / notional * 100.0 if notional > 0 else 0.0
     )
-    allocation = recommend_capital(
-        available_capital=equity,
-        stop_distance_pct=float(economics.stop_pct),
-        confidence_score=float(attainability.attainability_score),
-        quality_score=float(attainability.attainability_score),
-        net_edge_pct=net_edge_pct,
-        max_position_pct=PRODUCTION_MAX_CAPITAL_FRACTION * 100.0,
-        risk_per_trade_pct=risk_per_trade_pct,
-    )
+    owner_error: str | None = None
+    try:
+        allocation = recommend_capital(
+            available_capital=equity,
+            stop_distance_pct=float(economics.stop_pct),
+            confidence_score=float(attainability.attainability_score),
+            quality_score=float(attainability.attainability_score),
+            net_edge_pct=net_edge_pct,
+            max_position_pct=PRODUCTION_MAX_CAPITAL_FRACTION * 100.0,
+            risk_per_trade_pct=risk_per_trade_pct,
+        )
+    except Exception as exc:  # noqa: BLE001 - a broken owner must not crash the run
+        allocation = None
+        owner_error = f"{type(exc).__name__}: {exc}"
+
+    (
+        allocation_capital,
+        allocation_risk,
+        allocation_pct,
+        malformed_reason,
+    ) = _read_allocation_fields(allocation)
+
     evidence["f7_capital"] = {
-        "recommended_capital": allocation.recommended_capital,
-        "risk_dollars": allocation.risk_dollars,
-        "position_pct": allocation.position_pct,
-        "reason": allocation.reason,
+        "recommended_capital": (
+            allocation_capital if math.isfinite(allocation_capital) else None
+        ),
+        "risk_dollars": allocation_risk if math.isfinite(allocation_risk) else None,
+        "position_pct": allocation_pct if math.isfinite(allocation_pct) else None,
+        "reason": getattr(allocation, "reason", None) or owner_error,
+        "owner_error": owner_error,
         "net_edge_pct": round(net_edge_pct, 4),
         "min_executable_notional_usd": MIN_EXECUTABLE_NOTIONAL_USD,
     }
 
+    # ------------------------------------------------------------------
+    # Final-allocation economic qualification.
+    #
+    # The F5 call above decides at the *account-envelope* notional
+    # (equity x PRODUCTION_MAX_CAPITAL_FRACTION), which is not the capital F7
+    # would actually permit. Re-running the SAME F5 owner against the final
+    # allocation makes the qualifying number and the displayed number the same
+    # figure. No threshold, fee, ratio or formula changes: only the notional
+    # basis. ``max_account_risk_at_stop_pct`` is left to the envelope call
+    # above, which owns that limit by design; F7's fixed risk budget bounds the
+    # actual risk of the permitted allocation.
+    #
+    # Safety of passing ``max_capital_fraction=1.0``: the value handed in is
+    # F7's own output, which is itself capped by ``max_position_pct`` (the same
+    # 20% constant) and by the fixed per-trade risk budget. The tripwires below
+    # assert that contract instead of trusting it, so a broken or replaced F7
+    # cannot turn a 1.0 envelope into an unbounded notional.
+    # ------------------------------------------------------------------
+    permitted_notional = float(equity) * PRODUCTION_MAX_CAPITAL_FRACTION
+    risk_budget = float(equity) * risk_per_trade_pct / 100.0
+
+    reason_code = ""
+    if malformed_reason:
+        reason_code = malformed_reason
+    elif not (
+        math.isfinite(allocation_capital)
+        and math.isfinite(allocation_risk)
+        and math.isfinite(allocation_pct)
+    ):
+        reason_code = "NON_FINITE_ALLOCATION"
+    elif allocation_capital <= 0:
+        reason_code = "NON_POSITIVE_CAPITAL"
+    elif allocation_risk < 0:
+        reason_code = "NEGATIVE_RISK"
+    elif (
+        allocation_capital > permitted_notional + ALLOCATION_TOLERANCE
+        or allocation_risk > risk_budget + ALLOCATION_TOLERANCE
+    ):
+        reason_code = "OVERSIZED_ALLOCATION"
+    elif abs(allocation_pct - allocation_capital / float(equity) * 100.0) > (
+        POSITION_PCT_TOLERANCE_PP
+    ):
+        reason_code = "POSITION_PCT_INCONSISTENT"
+    elif allocation_capital < MIN_EXECUTABLE_NOTIONAL_USD:
+        reason_code = "BELOW_EXECUTABLE_MINIMUM"
+
+    if reason_code in {"", "BELOW_EXECUTABLE_MINIMUM"}:
+        capital_status = "CONSISTENT" if not reason_code else "CAPITAL_BELOW_EXECUTABLE_MINIMUM"
+    elif reason_code == "NON_POSITIVE_CAPITAL":
+        capital_status = "CAPITAL_REJECT"
+    else:
+        capital_status = "CAPITAL_INCONSISTENT"
+
+    evidence["capital_consistency"] = {
+        "status": capital_status,
+        "reason_code": reason_code or "CONSISTENT",
+        "allocation": allocation_capital if math.isfinite(allocation_capital) else None,
+        "risk_dollars": allocation_risk if math.isfinite(allocation_risk) else None,
+        "position_pct": allocation_pct if math.isfinite(allocation_pct) else None,
+        "limit": permitted_notional,
+        "risk_budget": risk_budget,
+        "policy": "F7 output must stay within the position cap and the fixed risk budget",
+    }
+
+    final_economics: EconomicGateResult = economics
+    if capital_status in {"CONSISTENT", "CAPITAL_BELOW_EXECUTABLE_MINIMUM"}:
+        final_economics = evaluate_economic_quality(
+            plan,
+            allocation_capital,
+            max_capital_fraction=1.0,
+            max_account_risk_at_stop_pct=None,
+        )
+        evidence["economics_at_envelope"] = {
+            "recommended_capital": economics.recommended_capital,
+            "position_notional": economics.position_notional,
+            "target_1_net_profit": economics.target_1_net_profit,
+            "target_2_net_profit": economics.target_2_net_profit,
+            "qualified": economics.qualified,
+        }
+        evidence["final_allocation_basis"] = {
+            "allocation": allocation_capital,
+            "economics_recommended_capital": final_economics.recommended_capital,
+            "position_notional": final_economics.position_notional,
+            "parity": abs(
+                float(final_economics.recommended_capital) - allocation_capital
+            )
+            <= ALLOCATION_TOLERANCE,
+            "policy": "F5 thresholds unchanged; the notional basis is the F7 allocation",
+        }
+        evidence["f5_final"] = {
+            "qualified": final_economics.qualified,
+            "target_1_net_profit": final_economics.target_1_net_profit,
+            "target_2_net_profit": final_economics.target_2_net_profit,
+            "rejection_reason": final_economics.rejection_reason,
+        }
+    else:
+        # No usable allocation: never report an economic PASS at a size the
+        # operator cannot actually deploy.
+        final_economics = replace(
+            economics,
+            qualified=False,
+            rejection_reason=(
+                "no usable F7 allocation to qualify against "
+                f"({capital_status})"
+            ),
+        )
+
     rejection: tuple[str, str] | None = None
-    if allocation.recommended_capital <= 0:
+    if capital_status == "CAPITAL_INCONSISTENT":
+        rejection = (
+            "CAPITAL_INCONSISTENT",
+            f"F7 allocation is unusable ({reason_code}): {allocation_capital!r} capital / "
+            f"{allocation_risk!r} risk / {allocation_pct!r}% position against a permitted "
+            f"limit of USD {permitted_notional:.2f} and a risk budget of "
+            f"USD {risk_budget:.2f}.",
+        )
+    elif capital_status == "CAPITAL_REJECT":
         rejection = (
             "CAPITAL_REJECT",
-            f"F7 capital planning allocated no capital: {allocation.reason}",
+            "F7 capital planning allocated no capital: "
+            f"{getattr(allocation, 'reason', None) or owner_error or 'no allocation'}",
         )
-    elif allocation.recommended_capital < MIN_EXECUTABLE_NOTIONAL_USD:
+    elif capital_status == "CAPITAL_BELOW_EXECUTABLE_MINIMUM":
         rejection = (
             "CAPITAL_BELOW_EXECUTABLE_MINIMUM",
-            f"F7 recommended capital USD {allocation.recommended_capital:.2f} is below "
+            f"F7 recommended capital USD {allocation_capital:.2f} is below "
             f"the minimum executable notional USD {MIN_EXECUTABLE_NOTIONAL_USD:.2f}.",
+        )
+    elif not final_economics.qualified:
+        # The candidate clears the bar only at capital the operator may not
+        # deploy, so it is NOT an economic pass at the permitted size.
+        rejection = (
+            "ECONOMIC_REJECT_AT_FINAL_ALLOCATION",
+            f"The economic gate fails at the F7-permitted allocation "
+            f"USD {allocation_capital:.2f}: "
+            f"{final_economics.rejection_reason}",
         )
 
     portfolio: dict[str, Any] | None = None
@@ -730,7 +918,7 @@ def _finalize_qualified_buy(
                 active_trades=list(active_trades),
                 proposed_symbol=signal.market,
                 proposed_direction="LONG",
-                proposed_capital=float(allocation.recommended_capital),
+                proposed_capital=allocation_capital,
                 account_capital=equity,
                 proposed_leverage=1.0,
             )
@@ -757,7 +945,7 @@ def _finalize_qualified_buy(
             regime=regime,
             price=price,
             plan=plan,
-            economics=economics,
+            economics=final_economics,
             attainability=attainability,
             allocation=allocation,
             portfolio=portfolio,
@@ -798,7 +986,7 @@ def _finalize_qualified_buy(
         regime=regime,
         price=price,
         plan=plan,
-        economics=economics,
+        economics=final_economics,
         attainability=attainability,
         allocation=allocation,
         portfolio=portfolio,

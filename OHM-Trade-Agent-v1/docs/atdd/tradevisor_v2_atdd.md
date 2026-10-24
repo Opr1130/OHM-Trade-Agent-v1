@@ -373,3 +373,93 @@ used a wall-clock trigger that lands inside the 60-second close tolerance at the
 top of an hour; it now triggers at the bar open, which is deterministic and still
 exercises the unfinished-bar refusal.
 
+
+## Addendum - advisory observability, provenance, native context (TV2-FR-01)
+
+This addendum adds eleven criteria and seventeen tests. It changes no policy:
+F6 and completed-4H still block actionable output, SELL is still exit evidence
+only, the ingress is still dark by default, and the new observation digest is a
+separate opt-in class that can never carry an entry, stop, target or size.
+
+| AC | Scenario | Test |
+| --- | --- | --- |
+| AC-016 | Provenance records external identity; algorithm version unverified | `test_ac_016_provenance_records_external_identity_and_unverified_algorithm` |
+| AC-017 | Provenance excluded from replay identity; bad values refused | `test_ac_017_provenance_never_changes_replay_identity_and_bad_values_fail_closed` |
+| AC-018 | BTC/native context sourced, stamped, availability-honest | `test_ac_018_native_btc_context_carries_source_timestamp_and_availability`, `test_ac_018_unavailable_btc_context_is_never_reported_as_a_pass` |
+| AC-019 | Chase risk reused from native owner, advisory only, inputs disclosed | `test_ac_019_chase_risk_is_reused_from_the_native_owner_as_context_only` |
+| AC-020 | Instrument coverage SUPPORTED/UNSUPPORTED/UNVERIFIED | `test_ac_020_instrument_coverage_distinguishes_supported_unsupported_unknown` |
+| AC-021 | Economic PASS uses the F7-permitted allocation; reject/pass/determinism/no-book | four `test_ac_021_*` cases |
+| AC-022 | Withheld-but-substantive candidate yields only an observation | `test_ac_022_*` (2 cases) |
+| AC-023 | Digest bounded, deduplicated, honest on transport failure | `test_ac_023_*` (2 cases) |
+| AC-024 | Observation digest disabled by default | `test_ac_024_observation_digest_is_disabled_by_default` |
+| AC-025 | Approved format states timing, venue, capital basis, horizon | `test_ac_025_actionable_alert_states_timing_venue_and_capital_basis` |
+| AC-026 | Actionable and observation delivery are mutually exclusive | `test_ac_026_observation_and_actionable_delivery_are_mutually_exclusive` |
+
+### Observed defect corrected in this addendum
+
+`tools/tradevisor_alert_preview.py` could not run at the previous head: it fed a
+`WATCH` decision to `format_tradevisor_alert`, which correctly refuses to render
+anything non-actionable. The preview now derives an explicitly labelled
+synthetic actionable object **only** for decisions that actually reached the
+observation cohort, and otherwise prints the real decision and rejection code.
+The tool remains banner-labelled synthetic and performs no market read.
+
+## Addendum - instruction leakage, allocation bounds, discovery coverage
+
+| AC | Scenario | Test |
+| --- | --- | --- |
+| AC-027 | No internal instruction token (`ENTER_NOW`, `SET_LIMIT_ENTRY`, `ACTIONABLE`) in operator-facing WATCH text; shadow evidence byte-identical; contradictory text refused | three `test_ac_027_*` cases |
+| AC-028 | Final F5 call bounded by the unchanged position cap and risk budget; oversized / NaN / infinite / negative / zero / below-minimum allocations fail closed without raising and without an economic PASS | four `test_ac_028_*` cases |
+| AC-029 | Discovery coverage separates native-discovered, TradingView-configured, actually-observed and uncovered markets; no invented signals; ranking reuse declared unavailable | four `test_ac_029_*` cases |
+
+### Defect record
+
+The observation previously echoed the internal decision reason verbatim, which
+rendered `Assessment: Shadow-only swing LONG hypothesis (ENTER_NOW); ...` to an
+operator. The guard list only contained the spaced form (`ENTER NOW`), so the
+underscore token passed. AC-027 covers both forms, the neutralised presentation
+and the refusal of a hand-built contradictory message.
+
+The final-allocation economic call previously had no bound on the allocation it
+accepted, and a non-finite allocation escaped as a `ValueError` from a
+downstream owner. AC-028 adds the consistency tripwires and the fail-closed
+rejection.
+
+## Addendum - six independent-review findings (AC-030 .. AC-035)
+
+| AC | Finding | Correction | Tests |
+| --- | --- | --- | --- |
+| AC-030 | Advisory delivery lived only in memory between settlement and send, so a crash, refusal, exception or suppression lost the report | Delivery is re-derived from durable rows; a confirmed send writes a per-row durable acknowledgement; bounded remainder rolls forward after cooldown | 5 `test_ac_030_*` |
+| AC-031 | The inbox serializer dropped `signal.provenance`, so a reloaded row lost it | Serializer persists provenance; legacy rows read as unknown; reclamation preserves it | 2 `test_ac_031_*` |
+| AC-032 | BTC context was labelled AVAILABLE on any returned trend, stamped with evaluation time | Identity match + qualified market data + source candle timestamp required, otherwise UNAVAILABLE with a reason | 1 `test_ac_032_*` |
+| AC-033 | Partial chase-risk inputs produced a confident LOW band | Input completeness exposed; conclusion indeterminate; band indicative-only | 1 `test_ac_033_*` |
+| AC-034 | The configured observation interval was dead code and suppression was opaque | Configured interval applied, stricter of config/policy wins, retry delay reported, suppression marks nothing | 3 `test_ac_034_*` |
+| AC-035 | Negative risk, malformed/None/non-numeric owner output and inconsistent position percentages could pass or raise | Every unusable result fails closed with a reason code, no exception escapes, no economic PASS | 3 `test_ac_035_*` |
+
+All six were reproduced RED before implementation (15 failing tests, 0 passing in
+the remediation selection), then GREEN (15 passing). No learning file, F6/4H
+policy, canonical path, execution path or risk threshold was modified.
+
+## Addendum - delivery reliability review (AC-036 .. AC-038)
+
+| AC | Scope | Scenarios | Tests |
+| --- | --- | --- | --- |
+| AC-036 | Guarantee and every ambiguous outcome | crash before transport; acknowledgement lost after delivery; transport timeout with unknown outcome; refusal; concurrent worker and expired reservation | 6 `test_ac_036_*` |
+| AC-037 | Bounded backlog | horizon sizing and aged-out accounting; per-call cap without deletion; sustained ingress drained across cooldowns; inbox capacity backpressure with pending evidence intact | 4 `test_ac_037_*` |
+| AC-038 | Marker lifecycle and priority | compaction of ancient markers; compaction on the write path; 5 000 markers plus backlog do not disturb protection; 20 000 markers keep lookup bounded | 4 `test_ac_038_*` |
+
+### Defects found by this review
+
+1. **Horizon shorter than the drain (P1).** `2 x cooldown + 1h` = 13h could not
+   cover a 12-row backlog needing three digests = 14h, so the tail aged out
+   silently. Fixed by sizing the horizon to `DRAIN_CAPACITY_CYCLES` cooldowns and
+   by adding `observation_backlog()` aged-out accounting.
+2. **Stranded evidence after a lost acknowledgement (P1).** A confirmed emission
+   whose per-row marker was lost left rows pending forever: the digest
+   fingerprint matched permanently, so `should_emit` refused and nothing ever
+   acknowledged them. Fixed with the `ALREADY_DELIVERED` repair path.
+3. **Unbounded marker growth (P2).** Every acknowledged row added a state entry
+   with no compaction. Fixed by pruning markers older than 30 days on the write
+   path and by `compact_markers()`.
+
+All three were reproduced RED before the correction.

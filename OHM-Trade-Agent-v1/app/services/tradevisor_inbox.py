@@ -135,6 +135,10 @@ def _row_from_signal(signal: TradevisorSignal, now: datetime) -> dict:
             "signal_price": signal.signal_price,
             "alert_config_version": signal.alert_config_version,
             "disposition": signal.disposition or DISPOSITION_ACCEPTED,
+            # Observation provenance must survive the durable round trip: a row
+            # reloaded for worker evaluation or reclamation would otherwise lose
+            # what the external script claimed (and what O'Pip could not verify).
+            "provenance": dict(getattr(signal, "provenance", {}) or {}),
         },
     }
 

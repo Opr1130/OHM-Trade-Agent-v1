@@ -7,6 +7,11 @@ selection. It is inert unless ``OPIP_TRADEVISOR_ENABLED`` is true.
 """
 from app.core.config import get_settings
 from app.services.tradevisor_inbox import pending_count, process_queued_events
+from app.services.tradevisor_observation import (
+    observations_enabled,
+    pending_observations,
+    send_observation_digest,
+)
 from app.services.tradevisor_pipeline import evaluate_and_notify
 
 MAX_BATCHES_PER_RUN = 4
@@ -40,6 +45,19 @@ def main() -> None:
             break
     for key, value in total.items():
         print(f"{key}: {value}")
+    # Advisory observations are re-derived from durable rows, so a crash or a
+    # refused send between settlement and delivery is recoverable next run. The
+    # recovery scan is skipped entirely while the observation class is off.
+    if observations_enabled(settings):
+        digest = send_observation_digest(
+            pending_observations(settings=settings), settings=settings
+        )
+        print(
+            f"observations: {digest.status} ({digest.observed} observed, "
+            f"{digest.suppressed_bounded} bounded)"
+        )
+    else:
+        print("observations: DISABLED (observation class off; no inbox scan)")
     print("Pending after run:", pending_count())
     print("Trade authority changed: False")
     print("Execution authority: False")

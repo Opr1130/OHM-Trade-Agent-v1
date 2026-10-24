@@ -499,12 +499,36 @@ def _run_tradevisor_fail_open() -> None:
                 break
         # Undelivered actionable alerts are re-evaluated, never re-sent stale.
         retry = retry_undelivered_notifications(settings=settings, limit=2)
+        # Advisory observations are re-derived from durable rows: a crash or a
+        # refused send between settlement and delivery is recovered next cycle.
+        # The recovery scan is skipped entirely while the observation class is
+        # off; the Tradevisor drain above (and its lease reclamation) is not.
+        from app.services.tradevisor_observation import (
+            observations_enabled,
+            pending_observations,
+            send_observation_digest,
+        )
+
+        if observations_enabled(settings):
+            digest = send_observation_digest(
+                pending_observations(settings=settings), settings=settings
+            )
+        else:
+            digest = None
+
         print("Tradevisor advisory drain (non-authoritative)")
         for key, value in total.items():
             print(f"  {key}: {value}")
         print(f"  notification_retry_candidates: {retry['candidates']}")
         print(f"  notification_retry_delivered: {retry['delivered']}")
         print(f"  notification_retry_not_actionable: {retry['not_actionable']}")
+        if digest is None:
+            print("  observations: DISABLED (observation class off; no inbox scan)")
+        else:
+            print(
+                f"  observations: {digest.status} (sent {digest.observed}, "
+                f"bounded {digest.suppressed_bounded})"
+            )
         print("  trade_authority_changed: False")
     except Exception as exc:  # noqa: BLE001 - advisory work must not abort the cycle
         print(

@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from app.services.tradevisor_evaluation import evaluate_signal
 from app.services.tradevisor_ingress import TradevisorSignal, signal_from_record
 from app.services.tradevisor_notifier import notify_tradevisor_decision
+from app.services.tradevisor_observation import observation_candidate
 
 DISPOSITION_EVALUATED = "EVALUATED"
 DISPOSITION_REJECTED = "REJECTED"
@@ -69,10 +70,16 @@ def evaluate_and_notify(
     )
 
     notification = None
-    if deliver and decision.actionable:
-        notification = notify_tradevisor_decision(
-            decision, settings=settings, now=evaluated_at, sender=sender
-        ).as_dict()
+    observation = None
+    if deliver:
+        if decision.actionable:
+            notification = notify_tradevisor_decision(
+                decision, settings=settings, now=evaluated_at, sender=sender
+            ).as_dict()
+        else:
+            # A withheld-but-substantive candidate is reported as an OBSERVATION.
+            # Actionable and observation classes are mutually exclusive.
+            observation = observation_candidate(decision, now=evaluated_at)
 
     return {
         "decision": decision.decision,
@@ -80,6 +87,7 @@ def evaluate_and_notify(
         "disposition": DISPOSITION_EVALUATED,
         "record": decision.as_record(),
         "notification": notification,
+        "observation": observation,
     }
 
 
