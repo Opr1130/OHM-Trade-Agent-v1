@@ -114,6 +114,53 @@ def _timeframe_label(minutes: int) -> str:
     return f"{minutes}m"
 
 
+def _utc_label(value: object) -> str:
+    """Render one ISO timestamp as an explicit UTC label, or 'UNAVAILABLE'."""
+    if not value:
+        return "UNAVAILABLE"
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return "UNAVAILABLE"
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return "UNAVAILABLE"
+    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _atr_label(decision: TradevisorDecision) -> str:
+    """Native ATR% that drove the horizon classification, or 'UNAVAILABLE'."""
+    policy = (decision.evidence or {}).get("horizon_policy") or {}
+    atr_pct = policy.get("atr_pct")
+    if atr_pct is None:
+        return "UNAVAILABLE"
+    return f"{float(atr_pct):.2f}%"
+
+
+def _timing_block(decision: TradevisorDecision) -> list[str]:
+    """Evidence timeline. Every value is measured, never inferred."""
+    timing = (decision.evidence or {}).get("timing") or {}
+    liquidity = ((decision.evidence or {}).get("native_context") or {}).get("liquidity")
+    freshness = None
+    if isinstance(liquidity, dict):
+        freshness = liquidity.get("freshness_seconds")
+    evidence_as_of = (
+        _utc_label(timing.get("source_triggered_at"))
+        if timing.get("source_triggered_at")
+        else _utc_label(decision.evaluated_at.isoformat())
+    )
+    lines = [
+        f"Evidence as of: {evidence_as_of}",
+        f"Source bar closed: {_utc_label(timing.get('source_bar_closed_at'))}",
+        f"Received: {_utc_label(timing.get('received_at'))}",
+        f"Evaluated: {_utc_label(decision.evaluated_at.isoformat())}",
+    ]
+    if freshness is not None:
+        lines.append(f"Execution book age: {float(freshness):.1f}s at evaluation")
+    else:
+        lines.append("Execution book age: UNAVAILABLE")
+    return lines
+
+
 def _evidence_line(decision: TradevisorDecision) -> str:
     """State exactly which evidence is present and which is missing.
 
@@ -168,6 +215,8 @@ def format_tradevisor_alert(decision: TradevisorDecision) -> str:
         f"Source: {decision.source_exchange} {_timeframe_label(decision.timeframe_minutes)}",
         f"Execution venue: Kraken ({decision.market})",
         "",
+        *_timing_block(decision),
+        "",
         f"Current price: {_price(decision.current_price)}",
         f"Preferred entry: {_price(plan.entry_low)} - {_price(plan.entry_high)}",
     ]
@@ -183,10 +232,15 @@ def format_tradevisor_alert(decision: TradevisorDecision) -> str:
             f"Target 2: {_price(plan.target_2)}",
             "",
             f"Capital: {_usd(allocation.recommended_capital)}",
+            f"Capital basis: {_usd(allocation.recommended_capital)} "
+            f"({float(allocation.position_pct):.2f}% of equity; F7 permitted, "
+            "the same notional the economic gates passed)",
             f"Planned loss: {_usd(allocation.risk_dollars)}",
             f"Estimated net profit T1: {_usd(net_t1)}",
             f"Estimated net profit T2: {_usd(net_t2)}",
             f"Reward/Risk: {float(plan.reward_to_risk_2):.2f}:1",
+            f"Horizon: {decision.horizon or 'UNCLASSIFIED'} "
+            f"(native ATR {_atr_label(decision)}; no holding duration is modelled)",
             "",
             f"Do not chase above: {_price(plan.chase_limit)}",
             f"Expires: {expires}",

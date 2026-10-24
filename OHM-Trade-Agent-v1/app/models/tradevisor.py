@@ -49,3 +49,16 @@ class TradevisorIngressV1(BaseModel):
     alert_config_version: str = Field(
         min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$"
     )
+    #: Operator/vendor-declared version of the EXTERNAL indicator script.
+    #:
+    #: Optional so every already-configured TradingView alert keeps working.
+    #: It is provenance only: an alert body cannot prove what the external
+    #: Pine script contains, so this value is recorded as an unverified claim
+    #: and never as a Certified source revision. It is deliberately excluded
+    #: from the replay identity (see ``dedup_id_for``).
+    indicator_version: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=32,
+        pattern=r"^[A-Za-z0-9._+-]+$",
+    )

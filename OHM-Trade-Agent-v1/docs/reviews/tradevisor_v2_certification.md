@@ -410,3 +410,60 @@ by default; F6-absent still yields shadow-only `WATCH`; SWING still requires
 trusted completed 4H; G-03 remains the approved noncanonical shadow exception.
 No new service, database, queue, scheduler or host was introduced.
 
+
+## 13. Advisory observability and native-context increment - TV2-FR-01 (2026-10-24)
+
+Local, unpushed work on `feature/tradevisor-advisory-observability-v1` branched
+from `294d90c7` (PR #444 head). Not deployed, not activated, not merged.
+
+### What changed
+
+| WP | Change | ACs |
+| --- | --- | --- |
+| WP-01 | External-observation provenance: vendor identity, source bar, operator integration version, and a declared script version recorded as `declared_version_verified=false` / `UNVERIFIED_EXTERNAL_SCRIPT`; excluded from dedup identity | AC-016, AC-017 |
+| WP-02 | Read-only native context: BTC regime via the native scanner, breadth via the native regime owner (refused below 30 snapshots), chase risk via `assess_chase_risk` with unsupplied inputs disclosed, liquidity from execution evidence, and explicit incompatibility declarations for signal-quality stage scoring and ranking; instrument-coverage diagnostics | AC-018, AC-019, AC-020 |
+| WP-03 | Final-allocation economic qualification: the F5 owner re-evaluates at the F7-permitted notional; a candidate below the unchanged minimum is withheld as `ECONOMIC_REJECT_AT_FINAL_ALLOCATION` and reports no economic PASS | AC-021 |
+| WP-04 | Separately classified, bounded, opt-in `TRADEVISOR OBSERVATION - WATCH / NO TRADE` digest with instruction-phrase guard, policy dedup/reservation, honest transport failure, and noncritical budget class | AC-022, AC-023, AC-024, AC-026 |
+| WP-05 | Approved-format additions: evidence-as-of / bar-close / receipt / evaluation timestamps, book age, venue, F7-permitted capital basis, horizon with native ATR and explicit no-duration statement | AC-025 |
+
+### Measured effect of WP-03 (offline fixtures, real owners)
+
+Same plan, equity 10,000: envelope net $168.90 qualified and F7 permitted
+$1,066.23, so the old display showed $90.04 against a $75 bar. Equity 8,000:
+envelope net $135.12 cleared the bar while the permitted allocation implied
+$72.03, which previously still qualified. It now returns
+`ECONOMIC_REJECT_AT_FINAL_ALLOCATION`. No threshold was changed.
+
+### Executed evidence
+
+| Check | Result |
+| --- | --- |
+| Tradevisor suite (10 files, incl. new AC-016..026) | 236 passed, 3.15s, exit 0 |
+| Adjacent regressions (`atdd_scope_control`, `operator_cycle_v2`, `r4_f8_cutover_readiness`, `signal_evidence_contracts`) | 78 passed, 48.01s, exit 0 |
+| `python -m compileall -q app` | exit 0 |
+| `python tests/atdd_scope.py --git-base 294d90c7` | PASS, exit 0 |
+| `git diff --check` | exit 0 |
+| Frozen files (learning, inbox, geometry, economics, attainability, capital, portfolio, notification policy, release profiles, freqtrade) | unchanged |
+
+`ruff` and `bandit` are not installed in this local environment, so those
+advisory CI jobs were not reproduced here; CI remains authoritative for them.
+
+### Still NOT verified
+
+- **G-01**: no genuine TradingView to O'Pip delivery has been observed. All
+evidence remains synthetic.
+- **G-05**: no burst, latency injection or soak measurement. F11 independence
+remains structural (phase ordering plus the noncritical budget class).
+- **G-02 / G-04**: unchanged. No trusted F6 model exists and no completed-4H
+provider exists, so no BUY can become actionable and every qualified SWING
+stays WATCH.
+- The external indicator''s internal BUY/SELL algorithm remains unverified by
+design; provenance records a claim, never a certification.
+
+### Defect found and corrected in passing
+
+`tools/tradevisor_alert_preview.py` could not run at the previous head: it
+passed a `WATCH` decision to `format_tradevisor_alert`, which correctly refuses
+non-actionable decisions. It now derives a labelled synthetic actionable object
+only from decisions that genuinely reached the withheld-but-substantive cohort,
+and otherwise prints the real decision and rejection code.

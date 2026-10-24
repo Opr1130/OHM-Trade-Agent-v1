@@ -373,3 +373,33 @@ used a wall-clock trigger that lands inside the 60-second close tolerance at the
 top of an hour; it now triggers at the bar open, which is deterministic and still
 exercises the unfinished-bar refusal.
 
+
+## Addendum - advisory observability, provenance, native context (TV2-FR-01)
+
+This addendum adds eleven criteria and seventeen tests. It changes no policy:
+F6 and completed-4H still block actionable output, SELL is still exit evidence
+only, the ingress is still dark by default, and the new observation digest is a
+separate opt-in class that can never carry an entry, stop, target or size.
+
+| AC | Scenario | Test |
+| --- | --- | --- |
+| AC-016 | Provenance records external identity; algorithm version unverified | `test_ac_016_provenance_records_external_identity_and_unverified_algorithm` |
+| AC-017 | Provenance excluded from replay identity; bad values refused | `test_ac_017_provenance_never_changes_replay_identity_and_bad_values_fail_closed` |
+| AC-018 | BTC/native context sourced, stamped, availability-honest | `test_ac_018_native_btc_context_carries_source_timestamp_and_availability`, `test_ac_018_unavailable_btc_context_is_never_reported_as_a_pass` |
+| AC-019 | Chase risk reused from native owner, advisory only, inputs disclosed | `test_ac_019_chase_risk_is_reused_from_the_native_owner_as_context_only` |
+| AC-020 | Instrument coverage SUPPORTED/UNSUPPORTED/UNVERIFIED | `test_ac_020_instrument_coverage_distinguishes_supported_unsupported_unknown` |
+| AC-021 | Economic PASS uses the F7-permitted allocation; reject/pass/determinism/no-book | four `test_ac_021_*` cases |
+| AC-022 | Withheld-but-substantive candidate yields only an observation | `test_ac_022_*` (2 cases) |
+| AC-023 | Digest bounded, deduplicated, honest on transport failure | `test_ac_023_*` (2 cases) |
+| AC-024 | Observation digest disabled by default | `test_ac_024_observation_digest_is_disabled_by_default` |
+| AC-025 | Approved format states timing, venue, capital basis, horizon | `test_ac_025_actionable_alert_states_timing_venue_and_capital_basis` |
+| AC-026 | Actionable and observation delivery are mutually exclusive | `test_ac_026_observation_and_actionable_delivery_are_mutually_exclusive` |
+
+### Observed defect corrected in this addendum
+
+`tools/tradevisor_alert_preview.py` could not run at the previous head: it fed a
+`WATCH` decision to `format_tradevisor_alert`, which correctly refuses to render
+anything non-actionable. The preview now derives an explicitly labelled
+synthetic actionable object **only** for decisions that actually reached the
+observation cohort, and otherwise prints the real decision and rejection code.
+The tool remains banner-labelled synthetic and performs no market read.

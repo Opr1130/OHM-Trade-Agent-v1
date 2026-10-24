@@ -20,7 +20,8 @@ would treat an unfinished bar as closed evidence (look-ahead leakage).
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Mapping
 
@@ -32,6 +33,13 @@ DISPOSITION_ACCEPTED = "ACCEPTED_SHADOW"
 DISPOSITION_REJECTED = "REJECTED"
 
 TIMEFRAME_ALIASES = {"1H": 60, "60": 60, "4H": 240, "240": 240}
+
+#: Provenance labels. The external indicator is invite-only: O'Pip receives a
+#: claimed BUY/SELL event and can never inspect the Pine script that produced
+#: it, so algorithm verification is recorded as UNVERIFIED by construction.
+PROVENANCE_SCHEMA_VERSION = "tradevisor-provenance-v1"
+ALGORITHM_VERIFICATION_UNVERIFIED = "UNVERIFIED_EXTERNAL_SCRIPT"
+DEFAULT_INTEGRATION_VERSION = "tradevisor-ingress-v1"
 
 
 class TradevisorIngressError(ValueError):
@@ -54,6 +62,9 @@ class TradevisorConfig:
     max_source_age_seconds: int = 300
     close_tolerance_seconds: int = 60
     future_skew_seconds: int = 5
+    #: Operator-declared version of THIS integration contract (ours). It never
+    #: describes the external script's contents.
+    integration_version: str = DEFAULT_INTEGRATION_VERSION
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -80,6 +91,9 @@ class TradevisorSignal:
     signal_price: float
     alert_config_version: str
     disposition: str = DISPOSITION_ACCEPTED
+    #: Observed external-observation provenance. Recorded, never trusted as
+    #: proof of the external script's algorithm; excluded from dedup identity.
+    provenance: dict = field(default_factory=dict)
 
     def as_evidence(self) -> dict:
         return {
@@ -89,6 +103,7 @@ class TradevisorSignal:
             "strategy_family": "TRADEVISOR_SWING_V1",
             "measurement_only": True,
             "trade_authority_changed": False,
+            "provenance": dict(self.provenance),
             "dedup_id": self.dedup_id,
             "signal": self.signal,
             "instrument": self.instrument,
@@ -130,6 +145,41 @@ def dedup_id_for(event: TradevisorIngressV1) -> str:
         )
     )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def provenance_for(
+    event: TradevisorIngressV1,
+    *,
+    integration_version: str,
+    bar_opened_at: datetime,
+    timeframe_minutes: int,
+) -> dict:
+    """Describe the externally observed observation, without over-claiming.
+
+    Three separate facts are kept apart on purpose:
+
+    * ``integration_version``  - the operator-declared version of THIS contract;
+    * ``external_indicator``   - the vendor identity the alert asserts;
+    * ``declared_indicator_version`` - a string supplied by the alert body.
+
+    The last one is *unverified*: TradingView delivers only the alert message,
+    so no field can prove what the invite-only Pine script contains. Recording
+    it as anything stronger would be a fabricated certification.
+    """
+    declared = (event.indicator_version or "").strip() or None
+    return {
+        "schema_version": PROVENANCE_SCHEMA_VERSION,
+        "external_indicator": event.indicator,
+        "integration_version": integration_version,
+        "declared_indicator_version": declared,
+        "declared_version_verified": False,
+        "algorithm_verification": ALGORITHM_VERIFICATION_UNVERIFIED,
+        "source_exchange": event.exchange.strip().upper(),
+        "source_symbol": event.symbol.strip().upper(),
+        "timeframe_minutes": int(timeframe_minutes),
+        "signal": event.signal,
+        "source_bar_opened_at": bar_opened_at.isoformat(),
+    }
 
 
 def parse_payload(raw: object) -> TradevisorIngressV1:
@@ -207,6 +257,12 @@ def evaluate_ingress(
         received_at=received,
         signal_price=event.signal_price,
         alert_config_version=event.alert_config_version,
+        provenance=provenance_for(
+            event,
+            integration_version=config.integration_version,
+            bar_opened_at=opened,
+            timeframe_minutes=minutes,
+        ),
     )
 
 
@@ -253,6 +309,11 @@ def signal_from_record(record: Mapping[str, object]) -> TradevisorSignal:
             signal_price=float(record["signal_price"]),
             alert_config_version=str(record["alert_config_version"]),
             disposition=str(record.get("disposition") or DISPOSITION_ACCEPTED),
+            provenance=(
+                dict(record["provenance"])
+                if isinstance(record.get("provenance"), Mapping)
+                else {}
+            ),
         )
     except TradevisorIngressError:
         raise
@@ -323,6 +384,21 @@ def config_from_settings(settings: object) -> TradevisorConfig:
         max_source_age_seconds=_int("opip_tradevisor_max_event_age_seconds", 300),
         close_tolerance_seconds=_int("opip_tradevisor_close_tolerance_seconds", 60),
         future_skew_seconds=_int("opip_tradevisor_future_skew_seconds", 5),
+        integration_version=_integration_version(settings),
     )
+
+
+def _integration_version(settings: object) -> str:
+    """Resolve the operator-declared integration contract version.
+
+    This labels OUR contract, so a malformed value is a boot-time configuration
+    error rather than a silently relabelled provenance record.
+    """
+    raw = str(
+        getattr(settings, "opip_tradevisor_integration_version", "") or ""
+    ).strip()
+    if not raw or len(raw) > 64 or not re.fullmatch(r"[A-Za-z0-9._+-]+", raw):
+        raise TradevisorIngressError("CONFIG_INVALID:INTEGRATION_VERSION")
+    return raw
 
 

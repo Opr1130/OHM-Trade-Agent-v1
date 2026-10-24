@@ -35,8 +35,80 @@ unavailable; the notifier is gated on actual actionable qualification.
 - Not an automatic execution system. Every recommendation ends with
   `Execution: Human approval required`.
 
-## Verified external facts (not assumptions)
+## Observation provenance, native context and advisory observations
 
+### Provenance: what O'Pip can and cannot claim
+
+The Tradevisor V2 indicator is an **external, invite-only TradingView script**.
+Its Pine source is not in this repository and is not available to O'Pip, so no
+inbound field can prove what it computed.
+
+| Recorded field | Meaning |
+| --- | --- |
+| `integration_version` | Version of **this** integration contract, from `OPIP_TRADEVISOR_INTEGRATION_VERSION` (default `tradevisor-ingress-v1`). Ours, operator-declared. |
+| `external_indicator` | The vendor identity the alert asserts (`TRADEVISOR_V2`, a literal in the schema). |
+| `declared_indicator_version` | Optional `indicator_version` string from the alert body. |
+| `declared_version_verified` | Always `false`: a body string is a claim, not evidence. |
+| `algorithm_verification` | Always `UNVERIFIED_EXTERNAL_SCRIPT`. |
+
+Provenance is **never** part of the replay identity: `dedup_id` is computed from
+source facts (source, indicator, exchange, symbol, timeframe, direction, bar
+open) only, so a re-delivery cannot create a second observation and a changed
+version string cannot defeat idempotency. Adding `indicator_version` is
+backward compatible — existing alerts without it keep working, and an invalid
+value is refused by the schema before any row is written.
+
+### Native context (read-only)
+
+Every evaluation attaches a `native_context` block. Each field records its
+`source`, `status`, `observed_at`, `freshness_seconds`, `reason` and
+`limitations`; an unavailable component is never reported as corroboration.
+
+| Field | Owner | Notes |
+| --- | --- | --- |
+| `btc_regime` | `app.scanner.market_scanner.analyze_symbol` | BTC's own completed-1H EMA stack (`OPIP_TRADEVISOR_BTC_MARKET`, default `XBTUSD`). Not broad-market breadth. |
+| `market_breadth` | `app.scanner.market_regime.evaluate_market_regime` | Refuses below 30 validated snapshots, so a single-symbol evaluation reports `UNAVAILABLE` with that reason. |
+| `chase_risk` | `app.services.chase_risk.assess_chase_risk` | Band/score/late-entry; unsupplied inputs are disclosed as `INPUT_NOT_SUPPLIED:*` limitations. Advisory only. |
+| `liquidity` | `app.scanner.execution_validation.evaluate_execution` | Executable spread, depth coverage and round-trip drag already measured for this evaluation. |
+| `signal_quality` | `app.services.signal_scoring` | **Incompatible**: needs the scan's `SymbolFeatures`, so it reports `UNAVAILABLE` rather than an approximation. |
+| `opportunity_ranking` | `app.scanner.intelligence_ranking` | **Incompatible**: ranks a candidate set, not one observation. |
+
+`instrument_coverage()` classifies each configured symbol as `SUPPORTED`,
+`UNSUPPORTED` or `UNVERIFIED_NO_VENUE_CATALOGUE`. No exchange client is created
+for it, so support is never assumed; a mistyped mapping stays visible instead of
+silently becoming a permanent `MARKET_DATA_UNAVAILABLE`.
+
+### Economic qualification uses the permitted allocation
+
+The F5 economic gate is evaluated at the account envelope
+(`equity × 20%`) to size the candidate, and then **re-evaluated by the same F5
+owner at the F7-permitted allocation**. The number that qualifies is the number
+that is displayed; no threshold, fee or ratio changes. A candidate that clears
+the minimum net profit only at capital F7 will not permit is withheld with
+`ECONOMIC_REJECT_AT_FINAL_ALLOCATION` and reports no economic pass. Determinism
+is unchanged (the same inputs replay byte-identically).
+
+### Advisory observations (opt-in)
+
+A candidate that passes the market, attainability and economic gates but is
+withheld by the F6 or 4H authority gate is reported as a **separate message
+class** rather than silence:
+
+```
+TRADEVISOR OBSERVATION — WATCH / NO TRADE
+...
+NO TRADE RECOMMENDATION — no entry, stop, target or size is implied.
+```
+
+Properties: one bounded digest per drain run (max 5 items, remainder counted),
+deduplicated and rate-limited by the existing notification policy, delivered
+through the existing Telegram transport and ledger, never labelled qualified, and
+structurally unable to carry an entry/stop/target because the formatter refuses
+any instruction-like phrase. It is **disabled by default**
+(`OPIP_TRADEVISOR_OBSERVATION_ENABLED=false`) and does not affect F11 protection
+priority.
+
+## Verified external facts (not assumptions)
 Checked against TradingView's own help centre:
 
 | Fact | Value |

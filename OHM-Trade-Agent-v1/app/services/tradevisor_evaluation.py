@@ -54,6 +54,7 @@ from app.services.target_attainability import (
 )
 from app.services.tradevisor_ingress import TradevisorSignal
 from app.services.tradevisor_market import attach_execution_evidence
+from app.services.tradevisor_native_context import build_native_context
 
 #: Source attribution. A measurement/policy identifier, never an authority.
 STRATEGY_FAMILY = "TRADEVISOR_SWING_V1"
@@ -387,6 +388,14 @@ def _base_evidence(
 ) -> dict[str, Any]:
     return {
         "source": signal.as_evidence(),
+        # What the external alert claimed, and what O'Pip could verify about it.
+        "provenance": dict(signal.provenance or {}),
+        "timing": {
+            "source_bar_opened_at": signal.bar_opened_at.isoformat(),
+            "source_bar_closed_at": signal.bar_closed_at.isoformat(),
+            "source_triggered_at": signal.triggered_at.isoformat(),
+            "received_at": signal.received_at.isoformat(),
+        },
         "strategy_family": STRATEGY_FAMILY,
         "account_equity": equity,
         "native_snapshot_status": "AVAILABLE" if snapshot is not None else "UNAVAILABLE",
@@ -514,6 +523,7 @@ def evaluate_signal(
     execution_provider: Callable[..., Any] | None = None,
     account_equity: float | None = None,
     active_trades: list[Any] | None = None,
+    btc_context_provider: Callable[[str], Any] | None = None,
 ) -> TradevisorDecision:
     """Evaluate one validated Tradevisor signal against native O'Pip evidence.
 
@@ -651,6 +661,18 @@ def evaluate_signal(
         ),
         "warnings": list(getattr(execution, "warnings", []) or []),
     }
+    # Independent native context (BTC regime, chase risk, breadth, ranking).
+    # Read-only: it informs the operator and never grants authority.
+    btc_market = str(
+        getattr(resolved, "opip_tradevisor_btc_market", "XBTUSD") or ""
+    ).strip().upper()
+    evidence["native_context"] = build_native_context(
+        snapshot=snapshot,
+        execution=execution,
+        now=evaluated_at,
+        btc_provider=btc_context_provider or provider,
+        btc_market=btc_market,
+    )
     return _evaluate_buy_plans(
         signal,
         snapshot=snapshot,
@@ -710,6 +732,51 @@ def _finalize_qualified_buy(
         "min_executable_notional_usd": MIN_EXECUTABLE_NOTIONAL_USD,
     }
 
+    # ------------------------------------------------------------------
+    # Final-allocation economic qualification.
+    #
+    # The F5 call above decides at the *account-envelope* notional
+    # (equity x PRODUCTION_MAX_CAPITAL_FRACTION), which is not the capital F7
+    # would actually permit. Re-running the SAME F5 owner against the final
+    # allocation makes the qualifying number and the displayed number the same
+    # figure. No threshold, fee, ratio or formula changes: only the notional
+    # basis. ``max_account_risk_at_stop_pct`` is left to the envelope call
+    # above, which owns that limit by design; F7's fixed risk budget bounds the
+    # actual risk of the permitted allocation.
+    # ------------------------------------------------------------------
+    final_economics: EconomicGateResult = economics
+    if allocation.recommended_capital > 0:
+        final_economics = evaluate_economic_quality(
+            plan,
+            float(allocation.recommended_capital),
+            max_capital_fraction=1.0,
+            max_account_risk_at_stop_pct=None,
+        )
+        evidence["economics_at_envelope"] = {
+            "recommended_capital": economics.recommended_capital,
+            "position_notional": economics.position_notional,
+            "target_1_net_profit": economics.target_1_net_profit,
+            "target_2_net_profit": economics.target_2_net_profit,
+            "qualified": economics.qualified,
+        }
+        evidence["final_allocation_basis"] = {
+            "allocation": allocation.recommended_capital,
+            "economics_recommended_capital": final_economics.recommended_capital,
+            "position_notional": final_economics.position_notional,
+            "parity": abs(
+                float(final_economics.recommended_capital)
+                - float(allocation.recommended_capital)
+            )
+            <= 0.01,
+            "policy": "F5 thresholds unchanged; the notional basis is the F7 allocation",
+        }
+        evidence["f5_final"] = {
+            "qualified": final_economics.qualified,
+            "target_1_net_profit": final_economics.target_1_net_profit,
+            "target_2_net_profit": final_economics.target_2_net_profit,
+            "rejection_reason": final_economics.rejection_reason,
+        }
+
     rejection: tuple[str, str] | None = None
     if allocation.recommended_capital <= 0:
         rejection = (
@@ -721,6 +788,15 @@ def _finalize_qualified_buy(
             "CAPITAL_BELOW_EXECUTABLE_MINIMUM",
             f"F7 recommended capital USD {allocation.recommended_capital:.2f} is below "
             f"the minimum executable notional USD {MIN_EXECUTABLE_NOTIONAL_USD:.2f}.",
+        )
+    elif not final_economics.qualified:
+        # The candidate clears the bar only at capital the operator may not
+        # deploy, so it is NOT an economic pass at the permitted size.
+        rejection = (
+            "ECONOMIC_REJECT_AT_FINAL_ALLOCATION",
+            f"The economic gate fails at the F7-permitted allocation "
+            f"USD {allocation.recommended_capital:.2f}: "
+            f"{final_economics.rejection_reason}",
         )
 
     portfolio: dict[str, Any] | None = None
@@ -757,7 +833,7 @@ def _finalize_qualified_buy(
             regime=regime,
             price=price,
             plan=plan,
-            economics=economics,
+            economics=final_economics,
             attainability=attainability,
             allocation=allocation,
             portfolio=portfolio,
@@ -798,7 +874,7 @@ def _finalize_qualified_buy(
         regime=regime,
         price=price,
         plan=plan,
-        economics=economics,
+        economics=final_economics,
         attainability=attainability,
         allocation=allocation,
         portfolio=portfolio,

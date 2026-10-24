@@ -37,6 +37,8 @@ TRADEVISOR_MODULES = (
     "services/tradevisor_market.py",
     "services/tradevisor_evaluation.py",
     "services/tradevisor_notifier.py",
+    "services/tradevisor_observation.py",
+    "services/tradevisor_native_context.py",
     "services/tradevisor_pipeline.py",
     "services/tradevisor_learning.py",
     "jobs/drain_tradevisor_inbox.py",

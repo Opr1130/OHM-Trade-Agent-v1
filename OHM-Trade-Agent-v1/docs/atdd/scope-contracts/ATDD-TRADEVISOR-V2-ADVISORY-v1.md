@@ -4,8 +4,26 @@ ATDD-TRADEVISOR-V2-ADVISORY-v1
 OWNER-APPROVED INTENT:
 Authorize, and only authorize, the Tradevisor V2 advisory integration on `feature/tradevisor-v2-ingress`: default-disabled Tradevisor TradingView webhook ingress, deterministic evaluation, notifications and learning. The owner subsequently approved three *policy dispositions* on 2026-10-23: G-02, unavailable F6 permits a recorded shadow hypothesis but never actionable qualification without an independently approved trusted forecast or deterministic fallback; G-03, the explicitly classified noncanonical inbox is an approved shadow-observation/learning exception with no canonical admission or execution rights; and G-04, actionable SWING qualification requires independently trusted completed 4H context, never inferred from 1H. This increment implements fail-closed qualification and retains shadow plan evidence. No F6 model or fallback, no 4H data provider and no canonical handoff are authorized or created. ATDD-29 is now exercised by an explicit F6 abstention gate; ATDD-38 is an approved scope exception **not an outage PASS**; ATDD-43 remains structurally partial pending soak. This contract grants no trading authority, changes no risk default, no fixed sizing, no minimum reward-to-risk, no order path, no canonical writer, no selector, no release-profile key and no production configuration. It does not authorize deployment, activation, credentials, Telegram production delivery, paper or funded execution, or merging PR #444.
 
+ADDENDUM — TV2-FR-01 advisory observability (owner-authorized mission):
+
+The owner confirmed the Tradevisor V2 indicator is an external, invite-only
+TradingView script whose Pine source is inaccessible, and authorized the
+following additions on a separate local branch off this increment's head:
+external-observation provenance (which records the vendor identity and any
+declared script version as UNVERIFIED, never as certification), read-only
+native-context reuse (BTC regime, breadth, chase risk, liquidity, instrument
+coverage), final-allocation economic qualification (the same F5 owner evaluated
+at the F7-permitted notional), an opt-in bounded advisory observation digest,
+and clearer approved-format presentation. F6 and completed-4H remain blocking
+for actionable output; WATCH/SHADOW evidence never becomes an instruction; the
+observation digest is disabled by default and carries no entry, stop, target or
+size. No threshold, risk default, geometry formula, capital algorithm, canonical
+path, learning file or deployment control is changed.
+
 ARCHITECTURE REFERENCES:
 - OHM-Trade-Agent-v1/docs/atdd/README.md: the ATDD scope-control mechanism, its precedence, the required contract sections and the movable `ACTIVE_INCREMENT` pointer.
+- OHM-Trade-Agent-v1/app/services/tradevisor_native_context.py: read-only native evidence (BTC regime, breadth, chase risk, liquidity, coverage) delegated to existing owners.
+- OHM-Trade-Agent-v1/app/services/tradevisor_observation.py: separately classified, bounded, opt-in advisory observation digest.
 - OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-SCOPE-MOVABLE-ACTIVE-POINTER-v1.md: the canonical rule that `ACTIVE_INCREMENT` is mutable orchestration state naming the single increment currently authorized to change files, and that exact current-increment enforcement belongs to `tests/atdd_scope.py` and CI.
 - OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-LEARNING-RECOVERY-v1.md: the increment this contract succeeds. Its AC-005 acceptance test verifies that the pointer resolves to an existing contract and declares its own increment; it does not pin the pointer to itself, so the pointer is formally movable without breaking that increment.
 - OHM-Trade-Agent-v1/tests/atdd_scope.py: the canonical parser and checker, including exit 0 PASS, 1 TRACEABILITY_GAP and 2 SCOPE_CHANGE_REQUIRED.
@@ -135,6 +153,94 @@ the evaluator finishes the proposed trade hypothesis and the notifier receives t
 THEN:
 the decision is WATCH and nonactionable, records ADVISORY_EVIDENCE_INCOMPLETE with explicit F6 and (for SWING only) 4H blockers, preserves a frozen hypothetical plan for prospective shadow measurement without an actionable expiry, and emits no actionable Telegram notification; forward-only candle observations are measured as SHADOW_HYPOTHESIS with no fill attribution, but unrelated WATCH rejections are not treated as trade hypotheses; no 1H approximation or missing-status substitution creates an authorization
 
+AC-016:
+GIVEN:
+an authenticated Tradevisor alert, optionally declaring a version of the external invite-only indicator
+WHEN:
+the ingress admits it
+THEN:
+the normalized signal carries provenance that records the external indicator identity, the source exchange and symbol, the timeframe, the direction and the source bar open, together with the operator-declared integration version of THIS contract and the body-supplied declared version, the declared version is marked not verified, and the algorithm verification is recorded as UNVERIFIED_EXTERNAL_SCRIPT because a webhook body can never prove the contents of the external Pine script
+
+AC-017:
+GIVEN:
+the same source bar delivered with and without a declared indicator version, and payloads with empty, over-long or non-conforming version values
+WHEN:
+each is admitted or replayed at a different receipt time
+THEN:
+every valid variant produces the same dedup identity so provenance can never defeat source-fact idempotency, an absent version is recorded as null rather than invented, and each malformed or conflicting value is refused before any durable row is created
+
+AC-018:
+GIVEN:
+a Tradevisor BUY with native market evidence available, and a BTC context provider that fails
+WHEN:
+the advisory evaluation runs
+THEN:
+the native context block carries BTC regime, market breadth, chase risk, signal quality, ranking and liquidity fields, each with its source, observed timestamp, freshness and availability state, the BTC field delegates to the native scanner on the configured market, breadth and ranking report UNAVAILABLE with an explicit input-contract reason instead of an approximation, and a failing BTC provider produces UNAVAILABLE with its reason and never a PASS or corroboration
+
+AC-019:
+GIVEN:
+a native snapshot whose executable price is at or above its recent high
+WHEN:
+the native context is assembled
+THEN:
+chase-risk band, score, late-entry and retest state come from the existing chase-risk owner marked advisory only, every input that was not supplied is disclosed as a limitation, and the field neither grants nor removes trading authority
+
+AC-020:
+GIVEN:
+the configured Tradevisor instrument mapping, with and without a supplied Kraken venue catalogue
+WHEN:
+instrument coverage is reported
+THEN:
+each configured symbol is classified SUPPORTED, UNSUPPORTED or UNVERIFIED_NO_VENUE_CATALOGUE, support is never assumed without a catalogue, and the aggregate status distinguishes verified, partially supported and unverified coverage
+
+AC-021:
+GIVEN:
+a plan that clears the F5 economic bar at the account envelope but whose F7-permitted allocation implies a smaller notional
+WHEN:
+the qualified-buy composition finalizes
+THEN:
+the economic gate is re-evaluated against the F7-permitted allocation using the unchanged F5 owner and thresholds, a candidate whose final net profit falls below the unchanged minimum is withheld with an explicit final-allocation rejection and reports no economic pass, a candidate that still passes reports one basis for both the gate and the displayed figures, repeated evaluation is byte identical, and missing execution economics still fails closed
+
+AC-022:
+GIVEN:
+a candidate that passed the market, attainability and economic gates but was withheld by the F6 or 4H authority gate, and separately a candidate rejected for unavailable market data or for being SELL evidence
+WHEN:
+advisory observability is composed
+THEN:
+only the withheld-but-substantive candidate produces an observation that states the symbol, source exchange and Kraken venue, the external observation, the source-bar and evaluation timestamps, native corroboration or contradiction, BTC and chase-risk context when available, the missing evidence and the abstention reason, and it is explicitly labelled WATCH / NO TRADE with NO TRADE RECOMMENDATION and no entry, limit, stop, target, size or qualified wording, while the other candidates produce nothing
+
+AC-023:
+GIVEN:
+more observations than one digest may carry, the same observation set offered twice, and a transport that refuses the message
+WHEN:
+the digest is delivered
+THEN:
+at most the bounded number of items is included with the remainder counted as bounded, a single digest is sent rather than one message per event, a repeat of the same evidence is suppressed by the existing notification policy and its reservation accounting, and a transport refusal is reported as a send failure that is never claimed as delivered
+
+AC-024:
+GIVEN:
+the shipped configuration with no operator override
+WHEN:
+observation delivery is attempted
+THEN:
+the digest returns a disabled status without contacting the transport, the observation flag defaults to false, and the ingress itself remains disabled by default
+
+AC-025:
+GIVEN:
+an actionable decision formatted for delivery
+WHEN:
+the message is rendered
+THEN:
+it states the evidence-as-of, source-bar-close, receipt and evaluation timestamps, the execution book age or its unavailability, the source exchange and the Kraken evaluation venue, the F7-permitted capital basis that the economic gates passed, the horizon classification with its native ATR and an explicit statement that no holding duration is modelled, while retaining the expiry, the invalidation limit and the human-approval footer
+
+AC-026:
+GIVEN:
+a decision that is actionable and a decision that is withheld by an authority gate
+WHEN:
+the pipeline composes delivery for each
+THEN:
+an actionable decision yields only an actionable notification and never an observation, a withheld decision yields only an observation and never a notification, and the two delivery classes can never both describe the same decision
+
 EXPLICITLY OUT OF SCOPE:
 - Any order placement, modification, cancellation or confirmation path, and any execution authority
 - Any change to fixed risk sizing, minimum reward-to-risk, position verification or execution safeguards
@@ -147,6 +253,8 @@ EXPLICITLY OUT OF SCOPE:
 - Changing the scope checker's parser, arrow syntax, status codes or fail-closed behaviour
 - Editing, retiring or weakening another increment's contract, acceptance traceability or assertions
 - Adding a second active increment, a concurrent-increment mechanism, or a second scope-control mechanism
+- Certifying, reproducing or reverse-engineering the invite-only external indicator's Pine source, or treating a body-supplied version string as proof of its contents
+- Raising an observation, a WATCH decision or a shadow hypothesis to actionable or qualified status, or bypassing the F6/4H authority gates to do so
 
 FROZEN BOUNDARIES:
 - `docs/atdd/ACTIVE_INCREMENT` names exactly one increment and that increment's contract must exist; `tests/atdd_scope.py` remains the sole owner of exact current-increment enforcement.
@@ -175,6 +283,23 @@ AC-012 -> tests/test_tradevisor_v2_advisory_acceptance_v1.py::test_ac_012_learni
 AC-013 -> tests/test_tradevisor_v2_advisory_acceptance_v1.py::test_ac_013_advisory_phase_is_last_inert_and_contained
 AC-014 -> tests/test_tradevisor_v2_advisory_acceptance_v1.py::test_ac_014_evidence_is_noncanonical_and_has_a_consumer
 AC-015 -> tests/test_tradevisor_v2_advisory_acceptance_v1.py::test_ac_015_untrusted_f6_and_missing_swing_4h_never_send_actionable_alert
+AC-016 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_016_provenance_records_external_identity_and_unverified_algorithm
+AC-017 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_017_provenance_never_changes_replay_identity_and_bad_values_fail_closed
+AC-018 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_018_native_btc_context_carries_source_timestamp_and_availability
+AC-018 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_018_unavailable_btc_context_is_never_reported_as_a_pass
+AC-019 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_019_chase_risk_is_reused_from_the_native_owner_as_context_only
+AC-020 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_020_instrument_coverage_distinguishes_supported_unsupported_unknown
+AC-021 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_021_final_economics_pass_uses_the_same_basis_for_display
+AC-021 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_021_final_economics_rejects_when_f7_allocation_falls_below_minimum
+AC-021 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_021_missing_execution_economics_still_fails_closed
+AC-021 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_021_repeated_evaluation_is_byte_identical
+AC-022 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_022_authority_blocked_candidate_yields_only_an_observation
+AC-022 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_022_non_substantive_rejections_are_not_observed
+AC-023 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_023_digest_is_bounded_and_deduplicated_by_policy
+AC-023 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_023_transport_failure_is_reported_and_never_claimed_delivered
+AC-024 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_024_observation_digest_is_disabled_by_default
+AC-025 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_025_actionable_alert_states_timing_venue_and_capital_basis
+AC-026 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_026_observation_and_actionable_delivery_are_mutually_exclusive
 
 
 IMPLEMENTATION MAP:
@@ -249,6 +374,39 @@ AC-015 -> OHM-Trade-Agent-v1/docs/reviews/tradevisor_v2_certification.md
 AC-015 -> OHM-Trade-Agent-v1/tests/test_tradevisor_evaluation_v1.py
 AC-015 -> OHM-Trade-Agent-v1/tests/test_tradevisor_learning_v1.py
 AC-015 -> OHM-Trade-Agent-v1/tests/test_tradevisor_v2_advisory_acceptance_v1.py
+AC-016 -> OHM-Trade-Agent-v1/app/core/config.py
+AC-016 -> OHM-Trade-Agent-v1/app/models/tradevisor.py
+AC-016 -> OHM-Trade-Agent-v1/app/services/tradevisor_ingress.py
+AC-016 -> OHM-Trade-Agent-v1/tests/test_tradevisor_advisory_observability_v1.py
+AC-016 -> OHM-Trade-Agent-v1/TRADEVISOR_V2.md
+AC-017 -> OHM-Trade-Agent-v1/app/models/tradevisor.py
+AC-017 -> OHM-Trade-Agent-v1/app/services/tradevisor_ingress.py
+AC-017 -> OHM-Trade-Agent-v1/tests/test_tradevisor_advisory_observability_v1.py
+AC-018 -> OHM-Trade-Agent-v1/app/core/config.py
+AC-018 -> OHM-Trade-Agent-v1/app/services/tradevisor_evaluation.py
+AC-018 -> OHM-Trade-Agent-v1/app/services/tradevisor_native_context.py
+AC-018 -> OHM-Trade-Agent-v1/tests/test_tradevisor_advisory_observability_v1.py
+AC-019 -> OHM-Trade-Agent-v1/app/services/tradevisor_native_context.py
+AC-019 -> OHM-Trade-Agent-v1/tests/test_tradevisor_advisory_observability_v1.py
+AC-020 -> OHM-Trade-Agent-v1/app/services/tradevisor_native_context.py
+AC-020 -> OHM-Trade-Agent-v1/tests/test_tradevisor_advisory_observability_v1.py
+AC-021 -> OHM-Trade-Agent-v1/app/services/tradevisor_evaluation.py
+AC-021 -> OHM-Trade-Agent-v1/tests/test_tradevisor_advisory_observability_v1.py
+AC-022 -> OHM-Trade-Agent-v1/app/services/tradevisor_observation.py
+AC-022 -> OHM-Trade-Agent-v1/app/services/tradevisor_pipeline.py
+AC-022 -> OHM-Trade-Agent-v1/tests/test_tradevisor_advisory_observability_v1.py
+AC-023 -> OHM-Trade-Agent-v1/app/jobs/drain_tradevisor_inbox.py
+AC-023 -> OHM-Trade-Agent-v1/app/services/tradevisor_observation.py
+AC-023 -> OHM-Trade-Agent-v1/tests/test_tradevisor_advisory_observability_v1.py
+AC-024 -> OHM-Trade-Agent-v1/app/core/config.py
+AC-024 -> OHM-Trade-Agent-v1/app/services/tradevisor_observation.py
+AC-024 -> OHM-Trade-Agent-v1/tests/test_tradevisor_advisory_observability_v1.py
+AC-025 -> OHM-Trade-Agent-v1/app/services/tradevisor_notifier.py
+AC-025 -> OHM-Trade-Agent-v1/tests/test_tradevisor_advisory_observability_v1.py
+AC-025 -> OHM-Trade-Agent-v1/tools/tradevisor_alert_preview.py
+AC-026 -> OHM-Trade-Agent-v1/app/services/tradevisor_observation.py
+AC-026 -> OHM-Trade-Agent-v1/app/services/tradevisor_pipeline.py
+AC-026 -> OHM-Trade-Agent-v1/tests/test_tradevisor_advisory_observability_v1.py
 
 DEFERRED DISCOVERIES:
 - G-01: no genuine TradingView to O'Pip delivery has been observed; the source-to-production certification remains open and blocks activation, not this increment.

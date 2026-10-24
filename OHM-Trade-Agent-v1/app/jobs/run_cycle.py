@@ -486,10 +486,17 @@ def _run_tradevisor_fail_open() -> None:
             "reclaimed": 0,
             "qualified": 0,
         }
+        observations: list[dict] = []
+
+        def _evaluate(signal):
+            result = evaluate_and_notify(signal, settings=settings)
+            observation = result.get("observation")
+            if isinstance(observation, dict):
+                observations.append(observation)
+            return result
+
         while batches < 4:
-            summary = process_queued_events(
-                evaluator=lambda signal: evaluate_and_notify(signal, settings=settings)
-            )
+            summary = process_queued_events(evaluator=_evaluate)
             for key in total:
                 total[key] += int(summary.get(key, 0) or 0)
             batches += 1
@@ -499,12 +506,19 @@ def _run_tradevisor_fail_open() -> None:
                 break
         # Undelivered actionable alerts are re-evaluated, never re-sent stale.
         retry = retry_undelivered_notifications(settings=settings, limit=2)
+        from app.services.tradevisor_observation import send_observation_digest
+
+        digest = send_observation_digest(observations, settings=settings)
         print("Tradevisor advisory drain (non-authoritative)")
         for key, value in total.items():
             print(f"  {key}: {value}")
         print(f"  notification_retry_candidates: {retry['candidates']}")
         print(f"  notification_retry_delivered: {retry['delivered']}")
         print(f"  notification_retry_not_actionable: {retry['not_actionable']}")
+        print(
+            f"  observations: {digest.status} (sent {digest.observed}, "
+            f"bounded {digest.suppressed_bounded})"
+        )
         print("  trade_authority_changed: False")
     except Exception as exc:  # noqa: BLE001 - advisory work must not abort the cycle
         print(
