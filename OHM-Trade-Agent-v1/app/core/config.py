@@ -21,6 +21,35 @@ _OFF_SHADOW_MODE_PATTERN = r"^(off|shadow)$"
 #: ``off`` in the R4-B0 increment.
 _FEATURE_BUS_MODE_PATTERN = r"^(off|shadow|active)$"
 
+#: Tradevisor V2 ingress defaults. The verification value is a fixed,
+#: publicly documented string shipped in TRADEVISOR_V2.md, not a secret: an
+#: operator who deploys it unchanged in production gets no second factor
+#: beyond network trust, so Settings.validate_tradevisor_configuration refuses
+#: to boot with it while the ingress is enabled in production. It is a
+#: different literal than the Wave 8.2 bridge's value so the two boundaries
+#: cannot be satisfied by one leaked configuration.
+_DEFAULT_TRADEVISOR_VERIFICATION_VALUE = "tradevisor-verified-by-trusted-proxy"
+
+#: Default (exchange, source symbol) -> (instrument, execution market) table.
+#: Ten coins the owner intends to observe on Coinbase. Every entry is an
+#: explicit mapping; a Binance USDT pair is NOT assumed to equal a Kraken USD
+#: market and must be added deliberately (see TRADEVISOR_V2.md).
+_DEFAULT_TRADEVISOR_INSTRUMENTS = ",".join(
+    f"COINBASE:{base}USD={base}/USD:{kraken}"
+    for base, kraken in (
+        ("BTC", "XBTUSD"),
+        ("ETH", "ETHUSD"),
+        ("SOL", "SOLUSD"),
+        ("AVAX", "AVAXUSD"),
+        ("DOGE", "XDGUSD"),
+        ("XRP", "XRPUSD"),
+        ("NEAR", "NEARUSD"),
+        ("MANA", "MANAUSD"),
+        ("LINK", "LINKUSD"),
+        ("ADA", "ADAUSD"),
+    )
+)
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -260,6 +289,63 @@ class Settings(BaseSettings):
     tradingview_kraken_timeout_seconds: float = Field(default=5.0, ge=1.0, le=10.0)
     tradingview_max_inbox_events: int = Field(default=5000, ge=100, le=50000)
 
+    # ------------------------------------------------------------------
+    # Tradevisor V2 advisory ingress (OPIP_TRADEVISOR_*).
+    #
+    # A SEPARATE, versioned webhook for the invite-only Tradevisor V2
+    # TradingView indicator. It is deliberately NOT the Wave 8.2 bridge: the
+    # v2 route, its schema, its policy and its native-merge contract are
+    # unchanged by anything in this block.
+    #
+    # Tradevisor is external ADVISORY EVIDENCE. Nothing here can place,
+    # modify, confirm or cancel an order, widen risk, admit a candidate into
+    # native selection, or grant the source any authority. Disabled by
+    # default: with OPIP_TRADEVISOR_ENABLED=false the route answers 404 and
+    # the cycle phase is inert.
+    # ------------------------------------------------------------------
+    opip_tradevisor_enabled: bool = False
+    opip_tradevisor_trusted_proxy_ips: str = "127.0.0.1,::1"
+    opip_tradevisor_internal_verification_value: str = _DEFAULT_TRADEVISOR_VERIFICATION_VALUE
+    # Per-deployment ingestion token carried INSIDE the alert body. TradingView
+    # documents no support for custom headers and no credentials in the webhook
+    # URL, so a body token plus the trusted-edge header is the only shared
+    # secret this deployment can require. (TradingView also documents an SSL
+    # client certificate that the recipient may verify; this route does not
+    # verify it yet, so it must not be counted as a control. See
+    # TRADEVISOR_V2.md.) The token is removed before validation and never
+    # persisted or logged.
+    opip_tradevisor_webhook_token: str | None = None
+    opip_tradevisor_max_payload_bytes: int = Field(default=8192, ge=512, le=65536)
+    opip_tradevisor_max_requests_per_minute: int = Field(default=60, ge=1, le=600)
+    # Primary configured timeframe. TradingView's {{interval}} resolves to a
+    # minute count ("60" for 1H) and degenerates to "1" for price-based alerts,
+    # which this interval check therefore refuses.
+    opip_tradevisor_interval_minutes: int = Field(default=60, ge=1, le=1440)
+    opip_tradevisor_allowed_exchanges: str = "COINBASE"
+    # alert_config_version -> direction. The configured alert identity is bound
+    # to a direction, so a BUY-labelled alert cannot claim SELL semantics.
+    opip_tradevisor_alert_configs: str = (
+        "tradevisor-1h-buy=BUY,tradevisor-1h-sell=SELL"
+    )
+    # (exchange, source symbol) -> (normalized instrument, execution market).
+    # Every cross-venue pair is an explicit operator decision; no USDT/USD
+    # parity is ever inferred.
+    opip_tradevisor_instruments: str = _DEFAULT_TRADEVISOR_INSTRUMENTS
+    opip_tradevisor_max_event_age_seconds: int = Field(default=300, ge=30, le=1800)
+    opip_tradevisor_close_tolerance_seconds: int = Field(default=60, ge=0, le=600)
+    opip_tradevisor_future_skew_seconds: int = Field(default=5, ge=0, le=300)
+    opip_tradevisor_max_price_divergence_pct: float = Field(default=1.0, gt=0, le=3.0)
+    opip_tradevisor_max_attempts: int = Field(default=5, ge=1, le=20)
+    opip_tradevisor_retention_seconds: int = Field(
+        default=7 * 24 * 3600, ge=3600, le=30 * 24 * 3600
+    )
+    opip_tradevisor_processing_timeout_seconds: int = Field(default=120, ge=10, le=900)
+    opip_tradevisor_processing_batch_limit: int = Field(default=2, ge=1, le=3)
+    opip_tradevisor_max_inbox_events: int = Field(default=2000, ge=100, le=50000)
+    # An actionable recommendation stops being deliverable this long after it
+    # was produced. A stale actionable plan is never sent (ATDD-42).
+    opip_tradevisor_actionable_expiry_minutes: int = Field(default=90, ge=5, le=1440)
+
     # ---------------------------------------------------------------------
     # Signal Quality / Explosion Detection v1 (Phase 1)
     #
@@ -455,6 +541,61 @@ class Settings(BaseSettings):
                     "or shorter than 32 characters. Generate a unique value before enabling."
                 )
             self.tradingview_internal_verification_value = verification
+        return self
+
+    @model_validator(mode="after")
+    def validate_tradevisor_configuration(self) -> "Settings":
+        """Fail closed at boot rather than at first webhook.
+
+        Only enforced when the ingress is enabled, so the default-off posture
+        cannot be broken by an unrelated environment.
+        """
+        if not self.opip_tradevisor_enabled:
+            return self
+
+        token = (self.opip_tradevisor_webhook_token or "").strip()
+        if len(token) < _MIN_TRADINGVIEW_BEARER_LENGTH:
+            raise ValueError(
+                "OPIP_TRADEVISOR_ENABLED requires a unique URL-safe "
+                f"OPIP_TRADEVISOR_WEBHOOK_TOKEN of at least "
+                f"{_MIN_TRADINGVIEW_BEARER_LENGTH} characters."
+            )
+        if not all(char.isalnum() or char in "-_" for char in token):
+            raise ValueError(
+                "OPIP_TRADEVISOR_WEBHOOK_TOKEN must be URL-safe "
+                "(letters, digits, '-' and '_' only)."
+            )
+        self.opip_tradevisor_webhook_token = token
+
+        if self.app_env.strip().casefold() == "production":
+            verification = self.opip_tradevisor_internal_verification_value.strip()
+            if (
+                verification.casefold() == _DEFAULT_TRADEVISOR_VERIFICATION_VALUE.casefold()
+                or len(verification) < 32
+            ):
+                raise ValueError(
+                    "OPIP_TRADEVISOR_ENABLED is true in production but "
+                    "OPIP_TRADEVISOR_INTERNAL_VERIFICATION_VALUE is the documented "
+                    "default or shorter than 32 characters. Generate a unique value "
+                    "before enabling."
+                )
+            self.opip_tradevisor_internal_verification_value = verification
+
+        # One malformed mapping must not silently shrink the observable
+        # universe: parse the operator table at boot and refuse to start.
+        from app.services.tradevisor_ingress import (  # local import: no cycle
+            TradevisorIngressError,
+            config_from_settings,
+        )
+
+        try:
+            resolved = config_from_settings(self)
+        except TradevisorIngressError as exc:
+            raise ValueError(f"invalid Tradevisor configuration: {exc.reason}") from exc
+        if not resolved.instruments:
+            raise ValueError("OPIP_TRADEVISOR_INSTRUMENTS resolved to no instruments")
+        if not resolved.alert_configs:
+            raise ValueError("OPIP_TRADEVISOR_ALERT_CONFIGS resolved to no alert configs")
         return self
 
 

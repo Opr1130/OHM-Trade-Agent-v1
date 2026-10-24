@@ -4,6 +4,7 @@ from starlette.datastructures import MutableHeaders
 
 from app.api.dashboard import router as dashboard_router
 from app.api.routes import router
+from app.api.tradevisor import router as tradevisor_router
 from app.core.config import get_settings
 from app.services.legacy_tradingview_guard import evaluate_legacy_tradingview_request
 from app.services.freqtrade_signal_bridge import ensure_bridge_files
@@ -44,6 +45,7 @@ async def fence_legacy_tradingview(request: Request, call_next):
 
 app.include_router(router)
 app.include_router(dashboard_router)
+app.include_router(tradevisor_router)
 
 # The B/C-4 Cockpit analytics router is deliberately NOT mounted here. It reads the
 # verified canonical replica, which exists only on the analytics plane, so serving it
