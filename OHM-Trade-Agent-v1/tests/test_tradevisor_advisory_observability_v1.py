@@ -1056,13 +1056,14 @@ def test_ac_030_crash_after_settlement_is_recovered_from_durable_rows(durable_in
 
     from app.services import notification_policy
 
-    budget = json.loads(
-        (notification_policy.STATE_FILE.parent / "attention_budget_state.json").read_text(
-            encoding="utf-8"
-        )
-    )
+    budget_file = notification_policy.STATE_FILE.parent / "attention_budget_state.json"
+    budget = json.loads(budget_file.read_text(encoding="utf-8"))
     assert len(budget["history"]) == 1
-    assert notification_policy.allow_new_noncritical(now=NOW) is True
+    # ``allow_new_noncritical`` is re-exported from attention_budget, so its
+    # default path is the production registry, not the patched policy file.
+    assert (
+        notification_policy.allow_new_noncritical(now=NOW, state_file=budget_file) is True
+    )
 
 
 def test_ac_030_transport_refusal_or_exception_keeps_rows_pending(durable_inbox):
