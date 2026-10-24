@@ -1,0 +1,57 @@
+# Tradevisor V2 webhook edge — EXAMPLE ONLY.
+#
+# This file documents the reviewed boundary. It is NOT deployed by anything in
+# this repository and it contains no secret values: replace every <PLACEHOLDER>.
+#
+# TradingView documents these source addresses for webhooks:
+#   52.89.214.238  34.212.75.30  54.218.53.128  52.32.178.7
+# Ports 80/443 only, IPv6 unsupported, and the whole request must be answered
+# within 3 seconds — so the proxy must not add its own latency.
+#
+# The app additionally checks that the immediate peer is in
+# OPIP_TRADEVISOR_TRUSTED_PROXY_IPS and that this header carries
+# OPIP_TRADEVISOR_INTERNAL_VERIFICATION_VALUE.
+
+limit_req_zone $binary_remote_addr zone=tradevisor_webhook:1m rate=30r/m;
+
+server {
+    listen 443 ssl;
+    server_name <WEBHOOK_HOST>;
+
+    ssl_certificate     /etc/letsencrypt/live/<WEBHOOK_HOST>/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/<WEBHOOK_HOST>/privkey.pem;
+
+    # Tradevisor route only. Everything else on this host is refused.
+    location = /webhooks/tradevisor/v1 {
+        allow 52.89.214.238;
+        allow 34.212.75.30;
+        allow 54.218.53.128;
+        allow 52.32.178.7;
+        deny all;
+
+        limit_except POST {
+            deny all;
+        }
+        limit_req zone=tradevisor_webhook burst=20 nodelay;
+
+        client_max_body_size 8k;
+
+        proxy_pass http://127.0.0.1:8000/webhooks/tradevisor/v1;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+
+        # Proves the request crossed this proxy. Generate a unique value and
+        # keep it equal to OPIP_TRADEVISOR_INTERNAL_VERIFICATION_VALUE.
+        proxy_set_header x-ohm-tradevisor-verification "<EDGE_VERIFICATION_VALUE>";
+
+        proxy_connect_timeout 1s;
+        proxy_send_timeout 2s;
+        proxy_read_timeout 2s;
+    }
+
+    # The Wave 8.2 bridge must NOT be reachable from this vhost.
+    location / {
+        return 404;
+    }
+}
