@@ -776,7 +776,7 @@ def test_ac_028_allocation_never_exceeds_position_or_account_risk_limits():
 def test_ac_028_oversized_allocation_is_refused_as_inconsistent(monkeypatch):
     """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-028: a broken owner cannot size a trade."""
     monkeypatch.setattr(
-        te, "recommend_capital", lambda **_kwargs: _FakeAllocation(50_000.0)
+        te, "recommend_capital", _fake_owner(_FakeAllocation(50_000.0))
     )
     decision = evaluate(equity=10_000.0)
 
@@ -789,6 +789,24 @@ def test_ac_028_oversized_allocation_is_refused_as_inconsistent(monkeypatch):
     assert decision.evidence["capital_consistency"]["limit"] == pytest.approx(
         10_000.0 * te.PRODUCTION_MAX_CAPITAL_FRACTION
     )
+    assert decision.evidence["capital_consistency"]["risk_budget"] == pytest.approx(
+        10_000.0 * settings().risk_per_trade_pct / 100.0
+    )
+
+    # The independent risk-budget tripwire: inside the position cap but far over
+    # the fixed account-risk budget must also be refused.
+    monkeypatch.setattr(
+        te,
+        "recommend_capital",
+        _fake_owner(_FakeAllocation(1_000.0, risk_dollars=5_000.0)),
+    )
+    over_budget = evaluate(equity=10_000.0)
+    assert over_budget.rejection_code == "CAPITAL_INCONSISTENT"
+    assert over_budget.evidence["capital_consistency"]["status"] == "CAPITAL_INCONSISTENT"
+    assert over_budget.evidence["capital_consistency"]["risk_dollars"] == pytest.approx(
+        5_000.0
+    )
+    assert over_budget.economics.qualified is False
 
 
 def test_ac_028_non_finite_or_negative_allocation_fails_closed_without_raising(
