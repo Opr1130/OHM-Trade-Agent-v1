@@ -1048,6 +1048,19 @@ def test_ac_030_crash_after_settlement_is_recovered_from_durable_rows(durable_in
     assert len(sent) == 1
     # Next cycle: already reported, so nothing is resent.
     assert observation.pending_observations(now=NOW, settings=settings()) == []
+    # Acknowledgements are bookkeeping: one digest consumes exactly one
+    # noncritical attention slot, however many rows it acknowledged.
+    import json
+
+    from app.services import notification_policy
+
+    budget = json.loads(
+        (notification_policy.STATE_FILE.parent / "attention_budget_state.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert len(budget["history"]) == 1
+    assert notification_policy.allow_new_noncritical(now=NOW) is True
 
 
 def test_ac_030_transport_refusal_or_exception_keeps_rows_pending(durable_inbox):

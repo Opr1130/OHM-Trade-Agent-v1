@@ -27,7 +27,6 @@ from datetime import datetime, timedelta, timezone
 from app.services.notification_policy import (
     DEFAULT_COOLDOWN_SECONDS,
     confirm_emit,
-    record_emitted,
     release_emit,
     reserve_emit,
     should_emit,
@@ -197,23 +196,37 @@ def _content_fingerprint(candidate: dict) -> str:
 
 
 def _mark_reported(candidates: list[dict], *, now: datetime) -> int:
-    """Record the durable per-row acknowledgement after a confirmed delivery."""
-    marked = 0
+    """Record the durable per-row acknowledgement after a confirmed delivery.
+
+    The acknowledgement is bookkeeping, not a new attention card, so it is
+    written into the notification-policy state under that module's own lock
+    without consuming the noncritical attention budget. Only the digest itself
+    (one card) passes through ``confirm_emit``.
+    """
+    markers: dict[str, dict] = {}
     for candidate in candidates:
         dedup_id = str(candidate.get("dedup_id") or "").strip()
         if not dedup_id:
             continue
-        try:
-            record_emitted(
-                identity=_marker_identity(dedup_id),
-                event_type=OBSERVATION_EVENT_TYPE,
-                fingerprint=_content_fingerprint(candidate),
-                now=now,
-            )
-            marked += 1
-        except Exception:  # noqa: BLE001 - a ledger write failure must not duplicate
-            continue
-    return marked
+        markers[f"{_marker_identity(dedup_id)}:{OBSERVATION_EVENT_TYPE}"] = {
+            "fingerprint": _content_fingerprint(candidate),
+            "sent_at": now.isoformat(),
+        }
+    if not markers:
+        return 0
+    from app.services import notification_policy
+    from app.services.registry_io import registry_lock, save_json_atomic
+
+    try:
+        with registry_lock(notification_policy.LOCK_FILE):
+            state = load_json(notification_policy.STATE_FILE) or {}
+            if not isinstance(state, dict):
+                state = {}
+            state.update(markers)
+            save_json_atomic(notification_policy.STATE_FILE, state)
+    except Exception:  # noqa: BLE001 - a ledger write failure must not duplicate
+        return 0
+    return len(markers)
 
 
 def _as_dict(value: object) -> dict:
