@@ -446,7 +446,10 @@ $72.03, which previously still qualified. It now returns
 | Frozen files (learning, inbox, geometry, economics, attainability, capital, portfolio, notification policy, release profiles, freqtrade) | unchanged |
 
 `ruff` and `bandit` are not installed in this local environment, so those
-advisory CI jobs were not reproduced here; CI remains authoritative for them.
+advisory CI jobs were not reproduced here; CI remains authoritative for them. Two substitutes were used instead, and neither required installing anything:
+
+- A stdlib AST check covering the rule families CI enforces (`F401`/`F811`/`E711`/`E712`/`E303`) over every changed file. The only findings are two pre-existing `E303` blank-line runs in `tradevisor_evaluation.py`, proven present at the baseline by running the same check against `git show 294d90c7:...`, so this increment adds **zero** new lint findings. No bandit-sensitive construct (`eval`, `exec`, `subprocess`, `os.system`, `pickle`, `yaml.load`, `shell=True`) exists in the new modules.
+- `pyright` (already installed as a local tool) over the new and modified modules. The two errors it found in the new code were corrected by making the narrowing explicit (`_as_dict`, `_provenance_from_record`) and by refusing an unexpected provider return object instead of treating it as market evidence. The final state is **parity with the baseline: 4 errors before, 4 after**, all pre-existing (`_resolve_snapshot` return typing and three `signal_from_record` casts); the two brand-new modules report 0 errors and 0 warnings.
 
 ### Still NOT verified
 

@@ -87,15 +87,21 @@ def _unavailable(
 
 
 def _resolve_snapshot(result: Any) -> tuple[MarketSnapshot | None, str | None]:
-    """Accept a snapshot or the scanner's ``(status, snapshot, reason)`` tuple."""
+    """Accept a snapshot or the scanner's ``(status, snapshot, reason)`` tuple.
+
+    Anything else is treated as unavailable rather than trusted: a provider that
+    returns an unexpected object must not become market evidence.
+    """
     if isinstance(result, tuple) and len(result) == 3:
         status, snapshot, reason = result
         if status != "ok" or snapshot is None:
             return None, str(reason or status)
         return snapshot, None
+    if isinstance(result, MarketSnapshot):
+        return result, None
     if result is None:
         return None, "NO_SNAPSHOT"
-    return result, None
+    return None, f"UNSUPPORTED_PROVIDER_RESULT:{type(result).__name__}"
 
 
 def btc_regime_context(

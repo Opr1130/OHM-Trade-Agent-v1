@@ -101,6 +101,16 @@ def _iso(value: object) -> str | None:
     return text.replace("+00:00", "Z") if "T" in text else text
 
 
+def _as_dict(value: object) -> dict:
+    """Return ``value`` when it is a mapping, else an empty mapping.
+
+    Written as a helper (not a conditional expression) so the narrowing is
+    explicit and statically checkable: ``X if isinstance(X, dict) else {}``
+    does not narrow ``evidence.get(...)`` for a type checker.
+    """
+    return value if isinstance(value, dict) else {}
+
+
 def _context_field(evidence: dict, name: str) -> dict | None:
     context = evidence.get("native_context")
     if not isinstance(context, dict):
@@ -138,19 +148,13 @@ def observation_candidate(
     if decision.rejection_code not in OBSERVATION_COHORT:
         return None
 
-    evidence = decision.evidence if isinstance(decision.evidence, dict) else {}
-    timing = evidence.get("timing") if isinstance(evidence.get("timing"), dict) else {}
-    qualification = (
-        evidence.get("advisory_qualification")
-        if isinstance(evidence.get("advisory_qualification"), dict)
-        else {}
-    )
+    evidence = _as_dict(decision.evidence)
+    timing = _as_dict(evidence.get("timing"))
+    qualification = _as_dict(evidence.get("advisory_qualification"))
     btc = _context_field(evidence, "btc_regime")
     btc_value = btc.get("value") if btc and btc.get("status") == "AVAILABLE" else None
     native_regime = decision.market_regime
-    provenance = (
-        evidence.get("provenance") if isinstance(evidence.get("provenance"), dict) else {}
-    )
+    provenance = _as_dict(evidence.get("provenance"))
 
     return {
         "classification": OBSERVATION_CLASSIFICATION,

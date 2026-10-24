@@ -281,6 +281,16 @@ def _csv_items(value: str, *, field: str) -> list[str]:
     return [item for item in items if item]
 
 
+def _provenance_from_record(record: Mapping[str, object]) -> dict:
+    """Restore recorded provenance, or an empty mapping when absent/malformed.
+
+    A row written before provenance existed has no such field; that must read as
+    "unknown", never as a fabricated verification.
+    """
+    value = record.get("provenance")
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
 def signal_from_record(record: Mapping[str, object]) -> TradevisorSignal:
     """Rebuild a normalized signal from its durable representation.
 
@@ -309,11 +319,7 @@ def signal_from_record(record: Mapping[str, object]) -> TradevisorSignal:
             signal_price=float(record["signal_price"]),
             alert_config_version=str(record["alert_config_version"]),
             disposition=str(record.get("disposition") or DISPOSITION_ACCEPTED),
-            provenance=(
-                dict(record["provenance"])
-                if isinstance(record.get("provenance"), Mapping)
-                else {}
-            ),
+            provenance=_provenance_from_record(record),
         )
     except TradevisorIngressError:
         raise
