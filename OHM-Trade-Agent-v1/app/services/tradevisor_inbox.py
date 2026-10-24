@@ -30,6 +30,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app.core.config import get_settings
+from app.opip.learning.job_disposition import RELEASE_CURRENT
 from app.services.registry_io import load_json, registry_lock, save_json_atomic
 from app.services.tradevisor_ingress import (
     DISPOSITION_ACCEPTED,
@@ -54,6 +55,20 @@ STATUS_PROCESSING = "PROCESSING"
 STATUS_PROCESSED = "PROCESSED"
 STATUS_REJECTED = "REJECTED"
 STATUS_POISONED = "POISONED"
+
+#: A durable per-record consumption acknowledgement. ``LEARNING_TERMINAL_NON_MEASURABLE``
+#: records that the evidence can never become a measurable outcome; it is not a
+#: measurement claim.
+CONSUMPTION_LEARNING_CONSUMED = "LEARNING_CONSUMED"
+CONSUMPTION_TERMINAL_NON_MEASURABLE = "LEARNING_TERMINAL_NON_MEASURABLE"
+CONSUMPTION_DISPOSITIONS = frozenset(
+    {CONSUMPTION_LEARNING_CONSUMED, CONSUMPTION_TERMINAL_NON_MEASURABLE}
+)
+#: Only a definitive measurement may authorize deletion of learning evidence.
+DEFINITIVE_MEASUREMENT_STATUSES = frozenset({"MEASURED", "NO_ENTRY_TOUCH"})
+#: Terminal states whose evidence can never contribute to learning: a poisoned
+#: row never produced a frozen decision, so it has no measurable hypothesis.
+NON_LEARNING_TERMINAL = {STATUS_POISONED}
 
 
 class TradevisorInboxFullError(RuntimeError):
@@ -99,6 +114,9 @@ def _row_from_signal(signal: TradevisorSignal, now: datetime) -> dict:
         "decision_record": None,
         "notification": None,
         "outcome": None,
+        #: Durable learning-consumption disposition. ``None`` means "not yet
+        #: consumed", so the record is not eligible for retention pruning.
+        "consumption": None,
         # The normalized signal is the durable evidence of what arrived. The
         # ingestion credential never reaches this point: it is stripped before
         # validation and the wire model forbids unknown fields.
@@ -121,17 +139,122 @@ def _row_from_signal(signal: TradevisorSignal, now: datetime) -> dict:
     }
 
 
+def _consumption_ack_is_valid(row: dict) -> bool:
+    """A consumption acknowledgement is durable evidence, so it fails closed.
+
+    It must name the exact record, carry an allowed disposition, be backed by a
+    *definitive* measurement, and have been recorded against an exact-SHA
+    current release. Anything else is treated as "not consumed".
+    """
+    ack = row.get("consumption")
+    if not isinstance(ack, dict):
+        return False
+    dedup = str(row.get("dedup_id") or "")
+    if not dedup or str(ack.get("dedup_id") or "") != dedup:
+        return False
+    if str(ack.get("evidence_id") or "") == "":
+        return False
+    if str(ack.get("disposition") or "") not in CONSUMPTION_DISPOSITIONS:
+        return False
+    if str(ack.get("measurement_status") or "") not in DEFINITIVE_MEASUREMENT_STATUSES:
+        return False
+    if str(ack.get("release_compatibility") or "") != RELEASE_CURRENT:
+        return False
+    return _parse(ack.get("acknowledged_at")) is not None
+
+
+def _is_learning_evidence(row: dict) -> bool:
+    """True when this row can still become measurable learning evidence."""
+    if row.get("status") not in TERMINAL:
+        return True
+    return row.get("status") not in NON_LEARNING_TERMINAL
+
+
+def _retention_eligible(row: dict) -> bool:
+    """Only a terminal non-learning row or an acknowledged row may be pruned."""
+    if row.get("status") in NON_LEARNING_TERMINAL:
+        return True
+    return _consumption_ack_is_valid(row)
+
+
 def _prune(events: dict, *, now: datetime, retention_seconds: int) -> int:
+    """Age out rows whose evidence is provably no longer needed.
+
+    Terminal *transport* status is not proof of learning consumption: a
+    ``PROCESSED`` row can still owe a 24-hour prospective measurement. Retention
+    therefore requires either an explicitly non-measurable disposition or a
+    valid durable consumption acknowledgement. Unacknowledged evidence is kept
+    even when it is older than the retention window, and capacity is enforced by
+    existing backpressure instead of silent eviction.
+    """
     cutoff = now - timedelta(seconds=retention_seconds)
     removed = 0
     for key, row in list(events.items()):
         if not isinstance(row, dict) or row.get("status") not in TERMINAL:
+            continue
+        if not _retention_eligible(row):
             continue
         stamp = _parse(row.get("processed_at")) or _parse(row.get("enqueued_at"))
         if stamp is not None and stamp < cutoff:
             events.pop(key, None)
             removed += 1
     return removed
+
+
+def record_consumption_ack(
+    dedup_id: str,
+    *,
+    evidence_id: str,
+    measurement_status: str,
+    release_compatibility: str,
+    disposition: str = CONSUMPTION_LEARNING_CONSUMED,
+    now: datetime | None = None,
+) -> bool:
+    """Record a durable per-record learning-consumption disposition.
+
+    This is the only write path for consumption bookkeeping, and it touches only
+    ``row["consumption"]``. It is idempotent: re-acknowledging the same evidence
+    keeps the original timestamp, so a crash after the write and before cleanup
+    cannot produce a duplicate logical consumption. Invalid input or a
+    non-terminal row returns ``False`` without writing - consumption is never
+    fabricated.
+    """
+    now = now or _now()
+    dedup = str(dedup_id or "").strip()
+    if not dedup or not str(evidence_id or "").strip():
+        return False
+    if str(disposition) not in CONSUMPTION_DISPOSITIONS:
+        return False
+    if str(measurement_status) not in DEFINITIVE_MEASUREMENT_STATUSES:
+        return False
+    if str(release_compatibility) != RELEASE_CURRENT:
+        return False
+
+    with registry_lock(LOCK_FILE):
+        registry = load_json(INBOX_FILE) or _empty_registry()
+        events = registry.get("events", {})
+        row = events.get(dedup)
+        if not isinstance(row, dict) or row.get("status") not in TERMINAL:
+            return False
+        existing = row.get("consumption")
+        if _consumption_ack_is_valid(row) and isinstance(existing, dict):
+            # Idempotent: same evidence already acknowledged by the same release.
+            if (
+                str(existing.get("evidence_id")) == str(evidence_id)
+                and str(existing.get("measurement_status")) == str(measurement_status)
+                and str(existing.get("disposition")) == str(disposition)
+            ):
+                return True
+        row["consumption"] = {
+            "dedup_id": dedup,
+            "evidence_id": str(evidence_id),
+            "disposition": str(disposition),
+            "measurement_status": str(measurement_status),
+            "release_compatibility": str(release_compatibility),
+            "acknowledged_at": now.isoformat(),
+        }
+        save_json_atomic(INBOX_FILE, registry)
+        return True
 
 
 def enqueue(signal: TradevisorSignal, *, now: datetime | None = None) -> tuple[dict, bool]:
@@ -165,6 +288,12 @@ def enqueue(signal: TradevisorSignal, *, now: datetime | None = None) -> tuple[d
             retention_seconds=int(settings.opip_tradevisor_retention_seconds),
         )
         if len(events) >= int(settings.opip_tradevisor_max_inbox_events):
+            # Preserve explicit backpressure. Unconsumed evidence is never
+            # evicted to make room, so the counter is the operational signal.
+            metrics["capacity_backpressure_events"] = (
+                int(metrics.get("capacity_backpressure_events", 0)) + 1
+            )
+            save_json_atomic(INBOX_FILE, registry)
             raise TradevisorInboxFullError("Tradevisor inbox is at capacity")
 
         row = _row_from_signal(signal, now)
@@ -212,21 +341,60 @@ def pending_count() -> int:
 
 
 def inbox_status() -> dict:
-    """Bounded, secret-free operational view of the inbox."""
+    """Bounded, secret-free operational view of the inbox.
+
+    Backlog metrics are aggregate counts only: no dedup identifiers, signal
+    data or credentials are exposed.
+    """
     registry = load_json(INBOX_FILE) or _empty_registry()
     events = registry.get("events", {})
+    settings = get_settings()
+    now = _now()
+    cutoff = now - timedelta(
+        seconds=int(settings.opip_tradevisor_retention_seconds)
+    )
     counts: dict[str, int] = {}
+    consumed = 0
+    unconsumed = 0
+    retention_blocked = 0
+    oldest_unconsumed: datetime | None = None
     for row in events.values():
         if not isinstance(row, dict):
             continue
         status = str(row.get("status") or "UNKNOWN")
         counts[status] = counts.get(status, 0) + 1
+        if row.get("status") not in TERMINAL:
+            continue
+        if _retention_eligible(row):
+            consumed += 1
+            continue
+        unconsumed += 1
+        stamp = _parse(row.get("processed_at")) or _parse(row.get("enqueued_at"))
+        if stamp is None:
+            continue
+        if oldest_unconsumed is None or stamp < oldest_unconsumed:
+            oldest_unconsumed = stamp
+        if stamp < cutoff:
+            retention_blocked += 1
     return {
         "schema_version": 1,
-        "configured": bool(get_settings().opip_tradevisor_enabled),
+        "configured": bool(settings.opip_tradevisor_enabled),
         "depth": len(events),
         "pending": sum(counts.get(key, 0) for key in ACTIVE),
         "by_status": counts,
+        # Learning-evidence backlog: retained because no durable consumption
+        # acknowledgement exists for these rows.
+        "consumed": consumed,
+        "unconsumed": unconsumed,
+        "retention_blocked": retention_blocked,
+        "oldest_unconsumed_age_seconds": (
+            int((now - oldest_unconsumed).total_seconds())
+            if oldest_unconsumed is not None
+            else 0
+        ),
+        "capacity_backpressure_events": int(
+            (registry.get("metrics") or {}).get("capacity_backpressure_events", 0)
+        ),
         "metrics": dict(registry.get("metrics") or {}),
         # Explicit evidence classification: this store is advisory operational
         # evidence, NOT the canonical ledger. Naming it prevents any downstream

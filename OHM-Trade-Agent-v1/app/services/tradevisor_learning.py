@@ -33,6 +33,7 @@ never disagree. An unverifiable identity fails closed.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Mapping
@@ -62,6 +63,8 @@ OUTCOME_PENDING = "PENDING"
 OUTCOME_MEASURED = "MEASURED"
 OUTCOME_NO_ENTRY_TOUCH = "NO_ENTRY_TOUCH"
 OUTCOME_WINDOW_INCOMPLETE = "WINDOW_INCOMPLETE"
+#: Observation coverage was not proven. Never counted as a measurement.
+OUTCOME_PARTIAL_COVERAGE = "PARTIAL_COVERAGE"
 
 FILL_ATTRIBUTION_NONE = "NONE_TOUCH_INFERRED"
 
@@ -139,6 +142,130 @@ def _candle_is_incomplete(candle: Any) -> bool:
         if isinstance(value, bool):
             return not value
     return False
+
+
+def _interval_seconds(interval: timedelta | None) -> int | None:
+    if not isinstance(interval, timedelta):
+        return None
+    seconds = int(interval.total_seconds())
+    return seconds if seconds > 0 else None
+
+
+def _finite_number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _same_candle(left: Any, right: Any) -> bool:
+    """Two records of the same bar are interchangeable only if their prices are."""
+    for attribute in ("high", "low", "close"):
+        a = _finite_number(getattr(left, attribute, None))
+        b = _finite_number(getattr(right, attribute, None))
+        if a is None or b is None:
+            if a is not b:
+                return False
+            continue
+        if a != b:
+            return False
+    return True
+
+
+def _expected_candle_opens(
+    start: datetime, end: datetime, interval: timedelta | None
+) -> list[datetime] | None:
+    """Every eligible bar open, on the source's own UTC candle grid.
+
+    Kraken timestamps hourly bars by open time on UTC epoch multiples of the
+    interval, so the grid is anchored at the epoch. The first eligible bar is
+    the first boundary strictly after the decision instant: a decision at 10:23
+    makes 11:00 the first complete post-decision bar, and the 10:00-11:00 bar
+    (which carries pre-decision prices) is never eligible. A decision exactly on
+    a boundary still excludes that boundary's bar, because that bar contains the
+    decision instant's own price. A bar is only expected when its whole interval
+    closes at or before ``end``.
+    """
+    seconds = _interval_seconds(interval)
+    if seconds is None:
+        return None
+    first = (math.floor(start.timestamp() / seconds) + 1) * seconds
+    last = int(end.timestamp())
+    opens: list[datetime] = []
+    while first + seconds <= last:
+        opens.append(datetime.fromtimestamp(first, tz=timezone.utc))
+        first += seconds
+    return opens
+
+
+def _candle_coverage(
+    decided_at: datetime,
+    window_end: datetime,
+    interval: timedelta | None,
+    admissible: list[tuple[datetime, Any]],
+) -> tuple[list[datetime] | None, dict[datetime, Any], str | None]:
+    """Prove that every expected bar is present exactly once, or say why not."""
+    seconds = _interval_seconds(interval)
+    if seconds is None:
+        return None, {}, "UNSUPPORTED_CANDLE_INTERVAL"
+    expected = _expected_candle_opens(decided_at, window_end, interval)
+    if not expected:
+        return expected, {}, "NO_EXPECTED_CANDLES"
+    expected_set = set(expected)
+    observed: dict[datetime, Any] = {}
+    for opened, candle in admissible:
+        if int(opened.timestamp()) % seconds != 0:
+            return expected, observed, "MISALIGNED_CANDLE_TIMESTAMP"
+        if opened not in expected_set:
+            return expected, observed, "UNEXPECTED_CANDLE_TIMESTAMP"
+        existing = observed.get(opened)
+        if existing is not None:
+            if not _same_candle(existing, candle):
+                return expected, observed, "CONFLICTING_DUPLICATE_CANDLES"
+            continue  # identical restatement of the same bar
+        observed[opened] = candle
+    if any(op not in observed for op in expected):
+        return expected, observed, "MISSING_EXPECTED_CANDLES"
+    return expected, observed, None
+
+
+def _coverage_diagnostics(
+    decided_at: datetime,
+    window_end: datetime,
+    interval: timedelta | None,
+    expected: list[datetime] | None,
+    observed: dict[datetime, Any],
+    reason: str | None,
+) -> dict[str, Any]:
+    """Bounded, honest description of what was and was not observed."""
+    expected_opens = expected or []
+    missing = [op for op in expected_opens if op not in observed]
+    first = expected_opens[0] if expected_opens else None
+    last_close = (
+        expected_opens[-1] + interval
+        if expected_opens and isinstance(interval, timedelta)
+        else None
+    )
+    return {
+        "coverage_status": "COMPLETE" if reason is None else "PARTIAL",
+        "coverage_reason": reason,
+        "expected_candles": len(expected_opens),
+        "observed_valid_candles": len(observed),
+        "missing_candles": len(missing),
+        "missing_candle_opens": [op.isoformat() for op in missing[:6]],
+        "first_expected_open": first.isoformat() if first else None,
+        "last_expected_close": last_close.isoformat() if last_close else None,
+        "observation_window_end": window_end.isoformat(),
+        "excluded_lead_seconds": (
+            int((first - decided_at).total_seconds()) if first else None
+        ),
+        "excluded_tail_seconds": (
+            int((window_end - last_close).total_seconds()) if last_close else None
+        ),
+    }
 
 
 def evaluate_outcome(
@@ -237,9 +364,10 @@ def evaluate_outcome(
         else None
     )
     admissible = []
+    invalid_ohlc = False
     for candle in candles:
         opened = _candle_time(candle)
-        if opened is None or opened < decided_at or opened >= window_end:
+        if opened is None or opened <= decided_at or opened >= window_end:
             continue
         closes = _candle_close(candle) or (opened + interval if interval else None)
         if closes is None:
@@ -249,10 +377,42 @@ def evaluate_outcome(
             continue
         if _candle_is_incomplete(candle):
             continue
+        high = _finite_number(getattr(candle, "high", None))
+        low = _finite_number(getattr(candle, "low", None))
+        if high is None or low is None or high < low:
+            invalid_ohlc = True
+            continue
         admissible.append((opened, candle))
     if not admissible:
         base.update(status=OUTCOME_PENDING, reason="no admissible forward candles")
         return base
+
+    expected, observed, coverage_reason = _candle_coverage(
+        decided_at, window_end, interval, admissible
+    )
+    base.update(
+        _coverage_diagnostics(
+            decided_at, window_end, interval, expected, observed, coverage_reason
+        )
+    )
+    if coverage_reason is None and invalid_ohlc:
+        # A structurally invalid bar means the history cannot be trusted even if
+        # every expected timestamp happened to be present.
+        base.update(
+            status=OUTCOME_PARTIAL_COVERAGE,
+            coverage_status="PARTIAL",
+            coverage_reason="INVALID_OHLC",
+            reason="incomplete candle coverage: INVALID_OHLC",
+        )
+        return base
+    if coverage_reason is not None:
+        base.update(
+            status=OUTCOME_PARTIAL_COVERAGE,
+            coverage_status="PARTIAL",
+            reason=f"incomplete candle coverage: {coverage_reason}",
+        )
+        return base
+    base.update(coverage_status="COMPLETE")
 
     entry_reference = entry_high
     entry_touched = False
@@ -261,7 +421,7 @@ def evaluate_outcome(
     t1_at: datetime | None = None
     t2_at: datetime | None = None
     stop_at: datetime | None = None
-    for when, candle in admissible:
+    for when, candle in sorted(observed.items()):
         high = float(getattr(candle, "high", 0.0) or 0.0)
         low = float(getattr(candle, "low", 0.0) or 0.0)
         if not entry_touched:

@@ -315,15 +315,18 @@ def test_learning_job_measures_persisted_records():
     _settle_failed()
     later = NOW + timedelta(days=2)
     def provider(_market, decided_at):
+        grid = decided_at.replace(minute=0, second=0, microsecond=0)
         return [
-            _Candle(decided_at + timedelta(hours=1), 101.0, 99.5),
-            _Candle(decided_at + timedelta(hours=2), 106.0, 100.5),
+            _Candle(grid + timedelta(hours=1), 101.0, 99.5),
+            _Candle(grid + timedelta(hours=2), 106.0, 100.5),
         ]
+
     result = learning_job.build_report(
         now=later,
         deployed_sha=SHA_A,
         expected_sha=SHA_A,
         candles_provider=provider,
+        measurement_hours=3,
     )
     report = result["report"]
     assert report["status"] == learning.RELEASE_CURRENT
@@ -581,9 +584,10 @@ def test_current_release_still_measures_outcomes(isolated):
 
     def provider(market, decided_at):
         calls.append(market)
+        grid = decided_at.replace(minute=0, second=0, microsecond=0)
         return [
-            _Candle(decided_at + timedelta(hours=1), 101.0, 99.5),
-            _Candle(decided_at + timedelta(hours=2), 106.0, 100.5),
+            _Candle(grid + timedelta(hours=1), 101.0, 99.5),
+            _Candle(grid + timedelta(hours=2), 106.0, 100.5),
         ]
 
     result = learning_job.build_report(
@@ -591,6 +595,7 @@ def test_current_release_still_measures_outcomes(isolated):
         deployed_sha=SHA_A,
         expected_sha=SHA_A,
         candles_provider=provider,
+        measurement_hours=3,
     )
 
     assert calls == ["BTCUSD"]

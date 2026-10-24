@@ -358,9 +358,12 @@ def test_ac_005_unfinished_stale_and_future_events_are_refused(monkeypatch):
     )
     unfinished = http.post(
         "/webhooks/tradevisor/v1",
+        # Trigger at the bar open, not at wall clock: inside the last
+        # close-tolerance second of an hour a wall-clock trigger is legitimately
+        # treated as an already-closed bar (pre-existing flake, made deterministic).
         json=payload(
             bar_opened_at=_z(unfinished_open),
-            triggered_at=_z(datetime.now(timezone.utc)),
+            triggered_at=_z(unfinished_open),
         ),
         headers=HEADERS,
     )
@@ -770,16 +773,20 @@ def test_ac_015_untrusted_f6_and_missing_swing_4h_never_send_actionable_alert():
         "decision": result.decision,
         "decision_record": result.as_record(),
     }
+    # Candle timestamps must sit on the source's UTC grid, and the window must
+    # be fully covered before a definitive measurement is allowed (N-02).
+    grid = NOW.replace(minute=0, second=0, microsecond=0)
     outcome = learning.evaluate_outcome(
         frozen_row,
         now=NOW + timedelta(days=2),
         candles_provider=lambda *_: [
             SimpleNamespace(
-                open_time=NOW + timedelta(hours=1),
+                open_time=grid + timedelta(hours=1),
                 low=result.plan.entry_low,
                 high=result.plan.target_1,
             )
         ],
+        measurement_hours=2,
     )
     assert outcome["status"] == learning.OUTCOME_MEASURED
     assert outcome["measurement_subject"] == "SHADOW_HYPOTHESIS"

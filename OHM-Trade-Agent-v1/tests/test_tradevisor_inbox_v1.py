@@ -102,10 +102,21 @@ def test_capacity_is_bounded_and_raises_backpressure(store):
         inbox.enqueue(signal(symbol="ZZZUSD"), now=NOW)
 
 
-def test_terminal_rows_are_pruned_after_retention(store):
+def test_non_learning_terminal_rows_are_pruned_after_retention(store):
+    """Retention still ages out evidence that can never become measurable.
+
+    A ``PROCESSED`` row is deliberately excluded here: it can still owe a
+    prospective measurement, so it requires a durable consumption
+    acknowledgement before retention may remove it (N-01).
+    """
     store.opip_tradevisor_retention_seconds = 3600
     inbox.enqueue(signal(), now=NOW)
-    inbox.process_queued_events(evaluator=evaluate_ok, now=NOW)
+    registry = inbox.load_json(inbox.INBOX_FILE)
+    key = next(iter(registry["events"]))
+    registry["events"][key]["status"] = inbox.STATUS_POISONED
+    registry["events"][key]["processed_at"] = NOW.isoformat()
+    inbox.save_json_atomic(inbox.INBOX_FILE, registry)
+
     old = NOW + timedelta(hours=3)
     inbox.enqueue(signal(symbol="ETHUSD"), now=old)
     keys = list(inbox.load_json(inbox.INBOX_FILE)["events"])
@@ -350,3 +361,238 @@ def test_reclaimed_row_is_settled_by_its_new_owner(store):
     assert summary["checked"] == 1
     stored = next(iter(inbox.load_json(inbox.INBOX_FILE)["events"].values()))
     assert stored["status"] == inbox.STATUS_PROCESSED
+
+
+# ---------------------------------------------------------------------------
+# N-01: durable learning-evidence retention (no pruning before consumption)
+# ---------------------------------------------------------------------------
+
+from app.opip.learning.job_disposition import RELEASE_CURRENT
+
+
+def _consumption(**over) -> dict:
+    """A durable per-record consumption disposition (the acknowledged shape)."""
+    values = {
+        "dedup_id": None,
+        "evidence_id": "tradevisor-decision-v1",
+        "disposition": inbox.CONSUMPTION_LEARNING_CONSUMED,
+        "measurement_status": "MEASURED",
+        "release_compatibility": RELEASE_CURRENT,
+        "acknowledged_at": NOW.isoformat(),
+    }
+    values.update(over)
+    return values
+
+
+def _settled_row(*, status: str | None = None, age_days: float = 8) -> str:
+    """Persist one settled row and age it past the default 7-day retention."""
+    inbox.enqueue(signal(), now=NOW)
+    inbox.process_queued_events(evaluator=evaluate_ok, now=NOW)
+    registry = inbox.load_json(inbox.INBOX_FILE)
+    key = next(iter(registry["events"]))
+    row = registry["events"][key]
+    if status is not None:
+        row["status"] = status
+    stamp = (NOW - timedelta(days=age_days)).isoformat()
+    row["processed_at"] = stamp
+    row["enqueued_at"] = stamp
+    inbox.save_json_atomic(inbox.INBOX_FILE, registry)
+    return key
+
+
+def _trigger_prune() -> None:
+    """A new alert is the only thing that runs retention."""
+    inbox.enqueue(signal(symbol="ETHUSD"), now=NOW)
+
+
+def test_processed_evidence_is_not_pruned_without_a_consumption_ack(store):
+    key = _settled_row()
+    _trigger_prune()
+
+    events = inbox.load_json(inbox.INBOX_FILE)["events"]
+    assert key in events, "eligible unmeasured evidence must survive retention"
+    assert events[key]["status"] == inbox.STATUS_PROCESSED
+
+
+def test_one_hour_retention_cannot_erase_a_24h_hypothesis(store):
+    store.opip_tradevisor_retention_seconds = 3600
+    key = _settled_row(age_days=0)
+    registry = inbox.load_json(inbox.INBOX_FILE)
+    registry["events"][key]["processed_at"] = (NOW - timedelta(hours=2)).isoformat()
+    inbox.save_json_atomic(inbox.INBOX_FILE, registry)
+
+    _trigger_prune()
+
+    assert key in inbox.load_json(inbox.INBOX_FILE)["events"]
+
+
+def test_extended_learning_outage_does_not_erase_eligible_records(store):
+    key = _settled_row(age_days=30)
+    _trigger_prune()
+    assert key in inbox.load_json(inbox.INBOX_FILE)["events"]
+
+
+def test_poisoned_row_is_prunable_after_retention(store):
+    key = _settled_row(status=inbox.STATUS_POISONED)
+    _trigger_prune()
+    assert key not in inbox.load_json(inbox.INBOX_FILE)["events"]
+
+
+def test_acknowledged_row_is_prunable_after_retention(store):
+    key = _settled_row()
+    registry = inbox.load_json(inbox.INBOX_FILE)
+    row = registry["events"][key]
+    row["consumption"] = _consumption(dedup_id=row["dedup_id"])
+    inbox.save_json_atomic(inbox.INBOX_FILE, registry)
+
+    _trigger_prune()
+
+    assert key not in inbox.load_json(inbox.INBOX_FILE)["events"]
+
+
+def test_release_drift_acknowledgement_does_not_authorize_pruning(store):
+    key = _settled_row()
+    registry = inbox.load_json(inbox.INBOX_FILE)
+    row = registry["events"][key]
+    row["consumption"] = _consumption(
+        dedup_id=row["dedup_id"], release_compatibility="RELEASE_DRIFT"
+    )
+    inbox.save_json_atomic(inbox.INBOX_FILE, registry)
+
+    _trigger_prune()
+
+    assert key in inbox.load_json(inbox.INBOX_FILE)["events"]
+
+
+def test_nondefinitive_measurement_does_not_authorize_pruning(store):
+    key = _settled_row()
+    registry = inbox.load_json(inbox.INBOX_FILE)
+    row = registry["events"][key]
+    row["consumption"] = _consumption(
+        dedup_id=row["dedup_id"], measurement_status="PARTIAL_COVERAGE"
+    )
+    inbox.save_json_atomic(inbox.INBOX_FILE, registry)
+
+    _trigger_prune()
+
+    assert key in inbox.load_json(inbox.INBOX_FILE)["events"]
+
+
+def test_mismatched_acknowledgement_identity_fails_closed(store):
+    key = _settled_row()
+    registry = inbox.load_json(inbox.INBOX_FILE)
+    row = registry["events"][key]
+    row["consumption"] = _consumption(dedup_id="some-other-alert")
+    inbox.save_json_atomic(inbox.INBOX_FILE, registry)
+
+    _trigger_prune()
+
+    assert key in inbox.load_json(inbox.INBOX_FILE)["events"]
+
+
+
+def test_malformed_consumption_metadata_fails_closed(store):
+    key = _settled_row()
+    registry = inbox.load_json(inbox.INBOX_FILE)
+    registry["events"][key]["consumption"] = "consumed"
+    inbox.save_json_atomic(inbox.INBOX_FILE, registry)
+
+    _trigger_prune()
+
+    assert key in inbox.load_json(inbox.INBOX_FILE)["events"]
+
+
+def test_legacy_row_without_consumption_fields_is_retained(store):
+    key = _settled_row()
+    registry = inbox.load_json(inbox.INBOX_FILE)
+    registry["events"][key].pop("consumption", None)
+    inbox.save_json_atomic(inbox.INBOX_FILE, registry)
+
+    _trigger_prune()
+
+    assert key in inbox.load_json(inbox.INBOX_FILE)["events"]
+
+
+def test_duplicate_delivery_cannot_reset_a_consumption_ack(store):
+    key = _settled_row()
+    registry = inbox.load_json(inbox.INBOX_FILE)
+    row = registry["events"][key]
+    ack = _consumption(dedup_id=row["dedup_id"])
+    row["consumption"] = ack
+    inbox.save_json_atomic(inbox.INBOX_FILE, registry)
+
+    inbox.enqueue(signal(), now=NOW)  # exact replay of the same alert
+
+    stored = inbox.load_json(inbox.INBOX_FILE)["events"][key]
+    assert stored["consumption"] == ack
+
+
+def test_consumption_acknowledgement_is_idempotent(store):
+    key = _settled_row(age_days=0)
+    row = inbox.load_json(inbox.INBOX_FILE)["events"][key]
+
+    first = inbox.record_consumption_ack(
+        row["dedup_id"],
+        evidence_id="tradevisor-decision-v1",
+        measurement_status="MEASURED",
+        release_compatibility=RELEASE_CURRENT,
+        now=NOW,
+    )
+    second = inbox.record_consumption_ack(
+        row["dedup_id"],
+        evidence_id="tradevisor-decision-v1",
+        measurement_status="MEASURED",
+        release_compatibility=RELEASE_CURRENT,
+        now=NOW + timedelta(hours=1),
+    )
+
+    assert first is True and second is True
+    stored = inbox.load_json(inbox.INBOX_FILE)["events"][key]
+    assert stored["consumption"]["acknowledged_at"] == NOW.isoformat()
+
+
+def test_consumption_bookkeeping_preserves_processing_state(store):
+    key = _settled_row(age_days=0)
+    before = inbox.load_json(inbox.INBOX_FILE)["events"][key]
+
+    inbox.record_consumption_ack(
+        before["dedup_id"],
+        evidence_id="tradevisor-decision-v1",
+        measurement_status="MEASURED",
+        release_compatibility=RELEASE_CURRENT,
+        now=NOW,
+    )
+
+    after = inbox.load_json(inbox.INBOX_FILE)["events"][key]
+    for field in (
+        "status",
+        "decision",
+        "decision_record",
+        "notification",
+        "claim_token",
+        "attempts",
+        "final_disposition",
+    ):
+        assert after.get(field) == before.get(field), field
+
+
+def test_capacity_backpressure_is_preserved_and_counted(store):
+    store.opip_tradevisor_max_inbox_events = 1
+    inbox.enqueue(signal(), now=NOW)
+
+    with pytest.raises(inbox.TradevisorInboxFullError):
+        inbox.enqueue(signal(symbol="ETHUSD"), now=NOW)
+
+    status = inbox.inbox_status()
+    assert status["capacity_backpressure_events"] >= 1
+    assert status["depth"] == 1, "no silent oldest-first eviction"
+
+
+def test_inbox_status_reports_the_unconsumed_backlog(store):
+    _settled_row()
+    status = inbox.inbox_status()
+
+    assert status["unconsumed"] >= 1
+    assert status["consumed"] == 0
+    assert status["oldest_unconsumed_age_seconds"] > 0
+    assert "dedup" not in repr(status)  # aggregate only: no record identifiers

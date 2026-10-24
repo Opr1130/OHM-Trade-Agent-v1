@@ -163,6 +163,7 @@ def test_owner_approved_shadow_hypothesis_is_measured_without_a_fill():
         hypothesis,
         now=DECIDED + timedelta(days=2),
         candles_provider=lambda *_: forward,
+        measurement_hours=3,
     )
     assert outcome["status"] == learning.OUTCOME_MEASURED
     assert outcome["measurement_subject"] == "SHADOW_HYPOTHESIS"
@@ -185,6 +186,7 @@ def test_outcome_measures_forward_path_only():
         record(),
         now=DECIDED + timedelta(days=2),
         candles_provider=lambda *_: candles(before, entry, to_target),
+        measurement_hours=3,
     )
     assert outcome["status"] == learning.OUTCOME_MEASURED
     assert outcome["target_1_touched"] is True
@@ -198,10 +200,12 @@ def test_outcome_measures_forward_path_only():
 
 def test_outcome_marks_invalidation_before_target_as_false_positive():
     drop = Candle(DECIDED + timedelta(hours=1), 100.5, 96.0)
+    quiet = Candle(DECIDED + timedelta(hours=2), 101.0, 99.5)
     outcome = learning.evaluate_outcome(
         record(),
         now=DECIDED + timedelta(days=2),
-        candles_provider=lambda *_: candles(drop),
+        candles_provider=lambda *_: candles(drop, quiet),
+        measurement_hours=3,
     )
     assert outcome["status"] == learning.OUTCOME_MEASURED
     assert outcome["stop_touched"] is True
@@ -211,10 +215,12 @@ def test_outcome_marks_invalidation_before_target_as_false_positive():
 
 def test_outcome_without_an_entry_touch_is_not_counted_as_a_trade():
     never = Candle(DECIDED + timedelta(hours=1), 120.0, 101.0)
+    never_2 = Candle(DECIDED + timedelta(hours=2), 119.0, 101.5)
     outcome = learning.evaluate_outcome(
         record(),
         now=DECIDED + timedelta(days=2),
-        candles_provider=lambda *_: candles(never),
+        candles_provider=lambda *_: candles(never, never_2),
+        measurement_hours=3,
     )
     assert outcome["status"] == learning.OUTCOME_NO_ENTRY_TOUCH
 
@@ -372,3 +378,149 @@ def test_completed_candles_inside_the_window_are_measured_without_a_fill():
     # A touch is evidence about price, never an executed fill.
     assert outcome["fill_attribution"] == learning.FILL_ATTRIBUTION_NONE
     assert outcome["measurement_subject"] == "ACTIONABLE_RECOMMENDATION"
+
+
+# ---------------------------------------------------------------------------
+# N-02: complete candle coverage is required for a definitive outcome
+# ---------------------------------------------------------------------------
+
+
+def _bar(hours: float, high: float = 101.0, low: float = 99.5) -> "Candle":
+    return Candle(DECIDED + timedelta(hours=hours), high, low)
+
+
+def _complete_window(hours: int = 3) -> list:
+    """Every expected eligible bar, each quiet (touches entry, nothing else)."""
+    return [_bar(h) for h in range(1, hours)]
+
+
+def test_single_candle_cannot_produce_a_measured_outcome():
+    outcome = _measured([_bar(1)], measurement_hours=3)
+
+    assert outcome["status"] == learning.OUTCOME_PARTIAL_COVERAGE
+    assert outcome["coverage_status"] == "PARTIAL"
+    assert outcome["expected_candles"] == 2
+    assert outcome["observed_valid_candles"] == 1
+
+
+def test_missing_middle_candle_is_nondefinitive():
+    outcome = _measured([_bar(1), _bar(3)], measurement_hours=4)
+
+    assert outcome["status"] == learning.OUTCOME_PARTIAL_COVERAGE
+    assert outcome["missing_candles"] == 1
+
+
+def test_missing_final_candle_is_nondefinitive():
+    outcome = _measured([_bar(1)], measurement_hours=3)
+
+    assert outcome["status"] == learning.OUTCOME_PARTIAL_COVERAGE
+    assert outcome["coverage_reason"] == "MISSING_EXPECTED_CANDLES"
+
+
+def test_truncated_history_is_nondefinitive():
+    # A single late bar would otherwise look like a complete window.
+    outcome = _measured([_bar(2, high=106.0, low=100.5)], measurement_hours=3)
+
+    assert outcome["status"] == learning.OUTCOME_PARTIAL_COVERAGE
+    assert outcome.get("target_1_touched") is not True
+
+
+def test_conflicting_duplicate_candles_fail_closed():
+    bars = [_bar(1, high=101.0), _bar(1, high=115.0), _bar(2)]
+    outcome = _measured(bars, measurement_hours=3)
+
+    assert outcome["status"] == learning.OUTCOME_PARTIAL_COVERAGE
+    assert outcome["coverage_reason"] == "CONFLICTING_DUPLICATE_CANDLES"
+
+
+def test_identical_duplicate_candles_collapse():
+    bars = [_bar(1), _bar(2), _bar(2)]
+    outcome = _measured(bars, measurement_hours=3)
+
+    assert outcome["status"] == learning.OUTCOME_MEASURED
+    assert outcome["observed_valid_candles"] == 2
+
+
+def test_out_of_order_candles_are_ordered_deterministically():
+    bars = [_bar(2, high=106.0, low=100.5), _bar(1)]
+    outcome = _measured(bars, measurement_hours=3)
+
+    assert outcome["status"] == learning.OUTCOME_MEASURED
+    assert outcome["target_1_touched"] is True
+    assert outcome["time_to_target_1_seconds"] == 7200
+
+
+def test_misaligned_candle_timestamp_is_nondefinitive():
+    bars = [_bar(1), _bar(1.5), _bar(2)]
+    outcome = _measured(bars, measurement_hours=3)
+
+    assert outcome["status"] == learning.OUTCOME_PARTIAL_COVERAGE
+    assert outcome["coverage_reason"] == "MISALIGNED_CANDLE_TIMESTAMP"
+
+
+def test_non_finite_ohlc_is_not_measured():
+    bars = [_bar(1, high=float("nan")), _bar(2)]
+    outcome = _measured(bars, measurement_hours=3)
+
+    assert outcome["status"] != learning.OUTCOME_MEASURED
+
+
+
+def test_partial_coverage_is_excluded_from_cohort_metrics():
+    record_ = record()
+    outcome = _measured([_bar(1)], measurement_hours=3)
+    cohort = learning.summarize_cohorts(
+        [record_], outcomes={str(record_["dedup_id"]): outcome}
+    )[learning.COHORT_CORROBORATED]
+
+    assert outcome["status"] == learning.OUTCOME_PARTIAL_COVERAGE
+    assert cohort["measured"] == 0
+    assert cohort["false_positive_rate"] is None
+    assert cohort["estimated_net_usd"] == 0.0
+
+
+def test_complete_coverage_measures_and_keeps_touch_semantics():
+    bars = [_bar(1), _bar(2, high=106.0, low=100.5)]
+    outcome = _measured(bars, measurement_hours=3)
+
+    assert outcome["status"] == learning.OUTCOME_MEASURED
+    assert outcome["coverage_status"] == "COMPLETE"
+    assert outcome["expected_candles"] == outcome["observed_valid_candles"] == 2
+    assert outcome["target_1_touched"] is True
+    assert outcome["target_2_touched"] is False
+    assert outcome["fill_attribution"] == learning.FILL_ATTRIBUTION_NONE
+
+
+def test_complete_window_without_entry_touch_is_definitive():
+    bars = [Candle(DECIDED + timedelta(hours=h), 120.0, 101.0) for h in (1, 2)]
+    outcome = _measured(bars, measurement_hours=3)
+
+    assert outcome["status"] == learning.OUTCOME_NO_ENTRY_TOUCH
+    assert outcome["coverage_status"] == "COMPLETE"
+
+
+def test_coverage_diagnostics_describe_the_boundaries():
+    outcome = _measured(_complete_window(), measurement_hours=3)
+
+    assert outcome["first_expected_open"] == (
+        DECIDED + timedelta(hours=1)
+    ).isoformat()
+    assert outcome["last_expected_close"] == (
+        DECIDED + timedelta(hours=3)
+    ).isoformat()
+    assert outcome["observation_window_end"] == (
+        DECIDED + timedelta(hours=3)
+    ).isoformat()
+
+
+def test_incomplete_window_is_not_part_of_the_measured_count():
+    record_ = record()
+    partial = _measured([_bar(1)], measurement_hours=3)
+    full = _measured(_complete_window(), measurement_hours=3)
+    cohorts = learning.summarize_cohorts(
+        [record_],
+        outcomes={str(record_["dedup_id"]): partial, "other": full},
+    )
+    bucket = cohorts[learning.COHORT_CORROBORATED]
+
+    assert bucket["measured"] == 0, "the record carries the partial outcome"

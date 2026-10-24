@@ -155,6 +155,8 @@ FROZEN BOUNDARIES:
 - Advisory evidence never acquires admission, execution, Telegram-production or canonical-writer authority.
 - ATDD-29 is an exercised fail-closed F6 abstention check; ATDD-38 remains an **owner-approved shadow-only scope exception**, not a successful canonical outage test; ATDD-43 remains partial, without load/soak certification.
 - No production, trading, Feature Bus, paper or deployment authority is created, widened or transferred by this increment.
+- Learning-evidence retention is fail-closed (N-01): a terminal *transport* status never authorises deletion. Retention requires a non-learning terminal state (`POISONED`) or a valid durable acknowledgement naming the exact `dedup_id`, an allowed disposition, a definitive measurement status and the current release SHA. Unacknowledged evidence is retained; capacity enforces existing 503 backpressure rather than evicting it; legacy rows without consumption metadata are treated as unconsumed.
+- A definitive outcome requires provably complete observation (N-02): expected bars are the UTC epoch-grid multiples of the real candle interval starting strictly after the decision instant and closing at or before the window end. Missing, duplicated-conflicting, misaligned, unfinished or non-finite bars yield `PARTIAL_COVERAGE`, which never contributes to measured counts, false-positive rates or profitability statistics. A touch is never a fill.
 
 
 ACCEPTANCE TEST TRACEABILITY:
@@ -256,6 +258,8 @@ DEFERRED DISCOVERIES:
 - G-05: F11 independence is proven structurally; no overload, burst or soak measurement exists, so ATDD-43 stays partial.
 - TradingView documents an SSL client certificate that the recipient may verify. This integration does not verify it; adopting recipient-side verification is an edge change plus a staging verification, tracked as a security follow-up.
 - Whether the Tradevisor scenario suite should carry acceptance markers per scenario, rather than the grouped criteria used here, is a documentation question for a future increment.
+- N-01 limitation (2026-10-24): no deployment unit invokes `report_tradevisor_learning` and the learning worker holds no reverse-write authority into production storage, so no production process records a consumption acknowledgement. Eligible evidence is therefore retained until the inbox reaches capacity and ingress returns 503. Ending that state requires an owner-approved acknowledgement writer or durable archival handoff; until then the consumption lifecycle must not be described as fully operational.
+- N-02 limitation (2026-10-24): coverage uses the interval the caller declares (60 minutes from the report job). A source that changes interval, or returns bars on a different grid, will be classified `PARTIAL_COVERAGE` rather than measured - a deliberate fail-closed default.
 
 UNAPPROVED SCOPE CHANGES:
 NONE

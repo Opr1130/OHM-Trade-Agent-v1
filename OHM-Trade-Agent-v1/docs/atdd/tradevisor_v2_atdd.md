@@ -161,7 +161,7 @@ price touch remains evidence about price — never a fill
 
 ## Reconciled test totals
 
-No group is double-counted. The 52-scenario matrix maps onto **188** distinct
+No group is double-counted. The 52-scenario matrix maps onto **217** distinct
 Tradevisor tests (some scenarios have more than one test; none share a test).
 ``test_tradevisor_v2_advisory_acceptance_v1.py`` is the ATDD acceptance
 traceability module for the scope contract, not a duplicate of the scenario
@@ -171,14 +171,14 @@ suite.
 | --- | --- |
 | `test_tradevisor_ingress_v1.py` | 29 |
 | `test_tradevisor_webhook_v1.py` | 32 |
-| `test_tradevisor_inbox_v1.py` | 15 |
+| `test_tradevisor_inbox_v1.py` | 30 |
 | `test_tradevisor_evaluation_v1.py` | 20 |
 | `test_tradevisor_notifier_v1.py` | 12 |
-| `test_tradevisor_learning_v1.py` | 22 |
+| `test_tradevisor_learning_v1.py` | 36 |
 | `test_tradevisor_recovery_v1.py` | 20 |
 | `test_tradevisor_boundaries_v1.py` | 23 |
 | `test_tradevisor_v2_advisory_acceptance_v1.py` | 15 |
-| **Total** | **188** |
+| **Total** | **217** |
 
 
 
@@ -246,4 +246,130 @@ stay visible and no trading or production authority follows from approval.
   containment), not by a 10x burst soak test. No soak environment was available,
   so ATDD-43 is **partial**, not a pass.
 
+
+
+
+## Post-review remediation — N-01 / N-02 (2026-10-24)
+
+Two independent review findings about learning integrity. Both were reproduced
+with failing tests before any production change.
+
+### N-01 — durable evidence retention
+
+**Defect.** `_prune()` treated transport/evaluation *terminal status* as proof of
+learning consumption. A `PROCESSED` row can still owe a 24-hour prospective
+measurement, and the configuration legally permits a 1-hour retention interval,
+so eligible evidence could be deleted before it was ever measured.
+
+**Lifecycle events are distinct and must not be conflated:**
+
+| Event | Where it is recorded | Proves |
+| --- | --- | --- |
+| Transport receipt | `enqueue()` → row exists | durable receipt only |
+| Evaluation completion | `status = PROCESSED/REJECTED` | the pipeline ran |
+| Learning eligibility | frozen `decision_record` present | the row can become an outcome |
+| Measurement completion | outcome `MEASURED`/`NO_ENTRY_TOUCH` | a definitive outcome exists |
+| Durable learning consumption | `row["consumption"]` acknowledgement | this record is discharged |
+| Safe retention eligibility | `_retention_eligible()` | deletion is allowed |
+
+**Correction (fail-closed retention).** Retention removes a row only when it is
+either (a) in a non-learning terminal state (`POISONED`, which never produced a
+frozen decision) or (b) carrying a *valid* durable acknowledgement. An
+acknowledgement is accepted only when it names the exact `dedup_id`, carries an
+allowed disposition, is backed by a **definitive** measurement status, and was
+recorded against the **current** release SHA. Missing, malformed, drifted,
+unverified or non-definitive acknowledgements all fail closed. Duplicate webhook
+delivery never touches consumption state. Capacity stays bounded and now enforces
+the existing 503 backpressure instead of evicting unacknowledged evidence.
+
+**No acknowledgement writer exists in this change.** No deployment unit invokes
+the learning report job, and the learning worker has no reverse-write authority
+into production storage, so no production caller records an acknowledgement.
+Consequence, stated plainly: eligible evidence is retained indefinitely until an
+authorized consumer acknowledges it, and the inbox will eventually reach capacity
+and return 503. The backlog is observable through `inbox_status()`:
+`consumed`, `unconsumed`, `retention_blocked`, `oldest_unconsumed_age_seconds`,
+`capacity_backpressure_events` (aggregate only; no identifiers or secrets).
+
+**Traceability:** N01-AC01…AC22 → `inbox::test_processed_evidence_is_not_pruned_without_a_consumption_ack`,
+`test_one_hour_retention_cannot_erase_a_24h_hypothesis`,
+`test_extended_learning_outage_does_not_erase_eligible_records`,
+`test_poisoned_row_is_prunable_after_retention`,
+`test_acknowledged_row_is_prunable_after_retention`,
+`test_release_drift_acknowledgement_does_not_authorize_pruning`,
+`test_nondefinitive_measurement_does_not_authorize_pruning`,
+`test_mismatched_acknowledgement_identity_fails_closed`,
+`test_malformed_consumption_metadata_fails_closed`,
+`test_legacy_row_without_consumption_fields_is_retained`,
+`test_duplicate_delivery_cannot_reset_a_consumption_ack`,
+`test_consumption_acknowledgement_is_idempotent`,
+`test_consumption_bookkeeping_preserves_processing_state`,
+`test_capacity_backpressure_is_preserved_and_counted`,
+`test_inbox_status_reports_the_unconsumed_backlog`.
+
+
+### N-02 — complete candle coverage
+
+**Defect.** `evaluate_outcome()` only required *any* admissible candle, so a
+single bar could produce `MEASURED` or the definitive claim `NO_ENTRY_TOUCH`
+("the entry zone was never traded"), biasing learning evidence.
+
+**Eligible interval, defined.** With `t0` = frozen decision time, `H` =
+measurement duration, `t1 = t0 + H`, `Δ` = candle interval:
+
+- expected opens are the UTC epoch multiples of `Δ` starting strictly after `t0`;
+- a decision at 10:23 UTC makes 11:00 the first eligible bar; the 10:00–11:00 bar
+  carries pre-decision prices and is never eligible;
+- a bar is expected only if `open + Δ ≤ t1`;
+- `excluded_lead_seconds` / `excluded_tail_seconds` record the honest boundary
+  remainder. This is **not** continuous 24-hour price coverage — it is every
+  complete post-decision closed bar.
+
+**Correction.** Every expected open must be present exactly once, grid-aligned,
+complete and inside the window. Missing first/middle/last bars, truncated
+history, misaligned timestamps, conflicting duplicates and non-finite OHLC all
+produce the new non-definitive status `PARTIAL_COVERAGE` with bounded diagnostics
+(`coverage_status`, `coverage_reason`, `expected_candles`,
+`observed_valid_candles`, `missing_candles`, `missing_candle_opens` (≤6),
+`first_expected_open`, `last_expected_close`, `observation_window_end`,
+`excluded_lead_seconds`, `excluded_tail_seconds`). Identical duplicates collapse;
+conflicting ones fail closed; unordered responses are sorted deterministically.
+`PARTIAL_COVERAGE` never contributes to measured counts, false-positive rates or
+estimated profitability. A touch is still never a fill
+(`fill_attribution = NONE_TOUCH_INFERRED`).
+
+**Traceability:** N02-AC01…AC30 → `learning::test_single_candle_cannot_produce_a_measured_outcome`,
+`test_missing_middle_candle_is_nondefinitive`,
+`test_missing_final_candle_is_nondefinitive`,
+`test_truncated_history_is_nondefinitive`,
+`test_conflicting_duplicate_candles_fail_closed`,
+`test_identical_duplicate_candles_collapse`,
+`test_out_of_order_candles_are_ordered_deterministically`,
+`test_misaligned_candle_timestamp_is_nondefinitive`,
+`test_non_finite_ohlc_is_not_measured`,
+`test_partial_coverage_is_excluded_from_cohort_metrics`,
+`test_complete_coverage_measures_and_keeps_touch_semantics`,
+`test_complete_window_without_entry_touch_is_definitive`,
+`test_coverage_diagnostics_describe_the_boundaries`,
+`test_incomplete_window_is_not_part_of_the_measured_count`.
+
+### Requirement → AC → test map (no new AC identifiers)
+
+The active scope contract's ACs already own these paths (AC-010 inbox durability
+and terminal disposition, AC-012 exact-SHA learning, AC-014 noncanonical
+evidence). N-01/N-02 refine *how* those ACs are satisfied, so no new AC ids were
+created and the acceptance traceability set is unchanged; the contract records
+the amended invariants under FROZEN BOUNDARIES.
+
+### Fixture corrections (contract changes, not weakened assertions)
+
+Four learning fixtures and two job-level fixtures previously asserted definitive
+outcomes from two bars across a 24-hour window — precisely the N-02 defect. They
+now declare a matching 3-hour window (one acceptance fixture uses 2 hours), so
+the semantic intent is unchanged while coverage is genuinely complete. One
+retention test named for the old behaviour was narrowed to the poisoned case,
+because `PROCESSED` alone no longer authorises deletion. One acceptance fixture
+used a wall-clock trigger that lands inside the 60-second close tolerance at the
+top of an hour; it now triggers at the bar open, which is deterministic and still
+exercises the unfinished-bar refusal.
 

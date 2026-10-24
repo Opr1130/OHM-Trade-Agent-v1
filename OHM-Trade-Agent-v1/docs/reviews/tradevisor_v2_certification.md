@@ -369,3 +369,44 @@ learning-worker exact-SHA contract, F11 protection priority, the Wave 8.2
 bridge and paper/live isolation are all unchanged. Nothing was deployed or
 activated.
 
+
+
+## 12. Learning-integrity remediation — N-01 / N-02 (2026-10-24)
+
+Two review findings about learning evidence. Each was reproduced with a failing
+test first, then fixed with the smallest change that preserves the architecture.
+
+| ID | Finding | Before | After |
+| --- | --- | --- | --- |
+| **N-01** (P1) | Evidence pruned before durable consumption | `_prune()` deleted any terminal row past retention, so a `PROCESSED` row could be removed before its 24-hour measurement window elapsed — and a legal 1-hour retention removed it immediately | Retention requires either a non-learning terminal state (`POISONED`) or a valid durable acknowledgement (exact `dedup_id`, allowed disposition, **definitive** measurement status, **current** release SHA). Everything else is retained; capacity enforces the existing 503 backpressure; backlog is exposed in `inbox_status()` |
+| **N-02** (P2) | Partial history classified as a definitive outcome | `evaluate_outcome()` accepted a single admissible candle, so truncated history produced `MEASURED` or the definitive `NO_ENTRY_TOUCH` | Expected opens are derived from `t0`, `t1` and `Δ` on the UTC epoch grid; every expected bar must be present exactly once, aligned, complete and inside the window, else the new non-definitive `PARTIAL_COVERAGE` with bounded diagnostics. Partial coverage never reaches measured counts or profitability statistics |
+
+### Evidence lifecycle contract
+
+`receipt → evaluation → eligibility → measurement → consumption → safe retention`.
+Only `_retention_eligible()` authorises deletion, and it can never be satisfied
+by transport status alone. A release-drift or unverified acknowledgement cannot
+authorise pruning; neither can a `PENDING`/`PARTIAL_COVERAGE` measurement; an
+aggregate `CONSUMED_OK` report is not a per-record acknowledgement.
+
+### Operational limitation (disclosed, not hidden)
+
+No deployment unit invokes `report_tradevisor_learning`, and the learning worker
+has no reverse-write authority into production storage (frozen boundary P), so
+**no production process records an acknowledgement today**. Therefore eligible
+evidence is retained indefinitely, the inbox will eventually reach capacity, and
+ingress will return explicit 503 backpressure. That is the deliberate
+fail-closed trade-off: it prevents silent evidence loss and does not block
+trading, but the end-to-end consumption lifecycle is **not** fully operational
+until an owner authorises an acknowledgement writer or durable archival handoff.
+
+### Boundaries preserved
+
+No trading authority, order path, risk default, sizing, minimum R:R, R4 geometry,
+F5 attainability/economics, F7 capital, exposure limit, F11 priority,
+notification policy, canonical writer, selector, release-profile key, paper/live
+isolation or Wave 8.2 behaviour changed. `OPIP_TRADEVISOR_ENABLED` remains false
+by default; F6-absent still yields shadow-only `WATCH`; SWING still requires
+trusted completed 4H; G-03 remains the approved noncanonical shadow exception.
+No new service, database, queue, scheduler or host was introduced.
+

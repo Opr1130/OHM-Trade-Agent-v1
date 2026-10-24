@@ -283,3 +283,62 @@ A SELL alert is bearish/exit evidence only:
 source signal is **not** automatically classified SWING; the horizon comes from
 native volatility evidence, not from the source timeframe.
 
+
+
+## Evidence lifecycle and retention
+
+Receipt, evaluation, learning eligibility, measurement, consumption and safe
+retention are **separate** lifecycle events. Conflating them loses evidence.
+
+| Stage | Recorded as | Does *not* prove |
+| --- | --- | --- |
+| Receipt | a durable inbox row | that the alert was authorized |
+| Evaluation | `status = PROCESSED` / `REJECTED` | that learning consumed it |
+| Eligibility | a frozen `decision_record` | that a measurement exists |
+| Measurement | outcome `MEASURED` / `NO_ENTRY_TOUCH` | that the outcome was recorded anywhere |
+| Consumption | `row["consumption"]` acknowledgement | policy promotion |
+| Safe retention | `_retention_eligible()` | — |
+
+**Retention is fail-closed.** A row is pruned only when it is either in a
+non-learning terminal state (`POISONED`, which never produced a frozen decision)
+or carries a valid durable acknowledgement: exact `dedup_id`, allowed
+disposition, a **definitive** measurement status, and the **current** release
+SHA. Missing, malformed, drifted, unverified or non-definitive acknowledgements
+all block deletion. Duplicate webhook delivery never alters consumption state,
+and retention preserves claim tokens, decisions, notification state and retry
+counters.
+
+**Operational consequence.** No deployment unit runs
+`report_tradevisor_learning`, and the learning worker may not write back into
+production storage, so nothing records an acknowledgement in production today.
+Eligible evidence is therefore retained indefinitely; the inbox will reach its
+bounded capacity and the webhook will answer `503` rather than evict evidence.
+Watch `inbox_status()`: `unconsumed`, `retention_blocked`,
+`oldest_unconsumed_age_seconds`, `capacity_backpressure_events` (aggregate only).
+Enabling safe pruning requires an owner-approved acknowledgement writer or a
+durable archival handoff — a separate decision, deliberately not taken here.
+
+## Outcome measurement coverage
+
+A definitive outcome requires provably complete observation.
+
+With `t0` = decision time, `H` = measurement duration, `t1 = t0 + H` and `Δ` =
+candle interval, the expected bars are the UTC epoch multiples of `Δ` starting
+**strictly after** `t0`, each closing at or before `t1`. A decision at 10:23 UTC
+makes 11:00 the first eligible bar; the 10:00–11:00 bar carries pre-decision
+prices and is never used. Boundary remainders are recorded
+(`excluded_lead_seconds`, `excluded_tail_seconds`) rather than papered over: this
+is complete post-decision coverage, not continuous wall-clock coverage.
+
+If any expected bar is missing, duplicated with conflicting prices, misaligned to
+the grid, unfinished, outside the window, or carries non-finite OHLC, the outcome
+is `PARTIAL_COVERAGE` — never `MEASURED` and never the definitive
+`NO_ENTRY_TOUCH`. Partial coverage contributes nothing to measured counts,
+false-positive rates or estimated profitability. Identical duplicate bars
+collapse; unordered responses are sorted. A price touch is always evidence about
+price, never a fill (`fill_attribution = NONE_TOUCH_INFERRED`).
+
+Existing rows written before this change carry no `consumption` field. They are
+treated as **not consumed** and remain protected — missing metadata never
+defaults to "consumed".
+
