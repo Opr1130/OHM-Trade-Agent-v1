@@ -1206,6 +1206,204 @@ def test_ac_030_successful_retry_delivers_exactly_once(durable_inbox):
 
 
 # ---------------------------------------------------------------------------
+# AC-030 - the digest identity must name the exact observation set
+# ---------------------------------------------------------------------------
+
+
+def _settle_rows_that_differ_only_by_identity(inbox, count: int, *, market: str = "BTCUSD"):
+    """Settle durable rows whose only distinguishing fact is their dedup identity.
+
+    Distinct ``dedup_id`` values are distinct inbox rows even when market,
+    rejection code and source bar close are identical, so this builds the exact
+    collision the digest identity has to survive.
+    """
+    from app.services import tradevisor_observation as observation
+
+    for index in range(count):
+        inbox.enqueue(
+            signal(
+                dedup_id=f"identity-only-{index}-{market}",
+                market=market,
+                instrument=f"{market[:-3]}/USD",
+                source_symbol=market,
+            ),
+            now=NOW,
+        )
+    for _ in range(10):
+        result = inbox.process_queued_events(
+            evaluator=lambda queued: pipeline_result(queued, equity=10_000.0), now=NOW
+        )
+        if int(result.get("checked", 0) or 0) == 0:
+            break
+    return observation.pending_observations(now=NOW, settings=settings())
+
+
+def test_ac_030_fingerprint_separates_rows_that_differ_only_by_identity(durable_inbox):
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-030: a digest names the rows it carries."""
+    from app.services import tradevisor_observation as observation
+
+    pending = _settle_rows_that_differ_only_by_identity(durable_inbox, 3)
+    assert len(pending) == 3
+    # Market, rejection code and bar close are identical across all three rows:
+    # only the durable identity distinguishes them.
+    assert (
+        len(
+            {
+                (row["market"], row["rejection_code"], row["source_bar_closed_at"])
+                for row in pending
+            }
+        )
+        == 1
+    )
+    first, second, third = pending
+    assert len({observation._fingerprint([row]) for row in (first, second, third)}) == 3
+    # Exact-set identity, and still independent of discovery order.
+    assert observation._fingerprint([first, second]) != observation._fingerprint(
+        [first, third]
+    )
+    assert observation._fingerprint([first, second]) != observation._fingerprint([first])
+    assert observation._fingerprint([first, second]) == observation._fingerprint(
+        [second, first]
+    )
+
+
+def test_ac_030_delivery_never_acknowledges_a_different_pending_row(durable_inbox):
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-030: an acknowledgement covers only sent rows."""
+    from app.services import notification_policy
+    from app.services import tradevisor_observation as observation
+    from app.services.registry_io import load_json
+
+    pending = _settle_rows_that_differ_only_by_identity(durable_inbox, 2)
+    assert len(pending) == 2
+    delivered_row, withheld_row = pending
+    sent: list[str] = []
+    calls: list[dict] = []
+
+    def sender(**kwargs):
+        calls.append(kwargs)
+        sent.append(kwargs["message"])
+        return SimpleNamespace(delivered=True, message_id=len(sent))
+
+    first = observation.send_observation_digest(
+        [delivered_row], settings=_delivery_settings(), now=NOW, sender=sender
+    )
+    assert first.status == observation.STATUS_DELIVERED
+    assert len(sent) == 1
+    # One fingerprint governs the transport call, the policy record and the
+    # confirmation, so all three agree on what was delivered.
+    assert calls[0]["fingerprint"] == observation._fingerprint([delivered_row])
+    key = f"{observation.OBSERVATION_IDENTITY}:{observation.OBSERVATION_EVENT_TYPE}"
+    recorded = load_json(notification_policy.STATE_FILE).get(key) or {}
+    assert recorded.get("fingerprint") == calls[0]["fingerprint"]
+
+    assert observation.observation_already_reported(delivered_row["dedup_id"]) is True
+    # The sibling was never transmitted, so it must keep both its evidence and
+    # its unreported status.
+    assert observation.observation_already_reported(withheld_row["dedup_id"]) is False
+    assert [
+        row["dedup_id"]
+        for row in observation.pending_observations(now=NOW, settings=settings())
+    ] == [withheld_row["dedup_id"]]
+
+    # Inside the cooldown the sibling is deferred, never falsely acknowledged.
+    blocked = observation.send_observation_digest(
+        [withheld_row], settings=_delivery_settings(), now=NOW, sender=sender
+    )
+    assert blocked.status == observation.STATUS_SUPPRESSED_POLICY
+    assert blocked.delivered is False
+    assert (blocked.retry_after_seconds or 0) > 0
+    assert len(sent) == 1
+    assert observation.observation_already_reported(withheld_row["dedup_id"]) is False
+
+    # After the reconciled cooldown the deferred row becomes deliverable, once.
+    later = NOW + timedelta(hours=7)
+    recovered = observation.send_observation_digest(
+        observation.pending_observations(now=later, settings=settings()),
+        settings=_delivery_settings(),
+        now=later,
+        sender=sender,
+    )
+    assert recovered.status == observation.STATUS_DELIVERED
+    assert len(sent) == 2
+    assert observation.pending_observations(now=later, settings=settings()) == []
+
+
+def test_ac_030_retry_repairs_the_missing_acknowledgement_of_the_same_identity(
+    durable_inbox, monkeypatch
+):
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-030: a stable identity repairs a lost ack."""
+    from app.services import tradevisor_observation as observation
+
+    pending = _settle_rows_that_differ_only_by_identity(durable_inbox, 1)
+    assert len(pending) == 1
+    row = pending[0]
+    fingerprint = observation._fingerprint([row])
+    sent: list[str] = []
+
+    original_marker = observation._mark_reported
+    monkeypatch.setattr(observation, "_mark_reported", lambda *_args, **_kwargs: 0)
+    first = observation.send_observation_digest(
+        [row], settings=_delivery_settings(), now=NOW, sender=_sender(sent)
+    )
+    assert first.status == observation.STATUS_DELIVERED
+    monkeypatch.setattr(observation, "_mark_reported", original_marker)
+    assert len(sent) == 1
+
+    # The same observation keeps the same identity across the retry ...
+    assert observation._fingerprint([row]) == fingerprint
+    assert observation.observation_already_reported(row["dedup_id"]) is False
+
+    repaired = observation.send_observation_digest(
+        [row], settings=_delivery_settings(), now=NOW, sender=_sender(sent)
+    )
+    assert repaired.status == observation.STATUS_ALREADY_DELIVERED
+    assert repaired.delivered is False
+    assert len(sent) == 1, "an already-confirmed digest must never be resent"
+    # ... so the missing acknowledgement is repaired instead of lost.
+    assert observation.observation_already_reported(row["dedup_id"]) is True
+    assert observation.pending_observations(now=NOW, settings=settings()) == []
+
+
+def test_ac_030_missing_or_malformed_identity_fails_closed(durable_inbox):
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-030: an unidentifiable row is never delivered."""
+    from app.services import tradevisor_observation as observation
+
+    pending = _settle_rows_that_differ_only_by_identity(durable_inbox, 1)
+    assert len(pending) == 1
+    identifiable = pending[0]
+    sent: list[str] = []
+    malformed: tuple[object, ...] = (
+        None,
+        "",
+        "   ",
+        0,
+        12345,
+        {"id": "x"},
+        ["x"],
+        "bad\x00identity",
+        "broken\nidentity",
+    )
+
+    for value in malformed:
+        broken = dict(identifiable)
+        broken["dedup_id"] = value
+        outcome = observation.send_observation_digest(
+            [identifiable, broken],
+            settings=_delivery_settings(),
+            now=NOW,
+            sender=_sender(sent),
+        )
+        assert outcome.status == observation.STATUS_SEND_FAILED, value
+        assert outcome.delivered is False, value
+        assert "identity" in (outcome.reason or "").lower(), value
+
+    assert sent == []
+    # A refused digest must not acknowledge anything, so the row stays pending.
+    assert observation.observation_already_reported(identifiable["dedup_id"]) is False
+    assert len(observation.pending_observations(now=NOW, settings=settings())) == 1
+
+
+# ---------------------------------------------------------------------------
 # AC-031 - provenance is durable end to end
 # ---------------------------------------------------------------------------
 

@@ -20,6 +20,7 @@ This module renders that cohort as an OBSERVATION. Hard rules:
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -204,10 +205,28 @@ def observation_already_reported(dedup_id: object) -> bool:
     return f"{_marker_identity(key)}:{OBSERVATION_EVENT_TYPE}" in _policy_state()
 
 
+def _stable_identity(row: dict) -> str | None:
+    """Return the row's durable dedup identity, or ``None`` when it is unusable.
+
+    A digest that cannot name its own observations can neither be delivered
+    distinctly nor acknowledged per row: an identity-less row would collide with
+    every other identity-less row, so it is refused rather than guessed at.
+    """
+    value = row.get("dedup_id")
+    if not isinstance(value, str):
+        return None
+    identity = value.strip()
+    if not identity:
+        return None
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in identity):
+        return None
+    return identity
+
+
 def _content_fingerprint(candidate: dict) -> str:
     material = "|".join(
         (
-            str(candidate.get("dedup_id") or ""),
+            _stable_identity(candidate) or "",
             str(candidate.get("rejection_code") or ""),
             str(candidate.get("source_bar_closed_at") or ""),
         )
@@ -712,13 +731,24 @@ def format_observation_digest(
 
 
 def _fingerprint(candidates: list[dict]) -> str:
-    material = "|".join(
-        sorted(
-            f"{row.get('market')}:{row.get('rejection_code')}:"
-            f"{row.get('source_bar_closed_at')}"
-            for row in candidates[:MAX_OBSERVATIONS_PER_DIGEST]
+    """Deterministic identity of the exact observation set inside one digest.
+
+    The durable dedup identity is part of the fingerprint because two rows that
+    share market, rejection code and source bar close are still two different
+    observations: excluding it would let the ALREADY_DELIVERED recovery path
+    acknowledge a row that was never transmitted. Sorting keeps the value
+    independent of discovery order while remaining an exact-set identity.
+    """
+    rows = sorted(
+        (
+            _stable_identity(row) or "",
+            str(row.get("market") or ""),
+            str(row.get("rejection_code") or ""),
+            str(row.get("source_bar_closed_at") or ""),
         )
+        for row in candidates[:MAX_OBSERVATIONS_PER_DIGEST]
     )
+    material = json.dumps(rows, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
@@ -758,6 +788,18 @@ def send_observation_digest(
             observed=len(bounded),
             suppressed_bounded=suppressed,
             reason="Telegram delivery is not enabled or configured",
+        )
+
+    if any(_stable_identity(row) is None for row in bounded):
+        # Fail closed: without a stable identity the digest can neither be
+        # fingerprinted distinctly nor acknowledged per row, and sending it would
+        # strand the evidence behind a permanent false acknowledgement.
+        return ObservationOutcome(
+            status=STATUS_SEND_FAILED,
+            observed=len(bounded),
+            suppressed_bounded=suppressed,
+            delivered=False,
+            reason="observation identity is missing or malformed; refusing to deliver",
         )
 
     message = format_observation_digest(bounded, now=now, suppressed=suppressed)
