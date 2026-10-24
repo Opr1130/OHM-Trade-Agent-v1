@@ -107,6 +107,26 @@ STATUS_SUPPRESSED_POLICY = "SUPPRESSED_POLICY"
 STATUS_ALREADY_DELIVERED = "ALREADY_DELIVERED"
 STATUS_SEND_FAILED = "SEND_FAILED"
 STATUS_TELEGRAM_DISABLED = "TELEGRAM_DISABLED"
+#: The rendering guard refused the content, so nothing was sent or recorded.
+STATUS_FORMAT_REFUSED = "FORMAT_REFUSED"
+
+
+class ObservationRenderRefused(ValueError):
+    """Rendered content read like a trade instruction; the guard refused it.
+
+    A dedicated type (still a ``ValueError``) lets the delivery boundary report
+    a refusal as a non-delivery outcome without swallowing unrelated faults.
+    """
+
+
+def observations_enabled(settings) -> bool:
+    """True only when the advisory observation message class is switched on.
+
+    Callers use this to skip the recovery scan entirely while the class is off.
+    ``send_observation_digest`` keeps its own guard, so a direct call still
+    returns an explicit ``STATUS_DISABLED`` outcome.
+    """
+    return bool(getattr(settings, "opip_tradevisor_observation_enabled", False))
 
 
 @dataclass(frozen=True)
@@ -195,6 +215,26 @@ def _notification_state_file():
     from app.services import notification_policy
 
     return notification_policy.STATE_FILE
+
+
+def _acknowledged_identities(state: dict) -> frozenset[str]:
+    """Durable per-row acknowledgements present in ONE policy-state snapshot.
+
+    Reading the snapshot once per pass turns acknowledgement filtering into a
+    membership test, so the cost no longer multiplies by the inbox row count.
+    Only the exact ``TRADEVISOR:OBSERVED:<dedup>:ADVISORY_OBSERVATION`` key
+    acknowledges a row; near-miss keys never do.
+    """
+    suffix = f":{OBSERVATION_EVENT_TYPE}"
+    identities: set[str] = set()
+    for key in state:
+        text = str(key)
+        if not text.startswith(OBSERVATION_MARKER_PREFIX) or not text.endswith(suffix):
+            continue
+        identity = text[len(OBSERVATION_MARKER_PREFIX) : -len(suffix)]
+        if identity:
+            identities.add(identity)
+    return frozenset(identities)
 
 
 def observation_already_reported(dedup_id: object) -> bool:
@@ -511,6 +551,9 @@ def pending_observations(
     horizon = reference - timedelta(minutes=window_minutes)
 
     candidates: list[dict] = []
+    # One snapshot for the whole pass: acknowledgement filtering must not read
+    # the shared notification state once per inbox row.
+    acknowledged = _acknowledged_identities(_policy_state())
     for row in records if records is not None else _inbox_records():
         candidate = candidate_from_record(row, now=reference)
         if candidate is None:
@@ -518,7 +561,8 @@ def pending_observations(
         stamp = _stamp(candidate.get("evaluated_at"))
         if stamp is None or stamp < horizon:
             continue
-        if observation_already_reported(candidate.get("dedup_id")):
+        dedup_id = str(candidate.get("dedup_id") or "").strip()
+        if dedup_id and dedup_id in acknowledged:
             continue
         candidates.append(candidate)
 
@@ -562,6 +606,7 @@ def observation_backlog(
         "undated": 0,
         "eligible": 0,
     }
+    acknowledged = _acknowledged_identities(_policy_state())
     for row in records if records is not None else _inbox_records():
         counts["total_rows"] += 1
         candidate = candidate_from_record(row, now=reference)
@@ -572,7 +617,8 @@ def observation_backlog(
         if stamp is None:
             counts["undated"] += 1
             continue
-        if observation_already_reported(candidate.get("dedup_id")):
+        dedup_id = str(candidate.get("dedup_id") or "").strip()
+        if dedup_id and dedup_id in acknowledged:
             counts["already_reported"] += 1
             continue
         if stamp < horizon:
@@ -694,7 +740,9 @@ def _guard(text: str) -> str:
     upper = text.upper()
     for phrase in FORBIDDEN_PHRASES:
         if phrase.upper() in upper:
-            raise ValueError(f"observation text contains a forbidden instruction: {phrase}")
+            raise ObservationRenderRefused(
+                f"observation text contains a forbidden instruction: {phrase}"
+            )
     return text
 
 
@@ -766,7 +814,7 @@ def send_observation_digest(
     status and never a pretended delivery.
     """
     now = now or datetime.now(timezone.utc)
-    if not bool(getattr(settings, "opip_tradevisor_observation_enabled", False)):
+    if not observations_enabled(settings):
         return ObservationOutcome(
             status=STATUS_DISABLED, reason="observations are disabled by configuration"
         )
@@ -802,7 +850,22 @@ def send_observation_digest(
             reason="observation identity is missing or malformed; refusing to deliver",
         )
 
-    message = format_observation_digest(bounded, now=now, suppressed=suppressed)
+    try:
+        message = format_observation_digest(bounded, now=now, suppressed=suppressed)
+    except ObservationRenderRefused:
+        # Refused before any policy check, reservation, transport call,
+        # confirmation or acknowledgement, so the rows stay pending and the job
+        # survives. The reason is sanitized: the matched phrase is never echoed.
+        return ObservationOutcome(
+            status=STATUS_FORMAT_REFUSED,
+            observed=len(bounded),
+            suppressed_bounded=suppressed,
+            delivered=False,
+            reason=(
+                "observation rendering refused the content "
+                f"({ObservationRenderRefused.__name__}); nothing was sent or recorded"
+            ),
+        )
     fingerprint = _fingerprint(bounded)
     cooldown_seconds = _effective_cooldown_seconds(settings)
 

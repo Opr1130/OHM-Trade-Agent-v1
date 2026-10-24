@@ -494,11 +494,16 @@ def test_ac_026_observation_and_actionable_delivery_are_mutually_exclusive():
 
 
 def _candidates(count: int):
+    """``count`` distinct observation rows (each with its own durable identity)."""
     from app.services import tradevisor_observation as observation
 
     rows = []
     for index in range(count):
         candidate = observation.observation_candidate(evaluate(), now=NOW)
+        # These represent distinct durable rows, so they must carry distinct
+        # dedup identities; reusing one id would model a single row ``count``
+        # times and hide per-row acknowledgement behaviour.
+        candidate["dedup_id"] = f"digest-candidate-{index}"
         candidate["market"] = f"TEST{index}USD"
         candidate["instrument"] = f"TEST{index}/USD"
         rows.append(candidate)

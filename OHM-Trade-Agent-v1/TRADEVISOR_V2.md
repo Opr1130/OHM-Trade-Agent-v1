@@ -588,3 +588,23 @@ Acknowledgement markers are pruned on the acknowledgement path itself (and by
 digest, alert and budget entries in the same state file are never modified. A
 digest of N rows still consumes exactly **one** noncritical attention slot,
 because acknowledgements are bookkeeping rather than new cards.
+
+### Lookup cost, and the shared-state limit
+
+The recovery scan reads the notification state **once per pass** and filters rows
+by membership, so its cost is `O(rows + state)` rather than `O(rows × state)`.
+Measured on a developer host (median of repeated runs): with 3,600 markers a
+2,000-row scan takes ~25 ms instead of ~10.5 s; with 20,000 markers ~52 ms
+instead of ~56 s. There is no zero-overhead claim: a scan still builds one
+candidate per row, and the single state parse still costs ~0.1 ms (empty),
+~4.9 ms (3,600 markers) and ~31 ms (20,000 markers).
+
+The markers deliberately live in the existing notification-policy state, so the
+protection path still parses that file per decision. At the governed cadence the
+population is bounded by roughly 120 acknowledgements/day over the 30-day
+retention (~3,600 keys, ~400 KB). **Known limit:** if observation volume grows
+well beyond that, every protection decision inherits the larger parse. Isolating
+observation markers into their own store is a real design change and is
+deliberately **not** implemented here: it would need its own owner-approved
+increment, its own durability/lock contract and its own fail-closed review. No
+new persistence subsystem was introduced by this integration.

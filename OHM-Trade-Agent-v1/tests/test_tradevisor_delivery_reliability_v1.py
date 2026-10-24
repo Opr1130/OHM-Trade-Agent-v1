@@ -50,6 +50,16 @@ def delivery_settings(**over) -> Settings:
     return settings(**values)
 
 
+def enabled_settings(**over) -> Settings:
+    """Settings with Tradevisor ingress enabled (config requires a token)."""
+    values = dict(
+        opip_tradevisor_enabled=True,
+        opip_tradevisor_webhook_token="T" * 43,
+    )
+    values.update(over)
+    return settings(**values)
+
+
 @pytest.fixture(autouse=True)
 def isolated_state(tmp_path, monkeypatch):
     """Policy state, budget and lock all live inside the test's tmp_path."""
@@ -148,7 +158,6 @@ def settle(
 ) -> dict:
     """Enqueue and settle ``count`` observations through the real inbox."""
     for index in range(offset, offset + count):
-        name = MARKETS[index % len(MARKETS)]
         inbox.enqueue(observation_signal(index, when=when), now=when)
     totals = {"checked": 0, "processed": 0}
     for _ in range(20):
@@ -515,3 +524,361 @@ def test_ac_038_observation_lookup_stays_bounded_with_many_markers(tmp_path):
     assert observation.observation_already_reported("absent") is False
     elapsed = (datetime.now(timezone.utc) - started).total_seconds()
     assert elapsed < 5.0, f"marker lookup took {elapsed:.2f}s with 20000 markers"
+
+
+# ===========================================================================
+# AC-036 / AC-038 - operational hardening (cost, boundary, real transport)
+# ===========================================================================
+
+
+def _durable_record(index: int) -> dict:
+    """One settled inbox row in its durable shape, with a distinct identity."""
+    dedup = f"row-{index}"
+    return {
+        "dedup_id": dedup,
+        "signal": {"market": "BTCUSD", "dedup_id": dedup},
+        "decision_record": {
+            "rejection_code": "ADVISORY_EVIDENCE_INCOMPLETE",
+            "decision": "WATCH",
+            "dedup_id": dedup,
+            "market": "BTCUSD",
+            "evaluated_at": NOW.isoformat(),
+            "timeframe_minutes": 60,
+            "evidence": {"timing": {"source_bar_closed_at": BAR_OPEN.isoformat()}},
+        },
+    }
+
+
+def _count_policy_reads(monkeypatch) -> list:
+    """Record every notification-state read this module performs."""
+    reads: list = []
+    real_load = observation.load_json
+
+    def counting(path):
+        reads.append(path)
+        return real_load(path)
+
+    monkeypatch.setattr(observation, "load_json", counting)
+    return reads
+
+
+def test_ac_038_disabled_observation_path_skips_inbox_and_policy_reads(
+    monkeypatch, capsys
+):
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-038: an off class must cost nothing."""
+    from app.jobs import drain_tradevisor_inbox as drain
+
+    processed: list[int] = []
+    reads = _count_policy_reads(monkeypatch)
+    monkeypatch.setattr(drain, "get_settings", lambda: enabled_settings())
+    monkeypatch.setattr(
+        drain,
+        "process_queued_events",
+        lambda evaluator: processed.append(1) or {"checked": 0, "processed": 0},
+    )
+    monkeypatch.setattr(drain, "pending_count", lambda: 0)
+    monkeypatch.setattr(
+        drain,
+        "pending_observations",
+        lambda **kwargs: pytest.fail("disabled observations performed an inbox scan"),
+    )
+    monkeypatch.setattr(
+        drain,
+        "send_observation_digest",
+        lambda *args, **kwargs: pytest.fail("disabled observations attempted delivery"),
+    )
+
+    drain.main()
+
+    # The Tradevisor drain itself is untouched by the observation switch.
+    assert processed, "queued Tradevisor processing must still run"
+    assert reads == [], "the disabled path must not read the notification state"
+    assert "observations: DISABLED" in capsys.readouterr().out
+
+
+def test_ac_038_disabled_observation_path_keeps_drain_and_lease_recovery(monkeypatch):
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-038: expiry recovery is not disabled."""
+    from app.jobs import run_cycle
+    from app.services import tradevisor_inbox, tradevisor_pipeline
+
+    processed: list[int] = []
+    monkeypatch.setattr(run_cycle, "get_settings", lambda: enabled_settings())
+    monkeypatch.setattr(
+        tradevisor_inbox,
+        "process_queued_events",
+        lambda evaluator: processed.append(1) or {"checked": 0, "processed": 0},
+    )
+    monkeypatch.setattr(tradevisor_inbox, "pending_count", lambda: 0)
+    monkeypatch.setattr(
+        tradevisor_pipeline,
+        "retry_undelivered_notifications",
+        lambda **kwargs: {"candidates": 0, "delivered": 0, "not_actionable": 0},
+    )
+    monkeypatch.setattr(
+        observation,
+        "pending_observations",
+        lambda **kwargs: pytest.fail("disabled observations performed an inbox scan"),
+    )
+    monkeypatch.setattr(
+        observation,
+        "send_observation_digest",
+        lambda *args, **kwargs: pytest.fail("disabled observations attempted delivery"),
+    )
+
+    run_cycle._run_tradevisor_fail_open()
+
+    assert processed, "lease reclamation still runs inside process_queued_events"
+
+
+def test_ac_038_recovery_lookup_reads_policy_state_once_at_any_scale(
+    tmp_path, monkeypatch
+):
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-038: reads are O(1) in rows and state."""
+    stamp = (NOW - timedelta(hours=1)).isoformat()
+    _seed_state(
+        tmp_path,
+        {
+            f"{observation.OBSERVATION_MARKER_PREFIX}settled-{index}:"
+            f"{observation.OBSERVATION_EVENT_TYPE}": {
+                "fingerprint": "f",
+                "sent_at": stamp,
+            }
+            for index in range(3600)
+        },
+    )
+    reads = _count_policy_reads(monkeypatch)
+
+    for rows in (2000, 50000):
+        records = [_durable_record(index) for index in range(rows)]
+        reads.clear()
+        pending = observation.pending_observations(
+            now=NOW, records=records, settings=settings()
+        )
+        assert len(reads) == 1, (
+            f"{rows} rows and 3600 markers must still take one policy-state read, "
+            f"took {len(reads)}"
+        )
+        # The per-call cap is unchanged: the remainder stays recoverable.
+        assert len(pending) == observation.MAX_OBSERVATIONS_PER_DIGEST * 4
+
+
+def test_ac_038_malformed_markers_never_acknowledge_unrelated_rows(
+    durable_inbox, tmp_path
+):
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-038: only the exact marker acknowledges."""
+    settle(durable_inbox, 1)
+    row = _pending(now=NOW)[0]
+    dedup = row["dedup_id"]
+    prefix = observation.OBSERVATION_MARKER_PREFIX
+    event = observation.OBSERVATION_EVENT_TYPE
+    near_misses = {
+        f"{prefix}{dedup}": {"sent_at": NOW.isoformat()},
+        f"{prefix}{dedup}:SOME_OTHER_EVENT": {"sent_at": NOW.isoformat()},
+        f"{prefix}:{event}": {"sent_at": NOW.isoformat()},
+        f"{prefix}{dedup}:{event}x": {"sent_at": NOW.isoformat()},
+        f"{prefix}other-{dedup}:{event}": {"sent_at": NOW.isoformat()},
+    }
+    _seed_state(tmp_path, near_misses)
+
+    assert len(_pending(now=NOW)) == 1, "a near-miss marker must not acknowledge"
+
+    # Presence of the exact key is the durable acknowledgement contract, so a
+    # corrupt value can never resurrect an already delivered row.
+    _seed_state(tmp_path, {f"{prefix}{dedup}:{event}": "corrupt"})
+    assert _pending(now=NOW) == []
+
+
+def test_ac_038_confirmed_emission_without_marker_keeps_rows_pending(durable_inbox):
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-038: crash after confirm stays recoverable."""
+    settle(durable_inbox, 1)
+    pending = _pending(now=NOW)
+    fingerprint = observation._fingerprint(
+        pending[: observation.MAX_OBSERVATIONS_PER_DIGEST]
+    )
+    # The confirmation landed, then the process died before the acknowledgement.
+    notification_policy.record_emitted(
+        identity=observation.OBSERVATION_IDENTITY,
+        event_type=observation.OBSERVATION_EVENT_TYPE,
+        fingerprint=fingerprint,
+        now=NOW,
+    )
+    assert len(_pending(now=NOW)) == 1
+
+    sent: list[str] = []
+    repaired = observation.send_observation_digest(
+        pending, settings=delivery_settings(), now=NOW, sender=sender(sent)
+    )
+    assert repaired.status == observation.STATUS_ALREADY_DELIVERED
+    assert sent == [], "a confirmed emission must never be transmitted twice"
+    assert _pending(now=NOW) == []
+
+
+def test_ac_038_cross_row_acknowledgement_filters_only_its_own_row(durable_inbox):
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-038: an ack is per durable identity."""
+    settle(durable_inbox, 2)
+    first, second = _pending(now=NOW)
+
+    assert observation._mark_reported([first], now=NOW) == 1
+
+    remaining = _pending(now=NOW)
+    assert [row["dedup_id"] for row in remaining] == [second["dedup_id"]]
+
+
+def test_ac_036_formatting_refusal_is_a_reported_non_delivery(durable_inbox):
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-036: a refused render sends nothing."""
+    settle(durable_inbox, 1)
+    pending = _pending(now=NOW)
+    poisoned = dict(pending[0])
+    poisoned["abstention_reason"] = "ACTIONABLE"
+    sent: list[str] = []
+
+    outcome = observation.send_observation_digest(
+        [poisoned], settings=delivery_settings(), now=NOW, sender=sender(sent)
+    )
+
+    assert outcome.status == observation.STATUS_FORMAT_REFUSED
+    assert outcome.delivered is False
+    assert sent == [], "a refused render must not reach the transport"
+    # The reason is sanitized: the forbidden phrase itself is never echoed.
+    assert "ACTIONABLE" not in (outcome.reason or "")
+    assert "refused" in (outcome.reason or "").lower()
+
+    # No reservation, confirmation or acknowledgement was taken.
+    state_path = notification_policy.STATE_FILE
+    state = (
+        json.loads(state_path.read_text(encoding="utf-8"))
+        if state_path.exists()
+        else {}
+    )
+    assert (
+        f"{observation.OBSERVATION_IDENTITY}:{observation.OBSERVATION_EVENT_TYPE}"
+        not in state
+    )
+    assert not [
+        key for key in state if key.startswith(observation.OBSERVATION_MARKER_PREFIX)
+    ]
+    assert len(_pending(now=NOW)) == 1
+
+
+def test_ac_036_standalone_drain_survives_an_observation_formatting_refusal(
+    durable_inbox, monkeypatch, capsys
+):
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-036: a refused render cannot kill the job."""
+    from app.jobs import drain_tradevisor_inbox as drain
+
+    settle(durable_inbox, 1)
+    poisoned = dict(_pending(now=NOW)[0])
+    poisoned["abstention_reason"] = "ACTIONABLE"
+    monkeypatch.setattr(
+        drain,
+        "get_settings",
+        lambda: delivery_settings(
+            opip_tradevisor_enabled=True, opip_tradevisor_webhook_token="T" * 43
+        ),
+    )
+    monkeypatch.setattr(drain, "process_queued_events", lambda evaluator: {"checked": 0})
+    monkeypatch.setattr(drain, "pending_count", lambda: 0)
+    monkeypatch.setattr(drain, "pending_observations", lambda **kwargs: [poisoned])
+
+    drain.main()  # must not raise
+
+    assert observation.STATUS_FORMAT_REFUSED in capsys.readouterr().out
+
+
+def _isolate_delivery_ledger(monkeypatch, tmp_path) -> None:
+    """Point the real wrapper's ledger at tmp_path (destination, not transport)."""
+    from app.services import telegram_delivery
+
+    defaults = telegram_delivery.send_tracked_telegram.__kwdefaults__
+    monkeypatch.setitem(defaults, "state_file", tmp_path / "delivery_state.json")
+    monkeypatch.setitem(defaults, "event_file", tmp_path / "delivery_events.jsonl")
+
+
+def test_ac_036_production_sender_contract_is_satisfied_end_to_end(
+    durable_inbox, tmp_path, monkeypatch
+):
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-036: the real wrapper accepts the call."""
+    from app.services import telegram_delivery, telegram_notifier
+
+    _isolate_delivery_ledger(monkeypatch, tmp_path)
+    transmission: list[tuple] = []
+
+    def fake_network(bot_token, chat_id, message):
+        transmission.append((bot_token, chat_id, message))
+        return 4242
+
+    monkeypatch.setattr(telegram_delivery, "send_telegram_message_with_id", fake_network)
+    # Any real network attempt is a test failure, not a silent pass.
+    monkeypatch.setattr(
+        telegram_notifier.httpx, "post", lambda *a, **k: pytest.fail("network attempted")
+    )
+
+    settle(durable_inbox, 2)
+    pending = _pending(now=NOW)
+    expected = observation._fingerprint(
+        pending[: observation.MAX_OBSERVATIONS_PER_DIGEST]
+    )
+
+    outcome = observation.send_observation_digest(
+        pending, settings=delivery_settings(), now=NOW
+    )
+
+    assert outcome.status == observation.STATUS_DELIVERED
+    assert outcome.delivered is True
+    assert len(transmission) == 1, "exactly one external transmission"
+    bot_token, chat_id, message = transmission[0]
+    assert (bot_token, chat_id) == ("bot-token", "chat-id")
+    assert observation.OBSERVATION_TITLE in message
+    for phrase in observation.FORBIDDEN_PHRASES:
+        assert phrase.upper() not in message.upper()
+
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "delivery_events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    assert events, "the production wrapper must record the delivery"
+    recorded = events[-1]
+    assert recorded["identity"] == observation.OBSERVATION_IDENTITY
+    assert recorded["event_type"] == observation.OBSERVATION_EVENT_TYPE
+    assert recorded["alert_family"] == observation.OBSERVATION_FAMILY
+    assert recorded["fingerprint"] == expected
+    assert recorded["status"] == "DELIVERED"
+    assert recorded["message_id"] == 4242
+    assert recorded["signal_id"] == expected[:16]
+    assert _pending(now=NOW) == []
+
+
+def test_ac_036_production_sender_negative_outcomes_never_acknowledge(
+    durable_inbox, tmp_path, monkeypatch
+):
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-036: a refused transport acks nothing."""
+    from app.services import telegram_delivery
+
+    _isolate_delivery_ledger(monkeypatch, tmp_path)
+    settle(durable_inbox, 1)
+    pending = _pending(now=NOW)
+
+    def raising(bot_token, chat_id, message):
+        raise RuntimeError("socket closed")
+
+    monkeypatch.setattr(telegram_delivery, "send_telegram_message_with_id", raising)
+    failed = observation.send_observation_digest(
+        pending, settings=delivery_settings(), now=NOW
+    )
+    assert failed.status == observation.STATUS_SEND_FAILED
+    assert failed.delivered is False
+    assert len(_pending(now=NOW)) == len(pending)
+
+    # A transport that accepts the call but returns no message id is not delivery.
+    monkeypatch.setattr(
+        telegram_delivery, "send_telegram_message_with_id", lambda *a: None
+    )
+    refused = observation.send_observation_digest(
+        _pending(now=NOW), settings=delivery_settings(), now=NOW
+    )
+    assert refused.status == observation.STATUS_SEND_FAILED
+    assert refused.delivered is False
+    assert len(_pending(now=NOW)) == len(pending)
