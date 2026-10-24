@@ -608,3 +608,33 @@ observation markers into their own store is a real design change and is
 deliberately **not** implemented here: it would need its own owner-approved
 increment, its own durability/lock contract and its own fail-closed review. No
 new persistence subsystem was introduced by this integration.
+
+### Digests are bounded by the transport contract
+
+Telegram rejects a message longer than 4,096 UTF-16 code units, and the
+transport wrapper forwards this message family unchanged (its legacy compaction
+only rewrites the old `OHM CHIEF` layout). The digest is therefore bounded
+before any reservation: the renderer keeps the largest deterministic prefix of
+eligible observations whose fully detailed rendering fits
+`DIGEST_MESSAGE_BUDGET` (3,800 UTF-16 units, a deliberate margin), reducing the
+**number** of observations rather than shortening any included one. A single
+record that cannot fit at full detail is rendered compactly (instrument, market,
+bar close, rejection class and an explicit omission note). If even that exceeds
+the budget nothing is sent: `MESSAGE_TOO_LONG` is returned with no reservation,
+confirmation or acknowledgement.
+
+Fingerprint, reservation, transport record and durable acknowledgement are
+computed from exactly the rows in the rendered digest, so excluded rows stay
+pending and are delivered once eligible. This bounds a message; it changes no
+trading, risk or authority behaviour.
+
+### Account risk is reported against total equity
+
+F7's allocation remains the economic notional. The final F5 call receives total
+equity as available capital with the F7-approved fraction
+(`allocation / equity`), which keeps `recommended_capital`, `position_notional`,
+target profits, costs and the qualification/R:R thresholds identical while
+making `account_risk_at_stop_pct` the stop-loss share of the account rather than
+the raw stop distance. A non-finite, zero or negative equity denominator is
+refused as `CAPITAL_INCONSISTENT / INVALID_EQUITY_DENOMINATOR`; it is never
+divided by.

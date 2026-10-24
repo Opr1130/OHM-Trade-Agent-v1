@@ -52,6 +52,15 @@ OBSERVATION_IDENTITY = "TRADEVISOR:OBSERVATION"
 
 MAX_OBSERVATIONS_PER_DIGEST = 5
 
+#: Telegram rejects a message longer than this many UTF-16 code units.
+TELEGRAM_MAX_MESSAGE_UNITS = 4096
+#: Conservative rendered budget. The margin covers the transport's own
+#: formatting step and any future header/footer growth, so a digest that fits
+#: this budget can never be rejected for length.
+DIGEST_MESSAGE_BUDGET = 3800
+#: Disclosure used when one record cannot be rendered at full detail.
+COMPACT_OBSERVATION_NOTE = "detail omitted: message budget"
+
 #: Durable per-row acknowledgement markers. Stored in the existing notification
 #: policy state (the same file the policy already owns), keyed per observed row,
 #: so a settled row is never reported twice and an unreported row is never lost.
@@ -109,6 +118,8 @@ STATUS_SEND_FAILED = "SEND_FAILED"
 STATUS_TELEGRAM_DISABLED = "TELEGRAM_DISABLED"
 #: The rendering guard refused the content, so nothing was sent or recorded.
 STATUS_FORMAT_REFUSED = "FORMAT_REFUSED"
+#: No valid rendering fits the transport budget, so nothing was sent or recorded.
+STATUS_MESSAGE_TOO_LONG = "MESSAGE_TOO_LONG"
 
 
 class ObservationRenderRefused(ValueError):
@@ -759,8 +770,14 @@ def format_observation_digest(
     *,
     now: datetime,
     suppressed: int = 0,
+    compact: bool = False,
 ) -> str:
-    """Render a bounded digest. One heading, one footer, many items."""
+    """Render a bounded digest. One heading, one footer, many items.
+
+    ``compact`` renders the same identity, market, timing and rejection class
+    without the surrounding evidence prose; it is used only when one record
+    cannot fit the transport budget at full detail.
+    """
     bounded = candidates[:MAX_OBSERVATIONS_PER_DIGEST]
     header = (
         f"{OBSERVATION_TITLE}\n"
@@ -771,11 +788,64 @@ def format_observation_digest(
     blocks: list[str] = [header]
     for index, candidate in enumerate(bounded, start=1):
         blocks.append("")
-        item = _item_lines(candidate)
+        item = _compact_item_lines(candidate) if compact else _item_lines(candidate)
         blocks.append(f"{index}. {item[0]}")
         blocks.extend(item[1:])
     blocks.extend(["", OBSERVATION_FOOTER])
     return _guard("\n".join(blocks))
+
+
+def _message_units(text: str) -> int:
+    """Length in the units Telegram enforces (UTF-16 code units)."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _compact_item_lines(candidate: dict) -> list[str]:
+    """One observation reduced to identity, market, timing and rejection class.
+
+    Used only when a single record cannot be rendered at full detail. Nothing
+    essential is invented and nothing instructional is added.
+    """
+    direction = str(candidate.get("signal") or "?")
+    horizon = str(candidate.get("horizon") or "UNCLASSIFIED")
+    missing = candidate.get("missing_evidence") or []
+    return [
+        f"{candidate.get('instrument')} ({candidate.get('source_exchange')} "
+        f"{candidate.get('source_symbol')} -> Kraken {candidate.get('market')})",
+        f"  External observation: {direction} {horizon} "
+        f"(version {candidate.get('declared_indicator_version') or 'undeclared'}, "
+        "algorithm unverified)",
+        f"  Source bar closed: {_iso(candidate.get('source_bar_closed_at'))}"
+        f" | Evaluated: {_iso(candidate.get('evaluated_at'))}",
+        f"  Rejection: {candidate.get('rejection_code') or 'UNSPECIFIED'}",
+        "  Withheld by: "
+        + (", ".join(str(item) for item in missing) if missing else "UNSPECIFIED_GATE"),
+        f"  {COMPACT_OBSERVATION_NOTE}",
+    ]
+
+
+def _select_digest(rows: list[dict], *, now: datetime) -> tuple[list[dict], str] | None:
+    """The largest deterministic prefix whose digest fits the message budget.
+
+    Rows are reduced in number rather than shortened, so every included
+    observation keeps its full meaning. A single record that cannot fit at full
+    detail is rendered compactly; if even that exceeds the budget, nothing is
+    rendered and the caller must fail closed.
+    """
+    limit = min(len(rows), MAX_OBSERVATIONS_PER_DIGEST)
+    for count in range(limit, 0, -1):
+        selected = rows[:count]
+        message = format_observation_digest(
+            selected, now=now, suppressed=len(rows) - count
+        )
+        if _message_units(message) <= DIGEST_MESSAGE_BUDGET:
+            return selected, message
+    compact = format_observation_digest(
+        rows[:1], now=now, suppressed=len(rows) - 1, compact=True
+    )
+    if _message_units(compact) <= DIGEST_MESSAGE_BUDGET:
+        return rows[:1], compact
+    return None
 
 
 def _fingerprint(candidates: list[dict]) -> str:
@@ -851,7 +921,7 @@ def send_observation_digest(
         )
 
     try:
-        message = format_observation_digest(bounded, now=now, suppressed=suppressed)
+        selection = _select_digest(rows, now=now)
     except ObservationRenderRefused:
         # Refused before any policy check, reservation, transport call,
         # confirmation or acknowledgement, so the rows stay pending and the job
@@ -866,6 +936,23 @@ def send_observation_digest(
                 f"({ObservationRenderRefused.__name__}); nothing was sent or recorded"
             ),
         )
+    if selection is None:
+        # No valid rendering fits the transport budget. Nothing is reserved,
+        # confirmed or acknowledged, so the rows stay pending and retryable.
+        return ObservationOutcome(
+            status=STATUS_MESSAGE_TOO_LONG,
+            observed=len(rows),
+            suppressed_bounded=0,
+            delivered=False,
+            reason=(
+                "no rendering fits the transport message budget "
+                f"({DIGEST_MESSAGE_BUDGET} units); nothing was sent or recorded"
+            ),
+        )
+    # Identity, policy, transport tracking and acknowledgement all refer to the
+    # rows actually rendered — never to rows excluded by the budget.
+    bounded, message = selection
+    suppressed = len(rows) - len(bounded)
     fingerprint = _fingerprint(bounded)
     cooldown_seconds = _effective_cooldown_seconds(settings)
 

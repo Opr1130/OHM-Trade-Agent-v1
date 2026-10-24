@@ -882,3 +882,269 @@ def test_ac_036_production_sender_negative_outcomes_never_acknowledge(
     assert refused.status == observation.STATUS_SEND_FAILED
     assert refused.delivered is False
     assert len(_pending(now=NOW)) == len(pending)
+
+
+# ===========================================================================
+# AC-039 - the rendered digest must fit the Telegram transport contract
+# ===========================================================================
+
+
+def _units(text: str) -> int:
+    """Telegram counts UTF-16 code units, not Python characters."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _row_with_reason(row: dict, *, reason_chars: int, fill: str = "x") -> dict:
+    padded = dict(row)
+    padded["abstention_reason"] = fill * reason_chars
+    return padded
+
+
+def _row_at_units(row: dict, target_units: int, *, fill: str = "x") -> dict:
+    """Pad one row so its single-item digest renders to ``target_units``."""
+
+    def units_for(reason_chars: int) -> int:
+        message = observation.format_observation_digest(
+            [_row_with_reason(row, reason_chars=reason_chars, fill=fill)],
+            now=NOW,
+            suppressed=0,
+        )
+        return _units(message)
+
+    high = 1
+    while units_for(high) < target_units:
+        high *= 2
+        assert high < 1_000_000, "target is unreachable with padding"
+    low = 0
+    while low < high:
+        middle = (low + high) // 2
+        if units_for(middle) < target_units:
+            low = middle + 1
+        else:
+            high = middle
+    return _row_with_reason(row, reason_chars=low, fill=fill)
+
+
+def test_ac_039_digest_exactly_at_the_budget_keeps_full_detail(durable_inbox):
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-039: the budget edge is inclusive."""
+    settle(durable_inbox, 1)
+    budget = observation.DIGEST_MESSAGE_BUDGET
+    padded = _row_at_units(_pending(now=NOW)[0], budget)
+    sent: list[str] = []
+
+    outcome = observation.send_observation_digest(
+        [padded], settings=delivery_settings(), now=NOW, sender=sender(sent)
+    )
+
+    assert outcome.status == observation.STATUS_DELIVERED
+    assert len(sent) == 1
+    assert _units(sent[0]) == budget
+    assert observation.OBSERVATION_TITLE in sent[0]
+    # Full detail, not a compact rendering.
+    assert "Assessment:" in sent[0]
+
+
+def test_ac_039_one_unit_over_the_budget_uses_the_compact_rendering(durable_inbox):
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-039: over budget never truncates meaning."""
+    settle(durable_inbox, 1)
+    budget = observation.DIGEST_MESSAGE_BUDGET
+    padded = _row_at_units(_pending(now=NOW)[0], budget + 1)
+    sent: list[str] = []
+
+    outcome = observation.send_observation_digest(
+        [padded], settings=delivery_settings(), now=NOW, sender=sender(sent)
+    )
+
+    assert outcome.status == observation.STATUS_DELIVERED
+    assert len(sent) == 1
+    assert _units(sent[0]) <= budget
+    assert observation.COMPACT_OBSERVATION_NOTE in sent[0]
+    # Essential identity, market, timing and rejection class are preserved.
+    assert padded["instrument"] in sent[0]
+    assert f"Kraken {padded['market']}" in sent[0]
+    assert f"Rejection: {padded['rejection_code']}" in sent[0]
+    assert padded["source_bar_closed_at"].replace("+00:00", "Z") in sent[0]
+
+
+def test_ac_039_verbose_rows_are_reduced_not_truncated(durable_inbox):
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-039: fewer rows, never partial meaning."""
+    settle(durable_inbox, 5)
+    budget = observation.DIGEST_MESSAGE_BUDGET
+    rows = [
+        _row_with_reason(row, reason_chars=(budget // 2))
+        for row in _pending(now=NOW)
+    ]
+    assert len(rows) == 5
+    sent: list[str] = []
+
+    outcome = observation.send_observation_digest(
+        rows, settings=delivery_settings(), now=NOW, sender=sender(sent)
+    )
+
+    assert outcome.status == observation.STATUS_DELIVERED
+    assert len(sent) == 1
+    assert 1 <= outcome.observed < 5, "the digest must drop rows, not shorten them"
+    assert _units(sent[0]) <= budget
+    # Every included row keeps its complete detail.
+    assert "Assessment:" in sent[0]
+    included = rows[: outcome.observed]
+    assert included[0]["abstention_reason"] in sent[0]
+    # Excluded rows are still pending and unacknowledged.
+    excluded = rows[outcome.observed :]
+    assert excluded, "this fixture must exclude at least one row"
+    remaining = {row["dedup_id"] for row in _pending(now=NOW)}
+    for row in excluded:
+        assert row["dedup_id"] in remaining
+        assert observation.observation_already_reported(row["dedup_id"]) is False
+
+
+def test_ac_039_message_that_cannot_fit_fails_closed(durable_inbox):
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-039: an impossible render is not sent."""
+    settle(durable_inbox, 1)
+    row = dict(_pending(now=NOW)[0])
+    row["instrument"] = "X" * 5000  # even the compact identity cannot fit
+    sent: list[str] = []
+
+    outcome = observation.send_observation_digest(
+        [row], settings=delivery_settings(), now=NOW, sender=sender(sent)
+    )
+
+    assert outcome.status == observation.STATUS_MESSAGE_TOO_LONG
+    assert outcome.delivered is False
+    assert sent == []
+    # No reservation, confirmation or acknowledgement was taken.
+    state_path = notification_policy.STATE_FILE
+    state = (
+        json.loads(state_path.read_text(encoding="utf-8"))
+        if state_path.exists()
+        else {}
+    )
+    assert (
+        f"{observation.OBSERVATION_IDENTITY}:{observation.OBSERVATION_EVENT_TYPE}"
+        not in state
+    )
+    assert not [
+        key for key in state if key.startswith(observation.OBSERVATION_MARKER_PREFIX)
+    ]
+    assert len(_pending(now=NOW)) == 1
+
+
+def test_ac_039_unicode_heavy_digest_respects_the_utf16_budget(durable_inbox):
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-039: non-BMP text counts double."""
+    settle(durable_inbox, 1)
+    budget = observation.DIGEST_MESSAGE_BUDGET
+    padded = _row_at_units(_pending(now=NOW)[0], budget, fill="\U0001d54f")
+    sent: list[str] = []
+
+    outcome = observation.send_observation_digest(
+        [padded], settings=delivery_settings(), now=NOW, sender=sender(sent)
+    )
+
+    assert outcome.status == observation.STATUS_DELIVERED
+    assert len(sent) == 1
+    assert _units(sent[0]) <= budget
+    assert len(sent[0].encode("utf-16-le")) // 2 <= budget
+
+
+def test_ac_039_fingerprint_and_acks_cover_only_transmitted_rows(durable_inbox):
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-039: identity is the transmitted set."""
+    settle(durable_inbox, 5)
+    budget = observation.DIGEST_MESSAGE_BUDGET
+    rows = [
+        _row_with_reason(row, reason_chars=(budget // 2)) for row in _pending(now=NOW)
+    ]
+    sent: list[str] = []
+
+    outcome = observation.send_observation_digest(
+        rows, settings=delivery_settings(), now=NOW, sender=sender(sent)
+    )
+
+    assert outcome.status == observation.STATUS_DELIVERED
+    assert outcome.observed < 5
+    transmitted = rows[: outcome.observed]
+    state = json.loads(notification_policy.STATE_FILE.read_text(encoding="utf-8"))
+    key = f"{observation.OBSERVATION_IDENTITY}:{observation.OBSERVATION_EVENT_TYPE}"
+    assert state[key]["fingerprint"] == observation._fingerprint(transmitted)
+    markers = {name for name in state if name.startswith(observation.OBSERVATION_MARKER_PREFIX)}
+    expected = {
+        f"{observation.OBSERVATION_MARKER_PREFIX}{row['dedup_id']}:"
+        f"{observation.OBSERVATION_EVENT_TYPE}"
+        for row in transmitted
+    }
+    assert markers == expected
+
+
+def test_ac_039_excluded_rows_are_delivered_on_a_later_cycle(durable_inbox):
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-039: budget exclusions stay recoverable."""
+    settle(durable_inbox, 5)
+    budget = observation.DIGEST_MESSAGE_BUDGET
+    rows = [
+        _row_with_reason(row, reason_chars=(budget // 2)) for row in _pending(now=NOW)
+    ]
+    sent: list[str] = []
+
+    first = observation.send_observation_digest(
+        rows, settings=delivery_settings(), now=NOW, sender=sender(sent)
+    )
+    assert first.status == observation.STATUS_DELIVERED
+    assert first.observed < 5
+
+    # Inside the cooldown nothing more is sent.
+    blocked = observation.send_observation_digest(
+        _pending(now=NOW), settings=delivery_settings(), now=NOW, sender=sender(sent)
+    )
+    assert blocked.status == observation.STATUS_SUPPRESSED_POLICY
+    assert len(sent) == 1
+
+    later = NOW
+    for _ in range(6):
+        later = later + timedelta(hours=7)
+        pending = _pending(now=later)
+        if not pending:
+            break
+        outcome = observation.send_observation_digest(
+            pending, settings=delivery_settings(), now=later, sender=sender(sent)
+        )
+        assert outcome.status == observation.STATUS_DELIVERED
+
+    assert _pending(now=later) == [], "every excluded row must eventually be delivered"
+    assert len(sent) >= 2
+    assert all(
+        observation.observation_already_reported(row["dedup_id"]) for row in rows
+    )
+
+
+def test_ac_039_selection_is_deterministic(durable_inbox):
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-039: same input, same digest and identity."""
+    settle(durable_inbox, 5)
+    budget = observation.DIGEST_MESSAGE_BUDGET
+    rows = [
+        _row_with_reason(row, reason_chars=(budget // 2)) for row in _pending(now=NOW)
+    ]
+
+    first = observation._select_digest(rows, now=NOW)
+    second = observation._select_digest(rows, now=NOW)
+
+    assert first is not None and second is not None
+    assert [row["dedup_id"] for row in first[0]] == [
+        row["dedup_id"] for row in second[0]
+    ]
+    assert first[1] == second[1]
+    assert observation._fingerprint(first[0]) == observation._fingerprint(second[0])
+
+
+def test_ac_039_disabled_feature_performs_no_rendering(durable_inbox, monkeypatch):
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-039: an off class does no delivery work."""
+    settle(durable_inbox, 1)
+    row = _pending(now=NOW)[0]
+    monkeypatch.setattr(
+        observation,
+        "format_observation_digest",
+        lambda *args, **kwargs: pytest.fail("rendered while the class is disabled"),
+    )
+
+    outcome = observation.send_observation_digest(
+        [row], settings=settings(), now=NOW, sender=pytest.fail
+    )
+
+    assert outcome.status == observation.STATUS_DISABLED

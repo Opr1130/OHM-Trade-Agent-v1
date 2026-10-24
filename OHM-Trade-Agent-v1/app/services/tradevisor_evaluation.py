@@ -793,9 +793,14 @@ def _finalize_qualified_buy(
     # ------------------------------------------------------------------
     permitted_notional = float(equity) * PRODUCTION_MAX_CAPITAL_FRACTION
     risk_budget = float(equity) * risk_per_trade_pct / 100.0
+    equity_value = float(equity)
 
     reason_code = ""
-    if malformed_reason:
+    if not math.isfinite(equity_value) or equity_value <= 0:
+        # Account risk is a share of total equity, so an unusable denominator can
+        # never be measured: refuse instead of dividing by zero or by NaN.
+        reason_code = "INVALID_EQUITY_DENOMINATOR"
+    elif malformed_reason:
         reason_code = malformed_reason
     elif not (
         math.isfinite(allocation_capital)
@@ -812,7 +817,7 @@ def _finalize_qualified_buy(
         or allocation_risk > risk_budget + ALLOCATION_TOLERANCE
     ):
         reason_code = "OVERSIZED_ALLOCATION"
-    elif abs(allocation_pct - allocation_capital / float(equity) * 100.0) > (
+    elif abs(allocation_pct - allocation_capital / equity_value * 100.0) > (
         POSITION_PCT_TOLERANCE_PP
     ):
         reason_code = "POSITION_PCT_INCONSISTENT"
@@ -839,10 +844,16 @@ def _finalize_qualified_buy(
 
     final_economics: EconomicGateResult = economics
     if capital_status in {"CONSISTENT", "CAPITAL_BELOW_EXECUTABLE_MINIMUM"}:
+        # The F7 allocation stays the economic notional, but the account-risk
+        # percentage must be measured against TOTAL EQUITY: passing the equity as
+        # available capital with the F7-approved fraction keeps
+        # ``recommended_capital`` identical while making
+        # ``account_risk_at_stop_pct`` the stop-loss share of the account.
+        allocation_fraction = allocation_capital / equity_value
         final_economics = evaluate_economic_quality(
             plan,
-            allocation_capital,
-            max_capital_fraction=1.0,
+            equity_value,
+            max_capital_fraction=allocation_fraction,
             max_account_risk_at_stop_pct=None,
         )
         evidence["economics_at_envelope"] = {
@@ -854,13 +865,19 @@ def _finalize_qualified_buy(
         }
         evidence["final_allocation_basis"] = {
             "allocation": allocation_capital,
+            "equity_denominator": equity_value,
+            "allocation_fraction": allocation_fraction,
             "economics_recommended_capital": final_economics.recommended_capital,
             "position_notional": final_economics.position_notional,
+            "account_risk_at_stop_pct": final_economics.account_risk_at_stop_pct,
             "parity": abs(
                 float(final_economics.recommended_capital) - allocation_capital
             )
             <= ALLOCATION_TOLERANCE,
-            "policy": "F5 thresholds unchanged; the notional basis is the F7 allocation",
+            "policy": (
+                "F5 thresholds unchanged; the notional basis is the F7 allocation "
+                "and the account-risk basis is total equity"
+            ),
         }
         evidence["f5_final"] = {
             "qualified": final_economics.qualified,

@@ -336,6 +336,15 @@ WHEN:
 acknowledgements are written, compaction runs, and a protection notification is requested
 THEN:
 markers older than the configured age are pruned while recent markers, digest entries and unrelated alert entries are preserved, marker volume does not change the outcome or unbounded latency of an observation lookup, and a protection alert is still authorised and reserved regardless of the observation backlog or marker population because the observation class remains noncritical
+AC-039:
+GIVEN:
+rendered observation digests whose combined prose can exceed Telegram's message limit, including verbose, oversized, and non-BMP content
+WHEN:
+an advisory observation digest is delivered
+THEN:
+the rendered message is bounded by a conservative budget counted in the UTF-16 units the transport enforces, the number of included observations is reduced before any included observation's meaning is shortened, a single record that cannot fit at full detail is rendered compactly with its identity, market, bar close, rejection classification and an explicit detail-omission note, a rendering that still cannot fit fails closed with an explicit non-delivery outcome, and the fingerprint, policy reservation, transport confirmation and durable acknowledgement refer to exactly the observations transmitted while every excluded observation remains unacknowledged and retryable
+
+
 
 EXPLICITLY OUT OF SCOPE:
 - Any order placement, modification, cancellation or confirmation path, and any execution authority
@@ -399,10 +408,15 @@ AC-026 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_026_observ
 AC-027 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_027_contradictory_instruction_bearing_observation_is_refused
 AC-027 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_027_internal_shadow_evidence_is_preserved_unchanged
 AC-027 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_027_watch_observation_carries_no_internal_instruction_tokens
+AC-028 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_028_account_risk_scales_with_the_allocation_fraction
+AC-028 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_028_account_risk_uses_total_equity_denominator
 AC-028 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_028_allocation_never_exceeds_position_or_account_risk_limits
+AC-028 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_028_economic_decision_is_unchanged_by_the_denominator
 AC-028 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_028_non_finite_or_negative_allocation_fails_closed_without_raising
 AC-028 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_028_oversized_allocation_is_refused_as_inconsistent
+AC-028 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_028_oversized_allocation_still_refused_with_equity_basis
 AC-028 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_028_unusable_allocation_never_reports_an_economic_pass
+AC-028 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_028_zero_or_non_finite_equity_fails_closed
 AC-029 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_029_discovery_coverage_distinguishes_the_four_coin_sets
 AC-029 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_029_missing_native_universe_is_never_assumed
 AC-029 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_029_observed_markets_come_from_durable_records_only
@@ -450,6 +464,15 @@ AC-038 -> tests/test_tradevisor_delivery_reliability_v1.py::test_ac_038_marker_c
 AC-038 -> tests/test_tradevisor_delivery_reliability_v1.py::test_ac_038_observation_lookup_stays_bounded_with_many_markers
 AC-038 -> tests/test_tradevisor_delivery_reliability_v1.py::test_ac_038_protection_alerts_survive_saturated_observation_backlog
 AC-038 -> tests/test_tradevisor_delivery_reliability_v1.py::test_ac_038_recovery_lookup_reads_policy_state_once_at_any_scale
+AC-039 -> tests/test_tradevisor_delivery_reliability_v1.py::test_ac_039_digest_exactly_at_the_budget_keeps_full_detail
+AC-039 -> tests/test_tradevisor_delivery_reliability_v1.py::test_ac_039_disabled_feature_performs_no_rendering
+AC-039 -> tests/test_tradevisor_delivery_reliability_v1.py::test_ac_039_excluded_rows_are_delivered_on_a_later_cycle
+AC-039 -> tests/test_tradevisor_delivery_reliability_v1.py::test_ac_039_fingerprint_and_acks_cover_only_transmitted_rows
+AC-039 -> tests/test_tradevisor_delivery_reliability_v1.py::test_ac_039_message_that_cannot_fit_fails_closed
+AC-039 -> tests/test_tradevisor_delivery_reliability_v1.py::test_ac_039_one_unit_over_the_budget_uses_the_compact_rendering
+AC-039 -> tests/test_tradevisor_delivery_reliability_v1.py::test_ac_039_selection_is_deterministic
+AC-039 -> tests/test_tradevisor_delivery_reliability_v1.py::test_ac_039_unicode_heavy_digest_respects_the_utf16_budget
+AC-039 -> tests/test_tradevisor_delivery_reliability_v1.py::test_ac_039_verbose_rows_are_reduced_not_truncated
 
 
 IMPLEMENTATION MAP:
@@ -592,6 +615,9 @@ AC-037 -> OHM-Trade-Agent-v1/TRADEVISOR_V2.md
 AC-038 -> OHM-Trade-Agent-v1/app/services/tradevisor_observation.py
 AC-038 -> OHM-Trade-Agent-v1/tests/test_tradevisor_delivery_reliability_v1.py
 AC-038 -> OHM-Trade-Agent-v1/TRADEVISOR_V2.md
+AC-039 -> OHM-Trade-Agent-v1/app/services/tradevisor_observation.py
+AC-039 -> OHM-Trade-Agent-v1/tests/test_tradevisor_delivery_reliability_v1.py
+AC-039 -> OHM-Trade-Agent-v1/TRADEVISOR_V2.md
 
 DEFERRED DISCOVERIES:
 - G-01: no genuine TradingView to O'Pip delivery has been observed; the source-to-production certification remains open and blocks activation, not this increment.

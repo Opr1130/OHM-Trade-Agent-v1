@@ -749,6 +749,15 @@ class _FakeAllocation:
         )
         self.reason = "synthetic allocation for a composition guard test"
 
+    def as_dict(self) -> dict:
+        """Mirror the real owner's serialization so as_record() can persist it."""
+        return {
+            "recommended_capital": self.recommended_capital,
+            "risk_dollars": self.risk_dollars,
+            "position_pct": self.position_pct,
+            "reason": self.reason,
+        }
+
 
 def _fake_owner(allocation):
     """Return a ``recommend_capital`` replacement that yields one fixed result."""
@@ -1830,3 +1839,117 @@ def test_ac_035_non_finite_risk_and_unexpected_owner_results_fail_closed():
             _assert_inconsistent(decision, reason=reason)
     finally:
         evaluation.recommend_capital = original
+
+
+# ---------------------------------------------------------------------------
+# AC-028 - account risk is measured against total equity, not the allocation
+# ---------------------------------------------------------------------------
+
+
+def test_ac_028_account_risk_uses_total_equity_denominator(monkeypatch):
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-028: $10k equity / $2k allocation."""
+    monkeypatch.setattr(te, "recommend_capital", _fake_owner(_FakeAllocation(2_000.0)))
+
+    decision = evaluate(equity=10_000.0)
+
+    economics = decision.economics
+    assert economics is not None
+    assert economics.recommended_capital == pytest.approx(2_000.0)
+    assert economics.position_notional > 0
+    fraction = 2_000.0 / 10_000.0
+    # The gate rounds its published percentages to 2dp, so compare the
+    # relationship rather than the last bit of the rounding.
+    assert economics.account_risk_at_stop_pct == pytest.approx(
+        economics.stop_pct * fraction, abs=0.01
+    )
+    # The defect made this equal to stop_pct; it must now be the equity share.
+    assert economics.account_risk_at_stop_pct < economics.stop_pct
+    # Persisted evidence uses the same denominator.
+    recorded = decision.as_record()["economics"]
+    assert recorded["account_risk_at_stop_pct"] == pytest.approx(
+        economics.account_risk_at_stop_pct
+    )
+
+
+def test_ac_028_account_risk_scales_with_the_allocation_fraction(monkeypatch):
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-028: small through maximum fractions."""
+    risks: dict[float, float] = {}
+    for capital in (100.0, 500.0, 2_000.0):
+        monkeypatch.setattr(
+            te, "recommend_capital", _fake_owner(_FakeAllocation(capital))
+        )
+        decision = evaluate(equity=10_000.0)
+        economics = decision.economics
+        assert economics is not None
+        assert economics.recommended_capital == pytest.approx(capital)
+        risks[capital] = economics.account_risk_at_stop_pct
+
+    assert risks[500.0] == pytest.approx(5 * risks[100.0], abs=0.01)
+    assert risks[2_000.0] == pytest.approx(4 * risks[500.0], abs=0.01)
+
+
+def test_ac_028_economic_decision_is_unchanged_by_the_denominator(monkeypatch):
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-028: only the risk basis moves."""
+    capital = 2_000.0
+    monkeypatch.setattr(te, "recommend_capital", _fake_owner(_FakeAllocation(capital)))
+
+    decision = evaluate(equity=10_000.0)
+
+    assert decision.plan is not None
+    assert decision.economics is not None
+    legacy = te.evaluate_economic_quality(
+        decision.plan, capital, max_capital_fraction=1.0
+    )
+    current = decision.economics
+    assert current.qualified == legacy.qualified
+    assert current.position_notional == pytest.approx(legacy.position_notional)
+    assert current.target_1_net_profit == pytest.approx(legacy.target_1_net_profit)
+    assert current.target_2_net_profit == pytest.approx(legacy.target_2_net_profit)
+    assert current.estimated_costs == pytest.approx(legacy.estimated_costs)
+    assert current.stop_pct == pytest.approx(legacy.stop_pct)
+    assert current.target_1_move_pct == pytest.approx(legacy.target_1_move_pct)
+    # Exactly the account-risk percentage is rescaled to total equity.
+    assert current.account_risk_at_stop_pct == pytest.approx(
+        legacy.account_risk_at_stop_pct * capital / 10_000.0, abs=0.01
+    )
+
+
+def test_ac_028_zero_or_non_finite_equity_fails_closed(monkeypatch):
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-028: an unusable denominator is refused."""
+    monkeypatch.setattr(te, "recommend_capital", _fake_owner(_FakeAllocation(2_000.0)))
+    # Keep the envelope gate healthy so the capital block itself is exercised
+    # with the invalid denominator (a zero-equity envelope would reject earlier).
+    real_gate = te.evaluate_economic_quality
+
+    def healthy_envelope(plan, _available_capital, **kwargs):
+        return real_gate(plan, 10_000.0, **kwargs)
+
+    monkeypatch.setattr(te, "evaluate_economic_quality", healthy_envelope)
+
+    for equity in (0.0, -10_000.0, float("nan"), float("inf")):
+        decision = evaluate(equity=equity)  # must not raise
+        assert decision.actionable is False
+        assert decision.rejection_code == "CAPITAL_INCONSISTENT"
+        assert (
+            decision.evidence["capital_consistency"]["reason_code"]
+            == "INVALID_EQUITY_DENOMINATOR"
+        )
+        assert decision.economics is not None
+        assert decision.economics.qualified is False
+
+
+def test_ac_028_oversized_allocation_still_refused_with_equity_basis(monkeypatch):
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-028: the limits are unchanged."""
+    monkeypatch.setattr(
+        te, "recommend_capital", _fake_owner(_FakeAllocation(50_000.0))
+    )
+
+    decision = evaluate(equity=10_000.0)
+
+    assert decision.rejection_code == "CAPITAL_INCONSISTENT"
+    assert (
+        decision.evidence["capital_consistency"]["reason_code"] == "OVERSIZED_ALLOCATION"
+    )
+    assert decision.economics is not None
+    assert decision.economics.qualified is False
+    assert decision.actionable is False
