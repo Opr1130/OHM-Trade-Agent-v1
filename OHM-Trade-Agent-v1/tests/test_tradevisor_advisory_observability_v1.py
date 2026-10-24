@@ -550,7 +550,9 @@ def test_ac_023_digest_is_bounded_and_deduplicated_by_policy():
         now=NOW + timedelta(minutes=1),
         sender=sender,
     )
-    assert second.status == observation.STATUS_SUPPRESSED_POLICY
+    # The same content is recognised as already delivered: no second send, and
+    # the acknowledgement is confirmed rather than re-emitted.
+    assert second.status == observation.STATUS_ALREADY_DELIVERED
     assert len(sent) == 1
 
     # Protection alerts bypass the noncritical attention budget; observations
@@ -1197,7 +1199,7 @@ def test_ac_030_successful_retry_delivers_exactly_once(durable_inbox):
     repeat = observation.send_observation_digest(
         pending, settings=_delivery_settings(), now=NOW, sender=_sender(sent)
     )
-    assert repeat.status == observation.STATUS_SUPPRESSED_POLICY
+    assert repeat.status == observation.STATUS_ALREADY_DELIVERED
     assert len(sent) == 1
     assert observation.pending_observations(now=NOW, settings=settings()) == []
 
@@ -1523,11 +1525,13 @@ def test_ac_034_suppression_never_discards_durable_observations(durable_inbox):
     pending = observation.pending_observations(now=NOW, settings=settings())
     assert len(pending) == 1
 
-    # A cooldown already in force for this exact evidence set.
+    # A cooldown already in force for this identity, from a *different* set of
+    # evidence: the policy suppresses on the cooldown, and this content has
+    # never been confirmed as delivered.
     notification_policy.record_emitted(
         identity=observation.OBSERVATION_IDENTITY,
         event_type=observation.OBSERVATION_EVENT_TYPE,
-        fingerprint=observation._fingerprint(pending),
+        fingerprint="earlier-unrelated-digest",
         now=NOW,
     )
     sent: list[str] = []

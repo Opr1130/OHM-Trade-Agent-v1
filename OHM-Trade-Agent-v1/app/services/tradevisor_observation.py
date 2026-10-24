@@ -27,6 +27,7 @@ from datetime import datetime, timedelta, timezone
 from app.services.notification_policy import (
     DEFAULT_COOLDOWN_SECONDS,
     confirm_emit,
+    is_confirmed_emission,
     release_emit,
     reserve_emit,
     should_emit,
@@ -55,10 +56,16 @@ MAX_OBSERVATIONS_PER_DIGEST = 5
 #: so a settled row is never reported twice and an unreported row is never lost.
 OBSERVATION_MARKER_PREFIX = "TRADEVISOR:OBSERVED:"
 
-#: How far back the recovery path will look for unreported eligible rows before
-#: the configured cooldown window is taken into account (see
-#: ``pending_observations``).
+#: How far back the recovery path will look for unreported eligible rows.
+#: The horizon must cover the time a full per-call backlog needs to drain at the
+#: governed cadence, otherwise the tail of a sustained backlog ages out before it
+#: can be delivered. ``DRAIN_CAPACITY_CYCLES`` is the per-call row cap expressed
+#: in digest cycles (4 digests of capacity) plus one cycle of slack.
 DEFAULT_RECOVERY_MINUTES = 6 * 60
+DRAIN_CAPACITY_CYCLES = 5
+
+#: Marker bookkeeping older than this is pruned on the acknowledgement path.
+MARKER_MAX_AGE_DAYS = 30
 
 #: The cohort that is worth telling an operator about: everything substantive
 #: passed and only an authority/evidence gate withheld the trade.
@@ -96,6 +103,7 @@ STATUS_DELIVERED = "DELIVERED"
 STATUS_DISABLED = "DISABLED"
 STATUS_EMPTY = "EMPTY"
 STATUS_SUPPRESSED_POLICY = "SUPPRESSED_POLICY"
+STATUS_ALREADY_DELIVERED = "ALREADY_DELIVERED"
 STATUS_SEND_FAILED = "SEND_FAILED"
 STATUS_TELEGRAM_DISABLED = "TELEGRAM_DISABLED"
 
@@ -159,6 +167,18 @@ def _effective_cooldown_seconds(settings) -> int:
     return max(configured * 60, DEFAULT_COOLDOWN_SECONDS)
 
 
+def _recovery_window_minutes(settings) -> int:
+    """Recovery horizon: at least a full drain of the per-call backlog.
+
+    One digest per cooldown carries ``MAX_OBSERVATIONS_PER_DIGEST`` rows, and a
+    single call may surface four digests' worth. The horizon therefore has to be
+    at least ``DRAIN_CAPACITY_CYCLES`` cooldowns, or a sustained backlog loses
+    its tail to expiry before it can be delivered.
+    """
+    cooldown_minutes = max(1, int(_effective_cooldown_seconds(settings) / 60))
+    return max(DEFAULT_RECOVERY_MINUTES, cooldown_minutes * DRAIN_CAPACITY_CYCLES)
+
+
 def _marker_identity(dedup_id: str) -> str:
     return f"{OBSERVATION_MARKER_PREFIX}{dedup_id}"
 
@@ -217,11 +237,16 @@ def _mark_reported(candidates: list[dict], *, now: datetime) -> int:
     from app.services import notification_policy
     from app.services.registry_io import registry_lock, save_json_atomic
 
+    cutoff = now - timedelta(days=MARKER_MAX_AGE_DAYS)
     try:
         with registry_lock(notification_policy.LOCK_FILE):
             state = load_json(notification_policy.STATE_FILE) or {}
             if not isinstance(state, dict):
                 state = {}
+            # Bound growth on the write path: stale markers are dropped while the
+            # new acknowledgement is recorded, in the same locked pass.
+            for key in _stale_marker_keys(state, cutoff=cutoff):
+                state.pop(key, None)
             state.update(markers)
             save_json_atomic(notification_policy.STATE_FILE, state)
     except Exception:  # noqa: BLE001 - a ledger write failure must not duplicate
@@ -454,8 +479,8 @@ def pending_observations(
     Nothing here writes: discovery of pending work is read-only.
     """
     reference = now or datetime.now(timezone.utc)
+    resolved_settings = settings
     if window_minutes is None:
-        resolved_settings = settings
         if resolved_settings is None:
             try:
                 from app.core.config import get_settings
@@ -463,12 +488,7 @@ def pending_observations(
                 resolved_settings = get_settings()
             except Exception:  # noqa: BLE001 - cadence falls back to the policy default
                 resolved_settings = None
-        # Look back far enough to cover at least two full cooldown windows, so a
-        # suppressed observation survives until its cadence permits delivery.
-        window_minutes = max(
-            DEFAULT_RECOVERY_MINUTES,
-            int(_effective_cooldown_seconds(resolved_settings) / 60) * 2 + 60,
-        )
+        window_minutes = _recovery_window_minutes(resolved_settings)
     horizon = reference - timedelta(minutes=window_minutes)
 
     candidates: list[dict] = []
@@ -486,6 +506,105 @@ def pending_observations(
     candidates.sort(key=lambda item: str(item.get("evaluated_at") or ""))
     cap = MAX_OBSERVATIONS_PER_DIGEST * 4 if limit is None else max(1, int(limit))
     return candidates[:cap]
+
+
+def observation_backlog(
+    *,
+    now: datetime | None = None,
+    settings=None,
+    records: list[dict] | None = None,
+    window_minutes: int | None = None,
+) -> dict:
+    """Read-only accounting of every durable row against the delivery state.
+
+    Nothing undelivered is ever *silently* dropped: a row is either eligible, or
+    counted as already reported, aged out of the recovery horizon, or not
+    observable at all. Callers that want to know whether evidence is being lost
+    to expiry read ``aged_out`` here.
+    """
+    reference = now or datetime.now(timezone.utc)
+    resolved_settings = settings
+    if window_minutes is None:
+        if resolved_settings is None:
+            try:
+                from app.core.config import get_settings
+
+                resolved_settings = get_settings()
+            except Exception:  # noqa: BLE001 - cadence falls back to the policy default
+                resolved_settings = None
+        window_minutes = _recovery_window_minutes(resolved_settings)
+    horizon = reference - timedelta(minutes=window_minutes)
+
+    counts = {
+        "total_rows": 0,
+        "not_observable": 0,
+        "already_reported": 0,
+        "aged_out": 0,
+        "undated": 0,
+        "eligible": 0,
+    }
+    for row in records if records is not None else _inbox_records():
+        counts["total_rows"] += 1
+        candidate = candidate_from_record(row, now=reference)
+        if candidate is None:
+            counts["not_observable"] += 1
+            continue
+        stamp = _stamp(candidate.get("evaluated_at"))
+        if stamp is None:
+            counts["undated"] += 1
+            continue
+        if observation_already_reported(candidate.get("dedup_id")):
+            counts["already_reported"] += 1
+            continue
+        if stamp < horizon:
+            counts["aged_out"] += 1
+            continue
+        counts["eligible"] += 1
+
+    return {
+        "schema_version": "tradevisor-observation-backlog-v1",
+        "authority": "READ_ONLY_DIAGNOSTIC",
+        "window_minutes": window_minutes,
+        "horizon": horizon.isoformat(),
+        **counts,
+    }
+
+
+def _stale_marker_keys(state: dict, *, cutoff: datetime) -> list[str]:
+    stale: list[str] = []
+    for key, value in state.items():
+        if not str(key).startswith(OBSERVATION_MARKER_PREFIX):
+            continue
+        sent_at = _stamp(_as_dict(value).get("sent_at"))
+        if sent_at is not None and sent_at < cutoff:
+            stale.append(str(key))
+    return stale
+
+
+def compact_markers(*, now: datetime | None = None, max_age_days: int = MARKER_MAX_AGE_DAYS) -> int:
+    """Prune acknowledgement markers older than ``max_age_days``.
+
+    Only this module's own marker keys are touched; digest, alert and budget
+    entries in the same state file are never modified.
+    """
+    reference = now or datetime.now(timezone.utc)
+    cutoff = reference - timedelta(days=max_age_days)
+    from app.services import notification_policy
+    from app.services.registry_io import registry_lock, save_json_atomic
+
+    try:
+        with registry_lock(notification_policy.LOCK_FILE):
+            state = load_json(notification_policy.STATE_FILE) or {}
+            if not isinstance(state, dict):
+                return 0
+            stale = _stale_marker_keys(state, cutoff=cutoff)
+            for key in stale:
+                state.pop(key, None)
+            if stale:
+                save_json_atomic(notification_policy.STATE_FILE, state)
+        return len(stale)
+    except Exception:  # noqa: BLE001 - compaction is best-effort bookkeeping
+        return 0
 
 
 def _item_lines(candidate: dict) -> list[str]:
@@ -652,6 +771,24 @@ def send_observation_digest(
         cooldown_seconds=cooldown_seconds,
         now=now,
     ):
+        # A confirmed emission for this exact content means the transport already
+        # accepted it; only the per-row acknowledgement is missing (for example a
+        # crash or ledger fault between confirmation and marking). Repair it
+        # instead of stranding the rows as permanently suppressed, and never send
+        # the same content twice.
+        if is_confirmed_emission(
+            identity=OBSERVATION_IDENTITY,
+            event_type=OBSERVATION_EVENT_TYPE,
+            fingerprint=fingerprint,
+        ):
+            repaired = _mark_reported(bounded, now=now)
+            return ObservationOutcome(
+                status=STATUS_ALREADY_DELIVERED,
+                observed=len(bounded),
+                suppressed_bounded=suppressed,
+                delivered=False,
+                reason=f"already confirmed delivered; acknowledgement repaired={repaired}",
+            )
         return ObservationOutcome(
             status=STATUS_SUPPRESSED_POLICY,
             observed=len(bounded),

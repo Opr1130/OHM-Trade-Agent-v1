@@ -215,7 +215,7 @@ more observations than one digest may carry, the same observation set offered tw
 WHEN:
 the digest is delivered
 THEN:
-at most the bounded number of items is included with the remainder counted as bounded, a single digest is sent rather than one message per event, a repeat of the same evidence is suppressed by the existing notification policy and its reservation accounting, and a transport refusal is reported as a send failure that is never claimed as delivered
+at most the bounded number of items is included with the remainder counted as bounded, a single digest is sent rather than one message per event, a repeat of the same evidence is recognised as an already confirmed emission, its missing acknowledgement is repaired without a second send, and the existing notification policy still owns the cooldown and budget decision, and a transport refusal is reported as a send failure that is never claimed as delivered
 
 AC-024:
 GIVEN:
@@ -313,6 +313,30 @@ the qualified-buy composition finalizes
 THEN:
 every such result fails closed as an explicit rejection with a machine-readable reason code, no exception escapes the evaluator, no economic pass is reported, no F5 or F7 algorithm, threshold or risk limit is changed, and a valid allocation still qualifies on the unchanged basis
 
+AC-036:
+GIVEN:
+a durable observation cohort exposed to every ambiguous delivery outcome: a crash before the transport call, a crash or ledger fault after the transport accepted the digest but before the per-row acknowledgement was written, a transport timeout whose delivery outcome is unknown, a transport refusal, and a concurrent worker whose reservation later expires
+WHEN:
+the subsequent cycles run
+THEN:
+no outcome silently loses eligible evidence, content that a confirmed emission already covers is recognised and its missing acknowledgement repaired without a second send, content whose delivery outcome is genuinely unknown is retried and may therefore be delivered more than once, the documented guarantee is at-least-once for unknown outcomes and never exactly-once, and an abandoned reservation stops blocking delivery once its lease expires
+
+AC-037:
+GIVEN:
+a backlog of settled observations, a row older than the recovery horizon, ingress that exceeds digest throughput, and an inbox that has reached its configured capacity
+WHEN:
+the delivery cycle and the backlog report run
+THEN:
+the recovery horizon covers at least a full per-call backlog at the governed cadence, each call surfaces a bounded number of rows without deleting any, every row is accounted for as eligible, already reported, aged out or not observable so nothing disappears silently, a sustained backlog drains across successive cooldowns with each row acknowledged exactly once, and capacity backpressure refuses new ingress while leaving existing evidence intact and deliverable
+
+AC-038:
+GIVEN:
+acknowledgement markers that are ancient, recent, digest-level, alert-level and numerous, together with a saturated observation backlog
+WHEN:
+acknowledgements are written, compaction runs, and a protection notification is requested
+THEN:
+markers older than the configured age are pruned while recent markers, digest entries and unrelated alert entries are preserved, marker volume does not change the outcome or unbounded latency of an observation lookup, and a protection alert is still authorised and reserved regardless of the observation backlog or marker population because the observation class remains noncritical
+
 EXPLICITLY OUT OF SCOPE:
 - Any order placement, modification, cancellation or confirmation path, and any execution authority
 - Any change to fixed risk sizing, minimum reward-to-risk, position verification or execution safeguards
@@ -398,6 +422,20 @@ AC-034 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_034_suppre
 AC-035 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_035_missing_or_nonnumeric_allocation_fields_fail_closed
 AC-035 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_035_negative_risk_and_inconsistent_position_percentage_fail_closed
 AC-035 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_035_non_finite_risk_and_unexpected_owner_results_fail_closed
+AC-036 -> tests/test_tradevisor_delivery_reliability_v1.py::test_ac_036_concurrent_worker_reservation_expires
+AC-036 -> tests/test_tradevisor_delivery_reliability_v1.py::test_ac_036_crash_before_transport_leaves_evidence_available
+AC-036 -> tests/test_tradevisor_delivery_reliability_v1.py::test_ac_036_missing_acknowledgement_after_delivery_is_repaired_not_duplicated
+AC-036 -> tests/test_tradevisor_delivery_reliability_v1.py::test_ac_036_policy_state_write_failure_after_delivery_is_repairable
+AC-036 -> tests/test_tradevisor_delivery_reliability_v1.py::test_ac_036_transport_refusal_keeps_evidence_pending
+AC-036 -> tests/test_tradevisor_delivery_reliability_v1.py::test_ac_036_transport_timeout_is_an_unknown_outcome_and_is_retried
+AC-037 -> tests/test_tradevisor_delivery_reliability_v1.py::test_ac_037_backlog_is_capped_per_call_without_losing_rows
+AC-037 -> tests/test_tradevisor_delivery_reliability_v1.py::test_ac_037_inbox_capacity_rejects_ingress_without_losing_pending
+AC-037 -> tests/test_tradevisor_delivery_reliability_v1.py::test_ac_037_recovery_window_expiry_is_counted_not_silent
+AC-037 -> tests/test_tradevisor_delivery_reliability_v1.py::test_ac_037_sustained_ingress_drains_across_cycles_without_loss
+AC-038 -> tests/test_tradevisor_delivery_reliability_v1.py::test_ac_038_acknowledgement_write_compacts_in_the_same_pass
+AC-038 -> tests/test_tradevisor_delivery_reliability_v1.py::test_ac_038_marker_compaction_prunes_old_and_keeps_active
+AC-038 -> tests/test_tradevisor_delivery_reliability_v1.py::test_ac_038_observation_lookup_stays_bounded_with_many_markers
+AC-038 -> tests/test_tradevisor_delivery_reliability_v1.py::test_ac_038_protection_alerts_survive_saturated_observation_backlog
 
 
 IMPLEMENTATION MAP:
@@ -531,6 +569,15 @@ AC-034 -> OHM-Trade-Agent-v1/app/services/tradevisor_observation.py
 AC-034 -> OHM-Trade-Agent-v1/tests/test_tradevisor_advisory_observability_v1.py
 AC-035 -> OHM-Trade-Agent-v1/app/services/tradevisor_evaluation.py
 AC-035 -> OHM-Trade-Agent-v1/tests/test_tradevisor_advisory_observability_v1.py
+AC-036 -> OHM-Trade-Agent-v1/app/services/tradevisor_observation.py
+AC-036 -> OHM-Trade-Agent-v1/tests/test_tradevisor_delivery_reliability_v1.py
+AC-036 -> OHM-Trade-Agent-v1/TRADEVISOR_V2.md
+AC-037 -> OHM-Trade-Agent-v1/app/services/tradevisor_observation.py
+AC-037 -> OHM-Trade-Agent-v1/tests/test_tradevisor_delivery_reliability_v1.py
+AC-037 -> OHM-Trade-Agent-v1/TRADEVISOR_V2.md
+AC-038 -> OHM-Trade-Agent-v1/app/services/tradevisor_observation.py
+AC-038 -> OHM-Trade-Agent-v1/tests/test_tradevisor_delivery_reliability_v1.py
+AC-038 -> OHM-Trade-Agent-v1/TRADEVISOR_V2.md
 
 DEFERRED DISCOVERIES:
 - G-01: no genuine TradingView to O'Pip delivery has been observed; the source-to-production certification remains open and blocks activation, not this increment.

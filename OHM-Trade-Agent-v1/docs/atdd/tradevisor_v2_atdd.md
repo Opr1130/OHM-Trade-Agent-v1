@@ -439,3 +439,27 @@ rejection.
 All six were reproduced RED before implementation (15 failing tests, 0 passing in
 the remediation selection), then GREEN (15 passing). No learning file, F6/4H
 policy, canonical path, execution path or risk threshold was modified.
+
+## Addendum - delivery reliability review (AC-036 .. AC-038)
+
+| AC | Scope | Scenarios | Tests |
+| --- | --- | --- | --- |
+| AC-036 | Guarantee and every ambiguous outcome | crash before transport; acknowledgement lost after delivery; transport timeout with unknown outcome; refusal; concurrent worker and expired reservation | 6 `test_ac_036_*` |
+| AC-037 | Bounded backlog | horizon sizing and aged-out accounting; per-call cap without deletion; sustained ingress drained across cooldowns; inbox capacity backpressure with pending evidence intact | 4 `test_ac_037_*` |
+| AC-038 | Marker lifecycle and priority | compaction of ancient markers; compaction on the write path; 5 000 markers plus backlog do not disturb protection; 20 000 markers keep lookup bounded | 4 `test_ac_038_*` |
+
+### Defects found by this review
+
+1. **Horizon shorter than the drain (P1).** `2 x cooldown + 1h` = 13h could not
+   cover a 12-row backlog needing three digests = 14h, so the tail aged out
+   silently. Fixed by sizing the horizon to `DRAIN_CAPACITY_CYCLES` cooldowns and
+   by adding `observation_backlog()` aged-out accounting.
+2. **Stranded evidence after a lost acknowledgement (P1).** A confirmed emission
+   whose per-row marker was lost left rows pending forever: the digest
+   fingerprint matched permanently, so `should_emit` refused and nothing ever
+   acknowledged them. Fixed with the `ALREADY_DELIVERED` repair path.
+3. **Unbounded marker growth (P2).** Every acknowledged row added a state entry
+   with no compaction. Fixed by pruning markers older than 30 days on the write
+   path and by `compact_markers()`.
+
+All three were reproduced RED before the correction.

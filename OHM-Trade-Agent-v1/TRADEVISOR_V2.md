@@ -544,3 +544,47 @@ machine-readable `reason_code`:
 
 No exception escapes the evaluator, no economic PASS is reported in any of
 these cases, and no F5 or F7 algorithm, threshold or risk limit is changed.
+
+## Addendum - delivery guarantee, recovery horizon and marker lifecycle (2026-10-24)
+
+### Stated delivery guarantee
+
+The observation lane is **at-least-once for unknown outcomes, and at-most-once
+for content already confirmed as delivered**. It is **not** exactly-once: the
+Telegram transport offers no idempotency key that the receiver honours, so an
+outcome of "request written, response lost" cannot be distinguished from "never
+written". The implementation chooses the safe side of that ambiguity:
+
+| Outcome | Behaviour | Consequence |
+| --- | --- | --- |
+| Crash before the transport call | Row stays unacknowledged, recovered next cycle | delivered once |
+| Transport refused (`delivered=false`) | Reservation released, row pending | retried |
+| Transport raised (timeout, network) | `SEND_FAILED`, row pending | retried, **may duplicate** |
+| Delivered, acknowledgement lost | Next cycle recognises the confirmed emission from the policy state, repairs the marker, sends nothing | delivered once |
+| Cooldown or budget suppression | Nothing marked, row pending | retried after the window |
+| Reservation holder died | Lease expires, next worker proceeds | delivered once |
+
+`STATUS_ALREADY_DELIVERED` is the observable signal for the repair path: the
+content was already confirmed as sent, so the missing per-row acknowledgement is
+written and no second message is emitted.
+
+### Recovery horizon is sized to the drain, not to a guess
+
+A backlog can only drain one digest per cooldown, carrying at most five rows. The
+horizon is therefore `max(6h, 5 x cooldown)` - enough for a full per-call backlog
+(four digests) plus one cycle of slack. The previous `2 x cooldown + 1h` horizon
+(13h by default) was **shorter than the 14h a twelve-row backlog needs**, so the
+tail of a sustained backlog expired before it could be delivered.
+
+`observation_backlog()` reports, read-only, how every durable row is accounted
+for: `eligible`, `already_reported`, `aged_out`, `undated`, `not_observable`,
+`total_rows` and the active `window_minutes`. A non-zero `aged_out` is the signal
+that evidence is outrunning the drain; nothing is ever dropped silently.
+
+### Marker lifecycle
+
+Acknowledgement markers are pruned on the acknowledgement path itself (and by
+`compact_markers()`), keeping 30 days of history. Only marker keys are touched -
+digest, alert and budget entries in the same state file are never modified. A
+digest of N rows still consumes exactly **one** noncritical attention slot,
+because acknowledgements are bookkeeping rather than new cards.

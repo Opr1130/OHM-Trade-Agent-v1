@@ -581,3 +581,39 @@ Still not verified: G-01 (no genuine TradingView delivery observed), G-05 (no
 soak), G-02/G-04 (no trusted F6 model, no completed-4H provider). Nothing here
 changes trading authority, canonical promotion, learning consumption or
 retention, or F11 priority.
+
+## 16. Delivery reliability review (2026-10-24)
+
+Bounded reliability assessment of the advisory-observation delivery lifecycle at
+`90b5e169`. Local only: not pushed, not merged, not deployed, learning frozen.
+
+### Guarantee
+
+At-least-once for unknown outcomes, at-most-once for content already confirmed as
+delivered, and **not** exactly-once: the transport provides no end-to-end
+idempotency key, so a written request with a lost response is indistinguishable
+from a request never written. `STATUS_ALREADY_DELIVERED` marks the repair path
+where a confirmed emission was missing only its per-row acknowledgement.
+
+### Findings
+
+| # | Class | Finding | Correction |
+| --- | --- | --- | --- |
+| R-1 | P1 | Recovery horizon `2 x cooldown + 1h` (13h) was shorter than the 14h a 12-row backlog needs at the governed cadence, so the tail aged out silently | Horizon sized to `DRAIN_CAPACITY_CYCLES` cooldowns (30h) plus `observation_backlog()` aged-out accounting |
+| R-2 | P1 | A lost per-row acknowledgement after a confirmed delivery stranded the rows permanently: the digest fingerprint matched forever, so nothing resent and nothing acknowledged | `ALREADY_DELIVERED` repair path using `is_confirmed_emission`; writes the missing markers, sends nothing |
+| R-3 | P2 | Marker growth was unbounded (one entry per acknowledged row, never pruned) | Prune markers older than 30 days on the write path, plus `compact_markers()` |
+| R-4 | P3 | At most one digest per cooldown window (policy suppresses non-critical events for the whole window regardless of fingerprint) | Documented; safe because rows stay pending. Throughput remains one digest per 6h by default |
+| R-5 | P3 | Alert-market `observed_at` still uses evaluation time (only BTC context was moved to a source timestamp) | Documented; the market snapshot exposes no per-snapshot timestamp beyond `market_data_validation` |
+
+### Evidence
+
+RED before correction: 14 new reliability tests exercised a missing
+`observation_backlog`, a missing `STATUS_ALREADY_DELIVERED`, missing marker
+compaction, and - once those existed - the horizon defect reproduced as
+`pending=0` with two rows never delivered.
+GREEN after: 14 passed in the new file; 276 in the Tradevisor suite; 78 adjacent.
+
+`notification_policy.py`, `tradevisor_learning.py`, `report_tradevisor_learning.py`,
+`tradevisor_inbox.py` retention/consumption, F5/F7, R4 and release profiles are
+byte-identical to `72f592b5` except for the four-line provenance serializer from
+the previous increment.
