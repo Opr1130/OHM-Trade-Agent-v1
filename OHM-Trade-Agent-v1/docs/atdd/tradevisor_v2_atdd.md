@@ -403,3 +403,24 @@ anything non-actionable. The preview now derives an explicitly labelled
 synthetic actionable object **only** for decisions that actually reached the
 observation cohort, and otherwise prints the real decision and rejection code.
 The tool remains banner-labelled synthetic and performs no market read.
+
+## Addendum - instruction leakage, allocation bounds, discovery coverage
+
+| AC | Scenario | Test |
+| --- | --- | --- |
+| AC-027 | No internal instruction token (`ENTER_NOW`, `SET_LIMIT_ENTRY`, `ACTIONABLE`) in operator-facing WATCH text; shadow evidence byte-identical; contradictory text refused | three `test_ac_027_*` cases |
+| AC-028 | Final F5 call bounded by the unchanged position cap and risk budget; oversized / NaN / infinite / negative / zero / below-minimum allocations fail closed without raising and without an economic PASS | four `test_ac_028_*` cases |
+| AC-029 | Discovery coverage separates native-discovered, TradingView-configured, actually-observed and uncovered markets; no invented signals; ranking reuse declared unavailable | four `test_ac_029_*` cases |
+
+### Defect record
+
+The observation previously echoed the internal decision reason verbatim, which
+rendered `Assessment: Shadow-only swing LONG hypothesis (ENTER_NOW); ...` to an
+operator. The guard list only contained the spaced form (`ENTER NOW`), so the
+underscore token passed. AC-027 covers both forms, the neutralised presentation
+and the refusal of a hand-built contradictory message.
+
+The final-allocation economic call previously had no bound on the allocation it
+accepted, and a non-finite allocation escaped as a `ValueError` from a
+downstream owner. AC-028 adds the consistency tripwires and the fail-closed
+rejection.

@@ -241,6 +241,30 @@ the pipeline composes delivery for each
 THEN:
 an actionable decision yields only an actionable notification and never an observation, a withheld decision yields only an observation and never a notification, and the two delivery classes can never both describe the same decision
 
+AC-027:
+GIVEN:
+a withheld candidate whose internal decision reason and shadow proposal literally contain an internal instruction token, such as an immediate-entry or pullback-entry proposal
+WHEN:
+the operator-facing observation is rendered, singly and as a digest
+THEN:
+no internal instruction token appears in the rendered text, the abstention is still explained in operator language together with the missing evidence, the durable decision record and shadow evidence remain byte-identical to a fresh evaluation, and any candidate whose text would carry such a phrase is refused rather than rendered
+
+AC-028:
+GIVEN:
+a final economic qualification that re-runs the F5 owner at the F7-permitted allocation with a full capital fraction, and a replaced or malformed allocation of NaN, infinity, a negative, zero, a below-minimum value, or an amount exceeding the permitted position cap or risk budget
+WHEN:
+the qualified-buy composition finalizes
+THEN:
+the permitted allocation is proved to remain inside the unchanged position cap and fixed risky-trade budget for every evaluated equity and volatility, a passing case reports one basis for both the gate and the displayed figures with a final notional no larger than the envelope, and every unusable allocation fails closed as an explicit rejection without raising and without reporting an economic pass
+
+AC-029:
+GIVEN:
+a native eligible market universe, the operator's configured TradingView instrument map, and the markets that appear in durable Tradevisor observation rows, and separately no native universe at all
+WHEN:
+discovery coverage is reported
+THEN:
+each market is classified into exactly one visible population of native-discovered and TradingView-configured, configured but not native, actually observed, or native with no TradingView coverage, observed markets come only from durable records so no external signal is invented, a missing native universe is reported as unavailable rather than assumed, and native opportunity ranking is declared UNAVAILABLE with its input-contract reason because reusing it would require an owner architecture decision
+
 EXPLICITLY OUT OF SCOPE:
 - Any order placement, modification, cancellation or confirmation path, and any execution authority
 - Any change to fixed risk sizing, minimum reward-to-risk, position verification or execution safeguards
@@ -300,6 +324,17 @@ AC-023 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_023_transp
 AC-024 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_024_observation_digest_is_disabled_by_default
 AC-025 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_025_actionable_alert_states_timing_venue_and_capital_basis
 AC-026 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_026_observation_and_actionable_delivery_are_mutually_exclusive
+AC-027 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_027_contradictory_instruction_bearing_observation_is_refused
+AC-027 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_027_internal_shadow_evidence_is_preserved_unchanged
+AC-027 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_027_watch_observation_carries_no_internal_instruction_tokens
+AC-028 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_028_allocation_never_exceeds_position_or_account_risk_limits
+AC-028 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_028_non_finite_or_negative_allocation_fails_closed_without_raising
+AC-028 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_028_oversized_allocation_is_refused_as_inconsistent
+AC-028 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_028_unusable_allocation_never_reports_an_economic_pass
+AC-029 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_029_discovery_coverage_distinguishes_the_four_coin_sets
+AC-029 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_029_missing_native_universe_is_never_assumed
+AC-029 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_029_observed_markets_come_from_durable_records_only
+AC-029 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_029_opportunity_ranking_reuse_is_declared_unavailable
 
 
 IMPLEMENTATION MAP:
@@ -407,6 +442,14 @@ AC-025 -> OHM-Trade-Agent-v1/tools/tradevisor_alert_preview.py
 AC-026 -> OHM-Trade-Agent-v1/app/services/tradevisor_observation.py
 AC-026 -> OHM-Trade-Agent-v1/app/services/tradevisor_pipeline.py
 AC-026 -> OHM-Trade-Agent-v1/tests/test_tradevisor_advisory_observability_v1.py
+AC-027 -> OHM-Trade-Agent-v1/app/services/tradevisor_observation.py
+AC-027 -> OHM-Trade-Agent-v1/tests/test_tradevisor_advisory_observability_v1.py
+AC-027 -> OHM-Trade-Agent-v1/TRADEVISOR_V2.md
+AC-028 -> OHM-Trade-Agent-v1/app/services/tradevisor_evaluation.py
+AC-028 -> OHM-Trade-Agent-v1/tests/test_tradevisor_advisory_observability_v1.py
+AC-029 -> OHM-Trade-Agent-v1/app/services/tradevisor_native_context.py
+AC-029 -> OHM-Trade-Agent-v1/tests/test_tradevisor_advisory_observability_v1.py
+AC-029 -> OHM-Trade-Agent-v1/TRADEVISOR_V2.md
 
 DEFERRED DISCOVERIES:
 - G-01: no genuine TradingView to O'Pip delivery has been observed; the source-to-production certification remains open and blocks activation, not this increment.

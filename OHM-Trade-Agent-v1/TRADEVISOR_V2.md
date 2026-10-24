@@ -414,3 +414,59 @@ Existing rows written before this change carry no `consumption` field. They are
 treated as **not consumed** and remain protected — missing metadata never
 defaults to "consumed".
 
+
+## Addendum - presentation, allocation and discovery hardening (2026-10-24)
+
+### An observation never quotes an internal instruction
+
+Internal decision text names its own proposal (`ENTER_NOW`, `SET_LIMIT_ENTRY`).
+That vocabulary is correct in the durable record and wrong in an operator
+message, so the observation is rendered from neutralised operator language
+(`_operator_language`) and a guard refuses any text that still contains an
+instruction phrase. The durable `decision_record` and
+`evidence.shadow_proposed_action` are untouched: only the presentation copy
+differs, and the replay identity is unchanged.
+
+### The final-allocation economic call is bounded, and proved to be
+
+Re-running F5 at the F7 allocation with `max_capital_fraction=1.0` is safe
+because the value handed in is F7's own output, which is already capped by
+`max_position_pct` (the same 20% constant) and by the fixed per-trade risk
+budget. The composition does not trust that contract: it asserts it. A
+`capital_consistency` block records the status, allocation, risk, position-cap
+limit and risk budget, and anything unusable is rejected explicitly:
+
+| Situation | Rejection |
+| --- | --- |
+| Allocation exceeds the position cap or the risk budget | `CAPITAL_INCONSISTENT` |
+| Allocation is NaN or infinite | `CAPITAL_INCONSISTENT` (no exception escapes) |
+| Allocation is zero or negative | `CAPITAL_REJECT` |
+| Allocation is below the executable minimum | `CAPITAL_BELOW_EXECUTABLE_MINIMUM` |
+| Final net profit below the unchanged minimum | `ECONOMIC_REJECT_AT_FINAL_ALLOCATION` |
+
+No economic PASS is ever reported when there is no usable allocation to
+qualify against; the reported `economics.qualified` is false in every rejected
+case above.
+
+### Discovery coverage, and why ranking is not reused
+
+`discovery_coverage()` reports four separate populations from data the operator
+already has:
+
+| Population | Source |
+| --- | --- |
+| Discovered by O'Pip | eligible markets from the native scan universe, passed in |
+| Configured for an external alert | `OPIP_TRADEVISOR_INSTRUMENTS` |
+| Actually observed | markets in durable Tradevisor inbox rows |
+| Native with no TradingView coverage | universe minus configured |
+
+It performs no network call and never creates a signal: `native_markets` is
+supplied, and `observed_markets_from_records()` reads only what the inbox
+already holds. A missing universe is reported as `UNAVAILABLE`, not assumed.
+
+Native opportunity ranking (`app.scanner.intelligence_ranking`) is **not**
+reused and is reported as `UNAVAILABLE` with reason
+`REQUIRES_SCAN_CANDIDATE_SET`. Ranking orders the native scan's candidate set;
+placing an externally claimed observation into that ordering would let it
+compete for native admission. That is an authority decision for the owner, not
+an integration detail, so it is documented here and was not implemented.

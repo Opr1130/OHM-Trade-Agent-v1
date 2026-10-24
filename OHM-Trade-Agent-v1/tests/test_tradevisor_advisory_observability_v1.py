@@ -613,3 +613,314 @@ def test_ac_025_actionable_alert_states_timing_venue_and_capital_basis():
     assert "expected duration" not in text.lower()
     assert "Execution: Human approval required" in text
     assert "Expires:" in text
+
+
+# ---------------------------------------------------------------------------
+# AC-027 - no internal instruction may reach user-facing WATCH text
+# ---------------------------------------------------------------------------
+
+#: Tokens that describe an internal decision, never an operator instruction.
+_INTERNAL_INSTRUCTION_TOKENS = (
+    "ENTER_NOW",
+    "SET_LIMIT_ENTRY",
+    "ACTIONABLE",
+    "ENTER NOW",
+    "SET LIMIT ENTRY",
+    "Action:",
+)
+
+
+def _limit_entry_decision():
+    """A real withheld candidate whose internal proposal is SET_LIMIT_ENTRY."""
+    extended = market(last_price=104.0, ticker_last=104.0, ema20=100.0)
+    return te.evaluate_signal(
+        signal(signal_price=104.0),
+        now=NOW,
+        settings=settings(),
+        snapshot_provider=lambda _market: ("ok", extended, None),
+        account_equity=250_000.0,
+        active_trades=[],
+    )
+
+
+def test_ac_027_watch_observation_carries_no_internal_instruction_tokens():
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-027: WATCH text is never an instruction."""
+    from app.services import tradevisor_observation as observation
+
+    enter_now = evaluate(equity=10_000.0)
+    limit_entry = _limit_entry_decision()
+    # The internal proposals really do carry instruction tokens ...
+    assert enter_now.evidence["shadow_proposed_action"] == "ENTER_NOW"
+    assert limit_entry.evidence["shadow_proposed_action"] == "SET_LIMIT_ENTRY"
+    assert "ENTER_NOW" in enter_now.reason
+    assert "SET_LIMIT_ENTRY" in limit_entry.reason
+
+    candidates = [
+        observation.observation_candidate(enter_now, now=NOW),
+        observation.observation_candidate(limit_entry, now=NOW),
+    ]
+    assert all(candidate is not None for candidate in candidates)
+
+    rendered = [observation.format_observation(c) for c in candidates]
+    rendered.append(
+        observation.format_observation_digest(candidates, now=NOW, suppressed=0)
+    )
+    for text in rendered:
+        for token in _INTERNAL_INSTRUCTION_TOKENS:
+            assert token not in text, f"{token} leaked into: {text}"
+        assert "NO TRADE RECOMMENDATION" in text
+        assert "TRADEVISOR OBSERVATION" in text
+
+    # The assessment still explains the abstention in operator language.
+    single = candidates[0]
+    assert single["missing_evidence"] == [
+        "F6_TRUSTED_FORECAST",
+        "SWING_4H_CLOSED_CONTEXT",
+    ]
+    assert "hypothesis" in single["abstention_reason"].lower()
+    for token in _INTERNAL_INSTRUCTION_TOKENS:
+        assert token not in single["abstention_reason"]
+
+
+def test_ac_027_internal_shadow_evidence_is_preserved_unchanged():
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-027: presentation must not touch evidence."""
+    from app.services import tradevisor_observation as observation
+
+    decision = evaluate(equity=10_000.0)
+    before = decision.as_record()
+    candidate = observation.observation_candidate(decision, now=NOW)
+    observation.format_observation(candidate)
+    observation.format_observation_digest([candidate], now=NOW)
+
+    assert decision.as_record() == before
+    assert decision.evidence["shadow_proposed_action"] == "ENTER_NOW"
+    assert decision.evidence["advisory_qualification"]["status"] == "SHADOW_ONLY"
+    assert decision.evidence["advisory_qualification"]["policy"] == (
+        "OWNER_APPROVED_G02_G04_2026-10-23"
+    )
+    # Deterministic replay is unaffected by having rendered a report.
+    assert evaluate(equity=10_000.0).as_record() == before
+
+
+def test_ac_027_contradictory_instruction_bearing_observation_is_refused():
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-027: the guard refuses contradictions."""
+    from app.services import tradevisor_observation as observation
+
+    base = observation.observation_candidate(evaluate(), now=NOW)
+    assert base is not None
+
+    for injected in (
+        "ENTER NOW at market",
+        "internal proposal SET_LIMIT_ENTRY",
+        "O'Pip QUALIFIED entry",
+        "Action: buy 0.5 BTC",
+    ):
+        contradictory = {**base, "abstention_reason": injected}
+        with pytest.raises(ValueError):
+            observation.format_observation(contradictory)
+
+
+# ---------------------------------------------------------------------------
+# AC-028 - the final F5 call can never exceed any permitted limit
+# ---------------------------------------------------------------------------
+
+
+class _FakeAllocation:
+    """Stand-in for an F7 result, used only to probe the composition guard."""
+
+    def __init__(self, capital, *, risk_dollars=1.0, position_pct=999.0):
+        self.recommended_capital = capital
+        self.risk_dollars = risk_dollars
+        self.position_pct = position_pct
+        self.reason = "synthetic allocation for a composition guard test"
+
+
+def _fake_owner(allocation):
+    """Return a ``recommend_capital`` replacement that yields one fixed result."""
+
+    def owner(**_kwargs):
+        return allocation
+
+    return owner
+
+
+def test_ac_028_allocation_never_exceeds_position_or_account_risk_limits():
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-028: F7 output is bounded, end to end."""
+    risk_pct = settings().risk_per_trade_pct
+    for equity in (10_000.0, 25_000.0, 100_000.0):
+        for atr in (2.0, 3.0):
+            decision = evaluate(
+                equity=equity,
+                snapshot_provider=provider(atr=atr, atr_pct=atr),
+            )
+            allocation = decision.allocation
+            assert allocation is not None
+            # Position / strategy cap and fixed account-risk budget, unchanged.
+            assert allocation.recommended_capital <= (
+                equity * te.PRODUCTION_MAX_CAPITAL_FRACTION + 1e-6
+            )
+            assert allocation.risk_dollars <= equity * risk_pct / 100.0 + 1e-6
+
+            if decision.rejection_code == "ADVISORY_EVIDENCE_INCOMPLETE":
+                envelope = decision.evidence["economics_at_envelope"]
+                final = decision.evidence["final_allocation_basis"]
+                assert final["position_notional"] <= envelope["position_notional"]
+                assert decision.economics.position_notional <= (
+                    equity * te.PRODUCTION_MAX_CAPITAL_FRACTION + 1e-6
+                )
+                assert decision.economics.recommended_capital == pytest.approx(
+                    allocation.recommended_capital
+                )
+
+
+def test_ac_028_oversized_allocation_is_refused_as_inconsistent(monkeypatch):
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-028: a broken owner cannot size a trade."""
+    monkeypatch.setattr(
+        te, "recommend_capital", lambda **_kwargs: _FakeAllocation(50_000.0)
+    )
+    decision = evaluate(equity=10_000.0)
+
+    assert decision.decision == te.DECISION_WATCH
+    assert decision.rejection_code == "CAPITAL_INCONSISTENT"
+    assert decision.actionable is False
+    assert decision.economics is not None
+    assert decision.economics.qualified is False
+    assert "CAPITAL_INCONSISTENT" == decision.evidence["capital_consistency"]["status"]
+    assert decision.evidence["capital_consistency"]["limit"] == pytest.approx(
+        10_000.0 * te.PRODUCTION_MAX_CAPITAL_FRACTION
+    )
+
+
+def test_ac_028_non_finite_or_negative_allocation_fails_closed_without_raising(
+    monkeypatch,
+):
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-028: malformed capital never escapes."""
+    cases = {
+        "nan": (_FakeAllocation(float("nan")), "CAPITAL_INCONSISTENT"),
+        "inf": (_FakeAllocation(float("inf")), "CAPITAL_INCONSISTENT"),
+        "negative": (_FakeAllocation(-5.0), "CAPITAL_REJECT"),
+        "zero": (_FakeAllocation(0.0), "CAPITAL_REJECT"),
+    }
+    for label, (fake, expected) in cases.items():
+        monkeypatch.setattr(te, "recommend_capital", _fake_owner(fake))
+        decision = evaluate(equity=10_000.0)  # must not raise
+        assert decision.rejection_code == expected, label
+        assert decision.decision == te.DECISION_WATCH, label
+        assert decision.actionable is False, label
+        # No economic PASS may be reported at a size the operator cannot deploy.
+        assert decision.economics is not None
+        assert decision.economics.qualified is False, label
+
+
+def test_ac_028_unusable_allocation_never_reports_an_economic_pass(monkeypatch):
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-028: no PASS without a usable allocation."""
+    monkeypatch.setattr(
+        te, "recommend_capital", lambda **_kwargs: _FakeAllocation(10.0)
+    )
+    decision = evaluate(equity=10_000.0)
+
+    assert decision.rejection_code == "CAPITAL_BELOW_EXECUTABLE_MINIMUM"
+    assert decision.economics is not None
+    assert decision.economics.qualified is False
+    assert decision.evidence["f5_final"]["qualified"] is False
+
+
+# ---------------------------------------------------------------------------
+# AC-029 - discovery coverage separates the four coin populations
+# ---------------------------------------------------------------------------
+
+
+def _coverage_config():
+    return TradevisorConfig(
+        instruments={
+            ("COINBASE", "BTCUSD"): ("BTC/USD", "XBTUSD"),
+            ("COINBASE", "ETHUSD"): ("ETH/USD", "ETHUSD"),
+            ("COINBASE", "SOLUSD"): ("SOL/USD", "SOLUSD"),
+            # Configured for an external alert, but absent from the native
+            # universe used by these fixtures.
+            ("COINBASE", "DOGEUSD"): ("DOGE/USD", "XDGUSD"),
+        }
+    )
+
+
+def test_ac_029_discovery_coverage_distinguishes_the_four_coin_sets():
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-029: coverage is four explicit sets."""
+    from app.services.tradevisor_native_context import discovery_coverage
+
+    coverage = discovery_coverage(
+        native_markets=["XBTUSD", "ETHUSD", "SOLUSD", "MANAUSD", "ADAUSD"],
+        config=_coverage_config(),
+        observed_markets=["XBTUSD"],
+    )
+
+    rows = {row["market"]: row for row in coverage["rows"]}
+    # 1. discovered by O'Pip and configured for an external alert
+    assert rows["XBTUSD"]["native_discovered"] is True
+    assert rows["XBTUSD"]["tradingview_configured"] is True
+    # 3. actually observed (the only market with durable evidence)
+    assert rows["XBTUSD"]["tradevisor_observed"] is True
+    # A configured pair with no observation never claims one.
+    assert rows["ETHUSD"]["tradingview_configured"] is True
+    assert rows["ETHUSD"]["tradevisor_observed"] is False
+    # 2. configured for an external alert but NOT in the native universe
+    assert rows["XDGUSD"]["tradingview_configured"] is True
+    assert rows["XDGUSD"]["native_discovered"] is False
+    # 4. discovered by O'Pip with NO TradingView coverage
+    assert rows["MANAUSD"]["tradingview_configured"] is False
+    assert rows["MANAUSD"]["tradingview_coverage_gap"] is True
+    assert rows["MANAUSD"]["tradevisor_observed"] is False
+
+    counts = coverage["counts"]
+    assert counts["native_discovered"] == 5
+    assert counts["tradingview_configured"] == 4
+    assert counts["tradevisor_observed"] == 1
+    assert counts["configured_not_native"] == 1
+    assert counts["native_without_tradingview_coverage"] == 2
+    assert coverage["authority"] == "READ_ONLY_DIAGNOSTIC"
+    # No external signal is ever invented for an uncovered coin.
+    assert rows["MANAUSD"]["tradevisor_observed"] is False
+
+
+def test_ac_029_missing_native_universe_is_never_assumed():
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-029: unknown universe stays unknown."""
+    from app.services.tradevisor_native_context import discovery_coverage
+
+    coverage = discovery_coverage(
+        native_markets=None, config=_coverage_config(), observed_markets=[]
+    )
+    assert coverage["native_universe"] == "UNAVAILABLE"
+    assert coverage["native_universe_size"] is None
+    assert all(row["native_discovered"] is None for row in coverage["rows"])
+    assert coverage["counts"]["native_discovered"] is None
+    assert coverage["counts"]["native_without_tradingview_coverage"] is None
+
+
+def test_ac_029_observed_markets_come_from_durable_records_only():
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-029: observations are read, never invented."""
+    from app.services.tradevisor_native_context import observed_markets_from_records
+
+    records = [
+        {"dedup_id": "a", "signal": {"market": "XBTUSD", "signal": "BUY"}},
+        {"dedup_id": "b", "signal": {"market": "ethusd"}},
+        {"dedup_id": "c", "signal": {}},
+        {"dedup_id": "d"},
+        "not-a-row",
+    ]
+    assert observed_markets_from_records(records) == {"XBTUSD", "ETHUSD"}
+    assert observed_markets_from_records([]) == set()
+    assert observed_markets_from_records(None) == set()
+
+
+def test_ac_029_opportunity_ranking_reuse_is_declared_unavailable():
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-029: ranking reuse needs an architecture decision."""
+    from app.services.tradevisor_native_context import discovery_coverage
+
+    coverage = discovery_coverage(
+        native_markets=["XBTUSD"], config=_coverage_config(), observed_markets=["XBTUSD"]
+    )
+    ranking = coverage["ranking"]
+    assert ranking["status"] == "UNAVAILABLE"
+    assert "REQUIRES_SCAN_CANDIDATE_SET" in ranking["reason"]
+    # The diagnostic never ranks, scores or admits anything itself.
+    assert coverage["authority"] == "READ_ONLY_DIAGNOSTIC"
+    assert "rank" not in {key.lower() for key in coverage["counts"]}

@@ -20,6 +20,7 @@ This module renders that cohort as an OBSERVATION. Hard rules:
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -56,13 +57,27 @@ OBSERVATION_COHORT = frozenset({"ADVISORY_EVIDENCE_INCOMPLETE"})
 #: would read as a trade instruction.
 FORBIDDEN_PHRASES = (
     "ENTER NOW",
+    "ENTER_NOW",
     "BUY NOW",
     "SET LIMIT ENTRY",
+    "SET_LIMIT_ENTRY",
+    "ACTIONABLE",
     "Action:",
     "Preferred entry",
     "Do not chase",
     "QUALIFIED",
     "Execution: Human approval required",
+)
+
+#: Rewrites applied to internal decision prose before it is shown to an operator.
+#: The internal record keeps the verbatim decision (shadow evidence is untouched);
+#: only the user-facing rendering is translated into operator language.
+_NEUTRALIZATIONS = (
+    ("(ENTER_NOW)", ""),
+    ("(SET_LIMIT_ENTRY)", ""),
+    ("ENTER_NOW", "entry"),
+    ("SET_LIMIT_ENTRY", "pullback entry"),
+    ("actionable qualification", "entry qualification"),
 )
 
 STATUS_DELIVERED = "DELIVERED"
@@ -109,6 +124,21 @@ def _as_dict(value: object) -> dict:
     does not narrow ``evidence.get(...)`` for a type checker.
     """
     return value if isinstance(value, dict) else {}
+
+
+def _operator_language(text: object) -> str:
+    """Translate internal decision prose into operator language.
+
+    The durable decision record keeps the verbatim internal reason; this is the
+    presentation copy only, so a WATCH report can never quote ``ENTER_NOW`` /
+    ``SET_LIMIT_ENTRY`` back to an operator as if it were an instruction.
+    """
+    cleaned = str(text or "")
+    for token, replacement in _NEUTRALIZATIONS:
+        cleaned = cleaned.replace(token, replacement)
+    cleaned = re.sub(r"\s+([;,.)])", r"\1", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    return cleaned.strip()
 
 
 def _context_field(evidence: dict, name: str) -> dict | None:
@@ -178,7 +208,7 @@ def observation_candidate(
         "chase_risk": _context_field(evidence, "chase_risk"),
         "liquidity": _context_field(evidence, "liquidity"),
         "missing_evidence": list(qualification.get("missing") or []),
-        "abstention_reason": decision.reason,
+        "abstention_reason": _operator_language(decision.reason),
         "observed_at": (now or datetime.now(timezone.utc)).isoformat(),
         "trade_authority_changed": False,
         "measurement_only": True,

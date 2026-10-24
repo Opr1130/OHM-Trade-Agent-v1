@@ -26,6 +26,7 @@ from app.scanner.models import MarketSnapshot
 from app.services.chase_risk import ChaseRiskInput, assess_chase_risk
 
 CONTEXT_SCHEMA_VERSION = "tradevisor-native-context-v1"
+DISCOVERY_SCHEMA_VERSION = "tradevisor-discovery-coverage-v1"
 
 AVAILABLE = "AVAILABLE"
 UNAVAILABLE = "UNAVAILABLE"
@@ -290,6 +291,109 @@ def build_native_context(
         "signal_quality": signal_quality_context(),
         "opportunity_ranking": opportunity_ranking_context(),
         "liquidity": liquidity_context(execution, now=now),
+    }
+
+
+def observed_markets_from_records(records: Iterable[object] | None) -> set[str]:
+    """Markets that actually produced a durable Tradevisor observation.
+
+    Reads the rows the inbox already holds; it never creates, infers or replays a
+    signal, and malformed rows are ignored rather than guessed at.
+    """
+    markets: set[str] = set()
+    for row in records or ():
+        if not isinstance(row, dict):
+            continue
+        signal = row.get("signal")
+        if not isinstance(signal, dict):
+            continue
+        market = str(signal.get("market") or "").strip().upper()
+        if market:
+            markets.add(market)
+    return markets
+
+
+def discovery_coverage(
+    *,
+    native_markets: Iterable[str] | None,
+    config: Any,
+    observed_markets: Iterable[str] | None = None,
+) -> dict:
+    """Separate the four coin populations without inventing anything.
+
+    ``native_markets`` is the eligible market list produced by the native scan
+    universe (``app.scanner.universe``); it is passed in rather than fetched, so
+    this diagnostic performs no network call and cannot become a second scanner.
+    ``observed_markets`` comes from durable inbox rows.
+
+    The four populations are kept distinct on purpose:
+
+    1. discovered by O'Pip and configured for an external TradingView alert;
+    2. configured for an external alert but absent from the native universe;
+    3. markets that actually produced an observation;
+    4. native markets with **no** TradingView coverage at all.
+    """
+    configured: dict[str, tuple[str, str]] = {}
+    for (exchange, symbol), (_instrument, market) in getattr(
+        config, "instruments", {}
+    ).items():
+        configured[str(market).strip().upper()] = (exchange, symbol)
+
+    native = (
+        None
+        if native_markets is None
+        else {str(item).strip().upper() for item in native_markets if str(item).strip()}
+    )
+    observed = {
+        str(item).strip().upper() for item in (observed_markets or ()) if str(item).strip()
+    }
+
+    universe = set(configured) | observed | (native or set())
+    rows: list[dict] = []
+    for market in sorted(universe):
+        in_native = None if native is None else market in native
+        rows.append(
+            {
+                "market": market,
+                "native_discovered": in_native,
+                "tradingview_configured": market in configured,
+                "tradevisor_observed": market in observed,
+                "tradingview_coverage_gap": (
+                    None if in_native is None else (in_native and market not in configured)
+                ),
+                "configured_source": configured.get(market, (None, None))[0],
+                "configured_symbol": configured.get(market, (None, None))[1],
+            }
+        )
+
+    counts: dict[str, int | None] = {
+        "native_discovered": None if native is None else len(native),
+        "tradingview_configured": len(configured),
+        "tradevisor_observed": len(observed),
+        "configured_not_native": (
+            None if native is None else sum(1 for m in configured if m not in native)
+        ),
+        "native_without_tradingview_coverage": (
+            None if native is None else sum(1 for m in native if m not in configured)
+        ),
+    }
+    return {
+        "schema_version": DISCOVERY_SCHEMA_VERSION,
+        "authority": "READ_ONLY_DIAGNOSTIC",
+        "native_universe": "UNAVAILABLE" if native is None else "AVAILABLE",
+        "native_universe_size": None if native is None else len(native),
+        "counts": counts,
+        "rows": rows,
+        "ranking": {
+            "status": UNAVAILABLE,
+            "source": RANKING_SOURCE,
+            "reason": (
+                "REQUIRES_SCAN_CANDIDATE_SET: ranking orders the native scan's "
+                "candidate set; reusing it here would let an external observation "
+                "compete for native admission, which is an owner architecture "
+                "decision rather than an integration detail"
+            ),
+        },
     }
 
 

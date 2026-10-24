@@ -470,3 +470,76 @@ passed a `WATCH` decision to `format_tradevisor_alert`, which correctly refuses
 non-actionable decisions. It now derives a labelled synthetic actionable object
 only from decisions that genuinely reached the withheld-but-substantive cohort,
 and otherwise prints the real decision and rejection code.
+
+## 14. Principal-architect follow-up - three focused reviews (2026-10-24)
+
+Branch `feature/tradevisor-advisory-observability-v1`, continuing from
+`923662c7`/`9d49de97`. Local only: not pushed, not merged, not deployed, no
+learning file touched.
+
+### Baseline identity correction
+
+A previously reported baseline tree SHA was wrong. Measured values:
+
+| Identity | Value | Type |
+| --- | --- | --- |
+| Commit | `294d90c70d36aa9131459d7dee525fd3eb8b8365` | commit |
+| Tree of that commit | `49218188c54fea59b8397df97f2ab41d08e50c3e` | tree |
+| Parent commit | `90c760f5f5c9d5bdd729970f963c735a4fcf8e88` | **commit** |
+| Tree of the parent | `c5c8ef2e0ecf01dcaa39504945d3cfcbadd55e8d` | tree |
+
+The value `90c760f5...` is the **parent commit**, not a tree. It was captured
+because an earlier `git rev-parse HEAD^{tree}` was mangled by shell brace
+expansion (the captured output contained `-encodedCommand dAByAGUAZQA=`, i.e.
+base64 of `tree`). No analysis depended on it, but the identity must not be
+reused.
+
+### Confirmed defects
+
+| # | Defect | Evidence before the fix |
+| --- | --- | --- |
+| D1 | Operator-facing observation quoted the internal proposal | rendered line: `Assessment: Shadow-only swing LONG hypothesis (ENTER_NOW); ...`; guard only matched the spaced form |
+| D2 | No bound on the allocation feeding the final F5 call | injected 5x-equity allocation produced `economics.qualified=True` with a $50,000 notional on a $10,000 account |
+| D3 | Non-finite allocation escaped as an exception | injected NaN produced `ValueError: invalid non-finite capital or leverage` out of the evaluator |
+| D4 | A capital-rejected decision still reported the envelope economic PASS | negative allocation produced `CAPITAL_REJECT` with `economics.qualified=True` |
+
+### Fixes
+
+- `tradevisor_observation.py`: `_operator_language()` neutralises internal prose
+  for presentation only; the guard now also matches `ENTER_NOW`,
+  `SET_LIMIT_ENTRY`, `ACTIONABLE`; the durable record is untouched.
+- `tradevisor_evaluation.py`: `capital_consistency` tripwires against the
+  unchanged position cap and risk budget; `CAPITAL_INCONSISTENT` for unusable
+  allocations; `economics.qualified=False` whenever no usable allocation exists.
+  No F5/F7 algorithm, threshold or formula changed.
+- `tradevisor_native_context.py`: `discovery_coverage()` and
+  `observed_markets_from_records()` - read-only, no network call, no scanner.
+
+### Why `max_capital_fraction=1.0` is safe (independently verified)
+
+F7 sizes from `min(position_cap, risk_budget / stop%)` where the position cap is
+the same 20% constant used by the envelope, then applies quality/edge factors
+`<= 1.0`. Therefore the allocation is always `<= 20% of equity`, and
+`recommended * stop% / 100 <= risk_budget` by construction. AC-028 asserts both
+inequalities across equities and volatilities and asserts that the final
+notional never exceeds the envelope notional, so a replaced F7 cannot turn the
+full fraction into an unbounded notional.
+
+### Test evidence
+
+| Check | Result |
+| --- | --- |
+| RED before implementation | 8 failed, 3 passed (`-k 'ac_027 or ac_028 or ac_029'`) |
+| GREEN after implementation | 11 passed (same selection); 28 passed (whole file) |
+| Existing tradevisor files | 219 passed, 3.07s, exit 0 |
+| Tradevisor suite incl. new file | 247 passed |
+| `tests/atdd_scope.py --git-base 294d90c7` | PASS, exit 0 |
+
+### Remaining discovery/ranking gap
+
+Ranking reuse is **not** implemented and must not be improvised. See
+`TRADEVISOR_V2.md` addendum: reusing
+`app.scanner.intelligence_ranking` would require admitting an externally
+claimed observation into the native candidate ordering, which is an owner
+authority decision. Everything short of that (population separation, coverage
+counts, durable-observation truth) is now available read-only.
