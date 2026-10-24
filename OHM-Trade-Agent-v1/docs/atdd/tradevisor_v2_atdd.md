@@ -424,3 +424,18 @@ The final-allocation economic call previously had no bound on the allocation it
 accepted, and a non-finite allocation escaped as a `ValueError` from a
 downstream owner. AC-028 adds the consistency tripwires and the fail-closed
 rejection.
+
+## Addendum - six independent-review findings (AC-030 .. AC-035)
+
+| AC | Finding | Correction | Tests |
+| --- | --- | --- | --- |
+| AC-030 | Advisory delivery lived only in memory between settlement and send, so a crash, refusal, exception or suppression lost the report | Delivery is re-derived from durable rows; a confirmed send writes a per-row durable acknowledgement; bounded remainder rolls forward after cooldown | 5 `test_ac_030_*` |
+| AC-031 | The inbox serializer dropped `signal.provenance`, so a reloaded row lost it | Serializer persists provenance; legacy rows read as unknown; reclamation preserves it | 2 `test_ac_031_*` |
+| AC-032 | BTC context was labelled AVAILABLE on any returned trend, stamped with evaluation time | Identity match + qualified market data + source candle timestamp required, otherwise UNAVAILABLE with a reason | 1 `test_ac_032_*` |
+| AC-033 | Partial chase-risk inputs produced a confident LOW band | Input completeness exposed; conclusion indeterminate; band indicative-only | 1 `test_ac_033_*` |
+| AC-034 | The configured observation interval was dead code and suppression was opaque | Configured interval applied, stricter of config/policy wins, retry delay reported, suppression marks nothing | 3 `test_ac_034_*` |
+| AC-035 | Negative risk, malformed/None/non-numeric owner output and inconsistent position percentages could pass or raise | Every unusable result fails closed with a reason code, no exception escapes, no economic PASS | 3 `test_ac_035_*` |
+
+All six were reproduced RED before implementation (15 failing tests, 0 passing in
+the remediation selection), then GREEN (15 passing). No learning file, F6/4H
+policy, canonical path, execution path or risk threshold was modified.

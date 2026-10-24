@@ -22,14 +22,17 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from app.services.notification_policy import (
+    DEFAULT_COOLDOWN_SECONDS,
     confirm_emit,
+    record_emitted,
     release_emit,
     reserve_emit,
     should_emit,
 )
+from app.services.registry_io import load_json
 from app.services.telegram_delivery import send_tracked_telegram
 from app.services.tradevisor_evaluation import (
     ACTIONABLE_DECISIONS,
@@ -47,6 +50,16 @@ OBSERVATION_FAMILY = "TRADEVISOR_OBSERVATION"
 OBSERVATION_IDENTITY = "TRADEVISOR:OBSERVATION"
 
 MAX_OBSERVATIONS_PER_DIGEST = 5
+
+#: Durable per-row acknowledgement markers. Stored in the existing notification
+#: policy state (the same file the policy already owns), keyed per observed row,
+#: so a settled row is never reported twice and an unreported row is never lost.
+OBSERVATION_MARKER_PREFIX = "TRADEVISOR:OBSERVED:"
+
+#: How far back the recovery path will look for unreported eligible rows before
+#: the configured cooldown window is taken into account (see
+#: ``pending_observations``).
+DEFAULT_RECOVERY_MINUTES = 6 * 60
 
 #: The cohort that is worth telling an operator about: everything substantive
 #: passed and only an authority/evidence gate withheld the trade.
@@ -96,6 +109,7 @@ class ObservationOutcome:
     delivered: bool = False
     reason: str | None = None
     message: str | None = None
+    retry_after_seconds: int | None = None
 
     def as_dict(self) -> dict:
         return {
@@ -106,6 +120,7 @@ class ObservationOutcome:
             "alert_family": OBSERVATION_FAMILY,
             "trading_authority_changed": False,
             "reason": self.reason,
+            "retry_after_seconds": self.retry_after_seconds,
         }
 
 
@@ -114,6 +129,91 @@ def _iso(value: object) -> str | None:
         return None
     text = str(value)
     return text.replace("+00:00", "Z") if "T" in text else text
+
+
+def _stamp(value: object) -> datetime | None:
+    """Parse a stored timestamp; unparseable values are simply unknown."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _effective_cooldown_seconds(settings) -> int:
+    """Reconcile the configured observation interval with the policy default.
+
+    The stricter of the two always wins, so an operator can lengthen the
+    observation cadence but can never make O'Pip chattier than the shared
+    notification-policy cooldown already allows.
+    """
+    try:
+        configured = int(
+            getattr(settings, "opip_tradevisor_observation_min_interval_minutes", 0) or 0
+        )
+    except (TypeError, ValueError):
+        configured = 0
+    return max(configured * 60, DEFAULT_COOLDOWN_SECONDS)
+
+
+def _marker_identity(dedup_id: str) -> str:
+    return f"{OBSERVATION_MARKER_PREFIX}{dedup_id}"
+
+
+def _policy_state() -> dict:
+    try:
+        return _as_dict(load_json(_notification_state_file()))
+    except Exception:  # noqa: BLE001 - an unreadable ledger is "not yet reported"
+        return {}
+
+
+def _notification_state_file():
+    from app.services import notification_policy
+
+    return notification_policy.STATE_FILE
+
+
+def observation_already_reported(dedup_id: object) -> bool:
+    """True when this exact observation has already been reported durably."""
+    key = str(dedup_id or "").strip()
+    if not key:
+        return False
+    return f"{_marker_identity(key)}:{OBSERVATION_EVENT_TYPE}" in _policy_state()
+
+
+def _content_fingerprint(candidate: dict) -> str:
+    material = "|".join(
+        (
+            str(candidate.get("dedup_id") or ""),
+            str(candidate.get("rejection_code") or ""),
+            str(candidate.get("source_bar_closed_at") or ""),
+        )
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _mark_reported(candidates: list[dict], *, now: datetime) -> int:
+    """Record the durable per-row acknowledgement after a confirmed delivery."""
+    marked = 0
+    for candidate in candidates:
+        dedup_id = str(candidate.get("dedup_id") or "").strip()
+        if not dedup_id:
+            continue
+        try:
+            record_emitted(
+                identity=_marker_identity(dedup_id),
+                event_type=OBSERVATION_EVENT_TYPE,
+                fingerprint=_content_fingerprint(candidate),
+                now=now,
+            )
+            marked += 1
+        except Exception:  # noqa: BLE001 - a ledger write failure must not duplicate
+            continue
+    return marked
 
 
 def _as_dict(value: object) -> dict:
@@ -149,17 +249,77 @@ def _context_field(evidence: dict, name: str) -> dict | None:
     return field if isinstance(field, dict) else None
 
 
-def _corroboration(direction: str, regime: str | None) -> str:
+def _corroboration(direction: str, regime: object) -> str:
     """Independent native corroboration, stated plainly and never inflated."""
-    if not regime:
+    normalised = str(regime).upper() if regime else None
+    if not normalised:
         return "UNAVAILABLE"
     if direction == "SELL":
-        return "CORROBORATES_BEARISH" if regime == "BEARISH" else "CONTRADICTS"
-    if regime == "BULLISH":
+        return "CORROBORATES_BEARISH" if normalised == "BEARISH" else "CONTRADICTS"
+    if normalised == "BULLISH":
         return "CORROBORATES_BULLISH"
-    if regime == "BEARISH":
+    if normalised == "BEARISH":
         return "CONTRADICTS"
     return "NEUTRAL"
+
+
+def _build_candidate(
+    *,
+    decision_name: object,
+    rejection_code: object,
+    dedup_id: object,
+    signal_direction: object,
+    instrument: object,
+    market: object,
+    source_exchange: object,
+    source_symbol: object,
+    timeframe_minutes: object,
+    horizon: object,
+    reason: object,
+    evaluated_at: object,
+    current_price: object,
+    native_regime: object,
+    evidence: object,
+    observed_at: str,
+) -> dict:
+    """One candidate shape, used by both the live and the recovered path.
+
+    Keeping a single builder means a row replayed from durable storage produces
+    exactly the record a live evaluation would have produced.
+    """
+    evidence_map = _as_dict(evidence)
+    timing = _as_dict(evidence_map.get("timing"))
+    qualification = _as_dict(evidence_map.get("advisory_qualification"))
+    provenance = _as_dict(evidence_map.get("provenance"))
+    btc = _context_field(evidence_map, "btc_regime")
+    btc_value = btc.get("value") if btc and btc.get("status") == "AVAILABLE" else None
+    return {
+        "classification": OBSERVATION_CLASSIFICATION,
+        "decision": decision_name,
+        "rejection_code": rejection_code,
+        "declared_indicator_version": provenance.get("declared_indicator_version"),
+        "dedup_id": dedup_id,
+        "signal": signal_direction,
+        "instrument": instrument,
+        "market": market,
+        "source_exchange": source_exchange,
+        "source_symbol": source_symbol,
+        "timeframe_minutes": timeframe_minutes,
+        "horizon": horizon,
+        "source_bar_closed_at": timing.get("source_bar_closed_at"),
+        "evaluated_at": evaluated_at,
+        "current_price": current_price,
+        "native_regime": native_regime,
+        "native_corroboration": _corroboration(str(signal_direction or ""), native_regime),
+        "btc_context": btc_value,
+        "chase_risk": _context_field(evidence_map, "chase_risk"),
+        "liquidity": _context_field(evidence_map, "liquidity"),
+        "missing_evidence": list(qualification.get("missing") or []),
+        "abstention_reason": _operator_language(reason),
+        "observed_at": observed_at,
+        "trade_authority_changed": False,
+        "measurement_only": True,
+    }
 
 
 def observation_candidate(
@@ -178,41 +338,141 @@ def observation_candidate(
     if decision.rejection_code not in OBSERVATION_COHORT:
         return None
 
-    evidence = _as_dict(decision.evidence)
-    timing = _as_dict(evidence.get("timing"))
-    qualification = _as_dict(evidence.get("advisory_qualification"))
-    btc = _context_field(evidence, "btc_regime")
-    btc_value = btc.get("value") if btc and btc.get("status") == "AVAILABLE" else None
-    native_regime = decision.market_regime
-    provenance = _as_dict(evidence.get("provenance"))
+    return _build_candidate(
+        decision_name=decision.decision,
+        rejection_code=decision.rejection_code,
+        dedup_id=decision.dedup_id,
+        signal_direction=decision.signal,
+        instrument=decision.instrument,
+        market=decision.market,
+        source_exchange=decision.source_exchange,
+        source_symbol=decision.source_symbol,
+        timeframe_minutes=decision.timeframe_minutes,
+        horizon=decision.horizon,
+        reason=decision.reason,
+        evaluated_at=decision.evaluated_at.isoformat(),
+        current_price=decision.current_price,
+        native_regime=decision.market_regime,
+        evidence=decision.evidence,
+        observed_at=(now or datetime.now(timezone.utc)).isoformat(),
+    )
 
-    return {
-        "classification": OBSERVATION_CLASSIFICATION,
-        "decision": decision.decision,
-        "rejection_code": decision.rejection_code,
-        "declared_indicator_version": provenance.get("declared_indicator_version"),
-        "dedup_id": decision.dedup_id,
-        "signal": decision.signal,
-        "instrument": decision.instrument,
-        "market": decision.market,
-        "source_exchange": decision.source_exchange,
-        "source_symbol": decision.source_symbol,
-        "timeframe_minutes": decision.timeframe_minutes,
-        "horizon": decision.horizon,
-        "source_bar_closed_at": timing.get("source_bar_closed_at"),
-        "evaluated_at": decision.evaluated_at.isoformat(),
-        "current_price": decision.current_price,
-        "native_regime": native_regime,
-        "native_corroboration": _corroboration(decision.signal, native_regime),
-        "btc_context": btc_value,
-        "chase_risk": _context_field(evidence, "chase_risk"),
-        "liquidity": _context_field(evidence, "liquidity"),
-        "missing_evidence": list(qualification.get("missing") or []),
-        "abstention_reason": _operator_language(decision.reason),
-        "observed_at": (now or datetime.now(timezone.utc)).isoformat(),
-        "trade_authority_changed": False,
-        "measurement_only": True,
-    }
+
+def candidate_from_record(
+    record: object,
+    *,
+    now: datetime | None = None,
+) -> dict | None:
+    """Rebuild an observation from a durable inbox row's frozen decision.
+
+    Read-only: the row is never mutated, and a row that is not in the
+    substantive cohort (or carries no frozen decision) yields ``None``.
+    """
+    row = _as_dict(record)
+    frozen = _as_dict(row.get("decision_record"))
+    if not frozen:
+        return None
+    if str(frozen.get("rejection_code") or "") not in OBSERVATION_COHORT:
+        return None
+    signal_record = _as_dict(row.get("signal"))
+    dedup_id = row.get("dedup_id") or frozen.get("dedup_id")
+    if not dedup_id:
+        return None
+    try:
+        timeframe = int(frozen.get("timeframe_minutes") or 0)
+    except (TypeError, ValueError):
+        timeframe = 0
+    return _build_candidate(
+        decision_name=frozen.get("decision"),
+        rejection_code=frozen.get("rejection_code"),
+        dedup_id=str(dedup_id),
+        signal_direction=frozen.get("signal") or signal_record.get("signal"),
+        instrument=frozen.get("instrument"),
+        market=frozen.get("market") or signal_record.get("market"),
+        source_exchange=frozen.get("source_exchange")
+        or signal_record.get("source_exchange"),
+        source_symbol=frozen.get("source_symbol") or signal_record.get("source_symbol"),
+        timeframe_minutes=timeframe,
+        horizon=frozen.get("horizon"),
+        reason=frozen.get("reason"),
+        evaluated_at=frozen.get("evaluated_at"),
+        current_price=frozen.get("current_price"),
+        native_regime=frozen.get("market_regime"),
+        evidence=frozen.get("evidence"),
+        observed_at=(now or datetime.now(timezone.utc)).isoformat(),
+    )
+
+
+def _retry_after_seconds(*, now: datetime, cooldown_seconds: int) -> int | None:
+    """Seconds until the reconciled observation cooldown expires, if known."""
+    entry = _as_dict(
+        _policy_state().get(f"{OBSERVATION_IDENTITY}:{OBSERVATION_EVENT_TYPE}")
+    )
+    sent_at = _stamp(entry.get("sent_at"))
+    if sent_at is None:
+        return None
+    remaining = cooldown_seconds - (now - sent_at).total_seconds()
+    return max(0, int(remaining))
+
+
+def _inbox_records() -> list[dict]:
+    """Read the durable inbox rows (read-only; never mutates the store)."""
+    from app.services import tradevisor_inbox
+
+    return tradevisor_inbox.iter_records()
+
+
+def pending_observations(
+    *,
+    now: datetime | None = None,
+    records: list[dict] | None = None,
+    window_minutes: int | None = None,
+    settings=None,
+    limit: int | None = None,
+) -> list[dict]:
+    """Eligible, durable, not-yet-reported observations awaiting delivery.
+
+    This is the recovery half of advisory delivery. A settled inbox row keeps its
+    frozen decision forever, so a crash after settlement, a refused transport, a
+    transport exception or a cooldown suppression all leave work that the next
+    cycle can find. A row stops being eligible only when a durable per-row
+    acknowledgement exists.
+
+    Nothing here writes: discovery of pending work is read-only.
+    """
+    reference = now or datetime.now(timezone.utc)
+    if window_minutes is None:
+        resolved_settings = settings
+        if resolved_settings is None:
+            try:
+                from app.core.config import get_settings
+
+                resolved_settings = get_settings()
+            except Exception:  # noqa: BLE001 - cadence falls back to the policy default
+                resolved_settings = None
+        # Look back far enough to cover at least two full cooldown windows, so a
+        # suppressed observation survives until its cadence permits delivery.
+        window_minutes = max(
+            DEFAULT_RECOVERY_MINUTES,
+            int(_effective_cooldown_seconds(resolved_settings) / 60) * 2 + 60,
+        )
+    horizon = reference - timedelta(minutes=window_minutes)
+
+    candidates: list[dict] = []
+    for row in records if records is not None else _inbox_records():
+        candidate = candidate_from_record(row, now=reference)
+        if candidate is None:
+            continue
+        stamp = _stamp(candidate.get("evaluated_at"))
+        if stamp is None or stamp < horizon:
+            continue
+        if observation_already_reported(candidate.get("dedup_id")):
+            continue
+        candidates.append(candidate)
+
+    candidates.sort(key=lambda item: str(item.get("evaluated_at") or ""))
+    cap = MAX_OBSERVATIONS_PER_DIGEST * 4 if limit is None else max(1, int(limit))
+    return candidates[:cap]
 
 
 def _item_lines(candidate: dict) -> list[str]:
@@ -239,10 +499,18 @@ def _item_lines(candidate: dict) -> list[str]:
     chase = candidate.get("chase_risk")
     if isinstance(chase, dict) and chase.get("status") == "AVAILABLE":
         value = chase.get("value") or {}
-        lines.append(
-            f"  Chase risk: {value.get('band')} (score {value.get('score')}), "
-            "advisory only"
-        )
+        completeness = value.get("input_completeness") or {}
+        if value.get("band_is_indicative_only"):
+            lines.append(
+                f"  Chase risk: {value.get('band')} (score {value.get('score')}), "
+                f"partial inputs {completeness.get('provided')}/"
+                f"{completeness.get('total')} - indicative only, advisory only"
+            )
+        else:
+            lines.append(
+                f"  Chase risk: {value.get('band')} (score {value.get('score')}), "
+                "advisory only"
+            )
     else:
         lines.append(
             "  Chase risk: UNAVAILABLE"
@@ -362,11 +630,14 @@ def send_observation_digest(
 
     message = format_observation_digest(bounded, now=now, suppressed=suppressed)
     fingerprint = _fingerprint(bounded)
+    cooldown_seconds = _effective_cooldown_seconds(settings)
 
     if not should_emit(
         identity=OBSERVATION_IDENTITY,
         event_type=OBSERVATION_EVENT_TYPE,
         fingerprint=fingerprint,
+        cooldown_seconds=cooldown_seconds,
+        now=now,
     ):
         return ObservationOutcome(
             status=STATUS_SUPPRESSED_POLICY,
@@ -374,12 +645,15 @@ def send_observation_digest(
             suppressed_bounded=suppressed,
             reason="notification policy already reported this observation set",
             message=message,
+            retry_after_seconds=_retry_after_seconds(now=now, cooldown_seconds=cooldown_seconds),
         )
 
     reservation = reserve_emit(
         identity=OBSERVATION_IDENTITY,
         event_type=OBSERVATION_EVENT_TYPE,
         fingerprint=fingerprint,
+        cooldown_seconds=cooldown_seconds,
+        now=now,
     )
     if reservation is None:
         return ObservationOutcome(
@@ -392,6 +666,7 @@ def send_observation_digest(
 
     deliver = sender or send_tracked_telegram
     delivered = False
+    failure_reason = "Telegram transport did not accept the message"
     try:
         result = deliver(
             bot_token=bot_token,
@@ -406,6 +681,11 @@ def send_observation_digest(
             signal_id=fingerprint[:16],
         )
         delivered = bool(getattr(result, "delivered", False))
+    except Exception as exc:  # noqa: BLE001 - a transport fault is a failed send,
+        # not a lost observation: the reservation is released and the rows stay
+        # pending for the next cycle.
+        delivered = False
+        failure_reason = f"transport raised {type(exc).__name__}: {exc}"
     finally:
         if delivered:
             confirm_emit(
@@ -413,6 +693,7 @@ def send_observation_digest(
                 event_type=OBSERVATION_EVENT_TYPE,
                 fingerprint=fingerprint,
                 reservation_token=reservation,
+                now=now,
             )
         else:
             # Release immediately so the next cycle can retry honestly.
@@ -427,15 +708,19 @@ def send_observation_digest(
             status=STATUS_SEND_FAILED,
             observed=len(bounded),
             suppressed_bounded=suppressed,
-            reason="Telegram transport did not accept the message",
+            reason=failure_reason,
             message=message,
         )
+    # Durable per-row acknowledgement: only a confirmed delivery marks the rows
+    # reported, so a retry can never duplicate and a failure can never discard.
+    marked = _mark_reported(bounded, now=now)
     return ObservationOutcome(
         status=STATUS_DELIVERED,
         observed=len(bounded),
         suppressed_bounded=suppressed,
         delivered=True,
         message=message,
+        reason=f"marked_reported={marked}",
     )
 
 

@@ -90,6 +90,10 @@ DEFAULT_ACCOUNT_EQUITY = 1_000.0
 #: Tolerance for comparing F7's rounded allocation with a re-derived notional.
 ALLOCATION_TOLERANCE = 0.01
 
+#: Tolerance, in percentage points, between F7's reported position percentage
+#: and the capital it says it will deploy.
+POSITION_PCT_TOLERANCE_PP = 0.5
+
 
 @dataclass(frozen=True)
 class TradevisorDecision:
@@ -430,6 +434,25 @@ def _executable_price(snapshot: MarketSnapshot) -> float:
     return 0.0
 
 
+def _read_allocation_fields(allocation: Any) -> tuple[float, float, float, str | None]:
+    """Read F7's numeric output without trusting its shape.
+
+    Returns ``(capital, risk, position_pct, malformed_reason)``. A missing or
+    non-numeric field is reported instead of raised, so a replaced or broken
+    owner fails closed rather than crashing the evaluator.
+    """
+    try:
+        raw_capital = getattr(allocation, "recommended_capital")
+        raw_risk = getattr(allocation, "risk_dollars")
+        raw_pct = getattr(allocation, "position_pct")
+    except AttributeError:
+        return math.nan, math.nan, math.nan, "MISSING_ALLOCATION_FIELDS"
+    try:
+        return float(raw_capital), float(raw_risk), float(raw_pct), None
+    except (TypeError, ValueError):
+        return math.nan, math.nan, math.nan, "NON_NUMERIC_ALLOCATION"
+
+
 def _geometry_is_sane(plan: EntryExitPlan) -> bool:
     """Structural validation of an already-computed plan.
 
@@ -716,20 +739,36 @@ def _finalize_qualified_buy(
     net_edge_pct = (
         float(economics.target_2_net_profit) / notional * 100.0 if notional > 0 else 0.0
     )
-    allocation = recommend_capital(
-        available_capital=equity,
-        stop_distance_pct=float(economics.stop_pct),
-        confidence_score=float(attainability.attainability_score),
-        quality_score=float(attainability.attainability_score),
-        net_edge_pct=net_edge_pct,
-        max_position_pct=PRODUCTION_MAX_CAPITAL_FRACTION * 100.0,
-        risk_per_trade_pct=risk_per_trade_pct,
-    )
+    owner_error: str | None = None
+    try:
+        allocation = recommend_capital(
+            available_capital=equity,
+            stop_distance_pct=float(economics.stop_pct),
+            confidence_score=float(attainability.attainability_score),
+            quality_score=float(attainability.attainability_score),
+            net_edge_pct=net_edge_pct,
+            max_position_pct=PRODUCTION_MAX_CAPITAL_FRACTION * 100.0,
+            risk_per_trade_pct=risk_per_trade_pct,
+        )
+    except Exception as exc:  # noqa: BLE001 - a broken owner must not crash the run
+        allocation = None
+        owner_error = f"{type(exc).__name__}: {exc}"
+
+    (
+        allocation_capital,
+        allocation_risk,
+        allocation_pct,
+        malformed_reason,
+    ) = _read_allocation_fields(allocation)
+
     evidence["f7_capital"] = {
-        "recommended_capital": allocation.recommended_capital,
-        "risk_dollars": allocation.risk_dollars,
-        "position_pct": allocation.position_pct,
-        "reason": allocation.reason,
+        "recommended_capital": (
+            allocation_capital if math.isfinite(allocation_capital) else None
+        ),
+        "risk_dollars": allocation_risk if math.isfinite(allocation_risk) else None,
+        "position_pct": allocation_pct if math.isfinite(allocation_pct) else None,
+        "reason": getattr(allocation, "reason", None) or owner_error,
+        "owner_error": owner_error,
         "net_edge_pct": round(net_edge_pct, 4),
         "min_executable_notional_usd": MIN_EXECUTABLE_NOTIONAL_USD,
     }
@@ -754,29 +793,45 @@ def _finalize_qualified_buy(
     # ------------------------------------------------------------------
     permitted_notional = float(equity) * PRODUCTION_MAX_CAPITAL_FRACTION
     risk_budget = float(equity) * risk_per_trade_pct / 100.0
-    allocation_capital = float(allocation.recommended_capital)
-    allocation_risk = float(allocation.risk_dollars)
-    malformed_allocation = not (
-        math.isfinite(allocation_capital) and math.isfinite(allocation_risk)
-    )
-    oversized_allocation = not malformed_allocation and (
+
+    reason_code = ""
+    if malformed_reason:
+        reason_code = malformed_reason
+    elif not (
+        math.isfinite(allocation_capital)
+        and math.isfinite(allocation_risk)
+        and math.isfinite(allocation_pct)
+    ):
+        reason_code = "NON_FINITE_ALLOCATION"
+    elif allocation_capital <= 0:
+        reason_code = "NON_POSITIVE_CAPITAL"
+    elif allocation_risk < 0:
+        reason_code = "NEGATIVE_RISK"
+    elif (
         allocation_capital > permitted_notional + ALLOCATION_TOLERANCE
         or allocation_risk > risk_budget + ALLOCATION_TOLERANCE
-    )
-
-    if malformed_allocation or oversized_allocation:
-        capital_status = "CAPITAL_INCONSISTENT"
-    elif allocation_capital <= 0:
-        capital_status = "CAPITAL_REJECT"
+    ):
+        reason_code = "OVERSIZED_ALLOCATION"
+    elif abs(allocation_pct - allocation_capital / float(equity) * 100.0) > (
+        POSITION_PCT_TOLERANCE_PP
+    ):
+        reason_code = "POSITION_PCT_INCONSISTENT"
     elif allocation_capital < MIN_EXECUTABLE_NOTIONAL_USD:
-        capital_status = "CAPITAL_BELOW_EXECUTABLE_MINIMUM"
+        reason_code = "BELOW_EXECUTABLE_MINIMUM"
+
+    if reason_code in {"", "BELOW_EXECUTABLE_MINIMUM"}:
+        capital_status = "CONSISTENT" if not reason_code else "CAPITAL_BELOW_EXECUTABLE_MINIMUM"
+    elif reason_code == "NON_POSITIVE_CAPITAL":
+        capital_status = "CAPITAL_REJECT"
     else:
-        capital_status = "CONSISTENT"
+        capital_status = "CAPITAL_INCONSISTENT"
 
     evidence["capital_consistency"] = {
         "status": capital_status,
+        "reason_code": reason_code or "CONSISTENT",
         "allocation": allocation_capital if math.isfinite(allocation_capital) else None,
         "risk_dollars": allocation_risk if math.isfinite(allocation_risk) else None,
+        "position_pct": allocation_pct if math.isfinite(allocation_pct) else None,
         "limit": permitted_notional,
         "risk_budget": risk_budget,
         "policy": "F7 output must stay within the position cap and the fixed risk budget",
@@ -798,7 +853,7 @@ def _finalize_qualified_buy(
             "qualified": economics.qualified,
         }
         evidence["final_allocation_basis"] = {
-            "allocation": allocation.recommended_capital,
+            "allocation": allocation_capital,
             "economics_recommended_capital": final_economics.recommended_capital,
             "position_notional": final_economics.position_notional,
             "parity": abs(
@@ -829,15 +884,16 @@ def _finalize_qualified_buy(
     if capital_status == "CAPITAL_INCONSISTENT":
         rejection = (
             "CAPITAL_INCONSISTENT",
-            f"F7 allocation is not usable: {allocation_capital!r} capital / "
-            f"{allocation_risk!r} risk against a permitted limit of "
-            f"USD {permitted_notional:.2f} and a risk budget of "
+            f"F7 allocation is unusable ({reason_code}): {allocation_capital!r} capital / "
+            f"{allocation_risk!r} risk / {allocation_pct!r}% position against a permitted "
+            f"limit of USD {permitted_notional:.2f} and a risk budget of "
             f"USD {risk_budget:.2f}.",
         )
     elif capital_status == "CAPITAL_REJECT":
         rejection = (
             "CAPITAL_REJECT",
-            f"F7 capital planning allocated no capital: {allocation.reason}",
+            "F7 capital planning allocated no capital: "
+            f"{getattr(allocation, 'reason', None) or owner_error or 'no allocation'}",
         )
     elif capital_status == "CAPITAL_BELOW_EXECUTABLE_MINIMUM":
         rejection = (
@@ -862,7 +918,7 @@ def _finalize_qualified_buy(
                 active_trades=list(active_trades),
                 proposed_symbol=signal.market,
                 proposed_direction="LONG",
-                proposed_capital=float(allocation.recommended_capital),
+                proposed_capital=allocation_capital,
                 account_capital=equity,
                 proposed_leverage=1.0,
             )

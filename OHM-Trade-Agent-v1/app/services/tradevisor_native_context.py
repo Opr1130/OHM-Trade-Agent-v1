@@ -105,17 +105,27 @@ def _resolve_snapshot(result: Any) -> tuple[MarketSnapshot | None, str | None]:
     return None, f"UNSUPPORTED_PROVIDER_RESULT:{type(result).__name__}"
 
 
+def _normalise_market(value: object) -> str:
+    """Identity comparison key: alphanumerics only, upper case.
+
+    Used solely to decide whether a snapshot describes the market we asked for;
+    it performs no symbol translation and no trade arithmetic.
+    """
+    return "".join(character for character in str(value or "").upper() if character.isalnum())
+
+
 def btc_regime_context(
     *,
     provider: Callable[[str], Any] | None,
     market: str,
     now: datetime | None,
 ) -> dict:
-    """BTC context from the native scanner (the same owner as any other symbol).
+    """BTC context from the native scanner, gated on identity and freshness.
 
-    This is BTC's own completed-1H EMA stack, not a new broad-market formula.
-    Universe breadth is a separate field and stays unavailable when its sample
-    is too small.
+    A returned trend is not evidence on its own. The snapshot must describe the
+    market that was requested and carry a qualified market-data validation with
+    its own source timestamp; evaluation time is never substituted for the time
+    the source was observed.
     """
     if not market:
         return _unavailable(BTC_SOURCE, "DISABLED_BY_CONFIGURATION")
@@ -127,14 +137,54 @@ def btc_regime_context(
         return _unavailable(BTC_SOURCE, f"{type(exc).__name__}: {exc}", market=market)
     if snapshot is None:
         return _unavailable(BTC_SOURCE, reason or "NO_SNAPSHOT", market=market)
+
+    actual_market = getattr(snapshot, "symbol", None)
+    if _normalise_market(actual_market) != _normalise_market(market):
+        return _unavailable(
+            BTC_SOURCE,
+            f"MARKET_IDENTITY_MISMATCH:{actual_market!r} != {market!r}",
+            market=market,
+        )
+
+    validation = getattr(snapshot, "market_data_validation", None)
+    if validation is None:
+        return _unavailable(
+            BTC_SOURCE,
+            "NO_MARKET_DATA_VALIDATION: freshness cannot be verified",
+            market=market,
+        )
+    if not bool(getattr(validation, "qualified", False)):
+        blockers = ", ".join(
+            str(item) for item in (getattr(validation, "rejection_reasons", None) or ())
+        )
+        return _unavailable(
+            BTC_SOURCE,
+            f"MARKET_DATA_UNQUALIFIED:{getattr(validation, 'status', 'UNKNOWN')}"
+            + (f": {blockers}" if blockers else ""),
+            market=market,
+        )
+
+    candle_timestamp = getattr(validation, "latest_candle_timestamp", None)
+    if not isinstance(candle_timestamp, (int, float)):
+        return _unavailable(
+            BTC_SOURCE, "NO_SOURCE_TIMESTAMP: candle time is unknown", market=market
+        )
+    try:
+        observed = datetime.fromtimestamp(float(candle_timestamp), tz=timezone.utc)
+    except (TypeError, ValueError, OSError):
+        return _unavailable(
+            BTC_SOURCE, "NO_SOURCE_TIMESTAMP: candle time is unparseable", market=market
+        )
+
     trend = str(getattr(snapshot, "trend", "") or "").upper()
     if not trend:
         return _unavailable(BTC_SOURCE, "BTC_TREND_UNAVAILABLE", market=market)
     return _available(
         BTC_SOURCE,
         trend,
-        now=now,
+        now=observed,
         market=market,
+        freshness_seconds=getattr(validation, "latest_candle_age_seconds", None),
         limitations=("BTC_1H_EMA_STACK_ONLY", "NOT_BROAD_MARKET_BREADTH"),
     )
 
@@ -203,8 +253,20 @@ def chase_risk_context(snapshot: MarketSnapshot, *, now: datetime | None) -> dic
     except Exception as exc:  # noqa: BLE001 - context must never break evaluation
         return _unavailable(CHASE_SOURCE, f"{type(exc).__name__}: {exc}")
 
-    # Disclose exactly which inputs the native scorer did not receive, so a LOW
-    # band is never mistaken for a complete assessment.
+    # The owner's own docstring promises "missing data contributes no invented
+    # certainty"; the band it returns from a partial input set must therefore be
+    # reported as indicative, never as a complete LOW-risk clearance.
+    groups = {
+        "price_context": recent_high_value is not None,
+        "extension": False,
+        "persistence": False,
+        "exhaustion": False,
+        "retest": False,
+    }
+    missing_groups = [name for name, provided in groups.items() if not provided]
+    provided = len(groups) - len(missing_groups)
+    total = len(groups)
+    complete = provided == total
     unsupplied = (
         "breakout_level",
         "lift_from_24h_low_pct",
@@ -223,6 +285,14 @@ def chase_risk_context(snapshot: MarketSnapshot, *, now: datetime | None) -> dic
             "distance_from_recent_high_pct": assessment.distance_from_recent_high_pct,
             "reasons": list(assessment.reasons),
             "advisory_only": bool(assessment.advisory_only),
+            "input_completeness": {
+                "provided": provided,
+                "total": total,
+                "ratio": round(provided / total, 4) if total else 0.0,
+                "missing": missing_groups,
+            },
+            "conclusion": "COMPLETE" if complete else "INDETERMINATE_PARTIAL_INPUTS",
+            "band_is_indicative_only": not complete,
         },
         now=now,
         limitations=[f"INPUT_NOT_SUPPLIED:{name}" for name in unsupplied],

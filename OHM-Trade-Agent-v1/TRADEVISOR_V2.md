@@ -470,3 +470,77 @@ reused and is reported as `UNAVAILABLE` with reason
 placing an externally claimed observation into that ordering would let it
 compete for native admission. That is an authority decision for the owner, not
 an integration detail, so it is documented here and was not implemented.
+
+## Addendum - durable advisory delivery and evidence hardening (2026-10-24)
+
+### Observations are delivered from durable rows, not from memory
+
+A settled inbox row already holds the frozen decision, so it is the queue. The
+drain no longer carries candidates in memory between settlement and send:
+
+1. `pending_observations()` re-derives eligible, unreported observations from the
+   existing durable rows (read-only, bounded recovery window).
+2. `send_observation_digest()` sends at most one bounded digest.
+3. Only a confirmed delivery writes a durable per-row acknowledgement
+   (`TRADEVISOR:OBSERVED:<dedup_id>`) into the existing notification-policy
+   state file.
+
+Consequences: a crash after settlement, a refused transport, a transport
+exception and a cooldown suppression all leave the rows eligible, so the next
+cycle recovers them; a confirmed delivery can never be repeated; more items than
+one digest carries roll forward after the cooldown. No new queue, database or
+scheduler is introduced, and the row's learning-consumption and retention
+semantics are untouched.
+
+### Provenance survives the durable round trip
+
+The inbox serializer now persists `signal.provenance`. A row reloaded for worker
+evaluation or crash reclamation reproduces the provenance exactly, a legacy row
+written before this change reloads as unknown provenance (never as a verified
+claim), and the dedup identity is unchanged.
+
+### BTC context needs identity and verified freshness
+
+A returned trend is not evidence. The BTC field is AVAILABLE only when the
+snapshot's symbol matches the requested market, market-data validation is present
+and qualified, and that validation carries a source candle timestamp. The
+reported observation time is that candle time - evaluation time is never
+substituted. Anything else is `UNAVAILABLE` with a specific reason
+(`MARKET_IDENTITY_MISMATCH`, `NO_MARKET_DATA_VALIDATION`,
+`MARKET_DATA_UNQUALIFIED`, `NO_SOURCE_TIMESTAMP`).
+
+### Chase risk discloses partial inputs
+
+The native chase-risk owner remains authoritative and its formulas are not
+reimplemented. When only part of its input set is supplied, the record now
+carries `input_completeness` (provided/total/missing groups), marks the
+conclusion `INDETERMINATE_PARTIAL_INPUTS` and the band indicative-only, and the
+operator line says `partial inputs N/M - indicative only`. A partial low band is
+never presented as a complete clearance.
+
+### Observation cadence is reconciled with the notification policy
+
+`OPIP_TRADEVISOR_OBSERVATION_MIN_INTERVAL_MINUTES` is now applied as the digest
+cooldown, and the stricter of that value and the shared policy cooldown always
+wins: an operator can lengthen the cadence but can never make O'Pip chattier
+than the shared policy allows. A suppressed attempt reports
+`retry_after_seconds` and marks nothing, so the observation stays eligible.
+
+### Every unusable F7 result fails closed
+
+The composition reads F7's output without trusting its shape and reports a
+machine-readable `reason_code`:
+
+| Condition | Status | Reason code |
+| --- | --- | --- |
+| Missing required fields, or the owner returned `None`/raised | `CAPITAL_INCONSISTENT` | `MISSING_ALLOCATION_FIELDS` |
+| Non-numeric field | `CAPITAL_INCONSISTENT` | `NON_NUMERIC_ALLOCATION` |
+| NaN or infinite value | `CAPITAL_INCONSISTENT` | `NON_FINITE_ALLOCATION` |
+| Negative risk dollars | `CAPITAL_INCONSISTENT` | `NEGATIVE_RISK` |
+| Over the position cap or the risk budget | `CAPITAL_INCONSISTENT` | `OVERSIZED_ALLOCATION` |
+| Position percentage disagrees with the capital | `CAPITAL_INCONSISTENT` | `POSITION_PCT_INCONSISTENT` |
+| Zero or negative capital | `CAPITAL_REJECT` | `NON_POSITIVE_CAPITAL` |
+| Below the executable minimum | `CAPITAL_BELOW_EXECUTABLE_MINIMUM` | `BELOW_EXECUTABLE_MINIMUM` |
+
+No exception escapes the evaluator, no economic PASS is reported in any of
+these cases, and no F5 or F7 algorithm, threshold or risk limit is changed.

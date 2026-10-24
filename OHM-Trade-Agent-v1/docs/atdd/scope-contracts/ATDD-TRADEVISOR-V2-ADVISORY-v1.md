@@ -265,6 +265,54 @@ discovery coverage is reported
 THEN:
 each market is classified into exactly one visible population of native-discovered and TradingView-configured, configured but not native, actually observed, or native with no TradingView coverage, observed markets come only from durable records so no external signal is invented, a missing native universe is reported as unavailable rather than assumed, and native opportunity ranking is declared UNAVAILABLE with its input-contract reason because reusing it would require an owner architecture decision
 
+AC-030:
+GIVEN:
+an advisory observation cohort that has already been settled into durable inbox rows, and a delivery attempt that fails by refusal, by transport exception, by cooldown suppression, by process crash or by a concurrent worker taking the reservation
+WHEN:
+the next drain cycle runs
+THEN:
+the eligible observations are re-derived read-only from the durable rows and delivered at most once, a confirmed delivery writes a durable per-row acknowledgement so later cycles neither repeat nor forget, a failed or suppressed attempt writes nothing and leaves the rows pending for a bounded recovery window, more eligible rows than one digest may carry leave the remainder recoverable after the cooldown, and no competing queue, database or scheduler is introduced
+
+AC-031:
+GIVEN:
+an admitted Tradevisor alert carrying provenance, and separately a legacy row written before provenance existed and a row stranded in PROCESSING by a crashed worker
+WHEN:
+it is enqueued, reloaded, reclaimed and evaluated
+THEN:
+the persisted row contains the provenance, the reloaded signal reproduces it exactly, the frozen decision evidence carries it, dedup identity is unchanged, a legacy row reloads as unknown provenance rather than a fabricated verification, and a reclaimed row is evaluated with its provenance intact
+
+AC-032:
+GIVEN:
+a BTC context provider that returns a snapshot for a different market, a snapshot with no market-data validation, an unqualified validation, a validation without a source timestamp, and a qualified validation with a source candle timestamp
+WHEN:
+the native context is assembled
+THEN:
+only the identity-matching, qualified, source-stamped snapshot is AVAILABLE, its observed timestamp is the source candle time rather than the evaluation time, and every other case is UNAVAILABLE with a specific reason and no observed timestamp
+
+AC-033:
+GIVEN:
+a chase-risk assessment produced from the native owner with only a subset of its inputs supplied
+WHEN:
+the native context and the operator observation are rendered
+THEN:
+the record exposes input completeness and the missing input groups, the conclusion is marked indeterminate and the band indicative-only rather than a complete low-risk finding, the unsupplied inputs remain listed as limitations, and the rendered line says that the inputs are partial and indicative
+
+AC-034:
+GIVEN:
+the configured observation minimum interval set longer than the notification-policy default, set shorter than it, and a cooldown already in force for the exact evidence set
+WHEN:
+observations are offered for delivery
+THEN:
+the stricter of the configured interval and the policy cooldown governs, the configuration can never shorten the shared cooldown, suppression reports the remaining retry delay, and a suppressed attempt marks nothing so the durable observation remains eligible
+
+AC-035:
+GIVEN:
+F7 owner results that are negative in risk dollars, inconsistent between position percentage and capital, missing required fields, non-numeric, non-finite, or an unexpected object or exception
+WHEN:
+the qualified-buy composition finalizes
+THEN:
+every such result fails closed as an explicit rejection with a machine-readable reason code, no exception escapes the evaluator, no economic pass is reported, no F5 or F7 algorithm, threshold or risk limit is changed, and a valid allocation still qualifies on the unchanged basis
+
 EXPLICITLY OUT OF SCOPE:
 - Any order placement, modification, cancellation or confirmation path, and any execution authority
 - Any change to fixed risk sizing, minimum reward-to-risk, position verification or execution safeguards
@@ -335,6 +383,21 @@ AC-029 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_029_discov
 AC-029 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_029_missing_native_universe_is_never_assumed
 AC-029 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_029_observed_markets_come_from_durable_records_only
 AC-029 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_029_opportunity_ranking_reuse_is_declared_unavailable
+AC-030 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_030_bounded_digest_leaves_the_remainder_recoverable
+AC-030 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_030_consecutive_cycles_and_concurrent_workers_send_once
+AC-030 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_030_crash_after_settlement_is_recovered_from_durable_rows
+AC-030 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_030_successful_retry_delivers_exactly_once
+AC-030 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_030_transport_refusal_or_exception_keeps_rows_pending
+AC-031 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_031_legacy_and_reclaimed_rows_stay_honest
+AC-031 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_031_provenance_survives_enqueue_reload_and_evaluation
+AC-032 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_032_btc_context_requires_identity_and_verified_freshness
+AC-033 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_033_chase_risk_never_presents_partial_inputs_as_complete
+AC-034 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_034_configuration_never_shortens_the_shared_cooldown
+AC-034 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_034_configured_interval_governs_the_cooldown
+AC-034 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_034_suppression_never_discards_durable_observations
+AC-035 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_035_missing_or_nonnumeric_allocation_fields_fail_closed
+AC-035 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_035_negative_risk_and_inconsistent_position_percentage_fail_closed
+AC-035 -> tests/test_tradevisor_advisory_observability_v1.py::test_ac_035_non_finite_risk_and_unexpected_owner_results_fail_closed
 
 
 IMPLEMENTATION MAP:
@@ -450,6 +513,24 @@ AC-028 -> OHM-Trade-Agent-v1/tests/test_tradevisor_advisory_observability_v1.py
 AC-029 -> OHM-Trade-Agent-v1/app/services/tradevisor_native_context.py
 AC-029 -> OHM-Trade-Agent-v1/tests/test_tradevisor_advisory_observability_v1.py
 AC-029 -> OHM-Trade-Agent-v1/TRADEVISOR_V2.md
+AC-030 -> OHM-Trade-Agent-v1/app/jobs/drain_tradevisor_inbox.py
+AC-030 -> OHM-Trade-Agent-v1/app/jobs/run_cycle.py
+AC-030 -> OHM-Trade-Agent-v1/app/services/tradevisor_observation.py
+AC-030 -> OHM-Trade-Agent-v1/tests/test_tradevisor_advisory_observability_v1.py
+AC-030 -> OHM-Trade-Agent-v1/TRADEVISOR_V2.md
+AC-031 -> OHM-Trade-Agent-v1/app/services/tradevisor_inbox.py
+AC-031 -> OHM-Trade-Agent-v1/tests/test_tradevisor_advisory_observability_v1.py
+AC-031 -> OHM-Trade-Agent-v1/TRADEVISOR_V2.md
+AC-032 -> OHM-Trade-Agent-v1/app/services/tradevisor_native_context.py
+AC-032 -> OHM-Trade-Agent-v1/tests/test_tradevisor_advisory_observability_v1.py
+AC-033 -> OHM-Trade-Agent-v1/app/services/tradevisor_native_context.py
+AC-033 -> OHM-Trade-Agent-v1/app/services/tradevisor_observation.py
+AC-033 -> OHM-Trade-Agent-v1/tests/test_tradevisor_advisory_observability_v1.py
+AC-034 -> OHM-Trade-Agent-v1/app/core/config.py
+AC-034 -> OHM-Trade-Agent-v1/app/services/tradevisor_observation.py
+AC-034 -> OHM-Trade-Agent-v1/tests/test_tradevisor_advisory_observability_v1.py
+AC-035 -> OHM-Trade-Agent-v1/app/services/tradevisor_evaluation.py
+AC-035 -> OHM-Trade-Agent-v1/tests/test_tradevisor_advisory_observability_v1.py
 
 DEFERRED DISCOVERIES:
 - G-01: no genuine TradingView to O'Pip delivery has been observed; the source-to-production certification remains open and blocks activation, not this increment.
@@ -464,4 +545,3 @@ DEFERRED DISCOVERIES:
 
 UNAPPROVED SCOPE CHANGES:
 NONE
-

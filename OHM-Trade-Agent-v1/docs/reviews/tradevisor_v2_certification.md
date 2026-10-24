@@ -543,3 +543,41 @@ Ranking reuse is **not** implemented and must not be improvised. See
 claimed observation into the native candidate ordering, which is an owner
 authority decision. Everything short of that (population separation, coverage
 counts, durable-observation truth) is now available read-only.
+
+## 15. Independent-review remediation - six findings (2026-10-24)
+
+Branch `feature/tradevisor-advisory-observability-v1`, continuing from
+`72f592b5`. Local only: not pushed, not merged, not deployed.
+
+### Confirmed defects
+
+| # | Defect | Evidence before the fix |
+| --- | --- | --- |
+| P1-01 | Observation delivery was memory-only after settlement | a refusal, exception, crash or suppression left no durable work item; `_settle()` persists only `notification`, which observations never set |
+| P1-02 | `_row_from_signal` omitted `provenance` | a persisted row reloaded with `provenance == {}` and the frozen decision lost the declared version |
+| P2-03 | BTC context trusted any returned trend and used evaluation time as `observed_at` | a provider returning a different market, or an unvalidated snapshot, still produced AVAILABLE |
+| P2-04 | Partial chase-risk inputs produced a confident band | `LOW` was rendered as a plain finding with limitations buried in `limitations` |
+| P2-05 | `OPIP_TRADEVISOR_OBSERVATION_MIN_INTERVAL_MINUTES` was unused | the actual gate was the 6h policy default, and suppression discarded the report |
+| P2-06 | Capital guards missed negative risk, malformed/None/non-numeric owner output and inconsistent position percentages | a replaced owner could raise `AttributeError`/`TypeError`, or pass with negative risk |
+
+### Fixes and evidence
+
+| Item | Change |
+| --- | --- |
+| P1-01 | `pending_observations()` + `_mark_reported()`; drain and cycle use the recovery path |
+| P1-02 | `_row_from_signal` persists `provenance` (additive; retention/consumption untouched) |
+| P2-03 | identity + qualified validation + source timestamp gating |
+| P2-04 | `input_completeness`, `conclusion`, `band_is_indicative_only`, partial rendering |
+| P2-05 | reconciled cooldown (`max(config, policy)`), `retry_after_seconds`, no marking on suppression |
+| P2-06 | `_read_allocation_fields()` + reason codes; owner exceptions captured as `CAPITAL_INCONSISTENT` |
+
+RED before implementation: **15 failed, 0 passed** in the remediation selection.
+GREEN after: **15 passed**; whole new file **43 passed**; existing Tradevisor
+files **219 passed**; combined Tradevisor suite **262 passed**.
+
+### Limits
+
+Still not verified: G-01 (no genuine TradingView delivery observed), G-05 (no
+soak), G-02/G-04 (no trusted F6 model, no completed-4H provider). Nothing here
+changes trading authority, canonical promotion, learning consumption or
+retention, or F11 priority.
