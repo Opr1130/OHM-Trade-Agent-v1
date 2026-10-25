@@ -69,6 +69,22 @@ the record is reconciled with that artifact
 THEN:
 a matching record returns no reasons, every contradiction returns its specific mismatch reason, a missing artifact is refused, and the production registry is still empty - so a record can never qualify a different model than the one that would run
 
+AC-008:
+GIVEN:
+an empty dataset and a dataset too short for the requested folds
+WHEN:
+the offline evaluation runs
+THEN:
+it reports zero folds and zero out-of-sample predictions with no metrics, keeps dataset NONE_PROVIDED, promotable false and trust verdict DATASET_BLOCKED, and never raises or fabricates a fold
+
+AC-009:
+GIVEN:
+malformed, non-numeric, null, container or boolean probabilities, boolean outcomes, and a dataset containing one unscoreable sample
+WHEN:
+the Brier score and expected calibration error are computed
+THEN:
+every unscoreable input yields no metric rather than an exception or a guess, and a dataset containing one such sample reports no metric while keeping promotable false and DATASET_BLOCKED
+
 EXPLICITLY OUT OF SCOPE:
 - Registering, calibrating, training, promoting or trusting any model
 - Changing `PRODUCTION_MODEL_REGISTRY`, the artifact vocabulary or the engine
@@ -95,6 +111,11 @@ AC-006 -> tests/test_opip_f6_qualification_v1.py::test_ac_006_the_production_reg
 AC-007 -> tests/test_opip_f6_qualification_v1.py::test_ac_007_a_record_must_describe_the_artifact_that_would_execute
 AC-007 -> tests/test_opip_f6_qualification_v1.py::test_ac_007_a_mismatched_record_never_qualifies_the_artifact
 AC-007 -> tests/test_opip_f6_qualification_v1.py::test_ac_007_a_missing_artifact_is_refused
+AC-008 -> tests/test_opip_f6_qualification_v1.py::test_ac_008_an_empty_dataset_is_reported_not_crashed
+AC-008 -> tests/test_opip_f6_qualification_v1.py::test_ac_008_a_dataset_too_short_for_folds_is_reported_not_crashed
+AC-009 -> tests/test_opip_f6_qualification_v1.py::test_ac_009_malformed_probabilities_are_unscoreable
+AC-009 -> tests/test_opip_f6_qualification_v1.py::test_ac_009_boolean_outcomes_are_refused
+AC-009 -> tests/test_opip_f6_qualification_v1.py::test_ac_009_unscoreable_samples_inside_a_dataset_yield_no_metric
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/opip/forecast_qualification.py
@@ -113,6 +134,10 @@ AC-006 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-F6-QUALIFICATION-v1.
 AC-006 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
 AC-007 -> OHM-Trade-Agent-v1/app/opip/forecast_qualification.py
 AC-007 -> OHM-Trade-Agent-v1/tests/test_opip_f6_qualification_v1.py
+AC-008 -> OHM-Trade-Agent-v1/app/opip/forecast_qualification.py
+AC-008 -> OHM-Trade-Agent-v1/tests/test_opip_f6_qualification_v1.py
+AC-009 -> OHM-Trade-Agent-v1/app/opip/forecast_qualification.py
+AC-009 -> OHM-Trade-Agent-v1/tests/test_opip_f6_qualification_v1.py
 
 DEFERRED DISCOVERIES:
 - No dataset is available, so no out-of-sample performance is claimed. `DATASET_BLOCKED` is the correct verdict until a versioned, reproducible dataset exists.

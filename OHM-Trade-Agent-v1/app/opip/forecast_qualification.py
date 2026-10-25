@@ -165,25 +165,43 @@ def qualify_model_record(record: Any) -> QualificationResult:
 # ---------------------------------------------------------------------------
 
 
+def _label(outcome: Any) -> float | None:
+    """A binary label, or ``None``. A boolean is a flag, not a label."""
+    if isinstance(outcome, bool):
+        return None
+    if outcome not in (0, 1):
+        return None
+    return float(outcome)
+
+
+def _probability(probability: Any) -> float | None:
+    """A finite probability in [0, 1], or ``None``. Never raises."""
+    if isinstance(probability, bool):
+        return None
+    try:
+        value = float(probability)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        return None
+    return value
+
+
 def brier_score(predictions: Sequence[tuple[float, int]]) -> float | None:
     """Mean squared error of probabilities against binary outcomes.
 
-    ``None`` when there is no prediction or any probability is not a finite
-    number in [0, 1]: an unscoreable set is reported, never guessed.
+    ``None`` when there is no prediction or any probability/label is not
+    scoreable: an unscoreable set is reported, never guessed.
     """
     if not predictions:
         return None
     total = 0.0
     for probability, outcome in predictions:
-        if isinstance(probability, bool) or outcome not in (0, 1):
+        value = _probability(probability)
+        label = _label(outcome)
+        if value is None or label is None:
             return None
-        try:
-            value = float(probability)
-        except (TypeError, ValueError):
-            return None
-        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
-            return None
-        total += (value - float(outcome)) ** 2
+        total += (value - label) ** 2
     return total / len(predictions)
 
 
@@ -193,20 +211,19 @@ def expected_calibration_error(
     """Mean |predicted - observed| across equal-width probability bins."""
     if not predictions or bins < 1:
         return None
-    buckets: list[list[tuple[float, int]]] = [[] for _ in range(bins)]
+    buckets: list[list[tuple[float, float]]] = [[] for _ in range(bins)]
     for probability, outcome in predictions:
-        if isinstance(probability, bool) or outcome not in (0, 1):
+        value = _probability(probability)
+        label = _label(outcome)
+        if value is None or label is None:
             return None
-        value = float(probability)
-        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
-            return None
-        buckets[min(bins - 1, int(value * bins))].append((value, outcome))
+        buckets[min(bins - 1, int(value * bins))].append((value, label))
     total = 0.0
     for bucket in buckets:
         if not bucket:
             continue
         mean_probability = sum(item[0] for item in bucket) / len(bucket)
-        mean_outcome = sum(float(item[1]) for item in bucket) / len(bucket)
+        mean_outcome = sum(item[1] for item in bucket) / len(bucket)
         total += abs(mean_probability - mean_outcome) * (len(bucket) / len(predictions))
     return total
 
@@ -267,7 +284,23 @@ def evaluate_walk_forward(
     dataset is supplied.
     """
     stamps = [sample.get("observed_at") for sample in samples]
-    splits = walk_forward_splits(stamps, folds=folds, embargo_seconds=embargo_seconds)
+    try:
+        splits = walk_forward_splits(stamps, folds=folds, embargo_seconds=embargo_seconds)
+    except ValueError:
+        # An empty or too-short dataset cannot produce a fold. That is a blocked
+        # dataset with zero observations, not a crash and not a metric.
+        return {
+            "schema_version": "f6-offline-evaluation-v1",
+            "folds": 0,
+            "out_of_sample_predictions": 0,
+            "brier_score": None,
+            "expected_calibration_error": None,
+            "split_leak_detected": False,
+            "thresholds": dict(CANDIDATE_THRESHOLDS),
+            "promotable": False,
+            "dataset": "NONE_PROVIDED",
+            "trust_verdict": "DATASET_BLOCKED",
+        }
     scored: list[tuple[float, int]] = []
     leaking = False
     for train, test in splits:

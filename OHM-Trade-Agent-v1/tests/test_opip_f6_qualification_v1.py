@@ -234,3 +234,59 @@ def test_ac_007_a_missing_artifact_is_refused():
     assert ok is False
     assert reasons == ("ARTIFACT_MISSING",)
 
+
+
+# AC-008 ----------------------------------------------------------------------
+def test_ac_008_an_empty_dataset_is_reported_not_crashed():
+    """ATDD-F6-QUALIFICATION-v1/AC-008: an empty dataset is a blocked dataset."""
+    report = q.evaluate_walk_forward([])
+    assert report["folds"] == 0
+    assert report["out_of_sample_predictions"] == 0
+    assert report["brier_score"] is None
+    assert report["expected_calibration_error"] is None
+    assert report["split_leak_detected"] is False
+    assert report["promotable"] is False
+    assert report["dataset"] == "NONE_PROVIDED"
+    assert report["trust_verdict"] == "DATASET_BLOCKED"
+
+
+def test_ac_008_a_dataset_too_short_for_folds_is_reported_not_crashed():
+    """ATDD-F6-QUALIFICATION-v1/AC-008: too few observations cannot fabricate folds."""
+    samples = [
+        {"observed_at": T0 + timedelta(hours=index), "probability": 0.5, "outcome": 1}
+        for index in range(2)
+    ]
+    report = q.evaluate_walk_forward(samples, folds=3)
+    assert report["folds"] == 0
+    assert report["promotable"] is False
+    assert report["trust_verdict"] == "DATASET_BLOCKED"
+
+
+# AC-009 ----------------------------------------------------------------------
+@pytest.mark.parametrize("probability", [object(), None, "abc", [0.5], {"p": 0.5}])
+def test_ac_009_malformed_probabilities_are_unscoreable(probability):
+    """ATDD-F6-QUALIFICATION-v1/AC-009: malformed probabilities never raise or score."""
+    assert q.brier_score([(probability, 1)]) is None
+    assert q.expected_calibration_error([(probability, 1)]) is None
+
+
+@pytest.mark.parametrize("outcome", [True, False])
+def test_ac_009_boolean_outcomes_are_refused(outcome):
+    """ATDD-F6-QUALIFICATION-v1/AC-009: a boolean is not a label."""
+    assert q.brier_score([(0.5, outcome)]) is None
+    assert q.expected_calibration_error([(0.5, outcome)]) is None
+
+
+def test_ac_009_unscoreable_samples_inside_a_dataset_yield_no_metric():
+    """ATDD-F6-QUALIFICATION-v1/AC-009: one bad sample blocks the metric, never a guess."""
+    samples = [
+        {"observed_at": T0 + timedelta(hours=index), "probability": 0.5, "outcome": index % 2}
+        for index in range(8)
+    ]
+    samples[4]["probability"] = object()
+    report = q.evaluate_walk_forward(samples, folds=2)
+    assert report["brier_score"] is None
+    assert report["expected_calibration_error"] is None
+    assert report["promotable"] is False
+    assert report["trust_verdict"] == "DATASET_BLOCKED"
+
