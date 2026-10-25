@@ -679,6 +679,16 @@ interchangeable**, and neither is activated by this repository.
 Cloudflare's proxy in front of that file would silently reject every real alert, so
 mode 2 is a **different configuration**, not a DNS toggle.
 
+**Scope of the TLS guarantee.** Because nginx chooses the policy of the vhost the
+client *names*, this configuration guarantees the floor for a handshake that reaches
+the webhook vhost: a valid SNI for this host, a missing SNI, or an unknown SNI. It
+cannot govern a client that deliberately asks for a *different* vhost's own SNI on a
+shared `:443` — that client is negotiating with that other vhost, under that vhost's
+policy, by design. That is why this edge is required to be **dedicated**: the
+`default_server` declaration protects the SNI-less and unknown-SNI paths, and a host
+that must also serve other names needs a separate, jointly reviewed configuration
+rather than this file.
+
 ### Validation an operator must run (not run by this repository)
 
 ```bash
