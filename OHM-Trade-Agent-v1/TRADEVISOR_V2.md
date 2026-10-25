@@ -757,6 +757,10 @@ webhook vhost is therefore declared `listen 443 ssl default_server`, so:
   reachable from it.
 
 The negotiated minimum can only be proved by a real handshake, not by reading the
-file; `tests/test_tradevisor_edge_contract_v1.py` contains an **opt-in** handshake
-test for that (`OPIP_NGINX_HANDSHAKE_TEST=1`, requires nginx and openssl).
+file. `tests/test_tradevisor_edge_tls_v1.py` is the single authoritative
+certification path: it renders this example onto a throwaway loopback listener and
+executes `nginx -t` plus the protocol matrix (TLS 1.0/1.1 refused by the server,
+TLS 1.2/1.3 accepted, valid/missing/unknown SNI) on Linux CI. A missing nginx or
+openssl there is a **failure**, not a skip; non-Linux local runs skip because they
+cannot provide the proof.
 

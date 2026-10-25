@@ -184,6 +184,10 @@ def test_ac_001_the_multi_vhost_reasoning_is_documented():
     # vhost's own SNI is negotiating with that vhost by design.
     assert "Scope of the TLS guarantee" in DOC
     assert "vhost's own SNI" in DOC
+    # The dedicated-listener limitation is pinned: this file is only correct on a
+    # host that serves this webhook alone.
+    assert "dedicated" in DOC
+    assert "other names needs a separate, jointly reviewed configuration" in DOC
 
 
 # AC-002 ----------------------------------------------------------------------

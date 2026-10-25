@@ -20,7 +20,7 @@ the reviewed edge example, a host that serves the webhook on :443 alongside othe
 WHEN:
 the configuration is read and, where nginx and openssl are available, a real handshake is attempted
 THEN:
-the webhook vhost declares `listen 443 ssl default_server`, the TLS minimum is TLS 1.2 at server scope with no weaker protocol anywhere in the file, the reasoning is documented, and the negotiated floor really is TLS 1.2 (TLS 1.1 is refused) when the opt-in handshake test runs
+the webhook vhost declares `listen 443 ssl default_server`, the TLS minimum is TLS 1.2 at server scope with no weaker protocol anywhere in the file, the reasoning and the limit of the guarantee are documented, and the negotiated floor is proved by the mandatory Linux TLS certification (`tests/test_tradevisor_edge_tls_v1.py`): TLS 1.2/1.3 accepted, TLS 1.0/1.1 refused by the server for valid, missing and unknown SNI
 
 AC-002:
 GIVEN:
@@ -114,7 +114,7 @@ AC-005 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-TRADEVISOR-EDGE-TLS-
 DEFERRED DISCOVERIES:
 - The aggregate application ceiling (60/minute across all four sources) is documented but not decided. Raising it, or giving each source its own budget, changes `OPIP_TRADEVISOR_MAX_REQUESTS_PER_MINUTE` or the limiter key and needs an owner-approved capacity decision.
 - The Cloudflare-proxied edge mode remains unimplemented; its identity and rate-limit keying requirements are documented only.
-- The opt-in TLS handshake test starts a real nginx process and is skipped unless nginx, openssl and `OPIP_NGINX_HANDSHAKE_TEST=1` are all present, so a green suite never implies the negotiated floor was observed.
+- The retired opt-in handshake test has been replaced: `tests/test_tradevisor_edge_tls_v1.py` is now the only handshake certification and it runs mandatorily on Linux.
 - The Linux-mandatory module `tests/test_tradevisor_edge_tls_v1.py` executes the negotiated-protocol matrix on Linux CI: a missing nginx or openssl there is a FAILURE, not a skip, and a client that cannot offer a deprecated protocol fails the certification instead of passing it. Local Windows runs skip that module because they cannot provide the proof.
 - The `nginx -t` conflict test is skipped where nginx or openssl is absent; the structural assertions still pin that exactly one default-server declaration exists.
 - This example assumes a dedicated edge host. A future multi-vhost host would need its own reviewed configuration rather than this file.
