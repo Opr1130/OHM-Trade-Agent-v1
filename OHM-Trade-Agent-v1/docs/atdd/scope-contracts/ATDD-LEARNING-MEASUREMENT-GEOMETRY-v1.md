@@ -95,11 +95,11 @@ both results are byte-identical and deterministic, and the first is PARTIAL_COVE
 
 AC-011:
 GIVEN:
-a shared, pure OHLC predicate and the native market-data validator, evaluated over the same coherent and incoherent bars
+a shared, pure OHLC predicate used at runtime by the learning measurement path, the native market-data validator, and both owners evaluated over the same coherent and incoherent bars
 WHEN:
-each bar is classified by both owners
+each bar is classified by both owners, and the native module's imports are inspected
 THEN:
-the two agree on every bar - a bar the shared predicate refuses is a bar the native owner rejects and vice versa - so the measurement path cannot drift away from the native geometry policy, while learning still imports no scanner admission logic
+the learning path uses the shared predicate at runtime, the two owners agree on every bar so a regression test detects drift, and the native validator is NOT coupled to the shared module (it keeps its own admission policy and imports nothing from it) - so the equivalence is test-enforced rather than runtime-shared on the native side
 
 AC-012:
 GIVEN:
@@ -140,6 +140,7 @@ AC-008 -> tests/test_tradevisor_learning_geometry_v1.py::test_ac_008_conflicting
 AC-009 -> tests/test_tradevisor_learning_geometry_v1.py::test_ac_009_identical_restatement_still_measures_without_a_fill
 AC-010 -> tests/test_tradevisor_learning_geometry_v1.py::test_ac_010_replay_is_deterministic
 AC-011 -> tests/test_tradevisor_learning_geometry_v1.py::test_ac_011_shared_predicate_agrees_with_the_native_owner
+AC-011 -> tests/test_tradevisor_learning_geometry_v1.py::test_ac_011_the_native_owner_is_not_coupled_to_the_shared_predicate
 AC-012 -> tests/test_tradevisor_learning_geometry_v1.py::test_ac_012_a_missing_price_field_is_reported_as_absent
 AC-012 -> tests/test_tradevisor_learning_geometry_v1.py::test_ac_012_the_problem_class_distinguishes_absent_from_corrupt
 
@@ -177,7 +178,7 @@ AC-012 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
 AC-012 -> OHM-Trade-Agent-v1/tests/test_tradevisor_recovery_v1.py
 
 DEFERRED DISCOVERIES:
-- The geometry policy is mirrored, not imported: the learning plane must not import scanner modules, so the two predicates can drift. A future increment may extract a shared pure predicate owner.
+- Sharing status: the learning path shares pp/services/price_geometry.validated_ohlc at runtime; the native validator does not import it, so its equivalence with the measurement path is enforced by an acceptance test (which fails on drift) rather than by coupling. Adopting the shared predicate inside the native owner would change scanner admission code and is deliberately left to a separate increment.
 - `_finite_number` still accepts a numeric string (`"100.0"`). That leniency predates this increment and was left unchanged; only non-numeric values are refused.
 - Provider close times are compared with a 60-second tolerance. A provider with a different bar-close convention would be classified `CLOSE_TIME_CONTRADICTION`; the production Kraken provider reports no close time at all, so the check is inert there today.
 - Coverage diagnostics still describe the `expected/observed` grid from the declared interval (N-02 of the previous increment); this increment does not change that contract.

@@ -2,9 +2,18 @@
 
 One owner for one question: *may these four prices describe a real bar?* It is
 deliberately narrower than the native scanner validator, which additionally
-owns volume, VWAP, timestamp contiguity, gap and admission policy. Keeping the
-predicate here lets the measurement path and the native owner agree without
-coupling learning to scanner admission logic.
+owns volume, VWAP, timestamp contiguity, gap and admission policy.
+
+Sharing status (accurate, not aspirational):
+
+* **Runtime-shared** by the learning measurement path, which imports
+  :func:`validated_ohlc` from here.
+* **Test-enforced equivalence** with the native owner
+  (``app/scanner/market_data_validation``): an acceptance test evaluates the same
+  coherent and incoherent bars through both and fails if they disagree. The
+  native module is deliberately left unmodified and does not import this module,
+  because it carries unrelated admission policy; adopting it there is a separate
+  increment.
 
 Pure: no clock, no I/O, no mutable state, no imports from either consumer.
 """

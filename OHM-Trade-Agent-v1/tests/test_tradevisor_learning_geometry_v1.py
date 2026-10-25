@@ -258,6 +258,32 @@ def test_ac_011_shared_predicate_agrees_with_the_native_owner():
             assert problem is not None, index
 
 
+def test_ac_011_the_native_owner_is_not_coupled_to_the_shared_predicate():
+    """ATDD-LEARNING-MEASUREMENT-GEOMETRY-v1/AC-011: equivalence is test-enforced, not coupling."""
+    import ast
+    from pathlib import Path
+
+    from app.scanner import market_data_validation
+
+    source = Path(market_data_validation.__file__).read_text(encoding="utf-8")
+    modules = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            modules.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            modules.add(node.module)
+    # The native owner keeps its own admission policy and must not be coupled to
+    # the measurement predicate; the agreement is asserted by the previous test.
+    assert "app.services.price_geometry" not in modules
+    assert "price_geometry" not in source
+
+    # The learning path really does share it at runtime.
+    from app.services import tradevisor_learning
+
+    learning_source = Path(tradevisor_learning.__file__).read_text(encoding="utf-8")
+    assert "from app.services.price_geometry import" in learning_source
+
+
 # AC-012 ----------------------------------------------------------------------
 @pytest.mark.parametrize("missing", ["open", "high", "low", "close"])
 def test_ac_012_a_missing_price_field_is_reported_as_absent(missing):
