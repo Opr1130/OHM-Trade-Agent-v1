@@ -695,3 +695,58 @@ certification.
 No DNS, certificate, Cloudflare, firewall or nginx service change is authorized or
 performed by this integration.
 
+
+## Aggregate rate-limit contract
+
+Two independent limiters protect this route, at different layers and with
+different identities. Their arithmetic is not additive, and neither is a
+per-source budget for the application:
+
+| Layer | Limit | Identity | Applies to |
+| --- | --- | --- | --- |
+| nginx edge | **30 requests per minute per TradingView source** (`rate=30r/m`, `burst=20 nodelay`) | `$binary_remote_addr` — the real TradingView address in DNS-only mode | each of the four documented source addresses separately |
+| FastAPI route | **60 requests per minute per immediate peer** (`OPIP_TRADEVISOR_MAX_REQUESTS_PER_MINUTE`) | the immediate peer — always the single trusted reverse proxy | **one shared bucket for all four sources** |
+
+Consequences the operator must plan for:
+
+* the edge admits up to four sources × 30/min ≈ 120/min in aggregate (plus the
+  20-request bursts), but the application then admits only 60/min in
+  **aggregate**, because every alert arrives from the same proxy address;
+* the application limit is therefore the tighter, **aggregate** ceiling, and a
+  429 from the route means "more than 60 alerts were offered to this edge in the
+  last minute, across all sources", not "this source exceeded its own budget";
+* **429** is intentional throttling (either layer). **503** is queue-capacity
+  backpressure from the durable inbox, which is a different operation and must
+  never be retried as though it were throttling;
+* a request refused by either layer receives **no durable acceptance receipt**:
+  no inbox row is created, and only the duplicate path returns a `duplicate`
+  status for an alert that was already stored.
+
+**Owner decision (unapproved).** `60` per minute per peer is the shipped default
+and is preserved here; it is not an approved aggregate capacity statement for a
+four-source deployment. Whether the intended ceiling is 60 aggregate, 4 × 30 = 120
+aggregate, or something else is an owner decision that would change
+`OPIP_TRADEVISOR_MAX_REQUESTS_PER_MINUTE` (and, if per-source fairness is wanted,
+the limiter's key). This increment changes neither: it documents the behaviour and
+adds the acceptance tests that pin it.
+
+## TLS policy with multiple virtual hosts
+
+TLS policy is selected per SNI host, and a client that sends no SNI — or an
+unknown one — is served by the **default server** for that listen socket. The
+webhook vhost is therefore declared `listen 443 ssl default_server`, so:
+
+* the effective minimum for any handshake that reaches this edge is **TLS 1.2**,
+  regardless of what other vhosts on the host allow;
+* a host carrying a second `default_server` on `:443`, or an operator dropping
+  this file onto a host that already has one, fails `nginx -t` with
+  "duplicate default server" — a configuration error at validation time rather
+  than a silent policy downgrade;
+* this vhost remains a **dedicated edge**: the only other location is
+  `location / { return 404; }`, and no dashboard, health or Wave 8.2 route is
+  reachable from it.
+
+The negotiated minimum can only be proved by a real handshake, not by reading the
+file; `tests/test_tradevisor_edge_contract_v1.py` contains an **opt-in** handshake
+test for that (`OPIP_NGINX_HANDSHAKE_TEST=1`, requires nginx and openssl).
+

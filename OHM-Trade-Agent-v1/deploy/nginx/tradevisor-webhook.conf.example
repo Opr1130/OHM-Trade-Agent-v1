@@ -20,11 +20,28 @@
 # The app additionally checks that the immediate peer is in
 # OPIP_TRADEVISOR_TRUSTED_PROXY_IPS and that this header carries
 # OPIP_TRADEVISOR_INTERNAL_VERIFICATION_VALUE.
+#
+# TLS AND MULTIPLE VIRTUAL HOSTS
+# ------------------------------
+# nginx chooses the TLS policy of the *SNI host* the client asked for. A client
+# that sends no SNI, or an unknown one, is served by the default server for that
+# listen socket. If this vhost were not the default server, such a handshake
+# would negotiate against whatever sibling vhost happens to own the default -
+# possibly with an older protocol floor - and the webhook would appear reachable
+# on a weaker policy even though this file is correct.
+#
+# This edge is therefore DEDICATED: one host, one webhook vhost, declared
+# `default_server` on :443. That has two consequences the operator must accept:
+#   1. every no-SNI handshake is judged by the policy below (TLS 1.2 minimum);
+#   2. adding a second `default_server` for :443 - or dropping this file onto a
+#      host that already has one - makes `nginx -t` fail with "duplicate default
+#      server", so a conflicting configuration is refused at validation time
+#      instead of silently downgrading this endpoint.
 
 limit_req_zone $binary_remote_addr zone=tradevisor_webhook:1m rate=30r/m;
 
 server {
-    listen 443 ssl;
+    listen 443 ssl default_server;
     server_name <WEBHOOK_HOST>;
 
     # Do not advertise the edge's own version to an unauthenticated caller.
