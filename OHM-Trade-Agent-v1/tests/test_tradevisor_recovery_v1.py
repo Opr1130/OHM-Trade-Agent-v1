@@ -297,10 +297,26 @@ def test_retry_is_bounded_and_skips_expired_rows():
 
 
 class _Candle:
-    def __init__(self, ts: datetime, high: float, low: float) -> None:
+    """A candle with the four prices a real Kraken candle carries.
+
+    ``open``/``close`` default to ``low`` so high/low-only construction still
+    yields a coherent bar: measurement geometry validates all four prices
+    (ATDD-LEARNING-MEASUREMENT-GEOMETRY-v1).
+    """
+
+    def __init__(
+        self,
+        ts: datetime,
+        high: float,
+        low: float,
+        open: float | None = None,
+        close: float | None = None,
+    ) -> None:
         self.timestamp = int(ts.timestamp())
         self.high = high
         self.low = low
+        self.open = low if open is None else open
+        self.close = low if close is None else close
 
 
 def test_inbox_declares_its_evidence_class_and_consumer():

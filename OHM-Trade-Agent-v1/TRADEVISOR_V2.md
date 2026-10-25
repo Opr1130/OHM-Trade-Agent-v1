@@ -657,3 +657,118 @@ rather than resolved. Two parser-level cases were hardened after review:
 `"signal_price": true` coerced to `1.0` and produced a plausible-looking quote
 that only failed later at the cross-venue divergence gate, which masked the real
 schema violation.
+
+## Two edge deployment modes (this integration ships mode 1 only)
+
+The webhook boundary has exactly two supported shapes. They are **not
+interchangeable**, and neither is activated by this repository.
+
+| | Mode 1 — DNS-only (shipped) | Mode 2 — Cloudflare-proxied (documented, not shipped) |
+| --- | --- | --- |
+| Path | TradingView → `tv-staging.opip.io` (DNS-only) → this edge | TradingView → Cloudflare → this edge |
+| `$remote_addr` | the real TradingView source address | a **Cloudflare** address |
+| Source allowlist | the four documented TradingView IPs (`allow` / `deny all`) | must be the published Cloudflare ranges; the real client is then a header, not an address |
+| Client identity | the peer address is the identity | `CF-Connecting-IP`, accepted **only** from a verified Cloudflare peer; no other peer may assert it |
+| Rate-limit identity | `$binary_remote_addr` is correct | keying on `$binary_remote_addr` would put every customer in one bucket; key on the validated client identity, or terminate the limit at Cloudflare |
+| `X-Forwarded-For` | set to `$remote_addr` (replaces any client value) | must be rebuilt from the trusted chain, never copied from the request |
+| Header spoofing | impossible through the edge: the stamp is a fixed literal | safe only if the origin is firewalled to Cloudflare and the stamp is still set by this proxy |
+| Extra requirements | origin firewall limited to the four IPs; TLS ≥ 1.2; 8 KiB body cap; opaque 404 | origin reachable **only** through the tunnel/proxy (no public origin port); Cloudflare WAF and rate rules reviewed; the true-client header validated against Cloudflare ranges; a separate security review |
+| Status | example reviewed; **not deployed** | **not implemented**; needs its own approved review |
+
+`deploy/nginx/tradevisor-webhook.conf.example` implements mode 1 only. Enabling
+Cloudflare's proxy in front of that file would silently reject every real alert, so
+mode 2 is a **different configuration**, not a DNS toggle.
+
+**Scope of the TLS guarantee.** Because nginx chooses the policy of the vhost the
+client *names*, this configuration guarantees the floor for a handshake that reaches
+the webhook vhost: a valid SNI for this host, a missing SNI, or an unknown SNI. It
+cannot govern a client that deliberately asks for a *different* vhost's own SNI on a
+shared `:443` — that client is negotiating with that other vhost, under that vhost's
+policy, by design. That is why this edge is required to be **dedicated**: the
+`default_server` declaration protects the SNI-less and unknown-SNI paths, and a host
+that must also serve other names needs a separate, jointly reviewed configuration
+rather than this file.
+
+### Validation an operator must run (not run by this repository)
+
+```bash
+nginx -t -c /etc/nginx/nginx.conf
+```
+
+`tests/test_tradevisor_webhook_v1.py` contains an **environment-gated** test that
+performs the same `nginx -t` check inside a temporary prefix with a throwaway
+self-signed certificate. It is skipped when `nginx` or `openssl` is unavailable, so a
+green local suite never implies that a real nginx accepted the file. The textual
+assertions in that module are contract assertions over the example, not a runtime
+certification.
+
+No DNS, certificate, Cloudflare, firewall or nginx service change is authorized or
+performed by this integration.
+
+
+## Aggregate rate-limit contract
+
+Two independent limiters protect this route, at different layers and with
+different identities. Their arithmetic is not additive, and neither is a
+per-source budget for the application:
+
+| Layer | Limit | Identity | Applies to |
+| --- | --- | --- | --- |
+| nginx edge | **30 requests per minute per TradingView source** (`rate=30r/m`, `burst=20 nodelay`) | `$binary_remote_addr` — the real TradingView address in DNS-only mode | each of the four documented source addresses separately |
+| FastAPI route | **60 requests per minute per immediate peer** (`OPIP_TRADEVISOR_MAX_REQUESTS_PER_MINUTE`) | the immediate peer — always the single trusted reverse proxy | **one shared bucket for all four sources** |
+
+Consequences the operator must plan for:
+
+* the edge admits up to four sources × 30/min ≈ 120/min in aggregate (plus the
+  20-request bursts), but the application then admits only 60/min in
+  **aggregate**, because every alert arrives from the same proxy address;
+* the application limit is therefore the tighter, **aggregate** ceiling, and a
+  429 from the route means "more than 60 alerts were offered to this edge in the
+  last minute, across all sources", not "this source exceeded its own budget";
+* **429** is intentional throttling (either layer). **503** is queue-capacity
+  backpressure from the durable inbox, which is a different operation and must
+  never be retried as though it were throttling;
+* a request refused by either layer receives **no durable acceptance receipt**:
+  no inbox row is created, and only the duplicate path returns a `duplicate`
+  status for an alert that was already stored.
+
+**Approved initial policy.** `60` per minute per peer is the owner-approved *initial*
+shared policy and is preserved here, together with the edge's 30 per minute per source.
+It is **not** a production-validated capacity target: no load or soak measurement has
+established 60/min aggregate as sufficient for a four-source deployment, so production
+capacity sufficiency remains **unvalidated**. Raising the
+limit, or giving each source its own budget, would change
+`OPIP_TRADEVISOR_MAX_REQUESTS_PER_MINUTE` (and, for per-source fairness, the limiter's
+key) and needs its own approved increment. This increment changes neither.
+
+## TLS policy with multiple virtual hosts
+
+TLS policy is selected per SNI host, and a client that sends no SNI — or an
+unknown one — is served by the **default server** for that listen socket. The
+webhook vhost is therefore declared `listen 443 ssl default_server`, so:
+
+* on this dedicated listener the effective minimum for every handshake that
+  reaches it — a valid SNI for this host, a missing SNI, or an unknown SNI — is
+  **TLS 1.2**;
+* that floor does **not** extend to a handshake that deliberately names a
+  *sibling* vhost's own SNI on a shared `:443`: that client is negotiating with
+  the sibling, under the sibling's policy, by design (see "Scope of the TLS
+  guarantee" above). A shared multi-vhost deployment of this file is therefore
+  **not approved** — a host that must also serve other names needs a separate,
+  jointly reviewed configuration rather than this file;
+* a host carrying a second `default_server` on `:443`, or an operator dropping
+  this file onto a host that already has one, fails `nginx -t` with
+  "duplicate default server" — a configuration error at validation time rather
+  than a silent policy downgrade;
+* this vhost remains a **dedicated edge**: the only other location is
+  `location / { return 404; }`, and no dashboard, health or Wave 8.2 route is
+  reachable from it.
+
+The negotiated minimum can only be proved by a real handshake, not by reading the
+file. `tests/test_tradevisor_edge_tls_v1.py` is the single authoritative
+certification path: it renders this example onto a throwaway loopback listener and
+executes `nginx -t` plus the protocol matrix (TLS 1.0/1.1 refused by the server,
+TLS 1.2/1.3 accepted, valid/missing/unknown SNI) on Linux CI. A missing nginx or
+openssl there is a **failure**, not a skip; non-Linux local runs skip because they
+cannot provide the proof.
+
