@@ -50,7 +50,12 @@ from app.opip.learning.job_disposition import (
     RELEASE_UNVERIFIED as RELEASE_UNVERIFIED,
     classify_release_compatibility as _owner_classify_release_compatibility,
 )
+from app.services.price_geometry import OHLC_FIELDS, finite_number, validated_ohlc
 from app.services.tradevisor_evaluation import ACTIONABLE_DECISIONS
+
+#: How far a provider-reported close time may sit from the declared interval
+#: before the bar can no longer prove full-interval coverage.
+CLOSE_TIME_TOLERANCE_SECONDS = 60
 
 #: Public name used by this module. It is the owner's function object, not a
 #: wrapper and not a copy, so the two can never diverge.
@@ -152,18 +157,25 @@ def _interval_seconds(interval: timedelta | None) -> int | None:
 
 
 def _finite_number(value: Any) -> float | None:
-    if isinstance(value, bool):
-        return None
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    return number if math.isfinite(number) else None
+    """Delegate to the shared predicate so one owner defines "a price"."""
+    return finite_number(value)
+
+
+def _candle_geometry(candle: Any) -> tuple[dict[str, float] | None, str | None]:
+    """Return the validated OHLC prices and the failure class, if any.
+
+    The predicate itself lives in :mod:`app.services.price_geometry` so the
+    measurement path and the native owner can share one definition instead of
+    drifting apart (N-03-F1). A bar whose OHLC cannot be proven coherent never
+    contributes to a measurement, and the failure class distinguishes absent
+    data from untrustworthy prices (N-03-F2).
+    """
+    return validated_ohlc(candle)
 
 
 def _same_candle(left: Any, right: Any) -> bool:
-    """Two records of the same bar are interchangeable only if their prices are."""
-    for attribute in ("high", "low", "close"):
+    """Two records of the same bar are interchangeable only if the whole bar is."""
+    for attribute in OHLC_FIELDS:
         a = _finite_number(getattr(left, attribute, None))
         b = _finite_number(getattr(right, attribute, None))
         if a is None or b is None:
@@ -365,11 +377,14 @@ def evaluate_outcome(
     )
     admissible = []
     invalid_ohlc = False
+    invalid_ohlc_problem: str | None = None
+    close_time_contradiction = False
     for candle in candles:
         opened = _candle_time(candle)
         if opened is None or opened <= decided_at or opened >= window_end:
             continue
-        closes = _candle_close(candle) or (opened + interval if interval else None)
+        reported_close = _candle_close(candle)
+        closes = reported_close or (opened + interval if interval else None)
         if closes is None:
             # Completeness cannot be established: fail closed rather than guess.
             continue
@@ -377,13 +392,42 @@ def evaluate_outcome(
             continue
         if _candle_is_incomplete(candle):
             continue
-        high = _finite_number(getattr(candle, "high", None))
-        low = _finite_number(getattr(candle, "low", None))
-        if high is None or low is None or high < low:
+        if reported_close is not None and interval is not None:
+            drift = abs((reported_close - (opened + interval)).total_seconds())
+            if drift > CLOSE_TIME_TOLERANCE_SECONDS:
+                # The provider's own close time contradicts the interval this
+                # report claims, so full-interval coverage is not provable.
+                close_time_contradiction = True
+                continue
+        prices, ohlc_problem = _candle_geometry(candle)
+        if prices is None:
             invalid_ohlc = True
+            if invalid_ohlc_problem is None:
+                # First (deterministic) failure class wins: absent data is
+                # reported differently from untrustworthy prices.
+                invalid_ohlc_problem = ohlc_problem
             continue
         admissible.append((opened, candle))
     if not admissible:
+        if invalid_ohlc:
+            # Fail closed: an all-invalid window is a non-measurement, never a
+            # silently pending row that could later be mistaken for absent data.
+            base.update(
+                status=OUTCOME_PARTIAL_COVERAGE,
+                coverage_status="PARTIAL",
+                coverage_reason="INVALID_OHLC",
+                ohlc_problem=invalid_ohlc_problem,
+                reason="incomplete candle coverage: INVALID_OHLC",
+            )
+            return base
+        if close_time_contradiction:
+            base.update(
+                status=OUTCOME_PARTIAL_COVERAGE,
+                coverage_status="PARTIAL",
+                coverage_reason="CLOSE_TIME_CONTRADICTION",
+                reason="incomplete candle coverage: CLOSE_TIME_CONTRADICTION",
+            )
+            return base
         base.update(status=OUTCOME_PENDING, reason="no admissible forward candles")
         return base
 
@@ -395,14 +439,23 @@ def evaluate_outcome(
             decided_at, window_end, interval, expected, observed, coverage_reason
         )
     )
-    if coverage_reason is None and invalid_ohlc:
-        # A structurally invalid bar means the history cannot be trusted even if
-        # every expected timestamp happened to be present.
+    if invalid_ohlc:
+        # Priority: untrustworthy prices outrank a merely missing timestamp, so
+        # a corrupt bar is reported as corrupt instead of as absent.
         base.update(
             status=OUTCOME_PARTIAL_COVERAGE,
             coverage_status="PARTIAL",
             coverage_reason="INVALID_OHLC",
+            ohlc_problem=invalid_ohlc_problem,
             reason="incomplete candle coverage: INVALID_OHLC",
+        )
+        return base
+    if close_time_contradiction:
+        base.update(
+            status=OUTCOME_PARTIAL_COVERAGE,
+            coverage_status="PARTIAL",
+            coverage_reason="CLOSE_TIME_CONTRADICTION",
+            reason="incomplete candle coverage: CLOSE_TIME_CONTRADICTION",
         )
         return base
     if coverage_reason is not None:
