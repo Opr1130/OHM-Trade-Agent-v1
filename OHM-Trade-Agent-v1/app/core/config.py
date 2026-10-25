@@ -347,6 +347,26 @@ class Settings(BaseSettings):
     opip_tradevisor_actionable_expiry_minutes: int = Field(default=90, ge=5, le=1440)
 
     # ---------------------------------------------------------------------
+    # Tradevisor V2 observation provenance and advisory observability.
+    #
+    # ``integration_version`` names THIS integration contract (ours). It is
+    # never a claim about the external TradingView script's contents: the
+    # external indicator is invite-only, its Pine source is not available, and
+    # no webhook field can prove what it computed. Any version string supplied
+    # by an alert body is recorded as an UNVERIFIED operator/vendor claim.
+    # ---------------------------------------------------------------------
+    opip_tradevisor_integration_version: str = "tradevisor-ingress-v1"  # nosec B105 - a contract label, not a credential
+    # BTC/broad-market context reuses the native scanner on this market. Set
+    # empty to disable the extra public read entirely.
+    opip_tradevisor_btc_market: str = "XBTUSD"
+    # Advisory observations are a separate, opt-in message class. Disabled by
+    # default so an unqualified WATCH stays silent until an owner enables it.
+    opip_tradevisor_observation_enabled: bool = False
+    opip_tradevisor_observation_min_interval_minutes: int = Field(
+        default=60, ge=5, le=1440
+    )
+
+    # ---------------------------------------------------------------------
     # Signal Quality / Explosion Detection v1 (Phase 1)
     #
     # Every numeric value below is an INTERPRETABLE PRIOR, not a calibrated

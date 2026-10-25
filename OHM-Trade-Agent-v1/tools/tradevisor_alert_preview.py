@@ -127,31 +127,77 @@ def _section(title: str) -> None:
     print("=" * 72)
 
 
+def _synthetic_actionable(decision, *, limit_entry: bool = False):
+    """Test/preview-only: a deliberately synthetic actionable decision.
+
+    Production evaluation returns WATCH while F6 and trusted 4H are missing.
+    This helper exists ONLY so the preview can render the approved layout and is
+    labelled synthetic everywhere it is used.
+    """
+    return replace(
+        decision,
+        decision=(
+            evaluation.DECISION_SET_LIMIT_ENTRY
+            if limit_entry
+            else evaluation.DECISION_ENTER_NOW
+        ),
+        rejection_code=None,
+        reason="SYNTHETIC PREVIEW — formatting only; no qualification is implied.",
+        expires_at=decision.evaluated_at + timedelta(minutes=90),
+    )
+
+
 def main() -> int:
     print(BANNER)
 
-    _section("ENTER NOW — actionable")
-    enter_now = build()
-    print(format_tradevisor_alert(enter_now))
+    from app.services.tradevisor_observation import (
+        format_observation,
+        observation_candidate,
+    )
 
-    _section("SET LIMIT ENTRY — actionable (extended above EMA20)")
+    _section("ENTER NOW — approved layout (SYNTHETIC: F6/4H withheld)")
+    # A larger account so the final-allocation economic gate can genuinely pass;
+    # the authority gates still return WATCH, which is what makes this synthetic.
+    enter_now = build(equity=250_000.0)
+    candidate = observation_candidate(enter_now)
+    if candidate is None:
+        print(f"decision={enter_now.decision} rejection_code={enter_now.rejection_code}")
+        print(f"reason={enter_now.reason}")
+        print("No actionable layout: this fixture does not clear every deterministic gate.")
+    else:
+        print(format_tradevisor_alert(_synthetic_actionable(enter_now)))
+
+    _section("SET LIMIT ENTRY — approved layout (SYNTHETIC: F6/4H withheld)")
     extended = synthetic_snapshot(
         last_price=71000.0, ticker_last=71000.0, ema20=66400.0
     )
     limit = build(
         signal=synthetic_signal(price=71000.0), snapshot=extended, equity=250_000.0
     )
-    if limit.decision == evaluation.DECISION_SET_LIMIT_ENTRY:
-        print(format_tradevisor_alert(limit))
+    if (
+        observation_candidate(limit) is not None
+        and limit.evidence.get("shadow_proposed_action")
+        == evaluation.DECISION_SET_LIMIT_ENTRY
+    ):
+        print(format_tradevisor_alert(_synthetic_actionable(limit, limit_entry=True)))
     else:
         print(f"decision={limit.decision} reason={limit.reason}")
 
-    _section("WATCH — recorded, NOT delivered")
+    _section("WATCH — recorded, NOT delivered as a trade instruction")
     thin = build(equity=1_000.0)
     print(f"decision={thin.decision}")
     print(f"rejection_code={thin.rejection_code}")
     print(f"reason={thin.reason}")
-    print("Telegram: suppressed (non-actionable observations are never broadcast)")
+    print("Telegram: no actionable alert (non-actionable decisions are never sent)")
+
+    _section("OBSERVATION — substantive candidate withheld by an evidence gate")
+    candidate = candidate if candidate is not None else observation_candidate(enter_now)
+    if candidate is None:
+        print("no observation cohort for this fixture")
+    else:
+        print(format_observation(candidate))
+        print()
+        print("Telegram: only if OPIP_TRADEVISOR_OBSERVATION_ENABLED is true.")
 
     _section("SELL — evidence only, never a short")
     sell = build(signal=synthetic_signal("SELL"))
@@ -161,7 +207,10 @@ def main() -> int:
     print("Telegram: suppressed (non-actionable)")
 
     _section("EXPIRED — actionable plan past its lifetime")
-    expired = replace(enter_now, expires_at=enter_now.evaluated_at - timedelta(minutes=1))
+    expired = replace(
+        _synthetic_actionable(enter_now),
+        expires_at=enter_now.evaluated_at - timedelta(minutes=1),
+    )
     from app.services.tradevisor_notifier import notify_tradevisor_decision
 
     from types import SimpleNamespace

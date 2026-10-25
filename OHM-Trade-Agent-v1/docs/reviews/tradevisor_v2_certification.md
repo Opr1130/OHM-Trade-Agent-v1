@@ -410,3 +410,210 @@ by default; F6-absent still yields shadow-only `WATCH`; SWING still requires
 trusted completed 4H; G-03 remains the approved noncanonical shadow exception.
 No new service, database, queue, scheduler or host was introduced.
 
+
+## 13. Advisory observability and native-context increment - TV2-FR-01 (2026-10-24)
+
+Local, unpushed work on `feature/tradevisor-advisory-observability-v1` branched
+from `294d90c7` (PR #444 head). Not deployed, not activated, not merged.
+
+### What changed
+
+| WP | Change | ACs |
+| --- | --- | --- |
+| WP-01 | External-observation provenance: vendor identity, source bar, operator integration version, and a declared script version recorded as `declared_version_verified=false` / `UNVERIFIED_EXTERNAL_SCRIPT`; excluded from dedup identity | AC-016, AC-017 |
+| WP-02 | Read-only native context: BTC regime via the native scanner, breadth via the native regime owner (refused below 30 snapshots), chase risk via `assess_chase_risk` with unsupplied inputs disclosed, liquidity from execution evidence, and explicit incompatibility declarations for signal-quality stage scoring and ranking; instrument-coverage diagnostics | AC-018, AC-019, AC-020 |
+| WP-03 | Final-allocation economic qualification: the F5 owner re-evaluates at the F7-permitted notional; a candidate below the unchanged minimum is withheld as `ECONOMIC_REJECT_AT_FINAL_ALLOCATION` and reports no economic PASS | AC-021 |
+| WP-04 | Separately classified, bounded, opt-in `TRADEVISOR OBSERVATION - WATCH / NO TRADE` digest with instruction-phrase guard, policy dedup/reservation, honest transport failure, and noncritical budget class | AC-022, AC-023, AC-024, AC-026 |
+| WP-05 | Approved-format additions: evidence-as-of / bar-close / receipt / evaluation timestamps, book age, venue, F7-permitted capital basis, horizon with native ATR and explicit no-duration statement | AC-025 |
+
+### Measured effect of WP-03 (offline fixtures, real owners)
+
+Same plan, equity 10,000: envelope net $168.90 qualified and F7 permitted
+$1,066.23, so the old display showed $90.04 against a $75 bar. Equity 8,000:
+envelope net $135.12 cleared the bar while the permitted allocation implied
+$72.03, which previously still qualified. It now returns
+`ECONOMIC_REJECT_AT_FINAL_ALLOCATION`. No threshold was changed.
+
+### Executed evidence
+
+| Check | Result |
+| --- | --- |
+| Tradevisor suite (10 files, incl. new AC-016..026) | 236 passed, 3.15s, exit 0 |
+| Adjacent regressions (`atdd_scope_control`, `operator_cycle_v2`, `r4_f8_cutover_readiness`, `signal_evidence_contracts`) | 78 passed, 48.01s, exit 0 |
+| `python -m compileall -q app` | exit 0 |
+| `python tests/atdd_scope.py --git-base 294d90c7` | PASS, exit 0 |
+| `git diff --check` | exit 0 |
+| Frozen files (learning, inbox, geometry, economics, attainability, capital, portfolio, notification policy, release profiles, freqtrade) | unchanged |
+
+`ruff` and `bandit` are not installed in this local environment, so those
+advisory CI jobs were not reproduced here; CI remains authoritative for them. Two substitutes were used instead, and neither required installing anything:
+
+- A stdlib AST check covering the rule families CI enforces (`F401`/`F811`/`E711`/`E712`/`E303`) over every changed file. The only findings are two pre-existing `E303` blank-line runs in `tradevisor_evaluation.py`, proven present at the baseline by running the same check against `git show 294d90c7:...`, so this increment adds **zero** new lint findings. No bandit-sensitive construct (`eval`, `exec`, `subprocess`, `os.system`, `pickle`, `yaml.load`, `shell=True`) exists in the new modules.
+- `pyright` (already installed as a local tool) over the new and modified modules. The two errors it found in the new code were corrected by making the narrowing explicit (`_as_dict`, `_provenance_from_record`) and by refusing an unexpected provider return object instead of treating it as market evidence. The final state is **parity with the baseline: 4 errors before, 4 after**, all pre-existing (`_resolve_snapshot` return typing and three `signal_from_record` casts); the two brand-new modules report 0 errors and 0 warnings.
+
+### Still NOT verified
+
+- **G-01**: no genuine TradingView to O'Pip delivery has been observed. All
+evidence remains synthetic.
+- **G-05**: no burst, latency injection or soak measurement. F11 independence
+remains structural (phase ordering plus the noncritical budget class).
+- **G-02 / G-04**: unchanged. No trusted F6 model exists and no completed-4H
+provider exists, so no BUY can become actionable and every qualified SWING
+stays WATCH.
+- The external indicator''s internal BUY/SELL algorithm remains unverified by
+design; provenance records a claim, never a certification.
+
+### Defect found and corrected in passing
+
+`tools/tradevisor_alert_preview.py` could not run at the previous head: it
+passed a `WATCH` decision to `format_tradevisor_alert`, which correctly refuses
+non-actionable decisions. It now derives a labelled synthetic actionable object
+only from decisions that genuinely reached the withheld-but-substantive cohort,
+and otherwise prints the real decision and rejection code.
+
+## 14. Principal-architect follow-up - three focused reviews (2026-10-24)
+
+Branch `feature/tradevisor-advisory-observability-v1`, continuing from
+`923662c7`/`9d49de97`. Local only: not pushed, not merged, not deployed, no
+learning file touched.
+
+### Baseline identity correction
+
+A previously reported baseline tree SHA was wrong. Measured values:
+
+| Identity | Value | Type |
+| --- | --- | --- |
+| Commit | `294d90c70d36aa9131459d7dee525fd3eb8b8365` | commit |
+| Tree of that commit | `49218188c54fea59b8397df97f2ab41d08e50c3e` | tree |
+| Parent commit | `90c760f5f5c9d5bdd729970f963c735a4fcf8e88` | **commit** |
+| Tree of the parent | `c5c8ef2e0ecf01dcaa39504945d3cfcbadd55e8d` | tree |
+
+The value `90c760f5...` is the **parent commit**, not a tree. It was captured
+because an earlier `git rev-parse HEAD^{tree}` was mangled by shell brace
+expansion (the captured output contained `-encodedCommand dAByAGUAZQA=`, i.e.
+base64 of `tree`). No analysis depended on it, but the identity must not be
+reused.
+
+### Confirmed defects
+
+| # | Defect | Evidence before the fix |
+| --- | --- | --- |
+| D1 | Operator-facing observation quoted the internal proposal | rendered line: `Assessment: Shadow-only swing LONG hypothesis (ENTER_NOW); ...`; guard only matched the spaced form |
+| D2 | No bound on the allocation feeding the final F5 call | injected 5x-equity allocation produced `economics.qualified=True` with a $50,000 notional on a $10,000 account |
+| D3 | Non-finite allocation escaped as an exception | injected NaN produced `ValueError: invalid non-finite capital or leverage` out of the evaluator |
+| D4 | A capital-rejected decision still reported the envelope economic PASS | negative allocation produced `CAPITAL_REJECT` with `economics.qualified=True` |
+
+### Fixes
+
+- `tradevisor_observation.py`: `_operator_language()` neutralises internal prose
+  for presentation only; the guard now also matches `ENTER_NOW`,
+  `SET_LIMIT_ENTRY`, `ACTIONABLE`; the durable record is untouched.
+- `tradevisor_evaluation.py`: `capital_consistency` tripwires against the
+  unchanged position cap and risk budget; `CAPITAL_INCONSISTENT` for unusable
+  allocations; `economics.qualified=False` whenever no usable allocation exists.
+  No F5/F7 algorithm, threshold or formula changed.
+- `tradevisor_native_context.py`: `discovery_coverage()` and
+  `observed_markets_from_records()` - read-only, no network call, no scanner.
+
+### Why `max_capital_fraction=1.0` is safe (independently verified)
+
+F7 sizes from `min(position_cap, risk_budget / stop%)` where the position cap is
+the same 20% constant used by the envelope, then applies quality/edge factors
+`<= 1.0`. Therefore the allocation is always `<= 20% of equity`, and
+`recommended * stop% / 100 <= risk_budget` by construction. AC-028 asserts both
+inequalities across equities and volatilities and asserts that the final
+notional never exceeds the envelope notional, so a replaced F7 cannot turn the
+full fraction into an unbounded notional.
+
+### Test evidence
+
+| Check | Result |
+| --- | --- |
+| RED before implementation | 8 failed, 3 passed (`-k 'ac_027 or ac_028 or ac_029'`) |
+| GREEN after implementation | 11 passed (same selection); 28 passed (whole file) |
+| Existing tradevisor files | 219 passed, 3.07s, exit 0 |
+| Tradevisor suite incl. new file | 247 passed |
+| `tests/atdd_scope.py --git-base 294d90c7` | PASS, exit 0 |
+
+### Remaining discovery/ranking gap
+
+Ranking reuse is **not** implemented and must not be improvised. See
+`TRADEVISOR_V2.md` addendum: reusing
+`app.scanner.intelligence_ranking` would require admitting an externally
+claimed observation into the native candidate ordering, which is an owner
+authority decision. Everything short of that (population separation, coverage
+counts, durable-observation truth) is now available read-only.
+
+## 15. Independent-review remediation - six findings (2026-10-24)
+
+Branch `feature/tradevisor-advisory-observability-v1`, continuing from
+`72f592b5`. Local only: not pushed, not merged, not deployed.
+
+### Confirmed defects
+
+| # | Defect | Evidence before the fix |
+| --- | --- | --- |
+| P1-01 | Observation delivery was memory-only after settlement | a refusal, exception, crash or suppression left no durable work item; `_settle()` persists only `notification`, which observations never set |
+| P1-02 | `_row_from_signal` omitted `provenance` | a persisted row reloaded with `provenance == {}` and the frozen decision lost the declared version |
+| P2-03 | BTC context trusted any returned trend and used evaluation time as `observed_at` | a provider returning a different market, or an unvalidated snapshot, still produced AVAILABLE |
+| P2-04 | Partial chase-risk inputs produced a confident band | `LOW` was rendered as a plain finding with limitations buried in `limitations` |
+| P2-05 | `OPIP_TRADEVISOR_OBSERVATION_MIN_INTERVAL_MINUTES` was unused | the actual gate was the 6h policy default, and suppression discarded the report |
+| P2-06 | Capital guards missed negative risk, malformed/None/non-numeric owner output and inconsistent position percentages | a replaced owner could raise `AttributeError`/`TypeError`, or pass with negative risk |
+
+### Fixes and evidence
+
+| Item | Change |
+| --- | --- |
+| P1-01 | `pending_observations()` + `_mark_reported()`; drain and cycle use the recovery path |
+| P1-02 | `_row_from_signal` persists `provenance` (additive; retention/consumption untouched) |
+| P2-03 | identity + qualified validation + source timestamp gating |
+| P2-04 | `input_completeness`, `conclusion`, `band_is_indicative_only`, partial rendering |
+| P2-05 | reconciled cooldown (`max(config, policy)`), `retry_after_seconds`, no marking on suppression |
+| P2-06 | `_read_allocation_fields()` + reason codes; owner exceptions captured as `CAPITAL_INCONSISTENT` |
+
+RED before implementation: **15 failed, 0 passed** in the remediation selection.
+GREEN after: **15 passed**; whole new file **43 passed**; existing Tradevisor
+files **219 passed**; combined Tradevisor suite **262 passed**.
+
+### Limits
+
+Still not verified: G-01 (no genuine TradingView delivery observed), G-05 (no
+soak), G-02/G-04 (no trusted F6 model, no completed-4H provider). Nothing here
+changes trading authority, canonical promotion, learning consumption or
+retention, or F11 priority.
+
+## 16. Delivery reliability review (2026-10-24)
+
+Bounded reliability assessment of the advisory-observation delivery lifecycle at
+`90b5e169`. Local only: not pushed, not merged, not deployed, learning frozen.
+
+### Guarantee
+
+At-least-once for unknown outcomes, at-most-once for content already confirmed as
+delivered, and **not** exactly-once: the transport provides no end-to-end
+idempotency key, so a written request with a lost response is indistinguishable
+from a request never written. `STATUS_ALREADY_DELIVERED` marks the repair path
+where a confirmed emission was missing only its per-row acknowledgement.
+
+### Findings
+
+| # | Class | Finding | Correction |
+| --- | --- | --- | --- |
+| R-1 | P1 | Recovery horizon `2 x cooldown + 1h` (13h) was shorter than the 14h a 12-row backlog needs at the governed cadence, so the tail aged out silently | Horizon sized to `DRAIN_CAPACITY_CYCLES` cooldowns (30h) plus `observation_backlog()` aged-out accounting |
+| R-2 | P1 | A lost per-row acknowledgement after a confirmed delivery stranded the rows permanently: the digest fingerprint matched forever, so nothing resent and nothing acknowledged | `ALREADY_DELIVERED` repair path using `is_confirmed_emission`; writes the missing markers, sends nothing |
+| R-3 | P2 | Marker growth was unbounded (one entry per acknowledged row, never pruned) | Prune markers older than 30 days on the write path, plus `compact_markers()` |
+| R-4 | P3 | At most one digest per cooldown window (policy suppresses non-critical events for the whole window regardless of fingerprint) | Documented; safe because rows stay pending. Throughput remains one digest per 6h by default |
+| R-5 | P3 | Alert-market `observed_at` still uses evaluation time (only BTC context was moved to a source timestamp) | Documented; the market snapshot exposes no per-snapshot timestamp beyond `market_data_validation` |
+
+### Evidence
+
+RED before correction: 14 new reliability tests exercised a missing
+`observation_backlog`, a missing `STATUS_ALREADY_DELIVERED`, missing marker
+compaction, and - once those existed - the horizon defect reproduced as
+`pending=0` with two rows never delivered.
+GREEN after: 14 passed in the new file; 276 in the Tradevisor suite; 78 adjacent.
+
+`notification_policy.py`, `tradevisor_learning.py`, `report_tradevisor_learning.py`,
+`tradevisor_inbox.py` retention/consumption, F5/F7, R4 and release profiles are
+byte-identical to `72f592b5` except for the four-line provenance serializer from
+the previous increment.
