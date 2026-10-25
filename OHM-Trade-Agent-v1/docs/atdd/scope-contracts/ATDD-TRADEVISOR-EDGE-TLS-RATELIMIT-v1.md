@@ -74,7 +74,6 @@ ACCEPTANCE TEST TRACEABILITY:
 AC-001 -> tests/test_tradevisor_edge_contract_v1.py::test_ac_001_the_dedicated_edge_is_the_default_server_so_no_sni_falls_elsewhere
 AC-001 -> tests/test_tradevisor_edge_contract_v1.py::test_ac_001_the_tls_floor_is_declared_at_server_scope_and_never_weakened
 AC-001 -> tests/test_tradevisor_edge_contract_v1.py::test_ac_001_the_multi_vhost_reasoning_is_documented
-AC-001 -> tests/test_tradevisor_edge_contract_v1.py::test_ac_001_a_real_handshake_refuses_tls11_and_accepts_tls12
 AC-001 -> tests/test_tradevisor_edge_tls_v1.py::test_ac_001_a_valid_configuration_passes_nginx_t
 AC-001 -> tests/test_tradevisor_edge_tls_v1.py::test_ac_001_tls12_and_tls13_are_accepted
 AC-001 -> tests/test_tradevisor_edge_tls_v1.py::test_ac_001_deprecated_protocols_are_refused_by_the_server

@@ -64,23 +64,47 @@ def _free_port() -> int:
         return int(probe.getsockname()[1])
 
 
-def _server_config(port: int, cert: Path, key: Path, *, protocols: str) -> str:
-    """One hardened-or-permissive vhost on a loopback port.
+def _render_example(port: int, cert: Path, key: Path) -> str:
+    """Render the SHIPPED example onto a throwaway loopback listener.
 
-    Both variants use the same cipher list, so the *only* difference is
-    ``ssl_protocols``: a protocol refusal therefore cannot be a cipher refusal.
+    Only deployment-specific values change: the host placeholder, the edge stamp,
+    the certificate paths and the listen address/port. The protocol policy, source
+    allowlist, throttle, body cap and 404 fallback are exactly the shipped ones,
+    so the certification tests the reviewed file rather than a parallel copy.
     """
     return (
-        "server {\n"
-        f"    listen 127.0.0.1:{port} ssl default_server;\n"
-        f"    server_name {HOST};\n"
-        "    server_tokens off;\n"
-        f"    ssl_protocols {protocols};\n"
-        f"    ssl_ciphers {LEGACY_CIPHERS};\n"
-        f"    ssl_certificate {cert.as_posix()};\n"
-        f"    ssl_certificate_key {key.as_posix()};\n"
-        "    location / { return 204; }\n"
-        "}\n"
+        EXAMPLE.read_text(encoding="utf-8")
+        .replace("<WEBHOOK_HOST>", HOST)
+        .replace("<EDGE_VERIFICATION_VALUE>", "synthetic-edge-verification-value")
+        .replace(
+            "/etc/letsencrypt/live/tv-staging.opip.io/fullchain.pem", cert.as_posix()
+        )
+        .replace(
+            "/etc/letsencrypt/live/tv-staging.opip.io/privkey.pem", key.as_posix()
+        )
+        .replace(
+            "listen 443 ssl default_server;",
+            f"listen 127.0.0.1:{port} ssl default_server;",
+        )
+    )
+
+
+def _equalised_ciphers(config: str) -> str:
+    """Give both variants the same cipher security level.
+
+    Legacy protocols need legacy ciphers, so equalising the cipher list on the
+    hardened and the permissive server means a refusal can only be
+    protocol-based. The shipped file is not modified.
+    """
+    return config.replace(
+        "ssl_protocols", "ssl_ciphers DEFAULT:@SECLEVEL=0;\n    ssl_protocols", 1
+    )
+
+
+def _permissive_control(config: str) -> str:
+    """The same rendered edge, differing only in protocol policy."""
+    return config.replace(
+        "ssl_protocols TLSv1.2 TLSv1.3;", "ssl_protocols TLSv1 TLSv1.1 TLSv1.2;", 1
     )
 
 
@@ -159,9 +183,9 @@ def stack(tmp_path_factory):
     while control_port == hardened_port:
         control_port = _free_port()
 
-    hardened = _server_config(hardened_port, cert, key, protocols="TLSv1.2 TLSv1.3")
-    control = _server_config(
-        control_port, cert, key, protocols="TLSv1 TLSv1.1 TLSv1.2"
+    hardened = _equalised_ciphers(_render_example(hardened_port, cert, key))
+    control = _permissive_control(
+        _equalised_ciphers(_render_example(control_port, cert, key))
     )
     conf = _write_conf(prefix, hardened + control)
 
@@ -231,7 +255,9 @@ def test_ac_002_a_competing_default_server_is_rejected_by_real_nginx(stack):
         "    location / { return 404; }\n"
         "}\n"
     )
-    first = _server_config(port, stack["cert"], stack["key"], protocols="TLSv1.2")
+    # The shipped example, rendered on the conflicting port, plus a sibling that
+    # also claims the default server there.
+    first = _render_example(port, stack["cert"], stack["key"])
     result = _nginx_test(stack["prefix"], first + hostile)
     assert result.returncode != 0
     assert "duplicate default server" in result.stderr.lower()

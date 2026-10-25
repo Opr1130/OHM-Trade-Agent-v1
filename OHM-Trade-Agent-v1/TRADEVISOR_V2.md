@@ -722,13 +722,13 @@ Consequences the operator must plan for:
   no inbox row is created, and only the duplicate path returns a `duplicate`
   status for an alert that was already stored.
 
-**Owner decision (unapproved).** `60` per minute per peer is the shipped default
-and is preserved here; it is not an approved aggregate capacity statement for a
-four-source deployment. Whether the intended ceiling is 60 aggregate, 4 × 30 = 120
-aggregate, or something else is an owner decision that would change
-`OPIP_TRADEVISOR_MAX_REQUESTS_PER_MINUTE` (and, if per-source fairness is wanted,
-the limiter's key). This increment changes neither: it documents the behaviour and
-adds the acceptance tests that pin it.
+**Approved initial policy.** `60` per minute per peer is the owner-approved *initial*
+shared policy and is preserved here, together with the edge's 30 per minute per source.
+It is **not** a production-validated capacity target: no load or soak measurement has
+established 60/min aggregate as sufficient for a four-source deployment. Raising the
+limit, or giving each source its own budget, would change
+`OPIP_TRADEVISOR_MAX_REQUESTS_PER_MINUTE` (and, for per-source fairness, the limiter's
+key) and needs its own approved increment. This increment changes neither.
 
 ## TLS policy with multiple virtual hosts
 

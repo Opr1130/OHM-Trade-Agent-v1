@@ -221,65 +221,6 @@ def test_ac_002_nginx_refuses_two_default_servers_on_one_port(tmp_path):
     assert "duplicate default server" in completed.stderr.lower()
 
 
-
-@pytest.mark.skipif(
-    not all(shutil.which(tool) for tool in ("nginx", "openssl"))
-    or __import__("os").environ.get("OPIP_NGINX_HANDSHAKE_TEST") != "1",
-    reason="opt-in TLS handshake test (needs nginx+openssl and OPIP_NGINX_HANDSHAKE_TEST=1)",
-)
-def test_ac_001_a_real_handshake_refuses_tls11_and_accepts_tls12(tmp_path):
-    """ATDD-TRADEVISOR-EDGE-TLS-RATELIMIT-v1/AC-001: the negotiated floor is really 1.2.
-
-    Opt-in because it starts a real nginx process on a loopback port. It is the
-    only test that proves the *negotiated* protocol version; the syntax test and
-    the structural assertions cannot.
-    """
-    import time
-
-    cert, key = _self_signed(tmp_path)
-    rendered = _render(cert, key, port=38443)
-    conf = _nginx_conf(tmp_path, rendered)
-    nginx = shutil.which("nginx")
-    process = subprocess.Popen(
-        [
-            nginx, "-p", str(tmp_path).replace("\\", "/") + "/",
-            "-c", str(conf).replace("\\", "/"),
-            "-g", "error_log stderr; pid nginx.pid; daemon off;",
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    try:
-        deadline = time.time() + 15
-        while time.time() < deadline:
-            probe = _s_client("127.0.0.1", 38443, "-tls1_2")
-            if probe.returncode == 0:
-                break
-            time.sleep(0.5)
-        tls12 = _s_client("127.0.0.1", 38443, "-tls1_2")
-        assert tls12.returncode == 0, tls12.stderr
-        tls11 = _s_client("127.0.0.1", 38443, "-tls1_1")
-        assert tls11.returncode != 0
-        assert "handshake" in (tls11.stderr + tls11.stdout).lower() or tls11.returncode != 0
-    finally:
-        process.terminate()
-        try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:  # pragma: no cover - defensive teardown
-            process.kill()
-
-
-def _s_client(host: str, port: int, flag: str):
-    return subprocess.run(
-        [shutil.which("openssl"), "s_client", "-connect", f"{host}:{port}", flag],
-        input="\n",
-        capture_output=True,
-        text=True,
-        timeout=20,
-    )
-
-
 # AC-003 ----------------------------------------------------------------------
 def test_ac_003_the_aggregate_rate_limit_contract_is_documented():
     """ATDD-TRADEVISOR-EDGE-TLS-RATELIMIT-v1/AC-003: the aggregate ceiling is stated."""
