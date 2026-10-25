@@ -656,7 +656,11 @@ def test_edge_example_passes_a_real_nginx_syntax_check(tmp_path):
             "-t",
             "-p", str(tmp_path).replace("\\", "/") + "/",
             "-c", str(conf).replace("\\", "/"),
-            "-g", "error_log stderr;",
+            # Everything nginx would otherwise write goes into the temporary
+            # prefix: without these the test needs write access to /run and/or
+            # /var/log, which an unprivileged CI runner does not have.
+            "-g",
+            "error_log stderr; pid nginx.pid;",
         ],
         capture_output=True,
         text=True,
