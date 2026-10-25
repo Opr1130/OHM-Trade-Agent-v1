@@ -784,6 +784,10 @@ def test_ac_015_untrusted_f6_and_missing_swing_4h_never_send_actionable_alert():
                 open_time=grid + timedelta(hours=1),
                 low=result.plan.entry_low,
                 high=result.plan.target_1,
+                # A measured bar must carry a coherent OHLC set
+                # (ATDD-LEARNING-MEASUREMENT-GEOMETRY-v1).
+                open=result.plan.entry_low,
+                close=result.plan.entry_low,
             )
         ],
         measurement_hours=2,
