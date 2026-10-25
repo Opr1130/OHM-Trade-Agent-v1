@@ -527,3 +527,39 @@ def test_atdd13_numeric_price_still_accepted(settings):
     assert response.status_code == 202
     assert response.json()["status"] == "accepted"
     assert len(rows()) == 1
+
+
+def test_atdd13_duplicate_key_is_refused_at_every_nesting_level():
+    """The hook is applied to every object the parser builds, not just the root."""
+    hook = routes._object_without_duplicate_keys
+    assert json.loads('{"nested": {"a": 1, "b": 2}}', object_pairs_hook=hook) == {
+        "nested": {"a": 1, "b": 2}
+    }
+
+    for raw in (
+        '{"nested": {"a": 1, "a": 2}}',
+        '{"list": [{"a": 1, "a": 2}]}',
+        '{"a": 1, "b": {"c": 2, "c": 3}}',
+    ):
+        with pytest.raises(ValueError):
+            json.loads(raw, object_pairs_hook=hook)
+
+
+def test_atdd13_nested_duplicate_is_refused_by_the_parser_not_the_schema(settings):
+    """A nested duplicate is a parse refusal (404), not a schema refusal (422).
+
+    ``extra="forbid"`` would reject the unknown key with 422, so a 404 proves
+    the duplicate was caught while parsing, before any schema evaluation.
+    """
+    body = json.dumps(payload(), separators=(",", ":"))
+    nested = body[:-1] + ',"debug":{"a":1,"a":2}}'
+
+    response = client_for(settings).post(
+        "/webhooks/tradevisor/v1",
+        content=nested,
+        headers={**HEADERS, "content-type": "application/json"},
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Not found"}
+    assert rows() == []
