@@ -38,6 +38,13 @@ APP_ROOT = Path(__file__).resolve().parents[1]
 NGINX = APP_ROOT / "deploy" / "nginx" / "tradevisor-webhook.conf.example"
 NGINX_TEXT = NGINX.read_text(encoding="utf-8")
 DOC = (APP_ROOT / "TRADEVISOR_V2.md").read_text(encoding="utf-8")
+# Whitespace-free views, so a documentation assertion does not depend on where a
+# paragraph happens to wrap.
+DOC_FLAT = " ".join(DOC.split())
+CONTRACT = (
+    APP_ROOT / "docs" / "atdd" / "scope-contracts" / f"{INCREMENT}.md"
+).read_text(encoding="utf-8")
+CONTRACT_FLAT = " ".join(CONTRACT.split())
 
 TOKEN = "T" * 43
 EDGE_VALUE = "synthetic-edge-verification-value"
@@ -188,6 +195,23 @@ def test_ac_001_the_multi_vhost_reasoning_is_documented():
     # host that serves this webhook alone.
     assert "dedicated" in DOC
     assert "other names needs a separate, jointly reviewed configuration" in DOC
+    # The TLS 1.2 floor is a property of the dedicated listener, never a blanket
+    # guarantee for whatever else the host happens to serve. The withdrawn
+    # statement must not come back.
+    assert "regardless of what other vhosts on the host allow" not in DOC_FLAT
+    assert "on this dedicated listener" in DOC_FLAT
+    # The sibling-SNI limitation stays stated, not dropped.
+    assert "vhost's own SNI" in DOC_FLAT
+    # A host that also serves other names is explicitly not an approved shape,
+    # and the dedicated-host architecture is unchanged.
+    assert "shared multi-vhost deployment" in DOC_FLAT
+    assert "not approved" in DOC_FLAT
+    assert "separate, jointly reviewed configuration" in DOC_FLAT
+    # The scope contract carries the same scope: no listener-wide claim.
+    assert "for any handshake that reaches this edge" not in CONTRACT_FLAT
+    assert "dedicated listener" in CONTRACT_FLAT
+    assert "vhost's own SNI" in CONTRACT_FLAT
+    assert "not approved" in CONTRACT_FLAT
 
 
 # AC-002 ----------------------------------------------------------------------
@@ -243,6 +267,20 @@ def test_ac_003_the_aggregate_rate_limit_contract_is_documented():
         assert phrase in DOC, phrase
     # The application limit must not be presented as a per-source budget.
     assert "per-source application budget" not in DOC
+    # `60`/minute per immediate peer is the owner-approved *initial* policy; only
+    # production capacity sufficiency is unvalidated. The withdrawn framing —
+    # `60` as an *unapproved* capacity — must not come back to either document.
+    assert "approved initial policy" in DOC_FLAT.lower()
+    assert "production-validated capacity target" in DOC_FLAT
+    assert "production capacity sufficiency remains" in DOC_FLAT.lower()
+    assert "unapproved aggregate capacity" not in DOC_FLAT.lower()
+    assert "unapproved owner decision" not in CONTRACT_FLAT.lower()
+    assert "unapproved aggregate capacity" not in CONTRACT_FLAT.lower()
+    assert "approved initial policy" in CONTRACT_FLAT.lower()
+    assert "production capacity sufficiency remains unvalidated" in CONTRACT_FLAT.lower()
+    # A shared multi-vhost deployment stays unapproved in the owned contract too.
+    assert "shared multi-vhost deployment" in CONTRACT_FLAT.lower()
+    assert "not approved" in CONTRACT_FLAT.lower()
 
 
 

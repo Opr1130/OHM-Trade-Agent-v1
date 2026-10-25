@@ -735,7 +735,8 @@ Consequences the operator must plan for:
 **Approved initial policy.** `60` per minute per peer is the owner-approved *initial*
 shared policy and is preserved here, together with the edge's 30 per minute per source.
 It is **not** a production-validated capacity target: no load or soak measurement has
-established 60/min aggregate as sufficient for a four-source deployment. Raising the
+established 60/min aggregate as sufficient for a four-source deployment, so production
+capacity sufficiency remains **unvalidated**. Raising the
 limit, or giving each source its own budget, would change
 `OPIP_TRADEVISOR_MAX_REQUESTS_PER_MINUTE` (and, for per-source fairness, the limiter's
 key) and needs its own approved increment. This increment changes neither.
@@ -746,8 +747,15 @@ TLS policy is selected per SNI host, and a client that sends no SNI — or an
 unknown one — is served by the **default server** for that listen socket. The
 webhook vhost is therefore declared `listen 443 ssl default_server`, so:
 
-* the effective minimum for any handshake that reaches this edge is **TLS 1.2**,
-  regardless of what other vhosts on the host allow;
+* on this dedicated listener the effective minimum for every handshake that
+  reaches it — a valid SNI for this host, a missing SNI, or an unknown SNI — is
+  **TLS 1.2**;
+* that floor does **not** extend to a handshake that deliberately names a
+  *sibling* vhost's own SNI on a shared `:443`: that client is negotiating with
+  the sibling, under the sibling's policy, by design (see "Scope of the TLS
+  guarantee" above). A shared multi-vhost deployment of this file is therefore
+  **not approved** — a host that must also serve other names needs a separate,
+  jointly reviewed configuration rather than this file;
 * a host carrying a second `default_server` on `:443`, or an operator dropping
   this file onto a host that already has one, fails `nginx -t` with
   "duplicate default server" — a configuration error at validation time rather
