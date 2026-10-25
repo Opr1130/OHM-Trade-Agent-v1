@@ -648,7 +648,11 @@ def test_edge_example_passes_a_real_nginx_syntax_check(tmp_path):
     )
     conf = tmp_path / "nginx.conf"
     conf.write_text(
-        "events {}\nhttp {\n" + rendered + "\n}\n", encoding="utf-8"
+        # ``access_log off`` keeps nginx from opening its compiled-in default log
+        # path (/var/log/nginx/access.log), which an unprivileged runner cannot
+        # write even though the configuration itself is valid.
+        "events {}\nhttp {\n    access_log off;\n" + rendered + "\n}\n",
+        encoding="utf-8",
     )
     completed = subprocess.run(
         [
