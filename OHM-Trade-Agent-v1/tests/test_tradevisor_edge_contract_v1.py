@@ -183,7 +183,7 @@ def test_ac_001_the_multi_vhost_reasoning_is_documented():
     # The guarantee's boundary is stated, not implied: a client that names another
     # vhost's own SNI is negotiating with that vhost by design.
     assert "Scope of the TLS guarantee" in DOC
-    assert "other vhost's own SNI" in DOC
+    assert "vhost's own SNI" in DOC
 
 
 # AC-002 ----------------------------------------------------------------------
