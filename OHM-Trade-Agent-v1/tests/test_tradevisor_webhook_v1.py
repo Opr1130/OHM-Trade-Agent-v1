@@ -6,6 +6,8 @@ Every case is synthetic: no TradingView, Kraken, AI or Telegram call occurs.
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -581,11 +583,14 @@ def test_edge_example_throttle_status_matches_the_application_contract():
 
     nginx's ``limit_req_status`` default is 503, which makes a throttled alert
     indistinguishable from the queue-capacity backpressure the application
-    deliberately emits. The example states 429 explicitly so an operator cannot
-    deploy the ambiguous default by following it.
+    deliberately emits. The example states 429 at *server* scope, so a future
+    location inherits it instead of silently reverting to 503.
     """
     text = edge_config()
-    assert "limit_req_status 429;" in text
+    server_block = text.split("server {", 1)[1]
+    head, location = server_block.split("location = /webhooks/tradevisor/v1 {", 1)
+    assert "limit_req_status 429;" in head
+    assert "limit_req_status" not in location
     assert "client_max_body_size 8k;" in text
 
 
@@ -594,4 +599,68 @@ def test_edge_example_declares_a_tls_floor_and_hides_version_banners():
     text = edge_config()
     assert "ssl_protocols TLSv1.2 TLSv1.3;" in text
     assert "server_tokens off;" in text
+
+
+def test_edge_example_documents_only_the_dns_only_deployment_mode():
+    """A-F1: the shipped example must state which deployment mode it implements."""
+    text = edge_config()
+    assert "DNS-ONLY machine-to-machine mode" in text
+    assert "Cloudflare" in text
+    assert "Two edge deployment modes" in text
+    # It must never be mistaken for a proxied configuration.
+    assert "$http_cf_connecting_ip" not in text
+    assert "set_real_ip_from" not in text
+
+
+
+@pytest.mark.skipif(
+    shutil.which("nginx") is None or shutil.which("openssl") is None,
+    reason="nginx/openssl unavailable: a real syntax check cannot run here",
+)
+def test_edge_example_passes_a_real_nginx_syntax_check(tmp_path):
+    """A-F2: render the example and let a real nginx parse it.
+
+    This is the only test in the module that proves nginx *accepts* the file.
+    It is environment-gated, so its absence (skip) is reported as
+    NOT_TESTED rather than as a pass. A throwaway self-signed certificate is
+    generated inside the temporary prefix; nothing outside tmp_path is touched.
+    """
+    cert = tmp_path / "cert.pem"
+    key = tmp_path / "key.pem"
+    subprocess.run(
+        [
+            shutil.which("openssl"),
+            "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+            "-keyout", str(key), "-out", str(cert), "-days", "1",
+            "-subj", "/CN=tv-staging.opip.io",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    rendered = (
+        edge_config()
+        .replace("<WEBHOOK_HOST>", "tv-staging.opip.io")
+        .replace("<EDGE_VERIFICATION_VALUE>", "synthetic-verification-value")
+        .replace(
+            "/etc/letsencrypt/live/tv-staging.opip.io/fullchain.pem", cert.as_posix()
+        )
+        .replace("/etc/letsencrypt/live/tv-staging.opip.io/privkey.pem", key.as_posix())
+    )
+    conf = tmp_path / "nginx.conf"
+    conf.write_text(
+        "events {}\nhttp {\n" + rendered + "\n}\n", encoding="utf-8"
+    )
+    completed = subprocess.run(
+        [
+            shutil.which("nginx"),
+            "-t",
+            "-p", str(tmp_path).replace("\\", "/") + "/",
+            "-c", str(conf).replace("\\", "/"),
+            "-g", "error_log stderr;",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "syntax is ok" in (completed.stderr + completed.stdout).lower()
 

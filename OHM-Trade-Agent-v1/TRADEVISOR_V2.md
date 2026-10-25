@@ -657,3 +657,41 @@ rather than resolved. Two parser-level cases were hardened after review:
 `"signal_price": true` coerced to `1.0` and produced a plausible-looking quote
 that only failed later at the cross-venue divergence gate, which masked the real
 schema violation.
+
+## Two edge deployment modes (this integration ships mode 1 only)
+
+The webhook boundary has exactly two supported shapes. They are **not
+interchangeable**, and neither is activated by this repository.
+
+| | Mode 1 — DNS-only (shipped) | Mode 2 — Cloudflare-proxied (documented, not shipped) |
+| --- | --- | --- |
+| Path | TradingView → `tv-staging.opip.io` (DNS-only) → this edge | TradingView → Cloudflare → this edge |
+| `$remote_addr` | the real TradingView source address | a **Cloudflare** address |
+| Source allowlist | the four documented TradingView IPs (`allow` / `deny all`) | must be the published Cloudflare ranges; the real client is then a header, not an address |
+| Client identity | the peer address is the identity | `CF-Connecting-IP`, accepted **only** from a verified Cloudflare peer; no other peer may assert it |
+| Rate-limit identity | `$binary_remote_addr` is correct | keying on `$binary_remote_addr` would put every customer in one bucket; key on the validated client identity, or terminate the limit at Cloudflare |
+| `X-Forwarded-For` | set to `$remote_addr` (replaces any client value) | must be rebuilt from the trusted chain, never copied from the request |
+| Header spoofing | impossible through the edge: the stamp is a fixed literal | safe only if the origin is firewalled to Cloudflare and the stamp is still set by this proxy |
+| Extra requirements | origin firewall limited to the four IPs; TLS ≥ 1.2; 8 KiB body cap; opaque 404 | origin reachable **only** through the tunnel/proxy (no public origin port); Cloudflare WAF and rate rules reviewed; the true-client header validated against Cloudflare ranges; a separate security review |
+| Status | example reviewed; **not deployed** | **not implemented**; needs its own approved review |
+
+`deploy/nginx/tradevisor-webhook.conf.example` implements mode 1 only. Enabling
+Cloudflare's proxy in front of that file would silently reject every real alert, so
+mode 2 is a **different configuration**, not a DNS toggle.
+
+### Validation an operator must run (not run by this repository)
+
+```bash
+nginx -t -c /etc/nginx/nginx.conf
+```
+
+`tests/test_tradevisor_webhook_v1.py` contains an **environment-gated** test that
+performs the same `nginx -t` check inside a temporary prefix with a throwaway
+self-signed certificate. It is skipped when `nginx` or `openssl` is unavailable, so a
+green local suite never implies that a real nginx accepted the file. The textual
+assertions in that module are contract assertions over the example, not a runtime
+certification.
+
+No DNS, certificate, Cloudflare, firewall or nginx service change is authorized or
+performed by this integration.
+

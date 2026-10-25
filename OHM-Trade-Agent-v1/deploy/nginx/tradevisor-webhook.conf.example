@@ -3,6 +3,15 @@
 # This file documents the reviewed boundary. It is NOT deployed by anything in
 # this repository and it contains no secret values: replace every <PLACEHOLDER>.
 #
+# DEPLOYMENT MODE: this example is the DNS-ONLY machine-to-machine mode. It
+# assumes TradingView connects directly to this edge, so `$remote_addr` is the
+# real TradingView source address. Do NOT put Cloudflare's proxy in front of
+# this vhost: with the orange cloud enabled every request arrives from a
+# Cloudflare address, the four `allow` lines reject all real traffic, and
+# `X-Forwarded-For $remote_addr` would overwrite the true client identity.
+# See TRADEVISOR_V2.md "Two edge deployment modes" for the proxied variant,
+# which requires a differently reviewed configuration.
+#
 # TradingView documents these source addresses for webhooks:
 #   52.89.214.238  34.212.75.30  54.218.53.128  52.32.178.7
 # Ports 80/443 only, IPv6 unsupported, and the whole request must be answered
@@ -22,6 +31,11 @@ server {
     server_tokens off;
     ssl_protocols TLSv1.2 TLSv1.3;
 
+    # Server scope so every location inherits the same throttle status: the
+    # application answers 429 for its own limiter, and nginx's default 503
+    # would make a throttled alert indistinguishable from an outage.
+    limit_req_status 429;
+
     ssl_certificate     /etc/letsencrypt/live/<WEBHOOK_HOST>/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/<WEBHOOK_HOST>/privkey.pem;
 
@@ -37,10 +51,6 @@ server {
             deny all;
         }
         limit_req zone=tradevisor_webhook burst=20 nodelay;
-        # The application answers 429 for its own limiter. nginx's default is
-        # 503, which would make a throttled alert indistinguishable from an
-        # application outage, so the edge states the status explicitly.
-        limit_req_status 429;
 
         client_max_body_size 8k;
 
