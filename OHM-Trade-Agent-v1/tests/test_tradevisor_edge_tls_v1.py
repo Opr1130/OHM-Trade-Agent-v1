@@ -102,9 +102,16 @@ def _equalised_ciphers(config: str) -> str:
 
 
 def _permissive_control(config: str) -> str:
-    """The same rendered edge, differing only in protocol policy."""
-    return config.replace(
-        "ssl_protocols TLSv1.2 TLSv1.3;", "ssl_protocols TLSv1 TLSv1.1 TLSv1.2;", 1
+    """The same rendered edge, differing only in protocol policy and zone name.
+
+    ``limit_req_zone`` may be declared once per zone name, so rendering the example
+    twice needs a distinct zone for the second instance; every other directive -
+    allowlist, throttle, body cap, 404 fallback - is unchanged.
+    """
+    return (
+        config.replace(
+            "ssl_protocols TLSv1.2 TLSv1.3;", "ssl_protocols TLSv1 TLSv1.1 TLSv1.2;", 1
+        ).replace("tradevisor_webhook", "tradevisor_webhook_ctl")
     )
 
 
