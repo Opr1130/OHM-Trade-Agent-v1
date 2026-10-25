@@ -302,6 +302,7 @@ def test_ac_004_the_aggregate_ceiling_is_59_60_accepted_and_61_refused(edge):
     """ATDD-TRADEVISOR-EDGE-TLS-RATELIMIT-v1/AC-004: 60 per peer, shared by all sources."""
     # The immediate peer is always the single trusted proxy, so the four
     # TradingView sources share one bucket: 60 accepted, the 61st refused.
+    routes.reset_rate_limiter_for_tests()
     codes = [edge.post(ROUTE, content=body_bytes(), headers=headers()).status_code for _ in range(61)]
     assert codes[:60] == [202] * 60
     assert codes[60] == 429
@@ -310,6 +311,7 @@ def test_ac_004_the_aggregate_ceiling_is_59_60_accepted_and_61_refused(edge):
 
 def test_ac_004_multiple_sources_share_the_single_peer_bucket(edge):
     """ATDD-TRADEVISOR-EDGE-TLS-RATELIMIT-v1/AC-004: distinct sources do not get separate budgets."""
+    routes.reset_rate_limiter_for_tests()
     codes = []
     for index in range(4):
         codes.extend(

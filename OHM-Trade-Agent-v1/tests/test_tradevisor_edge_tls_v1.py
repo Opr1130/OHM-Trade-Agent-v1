@@ -160,7 +160,9 @@ def stack(tmp_path_factory):
         control_port = _free_port()
 
     hardened = _server_config(hardened_port, cert, key, protocols="TLSv1.2 TLSv1.3")
-    control = _server_config(control_port, cert, key, protocols="TLSv1.1 TLSv1.2")
+    control = _server_config(
+        control_port, cert, key, protocols="TLSv1 TLSv1.1 TLSv1.2"
+    )
     conf = _write_conf(prefix, hardened + control)
 
     process = subprocess.Popen(

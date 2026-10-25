@@ -648,10 +648,10 @@ def test_edge_example_passes_a_real_nginx_syntax_check(tmp_path):
         # `nginx -t` also opens the listening sockets, and an unprivileged runner
         # cannot bind :443. The port is a deployment attribute (asserted textually
         # on the shipped example), not part of the syntax under test.
-        .replace("listen 443 ssl;", "listen 38443 ssl;")
+        .replace("listen 443 ssl", "listen 38443 ssl")
     )
-    assert "listen 38443 ssl;" in rendered
-    assert "listen 443 ssl;" in edge_config()
+    assert "listen 38443 ssl default_server;" in rendered
+    assert "listen 443 ssl default_server;" in edge_config()
     conf = tmp_path / "nginx.conf"
     conf.write_text(
         # ``access_log off`` keeps nginx from opening its compiled-in default log
