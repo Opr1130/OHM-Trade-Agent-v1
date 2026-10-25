@@ -17,9 +17,25 @@ SHA_B = "b" * 40
 
 @dataclass
 class Candle:
+    """A candle carrying the four prices the real Kraken model provides.
+
+    ``open``/``close`` default to ``low`` so a bar built only from high/low is
+    still coherent: measurement geometry is validated on all four prices
+    (ATDD-LEARNING-MEASUREMENT-GEOMETRY-v1), and a fixture that omitted two of
+    them would no longer model a real ``app.exchanges.kraken.Candle``.
+    """
+
     open_time: datetime
     high: float
     low: float
+    open: float | None = None
+    close: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.open is None:
+            self.open = self.low
+        if self.close is None:
+            self.close = self.low
 
 
 def record(*, decision: str = "ENTER_NOW", dedup_id: str = "dedup-1") -> dict:

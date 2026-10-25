@@ -629,6 +629,7 @@ DEFERRED DISCOVERIES:
 - Whether the Tradevisor scenario suite should carry acceptance markers per scenario, rather than the grouped criteria used here, is a documentation question for a future increment.
 - N-01 limitation (2026-10-24): no deployment unit invokes `report_tradevisor_learning` and the learning worker holds no reverse-write authority into production storage, so no production process records a consumption acknowledgement. Eligible evidence is therefore retained until the inbox reaches capacity and ingress returns 503. Ending that state requires an owner-approved acknowledgement writer or durable archival handoff; until then the consumption lifecycle must not be described as fully operational.
 - N-02 limitation (2026-10-24): coverage uses the interval the caller declares (60 minutes from the report job). A source that changes interval, or returns bars on a different grid, will be classified `PARTIAL_COVERAGE` rather than measured - a deliberate fail-closed default.
+- N-03 limitation (2026-10-25, overnight certification): candle coverage validates finiteness and `high < low` only. A finite bar whose `open` or `close` lies outside `[low, high]`, or whose `open` is non-positive, is still counted as a valid bar and can produce a `MEASURED` outcome, while the native owner (`app/scanner/market_data_validation.py`) already rejects the same bar as invalid OHLC geometry. Closing this needs an owner-approved measurement increment; it changes no authority, no retention and no criterion in this contract.
 
 UNAPPROVED SCOPE CHANGES:
 NONE
