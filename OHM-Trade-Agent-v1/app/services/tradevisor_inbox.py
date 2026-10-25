@@ -205,6 +205,12 @@ def _prune(events: dict, *, now: datetime, retention_seconds: int) -> int:
     return removed
 
 
+#: Bounded audit history for repaired consumption records. A repair must not
+#: erase how the row was previously claimed, but the history may not grow
+#: without limit on a long-lived trading host.
+CONSUMPTION_HISTORY_LIMIT = 8
+
+
 def record_consumption_ack(
     dedup_id: str,
     *,
@@ -249,6 +255,27 @@ def record_consumption_ack(
                 and str(existing.get("disposition")) == str(disposition)
             ):
                 return True
+            # A valid acknowledgement is durable evidence, so a later and
+            # *different* claim must never rewrite it. Refuse instead of
+            # overwriting: a retry, a second worker, a superseded measurement or
+            # an operator re-run cannot rewrite consumption history. Only a
+            # record that is not valid evidence (never written, corrupt, or
+            # written by a different release) is repairable.
+            return False
+        if isinstance(existing, dict):
+            # Repairing a record that is not valid evidence keeps an audit trail
+            # of what was rejected, so a corrupted or cross-release claim cannot
+            # disappear without trace.
+            history = row.get("consumption_history")
+            history = list(history) if isinstance(history, list) else []
+            history.append(
+                {
+                    "record": dict(existing),
+                    "superseded_at": now.isoformat(),
+                    "reason": "REPAIRED_INVALID_OR_FOREIGN_RELEASE",
+                }
+            )
+            row["consumption_history"] = history[-CONSUMPTION_HISTORY_LIMIT:]
         row["consumption"] = {
             "dedup_id": dedup,
             "evidence_id": str(evidence_id),
