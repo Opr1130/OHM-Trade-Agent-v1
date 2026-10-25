@@ -108,6 +108,22 @@ def reset_rate_limiter_for_tests() -> None:
 
 
 
+def _object_without_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+    """Build a mapping, refusing a repeated key.
+
+    ``json.loads`` keeps the last occurrence, so an edge that inspected the
+    first one and the application could disagree about what was authenticated
+    (direction, symbol, alert identity). One body must have exactly one
+    meaning, so an ambiguous body is refused instead of resolved.
+    """
+    seen: set[str] = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise ValueError("duplicate JSON key")
+        seen.add(key)
+    return dict(pairs)
+
+
 @router.post("/webhooks/tradevisor/v1", status_code=status.HTTP_202_ACCEPTED)
 async def tradevisor_webhook_v1(request: Request) -> dict:
     settings = get_settings()
@@ -143,8 +159,12 @@ async def tradevisor_webhook_v1(request: Request) -> dict:
     )
 
     try:
-        payload = json.loads(body)
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        payload = json.loads(body, object_pairs_hook=_object_without_duplicate_keys)
+    except (ValueError, RecursionError) as exc:
+        # ``JSONDecodeError``/``UnicodeDecodeError`` are ``ValueError`` subclasses,
+        # and a deeply nested body exhausts the parser stack. Every unparseable
+        # or ambiguous body is refused identically, before any schema detail is
+        # disclosed and before any durable row exists.
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Not found"
         ) from exc

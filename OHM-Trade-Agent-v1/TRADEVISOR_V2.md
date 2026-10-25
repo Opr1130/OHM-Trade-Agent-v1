@@ -638,3 +638,22 @@ making `account_risk_at_stop_pct` the stop-loss share of the account rather than
 the raw stop distance. A non-finite, zero or negative equity denominator is
 refused as `CAPITAL_INCONSISTENT / INVALID_EQUITY_DENOMINATOR`; it is never
 divided by.
+
+### One body, one meaning
+
+The ingress body is parsed exactly once, and an ambiguous body is refused
+rather than resolved. Two parser-level cases were hardened after review:
+
+* **Duplicate JSON keys** are rejected (`_object_without_duplicate_keys`). The
+  standard parser keeps the last occurrence, so an edge that inspected the
+  first `signal`, `symbol` or `alert_config_version` and the application could
+  disagree about what was authenticated. Such a body now gets the same opaque
+  404 as malformed JSON, before any schema detail is disclosed.
+* **Deeply nested bodies** (a few kilobytes of nested arrays stay inside the
+  8 KiB cap but exhaust the parser stack) are refused with the same 404 instead
+  of surfacing a server error.
+
+`signal_price` additionally refuses JSON booleans. Without that guard
+`"signal_price": true` coerced to `1.0` and produced a plausible-looking quote
+that only failed later at the cross-venue divergence gate, which masked the real
+schema violation.

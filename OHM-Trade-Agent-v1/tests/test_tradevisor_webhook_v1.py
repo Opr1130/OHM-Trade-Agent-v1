@@ -5,6 +5,7 @@ Every case is synthetic: no TradingView, Kraken, AI or Telegram call occurs.
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -446,3 +447,83 @@ def test_malformed_instrument_table_refuses_to_boot():
     assert "OPIP_TRADEVISOR_INSTRUMENTS" in str(excinfo.value) or "invalid Tradevisor" in str(
         excinfo.value
     )
+
+
+# ---------------------------------------------------------------------------
+# ATDD-13 hardening — JSON parser ambiguity and numeric type confusion
+#
+# The edge forwards a body that O'Pip must parse exactly once and
+# unambiguously: a body whose meaning depends on which duplicate survives,
+# a body that exhausts the parser's stack, or a price that is really a boolean
+# is not a valid source observation and must be refused before any contract
+# detail is disclosed or any row is written.
+# ---------------------------------------------------------------------------
+
+
+def test_atdd13_duplicate_json_key_is_refused(settings):
+    body = json.dumps(payload(), separators=(",", ":"))
+    duplicated = body.replace('"symbol":"BTCUSD"', '"symbol":"ETHUSD","symbol":"BTCUSD"', 1)
+    assert duplicated != body, "fixture must actually contain a duplicate key"
+
+    response = client_for(settings).post(
+        "/webhooks/tradevisor/v1",
+        content=duplicated,
+        headers={**HEADERS, "content-type": "application/json"},
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Not found"}
+    assert rows() == []
+
+
+def test_atdd13_duplicate_signal_key_cannot_flip_direction(settings):
+    body = json.dumps(payload(), separators=(",", ":"))
+    duplicated = body.replace('"signal":"BUY"', '"signal":"SELL","signal":"BUY"', 1)
+    assert duplicated != body
+
+    response = client_for(settings).post(
+        "/webhooks/tradevisor/v1",
+        content=duplicated,
+        headers={**HEADERS, "content-type": "application/json"},
+    )
+
+    assert response.status_code == 404
+    assert rows() == []
+
+
+def test_atdd13_deeply_nested_body_is_refused_without_a_server_error(settings):
+    # 6,000 bytes: inside the 8,192-byte body cap, far beyond a safe parse depth.
+    nested = "[" * 3000 + "]" * 3000
+
+    response = client_for(settings).post(
+        "/webhooks/tradevisor/v1",
+        content=nested,
+        headers={**HEADERS, "content-type": "application/json"},
+    )
+
+    assert response.status_code == 404
+    assert rows() == []
+
+
+def test_atdd13_boolean_price_is_refused(settings):
+    response = client_for(settings).post(
+        "/webhooks/tradevisor/v1",
+        json=payload(signal_price=True),
+        headers=HEADERS,
+    )
+
+    assert response.status_code == 422
+    assert "SCHEMA_INVALID" in response.json()["detail"]
+    assert rows() == []
+
+
+def test_atdd13_numeric_price_still_accepted(settings):
+    response = client_for(settings).post(
+        "/webhooks/tradevisor/v1",
+        json=payload(signal_price=67000.5),
+        headers=HEADERS,
+    )
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "accepted"
+    assert len(rows()) == 1
