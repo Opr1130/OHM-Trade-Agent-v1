@@ -18,6 +18,10 @@ server {
     listen 443 ssl;
     server_name <WEBHOOK_HOST>;
 
+    # Do not advertise the edge's own version to an unauthenticated caller.
+    server_tokens off;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
     ssl_certificate     /etc/letsencrypt/live/<WEBHOOK_HOST>/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/<WEBHOOK_HOST>/privkey.pem;
 
@@ -33,6 +37,10 @@ server {
             deny all;
         }
         limit_req zone=tradevisor_webhook burst=20 nodelay;
+        # The application answers 429 for its own limiter. nginx's default is
+        # 503, which would make a throttled alert indistinguishable from an
+        # application outage, so the edge states the status explicitly.
+        limit_req_status 429;
 
         client_max_body_size 8k;
 

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
@@ -563,3 +564,34 @@ def test_atdd13_nested_duplicate_is_refused_by_the_parser_not_the_schema(setting
     assert response.status_code == 404
     assert response.json() == {"detail": "Not found"}
     assert rows() == []
+
+
+def edge_config() -> str:
+    """The reviewed edge example, as shipped in the repository."""
+    return (
+        Path(__file__).resolve().parents[1]
+        / "deploy"
+        / "nginx"
+        / "tradevisor-webhook.conf.example"
+    ).read_text(encoding="utf-8")
+
+
+def test_edge_example_throttle_status_matches_the_application_contract():
+    """The edge must not answer 503 for throttling while the app answers 429.
+
+    nginx's ``limit_req_status`` default is 503, which makes a throttled alert
+    indistinguishable from the queue-capacity backpressure the application
+    deliberately emits. The example states 429 explicitly so an operator cannot
+    deploy the ambiguous default by following it.
+    """
+    text = edge_config()
+    assert "limit_req_status 429;" in text
+    assert "client_max_body_size 8k;" in text
+
+
+def test_edge_example_declares_a_tls_floor_and_hides_version_banners():
+    """Transport hygiene for the documented boundary (example only)."""
+    text = edge_config()
+    assert "ssl_protocols TLSv1.2 TLSv1.3;" in text
+    assert "server_tokens off;" in text
+
