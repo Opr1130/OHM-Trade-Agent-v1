@@ -463,3 +463,19 @@ policy, canonical path, execution path or risk threshold was modified.
    path and by `compact_markers()`.
 
 All three were reproduced RED before the correction.
+
+## Overnight certification run (2026-10-25)
+
+Independent re-verification of this increment, executed on an isolated worktree
+of `origin/main` `aaf24643b29fcdcdc7d0d4ac7b0aa372109f5726`. No deployment, no
+activation, no credential and no external call was performed.
+
+| Area | Verdict | Basis |
+| --- | --- | --- |
+| F6 trust barrier | **BLOCKED_TRUSTED_MODEL** (barrier sound) | `PRODUCTION_MODEL_REGISTRY` holds zero adapters and zero vouched reports; `evaluate_forecast` has no production caller; `tradevisor_evaluation` records `UNAVAILABLE_NO_TRUSTED_MODEL`. A 30-criterion refusal matrix (missing model, empty registry, test-only adapter, research-only artifact, unregistered kind, missing report, incompatible artifact, bad output schema, NaN/Inf probabilities, invalid uncertainty, mismatched lineage, F5 `VETO`, foreign venue, horizon mismatch, future features, naive clock, adapter exception, determinism, no order/canonical capability) was exercised in-process and refused in every case. |
+| Completed-4H context | **BLOCKED_NO_TRUSTED_4H** | No module in the advisory path reads a 4H candle; `regime_4h` is the constant `UNAVAILABLE`; a SWING decision always lists `SWING_4H_CLOSED_CONTEXT`; a 240-minute alert grants no 4H trust. |
+| Edge example | hardenings added (not deployed) | `deploy/nginx/tradevisor-webhook.conf.example` now states `limit_req_status 429;` (nginx's 503 default made throttling indistinguishable from queue backpressure), `ssl_protocols TLSv1.2 TLSv1.3;` and `server_tokens off;`. Covered by `tests/test_tradevisor_webhook_v1.py::test_edge_example_throttle_status_matches_the_application_contract` and `::test_edge_example_declares_a_tls_floor_and_hides_version_banners`. |
+| Measurement consumption | **N-01 unchanged** | No deployment unit (Compose, systemd, cron, workflow) invokes `report_tradevisor_learning`; eligible evidence is still retained until capacity. |
+| Drain capacity ceiling | documented | `opip_tradevisor_processing_batch_limit` is capped at 3 and `MAX_BATCHES_PER_RUN` is 4, so one drain run settles at most 12 rows. Measured locally: 120/240/300-event profiles settled with zero loss, 41/81/101 batches, enqueue p50 7-18 ms, batch p50 58-121 ms. |
+| OHLC geometry | **deferred (N-03)** | The learning path does not detect `open`/`close` outside `[low, high]` or a non-positive `open`; the native owner does. No correction was applied because it changes measurement semantics and needs an owner-approved increment. |
+
