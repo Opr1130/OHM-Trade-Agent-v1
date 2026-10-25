@@ -14,7 +14,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 SUPPORTED_SCHEMA_VERSION = "tradevisor-ingress-v1"
 
@@ -62,3 +62,16 @@ class TradevisorIngressV1(BaseModel):
         max_length=32,
         pattern=r"^[A-Za-z0-9._+-]+$",
     )
+
+    @field_validator("signal_price", mode="before")
+    @classmethod
+    def _price_must_not_be_boolean(cls, value: object) -> object:
+        """A JSON boolean is not a price: ``true`` must never become ``1.0``.
+
+        Coercion would turn a malformed source body into a plausible-looking
+        quote that only fails much later, at the cross-venue divergence gate,
+        masking the real schema violation.
+        """
+        if isinstance(value, bool):
+            raise ValueError("signal_price must be a number, not a boolean")
+        return value
