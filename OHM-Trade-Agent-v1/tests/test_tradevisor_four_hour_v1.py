@@ -222,7 +222,11 @@ WINDOW_EVAL = datetime(2026, 10, 25, 1, 0, tzinfo=UTC)
 
 def window_candle(index: int, **over):
     opened = WINDOW_START + timedelta(hours=4 * index)
-    body = candle(open_at=opened, close_at=opened + timedelta(hours=4), **over)
+    closed = opened + timedelta(hours=4)
+    body = candle(
+        open_at=opened, close_at=closed, observed_at=closed + timedelta(seconds=1)
+    )
+    body.update(over)
     return body
 
 
@@ -284,7 +288,13 @@ def test_ac_007_a_partial_latest_bar_refuses_the_window():
     """ATDD-TRADEVISOR-4H-EVIDENCE-v1/AC-007: a forming bar is never completed context."""
     bars = [window_candle(index) for index in range(5)]
     forming_open = WINDOW_END
-    bars.append(candle(open_at=forming_open, close_at=forming_open + timedelta(hours=4)))
+    bars.append(
+        candle(
+            open_at=forming_open,
+            close_at=forming_open + timedelta(hours=4),
+            observed_at=WINDOW_EVAL,
+        )
+    )
     result = classify_window(bars + [window_candle(5)], window_end=WINDOW_END + timedelta(hours=4))
     assert result.available is False
     assert result.reason in {four.REASON_STILL_FORMING, four.REASON_MISSING_BARS}
@@ -332,4 +342,90 @@ def test_ac_007_a_provider_fault_is_an_unavailable_window():
 def test_ac_007_window_replay_is_deterministic():
     """ATDD-TRADEVISOR-4H-EVIDENCE-v1/AC-007: the window result is a pure function."""
     assert classify_window(six_bars()).as_evidence() == classify_window(six_bars()).as_evidence()
+
+
+
+# AC-008 ----------------------------------------------------------------------
+def test_ac_008_the_analytic_bar_must_be_complete_at_the_evaluation_instant():
+    """ATDD-TRADEVISOR-4H-EVIDENCE-v1/AC-008: an early-reported close cannot complete the bar."""
+    # The analytic 12:00-16:00 bar is not finished at 15:59:59; the provider reports
+    # a close one second early, which is inside the drift tolerance.
+    opened = datetime(2026, 10, 25, 12, 0, tzinfo=UTC)
+    evaluation = datetime(2026, 10, 25, 15, 59, 59, tzinfo=UTC)
+    result = classify(
+        open_at=opened,
+        close_at=evaluation,
+        observed_at=evaluation,
+        expected={"evaluation_time": evaluation},
+    )
+    assert result.available is False
+    assert result.reason in {four.REASON_STILL_FORMING, four.REASON_FUTURE}
+
+
+def test_ac_008_an_analytic_close_after_now_is_never_completed_context():
+    """ATDD-TRADEVISOR-4H-EVIDENCE-v1/AC-008: analytic close later than now refuses."""
+    opened = datetime(2026, 10, 25, 12, 0, tzinfo=UTC)
+    analytic_close = opened + timedelta(hours=4)
+    result = classify(
+        open_at=opened,
+        close_at=analytic_close,
+        observed_at=analytic_close - timedelta(minutes=5),
+        expected={"evaluation_time": analytic_close - timedelta(minutes=1)},
+    )
+    assert result.available is False
+    assert result.reason == four.REASON_STILL_FORMING
+
+
+def test_ac_008_observation_time_must_be_present_and_utc():
+    """ATDD-TRADEVISOR-4H-EVIDENCE-v1/AC-008: provenance needs a real observation instant."""
+    missing = classify(observed_at=None)
+    assert missing.available is False
+    assert missing.reason == four.REASON_MISSING_OBSERVATION_TIME
+
+    naive = classify(observed_at=datetime(2026, 10, 25, 12, 0))
+    assert naive.available is False
+    assert naive.reason == four.REASON_MISSING_OBSERVATION_TIME
+
+
+def test_ac_008_an_observation_acquired_after_the_evaluation_instant_is_refused():
+    """ATDD-TRADEVISOR-4H-EVIDENCE-v1/AC-008: no look-ahead observation."""
+    later = classify(observed_at=EVAL + timedelta(seconds=1))
+    assert later.available is False
+    assert later.reason == four.REASON_OBSERVATION_AFTER_EVALUATION
+
+
+# AC-009 ----------------------------------------------------------------------
+def test_ac_009_a_generator_fault_is_an_unavailable_window():
+    """ATDD-TRADEVISOR-4H-EVIDENCE-v1/AC-009: a mid-iteration failure is a refusal."""
+    def broken_stream():
+        yield window_candle(1)
+        raise TimeoutError("provider timed out mid-stream")
+
+    result = classify_window(broken_stream())
+    assert result.status == four.STATUS_UNAVAILABLE
+    assert result.reason == four.REASON_PROVIDER_ERROR
+
+
+def test_ac_009_a_valid_and_invalid_restatement_of_one_bar_is_a_conflict():
+    """ATDD-TRADEVISOR-4H-EVIDENCE-v1/AC-009: mixed restatements cannot be silently chosen."""
+    bars = six_bars()
+    bars.append(window_candle(2, open=106.0))  # same open time, incoherent prices
+    result = classify_window(bars)
+    assert result.available is False
+    assert result.reason == four.REASON_CONFLICTING_DUPLICATE
+
+
+def test_ac_009_window_evidence_stays_untrusted_and_non_actionable():
+    """ATDD-TRADEVISOR-4H-EVIDENCE-v1/AC-009: trust and SWING gates are unchanged."""
+    evidence = classify_window(six_bars()).as_evidence()
+    assert evidence["trusted"] is False
+    assert evidence["trade_authority_changed"] is False
+    for bar in evidence["bars"]:
+        assert bar["trusted"] is False
+
+    from app.services import tradevisor_evaluation as evaluation
+
+    source = __import__("pathlib").Path(evaluation.__file__).read_text(encoding="utf-8")
+    assert '"regime_4h": "UNAVAILABLE"' in source
+    assert "SWING_4H_CLOSED_CONTEXT" in source
 

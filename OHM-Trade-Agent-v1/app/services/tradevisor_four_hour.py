@@ -58,6 +58,8 @@ REASON_STALE = "STALE_BAR"
 REASON_CLOSE_CONTRADICTION = "CLOSE_TIME_CONTRADICTION"
 REASON_INVALID_OHLC = "INVALID_OHLC"
 REASON_PROVENANCE_MISSING = "PROVENANCE_MISSING"
+REASON_MISSING_OBSERVATION_TIME = "MISSING_OBSERVATION_TIME"
+REASON_OBSERVATION_AFTER_EVALUATION = "OBSERVATION_AFTER_EVALUATION"
 REASON_SYNTHETIC = "SYNTHETIC_OR_IMPUTED"
 REASON_ALERT_TIMEFRAME = "ALERT_TIMEFRAME_IS_NOT_EVIDENCE"
 
@@ -170,6 +172,18 @@ def classify_completed_four_hour(
         return _unavailable(REASON_NOT_OBJECT)
 
     observed_at = _as_utc(candle.get("observed_at"))
+    evaluation = _as_utc(evaluation_time)
+    clock = _as_utc(now) if now is not None else evaluation
+    if evaluation is None or clock is None:
+        return _unavailable(REASON_NOT_UTC, observed_at=observed_at)
+    if observed_at is None:
+        # Provenance without an acquisition instant cannot be placed in time, so
+        # it cannot be proven to have existed at the evaluation instant.
+        return _unavailable(REASON_MISSING_OBSERVATION_TIME)
+    if observed_at > evaluation:
+        # An observation acquired after the decision instant is look-ahead
+        # evidence, whatever the bar's own timestamps say.
+        return _unavailable(REASON_OBSERVATION_AFTER_EVALUATION, observed_at=observed_at)
     provenance = candle.get("provenance")
     if not isinstance(provenance, Mapping) or not str(
         provenance.get("provider") or ""
@@ -200,9 +214,7 @@ def classify_completed_four_hour(
 
     opened = _as_utc(candle.get("open_at"))
     reported_close = _as_utc(candle.get("close_at"))
-    evaluation = _as_utc(evaluation_time)
-    clock = _as_utc(now) if now is not None else evaluation
-    if opened is None or reported_close is None or evaluation is None or clock is None:
+    if opened is None or reported_close is None:
         return _unavailable(REASON_NOT_UTC, observed_at=observed_at)
 
     expected_close = opened + FOUR_HOUR_INTERVAL
@@ -217,6 +229,19 @@ def classify_completed_four_hour(
     if int(opened.timestamp()) % int(FOUR_HOUR_INTERVAL.total_seconds()) != 0:
         return _invalid(
             REASON_MISALIGNED, open_at=opened, close_at=reported_close,
+            observed_at=observed_at,
+        )
+    # The bar is complete only when its ANALYTIC interval has finished, not when a
+    # provider claims it closed: a close reported one second early is inside the
+    # drift tolerance and would otherwise let an unfinished bar through.
+    if expected_close > clock:
+        return _unavailable(
+            REASON_STILL_FORMING, open_at=opened, close_at=expected_close,
+            observed_at=observed_at,
+        )
+    if expected_close > evaluation:
+        return _unavailable(
+            REASON_FUTURE, open_at=opened, close_at=expected_close,
             observed_at=observed_at,
         )
     if reported_close > clock:
@@ -393,7 +418,9 @@ def classify_window(
         return FourHourWindow(STATUS_UNAVAILABLE, REASON_NO_EXPECTED_BARS, 0, 0)
     try:
         items = list(candles)
-    except TypeError:
+    except Exception:  # noqa: BLE001 - a generator may fail mid-iteration
+        # A provider that raises while streaming is an unavailable window, never
+        # an exception a caller could mistake for a successful classification.
         return FourHourWindow(STATUS_UNAVAILABLE, REASON_PROVIDER_ERROR, len(expected), 0)
 
     grouped: dict[datetime, list[FourHourContext]] = {}
@@ -422,6 +449,11 @@ def classify_window(
         if not usable:
             if refusal is None:
                 refusal = records[0].reason or REASON_WINDOW_INVALID
+            continue
+        if len(usable) != len(records):
+            # A usable record and an unusable one describe the same bar. The
+            # source is inconsistent, so neither may be chosen.
+            conflicting = True
             continue
         if len({(record.close_at, tuple(sorted(dict(record.prices).items())))
                 for record in usable}) > 1:

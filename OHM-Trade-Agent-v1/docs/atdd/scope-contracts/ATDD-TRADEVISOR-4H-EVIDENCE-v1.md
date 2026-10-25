@@ -69,6 +69,22 @@ the window is classified
 THEN:
 only a window whose every expected bar is present exactly once, coherent, from the matched venue and instrument and closed before the evaluation instant is AVAILABLE; every other case is UNAVAILABLE or INVALID with the specific reason and the missing open times listed, and a provider fault is a refusal rather than an exception
 
+AC-008:
+GIVEN:
+a candle whose provider-reported close is one second before its analytic 4H close while the analytic close has not yet passed, a candle with no observation instant, a candle with a naive observation instant, and a candle whose observation was acquired after the evaluation instant
+WHEN:
+the classifier evaluates it
+THEN:
+it reports UNAVAILABLE with STILL_FORMING, FUTURE_BAR, MISSING_OBSERVATION_TIME or OBSERVATION_AFTER_EVALUATION respectively, because completeness is proved by the analytic interval rather than by a provider claim and no observation may be acquired after the decision it informs
+
+AC-009:
+GIVEN:
+a provider that raises while a window is being iterated, a bar that arrives twice at the same open time once coherently and once incoherently, and a complete window
+WHEN:
+the window is classified
+THEN:
+the streamed fault is an UNAVAILABLE PROVIDER_ERROR rather than an exception, the mixed restatement is an INVALID CONFLICTING_DUPLICATE because neither record may be chosen, and even the complete window keeps trusted false, trade_authority_changed false, and the advisory evaluator keeps regime_4h UNAVAILABLE with SWING_4H_CLOSED_CONTEXT
+
 EXPLICITLY OUT OF SCOPE:
 - Any market-data provider, HTTP client, credential or subscription
 - Any wiring into `tradevisor_evaluation`, SWING qualification or notification
@@ -102,6 +118,13 @@ AC-007 -> tests/test_tradevisor_four_hour_v1.py::test_ac_007_a_partial_latest_ba
 AC-007 -> tests/test_tradevisor_four_hour_v1.py::test_ac_007_a_stale_or_incoherent_bar_refuses_the_window
 AC-007 -> tests/test_tradevisor_four_hour_v1.py::test_ac_007_a_provider_fault_is_an_unavailable_window
 AC-007 -> tests/test_tradevisor_four_hour_v1.py::test_ac_007_window_replay_is_deterministic
+AC-008 -> tests/test_tradevisor_four_hour_v1.py::test_ac_008_the_analytic_bar_must_be_complete_at_the_evaluation_instant
+AC-008 -> tests/test_tradevisor_four_hour_v1.py::test_ac_008_an_analytic_close_after_now_is_never_completed_context
+AC-008 -> tests/test_tradevisor_four_hour_v1.py::test_ac_008_observation_time_must_be_present_and_utc
+AC-008 -> tests/test_tradevisor_four_hour_v1.py::test_ac_008_an_observation_acquired_after_the_evaluation_instant_is_refused
+AC-009 -> tests/test_tradevisor_four_hour_v1.py::test_ac_009_a_generator_fault_is_an_unavailable_window
+AC-009 -> tests/test_tradevisor_four_hour_v1.py::test_ac_009_a_valid_and_invalid_restatement_of_one_bar_is_a_conflict
+AC-009 -> tests/test_tradevisor_four_hour_v1.py::test_ac_009_window_evidence_stays_untrusted_and_non_actionable
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/services/tradevisor_four_hour.py
@@ -120,6 +143,10 @@ AC-006 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-TRADEVISOR-4H-EVIDEN
 AC-006 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
 AC-007 -> OHM-Trade-Agent-v1/app/services/tradevisor_four_hour.py
 AC-007 -> OHM-Trade-Agent-v1/tests/test_tradevisor_four_hour_v1.py
+AC-008 -> OHM-Trade-Agent-v1/app/services/tradevisor_four_hour.py
+AC-008 -> OHM-Trade-Agent-v1/tests/test_tradevisor_four_hour_v1.py
+AC-009 -> OHM-Trade-Agent-v1/app/services/tradevisor_four_hour.py
+AC-009 -> OHM-Trade-Agent-v1/tests/test_tradevisor_four_hour_v1.py
 
 DEFERRED DISCOVERIES:
 - No provider is wired, so nothing can call the classifier in production. Integration requires an owner-approved provider decision and the evaluator change that consumes `AVAILABLE` context; neither is authorized here.
