@@ -5,9 +5,22 @@ services:
     restart: unless-stopped
     ports:
       - "8443:8443"
+      # Tradevisor V2 webhook ingress. TradingView accepts webhook ports 80 and
+      # 443 only, so the alert endpoint must be served on 443. The dashboard
+      # keeps 8443 and the application stays loopback-only.
+      - "443:443"
     volumes:
       - ./deploy/nginx/dashboard-sidecar.conf:/etc/nginx/nginx.conf:ro
+      - ./deploy/nginx/tradevisor-webhook.conf.template:/etc/nginx/templates/tradevisor-webhook.conf.template:ro
       - /etc/letsencrypt:/etc/letsencrypt:ro
+    environment:
+      # Compose interpolates this from the host `.env` (the same approved secret
+      # file the application uses). It is rendered into the webhook vhost at
+      # container start, so the edge stamp is never committed, never baked into
+      # the image and never written to a host file. Unset => the vhost is not
+      # rendered, the include matches nothing, and ingress stays dark with the
+      # dashboard unaffected.
+      OPIP_TRADEVISOR_INTERNAL_VERIFICATION_VALUE: ${OPIP_TRADEVISOR_INTERNAL_VERIFICATION_VALUE:-}
     read_only: true
     mem_limit: 64m
     memswap_limit: 64m
@@ -20,15 +33,35 @@ services:
       - /var/cache/nginx
       - /var/run
       - /tmp
+      # Render target for the webhook vhost. tmpfs keeps the rendered secret off
+      # disk and keeps the container filesystem read-only.
+      - /etc/nginx/tradevisor
+    networks:
+      default:
+      tradevisor_edge:
+        ipv4_address: 172.31.240.2
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "5"
     entrypoint:
-      - nginx
-      - -g
-      - daemon off;
+      - /bin/sh
+      - -c
+      - |
+        tpl=/etc/nginx/templates/tradevisor-webhook.conf.template
+        out=/etc/nginx/tradevisor/tradevisor-webhook.conf
+        value="$${OPIP_TRADEVISOR_INTERNAL_VERIFICATION_VALUE:-}"
+        case "$value" in
+          ""|*[!A-Za-z0-9_-]*)
+            echo "tradevisor edge: no usable verification value; webhook vhost disabled" >&2
+            ;;
+          *)
+            sed "s|__EDGE_VERIFICATION_VALUE__|$value|g" "$tpl" > "$out" 2>/dev/null \
+              || rm -f "$out"
+            ;;
+        esac
+        exec nginx -g 'daemon off;'
 
   ohm-trade-agent:
     build: .
@@ -87,6 +120,14 @@ services:
       OPIP_FEASIBILITY_CAPTURE_NOTIONAL_USD: "1000.0"
     ports:
       - "127.0.0.1:8000:8000"
+    networks:
+      default:
+      # Pinned peer for the Tradevisor webhook: the application only accepts the
+      # ingress from this exact address (OPIP_TRADEVISOR_TRUSTED_PROXY_IPS), so
+      # the peer check cannot be satisfied by any other container or by a
+      # misconfigured proxy on the default network.
+      tradevisor_edge:
+        ipv4_address: 172.31.240.3
     volumes:
       - ./data:/app/data
       # Sequence 4 core-consumer boundary: streaming shadow evidence is
@@ -218,3 +259,14 @@ services:
       timeout: 5s
       retries: 3
       start_period: 30s
+
+networks:
+  # Dedicated edge<->application network. It exists only so both ends carry a
+  # pinned address: the webhook vhost proxies to 172.31.240.3 and the application
+  # accepts the ingress only from 172.31.240.2. The default bridge network is
+  # untouched, so every existing service relationship (dashboard proxy, writer,
+  # stream worker, scheduler) keeps resolving exactly as before.
+  tradevisor_edge:
+    ipam:
+      config:
+        - subnet: 172.31.240.0/28

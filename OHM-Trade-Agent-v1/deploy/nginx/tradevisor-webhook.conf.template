@@ -1,0 +1,95 @@
+# Tradevisor V2 production webhook edge — TEMPLATE (rendered at container start).
+#
+# Source of truth for the public webhook vhost. `docker-compose.yml` renders this
+# file into /etc/nginx/tradevisor/tradevisor-webhook.conf inside the EXISTING
+# dashboard edge container, substituting __EDGE_VERIFICATION_VALUE__ with
+# OPIP_TRADEVISOR_INTERNAL_VERIFICATION_VALUE taken from the host `.env`.
+#
+# Why a template rather than a plain file: the edge stamp is a shared secret with
+# the application, so it must not exist in Git, in the image, or in a host file.
+# It exists only as a container environment value and in the tmpfs-rendered
+# config. If the value is absent or not URL-safe the render is skipped, the
+# include matches nothing, and the webhook vhost stays dark — the dashboard on
+# 8443 is untouched either way.
+#
+# Why port 443 on the shared container: TradingView documents that only ports 80
+# and 443 are accepted for webhooks, so 8443 cannot receive an alert. The
+# dashboard keeps 8443; this file adds a second, separate `server` for :443 that
+# serves one route and refuses everything else.
+#
+# Authentication model (three independent checks, none asserted by the payload):
+#   1. this edge's source-IP allowlist below;
+#   2. the edge stamp header, which only this proxy sets;
+#   3. the ingest token inside the body, compared by the application.
+# The application additionally requires the immediate peer to be this edge
+# container's pinned address, so the route cannot be reached around the proxy.
+
+limit_req_zone $binary_remote_addr zone=tradevisor_webhook:1m rate=30r/m;
+
+# Dedicated webhook log line: method, URI, status and certificate OBSERVATION
+# only. No request body, no headers, no query string — so the body token cannot
+# reach the log, and the record still proves which path a genuine delivery took.
+log_format tradevisor_edge '$remote_addr $time_iso8601 "$request_method $uri" '
+                           'status=$status bytes=$body_bytes_sent '
+                           'client_verify=$ssl_client_verify '
+                           'client_s_dn="$ssl_client_s_dn"';
+
+server {
+    listen 443 ssl default_server;
+    server_name 161-35-106-207.sslip.io;
+
+    server_tokens off;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_certificate     /etc/letsencrypt/live/161-35-106-207.sslip.io/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/161-35-106-207.sslip.io/privkey.pem;
+
+    # TradingView documents that its webhook server presents a client
+    # certificate, but publishes no CA certificate or public key to verify it
+    # against. Chain verification therefore cannot be configured without
+    # inventing a trust anchor, and a subject-only match would be satisfied by
+    # any self-signed certificate carrying the same subject. `optional_no_ca`
+    # REQUESTS the certificate so the subject can be observed as delivery
+    # evidence; it is never treated as authentication here.
+    ssl_verify_client optional_no_ca;
+
+    access_log /dev/stdout tradevisor_edge;
+
+    # The only route this virtual host serves.
+    location = /webhooks/tradevisor/v1 {
+        # TradingView's documented webhook source addresses.
+        allow 52.89.214.238;
+        allow 34.212.75.30;
+        allow 54.218.53.128;
+        allow 52.32.178.7;
+        deny all;
+
+        limit_except POST {
+            deny all;
+        }
+        limit_req zone=tradevisor_webhook burst=20 nodelay;
+        limit_req_status 429;
+
+        client_max_body_size 8k;
+
+        # Pinned application address on the dedicated compose network, so the
+        # application sees this edge's pinned peer address (fail-closed check).
+        proxy_pass http://172.31.240.3:8000/webhooks/tradevisor/v1;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+
+        # Proves the request crossed this proxy and passed the allowlist.
+        # Injected at render time; never committed.
+        proxy_set_header x-ohm-tradevisor-verification "__EDGE_VERIFICATION_VALUE__";
+
+        # TradingView cancels a delivery that takes longer than three seconds.
+        proxy_connect_timeout 1s;
+        proxy_send_timeout 2s;
+        proxy_read_timeout 2s;
+    }
+
+    # Nothing else is reachable here: not the dashboard, not the Wave 8.2 bridge.
+    location / {
+        return 404;
+    }
+}
