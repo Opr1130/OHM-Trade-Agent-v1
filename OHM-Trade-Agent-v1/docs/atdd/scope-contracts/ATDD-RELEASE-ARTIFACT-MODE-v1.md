@@ -93,6 +93,7 @@ AC-002 -> OHM-Trade-Agent-v1/tests/test_opip_release_artifact_receipt_v1.py
 AC-003 -> OHM-Trade-Agent-v1/deploy/release/release_artifact.py
 AC-003 -> OHM-Trade-Agent-v1/tests/test_opip_release_artifact_receipt_v1.py
 AC-004 -> OHM-Trade-Agent-v1/deploy/release/atdd/run-artifact-atdd.sh
+AC-004 -> OHM-Trade-Agent-v1/deploy/release/atdd/compose-validate.sh
 AC-004 -> OHM-Trade-Agent-v1/deploy/release/atdd/rehearsal.sh
 AC-004 -> .github/workflows/release-artifact-atdd.yml
 AC-004 -> .github/workflows/release-artifact-rehearsal.yml

@@ -9,18 +9,15 @@ name: release-artifact-publish
 # does not deploy, and it does not change production state.
 
 on:
+  # Owner-gated ONLY. There is deliberately no `push:` or `pull_request:`
+  # trigger: a merge to main must never publish by itself, and untrusted PR code
+  # must never receive a packages:write token.
   workflow_dispatch:
     inputs:
       revision:
         description: "40-char commit SHA to publish (must equal main HEAD)"
         required: true
         type: string
-  push:
-    branches: [main]
-    paths:
-      - "OHM-Trade-Agent-v1/app/**"
-      - "OHM-Trade-Agent-v1/Dockerfile"
-      - "OHM-Trade-Agent-v1/docker-compose.yml"
 
 permissions:
   contents: read
@@ -88,15 +85,23 @@ jobs:
       - name: Enforce private package visibility
         run: |
           set -euo pipefail
-          # Packages inherit repository-private visibility; assert the repo is private
-          # and record the packages that must remain private.
           vis="$(gh api "repos/${{ github.repository }}" --jq .visibility)"
           echo "REPO_VISIBILITY=$vis"
           if [ "$vis" != "private" ]; then
             echo "repository is not private; refusing to rely on inherited visibility" >&2
             exit 1
           fi
-          echo "PACKAGE_VISIBILITY=private(inherited)" >> "$GITHUB_STEP_SUMMARY"
+          # Independent package-visibility check: query the package itself rather
+          # than inferring it from the repository.
+          for pkg in opip-app opip-canonical-writer; do
+            pvis="$(gh api "/user/packages/container/$pkg" --jq .visibility 2>/dev/null || echo UNKNOWN)"
+            echo "PACKAGE_VISIBILITY $pkg=$pvis"
+            if [ "$pvis" != "private" ]; then
+              echo "package $pkg is not private ($pvis); refusing to claim private retention" >&2
+              exit 1
+            fi
+          done
+          echo "PACKAGE_VISIBILITY=private(verified)" >> "$GITHUB_STEP_SUMMARY"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

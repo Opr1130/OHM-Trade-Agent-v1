@@ -453,9 +453,10 @@ def test_ghcr_publication_is_protected_and_private():
     wf = (ROOT.parent / ".github" / "workflows" / "release-artifact-publish.yml")
     text = wf.read_text(encoding="utf-8")
     body = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
-    # owner-gated triggers only: no pull_request, no pull_request_target
+    # owner-gated triggers only: no pull_request, no pull_request_target, no auto-publish on push
     assert "pull_request" not in body
     assert "workflow_dispatch" in body
+    assert "push:" not in body
     # least privilege: packages write is job-scoped, contents read at top level
     assert "packages: write" in body
     assert body.index("permissions:") < body.index("packages: write")
