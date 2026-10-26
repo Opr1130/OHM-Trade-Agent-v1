@@ -244,6 +244,46 @@ production consideration and must be executed on a staging host:
 
 
 
+## Production composition (port 443 on the existing edge)
+
+The certified vhost above is a *dedicated* host. Production does not add a host:
+TradingView accepts webhook ports 80/443 only, so the vhost is composed onto the
+existing `ohm-dashboard-edge` container, which keeps serving the dashboard on
+8443.
+
+| Piece | Where |
+| --- | --- |
+| Tracked source of truth | `deploy/nginx/tradevisor-webhook.conf.template` |
+| Render target | `/etc/nginx/tradevisor/tradevisor-webhook.conf` (tmpfs, never on disk) |
+| Edge stamp source | `OPIP_TRADEVISOR_INTERNAL_VERIFICATION_VALUE` in the host `.env` |
+| Public listener | `443:443` on the edge service; application stays `127.0.0.1:8000` |
+| Peer identity | edge `172.31.240.2` → application `172.31.240.3` (`tradevisor_edge`) |
+| Dashboard protection | `dashboard-sidecar.conf` keeps its read-only mount; one additive `include` |
+
+Fail-closed properties: an absent or non-URL-safe verification value skips the
+render, the wildcard `include` matches nothing, and the dashboard starts exactly
+as before with no webhook listener. The dashboard vhost cannot serve the webhook
+route, and the webhook vhost refuses every path except `POST /webhooks/tradevisor/v1`.
+
+Operating steps (owner, on the host, in this order):
+
+1. Set `OPIP_TRADEVISOR_INTERNAL_VERIFICATION_VALUE` (≥32 URL-safe characters),
+   `OPIP_TRADEVISOR_WEBHOOK_TOKEN` (≥43 URL-safe characters), `_ENABLED=true`,
+   `_TRUSTED_PROXY_IPS=172.31.240.2`, `_ALERT_CONFIGS`, `_INSTRUMENTS`,
+   `_ALLOWED_EXCHANGES=COINBASE` and `_OBSERVATION_ENABLED` in `.env`.
+2. Validate before reload: `docker compose exec ohm-dashboard-edge nginx -t`.
+3. Recreate the edge only: `docker compose up -d --no-deps ohm-dashboard-edge`,
+   then confirm 8443 still serves the dashboard and 443 answers only the webhook.
+4. Open 443 to the four TradingView addresses in the cloud firewall only.
+5. Rollback: unset the value (or remove the rendered file) and recreate the edge;
+   the dashboard is unaffected because the include then matches nothing.
+
+Client certificate: TradingView publishes no CA, so chain verification is not
+configurable without an invented trust anchor. The vhost only *requests* the
+certificate (`optional_no_ca`) and logs `$ssl_client_verify`/`$ssl_client_s_dn`
+as delivery evidence. Source allowlist, edge stamp and body token remain the
+authentication, and the application fails closed on any of them.
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -771,4 +811,3 @@ executes `nginx -t` plus the protocol matrix (TLS 1.0/1.1 refused by the server,
 TLS 1.2/1.3 accepted, valid/missing/unknown SNI) on Linux CI. A missing nginx or
 openssl there is a **failure**, not a skip; non-Linux local runs skip because they
 cannot provide the proof.
-
