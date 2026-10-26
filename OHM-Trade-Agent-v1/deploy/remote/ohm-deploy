@@ -54,8 +54,116 @@ if ! flock -n 9; then
   exit 75
 fi
 
-REPO_OWNER="$(stat -c '%U' "$REPO_ROOT/.git")"
-GIT=(sudo -u "$REPO_OWNER" git -C "$REPO_ROOT")
+# --- artifact mode: no Git metadata, no host source rebuild ----------------
+# OPIP_DEPLOY_ARTIFACT_MODE=required consumes an approved release bundle and
+# digest-pinned images. The default (off) preserves the historical Git path
+# byte-for-byte.
+DEPLOY_ARTIFACT_MODE="${OPIP_DEPLOY_ARTIFACT_MODE:-off}"
+case "$DEPLOY_ARTIFACT_MODE" in
+  off|required) : ;;
+  *)
+    echo "invalid OPIP_DEPLOY_ARTIFACT_MODE: $DEPLOY_ARTIFACT_MODE" >&2
+    exit 64
+    ;;
+esac
+ARTIFACT_RELEASES="/var/lib/ohm-deploy/releases"
+RELEASE_TOOL="/usr/local/lib/opip/release_artifact.py"
+RECEIPT_DIR="$STATE_DIR/receipts"
+RECEIPT_CURRENT="$RECEIPT_DIR/current.json"
+ARTIFACT_APP_REF=""
+ARTIFACT_WRITER_REF=""
+ROLLBACK_APP_REF=""
+ROLLBACK_WRITER_REF=""
+
+artifact_mode() { [[ "$DEPLOY_ARTIFACT_MODE" == "required" ]]; }
+
+artifact_bundle() { printf '%s/%s' "$ARTIFACT_RELEASES" "$TARGET_SHA"; }
+
+artifact_tool() {
+  [[ -r "$RELEASE_TOOL" ]] || {
+    echo "release artifact tool is not installed: $RELEASE_TOOL" >&2
+    return 1
+  }
+  "$PYTHON_BIN" "$RELEASE_TOOL" "$@"
+}
+
+# Verify the release bundle and the on-host Compose inputs before touching
+# anything. Sets ARTIFACT_APP_REF / ARTIFACT_WRITER_REF. Fails closed.
+artifact_preflight() {
+  local bundle out
+  bundle="$(artifact_bundle)"
+  [[ -d "$bundle" ]] || {
+    echo "release bundle missing for $TARGET_SHA: $bundle" >&2
+    return 1
+  }
+  out="$(artifact_tool verify-bundle --dir "$bundle")" || return 1
+  printf '%s\n' "$out"
+  grep -qx 'BUNDLE_OK=1' <<< "$out" || return 1
+  ARTIFACT_APP_REF="$(sed -n 's/^APP_IMAGE_REF=//p' <<< "$out")"
+  ARTIFACT_WRITER_REF="$(sed -n 's/^WRITER_IMAGE_REF=//p' <<< "$out")"
+  [[ -n "$ARTIFACT_APP_REF" && -n "$ARTIFACT_WRITER_REF" ]] || {
+    echo "release bundle did not yield two image references" >&2
+    return 1
+  }
+  artifact_tool check-config --bundle "$bundle" --root "$APP_ROOT" >/dev/null || {
+    echo "on-host Compose inputs do not match the release bundle" >&2
+    return 1
+  }
+  echo "OPIP_ARTIFACT_BUNDLE=$bundle"
+  echo "OPIP_ARTIFACT_APP_REF=$ARTIFACT_APP_REF"
+  echo "OPIP_ARTIFACT_WRITER_REF=$ARTIFACT_WRITER_REF"
+  return 0
+}
+
+# Bring up BOTH services from immutable references. --no-build forbids an
+# implicit rebuild; pull_policy:never in the overlay forbids an implicit pull.
+artifact_apply_pair() {
+  local app_ref="$1" writer_ref="$2" phase="${3:-apply}"
+  echo "OPIP_ARTIFACT_APPLY=$phase"
+  OPIP_APP_IMAGE="$app_ref" OPIP_WRITER_IMAGE="$writer_ref" \
+    docker compose -f docker-compose.yml -f docker-compose.artifact.yml \
+      up -d --no-build --remove-orphans opip-canonical-writer ohm-trade-agent
+}
+
+# Resolve the rollback target from the last VERIFIED receipt. Never fabricates
+# an identity: an ineligible or missing receipt aborts the rollback.
+artifact_rollback_preflight() {
+  local out reason
+  [[ -s "$RECEIPT_CURRENT" ]] || {
+    echo "no release receipt: rollback identity is unprovable" >&2
+    return 1
+  }
+  out="$(artifact_tool validate --path "$RECEIPT_CURRENT")" || return 1
+  printf '%s\n' "$out"
+  if ! grep -qx 'ROLLBACK_ELIGIBLE=1' <<< "$out"; then
+    reason="$(sed -n 's/^ROLLBACK_REASON=//p' <<< "$out")"
+    echo "rollback is not eligible: ${reason:-UNKNOWN}" >&2
+    return 1
+  fi
+  ROLLBACK_APP_REF="$(sed -n 's/^APP_IMAGE_REF=//p' <<< "$out")"
+  ROLLBACK_WRITER_REF="$(sed -n 's/^WRITER_IMAGE_REF=//p' <<< "$out")"
+  ROLLBACK_RELEASE_ID="$(sed -n 's/^RELEASE_ID=//p' <<< "$out")"
+  [[ -n "$ROLLBACK_APP_REF" && -n "$ROLLBACK_WRITER_REF" ]] || return 1
+  [[ "$ROLLBACK_RELEASE_ID" =~ ^[0-9a-f]{40}$ ]] || {
+    echo "receipt did not yield a release identity" >&2
+    return 1
+  }
+  return 0
+}
+
+REPO_OWNER="$(stat -c '%U' "$REPO_ROOT/.git" 2>/dev/null || true)"
+if [[ -z "$REPO_OWNER" ]]; then
+  if artifact_mode; then
+    # No Git metadata is expected in artifact mode; make any stray Git call a
+    # hard failure rather than a silent no-op.
+    GIT=(false)
+  else
+    echo "refusing deploy: $REPO_ROOT/.git is missing and artifact mode is off" >&2
+    exit 67
+  fi
+else
+  GIT=(sudo -u "$REPO_OWNER" git -C "$REPO_ROOT")
+fi
 
 wait_core_health() {
   local healthy=0
@@ -847,18 +955,28 @@ validate_candidate_container_identity() {
   echo "OPIP_RELEASE_PROFILE=$profile"
 }
 
-"${GIT[@]}" fetch --prune origin main
-REMOTE_MAIN_SHA="$("${GIT[@]}" rev-parse origin/main)"
-if [[ "$TARGET_SHA" != "$REMOTE_MAIN_SHA" ]]; then
-  echo "refusing deploy: target is not current origin/main" >&2
-  echo "target=$TARGET_SHA origin/main=$REMOTE_MAIN_SHA" >&2
-  exit 65
-fi
+if artifact_mode; then
+  # Admission in artifact mode: the owner-approved SHA arrives over the forced
+  # command; identity comes from the verified bundle + digest-pinned images.
+  # No fetch, no worktree, no origin/main comparison.
+  artifact_preflight || {
+    echo "refusing deploy: artifact preflight failed" >&2
+    exit 65
+  }
+else
+  "${GIT[@]}" fetch --prune origin main
+  REMOTE_MAIN_SHA="$("${GIT[@]}" rev-parse origin/main)"
+  if [[ "$TARGET_SHA" != "$REMOTE_MAIN_SHA" ]]; then
+    echo "refusing deploy: target is not current origin/main" >&2
+    echo "target=$TARGET_SHA origin/main=$REMOTE_MAIN_SHA" >&2
+    exit 65
+  fi
 
-if [[ -n "$("${GIT[@]}" status --porcelain --untracked-files=no)" ]]; then
-  echo "refusing deploy: tracked production worktree is dirty" >&2
-  "${GIT[@]}" status --short >&2
-  exit 66
+  if [[ -n "$("${GIT[@]}" status --porcelain --untracked-files=no)" ]]; then
+    echo "refusing deploy: tracked production worktree is dirty" >&2
+    "${GIT[@]}" status --short >&2
+    exit 66
+  fi
 fi
 UNTRACKED_APP_FILES="$("${GIT[@]}" ls-files --others --exclude-standard -- OHM-Trade-Agent-v1/app)"
 IGNORED_APP_FILES="$("${GIT[@]}" ls-files --others --ignored --exclude-standard -- OHM-Trade-Agent-v1/app \
@@ -868,7 +986,13 @@ if [[ -n "$UNTRACKED_APP_FILES" || -n "$IGNORED_APP_FILES" ]]; then
   exit 66
 fi
 
-PREVIOUS_SHA="$("${GIT[@]}" rev-parse main)"
+if artifact_mode; then
+  # Rollback identity comes from the receipt, never from Git. Deliberately empty
+  # here so any accidental use of PREVIOUS_SHA in this mode is a hard failure.
+  PREVIOUS_SHA=""
+else
+  PREVIOUS_SHA="$("${GIT[@]}" rev-parse main)"
+fi
 if [[ -s "$LAST_GOOD_FILE" ]]; then
   RECORDED_SHA="$(cat "$LAST_GOOD_FILE")"
   if [[ "$RECORDED_SHA" =~ ^[0-9a-f]{40}$ ]] \
@@ -1240,18 +1364,48 @@ rollback() {
     exit "$rc"
   fi
 
-  "${GIT[@]}" checkout -f main
-  "${GIT[@]}" reset --hard "$PREVIOUS_SHA"
-  cd "$APP_ROOT"
-  [[ "$("${GIT[@]}" rev-parse HEAD)" == "$PREVIOUS_SHA" ]] || {
-    echo "rollback code SHA does not match the selected previous SHA" >&2
-    false
-  }
-  write_safe_baseline_override
+  if artifact_mode; then
+    if ! artifact_rollback_preflight; then
+      echo "OPIP_ROLLBACK_ABORTED=ROLLBACK_IDENTITY_UNPROVEN" >&2
+      echo "OPIP_SAFE_BASELINE_ROLLBACK=UNPROVEN" >&2
+      preserve_scheduler_snapshot_on_abort
+      exit "$rc"
+    fi
+    cd "$APP_ROOT"
+  else
+    "${GIT[@]}" checkout -f main
+    "${GIT[@]}" reset --hard "$PREVIOUS_SHA"
+    cd "$APP_ROOT"
+    [[ "$("${GIT[@]}" rev-parse HEAD)" == "$PREVIOUS_SHA" ]] || {
+      echo "rollback code SHA does not match the selected previous SHA" >&2
+      false
+    }
+    write_safe_baseline_override
+  fi
 
   # First PR 2 deploy may roll back to a SHA that does not declare the writer.
   # Detect Compose services after reset; never require a missing service.
-  if docker compose -f docker-compose.yml -f "$SAFE_BASELINE_OVERRIDE" \
+  if artifact_mode; then
+    if ! artifact_apply_pair "$ROLLBACK_APP_REF" "$ROLLBACK_WRITER_REF" rollback; then
+      echo "OPIP_SAFE_BASELINE_ROLLBACK=UNPROVEN" >&2
+      restore_scheduler_state
+      cleanup_snapshot
+      exit "$rc"
+    fi
+    if ! wait_core_health; then
+      echo "rollback core health check failed" >&2
+      restore_scheduler_state
+      cleanup_snapshot
+      exit "$rc"
+    fi
+    if ! wait_writer_health; then
+      echo "rollback writer health check failed" >&2
+      writer_health_diagnostics
+      restore_scheduler_state
+      cleanup_snapshot
+      exit "$rc"
+    fi
+  elif docker compose -f docker-compose.yml -f "$SAFE_BASELINE_OVERRIDE" \
     config --services 2>/dev/null | grep -qx 'opip-canonical-writer'; then
     docker compose -f docker-compose.yml -f "$SAFE_BASELINE_OVERRIDE" \
       build --build-arg "OPIP_RELEASE_SHA=$PREVIOUS_SHA" \
@@ -1308,7 +1462,13 @@ rollback() {
     exit "$rc"
   fi
 
-  printf '%s\n' "$PREVIOUS_SHA" > "$LAST_GOOD_FILE"
+  if artifact_mode; then
+    # The restored release identity comes from the verified receipt, never from
+    # an empty PREVIOUS_SHA.
+    printf '%s\n' "$ROLLBACK_RELEASE_ID" > "$LAST_GOOD_FILE"
+  else
+    printf '%s\n' "$PREVIOUS_SHA" > "$LAST_GOOD_FILE"
+  fi
   cleanup_snapshot
   echo "OPIP_SAFE_BASELINE_ROLLBACK=SUCCESS"
   echo "rollback health and paper checks passed" >&2
@@ -1636,14 +1796,19 @@ if ! run_protection_preflight; then
   exit 77
 fi
 
-"${GIT[@]}" checkout -f main
-"${GIT[@]}" reset --hard "$TARGET_SHA"
+if artifact_mode; then
+  # Identity was proven at admission; no checkout, no source mutation.
+  cd "$APP_ROOT"
+else
+  "${GIT[@]}" checkout -f main
+  "${GIT[@]}" reset --hard "$TARGET_SHA"
 
-cd "$APP_ROOT"
-[[ "$("${GIT[@]}" rev-parse HEAD)" == "$TARGET_SHA" ]] || {
-  echo "checked-out repository SHA changed before build" >&2
-  false
-}
+  cd "$APP_ROOT"
+  [[ "$("${GIT[@]}" rev-parse HEAD)" == "$TARGET_SHA" ]] || {
+    echo "checked-out repository SHA changed before build" >&2
+    false
+  }
+fi
 
 # Stop paper workers during the build/recreate window. Their dry-run state is
 # bind-mounted and survives the stop, while roughly two worker RSS footprints
@@ -1651,13 +1816,17 @@ cd "$APP_ROOT"
 # This is the first production-runtime mutation on the success path.
 stop_paper_stack
 
-docker compose build --build-arg "OPIP_RELEASE_SHA=$TARGET_SHA" \
-  opip-canonical-writer ohm-trade-agent
-# Writer and core are independent services. Build/start both; validate each
-# separately. Never introduce Compose depends_on: condition=service_healthy
-# from ohm-trade-agent onto opip-canonical-writer.
-docker compose up -d --remove-orphans opip-canonical-writer
-docker compose up -d --remove-orphans ohm-trade-agent
+if artifact_mode; then
+  artifact_apply_pair "$ARTIFACT_APP_REF" "$ARTIFACT_WRITER_REF" forward
+else
+  docker compose build --build-arg "OPIP_RELEASE_SHA=$TARGET_SHA" \
+    opip-canonical-writer ohm-trade-agent
+  # Writer and core are independent services. Build/start both; validate each
+  # separately. Never introduce Compose depends_on: condition=service_healthy
+  # from ohm-trade-agent onto opip-canonical-writer.
+  docker compose up -d --remove-orphans opip-canonical-writer
+  docker compose up -d --remove-orphans ohm-trade-agent
+fi
 
 if ! wait_core_health; then
   echo "production core health check failed" >&2
