@@ -1,0 +1,37 @@
+name: release-artifact-rehearsal
+
+# Disposable Linux/Docker rehearsal of the artifact-mode apply/rollback
+# mechanism on a GitHub-hosted Ubuntu runner. No production or staging contact,
+# no registry publication (the registry is ephemeral and local to the job).
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "OHM-Trade-Agent-v1/deploy/release/**"
+      - "OHM-Trade-Agent-v1/docker-compose.yml"
+      - "OHM-Trade-Agent-v1/docker-compose.paper.yml"
+      - "OHM-Trade-Agent-v1/docker-compose.artifact.yml"
+      - ".github/workflows/release-artifact-rehearsal.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  rehearsal:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: OHM-Trade-Agent-v1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Combined base+artifact Compose validation
+        run: bash deploy/release/atdd/compose-validate.sh
+      - name: Real Docker apply/rollback rehearsal
+        run: bash deploy/release/atdd/rehearsal.sh
+      - name: Dump container state on failure
+        if: failure()
+        run: docker ps -a | head -20; docker images | head -20

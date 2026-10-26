@@ -1,0 +1,114 @@
+name: release-artifact-publish
+
+# Owner-gated publication of the private GHCR images used by artifact-mode
+# deploys. NEVER triggered by pull-request code: only a manual dispatch or a
+# push to main. `packages: write` is granted to this job only, and the workflow
+# token cannot be reached from an untrusted branch.
+#
+# Publication is a build-and-push of the CURRENTLY APPROVED revision only; it
+# does not deploy, and it does not change production state.
+
+on:
+  # Owner-gated ONLY. There is deliberately no `push:` or `pull_request:`
+  # trigger: a merge to main must never publish by itself, and untrusted PR code
+  # must never receive a packages:write token.
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: "40-char commit SHA to publish (must equal main HEAD)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-artifact-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      REGISTRY: ghcr.io
+      OWNER: ${{ github.repository_owner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Resolve and pin the revision
+        id: rev
+        run: |
+          set -euo pipefail
+          head="$(git rev-parse HEAD)"
+          want="${{ github.event.inputs.revision }}"
+          if [ -n "$want" ] && [ "$want" != "$head" ]; then
+            echo "requested revision $want is not main HEAD $head" >&2
+            exit 1
+          fi
+          echo "sha=$head" >> "$GITHUB_OUTPUT"
+          echo "PUBLISH_REVISION=$head"
+
+      - name: Log in to private GHCR (no credential echo)
+        run: |
+          set -euo pipefail
+          printf '%s' "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login "$REGISTRY" -u "${{ github.actor }}" --password-stdin >/dev/null
+
+      - name: Build and push app + canonical writer (immutable digests)
+        id: push
+        run: |
+          set -euo pipefail
+          sha="${{ steps.rev.outputs.sha }}"
+          app="$REGISTRY/$OWNER/opip-app:sha-$sha"
+          writer="$REGISTRY/$OWNER/opip-canonical-writer:sha-$sha"
+          docker build \
+            --build-arg "OPIP_RELEASE_SHA=$sha" \
+            --label "org.opencontainers.image.revision=$sha" \
+            -f OHM-Trade-Agent-v1/Dockerfile \
+            -t "$app" OHM-Trade-Agent-v1
+          docker tag "$app" "$writer"
+          docker push "$app" >/dev/null
+          docker push "$writer" >/dev/null
+          app_digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$app")"
+          writer_digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$writer")"
+          echo "APP_IMAGE=$app_digest"      | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "WRITER_IMAGE=$writer_digest" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "app=$app_digest" >> "$GITHUB_OUTPUT"
+          echo "writer=$writer_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Enforce private package visibility
+        run: |
+          set -euo pipefail
+          vis="$(gh api "repos/${{ github.repository }}" --jq .visibility)"
+          echo "REPO_VISIBILITY=$vis"
+          if [ "$vis" != "private" ]; then
+            echo "repository is not private; refusing to rely on inherited visibility" >&2
+            exit 1
+          fi
+          # Independent package-visibility check: query the package itself rather
+          # than inferring it from the repository.
+          for pkg in opip-app opip-canonical-writer; do
+            pvis="$(gh api "/user/packages/container/$pkg" --jq .visibility 2>/dev/null || echo UNKNOWN)"
+            echo "PACKAGE_VISIBILITY $pkg=$pvis"
+            if [ "$pvis" != "private" ]; then
+              echo "package $pkg is not private ($pvis); refusing to claim private retention" >&2
+              exit 1
+            fi
+          done
+          echo "PACKAGE_VISIBILITY=private(verified)" >> "$GITHUB_STEP_SUMMARY"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify the digests are retrievable (off-host recovery proof)
+        run: |
+          set -euo pipefail
+          docker rmi "${{ steps.push.outputs.app }}" "${{ steps.push.outputs.writer }}" >/dev/null 2>&1 || true
+          docker pull "${{ steps.push.outputs.app }}"  >/dev/null
+          docker pull "${{ steps.push.outputs.writer }}" >/dev/null
+          echo "GHCR_PULL_BY_DIGEST=OK" | tee -a "$GITHUB_STEP_SUMMARY"

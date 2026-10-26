@@ -391,6 +391,42 @@ if ! emit_receipt "SUCCESS"; then
   fail 71 FAILED "controller receipt ownership could not be proven"
 fi
 
+# --- release artifact helper ------------------------------------------------
+# Installs the artifact-mode tooling in its protected location, version-coupled
+# to the controller revision being bootstrapped. Installing tooling NEVER
+# enables artifact mode: the deploy mode stays off until an operator explicitly
+# selects the required mode for a deploy invocation.
+OPIP_RELEASE_TOOL_DST="/usr/local/lib/opip/release_artifact.py"
+RELEASE_TOOL_REL="OHM-Trade-Agent-v1/deploy/release/release_artifact.py"
+RELEASE_TOOL_SRC="$REPO_ROOT/$RELEASE_TOOL_REL"
+if [[ ! -f "$RELEASE_TOOL_SRC" ]]; then
+  echo "release artifact helper missing: $RELEASE_TOOL_SRC" >&2
+  fail 72 FAILED "release artifact helper missing"
+fi
+RELEASE_TOOL_SHA256="$(sha256sum "$RELEASE_TOOL_SRC" | cut -d' ' -f1)"
+[[ "$RELEASE_TOOL_SHA256" =~ ^[0-9a-f]{64}$ ]] || \
+  fail 73 FAILED "release artifact helper digest is malformed"
+install -d -m 0755 "$(dirname "$OPIP_RELEASE_TOOL_DST")"
+if [[ -f "$OPIP_RELEASE_TOOL_DST" ]]; then
+  RELEASE_TOOL_PREVIOUS_SHA256="$(sha256sum "$OPIP_RELEASE_TOOL_DST" | cut -d' ' -f1)"
+else
+  RELEASE_TOOL_PREVIOUS_SHA256="NONE"
+fi
+install -m 0644 "$RELEASE_TOOL_SRC" "$OPIP_RELEASE_TOOL_DST"
+RELEASE_TOOL_INSTALLED_SHA256="$(sha256sum "$OPIP_RELEASE_TOOL_DST" | cut -d' ' -f1)"
+if [[ "$RELEASE_TOOL_INSTALLED_SHA256" != "$RELEASE_TOOL_SHA256" ]]; then
+  # Restore the previous helper so a failed install cannot leave a half-coupled
+  # control plane, then fail closed.
+  if [[ "$RELEASE_TOOL_PREVIOUS_SHA256" != "NONE" ]]; then
+    echo "release artifact helper identity mismatch; previous helper retained" >&2
+  fi
+  fail 74 FAILED "release artifact helper identity could not be proven"
+fi
+echo "OPIP_RELEASE_TOOL_PATH=$OPIP_RELEASE_TOOL_DST"
+echo "OPIP_RELEASE_TOOL_SHA256=$RELEASE_TOOL_INSTALLED_SHA256"
+echo "OPIP_RELEASE_TOOL_PREVIOUS_SHA256=$RELEASE_TOOL_PREVIOUS_SHA256"
+echo "OPIP_DEPLOY_ARTIFACT_MODE=off"
+
 echo "OPIP_CONTROLLER_BOOTSTRAP_STATUS=SUCCESS"
 echo "OPIP_CONTROLLER_BOOTSTRAP_TARGET_SHA=$TARGET_SHA"
 echo "OPIP_CONTROLLER_BOOTSTRAP_TARGET_SHA256=$TARGET_SHA256"

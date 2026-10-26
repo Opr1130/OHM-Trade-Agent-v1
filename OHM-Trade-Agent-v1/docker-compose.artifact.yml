@@ -1,0 +1,26 @@
+# O'Pip artifact-mode overlay.
+#
+# Used ONLY when the deploy controller runs in artifact mode:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.artifact.yml up -d \
+#     --no-build --remove-orphans ohm-trade-agent opip-canonical-writer
+#
+# Purpose:
+#   * pin each service to an immutable image reference (digest), so what runs is
+#     exactly what was verified -- never "whatever the source tree builds now";
+#   * forbid implicit builds (`--no-build` on the command line) and implicit
+#     pulls (`pull_policy: never`), so a missing image fails the deploy instead of
+#     silently fetching or rebuilding something unverified;
+#   * fail closed when the operator forgets to supply the image references
+#     (`${VAR:?}` aborts Compose variable interpolation).
+#
+# This file is additive: it does not change any service used by the existing
+# build-on-host path. Base compose keeps `build: .` for that path.
+services:
+  ohm-trade-agent:
+    image: ${OPIP_APP_IMAGE:?artifact mode requires OPIP_APP_IMAGE (digest-pinned)}
+    pull_policy: never
+
+  opip-canonical-writer:
+    image: ${OPIP_WRITER_IMAGE:?artifact mode requires OPIP_WRITER_IMAGE (digest-pinned)}
+    pull_policy: never
