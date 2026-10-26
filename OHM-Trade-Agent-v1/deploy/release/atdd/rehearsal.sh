@@ -25,10 +25,7 @@ curl -fsS "http://$REG/v2/" >/dev/null 2>&1 && ok "ephemeral registry live" \
   || { bad "ephemeral registry live" "unreachable"; exit 1; }
 
 build_img() { # name tag payload
-  # The base Compose file overrides CMD with `command:`, which for the real
-  # services is a `python ...` entrypoint. The synthetic image therefore needs an
-  # inert `python` shim so the fixture exercises image identity, not app code.
-  printf 'FROM busybox:1.36\nARG R=%s\nRUN echo %s > /identity.txt\nRUN printf "#!/bin/sh\\\\nexec sleep 3600\\\\n" > /usr/local/bin/python && chmod +x /usr/local/bin/python\nLABEL org.opencontainers.image.revision=%s\nCMD ["sleep","3600"]\n' "$2" "$3" "$2" \
+  printf 'FROM busybox:1.36\nARG R=%s\nRUN echo %s > /identity.txt\nLABEL org.opencontainers.image.revision=%s\nCMD ["sleep","3600"]\n' "$2" "$3" "$2" \
     | docker build -q -t "$REG/opip/$1:$2" -f - . >/dev/null
   docker push -q "$REG/opip/$1:$2" >/dev/null
   docker inspect --format '{{index .RepoDigests 0}}' "$REG/opip/$1:$2"
