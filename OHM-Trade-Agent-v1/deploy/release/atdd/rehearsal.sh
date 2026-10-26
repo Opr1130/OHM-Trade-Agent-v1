@@ -25,7 +25,16 @@ curl -fsS "http://$REG/v2/" >/dev/null 2>&1 && ok "ephemeral registry live" \
   || { bad "ephemeral registry live" "unreachable"; exit 1; }
 
 build_img() { # name tag payload
-  printf 'FROM busybox:1.36\nARG R=%s\nRUN echo %s > /identity.txt\nLABEL org.opencontainers.image.revision=%s\nCMD ["sleep","3600"]\n' "$2" "$3" "$2" \
+  # The base Compose file overrides CMD with `command:` (a `python ...` entrypoint
+  # for the real services), so the synthetic image needs an inert `python` shim.
+  # Lines are emitted one per argument: the inner printf's backslash escapes must
+  # reach the container's shell unmodified.
+  printf '%s\n' \
+    'FROM busybox:1.36' \
+    "RUN echo $3 > /identity.txt" \
+    'RUN printf "#!/bin/sh\nexec sleep 3600\n" > /usr/local/bin/python && chmod +x /usr/local/bin/python' \
+    "LABEL org.opencontainers.image.revision=$2" \
+    'CMD ["sleep","3600"]' \
     | docker build -q -t "$REG/opip/$1:$2" -f - . >/dev/null
   docker push -q "$REG/opip/$1:$2" >/dev/null
   docker inspect --format '{{index .RepoDigests 0}}' "$REG/opip/$1:$2"
@@ -61,6 +70,12 @@ docker compose -f docker-compose.yml -f docker-compose.artifact.yml up -d --no-b
 BACK="$(docker inspect --format '{{.Image}}' ohm-trade-agent)"
 [ "$NEW_APP" != "$RUN_APP" ] && ok "forward moved the app digest" || bad "forward moved the app digest" "unchanged"
 [ "$BACK" = "$RUN_APP" ] && ok "rollback restored the exact previous digest" || bad "rollback restored the exact previous digest" "$BACK"
+BACK_W="$(docker inspect --format '{{.Image}}' opip-canonical-writer 2>/dev/null || true)"
+[ "$BACK_W" = "$RUN_W" ] && ok "rollback preserved the canonical-writer identity" \
+  || bad "rollback preserved the canonical-writer identity" "want $RUN_W got $BACK_W"
+[ "$BACK" = "$RUN_APP" ] && [ "$BACK_W" = "$RUN_W" ] && [ "$BACK" != "$BACK_W" ] \
+  && ok "rollback restored BOTH distinct identities as a pair" \
+  || bad "rollback restored BOTH distinct identities as a pair" "pair mismatch"
 grep -qi 'building' /tmp/roll.log && bad "rollback rebuilt nothing" "build output" || ok "rollback rebuilt nothing"
 grep -qi 'git ' /tmp/roll.log && bad "rollback used no Git" "git output" || ok "rollback used no Git"
 
