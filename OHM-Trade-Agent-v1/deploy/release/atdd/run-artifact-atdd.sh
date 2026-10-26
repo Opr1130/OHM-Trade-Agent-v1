@@ -12,7 +12,8 @@ LC_ALL=C
 export LC_ALL
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-APP_ROOT="$(cd "$HERE/../.." && pwd)"
+# HERE = <app>/deploy/release/atdd  ->  <app>
+APP_ROOT="$(cd "$HERE/../../.." && pwd)"
 TOOL="$APP_ROOT/deploy/release/release_artifact.py"
 PY="${PYTHON:-python3}"
 WORK="$(mktemp -d)"
