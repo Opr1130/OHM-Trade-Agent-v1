@@ -5,7 +5,7 @@
 # with synthetic, non-secret environment values, and that the negative cases
 # fail closed. No production access, no registry, no build.
 set -uo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")/../.."   # -> OHM-Trade-Agent-v1
+cd "$(dirname "${BASH_SOURCE[0]}")/../../.."   # -> OHM-Trade-Agent-v1 (app root)
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  PASS  %s\n' "$1"; }

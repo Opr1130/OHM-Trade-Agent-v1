@@ -6,7 +6,7 @@
 # contract against real containers. It does NOT execute the controller's health/
 # quiescence/scheduler orchestration (needs production-shaped host state).
 set -uo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")/../.."
+cd "$(dirname "${BASH_SOURCE[0]}")/../../.."   # -> app root
 PY="${PYTHON:-python3}"; TOOL="deploy/release/release_artifact.py"; REG=localhost:5000
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  PASS  %s\n' "$1"; }
