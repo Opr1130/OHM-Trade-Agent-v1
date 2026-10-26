@@ -6,8 +6,14 @@
 # contract against real containers. It does NOT execute the controller's health/
 # quiescence/scheduler orchestration (needs production-shaped host state).
 set -uo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")/../../.."   # -> app root
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+cd "$SCRIPT_DIR/../../.."   # -> app root
 PY="${PYTHON:-python3}"; TOOL="deploy/release/release_artifact.py"; REG=localhost:5000
+if [ ! -f "$TOOL" ] || [ ! -r "$TOOL" ]; then
+  echo "FAIL  release artifact tool missing/unreadable: $TOOL" >&2
+  echo "TOTAL: pass=0 fail=1 skip=0" >&2
+  exit 1
+fi
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  PASS  %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  FAIL  %s (%s)\n' "$1" "$2"; }

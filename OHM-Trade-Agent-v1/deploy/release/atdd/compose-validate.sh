@@ -5,7 +5,9 @@
 # with synthetic, non-secret environment values, and that the negative cases
 # fail closed. No production access, no registry, no build.
 set -uo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")/../../.."   # -> OHM-Trade-Agent-v1 (app root)
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+cd "$SCRIPT_DIR/../../.."   # -> app root (OHM-Trade-Agent-v1)
+CONTROLLER="$SCRIPT_DIR/../../remote/ohm-deploy"
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  PASS  %s\n' "$1"; }
@@ -84,11 +86,26 @@ fi
 if grep -A40 '^  ohm-trade-agent:' <<< "$out" | grep -q 'dockerfile:'; then
   echo "NOTE build section present in base compose (unchanged); artifact-mode up uses --no-build"
 fi
-if grep -q -- '--no-build' ../../../deploy/remote/ohm-deploy 2>/dev/null || \
-   grep -q -- '--no-build' ../remote/ohm-deploy; then
-  ok "controller forbids implicit builds at apply time"
+
+# Controller assertions: resolve from THIS script's directory, and treat a
+# missing/unreadable controller as a hard failure so a negated grep against an
+# absent file can never be scored as PASS.
+if [ ! -f "$CONTROLLER" ]; then
+  bad "controller is present at deploy/remote/ohm-deploy" "missing: $CONTROLLER"
+elif [ ! -r "$CONTROLLER" ]; then
+  bad "controller is present at deploy/remote/ohm-deploy" "unreadable: $CONTROLLER"
 else
-  bad "controller forbids implicit builds at apply time" "flag missing"
+  ok "controller is present at deploy/remote/ohm-deploy"
+  if grep -q -- '--no-build' "$CONTROLLER"; then
+    ok "controller forbids implicit builds at apply time"
+  else
+    bad "controller forbids implicit builds at apply time" "flag missing in $CONTROLLER"
+  fi
+  if grep -q 'OPIP_DEPLOY_ARTIFACT_MODE' "$CONTROLLER"; then
+    ok "controller exposes the artifact-mode switch"
+  else
+    bad "controller exposes the artifact-mode switch" "missing in $CONTROLLER"
+  fi
 fi
 
 echo "TOTAL: pass=$PASS fail=$FAIL skip=0"
