@@ -31,7 +31,9 @@ jobs:
       - name: Install test runner
         run: python -m pip install --disable-pip-version-check pytest pyyaml
       - name: Receipt / bundle / registry-digest ATDD
-        run: python -m pytest tests/test_opip_release_artifact_receipt_v1.py -q
+        # --noconftest: these tests are stdlib-only and must not require the
+        # application runtime dependencies that tests/conftest.py imports.
+        run: python -m pytest tests/test_opip_release_artifact_receipt_v1.py -q --noconftest
       - name: Release-path Linux ATDD
         run: bash deploy/release/atdd/run-artifact-atdd.sh
       - name: Controller shell syntax (real Linux bash)
@@ -44,20 +46,19 @@ jobs:
         working-directory: OHM-Trade-Agent-v1
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
       - name: Compose overlay resolves with digest-pinned refs
+        # The overlay alone is validated: it must not depend on the base
+        # compose's application env, only on the two pinned image refs.
         run: |
           set -euo pipefail
           export OPIP_APP_IMAGE="ghcr.io/opip/app@sha256:$(printf 'a%.0s' {1..64})"
           export OPIP_WRITER_IMAGE="ghcr.io/opip/writer@sha256:$(printf 'b%.0s' {1..64})"
-          docker compose -f docker-compose.yml -f docker-compose.artifact.yml config >/dev/null
+          docker compose -f docker-compose.artifact.yml config >/dev/null
           echo COMPOSE_ARTIFACT_CONFIG=OK
       - name: Overlay fails closed when refs are absent
         run: |
           set -euo pipefail
-          if docker compose -f docker-compose.yml -f docker-compose.artifact.yml config >/dev/null 2>&1; then
+          if docker compose -f docker-compose.artifact.yml config >/dev/null 2>&1; then
             echo "overlay resolved without image refs" >&2; exit 1
           fi
           echo COMPOSE_ARTIFACT_REQUIRES_REFS=OK
