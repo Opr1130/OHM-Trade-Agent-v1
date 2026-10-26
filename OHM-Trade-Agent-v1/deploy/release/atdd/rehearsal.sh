@@ -27,16 +27,21 @@ curl -fsS "http://$REG/v2/" >/dev/null 2>&1 && ok "ephemeral registry live" \
 build_img() { # name tag payload
   # The base Compose file overrides CMD with `command:` (a `python ...` entrypoint
   # for the real services), so the synthetic image needs an inert `python` shim.
-  # Lines are emitted one per argument: the inner printf's backslash escapes must
-  # reach the container's shell unmodified.
-  printf '%s\n' \
-    'FROM busybox:1.36' \
-    "RUN echo $3 > /identity.txt" \
-    'RUN printf "#!/bin/sh\nexec sleep 3600\n" > /usr/local/bin/python && chmod +x /usr/local/bin/python' \
-    "LABEL org.opencontainers.image.revision=$2" \
-    'CMD ["sleep","3600"]' \
-    | docker build -q -t "$REG/opip/$1:$2" -f - . >/dev/null
-  docker push -q "$REG/opip/$1:$2" >/dev/null
+  # A real build context with a quoted heredoc avoids all shell escaping: the
+  # inner `\n` must reach the container's printf unchanged.
+  local ctx; ctx="$(mktemp -d)"
+  cat > "$ctx/Dockerfile" <<'DOCKERFILE'
+FROM busybox:1.36
+RUN printf '#!/bin/sh\nexec sleep 3600\n' > /usr/local/bin/python && chmod +x /usr/local/bin/python
+CMD ["sleep", "3600"]
+DOCKERFILE
+  printf 'LABEL org.opencontainers.image.revision=%s\n' "$2" >> "$ctx/Dockerfile"
+  printf 'RUN echo %s > /identity.txt\n' "$3" >> "$ctx/Dockerfile"
+  docker build -q -t "$REG/opip/$1:$2" "$ctx" >/dev/null
+  local rc=$?
+  rm -rf "$ctx"
+  [ "$rc" -eq 0 ] || return 1
+  docker push -q "$REG/opip/$1:$2" >/dev/null || return 1
   docker inspect --format '{{index .RepoDigests 0}}' "$REG/opip/$1:$2"
 }
 APP_REF="$(build_img app aaaa1111 a)"; WRITER_REF="$(build_img writer bbbb2222 b)"
