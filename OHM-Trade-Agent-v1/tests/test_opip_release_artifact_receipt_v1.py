@@ -21,6 +21,10 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+# Module-level mark: tests/atdd_scope.py only indexes tests that carry a pytest
+# mark (module-level pytestmark or a decorator), so this module declares one.
+# Acceptance marks are applied per traced test (see the AC docstrings), so only
+# the tests cited by the scope contract are indexed by tests/atdd_scope.py.
 MODULE_PATH = ROOT / "deploy" / "release" / "release_artifact.py"
 
 _spec = importlib.util.spec_from_file_location("opip_release_artifact", MODULE_PATH)
@@ -154,7 +158,9 @@ def test_receipt_rejects_zero_sequence():
 
 
 # --- rollback eligibility (fail closed) -----------------------------------
+@pytest.mark.acceptance
 def test_registry_verified_pair_is_rollback_eligible():
+    """ATDD-RELEASE-ARTIFACT-MODE-v1/AC-001: a registry-attestable VERIFIED pair is rollback-eligible."""
     verdict = receipt().rollback_eligibility()
     assert verdict["eligible"] is True
     assert verdict["reason"] == "OK"
@@ -340,6 +346,7 @@ def test_cli_bad_receipt_returns_two(tmp_path, capsys):
 
 # --- controller / compose static contracts --------------------------------
 CONTROLLER = ROOT / "deploy" / "remote" / "ohm-deploy"
+BOOTSTRAP = ROOT / "deploy" / "remote" / "bootstrap-deploy-controller-only.sh"
 COMPOSE = ROOT / "docker-compose.yml"
 ARTIFACT_OVERLAY = ROOT / "docker-compose.artifact.yml"
 
@@ -365,7 +372,9 @@ def _yaml_body(path: Path) -> str:
     )
 
 
+@pytest.mark.acceptance
 def test_artifact_overlay_pins_images_and_forbids_pull():
+    """ATDD-RELEASE-ARTIFACT-MODE-v1/AC-004: the overlay pins digests and forbids implicit pulls."""
     body = _yaml_body(ARTIFACT_OVERLAY)
     assert "image: ${OPIP_APP_IMAGE:" in body
     assert "image: ${OPIP_WRITER_IMAGE:" in body
@@ -419,7 +428,9 @@ def test_onhost_config_matching_bundle_verifies(tmp_path):
     assert set(checked) == set(ra.VERIFIED_CONFIG_ALLOWLIST)
 
 
+@pytest.mark.acceptance
 def test_onhost_config_drift_is_refused(tmp_path):
+    """ATDD-RELEASE-ARTIFACT-MODE-v1/AC-003: drifted on-host Compose inputs are refused."""
     out = make_bundle(tmp_path)
     root = tmp_path / "apptree"
     root.mkdir()
@@ -436,6 +447,36 @@ def test_missing_compose_file_in_bundle_is_refused(tmp_path):
 
 
 # --- controller wiring contracts (static, exact) ---------------------------
+@pytest.mark.acceptance
+def test_ghcr_publication_is_protected_and_private():
+    """ATDD-RELEASE-ARTIFACT-MODE-v1/AC-006: publication is owner-gated, job-scoped and never on PR code."""
+    wf = (ROOT.parent / ".github" / "workflows" / "release-artifact-publish.yml")
+    text = wf.read_text(encoding="utf-8")
+    body = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+    # owner-gated triggers only: no pull_request, no pull_request_target
+    assert "pull_request" not in body
+    assert "workflow_dispatch" in body
+    # least privilege: packages write is job-scoped, contents read at top level
+    assert "packages: write" in body
+    assert body.index("permissions:") < body.index("packages: write")
+    # private visibility enforced at package creation
+    assert "ghcr.io" in body
+    assert "visibility" in body or "private" in body.lower()
+
+
+@pytest.mark.acceptance
+def test_bootstrap_installs_release_helper_without_enabling_artifact_mode():
+    """ATDD-RELEASE-ARTIFACT-MODE-v1/AC-005: tooling install is version-coupled and does not enable artifact mode."""
+    text = BOOTSTRAP.read_text(encoding="utf-8")
+    assert "release_artifact.py" in text
+    assert "OPIP_RELEASE_TOOL_DST" in text
+    assert "sha256" in text.lower()
+    # installing tooling must never switch the deploy mode on
+    assert "OPIP_DEPLOY_ARTIFACT_MODE=required" not in text
+    assert "export OPIP_DEPLOY_ARTIFACT_MODE" not in text
+    assert 'echo "OPIP_DEPLOY_ARTIFACT_MODE=off"' in text
+
+
 def test_controller_cannot_silently_use_git_without_metadata():
     text = CONTROLLER.read_text(encoding="utf-8")
     assert "if [[ -z \"$REPO_OWNER\" ]]" in text
@@ -453,7 +494,9 @@ def test_controller_admission_is_git_free_in_artifact_mode():
     assert "else" in between
 
 
+@pytest.mark.acceptance
 def test_controller_rollback_has_no_rebuild_in_artifact_mode():
+    """ATDD-RELEASE-ARTIFACT-MODE-v1/AC-002: rollback must never rebuild in artifact mode."""
     text = CONTROLLER.read_text(encoding="utf-8")
     idx = text.index("artifact_apply_pair \"$ROLLBACK_APP_REF\"")
     branch_end = text.index("elif docker compose -f docker-compose.yml", idx)
