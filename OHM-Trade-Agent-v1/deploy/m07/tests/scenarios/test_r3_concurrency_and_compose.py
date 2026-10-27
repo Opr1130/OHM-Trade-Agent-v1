@@ -41,11 +41,15 @@ def test_certified_compose_declares_every_service_the_scripts_drive(compose):
 
 
 def test_environment_file_contract_is_the_app_root_dotenv(compose):
-    # The core consumes the canonical .env; the writer and stream worker use explicit
-    # `environment:` blocks so a stale .env can never activate capture or execution.
-    assert ".env" in (compose["services"][CORE].get("env_file") or [])
+    # The core consumes the controller-generated FILTERED dotenv (`.env.core`),
+    # which is derived from the canonical `.env` in the same app root and never
+    # carries a funded exchange credential. The writer and stream worker use
+    # explicit `environment:` blocks so a stale dotenv can never activate
+    # capture or execution.
+    assert compose["services"][CORE].get("env_file") == [".env.core"]
     for name in (WRITER, STREAM):
         assert ".env" not in (compose["services"][name].get("env_file") or []), name
+        assert ".env.core" not in (compose["services"][name].get("env_file") or []), name
         assert compose["services"][name].get("environment"), name
 
 
