@@ -184,6 +184,7 @@ AC-012 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
 AC-012 -> OHM-Trade-Agent-v1/docker-compose.yml
 AC-012 -> OHM-Trade-Agent-v1/app/services/telegram_command_center.py
 AC-012 -> .github/workflows/pytest.yml
+AC-012 -> .github/workflows/freqtrade-contract.yml
 AC-012 -> OHM-Trade-Agent-v1/tests/test_tradevisor_core_env_isolation_v1.py
 AC-007 -> OHM-Trade-Agent-v1/deploy/remote/bootstrap-release-tree-controller.sh
 AC-001 -> OHM-Trade-Agent-v1/tests/test_opip_release_tree_controller_v1.py

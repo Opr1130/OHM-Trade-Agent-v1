@@ -42,7 +42,9 @@ jobs:
 
       - name: Validate independent Compose models
         run: |
-          touch .env
+          # The core service consumes the controller-generated filtered
+          # environment (`.env.core`); the paper model keeps its own `.env`.
+          touch .env .env.core
           docker compose -f docker-compose.yml config -q
           docker compose -f docker-compose.paper.yml config -q
 
