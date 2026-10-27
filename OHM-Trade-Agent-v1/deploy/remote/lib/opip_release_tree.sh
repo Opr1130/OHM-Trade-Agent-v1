@@ -36,6 +36,73 @@ OPIP_STAGED_SHA=""
 REPO_OWNER=""
 GIT=()
 
+#: Funded-credential NAMES that must never reach the core container. This is a
+#: literal mirror of ``app.services.release_profiles.FUNDED_CREDENTIAL_KEYS``;
+#: the ATDD contract test asserts both lists are identical, so changing the
+#: Python authority fails CI instead of silently widening the core environment.
+OPIP_FUNDED_CREDENTIAL_KEYS="KRAKEN_API_KEY KRAKEN_API_SECRET KRAKEN_PRIVATE_KEY KRKN_API_KEY LIVE_TRADING_KEY"
+
+opip_core_env_path() {
+  printf '%s\n' "$APP_ROOT/.env.core"
+}
+
+opip_write_core_env() {
+  # Generate the core-only environment from the owner's `.env`, excluding every
+  # funded credential name. The owner's `.env` is never modified and no value is
+  # ever printed - only the destination path and the number of excluded names.
+  #
+  # The file is written atomically (temp file on the deploy state filesystem,
+  # then rename), is root-owned mode 0600, and is excluded from the Docker build
+  # context by `.dockerignore` (`.env.*`). Regenerating with unchanged input is
+  # idempotent; a rotated `.env` produces a new file on the next activation.
+  local src="$APP_ROOT/.env" dest tmp key
+  local -a keys
+  dest="$(opip_core_env_path)"
+  if [[ ! -f "$src" || -L "$src" || ! -r "$src" ]]; then
+    echo "refusing core environment: $src is missing, unreadable or a symlink" >&2
+    return 1
+  fi
+  read -r -a keys <<<"$OPIP_FUNDED_CREDENTIAL_KEYS"
+  if ((${#keys[@]} == 0)); then
+    echo "refusing core environment: no funded credential names are configured" >&2
+    return 1
+  fi
+  install -d -m 0700 "$STATE_DIR"
+  tmp="$(mktemp "$STATE_DIR/.core-env.XXXXXX")" || return 1
+  if ! awk -F= -v keys="$OPIP_FUNDED_CREDENTIAL_KEYS" '
+      BEGIN { n = split(keys, a, " "); for (i = 1; i <= n; i++) skip[a[i]] = 1 }
+      { name = $1; gsub(/^[ \t]+|[ \t]+$/, "", name); if (name in skip) next; print }
+    ' "$src" > "$tmp"; then
+    rm -f -- "$tmp"
+    echo "refusing core environment: filtering $src failed" >&2
+    return 1
+  fi
+  # Defence in depth: a funded name must not survive filtering under any
+  # spelling (leading whitespace, padding around the separator).
+  for key in "${keys[@]}"; do
+    if grep -qE "^[[:space:]]*${key}[[:space:]]*=" "$tmp" 2>/dev/null; then
+      rm -f -- "$tmp"
+      echo "refusing core environment: ${key} survived filtering" >&2
+      return 1
+    fi
+  done
+  if [[ ! -s "$tmp" ]]; then
+    rm -f -- "$tmp"
+    echo "refusing core environment: the filtered file is empty" >&2
+    return 1
+  fi
+  chmod 0600 "$tmp"
+  chown root:root "$tmp" 2>/dev/null || true
+  mv -f -- "$tmp" "$dest" || { rm -f -- "$tmp"; return 1; }
+  chmod 0600 "$dest"
+  chown root:root "$dest" 2>/dev/null || true
+  if [[ "$(stat -c '%a' "$dest")" != "600" ]]; then
+    echo "refusing core environment: $dest is not mode 0600" >&2
+    return 1
+  fi
+  echo "OPIP_CORE_ENV=WRITTEN path=$dest excluded_count=${#keys[@]}"
+}
+
 opip_source_die() {
   echo "$*" >&2
   exit 69
@@ -226,7 +293,8 @@ rt_install_tree() {
   # considered up to date by rsync's size+mtime quick check and silently keep
   # stale source. Content comparison is the only correct test here.
   rsync -a --checksum --delete \
-    --exclude=/data --exclude=/.env --exclude=/__pycache__ --exclude='*.py[cod]' \
+    --exclude=/data --exclude=/.env --exclude=/.env.core --exclude=/__pycache__ \
+    --exclude='*.py[cod]' \
     "$src/" "$APP_ROOT/" || return 1
   rt_verify_tree "$APP_ROOT" "$manifest" || return 1
   return 0

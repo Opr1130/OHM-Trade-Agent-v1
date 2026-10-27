@@ -1306,6 +1306,11 @@ rollback() {
       false
     }
   fi
+  # Regenerate the filtered core environment for the restored release. Rollback
+  # is never blocked by this: an older release may still read `.env` directly,
+  # and the filtered file is only required by a release that references it.
+  opip_write_core_env \
+    || echo "WARN  rollback: filtered core environment could not be regenerated" >&2
   write_safe_baseline_override
 
   # First PR 2 deploy may roll back to a SHA that does not declare the writer.
@@ -1722,6 +1727,14 @@ else
     false
   }
 fi
+
+# The core container must never inherit a funded credential. The filtered
+# environment is generated AFTER activation and BEFORE the first Compose call,
+# and the deploy fails closed if it cannot be produced.
+opip_write_core_env || {
+  echo "refusing deploy: the filtered core environment could not be generated" >&2
+  false
+}
 
 # Stop paper workers during the build/recreate window. Their dry-run state is
 # bind-mounted and survives the stop, while roughly two worker RSS footprints
