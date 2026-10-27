@@ -82,8 +82,23 @@ preserve_target_deploy_controller_snapshot() {
     return 1
   }
 
-  local head_sha target_controller
+  local head_sha target_controller record
   head_sha="$(git -c safe.directory='*' -C "$app_root" rev-parse --verify HEAD 2>/dev/null || true)"
+  if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+    # Certified release-tree host: there is no Git metadata at all, so the
+    # identity the controller recorded for the ACTIVE release is used instead.
+    # `current-release.env` is written only by a verified release activation
+    # (manifest re-verified install) and is root-owned controller state inside
+    # the deploy state directory - the same trust class as HEAD, so provenance is
+    # not weakened. Rollback state is deliberately NOT consulted here.
+    head_sha=""
+    record="$state_dir/current-release.env"
+    if [[ -r "$record" && ! -L "$record" ]]; then
+      head_sha="$(sed -n 's/^sha=//p' "$record" 2>/dev/null || true)"
+      head_sha="${head_sha%%$'\n'*}"
+      head_sha="${head_sha//[$'\r ']/}"
+    fi
+  fi
   [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] || {
     echo "deploy-controller bootstrap: repository HEAD is not a 40-char SHA" >&2
     return 1

@@ -339,6 +339,87 @@ def test_bootstrap_installs_the_library_at_a_stable_root_location() -> None:
     assert "bootstrap-release-tree-controller" not in gateway
 
 
+def _preserve_block() -> str:
+    text = (APP / "deploy" / "remote" / "reconcile-scheduler.sh").read_text(encoding="utf-8")
+    start = text.index("preserve_target_deploy_controller_snapshot() {")
+    end = text.index("\n}\n", start) + 3
+    return text[start:end]
+
+
+def _run_preserve(app_root: pathlib.Path, state_dir: pathlib.Path):
+    harness = f"""
+set -Eeuo pipefail
+export OPIP_DEPLOY_TEST_SEAMS=1
+export OPIP_BOOTSTRAP_APP_ROOT={app_root.as_posix()}
+export OPIP_BOOTSTRAP_STATE_DIR={state_dir.as_posix()}
+{_preserve_block()}
+preserve_target_deploy_controller_snapshot
+"""
+    return _run(harness, {})
+
+
+CONTROLLER_BODY = "#!/usr/bin/env bash\necho controller\n"
+
+
+def _seed_snapshot(state: pathlib.Path, name: str, body: str) -> None:
+    snapshot = state / name
+    snapshot.mkdir(parents=True, exist_ok=True)
+    (snapshot / "remote-op-ohm-deploy.present").write_text("", encoding="utf-8")
+    (snapshot / "remote-op-ohm-deploy").write_text(body, encoding="utf-8")
+
+
+def _seed_app(app_root: pathlib.Path) -> None:
+    remote = app_root / "deploy" / "remote"
+    remote.mkdir(parents=True, exist_ok=True)
+    (remote / "ohm-deploy").write_text(CONTROLLER_BODY, encoding="utf-8")
+
+
+def test_reconcile_resolves_release_tree_identity_without_git(
+    tmp_path: pathlib.Path,
+) -> None:
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-009: the scheduler reconciliation accepts
+    the authenticated release-tree identity when Git metadata is absent, keeps
+    the Git identity first, and still refuses when no identity exists."""
+    script = (APP / "deploy" / "remote" / "reconcile-scheduler.sh").read_text(encoding="utf-8")
+    assert "deploy-controller bootstrap: repository HEAD is not a 40-char SHA" in script
+    assert "current-release.env" in script
+
+    gitless_app = tmp_path / "gitless" / "OHM-Trade-Agent-v1"
+    _seed_app(gitless_app)
+    state = tmp_path / "state"
+    state.mkdir()
+
+    # No Git metadata and no recorded identity: still fail closed, same message.
+    _seed_snapshot(state, "scheduler-before.NOIDNT", CONTROLLER_BODY)
+    absent = _run_preserve(gitless_app, state)
+    assert absent.returncode != 0
+    assert "repository HEAD is not a 40-char SHA" in absent.stderr
+
+    # The verified activation record supplies the identity on a Git-less host.
+    installed = "b" * 40
+    (state / "current-release.env").write_text(
+        f"schema=1\nsha={installed}\ntree=deadbeef\n", encoding="utf-8"
+    )
+    from_release = _run_preserve(gitless_app, state)
+    assert from_release.returncode == 0, from_release.stderr
+    assert "OPIP_DEPLOY_CONTROLLER_BOOTSTRAP=NOT_NEEDED" in from_release.stdout
+    assert f"OPIP_DEPLOY_CONTROLLER_BOOTSTRAP_SHA={installed}" in from_release.stdout
+
+    # A real worktree still wins over any recorded release identity.
+    repo = tmp_path / "repo"
+    _seed_app(repo)
+    subprocess.run([GIT, "init", "-q", str(repo)], check=True)
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "t")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "c")
+    head = _git(repo, "rev-parse", "HEAD")
+    from_git = _run_preserve(repo, state)
+    assert from_git.returncode == 0, from_git.stderr
+    assert f"OPIP_DEPLOY_CONTROLLER_BOOTSTRAP_SHA={head}" in from_git.stdout
+    assert head != installed
+
+
 def _library_resolver_block() -> str:
     text = (APP / "deploy" / "remote" / "ohm-deploy").read_text(encoding="utf-8")
     start = text.index("opip_source_library_path() {")
