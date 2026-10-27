@@ -286,11 +286,20 @@ def test_image_helper_resolves_the_certified_compose_project():
     if not env_path.exists():
         env_path.write_text("", encoding="utf-8")
         created = True
+    # The core service consumes the controller-generated filtered environment,
+    # so a render harness must provide that artifact too.
+    core_env_path = app / ".env.core"
+    core_created = False
+    if not core_env_path.exists():
+        core_env_path.write_text("", encoding="utf-8")
+        core_created = True
     try:
         rendered = _run(["docker", "compose", "config", "--format", "json"], cwd=str(app))
     finally:
         if created:
             env_path.unlink()
+        if core_created:
+            core_env_path.unlink()
     assert rendered.returncode == 0, rendered.stderr
     config = json.loads(rendered.stdout)
     resolved = opip_image.compose_images(config)
