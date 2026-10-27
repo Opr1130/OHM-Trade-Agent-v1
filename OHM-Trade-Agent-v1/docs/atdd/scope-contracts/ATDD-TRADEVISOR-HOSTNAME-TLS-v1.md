@@ -30,7 +30,7 @@ APPROVED ACCEPTANCE CRITERIA:
 AC-001:
 GIVEN: a Trading droplet at 178.128.147.125, a webhook URL that must resolve to it, and a historical dashboard hostname that resolves elsewhere
 WHEN: the webhook template is read
-THEN: its only `server_name` is `178-128-147-125.sslip.io`, the historical name appears nowhere in it, and `ssl_certificate`/`ssl_certificate_key` both resolve inside `/etc/letsencrypt/live/178-128-147-125.sslip.io/`
+THEN: its only `server_name` is `178-128-147-125.sslip.io`, the historical name is never a served name, and `ssl_certificate`/`ssl_certificate_key` resolve inside the Certbot-managed certificate directory for that name. The directory's own name is a Certbot certificate name, not a served identity; it is corrected to the managed path in ATDD-TRADEVISOR-CERTBOT-PATH-v1
 
 AC-002:
 GIVEN: a certificate that may not yet exist for the corrected name and a dashboard that must keep serving on 8443
@@ -70,6 +70,7 @@ AC-002 -> OHM-Trade-Agent-v1/TRADEVISOR_V2.md
 
 DEFERRED DISCOVERIES:
 - Certificate existence, SAN and expiry on the Trading droplet cannot be verified from the agent environment: TCP 443 and 8443 reject connections from here, so `openssl s_client -servername 178-128-147-125.sslip.io -connect 178.128.147.125:443` remains an owner verification step.
+- The certificate paths assumed here (`/etc/letsencrypt/live/178-128-147-125.sslip.io/`) do not exist on the host; Certbot reports the certificate name `161-35-106-207.sslip.io` for material whose SAN covers the served name. That correction is made in ATDD-TRADEVISOR-CERTBOT-PATH-v1.
 - DNS for `178-128-147-125.sslip.io` resolves to `178.128.147.125`; `161-35-106-207.sslip.io` resolves to `161.35.106.207`, confirming the merged name was wrong.
 - The dashboard's own certificate name is historical and unresolved to the current droplet; correcting it is a separate decision not taken here.
 - No ACME renewal automation exists in the repository; renewal remains host-managed.

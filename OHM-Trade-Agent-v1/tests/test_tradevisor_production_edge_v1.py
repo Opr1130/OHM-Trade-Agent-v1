@@ -19,9 +19,14 @@ validated on the host before traffic is enabled.
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
+
+from app.core.config import Settings
+from app.services.tradevisor_ingress import config_from_settings
 
 pytestmark = pytest.mark.acceptance
 
@@ -217,7 +222,11 @@ def test_ac_008_the_edge_stamp_header_matches_the_application_contract():
 
 # --- Hostname and TLS identity (ATDD-TRADEVISOR-HOSTNAME-TLS-v1) -------------
 HOSTNAME = "178-128-147-125.sslip.io"
-STALE_HOSTNAME = "161-35-106-207.sslip.io"
+#: Certbot reports this *certificate name* for the certificate that covers
+#: HOSTNAME. It is the directory the managed material lives in; it is not a
+#: served identity and it is never renamed (see ATDD-TRADEVISOR-CERTBOT-PATH-v1).
+CERTBOT_NAME = "161-35-106-207.sslip.io"
+CERTBOT_LIVE_DIR = f"/etc/letsencrypt/live/{CERTBOT_NAME}/"
 
 
 def test_ac_001_the_webhook_vhost_names_the_trading_droplet():
@@ -225,9 +234,9 @@ def test_ac_001_the_webhook_vhost_names_the_trading_droplet():
     text = _text(TEMPLATE)
     server_names = re.findall(r"^\s*server_name\s+([^;]+);", text, flags=re.MULTILINE)
     assert server_names == [HOSTNAME]
-    # The historical dashboard name resolves to a different address (161.35.106.207)
-    # and must not be presented as the webhook identity.
-    assert STALE_HOSTNAME not in text
+    # The historical name resolves to 161.35.106.207, not to this droplet, so it
+    # is never a served name. It may appear only as Certbot's directory name.
+    assert f"server_name {CERTBOT_NAME}" not in text
 
 
 def test_ac_001_the_certificate_path_matches_the_hostname():
@@ -236,7 +245,7 @@ def test_ac_001_the_certificate_path_matches_the_hostname():
     cert = re.search(r"ssl_certificate\s+(\S+);", text)
     key = re.search(r"ssl_certificate_key\s+(\S+);", text)
     assert cert is not None and key is not None
-    directory = f"/etc/letsencrypt/live/{HOSTNAME}/"
+    directory = CERTBOT_LIVE_DIR
     assert cert.group(1) == directory + "fullchain.pem"
     assert key.group(1) == directory + "privkey.pem"
 
@@ -246,7 +255,7 @@ def test_ac_002_a_missing_certificate_leaves_the_vhost_dark():
     edge_block = _text(COMPOSE).split("ohm-dashboard-edge:", 1)[1].split(
         "ohm-trade-agent:", 1
     )[0]
-    assert f"cert=/etc/letsencrypt/live/{HOSTNAME}/fullchain.pem" in edge_block
+    assert f"cert={CERTBOT_LIVE_DIR}fullchain.pem" in edge_block
     assert 'if [ ! -s "$cert" ]; then' in edge_block
     assert "webhook vhost disabled" in edge_block
     # nginx still starts for the dashboard: the guard never exits early.
@@ -257,5 +266,136 @@ def test_ac_002_the_dashboard_certificate_and_listener_are_untouched():
     """ATDD-TRADEVISOR-HOSTNAME-TLS-v1/AC-002: dashboard traffic is unaffected by this change."""
     dashboard = _text(DASHBOARD)
     assert "listen 8443 ssl;" in dashboard
-    assert f"{STALE_HOSTNAME}/fullchain.pem" in dashboard
+    assert f"{CERTBOT_NAME}/fullchain.pem" in dashboard
     assert HOSTNAME not in dashboard
+
+
+# --- Certbot-managed certificate paths (ATDD-TRADEVISOR-CERTBOT-PATH-v1) -----
+ACTIVATION = ROOT / "deploy" / "tradevisor" / "activate-tradevisor-advisory.sh"
+
+
+def test_ac_001_the_edge_resolves_the_served_name_from_the_certbot_certificate_name():
+    """ATDD-TRADEVISOR-CERTBOT-PATH-v1/AC-001: served identity and Certbot name are distinct."""
+    text = _text(TEMPLATE)
+    # A live directory named after the served host does not exist on the host;
+    # pointing at it would stop nginx starting and take the dashboard with it.
+    assert f"/etc/letsencrypt/live/{HOSTNAME}/" not in text
+    assert f"ssl_certificate     {CERTBOT_LIVE_DIR}fullchain.pem;" in text
+    assert f"ssl_certificate_key {CERTBOT_LIVE_DIR}privkey.pem;" in text
+    assert f"server_name {HOSTNAME};" in text
+    # The distinction is explained in place, so no operator is invited to rename
+    # the Certbot directory or replace its managed symlinks.
+    assert "Certbot" in text
+    assert "never renamed" in text
+
+
+def test_ac_002_the_render_gate_checks_one_certbot_path_and_stays_fail_closed():
+    """ATDD-TRADEVISOR-CERTBOT-PATH-v1/AC-002: one path, checked, still fail-closed."""
+    edge_block = _text(COMPOSE).split("ohm-dashboard-edge:", 1)[1].split(
+        "ohm-trade-agent:", 1
+    )[0]
+    assert f"cert={CERTBOT_LIVE_DIR}fullchain.pem" in edge_block
+    assert 'if [ ! -s "$cert" ]; then' in edge_block
+    assert "webhook vhost disabled" in edge_block
+    assert "exec nginx -g 'daemon off;'" in edge_block
+    # No stale live directory survives anywhere in the deployed contract.
+    for path in (TEMPLATE, COMPOSE):
+        assert f"/etc/letsencrypt/live/{HOSTNAME}" not in _text(path)
+
+
+def test_ac_003_the_activation_script_is_failfast_bound_and_secret_free():
+    """ATDD-TRADEVISOR-CERTBOT-PATH-v1/AC-003: bounded operator script, no secrets, no deploy bypass."""
+    text = _text(ACTIVATION)
+    assert text.startswith("#!/usr/bin/env bash")
+    assert "set -Eeuo pipefail" in text
+    # Bound to the verified droplet, the Certbot name and an exact approved SHA.
+    assert 'readonly PUBLIC_IP="178.128.147.125"' in text
+    assert 'readonly PRIVATE_IP="10.116.0.3"' in text
+    assert f'readonly CERTBOT_NAME="{CERTBOT_NAME}"' in text
+    assert "--sha must be 40 lowercase hex characters" in text
+    # No secret value is embedded: the token and stamp are read from .env.
+    assert "OPIP_TRADEVISOR_WEBHOOK_TOKEN=" not in text
+    assert "OPIP_TRADEVISOR_INTERNAL_VERIFICATION_VALUE=" not in text
+    # The GitHub controller stays the only deployment path.
+    code = "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert "ssh " not in code
+    assert not re.search(r"(^|\s)(sudo\s+)?(/usr/local/sbin/)?ohm-deploy(\s|$)", code)
+    assert "/deploy " not in code
+
+
+def test_ac_003_the_activation_script_is_valid_bash():
+    """ATDD-TRADEVISOR-CERTBOT-PATH-v1/AC-003: the operator script parses as bash before it is shipped."""
+    bash = shutil.which("bash")
+    if bash is None:  # Windows dev hosts have no bash; the Linux runner is the gate.
+        pytest.skip("bash is not installed on this host")
+    result = subprocess.run(
+        [bash, "-n", str(ACTIVATION)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_ac_003_the_activation_script_orders_gates_before_enabling_ingress():
+    """ATDD-TRADEVISOR-CERTBOT-PATH-v1/AC-003: gates first, one flip, recoverable."""
+    text = _text(ACTIVATION)
+    validate = text.index("validate_composed_nginx() {")
+    edge = text.index("recreate_edge() {")
+    enable = text.index("enable_ingress() {")
+    assert validate < edge < enable
+    main_body = text.split("\nmain() {", 1)[1]
+    # rindex: the rollback branch calls final_verification earlier, so the
+    # activation sequence is the last occurrence of each gate.
+    order = [
+        main_body.rindex(name)
+        for name in (
+            "verify_host_identity",
+            "verify_env_file_and_credentials",
+            "verify_release_and_recovery",
+            "verify_certificate",
+            "validate_composed_nginx",
+            "recreate_edge",
+            "enable_ingress",
+            "verify_route_authenticated",
+            "final_verification",
+        )
+    ]
+    assert order == sorted(order)
+    # One atomic flip of the master switch, and no earlier write to it.
+    assert text.count('set_env_value "$ENABLE_KEY" "true"') == 1
+    # Failure restores the pre-activation posture instead of leaving ingress lit.
+    assert "restore_pre_activation_posture" in text
+    assert "trap 'on_error $LINENO' ERR" in text
+    # The only authenticated probe is a refusal path that writes no durable row.
+    assert "422" in text
+    assert "no durable row" in text
+
+
+def test_ac_004_the_documented_csv_formats_are_what_the_application_parses():
+    """ATDD-TRADEVISOR-CERTBOT-PATH-v1/AC-004: operator formats come from the parser, not a guess."""
+    settings = Settings(_env_file=None, webhook_secret="x" * 12)
+    resolved = config_from_settings(settings)
+    assert resolved.alert_configs == {
+        "tradevisor-1h-buy": "BUY",
+        "tradevisor-1h-sell": "SELL",
+    }
+    assert resolved.instruments[("COINBASE", "BTCUSD")] == ("BTC/USD", "XBTUSD")
+    assert len(resolved.instruments) == 10
+    assert resolved.interval_minutes == 60
+    assert settings.opip_tradevisor_enabled is False
+    assert settings.opip_tradevisor_observation_enabled is False
+
+    # The grammar is CSV of the two documented row shapes, nothing else.
+    overridden = Settings(
+        _env_file=None,
+        webhook_secret="x" * 12,
+        opip_tradevisor_alert_configs="tradevisor-4h-buy=BUY",
+        opip_tradevisor_instruments="COINBASE:ETHUSD=ETH/USD:ETHUSD",
+    )
+    narrowed = config_from_settings(overridden)
+    assert narrowed.alert_configs == {"tradevisor-4h-buy": "BUY"}
+    assert narrowed.instruments == {("COINBASE", "ETHUSD"): ("ETH/USD", "ETHUSD")}
+

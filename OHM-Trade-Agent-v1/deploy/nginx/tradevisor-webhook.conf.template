@@ -38,14 +38,22 @@ server {
     listen 443 ssl default_server;
     # This name must resolve to the Trading droplet: 178-128-147-125.sslip.io is
     # encoded from 178.128.147.125, the only host that runs this edge. The
-    # dashboard's historical hostname encodes a different address and must never
-    # be used for webhook delivery, so it appears nowhere in this file.
+    # dashboard's historical hostname encodes a different address and is never
+    # used as a served name here.
     server_name 178-128-147-125.sslip.io;
 
     server_tokens off;
     ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_certificate     /etc/letsencrypt/live/178-128-147-125.sslip.io/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/178-128-147-125.sslip.io/privkey.pem;
+    # The served identity (server_name) and the certificate's Certbot *name* are
+    # two different strings. Certbot reports the certificate name
+    # 161-35-106-207.sslip.io for the certificate that covers
+    # 178-128-147-125.sslip.io, so /etc/letsencrypt/live/161-35-106-207.sslip.io
+    # is the only directory the managed material exists in. Certbot directories
+    # and their symlinks are never renamed by this repository; the SAN/hostname
+    # match is verified on the host before activation, not assumed from the path
+    # (deploy/tradevisor/activate-tradevisor-advisory.sh).
+    ssl_certificate     /etc/letsencrypt/live/161-35-106-207.sslip.io/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/161-35-106-207.sslip.io/privkey.pem;
 
     # TradingView documents that its webhook server presents a client
     # certificate, but publishes no CA certificate or public key to verify it
