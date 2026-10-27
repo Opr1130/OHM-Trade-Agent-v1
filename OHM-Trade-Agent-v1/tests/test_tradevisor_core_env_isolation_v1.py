@@ -584,7 +584,10 @@ def test_runtime_core_env_is_not_part_of_the_release_manifest(
     (release / "app").mkdir(parents=True)
     (release / "data").mkdir()
     (release / "app" / "x.py").write_text("X = 1\n", encoding="utf-8")
-    (release / ".env").write_text("KRAKEN_API_KEY=not-a-real-key\n", encoding="utf-8")
+    (release / ".env").write_text(
+        "OPIP_RELEASE_PROFILE=EVIDENCE_SHADOW\nKRAKEN_API_KEY=not-a-real-key\n",
+        encoding="utf-8",
+    )
     (release / "data" / "canonical.sqlite3").write_bytes(b"db")
     state = tmp_path / "state"
     state.mkdir()
