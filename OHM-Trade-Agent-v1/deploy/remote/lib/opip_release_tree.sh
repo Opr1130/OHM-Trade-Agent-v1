@@ -43,6 +43,10 @@ GIT=()
 OPIP_FUNDED_CREDENTIAL_KEYS="KRAKEN_API_KEY KRAKEN_API_SECRET KRAKEN_PRIVATE_KEY KRKN_API_KEY LIVE_TRADING_KEY"
 
 opip_core_env_path() {
+  # Runtime-only, controller-generated file. Like `.env` and `data/` it is NOT
+  # part of the release artifact and MUST stay out of the release manifest:
+  # `rt_list_tree` excludes it, so a tree that carries it still re-verifies and
+  # the next activation cannot refuse it as "files absent from its manifest".
   printf '%s\n' "$APP_ROOT/.env.core"
 }
 
@@ -157,11 +161,19 @@ rt_manifest_digest() {
 rt_list_tree() {
   # Deterministic `sha256  relative-path` stream for a release tree directory.
   # Runtime-only paths are excluded exactly like the M07 install contract.
+  #
+  # `./.env.core` is the controller-generated filtered core environment
+  # (`opip_write_core_env`). It lives in the application root but is never part
+  # of the release artifact, so it is excluded here for the same reason `.env`
+  # and `data/` are: otherwise the file the controller must create to satisfy
+  # `env_file: .env.core` would make the very next activation refuse the tree as
+  # carrying "files absent from its manifest".
   local root="$1"
   (
     cd "$root" || exit 1
     find . -type f \
-      -not -path './data/*' -not -path './.env' -not -path './__pycache__/*' \
+      -not -path './data/*' -not -path './.env' -not -path './.env.core' \
+      -not -path './__pycache__/*' \
       -not -name '*.py[cod]' -print0 \
       | LC_ALL=C sort -z \
       | xargs -0 -r sha256sum
@@ -266,8 +278,11 @@ rt_snapshot_current() {
   install -d -m 0700 "$OPIP_RELEASES_DIR" "$dir"
   manifest="$dir/manifest.sha256"
   rt_list_tree "$APP_ROOT" > "$manifest"
+  # Same runtime-only exclusions as `rt_list_tree`: the retained vehicle is
+  # source bytes, so the owner's `.env` and the controller-generated filtered
+  # core environment never enter it (and never break its own re-verification).
   tar -cf "$dir/source.tar" -C "$APP_ROOT" \
-    --exclude=./data --exclude=./.env --exclude=./__pycache__ .
+    --exclude=./data --exclude=./.env --exclude=./.env.core --exclude=./__pycache__ .
   rt_verify_tree "$APP_ROOT" "$manifest" || {
     echo "refusing deploy: cannot retain the running source as a rollback vehicle" >&2
     return 1

@@ -18,6 +18,13 @@ STREAM_RECONCILE="$APP_ROOT/deploy/remote/reconcile-stream-worker.sh"
 LEARNING_EXPORTER="$APP_ROOT/deploy/remote/export-opip-learning-evidence.sh"
 DEPLOY_SCRIPT_SRC="$APP_ROOT/deploy/remote/ohm-deploy"
 SSH_GATEWAY_SRC="$APP_ROOT/deploy/remote/ohm-deploy-ssh"
+# The release-tree source provider is installed beside the controller, at the
+# stable root-controlled path the controller resolves BEFORE the release tree.
+# It is the only remote-op that the deploy itself depends on (the core service's
+# `env_file: .env.core` is produced by `opip_write_core_env` from this library),
+# so it must track the deployed release exactly like the controller does.
+LIBRARY_SRC="$APP_ROOT/deploy/remote/lib/opip_release_tree.sh"
+LIBRARY_DST="/usr/local/lib/opip/opip_release_tree.sh"
 LEARNING_READER_SRC="$APP_ROOT/deploy/remote/opip-learning-read-export.sh"
 LEARNING_DIAGNOSTICS_SRC="$APP_ROOT/deploy/remote/diagnose-opip-learning.sh"
 DEPLOY_SCRIPT_DST="/usr/local/sbin/ohm-deploy"
@@ -47,6 +54,7 @@ for required in \
   "$LEARNING_EXPORTER" \
   "$DEPLOY_SCRIPT_SRC" \
   "$SSH_GATEWAY_SRC" \
+  "$LIBRARY_SRC" \
   "$LEARNING_READER_SRC" \
   "$LEARNING_DIAGNOSTICS_SRC"; do
   if [[ ! -s "$required" ]]; then
@@ -334,6 +342,26 @@ else
   stream_rc=$?
   echo "O'Pip stream worker reconciliation: degraded (rc=$stream_rc); shadow evidence unavailable or incomplete; production core unaffected" >&2
 fi
+
+# Refresh the release-tree source provider from the exact deployed SHA, as the
+# last mutation of this reconciliation: the deploy of this SHA has already
+# sourced the previous copy, so this can only affect the NEXT deploy -- which is
+# the point, because the library must never be one release behind the controller
+# that sources it (it provides `opip_write_core_env`, and the core service's
+# `env_file: .env.core` cannot exist without it). It is data, not an executable
+# (mode 0644). It is installed only after every earlier step succeeded, so no
+# ERR rollback can leave a new library beside a restored old controller, and a
+# library that does not parse is never installed at all.
+if ! bash -n "$LIBRARY_SRC"; then
+  echo "source library fails syntax validation; refusing to install it" >&2
+  false
+fi
+install -d -o root -g root -m 0755 "$(dirname "$LIBRARY_DST")"
+LIBRARY_STAGED="$(mktemp "$(dirname "$LIBRARY_DST")/.opip_release_tree.stage.XXXXXX")"
+rm -f "$LIBRARY_STAGED"
+install -o root -g root -m 0644 "$LIBRARY_SRC" "$LIBRARY_STAGED"
+mv -f "$LIBRARY_STAGED" "$LIBRARY_DST"
+echo "OPIP_RELEASE_TREE_LIBRARY_INSTALLED=$LIBRARY_DST"
 
 trap - ERR
 rm -rf "$tmpdir"

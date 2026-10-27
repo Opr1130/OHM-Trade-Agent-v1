@@ -121,6 +121,7 @@ WHEN:
 the deploy controller activates a release
 THEN:
 it derives a filtered core environment from `.env` that excludes every name in `release_profiles.FUNDED_CREDENTIAL_KEYS`, keeps every other setting, is root-owned mode 0600, produced atomically and idempotently without printing any value, is regenerated on rotation and on rollback, refuses to proceed when the source is missing or symlinked, and the core service consumes only that filtered file; the owner's `.env` and all credentials remain intact, the Tradevisor credential-isolation gate is unchanged, and the operator `/positions` and `/orders` views degrade to a bounded message when no credential is present
+AND the filtered file exists before ANY Compose operation that resolves the core service: it is generated for the release installed before activation (ahead of the pre-activation `docker compose exec` evidence-baseline read, which is the first Compose call), regenerated after activation and before the build/recreate, and generated at the start of the rollback path BEFORE the producer-quiescence proof, so a deploy that fails before the file is generated still reaches a provable quiescence instead of aborting as `PRODUCER_QUIESCENCE_UNPROVEN`; a source provider that cannot provide the generator refuses at start-up, before activation and before any Compose call, naming the owner-operated controller bootstrap as the remedy; the file is runtime-only (`rt_list_tree`/`rt_snapshot_current` exclude it) so it can never make the installed release or its rollback vehicle fail verification, while an unrecorded or modified source file still fails closed; and the source provider is installed from the deployed release by scheduler reconciliation on the same path as the controller, so it can never be one release behind it
 
 EXPLICITLY OUT OF SCOPE:
 - Converting the production source root into a Git worktree, or creating any `.git` there.
@@ -160,7 +161,17 @@ AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_generator_removes
 AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_generator_is_idempotent_and_follows_rotation
 AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_missing_or_symlinked_source_fails_closed
 AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_core_compose_consumes_only_the_filtered_environment
-AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_controller_generates_before_compose_and_on_rollback
+AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_controller_generates_before_every_compose_operation_and_on_both_failure_paths
+AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_core_env_exists_before_the_first_compose_call_that_resolves_the_core_service
+AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_the_pre_incident_order_fails_exactly_as_reported
+AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_rollback_generates_the_core_env_before_the_producer_quiescence_proof
+AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_rollback_without_the_generation_gate_reproduces_the_reported_abort
+AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_rollback_stays_fail_closed_when_the_core_env_cannot_be_generated
+AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_runtime_core_env_is_not_part_of_the_release_manifest
+AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_controller_refuses_before_activation_when_the_library_cannot_generate
+AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_scheduler_reconciliation_keeps_the_source_provider_in_lockstep
+AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_bootstrap_preserves_a_proven_activation_record
+AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_the_edited_remote_operators_parse
 AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_positions_fails_safe_when_the_credential_is_absent
 
 IMPLEMENTATION MAP:
@@ -190,6 +201,8 @@ AC-012 -> OHM-Trade-Agent-v1/tests/test_tradevisor_core_env_isolation_v1.py
 AC-012 -> OHM-Trade-Agent-v1/deploy/m07/tests/scenarios/test_r3_concurrency_and_compose.py
 AC-012 -> OHM-Trade-Agent-v1/deploy/m07/tests/scenarios/test_r3_controller_parity.py
 AC-007 -> OHM-Trade-Agent-v1/deploy/remote/bootstrap-release-tree-controller.sh
+AC-012 -> OHM-Trade-Agent-v1/deploy/remote/bootstrap-release-tree-controller.sh
+AC-012 -> OHM-Trade-Agent-v1/deploy/remote/reconcile-scheduler.sh
 AC-001 -> OHM-Trade-Agent-v1/tests/test_opip_release_tree_controller_v1.py
 AC-002 -> OHM-Trade-Agent-v1/tests/test_opip_release_tree_controller_v1.py
 AC-003 -> OHM-Trade-Agent-v1/tests/test_opip_release_tree_controller_v1.py

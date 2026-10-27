@@ -101,6 +101,17 @@ for opip_required_fn in "${OPIP_SOURCE_LIB_REQUIRED[@]}"; do
 done
 unset opip_required_fn
 echo "OPIP_SOURCE_LIBRARY=$OPIP_SOURCE_LIB"
+# The core service declares `env_file: .env.core`, and every Compose operation
+# that resolves the core service fails closed when that file is absent. The
+# generator lives in this source library, which is installed at its stable
+# root-controlled location, so a library that predates the generator makes the
+# contract unsatisfiable. Refuse HERE -- before activation, before the first
+# runtime mutation and before any Compose call -- and name the only supported
+# remedy, instead of discovering it after the canonical writer was recreated.
+if ! declare -F opip_write_core_env >/dev/null; then
+  echo "refusing deploy: source library at $OPIP_SOURCE_LIB does not provide opip_write_core_env, which the core service's env_file (.env.core) requires; install the controller and library for the approved release first: sudo -n bash $APP_ROOT/deploy/remote/bootstrap-release-tree-controller.sh --apply --sha $TARGET_SHA" >&2
+  exit 69
+fi
 opip_source_init
 
 wait_core_health() {
@@ -928,6 +939,32 @@ else
 fi
 
 cd "$APP_ROOT"
+# The filtered core environment must exist BEFORE ANY Compose operation that
+# resolves the core service, and the first such operation is the evidence
+# baseline read directly below (`docker compose exec -T ohm-trade-agent`), which
+# runs against the release installed RIGHT NOW.
+#
+# Generation after activation only is too late for two states that occur in
+# production: (a) a retry after an activation that completed but whose deploy
+# then failed -- exactly the 3ed771fb incident, where the tree on disk already
+# declared `env_file: .env.core` while no filtered file had ever been produced;
+# and (b) every rollback entry point, which begins on that same candidate tree.
+# In both states Compose cannot resolve the core service, the process proof comes
+# back UNKNOWN, and a rollback that could have completed is aborted as
+# PRODUCER_QUIESCENCE_UNPROVEN.
+#
+# This is additive and idempotent: the owner's `.env` is never modified, the file
+# is root-owned mode 0600, and activation releases (never deletes) it. Its only
+# effect before the preflight is a derived, non-authoritative runtime file -- the
+# same class of artefact `snapshot_scheduler_state` already writes there -- so no
+# service, data store, scheduler entry, secret or source file changes. It fails
+# closed: no Compose call may run against a core service whose filtered
+# environment is unproven, and a refusal here happens before the ERR trap that
+# starts a rollback is installed, so it leaves the running release untouched.
+opip_write_core_env || {
+  echo "refusing deploy: the filtered core environment could not be generated for the installed release" >&2
+  false
+}
 RELEASE_EVIDENCE_BASELINE="$(capture_release_evidence_baseline)"
 [[ "$RELEASE_EVIDENCE_BASELINE" == \{*\} ]] || {
   echo "release evidence baseline is malformed; refusing deployment" >&2
@@ -1260,6 +1297,22 @@ rollback() {
     echo "OPIP_RELEASE_RUNTIME_VERIFIER_EXIT=$rc"
     emit_capture_producer_disposition_evidence || true
   fi
+
+  # `.env.core` BEFORE any Compose operation, and quiescence below is the FIRST
+  # one on this path (`docker compose ps`, then `docker compose exec -T
+  # ohm-trade-agent`). When the deploy failed before the filtered core
+  # environment existed -- activation interrupted, or any failure between
+  # activation and the post-activation generation -- the tree on disk already
+  # declares `env_file: .env.core`. Compose then cannot resolve the core service,
+  # the in-container process proof is UNKNOWN, and a rollback that could have
+  # completed is aborted as PRODUCER_QUIESCENCE_UNPROVEN. Regenerate for the tree
+  # that is installed right now.
+  #
+  # Like the regeneration after the previous release is restored, this never
+  # blocks the rollback: if the file genuinely cannot be produced, quiescence
+  # still fails closed below and the abort stays fail-closed.
+  opip_write_core_env \
+    || echo "WARN  rollback: filtered core environment could not be generated before producer quiescence" >&2
 
   # Free paper-worker memory before rebuilding the previous deterministic core.
   stop_paper_stack
@@ -1729,8 +1782,11 @@ else
 fi
 
 # The core container must never inherit a funded credential. The filtered
-# environment is generated AFTER activation and BEFORE the first Compose call,
-# and the deploy fails closed if it cannot be produced.
+# environment is generated AFTER activation (so it is regenerated from the
+# candidate release's own `.env` view) and BEFORE the build/recreate that
+# resolves the core service; the deploy fails closed if it cannot be produced.
+# This is the SECOND of the two generation gates: the first one, above, covers
+# the release installed before activation, whose Compose calls run earlier.
 opip_write_core_env || {
   echo "refusing deploy: the filtered core environment could not be generated" >&2
   false
