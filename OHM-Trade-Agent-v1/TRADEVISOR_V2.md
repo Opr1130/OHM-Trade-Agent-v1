@@ -257,6 +257,8 @@ existing `ohm-dashboard-edge` container, which keeps serving the dashboard on
 | Render target | `/etc/nginx/tradevisor/tradevisor-webhook.conf` (tmpfs, never on disk) |
 | Edge stamp source | `OPIP_TRADEVISOR_INTERNAL_VERIFICATION_VALUE` in the host `.env` |
 | Public listener | `443:443` on the edge service; application stays `127.0.0.1:8000` |
+| Webhook hostname | `178-128-147-125.sslip.io` (encodes the Trading droplet `178.128.147.125`); the dashboard's historical `161-35-106-207.sslip.io` resolves elsewhere and is never used here |
+| Certificate | `/etc/letsencrypt/live/178-128-147-125.sslip.io/` must exist for that name; when it is absent the render is skipped and the vhost stays dark |
 | Peer identity | edge `172.31.240.2` → application `172.31.240.3` (`tradevisor_edge`) |
 | Dashboard protection | `dashboard-sidecar.conf` keeps its read-only mount; one additive `include` |
 
@@ -271,11 +273,14 @@ Operating steps (owner, on the host, in this order):
    `OPIP_TRADEVISOR_WEBHOOK_TOKEN` (≥43 URL-safe characters), `_ENABLED=true`,
    `_TRUSTED_PROXY_IPS=172.31.240.2`, `_ALERT_CONFIGS`, `_INSTRUMENTS`,
    `_ALLOWED_EXCHANGES=COINBASE` and `_OBSERVATION_ENABLED` in `.env`.
-2. Validate before reload: `docker compose exec ohm-dashboard-edge nginx -t`.
-3. Recreate the edge only: `docker compose up -d --no-deps ohm-dashboard-edge`,
+2. Confirm the certificate for `178-128-147-125.sslip.io` exists
+   (`certbot certificates`); if it does not, issue it before enabling, otherwise
+   the vhost deliberately stays dark.
+3. Validate before reload: `docker compose exec ohm-dashboard-edge nginx -t`.
+4. Recreate the edge only: `docker compose up -d --no-deps ohm-dashboard-edge`,
    then confirm 8443 still serves the dashboard and 443 answers only the webhook.
-4. Open 443 to the four TradingView addresses in the cloud firewall only.
-5. Rollback: unset the value (or remove the rendered file) and recreate the edge;
+5. Open 443 to the four TradingView addresses in the cloud firewall only.
+6. Rollback: unset the value (or remove the rendered file) and recreate the edge;
    the dashboard is unaffected because the include then matches nothing.
 
 Client certificate: TradingView publishes no CA, so chain verification is not
