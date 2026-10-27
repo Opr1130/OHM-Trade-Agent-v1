@@ -171,12 +171,14 @@ def test_controller_generates_before_compose_and_on_rollback() -> None:
     """ATDD-RELEASE-TREE-DEPLOY-v1/AC-012: generation runs after activation and
     before the first Compose call, and again on the rollback path."""
     deploy = DEPLOY.read_text(encoding="utf-8")
-    first = deploy.index("opip_write_core_env")
+    deploy_call = deploy.index("opip_write_core_env || {")
     build = deploy.index('docker compose build --build-arg "OPIP_RELEASE_SHA=$TARGET_SHA"')
-    assert first < build
+    assert deploy_call < build
     assert "refusing deploy: the filtered core environment could not be generated" in deploy
-    rollback = deploy.index("rollback: filtered core environment could not be regenerated")
-    assert rollback < first
+    rollback_call = deploy.index("opip_write_core_env \\")
+    rollback_note = deploy.index("rollback: filtered core environment could not be regenerated")
+    assert rollback_call < rollback_note
+    assert rollback_note < deploy_call
 
 
 def test_positions_fails_safe_when_the_credential_is_absent(monkeypatch) -> None:
