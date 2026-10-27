@@ -136,6 +136,7 @@ rt_write_state "$OPIP_CURRENT_RELEASE" "$TARGET_SHA" unverified-baseline \\
 def _call(release: "Release", sha: str, body: str, env: dict[str, str] | None = None):
     script = f"""
 set -Eeuo pipefail
+OPIP_SOURCE_CACHE={release.cache}
 REPO_ROOT={release.repo_root}
 APP_ROOT={release.app_root}
 STATE_DIR={release.state}

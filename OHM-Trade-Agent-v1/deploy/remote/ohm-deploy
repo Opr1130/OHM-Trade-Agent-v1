@@ -852,7 +852,7 @@ validate_candidate_container_identity() {
   echo "OPIP_RELEASE_PROFILE=$profile"
 }
 
-if [[ "$OPIP_SOURCE_MODE" == "git-worktree" ]]; then
+if [[ "${OPIP_SOURCE_MODE:-git-worktree}" == "git-worktree" ]]; then
   "${GIT[@]}" fetch --prune origin main
   REMOTE_MAIN_SHA="$("${GIT[@]}" rev-parse origin/main)"
   if [[ "$TARGET_SHA" != "$REMOTE_MAIN_SHA" ]]; then
@@ -1249,7 +1249,7 @@ rollback() {
     exit "$rc"
   fi
 
-  if [[ "$OPIP_SOURCE_MODE" == "git-worktree" ]]; then
+  if [[ "${OPIP_SOURCE_MODE:-git-worktree}" == "git-worktree" ]]; then
     "${GIT[@]}" checkout -f main
     "${GIT[@]}" reset --hard "$PREVIOUS_SHA"
     cd "$APP_ROOT"
@@ -1373,7 +1373,7 @@ run_protection_preflight() {
   # concurrency. Any leftover tree or worktree registration from an interrupted
   # run is removed first, then `git worktree add --detach` checks out exactly
   # TARGET_SHA without touching the live worktree's HEAD or files.
-  if [[ "$OPIP_SOURCE_MODE" == "git-worktree" ]]; then
+  if [[ "${OPIP_SOURCE_MODE:-git-worktree}" == "git-worktree" ]]; then
     "${GIT[@]}" worktree remove --force "$candidate_root" >/dev/null 2>&1 || true
     rm -rf "$candidate_root"
     "${GIT[@]}" worktree prune 2>/dev/null || true
@@ -1604,7 +1604,7 @@ PY
 
   # Remove the temporary candidate tree BEFORE returning, on PASS and FAIL, so
   # the live repository HEAD is untouched in both outcomes.
-  if [[ "$OPIP_SOURCE_MODE" == "git-worktree" ]]; then
+  if [[ "${OPIP_SOURCE_MODE:-git-worktree}" == "git-worktree" ]]; then
     "${GIT[@]}" worktree remove --force "$candidate_root" >/dev/null 2>&1 || true
     "${GIT[@]}" worktree prune 2>/dev/null || true
   fi
@@ -1662,7 +1662,7 @@ if ! run_protection_preflight; then
   exit 77
 fi
 
-if [[ "$OPIP_SOURCE_MODE" == "git-worktree" ]]; then
+if [[ "${OPIP_SOURCE_MODE:-git-worktree}" == "git-worktree" ]]; then
   "${GIT[@]}" checkout -f main
   "${GIT[@]}" reset --hard "$TARGET_SHA"
 else
@@ -1670,7 +1670,7 @@ else
 fi
 
 cd "$APP_ROOT"
-if [[ "$OPIP_SOURCE_MODE" == "git-worktree" ]]; then
+if [[ "${OPIP_SOURCE_MODE:-git-worktree}" == "git-worktree" ]]; then
   [[ "$("${GIT[@]}" rev-parse HEAD)" == "$TARGET_SHA" ]] || {
     echo "checked-out repository SHA changed before build" >&2
     false
