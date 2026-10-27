@@ -1433,6 +1433,126 @@ rollback() {
 }
 trap rollback ERR
 
+# --- read-only preflight runtime image resolution ---------------------------
+#
+# The candidate-version preflight executes the CANDIDATE's own protection
+# evaluator: its app tree is bind-mounted read-only from TARGET_SHA, and the
+# container only supplies the interpreter and the installed dependencies.
+#
+# The controller used to take the running core container's image ID and pass it
+# straight to `docker run`. That ID can be gone from the daemon (a partially
+# applied release can leave a container whose image was pruned), and then the
+# entire preflight fails with an opaque `No such image` instead of evaluating
+# protection at all. Recovery must never mean "run any image": an image is
+# admitted only when its identity AND its runtime compatibility are provable,
+# and the image ID (never a mutable tag) is what executes.
+#
+#: Runtime inputs that define the preflight container's compatibility. Two
+#: revisions whose Dockerfile and requirements.txt are byte-identical produce
+#: the same runtime, so the candidate's evaluator can be executed in an image
+#: built from either of them.
+PREFLIGHT_RUNTIME_INPUTS=(Dockerfile requirements.txt)
+
+#: Resolution outcome, always emitted as bounded provenance markers.
+PREFLIGHT_IMAGE_SOURCE="NONE"
+PREFLIGHT_IMAGE_ID=""
+PREFLIGHT_IMAGE_REVISION=""
+PREFLIGHT_IMAGE_REFERENCE=""
+PREFLIGHT_IMAGE_REASON=""
+
+preflight_image_field() {
+  # preflight_image_field <reference> <format> -> one bounded daemon read.
+  docker image inspect --format "$2" "$1" 2>/dev/null || true
+}
+
+preflight_image_present() {
+  # The reference must resolve to a fully content-addressed image that the
+  # daemon still has; a partially matching or truncated answer is not proof.
+  local id="$1" actual
+  [[ "$id" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+  actual="$(preflight_image_field "$id" '{{.Id}}')"
+  [[ "$actual" == "$id" ]]
+}
+
+preflight_image_runtime_compatible() {
+  # preflight_image_runtime_compatible <image-id> <candidate-tree>
+  #
+  # Identity: the image's own release label must name a real commit in the
+  # trusted source cache. Compatibility: that commit's runtime inputs must be
+  # byte-identical to the candidate's. Anything unprovable is refused.
+  local id="$1" tree="$2" revision file expected actual
+  revision="$(preflight_image_field "$id" '{{index .Config.Labels "org.opencontainers.image.revision"}}')"
+  [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || return 1
+  "${GIT[@]}" cat-file -e "${revision}^{commit}" 2>/dev/null || return 1
+  for file in "${PREFLIGHT_RUNTIME_INPUTS[@]}"; do
+    [[ -f "$tree/$file" ]] || return 1
+    expected="$("${GIT[@]}" show "${revision}:OHM-Trade-Agent-v1/${file}" 2>/dev/null \
+      | sha256sum | awk '{print $1}')" || return 1
+    actual="$(sha256sum "$tree/$file" 2>/dev/null | awk '{print $1}')" || return 1
+    [[ -n "$expected" && "$expected" == "$actual" ]] || return 1
+  done
+  PREFLIGHT_IMAGE_REVISION="$revision"
+  return 0
+}
+
+resolve_preflight_runtime_image() {
+  # resolve_preflight_runtime_image <candidate-tree>
+  #
+  # Returns nonzero, setting no image, whenever no image can be verified. The
+  # caller then refuses the release; it never substitutes an image on its own.
+  # The outcome is published through PREFLIGHT_IMAGE_* (never through stdout, so
+  # the provenance is visible to the caller instead of dying in a subshell).
+  local tree="${1:-}" running_id reference resolved
+  PREFLIGHT_IMAGE_SOURCE="NONE"
+  PREFLIGHT_IMAGE_ID=""
+  PREFLIGHT_IMAGE_REVISION=""
+  PREFLIGHT_IMAGE_REFERENCE=""
+  PREFLIGHT_IMAGE_REASON=""
+
+  running_id="$(docker inspect --format '{{.Image}}' ohm-trade-agent 2>/dev/null || true)"
+  reference="$(docker inspect --format '{{.Config.Image}}' ohm-trade-agent 2>/dev/null || true)"
+
+  # (1) The image the running core container executes. Present locally means the
+  # preflight runs in exactly the runtime production is running, which is the
+  # strongest identity available and needs no further compatibility proof.
+  if [[ "$running_id" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    if preflight_image_present "$running_id"; then
+      PREFLIGHT_IMAGE_SOURCE="RUNNING_CONTAINER_IMAGE"
+      PREFLIGHT_IMAGE_ID="$running_id"
+      PREFLIGHT_IMAGE_REFERENCE="$reference"
+      PREFLIGHT_IMAGE_REVISION="$(
+        preflight_image_field "$running_id" '{{index .Config.Labels "org.opencontainers.image.revision"}}'
+      )"
+      return 0
+    fi
+    PREFLIGHT_IMAGE_REASON="RUNNING_IMAGE_ABSENT"
+  else
+    PREFLIGHT_IMAGE_REASON="RUNNING_IMAGE_UNREADABLE"
+  fi
+
+  # (2) The reference the running container was CREATED from, resolved to a
+  # content-addressed ID and admitted only when its source revision is provable
+  # and its runtime inputs match the candidate's. The ID is executed, so a
+  # concurrent retag of the tag cannot change what runs.
+  if [[ -z "$reference" ]]; then
+    PREFLIGHT_IMAGE_REASON="CONTAINER_IMAGE_REFERENCE_UNKNOWN"
+    return 1
+  fi
+  resolved="$(preflight_image_field "$reference" '{{.Id}}')"
+  if [[ "$resolved" =~ ^sha256:[0-9a-f]{64}$ ]] && preflight_image_present "$resolved"; then
+    if [[ -n "$tree" ]] && preflight_image_runtime_compatible "$resolved" "$tree"; then
+      PREFLIGHT_IMAGE_SOURCE="VERIFIED_CONTAINER_IMAGE_REFERENCE"
+      PREFLIGHT_IMAGE_ID="$resolved"
+      PREFLIGHT_IMAGE_REFERENCE="$reference"
+      return 0
+    fi
+    PREFLIGHT_IMAGE_REASON="CONTAINER_IMAGE_REFERENCE_INCOMPATIBLE"
+    return 1
+  fi
+  PREFLIGHT_IMAGE_REASON="CONTAINER_IMAGE_REFERENCE_UNRESOLVABLE"
+  return 1
+}
+
 # Candidate-version read-only protection preflight (AC-024).
 #
 # Bootstrap limitation: the host executes the already-installed
@@ -1460,8 +1580,9 @@ run_protection_preflight() {
   local shadow_readiness shadow_blocking shadow_advisory shadow_unmanaged
   local shadow_candidate shadow_blocking_incidents strict_f11_state
   local candidate_root="$STATE_DIR/protection-candidate"
+  local candidate_tree="$candidate_root/OHM-Trade-Agent-v1"
   local candidate_app=""
-  image="$(docker inspect --format '{{.Image}}' ohm-trade-agent 2>/dev/null || true)"
+  image=""
   receipt="$STATE_DIR/protection-preflight.json"
   install -d -m 0755 "$STATE_DIR"
   : > "$receipt"
@@ -1486,7 +1607,24 @@ run_protection_preflight() {
     # artifact, so the live application tree is still untouched here.
     rm -rf "$candidate_root"
   fi
-  candidate_app="$candidate_root/OHM-Trade-Agent-v1/app"
+  candidate_app="$candidate_tree/app"
+
+  # The runtime image is resolved only after the candidate tree exists, because
+  # compatibility is proven against the candidate's own runtime inputs. The
+  # chosen image is always a content-addressed ID, its provenance is recorded,
+  # and a failure to prove one refuses the release before any mutation -- the
+  # preflight never substitutes an image of its own choosing.
+  image=""
+  if resolve_preflight_runtime_image "$candidate_tree"; then
+    image="$PREFLIGHT_IMAGE_ID"
+  fi
+  echo "OPIP_PROTECTION_PREFLIGHT_IMAGE_SOURCE=$PREFLIGHT_IMAGE_SOURCE"
+  echo "OPIP_PROTECTION_PREFLIGHT_IMAGE_ID=${PREFLIGHT_IMAGE_ID:-NONE}"
+  echo "OPIP_PROTECTION_PREFLIGHT_IMAGE_REVISION=${PREFLIGHT_IMAGE_REVISION:-NONE}"
+  echo "OPIP_PROTECTION_PREFLIGHT_IMAGE_REASON=${PREFLIGHT_IMAGE_REASON:-NONE}"
+  if [[ -z "$image" ]]; then
+    echo "protection preflight refused: no verified runtime image ($PREFLIGHT_IMAGE_REASON)" >&2
+  fi
 
   rc=1
   if [[ -d "$candidate_app" && -n "$image" && -f "$APP_ROOT/.env" ]]; then

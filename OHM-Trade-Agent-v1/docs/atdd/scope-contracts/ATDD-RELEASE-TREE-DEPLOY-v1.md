@@ -123,6 +123,14 @@ THEN:
 it derives a filtered core environment from `.env` that excludes every name in `release_profiles.FUNDED_CREDENTIAL_KEYS`, keeps every other setting, is root-owned mode 0600, produced atomically and idempotently without printing any value, is regenerated on rotation and on rollback, refuses to proceed when the source is missing or symlinked, and the core service consumes only that filtered file; the owner's `.env` and all credentials remain intact, the Tradevisor credential-isolation gate is unchanged, and the operator `/positions` and `/orders` views degrade to a bounded message when no credential is present
 AND the filtered file exists before ANY Compose operation that resolves the core service: it is generated for the release installed before activation (ahead of the pre-activation `docker compose exec` evidence-baseline read, which is the first Compose call), regenerated after activation and before the build/recreate, and generated at the start of the rollback path BEFORE the producer-quiescence proof, so a deploy that fails before the file is generated still reaches a provable quiescence instead of aborting as `PRODUCER_QUIESCENCE_UNPROVEN`; a source provider that cannot provide the generator refuses at start-up, before activation and before any Compose call, naming the owner-operated controller bootstrap as the remedy; the file is runtime-only (`rt_list_tree`/`rt_snapshot_current` exclude it) so it can never make the installed release or its rollback vehicle fail verification, while an unrecorded or modified source file still fails closed; and the source provider is installed from the deployed release by scheduler reconciliation on the same path as the controller, so it can never be one release behind it
 
+AC-013:
+GIVEN:
+a candidate release whose read-only protection preflight must execute the candidate's own evaluator against current production data, and a Docker daemon that may no longer hold the exact image ID the running core container was created from
+WHEN:
+the deploy controller prepares the preflight container
+THEN:
+it executes only an image whose identity and runtime compatibility are both proven: the running core container's own image when the daemon still has it, otherwise the reference that container was created with, resolved to a fully content-addressed image ID and admitted only when the image's `org.opencontainers.image.revision` label names a real commit in the trusted source cache and that commit's `Dockerfile` and `requirements.txt` are byte-identical to the candidate's, because the image supplies only the interpreter and installed dependencies while the candidate code and production data are bind-mounted read-only; the content-addressed ID (never a mutable tag) is what runs, so a concurrent retag cannot change the runtime; the resolution outcome, image ID, source revision, source class and an allowlisted failure reason are emitted as bounded provenance markers that carry no environment value or credential; and when no image can be proven the release is refused before any mutation with `OPIP_PROTECTION_PREFLIGHT=FAIL`, `OPIP_PROTECTION_PREFLIGHT_ABORT=REFUSED_BEFORE_MUTATION` and `OPIP_PRODUCTION_MUTATION=NOT_STARTED`, never by substituting an arbitrary image and never by weakening, skipping or reordering the protection evaluation or its F11 evidence
+
 EXPLICITLY OUT OF SCOPE:
 - Converting the production source root into a Git worktree, or creating any `.git` there.
 - Fabricating commits, refs, trees or a previous-good SHA.
@@ -171,6 +179,12 @@ AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_runtime_core_env_
 AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_controller_refuses_before_activation_when_the_library_cannot_generate
 AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_scheduler_reconciliation_keeps_the_source_provider_in_lockstep
 AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_bootstrap_preserves_a_proven_activation_record
+AC-013 -> tests/test_release_protection_preflight_v1.py::test_ac_013_running_container_image_is_used_when_it_is_present
+AC-013 -> tests/test_release_protection_preflight_v1.py::test_ac_013_absent_running_image_falls_back_to_a_verified_reference
+AC-013 -> tests/test_release_protection_preflight_v1.py::test_ac_013_incompatible_image_is_refused_and_never_substituted
+AC-013 -> tests/test_release_protection_preflight_v1.py::test_ac_013_no_usable_image_is_refused
+AC-013 -> tests/test_release_protection_preflight_v1.py::test_ac_013_preflight_refuses_before_mutation_when_no_image_is_verified
+AC-013 -> tests/test_release_protection_preflight_v1.py::test_ac_013_image_markers_are_bounded_and_value_free
 AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_the_edited_remote_operators_parse
 AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_positions_fails_safe_when_the_credential_is_absent
 
@@ -203,6 +217,8 @@ AC-012 -> OHM-Trade-Agent-v1/deploy/m07/tests/scenarios/test_r3_controller_parit
 AC-007 -> OHM-Trade-Agent-v1/deploy/remote/bootstrap-release-tree-controller.sh
 AC-012 -> OHM-Trade-Agent-v1/deploy/remote/bootstrap-release-tree-controller.sh
 AC-012 -> OHM-Trade-Agent-v1/deploy/remote/reconcile-scheduler.sh
+AC-013 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
+AC-013 -> OHM-Trade-Agent-v1/tests/test_release_protection_preflight_v1.py
 AC-001 -> OHM-Trade-Agent-v1/tests/test_opip_release_tree_controller_v1.py
 AC-002 -> OHM-Trade-Agent-v1/tests/test_opip_release_tree_controller_v1.py
 AC-003 -> OHM-Trade-Agent-v1/tests/test_opip_release_tree_controller_v1.py
