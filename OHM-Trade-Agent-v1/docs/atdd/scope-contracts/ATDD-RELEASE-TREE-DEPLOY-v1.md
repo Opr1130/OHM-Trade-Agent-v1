@@ -90,6 +90,14 @@ the controller initialises
 THEN:
 it resolves the provider from the stable root-controlled location first, accepts an in-tree copy when the release ships one, and refuses with exit 69 before any deployment gate when neither exists or the provider lacks a required entry point
 
+AC-009:
+GIVEN:
+a Git-less certified release-tree host whose scheduler reconciliation must prove the deployed identity
+WHEN:
+the controller-preservation guard resolves the repository HEAD
+THEN:
+it keeps the Git worktree HEAD first, otherwise uses the controller-recorded release identity (`current-release.env` from a verified activation, then `last-good-sha` from a successful deployment) only when it is a 40-hex SHA, and otherwise still fails closed with the existing message
+
 EXPLICITLY OUT OF SCOPE:
 - Converting the production source root into a Git worktree, or creating any `.git` there.
 - Fabricating commits, refs, trees or a previous-good SHA.
@@ -117,6 +125,7 @@ AC-005 -> tests/test_opip_release_tree_controller_v1.py::test_tampered_retained_
 AC-006 -> tests/test_opip_release_tree_controller_v1.py::test_git_worktree_mode_is_still_selected_and_keeps_its_inline_gates
 AC-007 -> tests/test_opip_release_tree_controller_v1.py::test_bootstrap_installs_the_library_at_a_stable_root_location
 AC-008 -> tests/test_opip_release_tree_controller_v1.py::test_controller_prefers_the_stable_library_and_refuses_when_absent
+AC-009 -> tests/test_opip_release_tree_controller_v1.py::test_reconcile_resolves_release_tree_identity_without_git
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/deploy/remote/lib/opip_release_tree.sh
@@ -128,6 +137,8 @@ AC-004 -> OHM-Trade-Agent-v1/deploy/remote/lib/opip_release_tree.sh
 AC-005 -> OHM-Trade-Agent-v1/deploy/remote/lib/opip_release_tree.sh
 AC-006 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
 AC-008 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
+AC-009 -> OHM-Trade-Agent-v1/deploy/remote/reconcile-scheduler.sh
+AC-009 -> OHM-Trade-Agent-v1/tests/test_opip_release_tree_controller_v1.py
 AC-007 -> OHM-Trade-Agent-v1/deploy/remote/bootstrap-release-tree-controller.sh
 AC-001 -> OHM-Trade-Agent-v1/tests/test_opip_release_tree_controller_v1.py
 AC-002 -> OHM-Trade-Agent-v1/tests/test_opip_release_tree_controller_v1.py

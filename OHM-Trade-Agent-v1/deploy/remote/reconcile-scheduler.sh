@@ -61,6 +61,38 @@ done
 # transaction snapshot is present, replace only its deploy-controller file with
 # the checked-out target after the proofs below. No snapshot means this is not
 # an in-flight deploy (initial host bootstrap); do not invent one.
+resolve_repository_head() {
+  # resolve_repository_head <app_root> <state_dir>
+  #
+  # Git worktree first, so a checkout keeps its exact historical behaviour.
+  # A certified release-tree host has no Git metadata at all, so the identity the
+  # controller itself recorded is used instead: `current-release.env` is written
+  # only by a verified release activation (manifest re-verified install) and
+  # `last-good-sha` only by a successful deployment. Both are root-owned
+  # controller state inside the deploy state directory - the same trust class as
+  # HEAD, so no provenance is weakened. Anything else fails closed at the caller.
+  local app_root="$1" state_dir="$2" head_sha="" record
+  head_sha="$(git -c safe.directory='*' -C "$app_root" rev-parse --verify HEAD 2>/dev/null || true)"
+  if [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+    printf '%s\n' "$head_sha"
+    return 0
+  fi
+  for record in "$state_dir/current-release.env" "$state_dir/last-good-sha"; do
+    [[ -r "$record" ]] || continue
+    case "$record" in
+      *.env) head_sha="$(sed -n 's/^sha=//p' "$record" 2>/dev/null || true)" ;;
+      *) head_sha="$(sed -n '1p' "$record" 2>/dev/null || true)" ;;
+    esac
+    head_sha="${head_sha%%$'\n'*}"
+    head_sha="${head_sha//[$'\r ']/}"
+    if [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+      printf '%s\n' "$head_sha"
+      return 0
+    fi
+  done
+  return 1
+}
+
 preserve_target_deploy_controller_snapshot() {
   local app_root="/opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1"
   local state_dir="/var/lib/ohm-deploy"
@@ -83,7 +115,7 @@ preserve_target_deploy_controller_snapshot() {
   }
 
   local head_sha target_controller
-  head_sha="$(git -c safe.directory='*' -C "$app_root" rev-parse --verify HEAD 2>/dev/null || true)"
+  head_sha="$(resolve_repository_head "$app_root" "$state_dir" || true)"
   [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] || {
     echo "deploy-controller bootstrap: repository HEAD is not a 40-char SHA" >&2
     return 1

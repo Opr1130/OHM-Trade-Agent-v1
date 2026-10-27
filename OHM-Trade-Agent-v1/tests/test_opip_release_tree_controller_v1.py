@@ -339,6 +339,68 @@ def test_bootstrap_installs_the_library_at_a_stable_root_location() -> None:
     assert "bootstrap-release-tree-controller" not in gateway
 
 
+def _repository_head_resolver_block() -> str:
+    text = (APP / "deploy" / "remote" / "reconcile-scheduler.sh").read_text(encoding="utf-8")
+    start = text.index("resolve_repository_head() {")
+    end = text.index("\n}\n", start) + 3
+    return text[start:end]
+
+
+def test_reconcile_resolves_release_tree_identity_without_git(
+    tmp_path: pathlib.Path,
+) -> None:
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-009: the scheduler reconciliation accepts
+    the authenticated release-tree identity when Git metadata is absent, keeps
+    the Git identity first, and still refuses when no identity exists."""
+    script = (APP / "deploy" / "remote" / "reconcile-scheduler.sh").read_text(encoding="utf-8")
+    assert "resolve_repository_head" in script
+    assert "deploy-controller bootstrap: repository HEAD is not a 40-char SHA" in script
+    block = _repository_head_resolver_block()
+
+    gitless_app = tmp_path / "app" / "OHM-Trade-Agent-v1"
+    gitless_app.mkdir(parents=True)
+    state = tmp_path / "state"
+    state.mkdir()
+
+    def resolve(app_root: pathlib.Path, state_dir: pathlib.Path):
+        harness = f"""
+set -Eeuo pipefail
+{block}
+resolve_repository_head {app_root.as_posix()} {state_dir.as_posix()}
+"""
+        return _run(harness, {})
+
+    absent = resolve(gitless_app, state)
+    assert absent.returncode != 0
+    assert absent.stdout.strip() == ""
+
+    last_good = "a" * 40
+    (state / "last-good-sha").write_text(f"{last_good}\n", encoding="utf-8")
+    from_last_good = resolve(gitless_app, state)
+    assert from_last_good.returncode == 0, from_last_good.stderr
+    assert from_last_good.stdout.strip() == last_good
+
+    installed = "b" * 40
+    (state / "current-release.env").write_text(
+        f"schema=1\nsha={installed}\ntree=deadbeef\n", encoding="utf-8"
+    )
+    from_release = resolve(gitless_app, state)
+    assert from_release.returncode == 0, from_release.stderr
+    assert from_release.stdout.strip() == installed
+
+    repo = tmp_path / "repo"
+    subprocess.run([GIT, "init", "-q", str(repo)], check=True)
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "t")
+    (repo / "f.txt").write_text("x\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "c")
+    head = _git(repo, "rev-parse", "HEAD")
+    from_git = resolve(repo, state)
+    assert from_git.returncode == 0, from_git.stderr
+    assert from_git.stdout.strip() == head
+
+
 def _library_resolver_block() -> str:
     text = (APP / "deploy" / "remote" / "ohm-deploy").read_text(encoding="utf-8")
     start = text.index("opip_source_library_path() {")
