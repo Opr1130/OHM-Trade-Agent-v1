@@ -159,6 +159,23 @@ CREATE INDEX IF NOT EXISTS idx_events_paper_trade
     ON events(json_extract(payload_json, '$.paper_trade_id'))
     WHERE json_extract(payload_json, '$.paper_trade_id') IS NOT NULL;
 
+-- Additive canonical-cursor index.
+--
+-- Every canonical evidence consumer pages through history with an exclusive
+-- ``(history_epoch, local_sequence)`` cursor and
+-- ``ORDER BY history_epoch, local_sequence LIMIT n``. With only
+-- ``idx_events_event_type`` SQLite answered that by materializing and sorting
+-- the ENTIRE per-type backlog in a temp B-tree to return one page: a
+-- production read held roughly 69k rows of ~3 KB payloads (~215 MB) and
+-- overran the release verifier's single-read bound. Ordering by
+-- ``(event_type, history_epoch, local_sequence)`` turns the page into an index
+-- range seek, so one read costs ``limit`` rows instead of the whole history.
+-- ``IF NOT EXISTS`` and no table or column change: an existing database gains
+-- it on the next writer schema initialisation, and the canonical order it
+-- serves is unchanged.
+CREATE INDEX IF NOT EXISTS idx_events_type_cursor
+    ON events(event_type, history_epoch, local_sequence);
+
 -- Additive continuity-restore indexes. Instrument identity lives in the
 -- payload. ``IF NOT EXISTS`` and no table or column change: an existing
 -- database gains the indexes on the next writer schema initialisation.

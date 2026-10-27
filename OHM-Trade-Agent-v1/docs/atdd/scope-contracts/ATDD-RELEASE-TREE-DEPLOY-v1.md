@@ -98,6 +98,14 @@ the controller-preservation guard resolves the repository HEAD
 THEN:
 it keeps the Git worktree HEAD first, otherwise uses the controller-recorded identity of the active release (`current-release.env`, written only by a manifest-verified activation) and only when it is a 40-hex SHA, never consults rollback state, and otherwise still fails closed with the existing message
 
+AC-010:
+GIVEN:
+a canonical store whose per-type backlog is large and a consumer that pages it with an exclusive `(history_epoch, local_sequence)` cursor under a declared single-read bound
+WHEN:
+the release runtime verifier reads one page of feature snapshots or feasibility evidence
+THEN:
+the page is served by an ordering index as a range seek that returns only its page, no temp B-tree is built, the canonical order and the exclusive cursor semantics are unchanged, and the single-read bound is not raised
+
 EXPLICITLY OUT OF SCOPE:
 - Converting the production source root into a Git worktree, or creating any `.git` there.
 - Fabricating commits, refs, trees or a previous-good SHA.
@@ -126,6 +134,8 @@ AC-006 -> tests/test_opip_release_tree_controller_v1.py::test_git_worktree_mode_
 AC-007 -> tests/test_opip_release_tree_controller_v1.py::test_bootstrap_installs_the_library_at_a_stable_root_location
 AC-008 -> tests/test_opip_release_tree_controller_v1.py::test_controller_prefers_the_stable_library_and_refuses_when_absent
 AC-009 -> tests/test_opip_release_tree_controller_v1.py::test_reconcile_resolves_release_tree_identity_without_git
+AC-010 -> tests/test_opip_canonical_cursor_read_plan_v1.py::test_canonical_cursor_page_is_an_index_seek_not_a_full_sort
+AC-010 -> tests/test_opip_canonical_cursor_read_plan_v1.py::test_the_index_preserves_canonical_order_and_cursor_semantics
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/deploy/remote/lib/opip_release_tree.sh
@@ -139,6 +149,8 @@ AC-006 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
 AC-008 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
 AC-009 -> OHM-Trade-Agent-v1/deploy/remote/reconcile-scheduler.sh
 AC-009 -> OHM-Trade-Agent-v1/tests/test_opip_release_tree_controller_v1.py
+AC-010 -> OHM-Trade-Agent-v1/app/opip/canonical/schema.py
+AC-010 -> OHM-Trade-Agent-v1/tests/test_opip_canonical_cursor_read_plan_v1.py
 AC-007 -> OHM-Trade-Agent-v1/deploy/remote/bootstrap-release-tree-controller.sh
 AC-001 -> OHM-Trade-Agent-v1/tests/test_opip_release_tree_controller_v1.py
 AC-002 -> OHM-Trade-Agent-v1/tests/test_opip_release_tree_controller_v1.py
