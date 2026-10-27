@@ -36,12 +36,16 @@ log_format tradevisor_edge '$remote_addr $time_iso8601 "$request_method $uri" '
 
 server {
     listen 443 ssl default_server;
-    server_name 161-35-106-207.sslip.io;
+    # This name must resolve to the Trading droplet: 178-128-147-125.sslip.io is
+    # encoded from 178.128.147.125, the only host that runs this edge. The
+    # dashboard's historical hostname encodes a different address and must never
+    # be used for webhook delivery, so it appears nowhere in this file.
+    server_name 178-128-147-125.sslip.io;
 
     server_tokens off;
     ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_certificate     /etc/letsencrypt/live/161-35-106-207.sslip.io/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/161-35-106-207.sslip.io/privkey.pem;
+    ssl_certificate     /etc/letsencrypt/live/178-128-147-125.sslip.io/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/178-128-147-125.sslip.io/privkey.pem;
 
     # TradingView documents that its webhook server presents a client
     # certificate, but publishes no CA certificate or public key to verify it

@@ -213,3 +213,49 @@ def test_ac_008_the_edge_stamp_header_matches_the_application_contract():
     assert match.group(1) == "x-ohm-tradevisor-verification"
     assert f"proxy_set_header {match.group(1)}" in _text(TEMPLATE)
     assert f'@router.post("{ROUTE}"' in source
+
+
+# --- Hostname and TLS identity (ATDD-TRADEVISOR-HOSTNAME-TLS-v1) -------------
+HOSTNAME = "178-128-147-125.sslip.io"
+STALE_HOSTNAME = "161-35-106-207.sslip.io"
+
+
+def test_ac_001_the_webhook_vhost_names_the_trading_droplet():
+    """ATDD-TRADEVISOR-HOSTNAME-TLS-v1/AC-001: the vhost names the droplet that serves it."""
+    text = _text(TEMPLATE)
+    server_names = re.findall(r"^\s*server_name\s+([^;]+);", text, flags=re.MULTILINE)
+    assert server_names == [HOSTNAME]
+    # The historical dashboard name resolves to a different address (161.35.106.207)
+    # and must not be presented as the webhook identity.
+    assert STALE_HOSTNAME not in text
+
+
+def test_ac_001_the_certificate_path_matches_the_hostname():
+    """ATDD-TRADEVISOR-HOSTNAME-TLS-v1/AC-001: certificate material belongs to that name."""
+    text = _text(TEMPLATE)
+    cert = re.search(r"ssl_certificate\s+(\S+);", text)
+    key = re.search(r"ssl_certificate_key\s+(\S+);", text)
+    assert cert is not None and key is not None
+    directory = f"/etc/letsencrypt/live/{HOSTNAME}/"
+    assert cert.group(1) == directory + "fullchain.pem"
+    assert key.group(1) == directory + "privkey.pem"
+
+
+def test_ac_002_a_missing_certificate_leaves_the_vhost_dark():
+    """ATDD-TRADEVISOR-HOSTNAME-TLS-v1/AC-002: absent certificate must not break the edge."""
+    edge_block = _text(COMPOSE).split("ohm-dashboard-edge:", 1)[1].split(
+        "ohm-trade-agent:", 1
+    )[0]
+    assert f"cert=/etc/letsencrypt/live/{HOSTNAME}/fullchain.pem" in edge_block
+    assert 'if [ ! -s "$cert" ]; then' in edge_block
+    assert "webhook vhost disabled" in edge_block
+    # nginx still starts for the dashboard: the guard never exits early.
+    assert "exec nginx -g 'daemon off;'" in edge_block
+
+
+def test_ac_002_the_dashboard_certificate_and_listener_are_untouched():
+    """ATDD-TRADEVISOR-HOSTNAME-TLS-v1/AC-002: dashboard traffic is unaffected by this change."""
+    dashboard = _text(DASHBOARD)
+    assert "listen 8443 ssl;" in dashboard
+    assert f"{STALE_HOSTNAME}/fullchain.pem" in dashboard
+    assert HOSTNAME not in dashboard
