@@ -306,7 +306,7 @@ printf '%s\\n' "$OPIP_SOURCE_MODE"
     assert "git-worktree" in ok.stdout
 
     controller = (APP / "deploy" / "remote" / "ohm-deploy").read_text(encoding="utf-8")
-    assert 'OPIP_SOURCE_MODE" == "git-worktree"' in controller
+    assert "OPIP_SOURCE_MODE:-git-worktree" in controller
     assert "refusing deploy: tracked production worktree is dirty" in controller
     assert "refusing deploy: untracked files in the application Docker build context" in controller
 
