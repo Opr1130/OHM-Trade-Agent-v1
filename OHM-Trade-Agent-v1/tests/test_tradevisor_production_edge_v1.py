@@ -19,6 +19,8 @@ validated on the host before traffic is enabled.
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -321,6 +323,20 @@ def test_ac_003_the_activation_script_is_failfast_bound_and_secret_free():
     assert "ssh " not in code
     assert not re.search(r"(^|\s)(sudo\s+)?(/usr/local/sbin/)?ohm-deploy(\s|$)", code)
     assert "/deploy " not in code
+
+
+def test_ac_003_the_activation_script_is_valid_bash():
+    """ATDD-TRADEVISOR-CERTBOT-PATH-v1/AC-003: the operator script parses as bash before it is shipped."""
+    bash = shutil.which("bash")
+    if bash is None:  # Windows dev hosts have no bash; the Linux runner is the gate.
+        pytest.skip("bash is not installed on this host")
+    result = subprocess.run(
+        [bash, "-n", str(ACTIVATION)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_ac_003_the_activation_script_orders_gates_before_enabling_ingress():

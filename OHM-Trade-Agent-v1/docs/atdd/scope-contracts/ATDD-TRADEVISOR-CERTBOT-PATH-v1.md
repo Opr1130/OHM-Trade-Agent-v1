@@ -79,6 +79,7 @@ ACCEPTANCE TEST TRACEABILITY:
 AC-001 -> tests/test_tradevisor_production_edge_v1.py::test_ac_001_the_edge_resolves_the_served_name_from_the_certbot_certificate_name
 AC-002 -> tests/test_tradevisor_production_edge_v1.py::test_ac_002_the_render_gate_checks_one_certbot_path_and_stays_fail_closed
 AC-003 -> tests/test_tradevisor_production_edge_v1.py::test_ac_003_the_activation_script_is_failfast_bound_and_secret_free
+AC-003 -> tests/test_tradevisor_production_edge_v1.py::test_ac_003_the_activation_script_is_valid_bash
 AC-003 -> tests/test_tradevisor_production_edge_v1.py::test_ac_003_the_activation_script_orders_gates_before_enabling_ingress
 AC-004 -> tests/test_tradevisor_production_edge_v1.py::test_ac_004_the_documented_csv_formats_are_what_the_application_parses
 
