@@ -121,11 +121,26 @@ REPO_OWNER="root"
 GIT=(git --git-dir="$SOURCE_CACHE")
 
 # --- 3. running release becomes the verified baseline + rollback vehicle ----
-rt_snapshot_current "$RUNNING_SHA" || die "cannot retain the running release for rollback"
-rt_write_state "$OPIP_CURRENT_RELEASE" "$RUNNING_SHA" "unverified-baseline" \
-  "$(rt_manifest_digest "$STATE_DIR/releases/$RUNNING_SHA/manifest.sha256")" \
-  "unverified-baseline"
-say "baseline=RECORDED"
+# The activation record written by a manifest-verified install is AUTHORITATIVE
+# and is preserved when it provably describes the live tree. It differs from the
+# recorded last-good release after a deploy whose activation succeeded and whose
+# post-activation sequence then failed (the recovery state this controller
+# exists for): overwriting it with the last-good SHA would label the live tree
+# with a source identity it does not have and would make the very next deploy
+# refuse with SOURCE_BASELINE unverified. A record that cannot be proven is
+# still replaced, exactly as before, so nothing is ever taken on trust.
+LIVE_RECORD="$(rt_state_get "$OPIP_CURRENT_RELEASE" sha || true)"
+if [[ "$LIVE_RECORD" =~ ^[0-9a-f]{40}$ ]] \
+  && [[ -s "$STATE_DIR/releases/$LIVE_RECORD/manifest.sha256" ]] \
+  && rt_verify_tree "$APP_ROOT" "$STATE_DIR/releases/$LIVE_RECORD/manifest.sha256"; then
+  say "baseline=PRESERVED sha=$LIVE_RECORD (live tree matches its manifest-verified install)"
+else
+  rt_snapshot_current "$RUNNING_SHA" || die "cannot retain the running release for rollback"
+  rt_write_state "$OPIP_CURRENT_RELEASE" "$RUNNING_SHA" "unverified-baseline" \
+    "$(rt_manifest_digest "$STATE_DIR/releases/$RUNNING_SHA/manifest.sha256")" \
+    "unverified-baseline"
+  say "baseline=RECORDED"
+fi
 say "rollback_vehicle=RETAINED"
 
 # --- 4. install the library at its stable root-controlled location ----------
