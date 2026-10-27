@@ -45,8 +45,8 @@ jobs:
       - run: python -m compileall -q app
       - name: Validate production Compose
         run: |
-          test ! -e .env
-          cat > .env <<'EOF'
+          test ! -e .env.core
+          cat > .env.core <<'EOF'
           OPIP_RELEASE_PROFILE=SAFE_BASELINE
           OPIP_FEATURE_BUS_MODE=active
           OPIP_CANONICAL_WRITER_MODE=active
@@ -54,9 +54,9 @@ jobs:
           OPIP_PAPER_V2_MODE=active
           OPIP_COMMITTEE_MODE=shadow
           EOF
-          trap 'rm -f .env' EXIT
+          trap 'rm -f .env.core' EXIT
           docker compose config -q
-          docker compose config --format json | python -c 'import json,sys; e=json.load(sys.stdin)["services"]["ohm-trade-agent"]["environment"]; expected={"OPIP_RELEASE_PROFILE":"EVIDENCE_SHADOW","OPIP_FEATURE_BUS_MODE":"shadow","OPIP_CANONICAL_WRITER_MODE":"shadow","OPIP_TARGET_SPINE_MODE":"shadow","OPIP_PAPER_V2_MODE":"off","OPIP_COMMITTEE_MODE":"off"}; assert all(e.get(k)==v for k,v in expected.items()), e'
+          docker compose config --format json | python -c 'import json,sys; e=json.load(sys.stdin)["services"]["ohm-trade-agent"]["environment"]; expected={"OPIP_RELEASE_PROFILE":"EVIDENCE_SHADOW","OPIP_FEATURE_BUS_MODE":"shadow","OPIP_CANONICAL_WRITER_MODE":"shadow","OPIP_TARGET_SPINE_MODE":"shadow","OPIP_PAPER_V2_MODE":"off","OPIP_COMMITTEE_MODE":"off"}; assert all(e.get(k)==v for k,v in expected.items()), e; funded=("KRAKEN_API_KEY","KRAKEN_API_SECRET","KRAKEN_PRIVATE_KEY","KRKN_API_KEY","LIVE_TRADING_KEY"); assert not any(k in e for k in funded), {k:v for k,v in e.items() if k in funded}'
       - name: Validate deployment shell
         run: |
           bash -n deploy/remote/ohm-deploy

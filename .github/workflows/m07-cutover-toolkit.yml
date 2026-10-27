@@ -104,12 +104,15 @@ jobs:
           grep -Fq '( cd "$APP_ROOT" && docker compose "$@" )' \
             deploy/m07/scripts/v2/bootstrap-v2.sh
 
-          # Never render over a stale activation file. `.env` is required only
-          # because the core service declares `env_file: .env`; it is created
-          # empty here and removed on exit, so no value is injected anywhere.
+          # Never render over a stale activation file. The core service declares
+          # `env_file: .env.core` (the controller-generated filtered core
+          # environment) and the paper model keeps its own `.env`; both are
+          # created empty here and removed on exit, so no value is injected.
+          test ! -e .env.core
           test ! -e .env
           : > .env
-          trap 'rm -f .env' EXIT
+          : > .env.core
+          trap 'rm -f .env .env.core' EXIT
 
           docker compose config --quiet
           docker compose config --services | sort > /tmp/m07-services.txt

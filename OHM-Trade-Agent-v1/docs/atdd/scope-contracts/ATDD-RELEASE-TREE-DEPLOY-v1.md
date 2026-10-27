@@ -114,6 +114,14 @@ the Tradevisor activation gate proves the approved SHA, provenance and recovery 
 THEN:
 a Git checkout keeps its historical validation unchanged, while a Git-less host must agree on the active release record, the installed source manifest digest, the exact-commit artifact provenance and file count, the live source tree byte-for-byte with no unrecorded file, and a retained rollback vehicle whose manifest digest matches and whose archive is valid; any missing, mismatched or tampered fact refuses activation, and the application and writer image revisions must both still be the approved SHA
 
+AC-012:
+GIVEN:
+an owner `.env` that carries funded exchange credentials, and a core service that must never inherit them
+WHEN:
+the deploy controller activates a release
+THEN:
+it derives a filtered core environment from `.env` that excludes every name in `release_profiles.FUNDED_CREDENTIAL_KEYS`, keeps every other setting, is root-owned mode 0600, produced atomically and idempotently without printing any value, is regenerated on rotation and on rollback, refuses to proceed when the source is missing or symlinked, and the core service consumes only that filtered file; the owner's `.env` and all credentials remain intact, the Tradevisor credential-isolation gate is unchanged, and the operator `/positions` and `/orders` views degrade to a bounded message when no credential is present
+
 EXPLICITLY OUT OF SCOPE:
 - Converting the production source root into a Git worktree, or creating any `.git` there.
 - Fabricating commits, refs, trees or a previous-good SHA.
@@ -147,6 +155,13 @@ AC-010 -> tests/test_opip_canonical_cursor_read_plan_v1.py::test_the_index_prese
 AC-011 -> tests/test_tradevisor_activation_release_tree_v1.py::test_release_tree_evidence_is_accepted
 AC-011 -> tests/test_tradevisor_activation_release_tree_v1.py::test_tampered_or_missing_evidence_is_refused
 AC-011 -> tests/test_tradevisor_activation_release_tree_v1.py::test_git_worktree_path_keeps_its_historical_validation
+AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_funded_credential_names_match_the_python_authority
+AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_generator_removes_funded_names_and_keeps_the_rest
+AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_generator_is_idempotent_and_follows_rotation
+AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_missing_or_symlinked_source_fails_closed
+AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_core_compose_consumes_only_the_filtered_environment
+AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_controller_generates_before_compose_and_on_rollback
+AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_positions_fails_safe_when_the_credential_is_absent
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/deploy/remote/lib/opip_release_tree.sh
@@ -164,6 +179,16 @@ AC-010 -> OHM-Trade-Agent-v1/app/opip/canonical/schema.py
 AC-010 -> OHM-Trade-Agent-v1/tests/test_opip_canonical_cursor_read_plan_v1.py
 AC-011 -> OHM-Trade-Agent-v1/deploy/tradevisor/activate-tradevisor-advisory.sh
 AC-011 -> OHM-Trade-Agent-v1/tests/test_tradevisor_activation_release_tree_v1.py
+AC-012 -> OHM-Trade-Agent-v1/deploy/remote/lib/opip_release_tree.sh
+AC-012 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
+AC-012 -> OHM-Trade-Agent-v1/docker-compose.yml
+AC-012 -> OHM-Trade-Agent-v1/app/services/telegram_command_center.py
+AC-012 -> .github/workflows/pytest.yml
+AC-012 -> .github/workflows/freqtrade-contract.yml
+AC-012 -> .github/workflows/m07-cutover-toolkit.yml
+AC-012 -> OHM-Trade-Agent-v1/tests/test_tradevisor_core_env_isolation_v1.py
+AC-012 -> OHM-Trade-Agent-v1/deploy/m07/tests/scenarios/test_r3_concurrency_and_compose.py
+AC-012 -> OHM-Trade-Agent-v1/deploy/m07/tests/scenarios/test_r3_controller_parity.py
 AC-007 -> OHM-Trade-Agent-v1/deploy/remote/bootstrap-release-tree-controller.sh
 AC-001 -> OHM-Trade-Agent-v1/tests/test_opip_release_tree_controller_v1.py
 AC-002 -> OHM-Trade-Agent-v1/tests/test_opip_release_tree_controller_v1.py

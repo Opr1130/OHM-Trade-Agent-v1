@@ -340,7 +340,7 @@ def orders_report() -> str:
         open_orders = private.get_open_orders()
         intents = get_live_order_intents()
         return format_orders_report(open_orders, intents, KrakenClient(timeout_seconds=5.0))
-    except KrakenPrivateAPIError:
+    except (KrakenPrivateAPIError, TelegramCommandError):
         return "⚠️ ORDERS — Kraken private account data is temporarily unavailable. No order was changed."
     except RegistryIOError:
         return "⚠️ ORDERS — local lifecycle state is unavailable, so order attribution is unsafe. No order was changed."
@@ -366,7 +366,10 @@ def positions_report() -> str:
         private = _private_client()
         balances, invalid = _aggregate_balances(private.get_balance())
         margin_positions = private.get_open_positions()
-    except KrakenPrivateAPIError:
+    except (KrakenPrivateAPIError, TelegramCommandError):
+        # Includes the isolated-credential posture: the core container is
+        # deliberately given no funded credential, so this is the expected
+        # answer and it must never echo a credential or invent account data.
         return "⚠️ POSITIONS — Kraken private account data is temporarily unavailable."
 
     public = KrakenClient(timeout_seconds=5.0)

@@ -80,8 +80,14 @@ services:
     depends_on:
       ohm-dashboard-edge:
         condition: service_started
+    # The core consumes ONLY the filtered environment the deploy controller
+    # generates from `.env` (root:root, mode 0600, `.env.*` is in
+    # `.dockerignore`). Funded exchange credentials are removed from that file by
+    # the controller, so the core container can never inherit KRAKEN_* and the
+    # Tradevisor credential-isolation gate stays satisfiable. The owner's `.env`
+    # is untouched and remains the single source of truth.
     env_file:
-      - .env
+      - .env.core
     environment:
       # O'Pip Sequence 2 production shadow activation.
       # Evidence collection only; the event store is not consumed by
