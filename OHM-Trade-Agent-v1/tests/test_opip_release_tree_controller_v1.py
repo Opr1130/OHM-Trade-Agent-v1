@@ -382,7 +382,7 @@ def test_reconcile_resolves_release_tree_identity_without_git(
     the Git identity first, and still refuses when no identity exists."""
     script = (APP / "deploy" / "remote" / "reconcile-scheduler.sh").read_text(encoding="utf-8")
     assert "deploy-controller bootstrap: repository HEAD is not a 40-char SHA" in script
-    assert "current-release.env" in script and "last-good-sha" in script
+    assert "current-release.env" in script
 
     gitless_app = tmp_path / "gitless" / "OHM-Trade-Agent-v1"
     _seed_app(gitless_app)
@@ -395,21 +395,14 @@ def test_reconcile_resolves_release_tree_identity_without_git(
     assert absent.returncode != 0
     assert "repository HEAD is not a 40-char SHA" in absent.stderr
 
-    # last-good-sha alone is accepted (successful-deployment identity).
-    last_good = "a" * 40
-    (state / "last-good-sha").write_text(f"{last_good}\n", encoding="utf-8")
-    from_last_good = _run_preserve(gitless_app, state)
-    assert from_last_good.returncode == 0, from_last_good.stderr
-    assert "OPIP_DEPLOY_CONTROLLER_BOOTSTRAP=NOT_NEEDED" in from_last_good.stdout
-    assert f"OPIP_DEPLOY_CONTROLLER_BOOTSTRAP_SHA={last_good}" in from_last_good.stdout
-
-    # current-release.env (verified activation) is preferred over last-good-sha.
+    # The verified activation record supplies the identity on a Git-less host.
     installed = "b" * 40
     (state / "current-release.env").write_text(
         f"schema=1\nsha={installed}\ntree=deadbeef\n", encoding="utf-8"
     )
     from_release = _run_preserve(gitless_app, state)
     assert from_release.returncode == 0, from_release.stderr
+    assert "OPIP_DEPLOY_CONTROLLER_BOOTSTRAP=NOT_NEEDED" in from_release.stdout
     assert f"OPIP_DEPLOY_CONTROLLER_BOOTSTRAP_SHA={installed}" in from_release.stdout
 
     # A real worktree still wins over any recorded release identity.
@@ -424,6 +417,7 @@ def test_reconcile_resolves_release_tree_identity_without_git(
     from_git = _run_preserve(repo, state)
     assert from_git.returncode == 0, from_git.stderr
     assert f"OPIP_DEPLOY_CONTROLLER_BOOTSTRAP_SHA={head}" in from_git.stdout
+    assert head != installed
 
 
 def _library_resolver_block() -> str:

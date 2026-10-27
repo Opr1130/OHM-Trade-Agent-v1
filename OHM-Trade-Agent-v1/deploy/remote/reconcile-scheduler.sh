@@ -86,23 +86,18 @@ preserve_target_deploy_controller_snapshot() {
   head_sha="$(git -c safe.directory='*' -C "$app_root" rev-parse --verify HEAD 2>/dev/null || true)"
   if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
     # Certified release-tree host: there is no Git metadata at all, so the
-    # identity the controller itself recorded is used instead.
+    # identity the controller recorded for the ACTIVE release is used instead.
     # `current-release.env` is written only by a verified release activation
-    # (manifest re-verified install) and `last-good-sha` only by a successful
-    # deployment. Both are root-owned controller state inside the deploy state
-    # directory - the same trust class as HEAD, so provenance is not weakened.
+    # (manifest re-verified install) and is root-owned controller state inside
+    # the deploy state directory - the same trust class as HEAD, so provenance is
+    # not weakened. Rollback state is deliberately NOT consulted here.
     head_sha=""
-    for record in "$state_dir/current-release.env" "$state_dir/last-good-sha"; do
-      [[ -r "$record" ]] || continue
-      case "$record" in
-        *.env) head_sha="$(sed -n 's/^sha=//p' "$record" 2>/dev/null || true)" ;;
-        *) head_sha="$(sed -n '1p' "$record" 2>/dev/null || true)" ;;
-      esac
+    record="$state_dir/current-release.env"
+    if [[ -r "$record" && ! -L "$record" ]]; then
+      head_sha="$(sed -n 's/^sha=//p' "$record" 2>/dev/null || true)"
       head_sha="${head_sha%%$'\n'*}"
       head_sha="${head_sha//[$'\r ']/}"
-      [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] && break
-      head_sha=""
-    done
+    fi
   fi
   [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] || {
     echo "deploy-controller bootstrap: repository HEAD is not a 40-char SHA" >&2

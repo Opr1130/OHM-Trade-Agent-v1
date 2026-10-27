@@ -96,7 +96,7 @@ a Git-less certified release-tree host whose scheduler reconciliation must prove
 WHEN:
 the controller-preservation guard resolves the repository HEAD
 THEN:
-it keeps the Git worktree HEAD first, otherwise uses the controller-recorded release identity (`current-release.env` from a verified activation, then `last-good-sha` from a successful deployment) only when it is a 40-hex SHA, and otherwise still fails closed with the existing message
+it keeps the Git worktree HEAD first, otherwise uses the controller-recorded identity of the active release (`current-release.env`, written only by a manifest-verified activation) and only when it is a 40-hex SHA, never consults rollback state, and otherwise still fails closed with the existing message
 
 EXPLICITLY OUT OF SCOPE:
 - Converting the production source root into a Git worktree, or creating any `.git` there.
