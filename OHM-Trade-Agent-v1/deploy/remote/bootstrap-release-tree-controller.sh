@@ -25,6 +25,7 @@ APP_ROOT="$REPO_ROOT/OHM-Trade-Agent-v1"
 STATE_DIR="/var/lib/ohm-deploy"
 LAST_GOOD_FILE="$STATE_DIR/last-good-sha"
 DEPLOY_SCRIPT_DST="/usr/local/sbin/ohm-deploy"
+LIBRARY_DST="/usr/local/lib/opip/opip_release_tree.sh"
 CONTROLLER_PATH="OHM-Trade-Agent-v1/deploy/remote/ohm-deploy"
 LIB_PATH="OHM-Trade-Agent-v1/deploy/remote/lib/opip_release_tree.sh"
 REPO_URL="https://github.com/Opr1130/OHM-Trade-Agent-v1.git"
@@ -93,6 +94,7 @@ git --git-dir="$SOURCE_CACHE" cat-file -e "${TARGET_SHA}^{commit}" \
 
 if [[ "$MODE" == "check" ]]; then
   say "controller_installed=$([[ -x "$DEPLOY_SCRIPT_DST" ]] && echo yes || echo no)"
+  say "library_installed=$([[ -r "$LIBRARY_DST" ]] && echo yes || echo no)"
   say "baseline=$([[ -s "$STATE_DIR/current-release.env" ]] && echo RECORDED || echo PENDING)"
   say "rollback_vehicle=$([[ -s "$STATE_DIR/releases/$RUNNING_SHA/source.tar" ]] && echo RETAINED || echo PENDING)"
   say "CHECK=DONE (no change made)"
@@ -126,7 +128,21 @@ rt_write_state "$OPIP_CURRENT_RELEASE" "$RUNNING_SHA" "unverified-baseline" \
 say "baseline=RECORDED"
 say "rollback_vehicle=RETAINED"
 
-# --- 4. install the controller atomically, retaining the previous one -------
+# --- 4. install the library at its stable root-controlled location ----------
+# ohm-deploy resolves this path BEFORE the release tree, so it must exist before
+# the corrected controller can initialise: the running release predates this
+# correction and cannot supply it. It lives beside the controller, not inside a
+# release, so every later release keeps it.
+install -d -o root -g root -m 0755 "$(dirname "$LIBRARY_DST")"
+libstaged="$(mktemp "$(dirname "$LIBRARY_DST")/.opip_release_tree.stage.XXXXXX")"
+cp -- "$STAGE_LIB" "$libstaged"
+chmod 0644 "$libstaged"
+chown root:root "$libstaged"
+mv -f -- "$libstaged" "$LIBRARY_DST"
+bash -n "$LIBRARY_DST" || die "installed library fails syntax validation"
+say "library_installed=$LIBRARY_DST"
+
+# --- 5. install the controller atomically, retaining the previous one -------
 if [[ -f "$DEPLOY_SCRIPT_DST" ]]; then
   cp -a "$DEPLOY_SCRIPT_DST" "$PREVIOUS_CONTROLLER"
   chmod 0600 "$PREVIOUS_CONTROLLER"
@@ -146,6 +162,8 @@ mv -f -- "$staged" "$DEPLOY_SCRIPT_DST"
   printf 'running_release=%s\n' "$RUNNING_SHA"
   printf 'origin_main=%s\n' "$REMOTE_MAIN"
   printf 'controller_sha256=%s\n' "$(sha256sum "$DEPLOY_SCRIPT_DST" | awk '{print $1}')"
+  printf 'library_dst=%s\n' "$LIBRARY_DST"
+  printf 'library_sha256=%s\n' "$(sha256sum "$LIBRARY_DST" | awk '{print $1}')"
   printf 'previous_controller=%s\n' "$PREVIOUS_CONTROLLER"
 } > "$RECEIPT"
 chmod 0600 "$RECEIPT"

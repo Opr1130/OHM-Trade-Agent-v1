@@ -311,9 +311,10 @@ printf '%s\\n' "$OPIP_SOURCE_MODE"
     assert "refusing deploy: untracked files in the application Docker build context" in controller
 
 
-def test_bootstrap_is_root_only_offline_and_performs_no_deployment() -> None:
+def test_bootstrap_installs_the_library_at_a_stable_root_location() -> None:
     """ATDD-RELEASE-TREE-DEPLOY-v1/AC-007: the one-time bootstrap provisions
-    provenance only, never a deployment, and is not gateway-reachable."""
+    provenance and installs the provider beside the controller, never a
+    deployment, and is not gateway-reachable."""
     bootstrap = (APP / "deploy" / "remote" / "bootstrap-release-tree-controller.sh").read_text(
         encoding="utf-8"
     )
@@ -321,6 +322,11 @@ def test_bootstrap_is_root_only_offline_and_performs_no_deployment() -> None:
     assert "git clone --bare" in bootstrap
     assert "rt_snapshot_current" in bootstrap
     assert "--check" in bootstrap and "--apply" in bootstrap
+    # The provider must land beside the controller, not only in the staging dir.
+    assert 'LIBRARY_DST="/usr/local/lib/opip/opip_release_tree.sh"' in bootstrap
+    assert 'cp -- "$STAGE_LIB" "$libstaged"' in bootstrap
+    assert 'mv -f -- "$libstaged" "$LIBRARY_DST"' in bootstrap
+    assert "bash -n \"$LIBRARY_DST\"" in bootstrap
     for forbidden in (
         "docker compose",
         "docker run",
@@ -331,4 +337,57 @@ def test_bootstrap_is_root_only_offline_and_performs_no_deployment() -> None:
         assert forbidden not in bootstrap, forbidden
     gateway = (APP / "deploy" / "remote" / "ohm-deploy-ssh").read_text(encoding="utf-8")
     assert "bootstrap-release-tree-controller" not in gateway
+
+
+def _library_resolver_block() -> str:
+    text = (APP / "deploy" / "remote" / "ohm-deploy").read_text(encoding="utf-8")
+    start = text.index("opip_source_library_path() {")
+    end = text.index("\n}\n", start) + 3
+    return text[start:end]
+
+
+def test_controller_prefers_the_stable_library_and_refuses_when_absent(
+    tmp_path: pathlib.Path,
+) -> None:
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-008: the controller resolves the stable
+    root-controlled provider first, accepts an in-tree copy, and refuses to run
+    when neither exists."""
+    controller = (APP / "deploy" / "remote" / "ohm-deploy").read_text(encoding="utf-8")
+    assert 'OPIP_STABLE_LIB="/usr/local/lib/opip/opip_release_tree.sh"' in controller
+    assert "release-tree source library is not installed" in controller
+    assert "is incomplete (missing" in controller
+    assert "exit 69" in controller
+
+    block = _library_resolver_block()
+    app_root = tmp_path / "opt" / "OHM-Trade-Agent-v1" / "OHM-Trade-Agent-v1"
+    intree = app_root / "deploy" / "remote" / "lib" / "opip_release_tree.sh"
+    intree.parent.mkdir(parents=True)
+    intree.write_text("# in-tree copy\n", encoding="utf-8")
+    stable = tmp_path / "usr" / "local" / "lib" / "opip" / "opip_release_tree.sh"
+
+    def resolve(stable_path: pathlib.Path):
+        script = f"""
+set -Eeuo pipefail
+APP_ROOT={app_root.as_posix()}
+OPIP_STABLE_LIB={stable_path.as_posix()}
+{block}
+opip_source_library_path
+"""
+        return _run(script, {})
+
+    only_intree = resolve(stable)
+    assert only_intree.returncode == 0, only_intree.stderr
+    assert only_intree.stdout.strip() == intree.as_posix()
+
+    stable.parent.mkdir(parents=True, exist_ok=True)
+    stable.write_text("# stable install\n", encoding="utf-8")
+    preferred = resolve(stable)
+    assert preferred.returncode == 0, preferred.stderr
+    assert preferred.stdout.strip() == stable.as_posix()
+
+    stable.unlink()
+    intree.unlink()
+    absent = resolve(stable)
+    assert absent.returncode != 0
+    assert absent.stdout.strip() == ""
 

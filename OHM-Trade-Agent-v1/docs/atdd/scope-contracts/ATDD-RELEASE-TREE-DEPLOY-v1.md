@@ -80,7 +80,15 @@ an owner who must provision the corrected controller once
 WHEN:
 the bootstrap runs
 THEN:
-it requires root, refuses to deploy anything (no container, no `/deploy`, no gateway path), creates the object cache from the canonical origin, records the running release as the verified baseline and rollback vehicle, installs the controller atomically and writes a receipt
+it requires root, refuses to deploy anything (no container, no `/deploy`, no gateway path), creates the object cache from the canonical origin, records the running release as the verified baseline and rollback vehicle, installs the release-tree provider at `/usr/local/lib/opip/opip_release_tree.sh` and the controller atomically, and writes a receipt
+
+AC-008:
+GIVEN:
+a host whose running release predates the release-tree source provider
+WHEN:
+the controller initialises
+THEN:
+it resolves the provider from the stable root-controlled location first, accepts an in-tree copy when the release ships one, and refuses with exit 69 before any deployment gate when neither exists or the provider lacks a required entry point
 
 EXPLICITLY OUT OF SCOPE:
 - Converting the production source root into a Git worktree, or creating any `.git` there.
@@ -107,7 +115,8 @@ AC-004 -> tests/test_opip_release_tree_controller_v1.py::test_activation_preserv
 AC-005 -> tests/test_opip_release_tree_controller_v1.py::test_rollback_restores_the_retained_previous_release
 AC-005 -> tests/test_opip_release_tree_controller_v1.py::test_tampered_retained_release_is_reported_as_failure
 AC-006 -> tests/test_opip_release_tree_controller_v1.py::test_git_worktree_mode_is_still_selected_and_keeps_its_inline_gates
-AC-007 -> tests/test_opip_release_tree_controller_v1.py::test_bootstrap_is_root_only_offline_and_performs_no_deployment
+AC-007 -> tests/test_opip_release_tree_controller_v1.py::test_bootstrap_installs_the_library_at_a_stable_root_location
+AC-008 -> tests/test_opip_release_tree_controller_v1.py::test_controller_prefers_the_stable_library_and_refuses_when_absent
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/deploy/remote/lib/opip_release_tree.sh
@@ -118,6 +127,7 @@ AC-003 -> OHM-Trade-Agent-v1/deploy/remote/lib/opip_release_tree.sh
 AC-004 -> OHM-Trade-Agent-v1/deploy/remote/lib/opip_release_tree.sh
 AC-005 -> OHM-Trade-Agent-v1/deploy/remote/lib/opip_release_tree.sh
 AC-006 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
+AC-008 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
 AC-007 -> OHM-Trade-Agent-v1/deploy/remote/bootstrap-release-tree-controller.sh
 AC-001 -> OHM-Trade-Agent-v1/tests/test_opip_release_tree_controller_v1.py
 AC-002 -> OHM-Trade-Agent-v1/tests/test_opip_release_tree_controller_v1.py
