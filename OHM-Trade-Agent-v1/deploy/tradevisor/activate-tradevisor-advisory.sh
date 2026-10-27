@@ -61,6 +61,13 @@ readonly APP_ROOT="${REPO_ROOT}/OHM-Trade-Agent-v1"
 readonly ENV_FILE="${APP_ROOT}/.env"
 readonly STATE_DIR="/var/lib/ohm-deploy"
 readonly LAST_GOOD_FILE="${STATE_DIR}/last-good-sha"
+#: Controller-recorded identity of the ACTIVE release. Written only by a
+#: manifest-verified activation, so it is the Git-less equivalent of HEAD.
+readonly CURRENT_RELEASE_FILE="${STATE_DIR}/current-release.env"
+#: Retained per-release manifests and rollback vehicles, and the staged
+#: exact-commit artifact provenance. All root-owned controller state.
+readonly RELEASES_DIR="${STATE_DIR}/releases"
+readonly STAGING_DIR="${STATE_DIR}/staging"
 readonly DEPLOY_LOCK="/var/lock/ohm-deploy.lock"
 
 readonly EDGE_SERVICE="ohm-dashboard-edge"
@@ -411,10 +418,26 @@ image_revision() {
     "$cid" 2>/dev/null || printf 'UNLABELLED'
 }
 
-verify_release_and_recovery() {
-  step "GATE approved SHA, provenance and recovery artifacts"
+record_field() {
+  # record_field <file> <key> - one value from a controller receipt (.env form).
+  awk -F= -v key="$2" '$1 == key { print substr($0, length(key) + 2); exit }' "$1"
+}
+
+source_listing() {
+  # Deterministic `sha256  relative-path` stream for an application source tree.
+  # The same runtime-only exclusions the controller uses, so production data,
+  # secrets and byte-code caches never participate in provenance.
+  ( cd "$1" || exit 1
+    find . -type f \
+      -not -path './data/*' -not -path './.env' -not -path './__pycache__/*' \
+      -not -name '*.py[cod]' -print0 \
+      | LC_ALL=C sort -z | xargs -0 -r sha256sum ) | sed 's|\./||'
+}
+
+verify_release_git_worktree() {
+  # Historical Git-worktree validation, unchanged.
+  local head dirty last_good previous
   [[ -d "$REPO_ROOT/.git" ]] || die "production git checkout missing at $REPO_ROOT"
-  local head dirty last_good core_rev writer_rev previous
   head="$(git -C "$REPO_ROOT" rev-parse HEAD)"
   [[ "$head" == "$SHA" ]] || die "checked-out HEAD ${head} is not the approved SHA ${SHA}"
   git -C "$REPO_ROOT" cat-file -e "${SHA}^{commit}" 2>/dev/null \
@@ -432,6 +455,138 @@ verify_release_and_recovery() {
     || die "controller last-good-sha ${last_good} is not the approved SHA ${SHA}"
   pass "controller receipt: last-good-sha matches the approved SHA"
 
+  previous="$(git -C "$REPO_ROOT" rev-parse "${SHA}^" 2>/dev/null || true)"
+  if [[ -n "$previous" ]]; then
+    info "deployed parent commit (controller rollback candidate): ${previous}"
+  else
+    warn "approved SHA has no parent; rollback target must come from the controller record"
+  fi
+}
+
+
+verify_release_tree() {
+  # Certified Git-less release-tree validation. Every input is root-owned
+  # controller state, and every value is bound to the approved SHA: the record,
+  # the installed manifest, the exact-commit artifact provenance and the live
+  # source tree must agree, or the gate refuses.
+  local current manifest release_dir provenance actual
+  local recorded_sha recorded_tree recorded_digest
+  local release_sha release_digest
+  local prov_sha prov_tree prov_digest prov_archive prov_count
+  local last_good extra previous_sha best_sha best_mtime candidate dir_sha dir_digest mtime
+  local manifest_paths live_paths
+
+  current="$CURRENT_RELEASE_FILE"
+  [[ -f "$current" && ! -L "$current" ]] \
+    || die "controller release record missing at ${current}"
+  recorded_sha="$(record_field "$current" sha)"
+  recorded_tree="$(record_field "$current" tree)"
+  recorded_digest="$(record_field "$current" manifest_digest)"
+  [[ "$recorded_sha" =~ ^[0-9a-f]{40}$ ]] \
+    || die "controller release record carries no exact SHA"
+  [[ "$recorded_sha" == "$SHA" ]] \
+    || die "controller release record SHA ${recorded_sha} is not the approved SHA ${SHA}"
+  [[ "$recorded_tree" =~ ^[0-9a-f]{40}$ ]] \
+    || die "controller release record carries no source tree identity"
+  [[ "$recorded_digest" =~ ^[0-9a-f]{64}$ ]] \
+    || die "controller release record carries no source manifest digest"
+  pass "controller release record names the approved SHA ${SHA}"
+  pass "controller release record binds source tree ${recorded_tree} and manifest ${recorded_digest:0:16}"
+
+  [[ -s "$LAST_GOOD_FILE" ]] || die "deploy controller receipt missing: $LAST_GOOD_FILE"
+  last_good="$(tr -d '\r\n' < "$LAST_GOOD_FILE")"
+  [[ "$last_good" == "$SHA" ]] \
+    || die "controller last-good-sha ${last_good} is not the approved SHA ${SHA}"
+  pass "controller receipt: last-good-sha matches the approved SHA"
+
+  release_dir="$RELEASES_DIR/$SHA"
+  manifest="$release_dir/manifest.sha256"
+  [[ -f "$manifest" && ! -L "$manifest" && -s "$manifest" ]] \
+    || die "installed release manifest missing: ${manifest}"
+  actual="$(sha256sum "$manifest" | awk '{print $1}')"
+  [[ "$actual" == "$recorded_digest" ]] \
+    || die "installed release manifest ${actual} does not match the controller record ${recorded_digest}"
+  pass "installed release manifest matches the controller record"
+
+  [[ -f "$release_dir/release.env" && ! -L "$release_dir/release.env" ]] \
+    || die "installed release record missing: ${release_dir}/release.env"
+  release_sha="$(record_field "$release_dir/release.env" sha)"
+  release_digest="$(record_field "$release_dir/release.env" manifest_digest)"
+  [[ "$release_sha" == "$SHA" ]] \
+    || die "installed release record SHA ${release_sha} is not the approved SHA ${SHA}"
+  [[ "$release_digest" == "$recorded_digest" ]] \
+    || die "installed release record digest ${release_digest} is not ${recorded_digest}"
+
+  provenance="$STAGING_DIR/$SHA/provenance.env"
+  [[ -f "$provenance" && ! -L "$provenance" ]] \
+    || die "exact-commit artifact provenance missing: ${provenance}"
+  prov_sha="$(record_field "$provenance" sha)"
+  prov_tree="$(record_field "$provenance" tree)"
+  prov_digest="$(record_field "$provenance" manifest_digest)"
+  prov_archive="$(record_field "$provenance" archive_digest)"
+  prov_count="$(record_field "$provenance" file_count)"
+  [[ "$prov_sha" == "$SHA" ]] \
+    || die "artifact provenance SHA ${prov_sha} is not the approved SHA ${SHA}"
+  [[ "$prov_tree" == "$recorded_tree" ]] \
+    || die "artifact provenance tree ${prov_tree} is not the recorded tree ${recorded_tree}"
+  [[ "$prov_digest" == "$recorded_digest" ]] \
+    || die "artifact provenance manifest ${prov_digest} is not ${recorded_digest}"
+  [[ "$prov_archive" =~ ^[0-9a-f]{64}$ ]] \
+    || die "artifact provenance carries no archive digest"
+  [[ "$prov_count" =~ ^[0-9]+$ ]] || die "artifact provenance carries no file count"
+  [[ "$prov_count" -eq "$(grep -c . "$manifest")" ]] \
+    || die "artifact provenance file count ${prov_count} does not match the installed manifest"
+  pass "exact-commit artifact provenance matches the installed release"
+  pass "artifact digest ${prov_archive:0:16} binds the commit to the installed source"
+
+  ( cd "$APP_ROOT" && sha256sum --quiet -c "$manifest" ) >/dev/null 2>&1 \
+    || die "installed application source does not match the release manifest"
+  manifest_paths="$(awk '{print $NF}' "$manifest" | LC_ALL=C sort)"
+  live_paths="$(source_listing "$APP_ROOT" | awk '{print $NF}' | LC_ALL=C sort)"
+  extra="$(comm -13 <(printf '%s\n' "$manifest_paths") <(printf '%s\n' "$live_paths") || true)"
+  [[ -z "$extra" ]] \
+    || die "installed application source carries files absent from the release manifest: $(printf '%s' "$extra" | tr '\n' ' ')"
+  pass "installed application source matches the release manifest (${prov_count} files)"
+
+  previous_sha=""
+  best_sha=""
+  best_mtime=0
+  shopt -s nullglob
+  for candidate in "$RELEASES_DIR"/*/; do
+    [[ -s "$candidate/source.tar" && -s "$candidate/manifest.sha256" ]] || continue
+    [[ -f "$candidate/release.env" && ! -L "$candidate/release.env" ]] || continue
+    dir_sha="$(record_field "$candidate/release.env" sha)"
+    [[ "$dir_sha" =~ ^[0-9a-f]{40}$ && "$dir_sha" != "$SHA" ]] || continue
+    dir_digest="$(record_field "$candidate/release.env" manifest_digest)"
+    [[ "$(sha256sum "$candidate/manifest.sha256" | awk '{print $1}')" == "$dir_digest" ]] \
+      || die "retained recovery manifest for ${dir_sha} is tampered"
+    tar -tf "$candidate/source.tar" >/dev/null 2>&1 \
+      || die "retained recovery artifact for ${dir_sha} is not a valid archive"
+    mtime="$(stat -c %Y "$candidate/source.tar" 2>/dev/null || printf '0')"
+    if [[ -z "$best_sha" || "$mtime" -gt "$best_mtime" ]]; then
+      best_sha="$dir_sha"
+      best_mtime="$mtime"
+    fi
+  done
+  shopt -u nullglob
+  previous_sha="$best_sha"
+  [[ -n "$previous_sha" ]] \
+    || die "no retained recovery artifact is available for rollback under ${RELEASES_DIR}"
+  pass "retained recovery artifact verified for previous release ${previous_sha}"
+  info "controller rollback candidate (verified vehicle): ${previous_sha}"
+}
+
+verify_release_and_recovery() {
+  step "GATE approved SHA, provenance and recovery artifacts"
+  local core_rev writer_rev
+  # A Git checkout keeps its historical validation unchanged; a certified
+  # release-tree host is proven from the controller's own recorded evidence.
+  if [[ -d "$REPO_ROOT/.git" ]]; then
+    verify_release_git_worktree
+  else
+    verify_release_tree
+  fi
+
   core_rev="$(image_revision "$CORE_SERVICE")"
   writer_rev="$(image_revision "$WRITER_SERVICE")"
   [[ "$core_rev" == "$SHA" ]] || die "core image revision ${core_rev} is not ${SHA}"
@@ -441,12 +596,6 @@ verify_release_and_recovery() {
   compose config --quiet || die "docker compose rejects the production configuration"
   pass "compose configuration renders with the current .env"
 
-  previous="$(git -C "$REPO_ROOT" rev-parse "${SHA}^" 2>/dev/null || true)"
-  if [[ -n "$previous" ]]; then
-    info "deployed parent commit (controller rollback candidate): ${previous}"
-  else
-    warn "approved SHA has no parent; rollback target must come from the controller record"
-  fi
   if docker image ls --filter label=org.opencontainers.image.revision \
       --format '{{.Label "org.opencontainers.image.revision"}}' 2>/dev/null \
       | grep -E '^[0-9a-f]{40}$' | grep -vx "$SHA" | grep -q .; then

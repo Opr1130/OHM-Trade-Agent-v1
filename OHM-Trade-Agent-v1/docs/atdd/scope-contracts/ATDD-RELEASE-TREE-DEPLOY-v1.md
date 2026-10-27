@@ -106,6 +106,14 @@ the release runtime verifier reads one page of feature snapshots or feasibility 
 THEN:
 the page is served by an ordering index as a range seek that returns only its page, no temp B-tree is built, the canonical order and the exclusive cursor semantics are unchanged, and the single-read bound is not raised
 
+AC-011:
+GIVEN:
+a certified Git-less release-tree host whose approved release was installed by the controller, and a Git droplet that still has a checkout
+WHEN:
+the Tradevisor activation gate proves the approved SHA, provenance and recovery artifacts
+THEN:
+a Git checkout keeps its historical validation unchanged, while a Git-less host must agree on the active release record, the installed source manifest digest, the exact-commit artifact provenance and file count, the live source tree byte-for-byte with no unrecorded file, and a retained rollback vehicle whose manifest digest matches and whose archive is valid; any missing, mismatched or tampered fact refuses activation, and the application and writer image revisions must both still be the approved SHA
+
 EXPLICITLY OUT OF SCOPE:
 - Converting the production source root into a Git worktree, or creating any `.git` there.
 - Fabricating commits, refs, trees or a previous-good SHA.
@@ -136,6 +144,9 @@ AC-008 -> tests/test_opip_release_tree_controller_v1.py::test_controller_prefers
 AC-009 -> tests/test_opip_release_tree_controller_v1.py::test_reconcile_resolves_release_tree_identity_without_git
 AC-010 -> tests/test_opip_canonical_cursor_read_plan_v1.py::test_canonical_cursor_page_is_an_index_seek_not_a_full_sort
 AC-010 -> tests/test_opip_canonical_cursor_read_plan_v1.py::test_the_index_preserves_canonical_order_and_cursor_semantics
+AC-011 -> tests/test_tradevisor_activation_release_tree_v1.py::test_release_tree_evidence_is_accepted
+AC-011 -> tests/test_tradevisor_activation_release_tree_v1.py::test_tampered_or_missing_evidence_is_refused
+AC-011 -> tests/test_tradevisor_activation_release_tree_v1.py::test_git_worktree_path_keeps_its_historical_validation
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/deploy/remote/lib/opip_release_tree.sh
@@ -151,6 +162,8 @@ AC-009 -> OHM-Trade-Agent-v1/deploy/remote/reconcile-scheduler.sh
 AC-009 -> OHM-Trade-Agent-v1/tests/test_opip_release_tree_controller_v1.py
 AC-010 -> OHM-Trade-Agent-v1/app/opip/canonical/schema.py
 AC-010 -> OHM-Trade-Agent-v1/tests/test_opip_canonical_cursor_read_plan_v1.py
+AC-011 -> OHM-Trade-Agent-v1/deploy/tradevisor/activate-tradevisor-advisory.sh
+AC-011 -> OHM-Trade-Agent-v1/tests/test_tradevisor_activation_release_tree_v1.py
 AC-007 -> OHM-Trade-Agent-v1/deploy/remote/bootstrap-release-tree-controller.sh
 AC-001 -> OHM-Trade-Agent-v1/tests/test_opip_release_tree_controller_v1.py
 AC-002 -> OHM-Trade-Agent-v1/tests/test_opip_release_tree_controller_v1.py
