@@ -54,8 +54,13 @@ if ! flock -n 9; then
   exit 75
 fi
 
-REPO_OWNER="$(stat -c '%U' "$REPO_ROOT/.git")"
-GIT=(sudo -u "$REPO_OWNER" git -C "$REPO_ROOT")
+# Source model resolution (Git worktree or certified release tree). Everything
+# below this line is model-agnostic through the release-tree library: the
+# controller itself never assumes Git metadata exists on the host.
+# shellcheck source=lib/opip_release_tree.sh
+# shellcheck disable=SC1091
+source "$APP_ROOT/deploy/remote/lib/opip_release_tree.sh"
+opip_source_init
 
 wait_core_health() {
   local healthy=0
@@ -847,34 +852,38 @@ validate_candidate_container_identity() {
   echo "OPIP_RELEASE_PROFILE=$profile"
 }
 
-"${GIT[@]}" fetch --prune origin main
-REMOTE_MAIN_SHA="$("${GIT[@]}" rev-parse origin/main)"
-if [[ "$TARGET_SHA" != "$REMOTE_MAIN_SHA" ]]; then
-  echo "refusing deploy: target is not current origin/main" >&2
-  echo "target=$TARGET_SHA origin/main=$REMOTE_MAIN_SHA" >&2
-  exit 65
-fi
-
-if [[ -n "$("${GIT[@]}" status --porcelain --untracked-files=no)" ]]; then
-  echo "refusing deploy: tracked production worktree is dirty" >&2
-  "${GIT[@]}" status --short >&2
-  exit 66
-fi
-UNTRACKED_APP_FILES="$("${GIT[@]}" ls-files --others --exclude-standard -- OHM-Trade-Agent-v1/app)"
-IGNORED_APP_FILES="$("${GIT[@]}" ls-files --others --ignored --exclude-standard -- OHM-Trade-Agent-v1/app \
-  | grep -Ev '\.py[cod]$' || true)"
-if [[ -n "$UNTRACKED_APP_FILES" || -n "$IGNORED_APP_FILES" ]]; then
-  echo "refusing deploy: untracked files in the application Docker build context" >&2
-  exit 66
-fi
-
-PREVIOUS_SHA="$("${GIT[@]}" rev-parse main)"
-if [[ -s "$LAST_GOOD_FILE" ]]; then
-  RECORDED_SHA="$(cat "$LAST_GOOD_FILE")"
-  if [[ "$RECORDED_SHA" =~ ^[0-9a-f]{40}$ ]] \
-    && "${GIT[@]}" cat-file -e "$RECORDED_SHA^{commit}" 2>/dev/null; then
-    PREVIOUS_SHA="$RECORDED_SHA"
+if [[ "${OPIP_SOURCE_MODE:-git-worktree}" == "git-worktree" ]]; then
+  "${GIT[@]}" fetch --prune origin main
+  REMOTE_MAIN_SHA="$("${GIT[@]}" rev-parse origin/main)"
+  if [[ "$TARGET_SHA" != "$REMOTE_MAIN_SHA" ]]; then
+    echo "refusing deploy: target is not current origin/main" >&2
+    echo "target=$TARGET_SHA origin/main=$REMOTE_MAIN_SHA" >&2
+    exit 65
   fi
+
+  if [[ -n "$("${GIT[@]}" status --porcelain --untracked-files=no)" ]]; then
+    echo "refusing deploy: tracked production worktree is dirty" >&2
+    "${GIT[@]}" status --short >&2
+    exit 66
+  fi
+  UNTRACKED_APP_FILES="$("${GIT[@]}" ls-files --others --exclude-standard -- OHM-Trade-Agent-v1/app)"
+  IGNORED_APP_FILES="$("${GIT[@]}" ls-files --others --ignored --exclude-standard -- OHM-Trade-Agent-v1/app \
+    | grep -Ev '\.py[cod]$' || true)"
+  if [[ -n "$UNTRACKED_APP_FILES" || -n "$IGNORED_APP_FILES" ]]; then
+    echo "refusing deploy: untracked files in the application Docker build context" >&2
+    exit 66
+  fi
+
+  PREVIOUS_SHA="$("${GIT[@]}" rev-parse main)"
+  if [[ -s "$LAST_GOOD_FILE" ]]; then
+    RECORDED_SHA="$(cat "$LAST_GOOD_FILE")"
+    if [[ "$RECORDED_SHA" =~ ^[0-9a-f]{40}$ ]] \
+      && "${GIT[@]}" cat-file -e "$RECORDED_SHA^{commit}" 2>/dev/null; then
+      PREVIOUS_SHA="$RECORDED_SHA"
+    fi
+  fi
+else
+  source_prepare
 fi
 
 cd "$APP_ROOT"
@@ -1240,13 +1249,22 @@ rollback() {
     exit "$rc"
   fi
 
-  "${GIT[@]}" checkout -f main
-  "${GIT[@]}" reset --hard "$PREVIOUS_SHA"
-  cd "$APP_ROOT"
-  [[ "$("${GIT[@]}" rev-parse HEAD)" == "$PREVIOUS_SHA" ]] || {
-    echo "rollback code SHA does not match the selected previous SHA" >&2
-    false
-  }
+  if [[ "${OPIP_SOURCE_MODE:-git-worktree}" == "git-worktree" ]]; then
+    "${GIT[@]}" checkout -f main
+    "${GIT[@]}" reset --hard "$PREVIOUS_SHA"
+    cd "$APP_ROOT"
+    [[ "$("${GIT[@]}" rev-parse HEAD)" == "$PREVIOUS_SHA" ]] || {
+      echo "rollback code SHA does not match the selected previous SHA" >&2
+      false
+    }
+  else
+    source_restore_previous
+    cd "$APP_ROOT"
+    [[ "$(source_release_head)" == "$PREVIOUS_SHA" ]] || {
+      echo "rollback code SHA does not match the selected previous SHA" >&2
+      false
+    }
+  fi
   write_safe_baseline_override
 
   # First PR 2 deploy may roll back to a SHA that does not declare the writer.
@@ -1355,13 +1373,19 @@ run_protection_preflight() {
   # concurrency. Any leftover tree or worktree registration from an interrupted
   # run is removed first, then `git worktree add --detach` checks out exactly
   # TARGET_SHA without touching the live worktree's HEAD or files.
-  "${GIT[@]}" worktree remove --force "$candidate_root" >/dev/null 2>&1 || true
-  rm -rf "$candidate_root"
-  "${GIT[@]}" worktree prune 2>/dev/null || true
-  if mkdir -p "$candidate_root" && chown "$REPO_OWNER" "$candidate_root" 2>/dev/null; then
-    if ! "${GIT[@]}" worktree add --detach "$candidate_root" "$TARGET_SHA" >/dev/null 2>&1; then
-      rm -rf "$candidate_root"
+  if [[ "${OPIP_SOURCE_MODE:-git-worktree}" == "git-worktree" ]]; then
+    "${GIT[@]}" worktree remove --force "$candidate_root" >/dev/null 2>&1 || true
+    rm -rf "$candidate_root"
+    "${GIT[@]}" worktree prune 2>/dev/null || true
+    if mkdir -p "$candidate_root" && chown "$REPO_OWNER" "$candidate_root" 2>/dev/null; then
+      if ! "${GIT[@]}" worktree add --detach "$candidate_root" "$TARGET_SHA" >/dev/null 2>&1; then
+        rm -rf "$candidate_root"
+      fi
     fi
+  elif ! source_materialize_candidate "$candidate_root"; then
+    # Release-tree model: the candidate is an extraction of the verified
+    # artifact, so the live application tree is still untouched here.
+    rm -rf "$candidate_root"
   fi
   candidate_app="$candidate_root/OHM-Trade-Agent-v1/app"
 
@@ -1580,9 +1604,11 @@ PY
 
   # Remove the temporary candidate tree BEFORE returning, on PASS and FAIL, so
   # the live repository HEAD is untouched in both outcomes.
-  "${GIT[@]}" worktree remove --force "$candidate_root" >/dev/null 2>&1 || true
+  if [[ "${OPIP_SOURCE_MODE:-git-worktree}" == "git-worktree" ]]; then
+    "${GIT[@]}" worktree remove --force "$candidate_root" >/dev/null 2>&1 || true
+    "${GIT[@]}" worktree prune 2>/dev/null || true
+  fi
   rm -rf "$candidate_root"
-  "${GIT[@]}" worktree prune 2>/dev/null || true
 
   echo "OPIP_PROTECTION_PREFLIGHT=$status"
   echo "OPIP_PROTECTION_PREFLIGHT_STATE=${state:-UNAVAILABLE}"
@@ -1636,14 +1662,25 @@ if ! run_protection_preflight; then
   exit 77
 fi
 
-"${GIT[@]}" checkout -f main
-"${GIT[@]}" reset --hard "$TARGET_SHA"
+if [[ "${OPIP_SOURCE_MODE:-git-worktree}" == "git-worktree" ]]; then
+  "${GIT[@]}" checkout -f main
+  "${GIT[@]}" reset --hard "$TARGET_SHA"
+else
+  source_activate_target
+fi
 
 cd "$APP_ROOT"
-[[ "$("${GIT[@]}" rev-parse HEAD)" == "$TARGET_SHA" ]] || {
-  echo "checked-out repository SHA changed before build" >&2
-  false
-}
+if [[ "${OPIP_SOURCE_MODE:-git-worktree}" == "git-worktree" ]]; then
+  [[ "$("${GIT[@]}" rev-parse HEAD)" == "$TARGET_SHA" ]] || {
+    echo "checked-out repository SHA changed before build" >&2
+    false
+  }
+else
+  [[ "$(source_release_head)" == "$TARGET_SHA" ]] || {
+    echo "activated release SHA does not match the approved target" >&2
+    false
+  }
+fi
 
 # Stop paper workers during the build/recreate window. Their dry-run state is
 # bind-mounted and survives the stop, while roughly two worker RSS footprints
