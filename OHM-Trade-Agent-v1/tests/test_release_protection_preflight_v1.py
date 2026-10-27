@@ -1566,13 +1566,18 @@ def test_ac_024_docker_exit_code_capture_is_explicit(tmp_path):
         assert "FIRST=PROTECTION_PROVEN" in proc.stdout, proc.stdout
 
 
-def _preflight_harness(tmp: Path, *, docker_rc: int, payload: str | None):
+def _preflight_harness(
+    tmp: Path, *, docker_rc: int, payload: str | None, image_present: bool = True
+):
     """Run the real function with a stub docker that writes ``payload``.
 
     ``payload=None`` simulates a container that exits without writing a receipt.
-    Every other external effect is stubbed and recorded, so this measures only the
-    preflight's own exit-code handling and the real refusal control flow.
+    ``image_present=False`` simulates a daemon that no longer has the running
+    core's image and has no resolvable replacement. Every other external effect
+    is stubbed and recorded, so this measures only the preflight's own
+    exit-code handling and the real refusal control flow.
     """
+    image_id = "sha256:" + "a" * 64
     state = tmp / "state"
     app_root = tmp / "app"
     (app_root / "data").mkdir(parents=True, exist_ok=True)
@@ -1594,6 +1599,9 @@ def _preflight_harness(tmp: Path, *, docker_rc: int, payload: str | None):
             f"FAKE_RECEIPT_JSON={fixture.as_posix()!r}",
             f"FAKE_CANDIDATE_APP={candidate_app.as_posix()!r}",
             f"FAKE_DOCKER_RC={int(docker_rc)}",
+            f"FAKE_IMAGE_ID={image_id!r}",
+            f"FAKE_IMAGE_REVISION={'b' * 40!r}",
+            f"FAKE_IMAGE_PRESENT={1 if image_present else 0}",
             "GIT=(git)",
             ': > "$LOG"',
             'git() { printf "git %s\\n" "$*" >>"$LOG"; '
@@ -1606,11 +1614,16 @@ def _preflight_harness(tmp: Path, *, docker_rc: int, payload: str | None):
             "docker() {",
             '  printf "docker %s\\n" "$*" >>"$LOG"',
             '  case "$*" in',
-            '    inspect*) printf "%s\\n" "sha256:fake" ; return 0 ;;',
+            '    *".Config.Labels"*) printf "%s\\n" "$FAKE_IMAGE_REVISION" ; return 0 ;;',
+            '    "image inspect"*) [ "$FAKE_IMAGE_PRESENT" = 1 ] || return 1; '
+            'printf "%s\\n" "$FAKE_IMAGE_ID" ; return 0 ;;',
+            '    inspect*) [ "$FAKE_IMAGE_PRESENT" = 1 ] || return 1; '
+            'printf "%s\\n" "$FAKE_IMAGE_ID" ; return 0 ;;',
             '    run*) cat "$FAKE_RECEIPT_JSON" ; return "$FAKE_DOCKER_RC" ;;',
             "  esac",
             "  return 0",
             "}",
+            _image_resolver_block(),
             "run_protection_preflight() {" + _function_body(),
             # Return code of the real function, captured without errexit.
             "set +e",
@@ -1626,6 +1639,300 @@ def _preflight_harness(tmp: Path, *, docker_rc: int, payload: str | None):
         ]
     )
     return _run_bash_script(script, str(tmp), name="preflight.sh", timeout=120)
+
+
+# ---------------------------------------------------------------------------
+# ATDD-RELEASE-TREE-DEPLOY-v1/AC-013 - preflight runtime-image provenance.
+#
+# The reported production failure: `docker: No such image: sha256:82d0171f...`.
+# The controller read the running core's image ID and passed it straight to
+# `docker run`, so a pruned image made the whole preflight unreadable and blocked
+# the release before any mutation. These execute the REAL resolver with
+# docker/git stubs.
+# ---------------------------------------------------------------------------
+
+_RUNNING_ID = "sha256:" + "1" * 64
+_REFERENCE_ID = "sha256:" + "2" * 64
+_IMAGE_REVISION = "3ed771fb220b597bf583aa04c3caaf534ac4ac50"
+_REFERENCE = "ohm-trade-agent-v1-ohm-trade-agent:latest"
+
+
+def _image_resolver_block() -> str:
+    start = DEPLOY.index("PREFLIGHT_RUNTIME_INPUTS=(")
+    end = DEPLOY.index(
+        "\n# Candidate-version read-only protection preflight (AC-024).", start
+    )
+    return DEPLOY[start:end]
+
+
+_RESOLVER_HARNESS = """
+set -Eeuo pipefail
+LOG=__LOG__
+: >"$LOG"
+TREE=__TREE__
+RUNNING_ID=__RUNNING_ID__
+RUNNING_PRESENT=__RUNNING_PRESENT__
+REFERENCE=__REFERENCE__
+RESOLVED_ID=__RESOLVED_ID__
+REVISION=__REVISION__
+COMMIT_KNOWN=__COMMIT_KNOWN__
+GIT_DOCKERFILE=__GIT_DOCKERFILE__
+GIT_REQUIREMENTS=__GIT_REQUIREMENTS__
+__BLOCK__
+git() {
+  printf "git %s\\n" "$*" >>"$LOG"
+  case "$*" in
+    "cat-file -e"*) if [ "$COMMIT_KNOWN" = 1 ]; then return 0; fi; return 1 ;;
+    "show "*)
+      case "$*" in
+        *Dockerfile*) cat "$GIT_DOCKERFILE" ;;
+        *requirements.txt*) cat "$GIT_REQUIREMENTS" ;;
+        *) return 1 ;;
+      esac
+      return 0
+      ;;
+  esac
+  return 1
+}
+GIT=(git)
+docker() {
+  printf "docker %s\\n" "$*" >>"$LOG"
+  if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
+    fmt="$4"
+    target="$5"
+    case "$fmt" in
+      *".Config.Labels"*) printf '%s\\n' "$REVISION"; return 0 ;;
+      "{{.Id}}")
+        if [ "$target" = "$RUNNING_ID" ] && [ "$RUNNING_PRESENT" = 1 ]; then
+          printf '%s\\n' "$RUNNING_ID"; return 0
+        fi
+        if [ -n "$RESOLVED_ID" ] && { [ "$target" = "$RESOLVED_ID" ] || [ "$target" = "$REFERENCE" ]; }; then
+          printf '%s\\n' "$RESOLVED_ID"; return 0
+        fi
+        return 1
+        ;;
+    esac
+    return 1
+  fi
+  if [ "$1" = "inspect" ]; then
+    case "$3" in
+      "{{.Image}}") printf '%s\\n' "$RUNNING_ID"; return 0 ;;
+      "{{.Config.Image}}") printf '%s\\n' "$REFERENCE"; return 0 ;;
+    esac
+    return 1
+  fi
+  return 1
+}
+set +e
+resolve_preflight_runtime_image "$TREE"
+RET=$?
+set -e
+printf 'RET=%s\\nID=%s\\nSOURCE=%s\\nREVISION=%s\\nREASON=%s\\n' \\
+  "$RET" "$PREFLIGHT_IMAGE_ID" "$PREFLIGHT_IMAGE_SOURCE" "$PREFLIGHT_IMAGE_REVISION" "$PREFLIGHT_IMAGE_REASON"
+"""
+
+
+def _resolve_image(
+    tmp_path: Path,
+    *,
+    running_id: str = "",
+    running_present: bool = True,
+    reference: str = "",
+    resolvable_id: str = "",
+    revision: str = "",
+    commit_known: bool = True,
+    candidate_dockerfile: str = "FROM python:3.12-slim\n",
+    candidate_requirements: str = "fastapi\n",
+    image_dockerfile: str | None = None,
+    image_requirements: str | None = None,
+) -> tuple[dict[str, str], str]:
+    """Run the real resolver; return (fields, docker/git call log)."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    tree = tmp_path / "candidate"
+    tree.mkdir(parents=True, exist_ok=True)
+    (tree / "Dockerfile").write_text(candidate_dockerfile, encoding="utf-8")
+    (tree / "requirements.txt").write_text(candidate_requirements, encoding="utf-8")
+    git_dockerfile = tmp_path / "git-Dockerfile"
+    git_requirements = tmp_path / "git-requirements.txt"
+    git_dockerfile.write_text(
+        candidate_dockerfile if image_dockerfile is None else image_dockerfile,
+        encoding="utf-8",
+    )
+    git_requirements.write_text(
+        candidate_requirements if image_requirements is None else image_requirements,
+        encoding="utf-8",
+    )
+    log = tmp_path / "resolver.log"
+    script = _RESOLVER_HARNESS
+    for token, value in (
+        ("__LOG__", log.as_posix()),
+        ("__TREE__", tree.as_posix()),
+        ("__RUNNING_ID__", running_id),
+        ("__RUNNING_PRESENT__", "1" if running_present else "0"),
+        ("__REFERENCE__", reference),
+        ("__RESOLVED_ID__", resolvable_id),
+        ("__REVISION__", revision),
+        ("__COMMIT_KNOWN__", "1" if commit_known else "0"),
+        ("__GIT_DOCKERFILE__", git_dockerfile.as_posix()),
+        ("__GIT_REQUIREMENTS__", git_requirements.as_posix()),
+        ("__BLOCK__", _image_resolver_block()),
+    ):
+        script = script.replace(token, value)
+    proc = _run_bash_script(script, str(tmp_path), name="resolver.sh", timeout=90)
+    if _is_fork_failure(proc):
+        pytest.skip("bash cannot fork reliably in this environment")
+    fields: dict[str, str] = {}
+    for line in proc.stdout.splitlines():
+        if "=" in line:
+            key, _, value = line.partition("=")
+            fields[key.strip()] = value.strip()
+    calls = log.read_text(encoding="utf-8") if log.is_file() else ""
+    return fields, calls
+
+
+@pytest.mark.acceptance
+def test_ac_013_running_container_image_is_used_when_it_is_present(tmp_path):
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-013: the exact image the running core executes is used verbatim when the daemon still has it, and no other reference is consulted."""
+    if _bash() is None:
+        pytest.skip("bash is not available in this environment")
+
+    fields, calls = _resolve_image(
+        tmp_path,
+        running_id=_RUNNING_ID,
+        reference=_REFERENCE,
+        resolvable_id=_REFERENCE_ID,
+        revision=_IMAGE_REVISION,
+    )
+    if not fields:
+        pytest.skip("bash cannot run the resolver in this environment")
+    assert fields["RET"] == "0", fields
+    assert fields["ID"] == _RUNNING_ID
+    assert fields["SOURCE"] == "RUNNING_CONTAINER_IMAGE"
+    assert fields["REASON"] == ""
+    # The container's mutable tag is never resolved on this path.
+    assert _REFERENCE not in calls
+
+
+@pytest.mark.acceptance
+def test_ac_013_absent_running_image_falls_back_to_a_verified_reference(tmp_path):
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-013: when the running image ID is gone, the container's own creation reference is admitted only if its release label names a real commit whose runtime inputs match the candidate, and the content-addressed ID is what executes."""
+    if _bash() is None:
+        pytest.skip("bash is not available in this environment")
+
+    fields, calls = _resolve_image(
+        tmp_path,
+        running_id=_RUNNING_ID,
+        running_present=False,
+        reference=_REFERENCE,
+        resolvable_id=_REFERENCE_ID,
+        revision=_IMAGE_REVISION,
+    )
+    if not fields:
+        pytest.skip("bash cannot run the resolver in this environment")
+    assert fields["RET"] == "0", fields
+    assert fields["ID"] == _REFERENCE_ID
+    assert fields["SOURCE"] == "VERIFIED_CONTAINER_IMAGE_REFERENCE"
+    assert fields["REVISION"] == _IMAGE_REVISION
+    assert "cat-file -e" in calls
+    assert "show " in calls
+
+
+@pytest.mark.acceptance
+def test_ac_013_incompatible_image_is_refused_and_never_substituted(tmp_path):
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-013: a locally present image whose runtime inputs differ from the candidate is refused, and no image is emitted for `docker run`."""
+    if _bash() is None:
+        pytest.skip("bash is not available in this environment")
+
+    fields, _ = _resolve_image(
+        tmp_path,
+        running_id=_RUNNING_ID,
+        running_present=False,
+        reference=_REFERENCE,
+        resolvable_id=_REFERENCE_ID,
+        revision=_IMAGE_REVISION,
+        candidate_requirements="fastapi\nuvicorn\n",
+        image_requirements="fastapi\n",
+    )
+    if not fields:
+        pytest.skip("bash cannot run the resolver in this environment")
+    assert fields["RET"] != "0"
+    assert fields["ID"] == ""
+    assert fields["SOURCE"] == "NONE"
+    assert fields["REASON"] == "CONTAINER_IMAGE_REFERENCE_INCOMPATIBLE"
+
+
+@pytest.mark.acceptance
+def test_ac_013_no_usable_image_is_refused(tmp_path):
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-013: an unprovable revision label, or no resolvable image at all, refuses the release instead of guessing."""
+    if _bash() is None:
+        pytest.skip("bash is not available in this environment")
+
+    unprovable, _ = _resolve_image(
+        tmp_path / "unprovable",
+        running_id=_RUNNING_ID,
+        running_present=False,
+        reference=_REFERENCE,
+        resolvable_id=_REFERENCE_ID,
+        revision=_IMAGE_REVISION,
+        commit_known=False,
+    )
+    if not unprovable:
+        pytest.skip("bash cannot run the resolver in this environment")
+    assert unprovable["RET"] != "0"
+    assert unprovable["ID"] == ""
+    assert unprovable["REASON"] == "CONTAINER_IMAGE_REFERENCE_INCOMPATIBLE"
+
+    missing, _ = _resolve_image(tmp_path / "missing", reference=_REFERENCE)
+    assert missing["RET"] != "0"
+    assert missing["ID"] == ""
+    assert missing["SOURCE"] == "NONE"
+    assert missing["REASON"] == "CONTAINER_IMAGE_REFERENCE_UNRESOLVABLE"
+
+
+@pytest.mark.acceptance
+def test_ac_013_preflight_refuses_before_mutation_when_no_image_is_verified(tmp_path):
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-013: with no verified runtime image the real preflight refuses before any mutation, reports the image reason, and never starts the container."""
+    if _bash() is None:
+        pytest.skip("bash is not available in this environment")
+
+    proc = _preflight_harness(
+        tmp_path, docker_rc=0, payload=_healthy_payload(), image_present=False
+    )
+    if _is_fork_failure(proc):
+        pytest.skip("bash cannot fork reliably in this environment")
+    combined = proc.stdout + proc.stderr
+    assert "OPIP_PROTECTION_PREFLIGHT=FAIL" in proc.stdout, combined
+    assert "OPIP_PROTECTION_PREFLIGHT_IMAGE_SOURCE=NONE" in proc.stdout, combined
+    assert "OPIP_PROTECTION_PREFLIGHT_IMAGE_REASON=" in proc.stdout, combined
+    assert "no verified runtime image" in proc.stderr, combined
+    assert "OPIP_PROTECTION_PREFLIGHT_ABORT=REFUSED_BEFORE_MUTATION" in proc.stderr
+    assert "OPIP_PRODUCTION_MUTATION=NOT_STARTED" in proc.stdout
+    assert "MUTATION_REACHED" not in proc.stdout
+    assert "docker run" not in (tmp_path / "calls.log").read_text(encoding="utf-8")
+
+
+@pytest.mark.acceptance
+def test_ac_013_image_markers_are_bounded_and_value_free():
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-013: the image markers carry only a content-addressed image ID, a release revision, an allowlisted source and an allowlisted reason -- never an environment value."""
+    body = _function_body()
+    for marker in (
+        "OPIP_PROTECTION_PREFLIGHT_IMAGE_SOURCE",
+        "OPIP_PROTECTION_PREFLIGHT_IMAGE_ID",
+        "OPIP_PROTECTION_PREFLIGHT_IMAGE_REVISION",
+        "OPIP_PROTECTION_PREFLIGHT_IMAGE_REASON",
+    ):
+        assert f"{marker}=" in body
+    for source in (
+        "RUNNING_CONTAINER_IMAGE",
+        "VERIFIED_CONTAINER_IMAGE_REFERENCE",
+        "RUNNING_IMAGE_ABSENT",
+        "CONTAINER_IMAGE_REFERENCE_INCOMPATIBLE",
+    ):
+        assert source in DEPLOY
+    resolver = _image_resolver_block()
+    assert "--env-file" not in resolver
+    assert "printenv" not in resolver
+    assert "PREFLIGHT_RUNTIME_INPUTS=(Dockerfile requirements.txt)" in DEPLOY
 
 
 def _healthy_payload() -> str:
