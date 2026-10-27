@@ -54,12 +54,53 @@ if ! flock -n 9; then
   exit 75
 fi
 
-# Source model resolution (Git worktree or certified release tree). Everything
-# below this line is model-agnostic through the release-tree library: the
+# Source-model resolution (Git worktree or certified release tree). Everything
+# below this line is model-agnostic through the release-tree library, so the
 # controller itself never assumes Git metadata exists on the host.
-# shellcheck source=lib/opip_release_tree.sh
-# shellcheck disable=SC1091
-source "$APP_ROOT/deploy/remote/lib/opip_release_tree.sh"
+#
+# The library MUST NOT be read only from the release tree: on a certified
+# release-tree host the running release predates this correction and therefore
+# does not carry it, so the first deployment after the one-time bootstrap would
+# have nothing to source. The stable root-controlled install location is
+# therefore authoritative, and an in-tree copy is accepted for a Git checkout
+# that ships it. A host with neither refuses here, before any gate runs.
+OPIP_STABLE_LIB="/usr/local/lib/opip/opip_release_tree.sh"
+OPIP_SOURCE_LIB_REQUIRED=(
+  opip_source_init
+  source_prepare
+  source_materialize_candidate
+  source_activate_target
+  source_restore_previous
+  source_release_head
+)
+
+opip_source_library_path() {
+  # Precedence: explicit test seam, stable install, in-tree release copy.
+  local candidate
+  for candidate in "${OPIP_RELEASE_TREE_LIB:-}" "$OPIP_STABLE_LIB" \
+    "$APP_ROOT/deploy/remote/lib/opip_release_tree.sh"; do
+    [[ -n "$candidate" && -r "$candidate" ]] || continue
+    printf '%s\n' "$candidate"
+    return 0
+  done
+  return 1
+}
+
+if ! OPIP_SOURCE_LIB="$(opip_source_library_path)"; then
+  echo "refusing deploy: release-tree source library is not installed at $OPIP_STABLE_LIB and the running release does not carry it; run bootstrap-release-tree-controller.sh --apply" >&2
+  exit 69
+fi
+# shellcheck source=/dev/null
+# shellcheck disable=SC1090
+source "$OPIP_SOURCE_LIB"
+for opip_required_fn in "${OPIP_SOURCE_LIB_REQUIRED[@]}"; do
+  declare -F "$opip_required_fn" >/dev/null || {
+    echo "refusing deploy: source library at $OPIP_SOURCE_LIB is incomplete (missing $opip_required_fn)" >&2
+    exit 69
+  }
+done
+unset opip_required_fn
+echo "OPIP_SOURCE_LIBRARY=$OPIP_SOURCE_LIB"
 opip_source_init
 
 wait_core_health() {
