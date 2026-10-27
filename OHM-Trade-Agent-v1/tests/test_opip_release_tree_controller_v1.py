@@ -26,9 +26,10 @@ LIB = APP / "deploy" / "remote" / "lib" / "opip_release_tree.sh"
 BASH = shutil.which("bash")
 GIT = shutil.which("git")
 
-pytestmark = pytest.mark.skipif(
-    BASH is None or GIT is None, reason="bash and git are required"
-)
+pytestmark = [
+    pytest.mark.acceptance,
+    pytest.mark.skipif(BASH is None or GIT is None, reason="bash and git are required"),
+]
 
 
 def _run(script: str, env: dict[str, str]) -> subprocess.CompletedProcess:
@@ -159,7 +160,8 @@ def release(tmp_path: pathlib.Path) -> "Release":
 
 
 def test_release_tree_mode_is_selected_when_no_git_metadata_exists(release) -> None:
-    """A Git-less production root must resolve to the release-tree model."""
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-001: a Git-less production root resolves
+    to the release-tree model; no Git metadata is created there."""
     result = _call(release, release.prev_sha, "opip_source_init; echo $OPIP_SOURCE_MODE")
     assert result.returncode == 0, result.stderr
     assert "OPIP_SOURCE_MODE=release-tree" in result.stdout
@@ -167,7 +169,8 @@ def test_release_tree_mode_is_selected_when_no_git_metadata_exists(release) -> N
 
 
 def test_exact_commit_artifact_is_staged_and_manifest_verified(release) -> None:
-    """Positive: the artifact is produced from the exact commit and verified."""
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-002: the artifact is produced from the
+    exact commit and its digest plus manifest are recorded and verified."""
     new_sha = release.commit_release("release-two")
     result = _call(release, new_sha, "source_prepare")
     assert result.returncode == 0, result.stderr
@@ -180,7 +183,8 @@ def test_exact_commit_artifact_is_staged_and_manifest_verified(release) -> None:
 
 
 def test_foreign_target_is_refused(release) -> None:
-    """Negative: a commit that is not current origin/main is refused (65)."""
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-003: a commit that is not current
+    origin/main is refused with exit 65."""
     new_sha = release.commit_release("release-two")
     result = _call(release, "b" * 40, "source_prepare")
     assert result.returncode == 65
@@ -189,7 +193,8 @@ def test_foreign_target_is_refused(release) -> None:
 
 
 def test_hand_edited_source_is_refused(release) -> None:
-    """Negative: deviations from the installed release refuse deployment (66)."""
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-003: deviations from the installed
+    release refuse deployment with exit 66."""
     new_sha = release.commit_release("release-two")
     (release.app_root / "app" / "main.py").write_text(
         "# hand edited in production\n", encoding="utf-8"
@@ -200,7 +205,8 @@ def test_hand_edited_source_is_refused(release) -> None:
 
 
 def test_activation_preserves_env_and_production_data(release) -> None:
-    """Positive: activation changes source only; .env and data survive."""
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-004: activation changes source only;
+    .env and production data survive byte-for-byte."""
     new_sha = release.commit_release("release-two")
     env_before = (release.app_root / ".env").read_bytes()
     db_before = (release.app_root / "data" / "opip" / "canonical.sqlite3").read_bytes()
@@ -219,7 +225,8 @@ def test_activation_preserves_env_and_production_data(release) -> None:
 
 
 def test_incomplete_staging_refuses_activation(release) -> None:
-    """Negative: partial staging never reaches the live tree."""
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-003: partial staging never reaches the
+    live tree."""
     new_sha = release.commit_release("release-two")
     before = (release.app_root / "app" / "main.py").read_text(encoding="utf-8")
     body = (
@@ -233,7 +240,8 @@ def test_incomplete_staging_refuses_activation(release) -> None:
 
 
 def test_rollback_restores_the_retained_previous_release(release) -> None:
-    """Positive: rollback reinstates the previous source bytes and data."""
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-005: rollback reinstates the retained
+    previous source bytes and leaves production data in place."""
     new_sha = release.commit_release("release-two")
     db_before = (release.app_root / "data" / "opip" / "canonical.sqlite3").read_bytes()
     advance = _call(release, new_sha, "source_prepare; source_activate_target")
@@ -253,7 +261,8 @@ def test_rollback_restores_the_retained_previous_release(release) -> None:
 
 
 def test_tampered_retained_release_is_reported_as_failure(release) -> None:
-    """Negative: a corrupted rollback vehicle must never report success."""
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-005: a corrupted rollback vehicle must
+    never report success."""
     new_sha = release.commit_release("release-two")
     advance = _call(release, new_sha, "source_prepare; source_activate_target")
     assert advance.returncode == 0, advance.stderr
@@ -270,7 +279,8 @@ def test_tampered_retained_release_is_reported_as_failure(release) -> None:
 def test_git_worktree_mode_is_still_selected_and_keeps_its_inline_gates(
     tmp_path: pathlib.Path,
 ) -> None:
-    """Regression: an existing checkout keeps the original controller gates.
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-006: an existing checkout keeps the
+    original controller gates.
 
     The Git gate bodies stay inline in the controller (the historical droplet's
     behaviour is byte-identical); only the release-tree model is delegated.
@@ -298,4 +308,26 @@ printf '%s\\n' "$OPIP_SOURCE_MODE"
     assert 'OPIP_SOURCE_MODE" == "git-worktree"' in controller
     assert "refusing deploy: tracked production worktree is dirty" in controller
     assert "refusing deploy: untracked files in the application Docker build context" in controller
+
+
+def test_bootstrap_is_root_only_offline_and_performs_no_deployment() -> None:
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-007: the one-time bootstrap provisions
+    provenance only, never a deployment, and is not gateway-reachable."""
+    bootstrap = (APP / "deploy" / "remote" / "bootstrap-release-tree-controller.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "((" " EUID == 0 ))" in bootstrap
+    assert "git clone --bare" in bootstrap
+    assert "rt_snapshot_current" in bootstrap
+    assert "--check" in bootstrap and "--apply" in bootstrap
+    for forbidden in (
+        "docker compose",
+        "docker run",
+        "/usr/local/sbin/ohm-deploy \"",
+        "ohm-deploy-ssh",
+        "ssh ",
+    ):
+        assert forbidden not in bootstrap, forbidden
+    gateway = (APP / "deploy" / "remote" / "ohm-deploy-ssh").read_text(encoding="utf-8")
+    assert "bootstrap-release-tree-controller" not in gateway
 
