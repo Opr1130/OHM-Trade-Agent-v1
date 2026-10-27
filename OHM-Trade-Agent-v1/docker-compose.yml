@@ -59,10 +59,12 @@ services:
           *)
             # A vhost whose certificate is absent would stop nginx starting and
             # take the dashboard down with it, so the render is gated on the
-            # certificate actually existing for this hostname.
-            cert=/etc/letsencrypt/live/178-128-147-125.sslip.io/fullchain.pem
+            # certificate actually existing. The path is the Certbot *certificate
+            # name* (161-35-106-207.sslip.io) whose SAN covers the served name
+            # 178-128-147-125.sslip.io; the two strings are not interchangeable.
+            cert=/etc/letsencrypt/live/161-35-106-207.sslip.io/fullchain.pem
             if [ ! -s "$cert" ]; then
-              echo "tradevisor edge: certificate missing for 178-128-147-125.sslip.io; webhook vhost disabled" >&2
+              echo "tradevisor edge: certificate missing at $cert; webhook vhost disabled" >&2
             else
               sed "s|__EDGE_VERIFICATION_VALUE__|$value|g" "$tpl" > "$out" 2>/dev/null \
                 || rm -f "$out"

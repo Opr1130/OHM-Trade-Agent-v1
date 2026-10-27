@@ -258,7 +258,7 @@ existing `ohm-dashboard-edge` container, which keeps serving the dashboard on
 | Edge stamp source | `OPIP_TRADEVISOR_INTERNAL_VERIFICATION_VALUE` in the host `.env` |
 | Public listener | `443:443` on the edge service; application stays `127.0.0.1:8000` |
 | Webhook hostname | `178-128-147-125.sslip.io` (encodes the Trading droplet `178.128.147.125`); the dashboard's historical `161-35-106-207.sslip.io` resolves elsewhere and is never used here |
-| Certificate | `/etc/letsencrypt/live/178-128-147-125.sslip.io/` must exist for that name; when it is absent the render is skipped and the vhost stays dark |
+| Certificate | `/etc/letsencrypt/live/161-35-106-207.sslip.io/` must exist. That is Certbot's certificate *name*; its SAN covers the served name `178-128-147-125.sslip.io`. A live directory named after the served host does not exist, and the Certbot directory and its managed symlinks are never renamed. When the file is absent the render is skipped and the vhost stays dark |
 | Peer identity | edge `172.31.240.2` → application `172.31.240.3` (`tradevisor_edge`) |
 | Dashboard protection | `dashboard-sidecar.conf` keeps its read-only mount; one additive `include` |
 
@@ -269,19 +269,32 @@ route, and the webhook vhost refuses every path except `POST /webhooks/tradeviso
 
 Operating steps (owner, on the host, in this order):
 
-1. Set `OPIP_TRADEVISOR_INTERNAL_VERIFICATION_VALUE` (≥32 URL-safe characters),
-   `OPIP_TRADEVISOR_WEBHOOK_TOKEN` (≥43 URL-safe characters), `_ENABLED=true`,
-   `_TRUSTED_PROXY_IPS=172.31.240.2`, `_ALERT_CONFIGS`, `_INSTRUMENTS`,
-   `_ALLOWED_EXCHANGES=COINBASE` and `_OBSERVATION_ENABLED` in `.env`.
-2. Confirm the certificate for `178-128-147-125.sslip.io` exists
-   (`certbot certificates`); if it does not, issue it before enabling, otherwise
-   the vhost deliberately stays dark.
-3. Validate before reload: `docker compose exec ohm-dashboard-edge nginx -t`.
-4. Recreate the edge only: `docker compose up -d --no-deps ohm-dashboard-edge`,
-   then confirm 8443 still serves the dashboard and 443 answers only the webhook.
-5. Open 443 to the four TradingView addresses in the cloud firewall only.
-6. Rollback: unset the value (or remove the rendered file) and recreate the edge;
-   the dashboard is unaffected because the include then matches nothing.
+1. Deploy the approved SHA through the controller only: `/deploy <sha>` and
+   `/deploy-learning <sha>`. A local script never replaces that path.
+2. Set `OPIP_TRADEVISOR_INTERNAL_VERIFICATION_VALUE` (≥32 URL-safe characters),
+   `OPIP_TRADEVISOR_WEBHOOK_TOKEN` (≥43 URL-safe characters), `_ENABLED=false`,
+   `_TRUSTED_PROXY_IPS=172.31.240.2`, `_ALLOWED_EXCHANGES=COINBASE`,
+   `_ALERT_CONFIGS`, `_INSTRUMENTS` and `_OBSERVATION_ENABLED=false` in `.env`
+   (root:root, `0600`).
+3. Run `sudo bash deploy/tradevisor/activate-tradevisor-advisory.sh --sha <sha>`.
+   With no `--apply` it is read-only: it verifies host identity, `.env` integrity
+   and formats, duplicate keys, the certificate SAN and key pairing against
+   `178-128-147-125.sslip.io`, the controller receipt and image revisions, the
+   authority boundaries, the Telegram transport, and `nginx -t` on the composed
+   configuration in a throwaway container. Nothing is changed.
+4. Re-run with `--apply --acknowledge-backup`. The script recreates only
+   `ohm-dashboard-edge` after validation, proves the dashboard on 8443 and the
+   certificate on 443, proves the route answers `404` while disabled, then flips
+   `OPIP_TRADEVISOR_ENABLED=true` once, recreates only `ohm-trade-agent`, and
+   proves authentication with a wrong-token `404` and a deliberately stale `422`.
+   A stale `422` proves the live route and the body token without creating a
+   durable row.
+5. Open 443 to the four TradingView addresses in the cloud firewall only (the
+   script prints the exact rule set; it does not change the cloud firewall).
+6. Rollback: `--rollback` restores `OPIP_TRADEVISOR_ENABLED=false` and re-verifies,
+   or unset the value and recreate the edge. The dashboard is unaffected because
+   the include then matches nothing. A bad *release* is rolled back only through
+   `/deploy <previous-approved-sha>`.
 
 Client certificate: TradingView publishes no CA, so chain verification is not
 configurable without an invented trust anchor. The vhost only *requests* the
@@ -328,6 +341,24 @@ COINBASE:LINKUSD=LINK/USD:LINKUSD COINBASE:ADAUSD=ADA/USD:ADAUSD
 Adding a Binance `SOLUSDT` alert requires an explicit
 `BINANCE:SOLUSDT=SOL/USD:SOLUSD` row **and** adding `BINANCE` to
 `OPIP_TRADEVISOR_ALLOWED_EXCHANGES`. Nothing is derived automatically.
+
+### Required formats of the three operator variables
+
+Parsed by `app/services/tradevisor_ingress.py` at boot, so a malformed row fails
+closed instead of silently shrinking the observable universe:
+
+- `OPIP_TRADEVISOR_ALERT_CONFIGS` — comma-separated `<alert_config_version>=<BUY|SELL>`.
+  Example (and default): `tradevisor-1h-buy=BUY,tradevisor-1h-sell=SELL`. The key
+  must equal the alert body's `alert_config_version`, and the direction must equal
+  its `signal`, otherwise the alert is refused with `UNKNOWN_ALERT_CONFIG` or
+  `CONFIG_SIGNAL_CONFLICT`.
+- `OPIP_TRADEVISOR_INSTRUMENTS` — comma-separated
+  `<EXCHANGE>:<SYMBOL>=<INSTRUMENT>:<MARKET>`, for example
+  `COINBASE:BTCUSD=BTC/USD:XBTUSD`. Default: the ten Coinbase pairs above.
+- `OPIP_TRADEVISOR_OBSERVATION_ENABLED` — boolean, default `false`. It gates the
+  separate WATCH/observation message class only. Leave it `false` until the >94%
+  confidence policy and the trusted 4H qualification are separately approved;
+  enabling it now would emit unqualified WATCH notifications.
 
 ## TradingView alert setup
 
