@@ -72,6 +72,14 @@ OPIP_SOURCE_LIB_REQUIRED=(
   source_activate_target
   source_restore_previous
   source_release_head
+  # The protection preflight and the running-core credential proof both decide
+  # through these, so a library that predates them cannot produce a meaningful
+  # verdict. Naming them here refuses at start-up - before activation, before
+  # the first runtime mutation - instead of failing deep inside the preflight.
+  opip_core_env_mode
+  opip_f11_credential_state
+  opip_f11_fingerprint_parity
+  opip_f11_release_credential_gate
 )
 
 opip_source_library_path() {
@@ -868,6 +876,9 @@ observe_unified_cycle() {
 validate_candidate_container_identity() {
   local image_sha actual profile expected
   local -a expected_modes
+  # Published to the controller: the F11 credential gate must decide against the
+  # PROVEN candidate profile, never against a default or an assumption.
+  CANDIDATE_RELEASE_PROFILE=""
   image_sha="$(docker inspect --format='{{ index .Config.Labels "org.opencontainers.image.revision" }}' ohm-trade-agent)"
   [[ "$image_sha" == "$TARGET_SHA" ]] || {
     echo "candidate container image SHA does not match the approved SHA" >&2
@@ -901,6 +912,7 @@ validate_candidate_container_identity() {
       return 1
     }
   done
+  CANDIDATE_RELEASE_PROFILE="$profile"
   echo "OPIP_RELEASE_PROFILE=$profile"
 }
 
@@ -1626,8 +1638,52 @@ run_protection_preflight() {
     echo "protection preflight refused: no verified runtime image ($PREFLIGHT_IMAGE_REASON)" >&2
   fi
 
+  # The preflight must observe EXACTLY the environment the core will run with,
+  # or its protection verdict proves nothing about the runtime. Which file that
+  # is comes from the CANDIDATE's own compose file (opip_core_env_mode), never
+  # from an assumption about the tree the controller is running in:
+  #
+  #   FILTERED            the candidate core declares `env_file: .env.core`, so
+  #                       that controller-generated file - and nothing else - is
+  #                       the configuration. A missing file REFUSES before any
+  #                       mutation; it never falls back to the owner's unfiltered
+  #                       `.env`. That fallback is precisely how the reported
+  #                       production mismatch happened: the preflight saw a
+  #                       funded credential the filtered runtime never had.
+  #   LEGACY_OWNER_ENV    a genuinely verified legacy shape whose core service
+  #                       itself declares `.env`, so the owner's `.env` IS the
+  #                       runtime environment and remains compatible.
+  #   anything else       unprovable: refuse before mutation.
+  local preflight_env="" preflight_env_source=UNRESOLVED core_env_mode=""
+  core_env_mode="$(opip_core_env_mode "$candidate_tree" 2>/dev/null)" || core_env_mode=""
+  case "$core_env_mode" in
+    FILTERED)
+      preflight_env="$APP_ROOT/.env.core"
+      preflight_env_source=CORE_FILTERED
+      if [[ ! -f "$preflight_env" ]]; then
+        preflight_env=""
+        preflight_env_source=UNRESOLVED
+        echo "protection preflight refused: the candidate core service reads .env.core, which the controller has not produced; refusing before any mutation" >&2
+      fi
+      ;;
+    LEGACY_OWNER_ENV)
+      preflight_env="$APP_ROOT/.env"
+      preflight_env_source=VERIFIED_LEGACY_OWNER_ENV
+      ;;
+    *)
+      echo "protection preflight refused: the candidate core environment is neither .env.core nor a verified legacy .env; refusing before any mutation" >&2
+      ;;
+  esac
+  echo "OPIP_PROTECTION_PREFLIGHT_ENV_SOURCE=$preflight_env_source"
+  # Published to the controller (deliberately not `local`), so the post-recreate
+  # proof can report which environment the preflight actually observed.
+  PROTECTION_PREFLIGHT_ENV_SOURCE="$preflight_env_source"
   rc=1
-  if [[ -d "$candidate_app" && -n "$image" && -f "$APP_ROOT/.env" ]]; then
+  # (`${preflight_env:-}` keeps this block self-contained for the bash harness
+  # that extracts it verbatim, and refuses when no environment could be
+  # resolved - it never substitutes another file.)
+  if [[ -d "$candidate_app" && -n "$image" && -n "${preflight_env:-}" && \
+    -f "${preflight_env:-}" ]]; then
     # Capture the container exit code on BOTH outcomes. A bare
     # `docker run ... || rc=$?` never assigns on success, which would leave rc=1
     # and misclassify a genuinely HEALTHY preflight as FAIL.
@@ -1636,7 +1692,7 @@ run_protection_preflight() {
       --tmpfs /tmp:rw,nosuid,size=32m \
       --pids-limit 64 \
       --memory 384m \
-      --env-file "$APP_ROOT/.env" \
+      --env-file "$preflight_env" \
       -e PYTHONDONTWRITEBYTECODE=1 \
       -v "$candidate_app:/app/app:ro" \
       -v "$APP_ROOT/data:/app/data:ro" \
@@ -1650,6 +1706,56 @@ run_protection_preflight() {
       rc=$?
     fi
   fi
+
+  # --- F11 read-only protection credential: proof BEFORE mutation -------------
+  # The same read-only job the running-core proof and the Tradevisor gate use,
+  # executed against the candidate app tree with the candidate's own environment
+  # and the verified runtime image. Its one-way fingerprint is published to the
+  # controller so the running core must reproduce it after the recreate.
+  #
+  # EVIDENCE_SHADOW requires this credential (opip_f11_release_credential_gate):
+  # an absent credential refuses the release HERE, before any mutation, instead
+  # of being accepted as the SAFE_BASELINE credential-less posture.
+  local f11_markers="" f11_rc=1 f11_identity="" f11_verdict="" f11_source=""
+  local f11_fingerprint="" f11_state=REFUSED
+  if [[ -d "$candidate_app" && -n "$image" && -n "$preflight_env" && \
+    -f "$preflight_env" ]]; then
+    if f11_markers="$(docker run --rm \
+      --read-only \
+      --tmpfs /tmp:rw,nosuid,size=32m \
+      --pids-limit 64 \
+      --memory 384m \
+      --env-file "$preflight_env" \
+      -e PYTHONDONTWRITEBYTECODE=1 \
+      -v "$candidate_app:/app/app:ro" \
+      -v "$APP_ROOT/data:/app/data:ro" \
+      "$image" \
+      python -m app.jobs.verify_f11_readonly_credential 2>/dev/null)"; then
+      f11_rc=0
+    else
+      f11_rc=$?
+    fi
+    f11_identity="$(printf '%s\n' "$f11_markers" \
+      | sed -n 's/^OPIP_F11_READONLY_IDENTITY=//p' | tail -n 1)"
+    f11_verdict="$(printf '%s\n' "$f11_markers" \
+      | sed -n 's/^OPIP_F11_READONLY_VERDICT=//p' | tail -n 1)"
+    f11_source="$(printf '%s\n' "$f11_markers" \
+      | sed -n 's/^OPIP_F11_READONLY_CREDENTIAL_SOURCE=//p' | tail -n 1)"
+    f11_fingerprint="$(printf '%s\n' "$f11_markers" \
+      | sed -n 's/^OPIP_F11_READONLY_FINGERPRINT=//p' | tail -n 1)"
+    f11_state="$(opip_f11_credential_state "$f11_rc" "$f11_identity" \
+      "$f11_verdict" "$f11_source" "$f11_fingerprint")"
+  fi
+  # Published to the controller (deliberately not `local`): the post-recreate
+  # proof compares the running core's fingerprint against exactly this value.
+  PROTECTION_PREFLIGHT_F11_FINGERPRINT="$f11_fingerprint"
+  PROTECTION_PREFLIGHT_F11_STATE="$f11_state"
+  echo "OPIP_PROTECTION_PREFLIGHT_F11_EXIT=$f11_rc"
+  echo "OPIP_PROTECTION_PREFLIGHT_F11_IDENTITY=${f11_identity:-UNPROVEN}"
+  echo "OPIP_PROTECTION_PREFLIGHT_F11_VERDICT=${f11_verdict:-UNPROVEN}"
+  echo "OPIP_PROTECTION_PREFLIGHT_F11_CREDENTIAL_SOURCE=${f11_source:-NONE}"
+  echo "OPIP_PROTECTION_PREFLIGHT_F11_FINGERPRINT=${f11_fingerprint:-NONE}"
+  echo "OPIP_PROTECTION_PREFLIGHT_F11_CREDENTIAL=$f11_state"
 
   raw="$("$PYTHON_BIN" - "$receipt" "$TARGET_SHA" "$rc" <<'PY'
 import json, re, sys
@@ -1838,6 +1944,18 @@ PY
   if [[ "$status" != "PASS" ]]; then
     status="FAIL"
   fi
+  # EVIDENCE_SHADOW requires a verified read-only protection credential BEFORE
+  # any mutation. The credential-less posture is the SAFE_BASELINE exception and
+  # is never a success for this profile; a configured-but-unverified credential
+  # (wrong key, wrong scopes, wrong allowlist, revoked, or an unreadable account)
+  # refuses every profile. Missing or mismatched proof fails closed.
+  if ! opip_f11_release_credential_gate EVIDENCE_SHADOW "$f11_state"; then
+    echo "protection preflight refused: EVIDENCE_SHADOW requires a verified F11 read-only protection credential (state=$f11_state)" >&2
+    if [[ "$status" == "PASS" ]]; then
+      reason="EVIDENCE_SHADOW requires a verified F11 read-only protection credential (state ${f11_state})"
+    fi
+    status="FAIL"
+  fi
 
   # Remove the temporary candidate tree BEFORE returning, on PASS and FAIL, so
   # the live repository HEAD is untouched in both outcomes.
@@ -1925,6 +2043,10 @@ fi
 # resolves the core service; the deploy fails closed if it cannot be produced.
 # This is the SECOND of the two generation gates: the first one, above, covers
 # the release installed before activation, whose Compose calls run earlier.
+#
+# The generator also reports (names only, never a value) whether the dedicated
+# F11 read-only pair crossed the isolation boundary; that marker is the
+# authoritative statement the runtime proof below is compared against.
 opip_write_core_env || {
   echo "refusing deploy: the filtered core environment could not be generated" >&2
   false
@@ -1971,6 +2093,64 @@ wait_paper_health
 validate_target_resource_budget
 validate_candidate_container_identity
 validate_release_scheduler_contract
+
+# --- F11 read-only protection credential: proof in the running core -----------
+# The dedicated protection key is the only exchange credential the core may
+# carry (app/exchanges/kraken_protection_credentials.py). Its identity is proven
+# in the RUNNING core - never inferred from the file that fed it - and the only
+# credential-derived values recorded are one-way fingerprints. The preflight
+# observed the same configuration the core mounts and recorded its fingerprint,
+# so PASS here plus fingerprint parity proves ONE configuration, not two.
+#
+# Read-only: GetApiKeyInfo, Balance, OpenPositions. No order, cancellation,
+# funding or configuration mutation.
+#
+# The exit status and the explicit verdict are BOTH required. A masked failure
+# (`|| true`) erases the only proof that the job completed its own verification,
+# so it is never used here, and a PASS marker alone is never accepted.
+F11_READONLY_MARKERS=""
+F11_READONLY_RC=1
+if F11_READONLY_MARKERS="$(docker compose exec -T ohm-trade-agent \
+  python -m app.jobs.verify_f11_readonly_credential 2>/dev/null)"; then
+  F11_READONLY_RC=0
+else
+  F11_READONLY_RC=$?
+fi
+F11_READONLY_IDENTITY="$(printf '%s\n' "$F11_READONLY_MARKERS" \
+  | sed -n 's/^OPIP_F11_READONLY_IDENTITY=//p' | tail -n 1)"
+F11_READONLY_VERDICT="$(printf '%s\n' "$F11_READONLY_MARKERS" \
+  | sed -n 's/^OPIP_F11_READONLY_VERDICT=//p' | tail -n 1)"
+F11_READONLY_SOURCE="$(printf '%s\n' "$F11_READONLY_MARKERS" \
+  | sed -n 's/^OPIP_F11_READONLY_CREDENTIAL_SOURCE=//p' | tail -n 1)"
+F11_READONLY_FINGERPRINT="$(printf '%s\n' "$F11_READONLY_MARKERS" \
+  | sed -n 's/^OPIP_F11_READONLY_FINGERPRINT=//p' | tail -n 1)"
+F11_READONLY_STATE="$(opip_f11_credential_state "$F11_READONLY_RC" \
+  "$F11_READONLY_IDENTITY" "$F11_READONLY_VERDICT" "$F11_READONLY_SOURCE" \
+  "$F11_READONLY_FINGERPRINT")"
+echo "OPIP_F11_READONLY_RUNTIME_EXIT=$F11_READONLY_RC"
+echo "OPIP_F11_READONLY_RUNTIME_IDENTITY=${F11_READONLY_IDENTITY:-UNPROVEN}"
+echo "OPIP_F11_READONLY_RUNTIME_VERDICT=${F11_READONLY_VERDICT:-UNPROVEN}"
+echo "OPIP_F11_READONLY_CREDENTIAL_SOURCE=${F11_READONLY_SOURCE:-NONE}"
+echo "OPIP_F11_READONLY_FINGERPRINT=${F11_READONLY_FINGERPRINT:-NONE}"
+echo "OPIP_F11_READONLY_RUNTIME_ENV_SOURCE=${PROTECTION_PREFLIGHT_ENV_SOURCE:-UNRESOLVED}"
+echo "OPIP_F11_READONLY_CREDENTIAL_PROOF=$F11_READONLY_STATE"
+# The profile that reached this point is proven EVIDENCE_SHADOW by
+# validate_candidate_container_identity (SAFE_BASELINE is refused there), so the
+# credential-less SAFE_BASELINE posture cannot be borrowed as a success here.
+opip_f11_release_credential_gate "${CANDIDATE_RELEASE_PROFILE:-UNPROVEN}" \
+  "$F11_READONLY_STATE" || {
+  echo "the F11 read-only protection credential did not verify in the running core (state=$F11_READONLY_STATE exit=$F11_READONLY_RC)" >&2
+  false
+}
+# Preflight/runtime parity. A missing (`NONE`) or mismatched fingerprint means
+# the preflight and the runtime did not resolve the same credential and scope
+# set, so neither proof describes this release. Fail closed on either.
+opip_f11_fingerprint_parity "${PROTECTION_PREFLIGHT_F11_FINGERPRINT:-}" \
+  "$F11_READONLY_FINGERPRINT" || {
+  echo "the running core did not reproduce the preflight F11 credential fingerprint (preflight=${PROTECTION_PREFLIGHT_F11_FINGERPRINT:-NONE} runtime=${F11_READONLY_FINGERPRINT:-NONE})" >&2
+  false
+}
+echo "OPIP_F11_READONLY_FINGERPRINT_PARITY=MATCH"
 
 READY_AFTER="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 RELEASE_PROFILE="$(docker compose exec -T ohm-trade-agent \

@@ -58,6 +58,7 @@ from tests.test_opip_canonical_single_writer_feasibility_v1 import (
 
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY = (ROOT / "deploy" / "remote" / "ohm-deploy").read_text(encoding="utf-8")
+LIBRARY = ROOT / "deploy" / "remote" / "lib" / "opip_release_tree.sh"
 SSH = (ROOT / "deploy" / "remote" / "ohm-deploy-ssh").read_text(encoding="utf-8")
 PREFLIGHT = (
     ROOT / "app" / "jobs" / "preflight_protection_health.py"
@@ -227,6 +228,31 @@ def _function_body() -> str:
     return DEPLOY.split("run_protection_preflight() {", 1)[1].split(
         "\n# AC-024 read-only protection boundary.", 1
     )[0]
+
+
+def _library_function(name: str) -> str:
+    """Extract one shipped provider-library function verbatim.
+
+    The preflight now delegates its credential decisions to these functions, so
+    the shell harness runs the REAL implementations instead of stubbing them.
+    """
+
+    text = LIBRARY.read_text(encoding="utf-8")
+    start = text.index(f"\n{name}() {{\n")
+    end = text.index("\n}\n", start) + len("\n}\n")
+    return text[start:end]
+
+
+def _preflight_library_block() -> str:
+    return "".join(
+        _library_function(name)
+        for name in (
+            "opip_core_env_mode",
+            "opip_f11_credential_state",
+            "opip_f11_fingerprint_parity",
+            "opip_f11_release_credential_gate",
+        )
+    )
 
 
 def _function_code() -> str:
@@ -1060,6 +1086,11 @@ def test_ac_026_coverage_degraded_scopes_are_same_cycle_structured(monkeypatch):
         def assert_read_only(self):
             return types.SimpleNamespace(name="ro")
 
+        def assert_protection_read_only(self):
+            # AC-014: F11 gates on the dedicated protection identity now; this
+            # double still stands for "the configured credential is acceptable".
+            return self.assert_read_only()
+
         def get_open_positions(self):
             return {}
 
@@ -1522,7 +1553,7 @@ def test_ac_024_docker_exit_code_capture_is_explicit(tmp_path):
     # command and therefore needs no fork at all.
     (tmp_path / "app").mkdir(parents=True, exist_ok=True)
     (tmp_path / "app-root").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "app-root" / ".env").write_text("", encoding="utf-8")
+    (tmp_path / "app-root" / ".env.core").write_text("", encoding="utf-8")
 
     script = "\n".join(
         [
@@ -1530,6 +1561,7 @@ def test_ac_024_docker_exit_code_capture_is_explicit(tmp_path):
             f"root={tmp_path.as_posix()!r}",
             'candidate_app="$root/app"',
             'APP_ROOT="$root/app-root"',
+            'preflight_env="$APP_ROOT/.env.core"',
             "image=sha256:fake",
             f"TARGET_SHA={SHA!r}",
             'receipt="$root/receipt.json"',
@@ -1566,26 +1598,83 @@ def test_ac_024_docker_exit_code_capture_is_explicit(tmp_path):
         assert "FIRST=PROTECTION_PROVEN" in proc.stdout, proc.stdout
 
 
+_F11_VERIFIED_MARKERS = "\n".join(
+    [
+        "OPIP_F11_READONLY_VERDICT=PASS",
+        "OPIP_F11_READONLY_IDENTITY=PASS",
+        "OPIP_F11_READONLY_CREDENTIAL_SOURCE=OPIP_F11_READONLY",
+        "OPIP_F11_READONLY_REASON=Dedicated_protection_key_positively_verified",
+        "OPIP_F11_READONLY_KEY_NAME=OPIP-V2-PROTECTION-READONLY",
+        "OPIP_F11_READONLY_PERMISSIONS=query-funds,query-open-trades",
+        "OPIP_F11_READONLY_IP_ALLOWLIST=178.128.147.125",
+        "OPIP_F11_READONLY_FINGERPRINT=0123456789abcdef",
+        "OPIP_F11_READONLY_BALANCE=OK:2",
+        "OPIP_F11_READONLY_OPEN_POSITIONS=OK:0",
+    ]
+) + "\n"
+
+_F11_ABSENT_MARKERS = "\n".join(
+    [
+        "OPIP_F11_READONLY_VERDICT=FAIL",
+        "OPIP_F11_READONLY_IDENTITY=UNVERIFIED",
+        "OPIP_F11_READONLY_CREDENTIAL_SOURCE=NONE",
+        "OPIP_F11_READONLY_REASON=KRAKEN_CREDENTIALS_UNAVAILABLE",
+        "OPIP_F11_READONLY_KEY_NAME=NONE",
+        "OPIP_F11_READONLY_PERMISSIONS=NONE",
+        "OPIP_F11_READONLY_IP_ALLOWLIST=NONE",
+        "OPIP_F11_READONLY_FINGERPRINT=NONE",
+        "OPIP_F11_READONLY_BALANCE=NOT_RUN",
+        "OPIP_F11_READONLY_OPEN_POSITIONS=NOT_RUN",
+    ]
+) + "\n"
+
+
 def _preflight_harness(
-    tmp: Path, *, docker_rc: int, payload: str | None, image_present: bool = True
+    tmp: Path,
+    *,
+    docker_rc: int,
+    payload: str | None,
+    image_present: bool = True,
+    f11_markers: str | None = None,
+    f11_rc: int = 0,
 ):
     """Run the real function with a stub docker that writes ``payload``.
 
     ``payload=None`` simulates a container that exits without writing a receipt.
     ``image_present=False`` simulates a daemon that no longer has the running
-    core's image and has no resolvable replacement. Every other external effect
-    is stubbed and recorded, so this measures only the preflight's own
-    exit-code handling and the real refusal control flow.
+    core's image and has no resolvable replacement. ``f11_markers`` is what the
+    real read-only credential verification job prints; the default is a fully
+    verified dedicated pair, and passing ``F11_ABSENT_MARKERS`` simulates the
+    unconfigured posture. Every other external effect is stubbed and recorded,
+    so this measures only the preflight's own exit-code handling, its credential
+    gate and the real refusal control flow.
     """
     image_id = "sha256:" + "a" * 64
     state = tmp / "state"
     app_root = tmp / "app"
     (app_root / "data").mkdir(parents=True, exist_ok=True)
     (app_root / ".env").write_text("", encoding="utf-8")
+    (app_root / ".env.core").write_text(
+        "OPIP_RELEASE_PROFILE=EVIDENCE_SHADOW\n", encoding="utf-8"
+    )
     fixture = tmp / "receipt-fixture.json"
     fixture.write_text(payload if payload is not None else "", encoding="utf-8")
+    f11_fixture = tmp / "f11-markers.txt"
+    f11_fixture.write_text(
+        _F11_VERIFIED_MARKERS if f11_markers is None else f11_markers,
+        encoding="utf-8",
+    )
     log = tmp / "calls.log"
-    candidate_app = state / "protection-candidate" / "OHM-Trade-Agent-v1" / "app"
+    candidate_tree = state / "protection-candidate" / "OHM-Trade-Agent-v1"
+    candidate_app = candidate_tree / "app"
+    compose_fixture = tmp / "candidate-compose.yml"
+    compose_fixture.write_text(
+        "services:\n"
+        "  ohm-trade-agent:\n"
+        "    env_file:\n"
+        "      - .env.core\n",
+        encoding="utf-8",
+    )
 
     script = "\n".join(
         [
@@ -1597,7 +1686,11 @@ def _preflight_harness(
             f"PYTHON_BIN={_python_for_bash()!r}",
             f"LOG={log.as_posix()!r}",
             f"FAKE_RECEIPT_JSON={fixture.as_posix()!r}",
+            f"FAKE_F11_MARKERS={f11_fixture.as_posix()!r}",
+            f"FAKE_F11_RC={int(f11_rc)}",
             f"FAKE_CANDIDATE_APP={candidate_app.as_posix()!r}",
+            f"FAKE_CANDIDATE_COMPOSE={(candidate_tree / 'docker-compose.yml').as_posix()!r}",
+            f"FAKE_COMPOSE_FIXTURE={compose_fixture.as_posix()!r}",
             f"FAKE_DOCKER_RC={int(docker_rc)}",
             f"FAKE_IMAGE_ID={image_id!r}",
             f"FAKE_IMAGE_REVISION={'b' * 40!r}",
@@ -1605,7 +1698,8 @@ def _preflight_harness(
             "GIT=(git)",
             ': > "$LOG"',
             'git() { printf "git %s\\n" "$*" >>"$LOG"; '
-            'case "$*" in *"worktree add"*) mkdir -p "$FAKE_CANDIDATE_APP" ;; esac; '
+            'case "$*" in *"worktree add"*) mkdir -p "$FAKE_CANDIDATE_APP"; '
+            'cp "$FAKE_COMPOSE_FIXTURE" "$FAKE_CANDIDATE_COMPOSE" ;; esac; '
             "return 0; }",
             # chown is host-specific inside a sandbox; production uses the real
             # one. The invariant under test is the exit-code capture.
@@ -1619,11 +1713,18 @@ def _preflight_harness(
             'printf "%s\\n" "$FAKE_IMAGE_ID" ; return 0 ;;',
             '    inspect*) [ "$FAKE_IMAGE_PRESENT" = 1 ] || return 1; '
             'printf "%s\\n" "$FAKE_IMAGE_ID" ; return 0 ;;',
-            '    run*) cat "$FAKE_RECEIPT_JSON" ; return "$FAKE_DOCKER_RC" ;;',
+            "    run*)",
+            '      case "$*" in',
+            '        *verify_f11_readonly_credential*) cat "$FAKE_F11_MARKERS"; '
+            'return "$FAKE_F11_RC" ;;',
+            '        *) cat "$FAKE_RECEIPT_JSON" ; return "$FAKE_DOCKER_RC" ;;',
+            "      esac",
+            "      ;;",
             "  esac",
             "  return 0",
             "}",
             _image_resolver_block(),
+            _preflight_library_block(),
             "run_protection_preflight() {" + _function_body(),
             # Return code of the real function, captured without errexit.
             "set +e",
@@ -1933,6 +2034,65 @@ def test_ac_013_image_markers_are_bounded_and_value_free():
     assert "--env-file" not in resolver
     assert "printenv" not in resolver
     assert "PREFLIGHT_RUNTIME_INPUTS=(Dockerfile requirements.txt)" in DEPLOY
+
+
+@pytest.mark.acceptance
+def test_ac_014_evidence_shadow_refuses_an_absent_credential_before_mutation(
+    tmp_path,
+):
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-014: a HEALTHY protection receipt is not
+    enough. EVIDENCE_SHADOW requires a verified F11 read-only credential, so the
+    credential-less posture refuses the release in the SAME pre-mutation boundary
+    and never reaches a mutation."""
+
+    if _bash() is None:
+        pytest.skip("bash is not available in this environment")
+
+    case_dir = tmp_path / "absent_credential"
+    case_dir.mkdir(parents=True, exist_ok=True)
+    proc = _preflight_harness(
+        case_dir,
+        docker_rc=0,
+        payload=_healthy_payload(),
+        f11_markers=_F11_ABSENT_MARKERS,
+        f11_rc=3,
+    )
+    if _is_fork_failure(proc):
+        pytest.skip("bash cannot fork reliably in this environment")
+    combined = proc.stdout + proc.stderr
+    assert "OPIP_PROTECTION_PREFLIGHT_F11_CREDENTIAL=ABSENT" in proc.stdout, combined
+    assert "OPIP_PROTECTION_PREFLIGHT=FAIL" in proc.stdout, combined
+    assert "EVIDENCE_SHADOW requires a verified F11 read-only protection credential" in combined
+    assert "OPIP_PROTECTION_PREFLIGHT_ABORT=REFUSED_BEFORE_MUTATION" in proc.stderr
+    assert "OPIP_PRODUCTION_MUTATION=NOT_STARTED" in proc.stdout
+    assert "MUTATION_REACHED" not in proc.stdout
+
+
+@pytest.mark.acceptance
+def test_ac_014_preflight_refuses_a_masked_credential_verification(tmp_path):
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-014: a PASS marker from a job that exited
+    non-zero is not a credential proof. The preflight must refuse it, which is
+    only possible because the exit status is captured instead of masked."""
+
+    if _bash() is None:
+        pytest.skip("bash is not available in this environment")
+
+    case_dir = tmp_path / "masked_credential"
+    case_dir.mkdir(parents=True, exist_ok=True)
+    proc = _preflight_harness(
+        case_dir,
+        docker_rc=0,
+        payload=_healthy_payload(),
+        f11_markers=_F11_VERIFIED_MARKERS,
+        f11_rc=3,
+    )
+    if _is_fork_failure(proc):
+        pytest.skip("bash cannot fork reliably in this environment")
+    combined = proc.stdout + proc.stderr
+    assert "OPIP_PROTECTION_PREFLIGHT_F11_EXIT=3" in proc.stdout, combined
+    assert "OPIP_PROTECTION_PREFLIGHT_F11_CREDENTIAL=REFUSED" in proc.stdout, combined
+    assert "OPIP_PROTECTION_PREFLIGHT=FAIL" in proc.stdout, combined
+    assert "MUTATION_REACHED" not in proc.stdout
 
 
 def _healthy_payload() -> str:

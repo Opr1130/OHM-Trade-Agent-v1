@@ -761,6 +761,37 @@ recreate_edge() {
 }
 
 # --- Gate 6: authorities stay where they were --------------------------------
+f11_credential_state() {
+  # f11_credential_state <exit-code> <identity> <verdict> <source> <fingerprint>
+  #   -> VERIFIED | ABSENT | REFUSED
+  #
+  # Identical semantics to opip_f11_credential_state in
+  # deploy/remote/lib/opip_release_tree.sh (the deploy controller's copy).
+  # tests/test_f11_readonly_credential_exception_v1.py runs the same scenario
+  # matrix through both, so the two implementations cannot drift.
+  #
+  # VERIFIED requires the successful process exit AND the explicit PASS verdict
+  # AND a PASS identity AND the dedicated protection-pair provenance AND a
+  # well-formed one-way fingerprint. A masked exit status, a PASS marker from a
+  # job that then failed Balance/OpenPositions, or a missing fingerprint can
+  # therefore never be read as success.
+  local exit_code="${1:-}" identity="${2:-}" verdict="${3:-}"
+  local source="${4:-}" fingerprint="${5:-}"
+  [[ "$exit_code" =~ ^[0-9]+$ ]] || { printf 'REFUSED\n'; return 0; }
+  if [[ "$exit_code" == "0" && "$verdict" == "PASS" && "$identity" == "PASS" &&
+    "$source" == "OPIP_F11_READONLY" && "$fingerprint" =~ ^[0-9a-f]{16}$ ]]; then
+    printf 'VERIFIED\n'
+    return 0
+  fi
+  if [[ "$exit_code" != "0" && "$identity" == "UNVERIFIED" &&
+    "$verdict" == "FAIL" && "$source" == "NONE" ]]; then
+    printf 'ABSENT\n'
+    return 0
+  fi
+  printf 'REFUSED\n'
+  return 0
+}
+
 verify_authority_boundaries() {
   step "GATE trading and learning authority remain disabled"
   local cid cfg pair key units
@@ -785,6 +816,62 @@ verify_authority_boundaries() {
     fi
   done
   pass "no funded/live exchange credential is present in the core environment"
+
+  # The single approved exception, recognised EXPLICITLY and verified
+  # INDEPENDENTLY rather than ignored: the dedicated F11 protection key may sit
+  # in the core under its own two names, because F11 protection health must be
+  # able to read the live account. It is not a funded credential, it is proven
+  # read-only, and this gate re-proves it from inside the running core - so an
+  # advisory ingress is only ever enabled while the core holds a credential that
+  # is positively the dedicated read-only protection key, and never one that
+  # merely claims to be.
+  local f11_key=0 f11_secret=0
+  if printf '%s\n' "$cfg" | grep -q "^OPIP_F11_KRAKEN_READONLY_API_KEY="; then
+    f11_key=1
+  fi
+  if printf '%s\n' "$cfg" | grep -q "^OPIP_F11_KRAKEN_READONLY_API_SECRET="; then
+    f11_secret=1
+  fi
+  if ((f11_key != f11_secret)); then
+    die "the F11 read-only protection credential pair is incomplete in the core environment; a half pair is refused"
+  fi
+  if ((f11_key == 0)); then
+    # The profile proven above is EVIDENCE_SHADOW, which requires a verified
+    # read-only protection credential. The credential-less posture is the
+    # SAFE_BASELINE exception and is never an EVIDENCE_SHADOW success.
+    die "the core carries no F11 read-only protection credential; EVIDENCE_SHADOW requires a verified one before advisory ingress is enabled"
+  fi
+  local f11_markers="" f11_rc=1 f11_identity="" f11_verdict=""
+  local f11_source="" f11_fingerprint="" f11_state=""
+  # The exit status is captured on BOTH outcomes. `... || true` would erase the
+  # only proof that the job completed its own verification, and a PASS marker
+  # from a job that then failed Balance/OpenPositions must never be accepted, so
+  # success requires the exit code AND the explicit verdict AND a real
+  # fingerprint.
+  if f11_markers="$(compose exec -T "$CORE_SERVICE" \
+    python -m app.jobs.verify_f11_readonly_credential 2>/dev/null)"; then
+    f11_rc=0
+  else
+    f11_rc=$?
+  fi
+  f11_identity="$(printf '%s\n' "$f11_markers" \
+    | sed -n 's/^OPIP_F11_READONLY_IDENTITY=//p' | tail -n 1)"
+  f11_verdict="$(printf '%s\n' "$f11_markers" \
+    | sed -n 's/^OPIP_F11_READONLY_VERDICT=//p' | tail -n 1)"
+  f11_source="$(printf '%s\n' "$f11_markers" \
+    | sed -n 's/^OPIP_F11_READONLY_CREDENTIAL_SOURCE=//p' | tail -n 1)"
+  f11_fingerprint="$(printf '%s\n' "$f11_markers" \
+    | sed -n 's/^OPIP_F11_READONLY_FINGERPRINT=//p' | tail -n 1)"
+  f11_state="$(f11_credential_state "$f11_rc" "$f11_identity" "$f11_verdict" \
+    "$f11_source" "$f11_fingerprint")"
+  echo "OPIP_F11_READONLY_GATE_EXIT=$f11_rc"
+  echo "OPIP_F11_READONLY_GATE_IDENTITY=${f11_identity:-UNPROVEN}"
+  echo "OPIP_F11_READONLY_GATE_VERDICT=${f11_verdict:-UNPROVEN}"
+  echo "OPIP_F11_READONLY_GATE_FINGERPRINT=${f11_fingerprint:-NONE}"
+  echo "OPIP_F11_READONLY_GATE_CREDENTIAL=$f11_state"
+  [[ "$f11_state" == "VERIFIED" ]] \
+    || die "the F11 read-only protection credential did not verify in the running core (state=${f11_state} exit=${f11_rc}); refusing to enable advisory ingress"
+  pass "the approved F11 read-only protection credential is present and independently verified"
 
   units="$(systemctl list-units --all --no-legend --plain 'opip-learning-*' 2>/dev/null \
     | awk '{print $3}' | sort -u || true)"

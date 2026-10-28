@@ -208,7 +208,11 @@ class KrakenPositionVerifier:
             )
             return
         try:
-            self.client.assert_read_only()
+            # Same protection gate as F11's exposure resolver: the dedicated
+            # key's identity and exact scopes are proven before any balance or
+            # position read, so position verification can never run on a
+            # broader credential.
+            self.client.assert_protection_read_only()
             self._balances = self.client.get_balance()
             self._positions = self.client.get_open_positions()
         except Exception as exc:
