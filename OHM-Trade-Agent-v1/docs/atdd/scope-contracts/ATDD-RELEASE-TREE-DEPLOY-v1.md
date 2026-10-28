@@ -141,7 +141,7 @@ exactly one bounded read-only credential may cross the isolation boundary - the 
 AND the verification job reports `PASS` only when, in one invocation, the key identity AND its exact scopes AND the confirmed allowlist AND `Balance` AND `OpenPositions` all succeed; the identity audit is reported separately, and the process exits 0 if and only if the whole proof passed, so a `PASS` marker from a job that then failed a read can never be accepted and no caller may mask the exit status with `|| true`
 AND the preflight derives its environment file from the CANDIDATE core service: a core that declares `.env.core` is given exactly that controller-generated file and the release is REFUSED before mutation when it is missing, with no fallback to the owner's unfiltered `.env`; the owner's `.env` is used only for a genuinely verified legacy compose shape whose core service itself declares it; the preflight records the verified credential's one-way fingerprint, the recreated core must reproduce the same fingerprint and the same dedicated-pair provenance or the release fails, and missing or mismatched proof fails closed
 AND `EVIDENCE_SHADOW` REQUIRES a verified read-only protection credential: an absent credential refuses the release in the preflight, before any mutation, and the credential-less posture remains an explicitly `SAFE_BASELINE`-only exception that can never be borrowed as an `EVIDENCE_SHADOW` success; the Tradevisor activation gate applies the same decision, refuses a half pair, and does all of it before any ingress is enabled
-AND the durable `KRAKEN:READ_ONLY_AUTH` incident - `AUTH_CONFIG`-owned, not monitor-owned - is closed only by an owner-run operation that first proves the credential identity, both read-only queries and the matching incident row through the existing `system_incidents.observe_recovery` authority, refuses on any failure leaving the row `OPEN`/`CHANGED` with admissions suspended, is idempotent when already recovered, and can never close an unrelated scope; because the in-release recovery operation cannot exist in the release that the incident blocks, one exact owner-executable command exists that performs the same proof and the same single transition against the CURRENTLY RUNNING release, executes the running core's own content-addressed image, receives only the two dedicated names (never the owner's whole `.env`), is read-only apart from the one registry write, and never deploys, restarts, activates or trades
+AND the durable `KRAKEN:READ_ONLY_AUTH` incident - `AUTH_CONFIG`-owned, not monitor-owned - is closed only by an owner-run operation that first proves the credential identity, both read-only queries and the matching incident row through the existing `system_incidents.observe_recovery` authority, refuses on any failure leaving the row `OPEN`/`CHANGED` with admissions suspended, is idempotent when already recovered, and can never close an unrelated scope; because the in-release recovery operation cannot exist in the release that the incident blocks, one exact owner-executable command exists that performs the same proof and the same single transition against the CURRENTLY RUNNING release, executes the running core's own content-addressed image only after proving that exact image is present locally (a pruned or removed image is refused by name, never substituted with an unverified one), mounts production data read-only for the plan and read-write only for the owner-approved apply, receives only the two dedicated names (never the owner's whole `.env`), never deploys, restarts, activates or trades, and the owner order that makes it usable is the bootstrap of the exact merged SHA's release-tree controller and provider library BEFORE any deployment, because the preflight and the running-core proof decide through that library and a library that predates it refuses at start-up
 
 EXPLICITLY OUT OF SCOPE:
 - Converting the production source root into a Git worktree, or creating any `.git` there.
@@ -170,9 +170,19 @@ B. Run the owner-approved, evidence-backed incident recovery (plan first, then a
    `AUTH_CONFIG` authority. Without this step the EVIDENCE_SHADOW readiness gate still reports
    `BLOCK_INCIDENT_OPEN` and every preflight refuses before mutation - correctly.
 C. Merge the corrected controller only after the exact-head CI run for the final PR head passes.
-D. Approve deployment of the exact merged `main` SHA through the existing owner-gated workflow.
-E. Validate F11 in the running core and the Tradevisor activation gate in read-only mode.
-F. Activate Tradevisor only with a separate explicit owner approval.
+D. Install the exact merged SHA's controller and provider library, BEFORE any deployment:
+     sudo -n bash /opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1/deploy/remote/bootstrap-release-tree-controller.sh \
+       --apply --sha <EXACT_MERGED_MAIN_SHA>
+   That existing bootstrap materializes `/usr/local/sbin/ohm-deploy` and
+   `/usr/local/lib/opip/opip_release_tree.sh` from that exact commit in the trusted object cache.
+   It is required now: the preflight, the running-core proof and the Tradevisor gate decide through
+   the provider library (`opip_core_env_mode`, `opip_f11_credential_state`,
+   `opip_f11_fingerprint_parity`, `opip_f11_release_credential_gate`), and a library that predates
+   them refuses the deploy at start-up (exit 69) before activation. The bootstrap performs no
+   deployment: no container is started, stopped or recreated, and `.env`/`data/` are untouched.
+E. Approve deployment of the exact merged `main` SHA through the existing owner-gated workflow.
+F. Validate F11 in the running core and the Tradevisor activation gate in read-only mode.
+G. Activate Tradevisor only with a separate explicit owner approval.
 
 ACCEPTANCE TEST TRACEABILITY:
 AC-001 -> tests/test_opip_release_tree_controller_v1.py::test_release_tree_mode_is_selected_when_no_git_metadata_exists
@@ -272,6 +282,8 @@ AC-014 -> tests/test_f11_incident_recovery_predeploy_v1.py::test_probe_verdict_n
 AC-014 -> tests/test_f11_incident_recovery_predeploy_v1.py::test_recovery_script_is_syntactically_valid
 AC-014 -> tests/test_f11_incident_recovery_predeploy_v1.py::test_recovery_probe_only_receives_the_dedicated_pair
 AC-014 -> tests/test_f11_incident_recovery_predeploy_v1.py::test_recovery_refuses_to_run_without_root
+AC-014 -> tests/test_f11_incident_recovery_predeploy_v1.py::test_recovery_requires_the_running_image_to_be_present_locally
+AC-014 -> tests/test_f11_incident_recovery_predeploy_v1.py::test_probe_data_mount_is_read_only_for_plan_and_writable_only_for_apply
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/deploy/remote/lib/opip_release_tree.sh

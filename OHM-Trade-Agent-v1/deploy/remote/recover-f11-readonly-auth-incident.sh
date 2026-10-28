@@ -35,6 +35,12 @@
 #   * It never closes any other incident: the row it acts on is the one whose
 #     key is exactly `KRAKEN:READ_ONLY_AUTH` and whose class is exactly
 #     `KRAKEN_READ_ONLY_AUTH_FAILURE`.
+#   * It executes only the image the running core was created from, and only
+#     after proving that exact content-addressed image is present locally; a
+#     pruned or removed image is refused, never replaced by another one.
+#   * Plan mode mounts production data READ-ONLY. Only the owner-approved
+#     `--apply` can write, and the only writable path is the single incident
+#     registry transition `observe_recovery` performs under its own lock.
 #
 # USAGE
 #   sudo -n bash recover-f11-readonly-auth-incident.sh            # plan only
@@ -156,17 +162,55 @@ unset pair_lines
 # A content-addressed image ID is executed, so a concurrent retag cannot change
 # what runs, and the executed code is the code production is running RIGHT NOW -
 # not the candidate release this recovery unblocks.
+require_local_image() {
+  # require_local_image <image-id> -> 0 only when that EXACT image is present
+  # locally. A pruned or removed image is refused with its own message: the probe
+  # never falls back to another (older or newer) image, because the evidence it
+  # produces is attributed to the release that is actually running.
+  local image="${1:-}" resolved
+  [[ "$image" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+    echo "refusing recovery: the running core image identity is unproven" >&2
+    return 1
+  }
+  resolved="$(docker image inspect --format '{{.Id}}' "$image" 2>/dev/null || true)"
+  if [[ "$resolved" != "$image" ]]; then
+    echo "refusing recovery: the running core image $image is not present locally (pruned or removed); no substitute image is used - restore that exact release image first" >&2
+    return 1
+  fi
+  return 0
+}
+
+data_mount() {
+  # data_mount <mode> -> the durable-data mount for the probe.
+  #   plan   observes the registry only, so the mount is READ-ONLY: a plan run
+  #          cannot write, and a refused/aborted plan cannot alter evidence.
+  #   apply  needs the single registry write `observe_recovery` performs under its
+  #          own lock. That is the only writable path, and only for --apply.
+  local mode="${1:-}"
+  case "$mode" in
+    plan) printf '%s\n' "$DATA_ROOT:/app/data:ro" ;;
+    apply) printf '%s\n' "$DATA_ROOT:/app/data" ;;
+    *) return 1 ;;
+  esac
+}
+
 CORE_IMAGE="$(docker inspect --format '{{.Image}}' "$CORE_SERVICE" 2>/dev/null || true)"
-[[ "$CORE_IMAGE" =~ ^sha256:[0-9a-f]{64}$ ]] \
-  || die "refusing recovery: the running $CORE_SERVICE image identity is unproven"
+require_local_image "$CORE_IMAGE" || {
+  echo "refusing recovery: the running $CORE_SERVICE image cannot be executed safely" >&2
+  exit "$EXIT_UNSAFE"
+}
 [[ -d "$DATA_ROOT" ]] \
   || die "refusing recovery: the durable data root $DATA_ROOT is missing"
+DATA_MOUNT="$(data_mount "$MODE")" \
+  || die "refusing recovery: unknown mode $MODE"
 echo "OPIP_F11_RECOVERY_CORE_IMAGE=$CORE_IMAGE"
 echo "OPIP_F11_RECOVERY_MODE=$MODE"
+echo "OPIP_F11_RECOVERY_DATA_MOUNT=$DATA_MOUNT"
 
 # --- Fresh proof, then at most one sanctioned transition ----------------------
-# The container is read-only except the durable data directory, which
-# `observe_recovery` needs for the single registry write under its own lock.
+# The container root filesystem is read-only. Production data is mounted
+# read-only for `--plan` and read-write only for `--apply`, where
+# `observe_recovery` needs the single registry write under its own lock.
 PROBE_RC=0
 PROBE_OUTPUT="$(docker run --rm -i \
   --read-only \
@@ -176,7 +220,7 @@ PROBE_OUTPUT="$(docker run --rm -i \
   --env-file "$PAIR_FILE" \
   -e PYTHONDONTWRITEBYTECODE=1 \
   --workdir /app \
-  -v "$DATA_ROOT:/app/data" \
+  -v "$DATA_MOUNT" \
   "$CORE_IMAGE" \
   python - "$MODE" <<'PY'
 """Fresh AUTH_CONFIG proof for the dedicated F11 read-only credential.

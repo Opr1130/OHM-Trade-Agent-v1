@@ -501,6 +501,103 @@ def test_probe_verdict_never_reads_a_partial_result_as_success(
     assert _run_probe_verdict(values) == expected
 
 
+def _run_extracted(function_name: str, body: str) -> subprocess.CompletedProcess:
+    """Run one shipped shell function verbatim with the caller's fixtures."""
+
+    function = _extract_bash_function(SCRIPT, function_name)
+    script = (
+        "set -Eeuo pipefail\n"
+        'DATA_ROOT="/srv/opip/data"\n'
+        f"{function}\n"
+        f"{body}\n"
+    )
+    result = subprocess.run(
+        [BASH, "-c", script], capture_output=True, text=True, check=False
+    )
+    _skip_if_bash_unusable(result)
+    return result
+
+
+_IMAGE_ID = "sha256:" + "a" * 64
+
+
+@requires_bash
+@pytest.mark.parametrize(
+    ("image", "docker_body", "expected"),
+    [
+        # Present locally, and the daemon reports exactly that ID.
+        (
+            _IMAGE_ID,
+            f'docker() {{ printf "%s\\n" "{_IMAGE_ID}" ; return 0 ; }}',
+            "PRESENT",
+        ),
+        # Pruned or removed: `docker image inspect` fails and nothing is run.
+        (_IMAGE_ID, "docker() { return 1 ; }", "ABSENT"),
+        # The daemon resolves it to a DIFFERENT image: never accepted.
+        (
+            _IMAGE_ID,
+            'docker() { printf "sha256:%s\\n" "ffffff" ; return 0 ; }',
+            "ABSENT",
+        ),
+        # An identity that was never content-addressed cannot even be checked.
+        ("core-image:latest", "docker() { return 0 ; }", "UNPROVEN"),
+        ("", "docker() { return 0 ; }", "UNPROVEN"),
+    ],
+)
+def test_recovery_requires_the_running_image_to_be_present_locally(
+    image, docker_body, expected
+) -> None:
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-014: the probe may execute ONLY the exact
+    content-addressed image the running core was created from, and only while
+    that image is still present locally. A pruned image refuses by name instead
+    of silently running a different one - the evidence would otherwise be
+    attributed to a release that is not the one running."""
+
+    result = _run_extracted(
+        "require_local_image",
+        docker_body + f"\nrequire_local_image '{image}' && echo PRESENT\n",
+    )
+
+    if expected == "PRESENT":
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "PRESENT"
+        assert result.stderr == ""
+        return
+
+    assert "PRESENT" not in result.stdout, result.stdout
+    assert result.returncode != 0
+    if expected == "ABSENT":
+        assert "is not present locally" in result.stderr, result.stderr
+        assert image in result.stderr, result.stderr
+    else:
+        assert "identity is unproven" in result.stderr, result.stderr
+
+
+@requires_bash
+def test_probe_data_mount_is_read_only_for_plan_and_writable_only_for_apply() -> None:
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-014: production data is mounted READ-ONLY
+    for the plan and read-write only for the owner-approved apply, so an
+    observation run physically cannot write durable evidence."""
+
+    plan = _run_extracted("data_mount", 'data_mount plan')
+    apply_mode = _run_extracted("data_mount", 'data_mount apply')
+    unknown = _run_extracted("data_mount", 'data_mount validate')
+
+    assert plan.returncode == 0, plan.stderr
+    assert plan.stdout.strip() == "/srv/opip/data:/app/data:ro"
+    assert apply_mode.returncode == 0, apply_mode.stderr
+    assert apply_mode.stdout.strip() == "/srv/opip/data:/app/data"
+    assert unknown.returncode != 0
+    assert unknown.stdout.strip() == ""
+
+    # The probe must consume that decision, not a hardcoded writable mount.
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert '-v "$DATA_MOUNT"' in script
+    assert '-v "$DATA_ROOT:/app/data"' not in script
+    assert 'DATA_MOUNT="$(data_mount "$MODE")"' in script
+
+
+
 
 @requires_bash
 def test_recovery_script_is_syntactically_valid() -> None:
@@ -526,13 +623,15 @@ def test_recovery_probe_only_receives_the_dedicated_pair() -> None:
     assert '--env-file "$PAIR_FILE"' in script
     assert 'KEY_ENV="OPIP_F11_KRAKEN_READONLY_API_KEY"' in script
     assert 'SECRET_ENV="OPIP_F11_KRAKEN_READONLY_API_SECRET"' in script
-    # Executed identity is the running release, not the candidate.
+    # Executed identity is the running release, not the candidate - and it is
+    # proven present locally before anything is executed.
     assert "docker inspect --format '{{.Image}}' \"$CORE_SERVICE\"" in script
-    assert '[[ "$CORE_IMAGE" =~ ^sha256:[0-9a-f]{64}$ ]]' in script
-    # Read-only apart from the durable data directory the registry lives in.
+    assert "require_local_image \"$CORE_IMAGE\"" in script
+    # Container root filesystem stays read-only; the durable data mount is the
+    # mode-dependent decision verified behaviourally above.
     assert "--read-only" in script
-    assert '-v "$DATA_ROOT:/app/data"' in script
-    assert '-v "$DATA_ROOT:/app/data:ro"' not in script
+    assert '-v "$DATA_MOUNT"' in script
+    assert 'DATA_MOUNT="$(data_mount "$MODE")"' in script
     # The temporary pair file is removed on every exit path.
     assert "trap cleanup EXIT" in script
     assert 'rm -f -- "$PAIR_FILE"' in script
