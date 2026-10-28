@@ -427,9 +427,17 @@ source_listing() {
   # Deterministic `sha256  relative-path` stream for an application source tree.
   # The same runtime-only exclusions the controller uses, so production data,
   # secrets and byte-code caches never participate in provenance.
+  #
+  # `./.env.core` is the controller-generated filtered core environment
+  # (`opip_write_core_env`): it lives in the application root but is never part
+  # of the release artifact, and the controller's own `rt_list_tree` excludes it
+  # for exactly that reason. Without this exclusion a legitimate file the
+  # controller must create to satisfy `env_file: .env.core` read as an
+  # unreleased source file and failed activation on a false integrity error.
   ( cd "$1" || exit 1
     find . -type f \
-      -not -path './data/*' -not -path './.env' -not -path './__pycache__/*' \
+      -not -path './data/*' -not -path './.env' -not -path './.env.core' \
+      -not -path './__pycache__/*' \
       -not -name '*.py[cod]' -print0 \
       | LC_ALL=C sort -z | xargs -0 -r sha256sum ) | sed 's|\./||'
 }

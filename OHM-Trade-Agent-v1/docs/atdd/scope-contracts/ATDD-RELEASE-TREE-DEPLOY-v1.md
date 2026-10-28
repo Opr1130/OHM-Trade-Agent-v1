@@ -202,6 +202,9 @@ AC-010 -> tests/test_opip_canonical_cursor_read_plan_v1.py::test_the_index_prese
 AC-011 -> tests/test_tradevisor_activation_release_tree_v1.py::test_release_tree_evidence_is_accepted
 AC-011 -> tests/test_tradevisor_activation_release_tree_v1.py::test_tampered_or_missing_evidence_is_refused
 AC-011 -> tests/test_tradevisor_activation_release_tree_v1.py::test_git_worktree_path_keeps_its_historical_validation
+AC-011 -> tests/test_tradevisor_activation_release_tree_v1.py::test_source_listing_runtime_only_exclusions_match_the_controller
+AC-011 -> tests/test_tradevisor_activation_release_tree_v1.py::test_source_listing_keeps_unexpected_files_and_drops_runtime_only_paths
+AC-011 -> tests/test_tradevisor_activation_release_tree_v1.py::test_runtime_only_core_env_is_accepted_by_the_release_tree_gate
 AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_funded_credential_names_match_the_python_authority
 AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_generator_removes_funded_names_and_keeps_the_rest
 AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_generator_is_idempotent_and_follows_rotation

@@ -14,6 +14,7 @@ refused.
 from __future__ import annotations
 
 import pathlib
+import re
 import shutil
 import subprocess
 
@@ -256,3 +257,122 @@ def test_git_worktree_path_keeps_its_historical_validation() -> None:
     assert 'if [[ -d "$REPO_ROOT/.git" ]]; then' in dispatcher
     assert "verify_release_git_worktree" in dispatcher
     assert "verify_release_tree" in dispatcher
+
+
+# ---------------------------------------------------------------------------
+# Runtime-only exclusion parity with the controller.
+#
+# The reported activation failure: the deployment controller generates
+# `.env.core` (the filtered core environment the Compose service mounts) and
+# correctly keeps it out of release provenance, while `source_listing()` did not
+# exclude it. The live-source comparison then read a legitimate controller file
+# as an unreleased source file and refused activation on a false integrity
+# error. These pin the parity and the behaviour it protects.
+# ---------------------------------------------------------------------------
+
+LIBRARY = APP / "deploy" / "remote" / "lib" / "opip_release_tree.sh"
+_NOT_EXCLUSION = re.compile(r"-not\s+-(path|name)\s+'([^']+)'")
+_BASH_UNAVAILABLE_CODES = {3221225794, -1073741502, 3221225477}
+
+
+def _function_body(path: pathlib.Path, name: str) -> str:
+    text = path.read_text(encoding="utf-8")
+    start = text.index(f"{name}() {{")
+    end = text.index("\n}\n", start) + len("\n}\n")
+    return text[start:end]
+
+
+def _exclusions(function_body: str) -> frozenset[tuple[str, str]]:
+    return frozenset(_NOT_EXCLUSION.findall(function_body))
+
+
+def _skip_if_bash_unusable(result: subprocess.CompletedProcess) -> None:
+    text = f"{result.stderr}{result.stdout}"
+    if result.returncode in _BASH_UNAVAILABLE_CODES or (
+        result.returncode != 0
+        and ("fork: Resource temporarily unavailable" in text or "dofork" in text)
+    ):
+        pytest.skip("bash cannot run reliably in this environment")
+
+
+def test_source_listing_runtime_only_exclusions_match_the_controller() -> None:
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-011: the activation gate must exclude
+    exactly the runtime-only paths the deployment controller excludes, so a
+    controller-generated `.env.core` can never be read as unreleased source and
+    any future drift between the two lists fails here."""
+
+    gate = _exclusions(_function_body(ACTIVATION, "source_listing"))
+    controller = _exclusions(_function_body(LIBRARY, "rt_list_tree"))
+
+    assert gate == controller
+    assert ("path", "./.env.core") in gate
+
+
+def test_source_listing_keeps_unexpected_files_and_drops_runtime_only_paths(
+    tmp_path: pathlib.Path,
+) -> None:
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-011: `.env.core`, `.env`, production data
+    and byte-code caches stay out of the live-source listing, while a genuinely
+    unexpected file is still listed - so it is still refused as "files absent
+    from the release manifest" rather than silently ignored."""
+
+    tree = tmp_path / "app"
+    (tree / "deploy").mkdir(parents=True)
+    (tree / "deploy" / "one.txt").write_text("x\n", encoding="utf-8")
+    (tree / "deploy" / "unexpected.txt").write_text("z\n", encoding="utf-8")
+    (tree / ".env").write_text("SECRET=never-logged\n", encoding="utf-8")
+    (tree / ".env.core").write_text(
+        "OPIP_RELEASE_PROFILE=EVIDENCE_SHADOW\n", encoding="utf-8"
+    )
+    (tree / "data" / "opip").mkdir(parents=True)
+    (tree / "data" / "opip" / "canonical.sqlite3").write_bytes(b"db")
+    (tree / "__pycache__").mkdir()
+    (tree / "__pycache__" / "module.pyc").write_bytes(b"\x00")
+
+    script = (
+        "set -Eeuo pipefail\n"
+        + _function_body(ACTIVATION, "source_listing")
+        + f"\nsource_listing {tree.as_posix()}\n"
+    )
+    result = subprocess.run(
+        [BASH, "-c", script], capture_output=True, text=True, check=False
+    )
+    _skip_if_bash_unusable(result)
+    assert result.returncode == 0, result.stderr
+
+    paths = {
+        line.split("  ", 1)[1]
+        for line in result.stdout.splitlines()
+        if line.strip()
+    }
+    assert "deploy/one.txt" in paths
+    # A real unrecorded file is still compared, so the controller's "files
+    # absent from the release manifest" refusal keeps working.
+    assert "deploy/unexpected.txt" in paths
+    assert ".env" not in paths
+    assert ".env.core" not in paths
+    assert not any(path.startswith("data/") for path in paths)
+    assert not any(
+        "__pycache__" in path or path.endswith(".pyc") for path in paths
+    )
+
+
+def test_runtime_only_core_env_is_accepted_by_the_release_tree_gate(
+    evidence: pathlib.Path,
+) -> None:
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-011: with a legitimate controller-generated
+    `.env.core` present, Gate 4 still passes, and every manifest/hash/path
+    verification between the record, the manifest, the provenance and the live
+    source stays enforced (the negative cases above are unchanged)."""
+
+    app = evidence / "repo" / "OHM-Trade-Agent-v1"
+    (app / ".env.core").write_text(
+        "OPIP_RELEASE_PROFILE=EVIDENCE_SHADOW\n", encoding="utf-8"
+    )
+
+    result = _run(evidence, "verify_release_and_recovery")
+    _skip_if_bash_unusable(result)
+
+    assert result.returncode == 0, result.stderr
+    assert "installed application source matches the release manifest" in result.stdout
+    assert "files absent from the release manifest" not in result.stderr
