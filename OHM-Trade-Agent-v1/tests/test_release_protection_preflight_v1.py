@@ -1060,6 +1060,11 @@ def test_ac_026_coverage_degraded_scopes_are_same_cycle_structured(monkeypatch):
         def assert_read_only(self):
             return types.SimpleNamespace(name="ro")
 
+        def assert_protection_read_only(self):
+            # AC-014: F11 gates on the dedicated protection identity now; this
+            # double still stands for "the configured credential is acceptable".
+            return self.assert_read_only()
+
         def get_open_positions(self):
             return {}
 

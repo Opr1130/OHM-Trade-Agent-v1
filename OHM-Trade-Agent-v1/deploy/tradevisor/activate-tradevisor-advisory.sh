@@ -786,6 +786,39 @@ verify_authority_boundaries() {
   done
   pass "no funded/live exchange credential is present in the core environment"
 
+  # The single approved exception, recognised EXPLICITLY and verified
+  # INDEPENDENTLY rather than ignored: the dedicated F11 protection key may sit
+  # in the core under its own two names, because F11 protection health must be
+  # able to read the live account. It is not a funded credential, it is proven
+  # read-only, and this gate re-proves it from inside the running core - so an
+  # advisory ingress is only ever enabled while the core holds a credential that
+  # is positively the dedicated read-only protection key, and never one that
+  # merely claims to be.
+  local f11_key=0 f11_secret=0 f11_verdict
+  if printf '%s\n' "$cfg" | grep -q "^OPIP_F11_KRAKEN_READONLY_API_KEY="; then
+    f11_key=1
+  fi
+  if printf '%s\n' "$cfg" | grep -q "^OPIP_F11_KRAKEN_READONLY_API_SECRET="; then
+    f11_secret=1
+  fi
+  if ((f11_key != f11_secret)); then
+    die "the F11 read-only protection credential pair is incomplete in the core environment; a half pair is refused"
+  fi
+  if ((f11_key == 1)); then
+    f11_verdict="$(compose exec -T "$CORE_SERVICE" \
+      python -m app.jobs.verify_f11_readonly_credential 2>/dev/null || true)"
+    if ! printf '%s\n' "$f11_verdict" \
+      | grep -qx 'OPIP_F11_READONLY_VERDICT=PASS'; then
+      die "the F11 read-only protection credential did not verify in the running core; refusing to enable advisory ingress"
+    fi
+    printf '%s\n' "$f11_verdict" \
+      | grep -q '^OPIP_F11_READONLY_FINGERPRINT=' \
+      || die "the F11 read-only protection credential proof carries no fingerprint marker"
+    pass "the approved F11 read-only protection credential is present and independently verified"
+  else
+    pass "no exchange credential is present in the core environment"
+  fi
+
   units="$(systemctl list-units --all --no-legend --plain 'opip-learning-*' 2>/dev/null \
     | awk '{print $3}' | sort -u || true)"
   if [[ -n "$units" ]] && printf '%s\n' "$units" | grep -qv '^inactive$'; then

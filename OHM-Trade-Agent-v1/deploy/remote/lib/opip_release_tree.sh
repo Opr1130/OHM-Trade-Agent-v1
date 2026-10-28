@@ -42,6 +42,21 @@ GIT=()
 #: Python authority fails CI instead of silently widening the core environment.
 OPIP_FUNDED_CREDENTIAL_KEYS="KRAKEN_API_KEY KRAKEN_API_SECRET KRAKEN_PRIVATE_KEY KRKN_API_KEY LIVE_TRADING_KEY"
 
+#: F11 protection credential NAMES that the core IS allowed to carry. A literal
+#: mirror of ``app.exchanges.kraken_protection_credentials``; the ATDD contract
+#: test asserts both name pairs are identical, so the Python authority cannot
+#: drift from the provider that materialises the file.
+#:
+#: These are NOT funded names. F11 protection health is read-only and is not
+#: optional (it observes the live account through Balance/OpenPositions), so the
+#: dedicated owner-created read-only key crosses the isolation boundary under
+#: these two names - and under no others. The runtime then independently proves
+#: the key's identity, its exact two scopes and its droplet IP allowlist before
+#: F11 may use it, so a value that is not that key is refused rather than
+#: trusted. Funded authority still never crosses: the five names above are
+#: removed from the core environment unconditionally.
+OPIP_F11_READONLY_CREDENTIAL_KEYS="OPIP_F11_KRAKEN_READONLY_API_KEY OPIP_F11_KRAKEN_READONLY_API_SECRET"
+
 opip_core_env_path() {
   # Runtime-only, controller-generated file. Like `.env` and `data/` it is NOT
   # part of the release artifact and MUST stay out of the release manifest:
@@ -90,6 +105,31 @@ opip_write_core_env() {
       return 1
     fi
   done
+  # The F11 protection pair is the only exchange credential the core may carry,
+  # and it must cross whole. A half pair is a broken rotation: refusing here
+  # means the core is never started with a silently disabled read-only client,
+  # and the pair is never completed from a funded name. Values are counted, never
+  # printed.
+  local -a f11_keys
+  local f11_present=0 f11_state
+  read -r -a f11_keys <<<"$OPIP_F11_READONLY_CREDENTIAL_KEYS"
+  for key in "${f11_keys[@]}"; do
+    if grep -qE "^[[:space:]]*${key}[[:space:]]*=[[:space:]]*[^[:space:]]" \
+      "$tmp" 2>/dev/null; then
+      f11_present=$((f11_present + 1))
+    fi
+  done
+  if ((${#f11_keys[@]} > 0)) &&
+    ((f11_present != 0)) && ((f11_present != ${#f11_keys[@]})); then
+    rm -f -- "$tmp"
+    echo "refusing core environment: the F11 read-only credential pair is incomplete" \
+      "(${f11_present}/${#f11_keys[@]} present)" >&2
+    return 1
+  fi
+  f11_state=ABSENT
+  if ((${#f11_keys[@]} > 0)) && ((f11_present == ${#f11_keys[@]})); then
+    f11_state=PRESENT
+  fi
   if [[ ! -s "$tmp" ]]; then
     rm -f -- "$tmp"
     echo "refusing core environment: the filtered file is empty" >&2
@@ -104,7 +144,8 @@ opip_write_core_env() {
     echo "refusing core environment: $dest is not mode 0600" >&2
     return 1
   fi
-  echo "OPIP_CORE_ENV=WRITTEN path=$dest excluded_count=${#keys[@]}"
+  echo "OPIP_CORE_ENV=WRITTEN path=$dest excluded_count=${#keys[@]}" \
+    "f11_readonly_pair=$f11_state"
 }
 
 opip_source_die() {

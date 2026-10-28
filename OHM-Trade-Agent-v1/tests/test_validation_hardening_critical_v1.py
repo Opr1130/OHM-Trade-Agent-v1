@@ -42,6 +42,11 @@ def test_doge_legacy_balance_code_is_visible_to_position_gate():
         def assert_read_only(self):
             return object()
 
+        def assert_protection_read_only(self):
+            # AC-014: F11 gates on the dedicated protection identity now; this
+            # double still stands for "the configured credential is acceptable".
+            return self.assert_read_only()
+
         def get_balance(self):
             return {"XXDG": 250.0}
 

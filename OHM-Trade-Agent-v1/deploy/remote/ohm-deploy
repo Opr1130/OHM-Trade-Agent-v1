@@ -1626,8 +1626,25 @@ run_protection_preflight() {
     echo "protection preflight refused: no verified runtime image ($PREFLIGHT_IMAGE_REASON)" >&2
   fi
 
+  # The preflight must observe EXACTLY the environment the core will run with,
+  # or its protection verdict proves nothing about the runtime. The core reads
+  # the controller-generated `.env.core` (funded names removed, the dedicated
+  # F11 read-only pair carried), so the preflight container is given that same
+  # file instead of the owner's unfiltered `.env`. The fallback exists only for
+  # a tree/harness where the controller has not produced the filtered file; the
+  # marker makes which one was used explicit in the receipt.
+  local preflight_env="$APP_ROOT/.env.core" preflight_env_source=CORE_FILTERED
+  if [[ ! -f "$preflight_env" ]]; then
+    preflight_env="$APP_ROOT/.env"
+    preflight_env_source=OWNER_ENV_FALLBACK
+  fi
+  echo "OPIP_PROTECTION_PREFLIGHT_ENV_SOURCE=$preflight_env_source"
   rc=1
-  if [[ -d "$candidate_app" && -n "$image" && -f "$APP_ROOT/.env" ]]; then
+  # (`${preflight_env:-$APP_ROOT/.env}` reads the value chosen above; the `:-`
+  # default keeps this block self-contained for the bash harness that extracts
+  # it verbatim, and equals the pre-existing owner-`.env` behaviour.)
+  if [[ -d "$candidate_app" && -n "$image" && \
+    -f "${preflight_env:-$APP_ROOT/.env}" ]]; then
     # Capture the container exit code on BOTH outcomes. A bare
     # `docker run ... || rc=$?` never assigns on success, which would leave rc=1
     # and misclassify a genuinely HEALTHY preflight as FAIL.
@@ -1636,7 +1653,7 @@ run_protection_preflight() {
       --tmpfs /tmp:rw,nosuid,size=32m \
       --pids-limit 64 \
       --memory 384m \
-      --env-file "$APP_ROOT/.env" \
+      --env-file "${preflight_env:-$APP_ROOT/.env}" \
       -e PYTHONDONTWRITEBYTECODE=1 \
       -v "$candidate_app:/app/app:ro" \
       -v "$APP_ROOT/data:/app/data:ro" \
@@ -1925,6 +1942,10 @@ fi
 # resolves the core service; the deploy fails closed if it cannot be produced.
 # This is the SECOND of the two generation gates: the first one, above, covers
 # the release installed before activation, whose Compose calls run earlier.
+#
+# The generator also reports (names only, never a value) whether the dedicated
+# F11 read-only pair crossed the isolation boundary; that marker is the
+# authoritative statement the runtime proof below is compared against.
 opip_write_core_env || {
   echo "refusing deploy: the filtered core environment could not be generated" >&2
   false
@@ -1971,6 +1992,50 @@ wait_paper_health
 validate_target_resource_budget
 validate_candidate_container_identity
 validate_release_scheduler_contract
+
+# --- F11 read-only protection credential: proof in the running core -----------
+# The dedicated protection key is the only exchange credential the core may
+# carry (app/exchanges/kraken_protection_credentials.py). Its identity is proven
+# in the RUNNING core - never inferred from the file that fed it - and the only
+# credential-derived value recorded is a one-way fingerprint. The preflight
+# observed the same `.env.core` the core mounts, so a PASS here and the
+# preflight's protection verdict describe one configuration, not two.
+#
+# Read-only: GetApiKeyInfo, Balance, OpenPositions. No order, cancellation,
+# funding or configuration mutation.
+#
+# The three accepted shapes are explicit, and everything else fails the release:
+#   PASS + dedicated pair            -> verified protection credential
+#   UNVERIFIED + no credential       -> the pre-existing SAFE_BASELINE posture;
+#                                       F11 reports UNAVAILABLE and admissions
+#                                       stay suspended, but nothing is claimed
+#   anything else                    -> a configured credential that does not
+#                                       verify (wrong key, wrong scopes, wrong
+#                                       allowlist, revoked or unreadable) must
+#                                       never be carried forward as trusted
+F11_READONLY_MARKERS="$(docker compose exec -T ohm-trade-agent \
+  python -m app.jobs.verify_f11_readonly_credential 2>/dev/null || true)"
+F11_READONLY_VERDICT="$(printf '%s\n' "$F11_READONLY_MARKERS" \
+  | sed -n 's/^OPIP_F11_READONLY_VERDICT=//p' | tail -n 1)"
+F11_READONLY_SOURCE="$(printf '%s\n' "$F11_READONLY_MARKERS" \
+  | sed -n 's/^OPIP_F11_READONLY_CREDENTIAL_SOURCE=//p' | tail -n 1)"
+F11_READONLY_FINGERPRINT="$(printf '%s\n' "$F11_READONLY_MARKERS" \
+  | sed -n 's/^OPIP_F11_READONLY_FINGERPRINT=//p' | tail -n 1)"
+echo "OPIP_F11_READONLY_RUNTIME_VERDICT=${F11_READONLY_VERDICT:-UNPROVEN}"
+echo "OPIP_F11_READONLY_CREDENTIAL_SOURCE=${F11_READONLY_SOURCE:-NONE}"
+echo "OPIP_F11_READONLY_FINGERPRINT=${F11_READONLY_FINGERPRINT:-NONE}"
+case "${F11_READONLY_VERDICT:-UNPROVEN}:${F11_READONLY_SOURCE:-NONE}" in
+  PASS:OPIP_F11_READONLY)
+    echo "OPIP_F11_READONLY_CREDENTIAL_PROOF=VERIFIED"
+    ;;
+  UNVERIFIED:NONE)
+    echo "OPIP_F11_READONLY_CREDENTIAL_PROOF=ABSENT"
+    ;;
+  *)
+    echo "the F11 read-only protection credential did not verify in the running core" >&2
+    false
+    ;;
+esac
 
 READY_AFTER="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 RELEASE_PROFILE="$(docker compose exec -T ohm-trade-agent \

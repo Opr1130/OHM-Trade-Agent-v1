@@ -282,7 +282,10 @@ class KrakenExposureResolver:
             )
 
         try:
-            self.private_client.assert_read_only()
+            # F11 observes the live account only through the dedicated
+            # protection credential: identity, exact scopes and the confirmed
+            # droplet allowlist are proven before any balance is read.
+            self.private_client.assert_protection_read_only()
             balances = self.private_client.get_balance()
             positions = self.private_client.get_open_positions()
         except Exception as exc:

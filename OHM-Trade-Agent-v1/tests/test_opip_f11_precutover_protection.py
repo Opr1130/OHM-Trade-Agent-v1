@@ -490,6 +490,11 @@ def test_ac_008_observer_disables_the_materiality_floor(monkeypatch):
         def assert_read_only(self):
             return SimpleNamespace(name="ro")
 
+        def assert_protection_read_only(self):
+            # AC-014: F11 gates on the dedicated protection identity now; this
+            # double still stands for "the configured credential is acceptable".
+            return self.assert_read_only()
+
         def get_balance(self):
             return {"SOL": 0.01}
 

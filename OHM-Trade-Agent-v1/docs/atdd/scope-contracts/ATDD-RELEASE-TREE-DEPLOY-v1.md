@@ -131,6 +131,15 @@ the deploy controller prepares the preflight container
 THEN:
 it executes only an image whose identity and runtime compatibility are both proven: the running core container's own image when the daemon still has it, otherwise the reference that container was created with, resolved to a fully content-addressed image ID and admitted only when the image's `org.opencontainers.image.revision` label names a real commit in the trusted source cache and that commit's `Dockerfile` and `requirements.txt` are byte-identical to the candidate's, because the image supplies only the interpreter and installed dependencies while the candidate code and production data are bind-mounted read-only; the content-addressed ID (never a mutable tag) is what runs, so a concurrent retag cannot change the runtime; the resolution outcome, image ID, source revision, source class and an allowlisted failure reason are emitted as bounded provenance markers that carry no environment value or credential; and when no image can be proven the release is refused before any mutation with `OPIP_PROTECTION_PREFLIGHT=FAIL`, `OPIP_PROTECTION_PREFLIGHT_ABORT=REFUSED_BEFORE_MUTATION` and `OPIP_PRODUCTION_MUTATION=NOT_STARTED`, never by substituting an arbitrary image and never by weakening, skipping or reordering the protection evaluation or its F11 evidence
 
+AC-014:
+GIVEN:
+a release-tree core whose filtered environment removes the funded Kraken names, so F11 protection runtime has no credential, while the preflight still read the owner's unfiltered `.env` and therefore disagreed with the runtime
+WHEN:
+the release is prepared and the deployed core starts
+THEN:
+exactly one bounded read-only credential may cross the isolation boundary - the dedicated protection key `OPIP-V2-PROTECTION-READONLY` delivered only under `OPIP_F11_KRAKEN_READONLY_API_KEY` and `OPIP_F11_KRAKEN_READONLY_API_SECRET`, carried whole or refused whole by the existing atomic, root-owned mode 0600 generator, with every funded name still removed and the owner's `.env` never modified; the read-only client resolves that pair ahead of the legacy names, refuses a half pair instead of completing it from another name, and keeps the legacy pair only as the SAFE_BASELINE/Git-worktree path; the client parses `GetApiKeyInfo` in both documented spellings (`api_key_name`/`apiKeyName`, `last_used`/`lastUsed`, `ip_allowlist`/`ipAllowlist`), refuses conflicting representations, and F11's own consumers accept the credential only when the reported key name is exactly `OPIP-V2-PROTECTION-READONLY`, the reported scopes are exactly `query-funds` and `query-open-trades`, and the IP allowlist is exactly the confirmed Trading droplet (`178.128.147.125` or its equivalent single-host `/32` representation), refusing unknown, trading, funding, ledger, closed-trade, export or WebSocket scopes and never falling back to funded credentials
+AND the preflight container is given the same `.env.core` the core mounts, the recreated core is proved with the same read-only verification job, and the deploy fails the release when a configured credential does not verify while still allowing the explicitly unconfigured SAFE_BASELINE posture; the Tradevisor activation gate recognises that approved pair explicitly and independently re-verifies it from inside the running core before any ingress is enabled, refusing an incomplete pair; and the durable `KRAKEN:READ_ONLY_AUTH` incident - `AUTH_CONFIG`-owned, not monitor-owned - is closed only by an operator-run operation that first proves the credential identity, both read-only queries, and the matching incident row, refuses on any failure leaving the row `OPEN`/`CHANGED` with admissions suspended, is idempotent when already recovered, and can never close an unrelated scope
+
 EXPLICITLY OUT OF SCOPE:
 - Converting the production source root into a Git worktree, or creating any `.git` there.
 - Fabricating commits, refs, trees or a previous-good SHA.
@@ -187,6 +196,38 @@ AC-013 -> tests/test_release_protection_preflight_v1.py::test_ac_013_preflight_r
 AC-013 -> tests/test_release_protection_preflight_v1.py::test_ac_013_image_markers_are_bounded_and_value_free
 AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_the_edited_remote_operators_parse
 AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_positions_fails_safe_when_the_credential_is_absent
+AC-014 -> tests/test_f11_readonly_credential_exception_v1.py::test_resolver_prefers_the_dedicated_pair_over_the_legacy_pair
+AC-014 -> tests/test_f11_readonly_credential_exception_v1.py::test_partial_protection_pair_is_refused_and_never_completed
+AC-014 -> tests/test_f11_readonly_credential_exception_v1.py::test_legacy_pair_is_used_only_when_no_protection_pair_exists
+AC-014 -> tests/test_f11_readonly_credential_exception_v1.py::test_no_credential_configuration_degrades_without_raising
+AC-014 -> tests/test_f11_readonly_credential_exception_v1.py::test_partial_pair_disables_the_client_with_the_reason
+AC-014 -> tests/test_f11_readonly_credential_exception_v1.py::test_live_snake_case_key_info_is_parsed
+AC-014 -> tests/test_f11_readonly_credential_exception_v1.py::test_camel_case_key_info_remains_supported
+AC-014 -> tests/test_f11_readonly_credential_exception_v1.py::test_conflicting_key_name_representations_are_refused
+AC-014 -> tests/test_f11_readonly_credential_exception_v1.py::test_protection_identity_requires_the_exact_key_name
+AC-014 -> tests/test_f11_readonly_credential_exception_v1.py::test_protection_identity_requires_a_reported_key_name
+AC-014 -> tests/test_f11_readonly_credential_exception_v1.py::test_protection_identity_accepts_the_two_permission_set
+AC-014 -> tests/test_f11_readonly_credential_exception_v1.py::test_protection_identity_refuses_extra_read_only_scopes
+AC-014 -> tests/test_f11_readonly_credential_exception_v1.py::test_protection_identity_refuses_a_missing_required_scope
+AC-014 -> tests/test_f11_readonly_credential_exception_v1.py::test_protection_identity_refuses_trading_and_funding_permissions
+AC-014 -> tests/test_f11_readonly_credential_exception_v1.py::test_protection_identity_requires_the_confirmed_allowlist
+AC-014 -> tests/test_f11_readonly_credential_exception_v1.py::test_protection_identity_refuses_a_wider_or_foreign_allowlist
+AC-014 -> tests/test_f11_readonly_credential_exception_v1.py::test_protection_identity_refuses_an_unreported_allowlist
+AC-014 -> tests/test_f11_readonly_credential_exception_v1.py::test_protection_identity_refuses_malformed_permissions
+AC-014 -> tests/test_f11_readonly_credential_exception_v1.py::test_revoked_or_failed_key_info_is_never_verified
+AC-014 -> tests/test_f11_readonly_credential_exception_v1.py::test_f11_consumers_use_the_protection_gate
+AC-014 -> tests/test_f11_readonly_credential_exception_v1.py::test_f11_permissions_do_not_include_history_ledger_or_export
+AC-014 -> tests/test_f11_readonly_credential_exception_v1.py::test_generator_carries_the_pair_and_still_excludes_funded_names
+AC-014 -> tests/test_f11_readonly_credential_exception_v1.py::test_protection_credential_names_match_the_python_authority
+AC-014 -> tests/test_f11_readonly_credential_exception_v1.py::test_generator_refuses_a_partial_pair
+AC-014 -> tests/test_f11_readonly_credential_exception_v1.py::test_generator_never_prints_a_value
+AC-014 -> tests/test_f11_readonly_credential_exception_v1.py::test_preflight_reads_the_same_filtered_environment_as_the_core
+AC-014 -> tests/test_f11_readonly_credential_exception_v1.py::test_deploy_proves_the_credential_in_the_running_core
+AC-014 -> tests/test_f11_readonly_credential_exception_v1.py::test_tradevisor_gate_verifies_the_exception_and_refuses_a_half_pair
+AC-014 -> tests/test_f11_readonly_credential_exception_v1.py::test_recovery_requires_matching_evidence_and_is_idempotent
+AC-014 -> tests/test_f11_readonly_credential_exception_v1.py::test_recovery_refuses_when_the_proof_fails
+AC-014 -> tests/test_f11_readonly_credential_exception_v1.py::test_recovery_only_closes_its_own_incident_key
+AC-014 -> tests/test_f11_readonly_credential_exception_v1.py::test_fingerprint_is_stable_and_value_free
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/deploy/remote/lib/opip_release_tree.sh
@@ -226,6 +267,26 @@ AC-004 -> OHM-Trade-Agent-v1/tests/test_opip_release_tree_controller_v1.py
 AC-005 -> OHM-Trade-Agent-v1/tests/test_opip_release_tree_controller_v1.py
 AC-006 -> OHM-Trade-Agent-v1/tests/test_opip_release_tree_controller_v1.py
 AC-007 -> OHM-Trade-Agent-v1/tests/test_opip_release_tree_controller_v1.py
+AC-014 -> OHM-Trade-Agent-v1/app/exchanges/kraken_protection_credentials.py
+AC-014 -> OHM-Trade-Agent-v1/app/exchanges/kraken_private.py
+AC-014 -> OHM-Trade-Agent-v1/app/services/kraken_credential_audit.py
+AC-014 -> OHM-Trade-Agent-v1/app/services/kraken_exposure_resolver.py
+AC-014 -> OHM-Trade-Agent-v1/app/services/kraken_position_verification.py
+AC-014 -> OHM-Trade-Agent-v1/app/jobs/verify_f11_readonly_credential.py
+AC-014 -> OHM-Trade-Agent-v1/app/jobs/recover_f11_readonly_auth_incident.py
+AC-014 -> OHM-Trade-Agent-v1/deploy/remote/lib/opip_release_tree.sh
+AC-014 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
+AC-014 -> OHM-Trade-Agent-v1/deploy/tradevisor/activate-tradevisor-advisory.sh
+AC-014 -> OHM-Trade-Agent-v1/tests/test_f11_readonly_credential_exception_v1.py
+AC-014 -> OHM-Trade-Agent-v1/tests/test_kraken_balance_identity_v1.py
+AC-014 -> OHM-Trade-Agent-v1/tests/test_kraken_exposure_resolver_r1_1.py
+AC-014 -> OHM-Trade-Agent-v1/tests/test_kraken_position_verification.py
+AC-014 -> OHM-Trade-Agent-v1/tests/test_opip_f11_precutover_protection.py
+AC-014 -> OHM-Trade-Agent-v1/tests/test_release_protection_preflight_v1.py
+AC-014 -> OHM-Trade-Agent-v1/tests/test_wave9_position_protection.py
+AC-014 -> OHM-Trade-Agent-v1/tests/test_wave9_review_fixes.py
+AC-014 -> OHM-Trade-Agent-v1/tests/test_validation_hardening_critical_v1.py
+AC-014 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-RELEASE-TREE-DEPLOY-v1.md
 
 DEFERRED DISCOVERIES:
 - The bootstrap records the running release as an `unverified-baseline` tree because the production host has no external manifest for it; the first release-tree activation replaces that record with a verified one.
