@@ -148,6 +148,116 @@ opip_write_core_env() {
     "f11_readonly_pair=$f11_state"
 }
 
+opip_core_env_mode() {
+  # opip_core_env_mode <candidate-tree> -> FILTERED | LEGACY_OWNER_ENV
+  #
+  # Which environment file the CANDIDATE core service actually consumes. The
+  # protection preflight must observe exactly that file, so this is read from the
+  # candidate's own `docker-compose.yml`, never assumed from the tree the
+  # controller happens to be running in.
+  #
+  # FILTERED            the core declares `env_file: - .env.core`, so only the
+  #                     controller-generated filtered file is authoritative. The
+  #                     caller must refuse when that file does not exist; there is
+  #                     no fallback to the owner's unfiltered `.env`, because a
+  #                     preflight that reads a different environment than the
+  #                     runtime proves nothing about the runtime (the reported
+  #                     production F11 failure was exactly that).
+  # LEGACY_OWNER_ENV    a genuinely verified legacy shape: the core service
+  #                     itself declares the owner's `.env`, so the owner's `.env`
+  #                     IS the runtime environment and is compatible.
+  # nonzero             no provable mode (unreadable compose file, no core
+  #                     service block, no `env_file` list, a symlinked file, or
+  #                     any other shape). The caller refuses before mutation.
+  local tree="${1:-}" compose block
+  [[ -n "$tree" ]] || return 1
+  compose="${tree%/}/docker-compose.yml"
+  [[ -f "$compose" && ! -L "$compose" && -r "$compose" ]] || return 1
+  # Extract just the core service block (top-level keys are two-space indented;
+  # the service's own keys are deeper), so an `env_file` declared by another
+  # service can never be mistaken for the core's.
+  block="$(awk '
+    /^  [A-Za-z0-9._-]+:[[:space:]]*$/ {
+      name = $1; sub(/:$/, "", name); in_core = (name == "ohm-trade-agent"); next
+    }
+    in_core { print }
+  ' "$compose" 2>/dev/null)" || return 1
+  [[ -n "$block" ]] || return 1
+  if grep -Eq '^[[:space:]]*-[[:space:]]*\.env\.core[[:space:]]*$' <<<"$block"; then
+    printf 'FILTERED\n'
+    return 0
+  fi
+  if grep -Eq '^[[:space:]]*-[[:space:]]*\.env[[:space:]]*$' <<<"$block"; then
+    printf 'LEGACY_OWNER_ENV\n'
+    return 0
+  fi
+  return 1
+}
+
+opip_f11_credential_state() {
+  # opip_f11_credential_state <exit-code> <identity> <verdict> <source> <fingerprint>
+  #   -> VERIFIED | ABSENT | REFUSED
+  #
+  # The single decision used by the preflight, the running-core proof and the
+  # Tradevisor gate, so no caller can invent a weaker reading of the same job.
+  #
+  # VERIFIED requires ALL of: a successful process exit, an explicit PASS
+  # verdict, a PASS identity, the dedicated protection-pair provenance and a
+  # well-formed one-way fingerprint. A `|| true` that lost the exit code, a
+  # PASS verdict from a job that then failed Balance/OpenPositions, or a
+  # fingerprint that is missing/`NONE` can therefore never be read as success.
+  #
+  # ABSENT is the explicitly unconfigured posture: the job reports no credential
+  # at all (`NONE`) and did not SUCCEED. A broken or half pair reports `INVALID`
+  # and is therefore REFUSED, not absent. ABSENT is never a success on its own:
+  # opip_f11_release_credential_gate decides which profile may accept it.
+  local exit_code="${1:-}" identity="${2:-}" verdict="${3:-}"
+  local source="${4:-}" fingerprint="${5:-}"
+  [[ "$exit_code" =~ ^[0-9]+$ ]] || { printf 'REFUSED\n'; return 0; }
+  if [[ "$exit_code" == "0" && "$verdict" == "PASS" && "$identity" == "PASS" &&
+    "$source" == "OPIP_F11_READONLY" && "$fingerprint" =~ ^[0-9a-f]{16}$ ]]; then
+    printf 'VERIFIED\n'
+    return 0
+  fi
+  if [[ "$exit_code" != "0" && "$identity" == "UNVERIFIED" &&
+    "$verdict" == "FAIL" && "$source" == "NONE" ]]; then
+    printf 'ABSENT\n'
+    return 0
+  fi
+  printf 'REFUSED\n'
+  return 0
+}
+
+opip_f11_fingerprint_parity() {
+  # opip_f11_fingerprint_parity <preflight-fingerprint> <runtime-fingerprint>
+  #
+  # Proves the preflight and the running core resolved the SAME credential and
+  # scope set. Missing (`NONE`, empty) or mismatched proof fails: parity is an
+  # equality of two verified one-way fingerprints, never an assumption.
+  local preflight="${1:-}" runtime="${2:-}"
+  [[ "$preflight" =~ ^[0-9a-f]{16}$ ]] || return 1
+  [[ "$runtime" =~ ^[0-9a-f]{16}$ ]] || return 1
+  [[ "$preflight" == "$runtime" ]] || return 1
+  return 0
+}
+
+opip_f11_release_credential_gate() {
+  # opip_f11_release_credential_gate <release-profile> <state> -> 0 acceptable
+  #
+  # EVIDENCE_SHADOW is the evidence-plane release profile and REQUIRES a
+  # verified read-only protection credential: an absent credential refuses it
+  # before mutation. The credential-less exception belongs only to the
+  # SAFE_BASELINE rollback posture, which never becomes a deployable release
+  # (`validate_candidate_container_identity` refuses it), so it can never be
+  # borrowed by an EVIDENCE_SHADOW activation.
+  local profile="${1:-}" state="${2:-}"
+  case "$profile:$state" in
+    EVIDENCE_SHADOW:VERIFIED) return 0 ;;
+    SAFE_BASELINE:ABSENT) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 opip_source_die() {
   echo "$*" >&2
   exit 69

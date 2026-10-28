@@ -20,6 +20,8 @@ an order, and no production state is touched.
 from __future__ import annotations
 
 import base64
+import contextlib
+import io
 import pathlib
 import shutil
 import subprocess
@@ -59,10 +61,16 @@ VERIFIER = APP / "app" / "services" / "kraken_position_verification.py"
 RECOVERY = APP / "app" / "jobs" / "recover_f11_readonly_auth_incident.py"
 BASH = shutil.which("bash")
 
-pytestmark = [
-    pytest.mark.acceptance,
-    pytest.mark.skipif(BASH is None, reason="bash is required"),
-]
+pytestmark = [pytest.mark.acceptance]
+
+#: The bash-dependent cases below are marked individually, so the Python-only
+#: contract tests still run on a host without bash (and every case runs in CI).
+requires_bash = pytest.mark.skipif(BASH is None, reason="bash is required")
+
+#: Exit statuses that mean "bash could not start at all" on this host, not "the
+#: script failed" (Windows raises 0xC0000142 when the shell cannot initialise).
+_BASH_UNAVAILABLE_CODES = {3221225794, -1073741502, 3221225477}
+
 
 _SECRET = "stub-secret-not-a-real-key"
 
@@ -115,8 +123,12 @@ def _skip_if_bash_cannot_fork(result) -> None:
     """
 
     text = f"{result.stderr}{result.stdout}"
-    if result.returncode != 0 and (
-        "fork: Resource temporarily unavailable" in text or "dofork" in text
+    if result.returncode in _BASH_UNAVAILABLE_CODES or (
+        result.returncode != 0
+        and (
+            "fork: Resource temporarily unavailable" in text
+            or "dofork" in text
+        )
     ):
         pytest.skip("bash cannot fork reliably in this environment")
 
@@ -518,6 +530,7 @@ def test_protection_credential_names_match_the_python_authority() -> None:
     assert tuple(match.group(1).split()) == (PROTECTION_KEY_ENV, PROTECTION_SECRET_ENV)
 
 
+@requires_bash
 def test_generator_carries_the_pair_and_still_excludes_funded_names(
     generator_sandbox,
 ) -> None:
@@ -543,6 +556,7 @@ def test_generator_carries_the_pair_and_still_excludes_funded_names(
     assert (app_root / ".env").read_bytes() == source_before
 
 
+@requires_bash
 def test_generator_refuses_a_partial_pair(generator_sandbox) -> None:
     """ATDD-RELEASE-TREE-DEPLOY-v1/AC-014: a half protection pair never reaches
     the core - the generator refuses and leaves no filtered file behind."""
@@ -564,6 +578,7 @@ def test_generator_refuses_a_partial_pair(generator_sandbox) -> None:
     assert not (app_root / ".env.core").exists()
 
 
+@requires_bash
 def test_generator_never_prints_a_value(generator_sandbox) -> None:
     """ATDD-RELEASE-TREE-DEPLOY-v1/AC-014: regeneration after a rotation reports
     only names, counts and presence - never a credential value."""
@@ -596,50 +611,320 @@ def test_generator_never_prints_a_value(generator_sandbox) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_preflight_reads_the_same_filtered_environment_as_the_core() -> None:
-    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-014: the preflight container is given the
-    filtered core environment the runtime mounts - the reported production
-    mismatch was a preflight that read the owner's unfiltered `.env`."""
+def _library_call(body: str):
+    """Source the shipped provider library and run a snippet against it."""
+
+    script = (
+        "set -Eeuo pipefail\n"
+        "APP_ROOT=/nonexistent-app-root\n"
+        "STATE_DIR=/nonexistent-state-dir\n"
+        f"source {LIBRARY.as_posix()}\n"
+        f"{body}\n"
+    )
+    result = subprocess.run(
+        [BASH, "-c", script], capture_output=True, text=True, check=False
+    )
+    _skip_if_bash_cannot_fork(result)
+    return result
+
+
+def _compose_tree(root: pathlib.Path, core_block: str) -> pathlib.Path:
+    tree = root / "candidate"
+    tree.mkdir(parents=True, exist_ok=True)
+    (tree / "docker-compose.yml").write_text(
+        "services:\n"
+        "  other-service:\n"
+        "    image: example/other\n"
+        "    env_file:\n"
+        "      - .env.other\n"
+        "  ohm-trade-agent:\n"
+        f"{core_block}"
+        "  third-service:\n"
+        "    env_file:\n"
+        "      - .env.third\n",
+        encoding="utf-8",
+    )
+    return tree
+
+
+@requires_bash
+def test_core_env_mode_is_read_from_the_candidate_compose(tmp_path) -> None:
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-014: the preflight's environment file is
+    derived from the CANDIDATE core service, never assumed. A core that declares
+    `.env.core` is FILTERED; one that declares the owner's `.env` is the only
+    verified legacy shape; anything else (another service's `env_file`, no
+    `env_file`, no core service, a symlinked file) is unprovable and refuses."""
+
+    filtered = _compose_tree(
+        tmp_path / "filtered", "    env_file:\n      - .env.core\n"
+    )
+    legacy = _compose_tree(tmp_path / "legacy", "    env_file:\n      - .env\n")
+    other_only = _compose_tree(tmp_path / "other", "    image: example/core\n")
+    no_core = tmp_path / "no-core"
+    no_core.mkdir()
+    (no_core / "docker-compose.yml").write_text(
+        "services:\n  other-service:\n    env_file:\n      - .env\n",
+        encoding="utf-8",
+    )
+    symlinked = tmp_path / "symlinked"
+    symlinked.mkdir()
+    (symlinked / "real.yml").write_text(
+        "services:\n  ohm-trade-agent:\n    env_file:\n      - .env.core\n",
+        encoding="utf-8",
+    )
+    try:
+        (symlinked / "docker-compose.yml").symlink_to(symlinked / "real.yml")
+    except (OSError, NotImplementedError):
+        pytest.skip("this filesystem cannot create symlinks")
+
+    for tree, expected in ((filtered, "FILTERED"), (legacy, "LEGACY_OWNER_ENV")):
+        result = _library_call(f"opip_core_env_mode {tree.as_posix()}")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == expected
+
+    for tree in (other_only, no_core, symlinked, tmp_path / "missing"):
+        result = _library_call(f"opip_core_env_mode {tree.as_posix()}")
+        assert result.returncode != 0
+        assert result.stdout.strip() == ""
+
+
+def test_preflight_never_falls_back_to_the_owner_env() -> None:
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-014: the reported production mismatch was a
+    preflight that read the owner's unfiltered `.env` while the runtime read
+    `.env.core`. The fallback must be gone, and both proofs must run through the
+    shared decision functions rather than a local re-interpretation."""
+
     deploy = DEPLOY.read_text(encoding="utf-8")
-    assert 'preflight_env="$APP_ROOT/.env.core"' in deploy
-    assert '--env-file "${preflight_env:-$APP_ROOT/.env}"' in deploy
+    assert "OWNER_ENV_FALLBACK" not in deploy
+    # The owner's `.env` is used ONLY inside the verified legacy branch.
+    assert deploy.count('preflight_env="$APP_ROOT/.env"') == 1
+    assert 'LEGACY_OWNER_ENV)\n      preflight_env="$APP_ROOT/.env"' in deploy
+    assert 'FILTERED)\n      preflight_env="$APP_ROOT/.env.core"' in deploy
     assert '--env-file "$APP_ROOT/.env"' not in deploy
+    assert 'core_env_mode="$(opip_core_env_mode "$candidate_tree"' in deploy
     assert "OPIP_PROTECTION_PREFLIGHT_ENV_SOURCE=$preflight_env_source" in deploy
+    # A missing filtered file is a refusal, not a substitution.
+    assert "refusing before any mutation" in deploy
     compose = (APP / "docker-compose.yml").read_text(encoding="utf-8")
     assert "- .env.core" in compose
+
+@requires_bash
+def test_credential_state_never_verifies_a_masked_or_partial_result() -> None:
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-014: the single decision used by the
+    preflight, the running core and the Tradevisor gate. VERIFIED needs the exit
+    code AND the explicit PASS AND the PASS identity AND the dedicated-pair
+    provenance AND a well-formed fingerprint together; anything less refuses."""
+
+    good = ("0", "PASS", "PASS", "OPIP_F11_READONLY", "0123456789abcdef")
+    cases = [
+        (good, "VERIFIED"),
+        # A masked exit status (`|| true`) is the defect this correction removes.
+        (("1",) + good[1:], "REFUSED"),
+        (("3",) + good[1:], "REFUSED"),
+        # Identity verified, but Balance/OpenPositions did not: verdict FAIL.
+        (("3", "FAIL", "PASS", "OPIP_F11_READONLY", "0123456789abcdef"), "REFUSED"),
+        (("0", "FAIL", "PASS", "OPIP_F11_READONLY", "0123456789abcdef"), "REFUSED"),
+        # A funded/legacy pair is not the approved exception.
+        (("0", "PASS", "PASS", "LEGACY_FUNDED_NAME", "0123456789abcdef"), "REFUSED"),
+        # Missing or malformed fingerprint proof.
+        (("0", "PASS", "PASS", "OPIP_F11_READONLY", "NONE"), "REFUSED"),
+        (("0", "PASS", "PASS", "OPIP_F11_READONLY", ""), "REFUSED"),
+        (("0", "PASS", "PASS", "OPIP_F11_READONLY", "0123"), "REFUSED"),
+        # The explicitly unconfigured posture, and its non-absence variants.
+        (("3", "UNVERIFIED", "FAIL", "NONE", "NONE"), "ABSENT"),
+        (("0", "UNVERIFIED", "FAIL", "NONE", "NONE"), "REFUSED"),
+        (("3", "UNVERIFIED", "FAIL", "INVALID", "NONE"), "REFUSED"),
+        (("not-a-code", "", "", "", ""), "REFUSED"),
+    ]
+    for values, expected in cases:
+        body = "opip_f11_credential_state " + " ".join(f"'{v}'" for v in values)
+        result = _library_call(body)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == expected, values
+
+
+@requires_bash
+def test_fingerprint_parity_requires_two_matching_well_formed_values() -> None:
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-014: preflight/runtime parity is an equality
+    of two verified one-way fingerprints. Missing proof, a truncated value or a
+    mismatch must fail - a preflight that does not describe the runtime proves
+    nothing about the runtime."""
+
+    fingerprint = "0123456789abcdef"
+    other = "fedcba9876543210"
+    result = _library_call(
+        f"opip_f11_fingerprint_parity {fingerprint} {fingerprint}"
+    )
+    assert result.returncode == 0, result.stderr
+    for left, right in (
+        (fingerprint, other),
+        (fingerprint, "NONE"),
+        ("NONE", fingerprint),
+        ("", ""),
+        (fingerprint, fingerprint[:8]),
+        (fingerprint.upper(), fingerprint.upper()),
+    ):
+        result = _library_call(f"opip_f11_fingerprint_parity '{left}' '{right}'")
+        assert result.returncode != 0, (left, right)
+
+
+@requires_bash
+def test_release_credential_gate_refuses_absent_for_evidence_shadow() -> None:
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-014: EVIDENCE_SHADOW requires a verified
+    read-only protection credential. The credential-less exception belongs to the
+    SAFE_BASELINE rollback posture only and can never be borrowed as an
+    EVIDENCE_SHADOW success."""
+
+    for profile, state in (
+        ("EVIDENCE_SHADOW", "VERIFIED"),
+        ("SAFE_BASELINE", "ABSENT"),
+    ):
+        result = _library_call(
+            f"opip_f11_release_credential_gate {profile} {state}"
+        )
+        assert result.returncode == 0, (profile, state)
+    for profile, state in (
+        ("EVIDENCE_SHADOW", "ABSENT"),
+        ("EVIDENCE_SHADOW", "REFUSED"),
+        ("SAFE_BASELINE", "VERIFIED"),
+        ("UNPROVEN", "VERIFIED"),
+        ("", ""),
+    ):
+        result = _library_call(
+            f"opip_f11_release_credential_gate '{profile}' '{state}'"
+        )
+        assert result.returncode != 0, (profile, state)
+
+
 
 
 def test_deploy_proves_the_credential_in_the_running_core() -> None:
     """ATDD-RELEASE-TREE-DEPLOY-v1/AC-014: the deployed core is proved with the
-    same read-only verification job the preflight and the Tradevisor gate use,
-    and every outcome except verified-or-absent fails the release."""
+    same read-only verification job the preflight and the Tradevisor gate use.
+    The proof must not be masked, must be read through the shared decision, and
+    must reproduce the preflight's fingerprint before the release is accepted."""
+
     deploy = DEPLOY.read_text(encoding="utf-8")
     assert "python -m app.jobs.verify_f11_readonly_credential" in deploy
-    assert "PASS:OPIP_F11_READONLY)" in deploy
-    assert "UNVERIFIED:NONE)" in deploy
-    assert "OPIP_F11_READONLY_FINGERPRINT=" in deploy
-    assert "OPIP_F11_READONLY_CREDENTIAL_PROOF=VERIFIED" in deploy
-    # The proof must run against the recreated core, never before it.
-    assert deploy.index("docker compose up -d --remove-orphans ohm-trade-agent") < (
-        deploy.index("verify_f11_readonly_credential")
+    # No masked verification: the exit status is captured on both outcomes.
+    assert "verify_f11_readonly_credential 2>/dev/null || true" not in deploy
+    assert 'F11_READONLY_RC=$?' in deploy
+    assert (
+        'F11_READONLY_STATE="$(opip_f11_credential_state "$F11_READONLY_RC"'
+        in deploy
     )
+    assert (
+        'opip_f11_release_credential_gate "${CANDIDATE_RELEASE_PROFILE:-UNPROVEN}"'
+        in deploy
+    )
+    assert (
+        'opip_f11_fingerprint_parity "${PROTECTION_PREFLIGHT_F11_FINGERPRINT:-}"'
+        in deploy
+    )
+    assert "OPIP_F11_READONLY_FINGERPRINT_PARITY=MATCH" in deploy
+    # The proof must run against the RECREATED core, never before it.
+    runtime_proof = deploy.index(
+        "docker compose exec -T ohm-trade-agent \\\n"
+        "  python -m app.jobs.verify_f11_readonly_credential"
+    )
+    assert deploy.index("docker compose up -d --remove-orphans ohm-trade-agent") < (
+        runtime_proof
+    )
+    # ... and the preflight proof must run before the first runtime mutation.
+    preflight_proof = deploy.index(
+        "python -m app.jobs.verify_f11_readonly_credential 2>/dev/null)"
+    )
+    assert preflight_proof < runtime_proof
+    assert preflight_proof < deploy.rindex("stop_paper_stack\n")
+    # The preflight publishes the fingerprint the runtime must reproduce.
+    assert 'PROTECTION_PREFLIGHT_F11_FINGERPRINT="$f11_fingerprint"' in deploy
 
 
 def test_tradevisor_gate_verifies_the_exception_and_refuses_a_half_pair() -> None:
     """ATDD-RELEASE-TREE-DEPLOY-v1/AC-014: the Tradevisor gate recognises the
-    approved read-only protection pair explicitly, verifies it independently
-    from inside the core, refuses a half pair, and does all of it before any
-    ingress is enabled - so a failed gate cannot leave Tradevisor half on."""
+    approved read-only protection pair explicitly, verifies it independently from
+    inside the core without masking the exit status, requires a VERIFIED state,
+    refuses a half pair, and does all of it before any ingress is enabled - so a
+    failed gate cannot leave Tradevisor half on."""
+
     gate = TRADEVISOR.read_text(encoding="utf-8")
     assert "OPIP_F11_KRAKEN_READONLY_API_KEY" in gate
     assert "OPIP_F11_KRAKEN_READONLY_API_SECRET" in gate
     assert "python -m app.jobs.verify_f11_readonly_credential" in gate
-    assert "OPIP_F11_READONLY_VERDICT=PASS" in gate
+    assert "verify_f11_readonly_credential 2>/dev/null || true" not in gate
+    assert 'f11_rc=$?' in gate
+    assert (
+        'f11_state="$(f11_credential_state "$f11_rc" "$f11_identity" '
+        '"$f11_verdict"' in gate
+    )
+    assert '[ "$f11_state" == "VERIFIED" ]' in gate
     assert "pair is incomplete" in gate
+    # An absent credential is NOT an EVIDENCE_SHADOW success.
+    assert "EVIDENCE_SHADOW requires a verified one" in gate
     # Gate 6 runs inside main() before the ingress flip at line "  enable_ingress".
     assert gate.index("verify_f11_readonly_credential") < gate.index(
         "\n  enable_ingress\n"
     )
+
+
+def _extract_bash_function(path: pathlib.Path, name: str) -> str:
+    """Extract one shipped shell function verbatim, so tests exercise the real
+    implementation instead of a re-implementation."""
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        if line.startswith(f"{name}() {{"):
+            start = index
+            break
+    assert start is not None, f"{name} is missing from {path.name}"
+    end = start
+    while end < len(lines) and lines[end] != "}":
+        end += 1
+    assert lines[end] == "}", f"{name} in {path.name} is not closed at column 0"
+    return "\n".join(lines[start : end + 1])
+
+
+@requires_bash
+def test_tradevisor_gate_decision_matches_the_deploy_controller_decision() -> None:
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-014: the Tradevisor gate and the deploy
+    controller ship the same credential decision. Running one scenario matrix
+    through both shipped functions proves they cannot drift into a weaker
+    reading of one verifier result."""
+
+    gate_function = _extract_bash_function(TRADEVISOR, "f11_credential_state")
+    library_function = _extract_bash_function(
+        LIBRARY, "opip_f11_credential_state"
+    )
+    cases = (
+        ("0", "PASS", "PASS", "OPIP_F11_READONLY", "0123456789abcdef"),
+        ("1", "PASS", "PASS", "OPIP_F11_READONLY", "0123456789abcdef"),
+        ("0", "FAIL", "PASS", "OPIP_F11_READONLY", "0123456789abcdef"),
+        ("0", "PASS", "FAIL", "OPIP_F11_READONLY", "0123456789abcdef"),
+        ("0", "PASS", "PASS", "LEGACY_FUNDED_NAME", "0123456789abcdef"),
+        ("0", "PASS", "PASS", "OPIP_F11_READONLY", "NONE"),
+        ("3", "FAIL", "UNVERIFIED", "NONE", "NONE"),
+        ("0", "FAIL", "UNVERIFIED", "NONE", "NONE"),
+        ("3", "FAIL", "UNVERIFIED", "INVALID", "NONE"),
+    )
+    for values in cases:
+        args = " ".join(f"'{value}'" for value in values)
+        script = (
+            "set -Eeuo pipefail\n"
+            f"{gate_function}\n"
+            f"{library_function}\n"
+            f"gate_state=\"$(f11_credential_state {args})\"\n"
+            f"library_state=\"$(opip_f11_credential_state {args})\"\n"
+            'printf "%s|%s\\n" "$gate_state" "$library_state"\n'
+        )
+        result = subprocess.run(
+            [BASH, "-c", script], capture_output=True, text=True, check=False
+        )
+        _skip_if_bash_cannot_fork(result)
+        assert result.returncode == 0, result.stderr
+        gate_state, library_state = result.stdout.strip().split("|")
+        assert gate_state == library_state, values
+
 
 
 # ---------------------------------------------------------------------------
@@ -778,4 +1063,154 @@ def test_fingerprint_is_stable_and_value_free() -> None:
 
 
 
+
+
+
+# ---------------------------------------------------------------------------
+# The verification job's own verdict.
+#
+# PASS is the WHOLE proof: identity AND Balance AND OpenPositions AND a
+# successful process exit. These run the shipped `main()` against stub clients
+# and pin every way the implementation could report PASS without proof.
+# ---------------------------------------------------------------------------
+
+
+class _UnconfiguredClient(_StubClient):
+    """A client with no credential at all (the explicitly absent posture)."""
+
+    def __init__(self, *, problem: str = ""):
+        super().__init__(result=_result())
+        # No pair at all: the client is disabled, as it is on a host that has
+        # configured no protection credential.
+        self.api_key = ""
+        self.api_secret = ""
+        self.credential_source = ""
+        self.credential_problem = problem
+
+
+class _BalanceUnreadable(_StubClient):
+    def get_balance(self):
+        raise KrakenPrivateAPIError("balance unavailable")
+
+
+class _PositionsUnreadable(_StubClient):
+    def get_open_positions(self):
+        raise KrakenPrivateAPIError("open positions unavailable")
+
+
+def _verifier_markers(monkeypatch, client) -> tuple[int, dict[str, str], str]:
+    from app.jobs import verify_f11_readonly_credential as verifier
+
+    monkeypatch.setattr(verifier, "KrakenPrivateClient", lambda: client)
+    captured = io.StringIO()
+    with contextlib.redirect_stdout(captured):
+        code = verifier.main()
+    stdout = captured.getvalue()
+    markers = dict(
+        line.split("=", 1) for line in stdout.splitlines() if "=" in line
+    )
+    return code, markers, stdout
+
+
+def test_verifier_passes_only_when_identity_balance_and_positions_all_hold(
+    monkeypatch,
+) -> None:
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-014: the full proof - and only the full
+    proof - exits 0 with VERDICT=PASS and carries the real fingerprint."""
+
+    client = _StubClient(
+        result=_result(), balances={"ZUSD": 1.0}, positions={"XBTUSD": {}}
+    )
+    client.credential_source = SOURCE_PROTECTION
+    code, markers, _ = _verifier_markers(monkeypatch, client)
+
+    assert code == 0
+    assert markers["OPIP_F11_READONLY_VERDICT"] == "PASS"
+    assert markers["OPIP_F11_READONLY_IDENTITY"] == "PASS"
+    assert markers["OPIP_F11_READONLY_CREDENTIAL_SOURCE"] == SOURCE_PROTECTION
+    assert markers["OPIP_F11_READONLY_BALANCE"] == "OK:1"
+    assert markers["OPIP_F11_READONLY_OPEN_POSITIONS"] == "OK:1"
+    assert markers["OPIP_F11_READONLY_FINGERPRINT"] == protection_fingerprint(
+        api_key=client.api_key,
+        key_name=PROTECTION_KEY_NAME,
+        permissions=PROTECTION_PERMISSIONS,
+        ip_allowlist=[PROTECTION_IP_ALLOWLIST_ENTRY],
+    )
+
+
+def test_verifier_never_reports_pass_when_balance_fails(monkeypatch) -> None:
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-014: the identity is right but the account
+    is unreadable. That is NOT a PASS and NOT a successful command - the defect
+    was a PASS verdict with a non-zero exit that the controller then ignored."""
+
+    client = _BalanceUnreadable(result=_result())
+    client.credential_source = SOURCE_PROTECTION
+    code, markers, stdout = _verifier_markers(monkeypatch, client)
+
+    assert code != 0
+    assert markers["OPIP_F11_READONLY_IDENTITY"] == "PASS"
+    assert markers["OPIP_F11_READONLY_VERDICT"] == "FAIL"
+    assert markers["OPIP_F11_READONLY_BALANCE"].startswith("FAIL:")
+    assert markers["OPIP_F11_READONLY_REASON"] == "BALANCE_UNPROVEN"
+    assert "OPIP_F11_READONLY_VERDICT=PASS" not in stdout
+
+
+def test_verifier_never_reports_pass_when_open_positions_fail(monkeypatch) -> None:
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-014: Balance succeeding is not enough;
+    OpenPositions is the second read F11 depends on."""
+
+    client = _PositionsUnreadable(result=_result(), balances={"ZUSD": 1.0})
+    client.credential_source = SOURCE_PROTECTION
+    code, markers, stdout = _verifier_markers(monkeypatch, client)
+
+    assert code != 0
+    assert markers["OPIP_F11_READONLY_VERDICT"] == "FAIL"
+    assert markers["OPIP_F11_READONLY_BALANCE"] == "OK:1"
+    assert markers["OPIP_F11_READONLY_OPEN_POSITIONS"].startswith("FAIL:")
+    assert markers["OPIP_F11_READONLY_REASON"] == "OPEN_POSITIONS_UNPROVEN"
+    assert "OPIP_F11_READONLY_VERDICT=PASS" not in stdout
+
+
+def test_verifier_reports_absent_without_any_credential(monkeypatch) -> None:
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-014: the explicitly unconfigured posture is
+    reported as absent (UNVERIFIED identity, source NONE) and still exits
+    non-zero, so no caller can mistake it for a verified credential."""
+
+    code, markers, stdout = _verifier_markers(monkeypatch, _UnconfiguredClient())
+
+    assert code != 0
+    assert markers["OPIP_F11_READONLY_IDENTITY"] == "UNVERIFIED"
+    assert markers["OPIP_F11_READONLY_VERDICT"] == "FAIL"
+    assert markers["OPIP_F11_READONLY_CREDENTIAL_SOURCE"] == "NONE"
+    assert markers["OPIP_F11_READONLY_FINGERPRINT"] == "NONE"
+    assert "OPIP_F11_READONLY_VERDICT=PASS" not in stdout
+
+
+def test_verifier_reports_a_half_pair_as_invalid_not_absent(monkeypatch) -> None:
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-014: a broken rotation is a configuration
+    fault. It must not degrade into the benign "no credential" posture."""
+
+    client = _UnconfiguredClient(problem="OPIP_F11_KRAKEN_READONLY_API_KEY ...")
+    code, markers, _ = _verifier_markers(monkeypatch, client)
+
+    assert code != 0
+    assert markers["OPIP_F11_READONLY_CREDENTIAL_SOURCE"] == "INVALID"
+    assert markers["OPIP_F11_READONLY_VERDICT"] == "FAIL"
+
+
+def test_verifier_refuses_a_key_that_is_not_the_dedicated_protection_key(
+    monkeypatch,
+) -> None:
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-014: a read-only key that fails identity is
+    a FAIL verdict with no fingerprint - never a PASS with a caveat."""
+
+    client = _StubClient(result=_result(api_key_name="SOME-OTHER-READONLY-KEY"))
+    client.credential_source = SOURCE_PROTECTION
+    code, markers, _ = _verifier_markers(monkeypatch, client)
+
+    assert code != 0
+    assert markers["OPIP_F11_READONLY_IDENTITY"] == "FAIL"
+    assert markers["OPIP_F11_READONLY_VERDICT"] == "FAIL"
+    assert markers["OPIP_F11_READONLY_FINGERPRINT"] == "NONE"
+    assert markers["OPIP_F11_READONLY_BALANCE"] == "NOT_RUN"
 
