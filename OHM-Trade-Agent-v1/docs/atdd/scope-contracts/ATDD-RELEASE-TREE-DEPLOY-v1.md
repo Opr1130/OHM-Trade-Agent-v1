@@ -151,6 +151,14 @@ Compose resolves the edge entrypoint and an owner-approved Tradevisor activation
 THEN:
 every shell-local variable used to validate the edge verification value, certificate and template output survives Compose interpolation literally (using doubled dollar signs), and the activation re-creates the edge container when its vhost is absent or stale, independently verifies the rendered vhost, preserves a healthy already-current edge idempotently, and uses the same re-create behavior for rollback; the dashboard must remain reachable and failure must refuse activation rather than claiming success
 
+AC-016:
+GIVEN:
+the deployed core consumes a controller-filtered `.env.core`, not the owner's `.env`, and `docker compose up -d` can leave an already-running container's environment unchanged
+WHEN:
+Tradevisor activation flips `OPIP_TRADEVISOR_ENABLED`, activation is retried, or an operator rolls it back (including a stale enabled core with the owner's flag already false)
+THEN:
+the activation reuses the existing controller's funded-credential-filtering generator, verifies that `.env.core` contains the intended flag, force-recreates only the core, and proves `Settings().opip_tradevisor_enabled` has the required runtime value before any authenticated webhook probe; rollback regenerates the filtered file, force-recreates the core and proves the runtime is disabled, refusing to claim restoration if any step fails; no learning or trading authority changes
+
 EXPLICITLY OUT OF SCOPE:
 - Converting the production source root into a Git worktree, or creating any `.git` there.
 - Fabricating commits, refs, trees or a previous-good SHA.
@@ -214,6 +222,11 @@ AC-011 -> tests/test_tradevisor_activation_release_tree_v1.py::test_source_listi
 AC-011 -> tests/test_tradevisor_activation_release_tree_v1.py::test_source_listing_keeps_unexpected_files_and_drops_runtime_only_paths
 AC-011 -> tests/test_tradevisor_activation_release_tree_v1.py::test_runtime_only_core_env_is_accepted_by_the_release_tree_gate
 AC-015 -> tests/test_tradevisor_production_edge_v1.py::test_ac_015_compose_preserves_edge_shell_variables_after_interpolation
+AC-016 -> tests/test_tradevisor_activation_core_env_v1.py::test_ac_016_enable_refreshes_filtered_env_and_recreates_running_core
+AC-016 -> tests/test_tradevisor_activation_core_env_v1.py::test_ac_016_rollback_refreshes_env_and_recreates_core_disabled
+AC-016 -> tests/test_tradevisor_activation_core_env_v1.py::test_ac_016_generator_failure_refuses_activation_and_restores_owner_flag
+AC-016 -> tests/test_tradevisor_activation_core_env_v1.py::test_ac_016_runtime_mismatch_refuses_activation_and_rolls_back
+AC-016 -> tests/test_tradevisor_activation_core_env_v1.py::test_ac_016_explicit_rollback_repairs_stale_core_even_if_owner_env_is_false
 AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_funded_credential_names_match_the_python_authority
 AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_generator_removes_funded_names_and_keeps_the_rest
 AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_generator_is_idempotent_and_follows_rotation
@@ -316,6 +329,8 @@ AC-011 -> OHM-Trade-Agent-v1/tests/test_tradevisor_activation_release_tree_v1.py
 AC-015 -> OHM-Trade-Agent-v1/docker-compose.yml
 AC-015 -> OHM-Trade-Agent-v1/deploy/tradevisor/activate-tradevisor-advisory.sh
 AC-015 -> OHM-Trade-Agent-v1/tests/test_tradevisor_production_edge_v1.py
+AC-016 -> OHM-Trade-Agent-v1/deploy/tradevisor/activate-tradevisor-advisory.sh
+AC-016 -> OHM-Trade-Agent-v1/tests/test_tradevisor_activation_core_env_v1.py
 AC-012 -> OHM-Trade-Agent-v1/deploy/remote/lib/opip_release_tree.sh
 AC-012 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
 AC-012 -> OHM-Trade-Agent-v1/docker-compose.yml

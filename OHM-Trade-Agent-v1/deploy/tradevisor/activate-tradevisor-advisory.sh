@@ -973,9 +973,45 @@ verify_cloud_firewall() {
 }
 
 # --- Route state transitions -------------------------------------------------
+refresh_core_env() (
+  # Compose runs the core from .env.core, NOT the owner's .env. Reuse the
+  # release controller's credential-filtering generator; never copy .env raw
+  # into the container or introduce a second credential policy.
+  # This function is invoked only during apply/rollback, never the dry run.
+  local provider="$APP_ROOT/deploy/remote/lib/opip_release_tree.sh"
+  [[ -f "$provider" && ! -L "$provider" ]] || return 1
+  # shellcheck source=/dev/null
+  source "$provider" || return 1
+  declare -F opip_write_core_env >/dev/null || return 1
+  opip_write_core_env || return 1
+
+  local actual expected
+  expected="$(env_value "$ENABLE_KEY")"
+  actual="$(awk -F= -v k="$ENABLE_KEY" '
+    $1 == k { n++; v=$2 }
+    END { if (n != 1) exit 1; print v }
+  ' "$(opip_core_env_path)")" || return 1
+  [[ "$actual" == "$expected" ]]
+)
+
+core_runtime_enabled_matches() {
+  # A healthy existing container can still carry the old environment.
+  # Check the application's parsed runtime value before accepting a route.
+  local actual
+  actual="$(compose exec -T "$CORE_SERVICE" python -c '
+from app.core.config import Settings
+print(str(Settings().opip_tradevisor_enabled).lower())
+  ')" || return 1
+  [[ "$actual" == "$1" ]]
+}
+
 verify_route_is_dark() {
   step "GATE the route answers nothing while ${ENABLE_KEY}=false"
   local code
+  if [[ "$ROLLBACK_ONLY" == "1" ]]; then
+    info "explicit rollback may start with a live route; verify it after disabling the core"
+    return 0
+  fi
   if is_true "$PRIOR_ENABLED"; then
     info "${ENABLE_KEY} is already true; the dark-route gate does not apply"
     return 0
@@ -990,20 +1026,23 @@ enable_ingress() {
   step "APPLY enable advisory ingress"
   local before_digest
   if is_true "$PRIOR_ENABLED"; then
-    pass "${ENABLE_KEY} already true (idempotent skip)"
-    return 0
+    info "${ENABLE_KEY} already true; reconciling the filtered core environment"
+  else
+    before_digest="$(env_digest_masked "$ENABLE_KEY")"
+    set_env_value "$ENABLE_KEY" "true"
+    ENABLED_FLIPPED=1
+    [[ "$(env_digest_masked "$ENABLE_KEY")" == "$before_digest" ]] \
+      || die ".env changed outside ${ENABLE_KEY}"
+    pass "${ENABLE_KEY}=true written atomically; no other line changed (masked-digest proof)"
+    pass ".env permissions preserved: $(stat -c '%U:%G %a' "$ENV_FILE")"
   fi
-  before_digest="$(env_digest_masked "$ENABLE_KEY")"
-  set_env_value "$ENABLE_KEY" "true"
-  ENABLED_FLIPPED=1
-  [[ "$(env_digest_masked "$ENABLE_KEY")" == "$before_digest" ]] \
-    || die ".env changed outside ${ENABLE_KEY}"
-  pass "${ENABLE_KEY}=true written atomically; no other line changed (masked-digest proof)"
-  pass ".env permissions preserved: $(stat -c '%U:%G %a' "$ENV_FILE")"
-  compose up -d --no-deps "$CORE_SERVICE" || die "core recreation failed"
+  refresh_core_env || die "filtered core environment refresh failed; refusing activation"
+  compose up -d --no-deps --force-recreate "$CORE_SERVICE" || die "core recreation failed"
   wait_core_health 240 \
     || die "core did not become healthy after enabling the ingress (config rejected or boot failure)"
-  pass "core healthy with ${ENABLE_KEY}=true"
+  core_runtime_enabled_matches true \
+    || die "running core did not accept ${ENABLE_KEY}=true"
+  pass "core healthy and runtime-confirmed with ${ENABLE_KEY}=true"
 }
 
 verify_route_authenticated() {
@@ -1024,10 +1063,15 @@ restore_pre_activation_posture() {
   trap - ERR
   set +e
   warn "restoring the pre-activation posture"
-  if [[ "$ENABLED_FLIPPED" == "1" ]]; then
-    set_env_value "$ENABLE_KEY" "$PRIOR_ENABLED" || return 3
-    compose up -d --no-deps "$CORE_SERVICE" || return 3
+  local dark_code
+  # Explicit rollback always reconciles the core, even when .env was already
+  # false but .env.core or the running container still carries true.
+  if [[ "$ENABLED_FLIPPED" == "1" || "${ROLLBACK_ONLY:-0}" == "1" ]]; then
+    set_env_value "$ENABLE_KEY" "false" || return 3
+    refresh_core_env || { warn "rollback could not regenerate filtered core environment"; return 3; }
+    compose up -d --no-deps --force-recreate "$CORE_SERVICE" || return 3
     wait_core_health 240 || return 3
+    core_runtime_enabled_matches false || { warn "rollback core runtime is not disabled"; return 3; }
     ENABLED_FLIPPED=0
   fi
   if [[ "$EDGE_RECREATED" == "1" ]]; then
@@ -1036,6 +1080,11 @@ restore_pre_activation_posture() {
   fi
   if is_true "$(env_value "$ENABLE_KEY")"; then
     warn "rollback did not clear ${ENABLE_KEY}"
+    return 3
+  fi
+  dark_code="$(probe_route '{}')"
+  if [[ "$dark_code" != "404" ]]; then
+    warn "rollback did not restore the disabled route (got ${dark_code})"
     return 3
   fi
   wait_writer_health 120 || warn "writer health was not confirmed after rollback"
