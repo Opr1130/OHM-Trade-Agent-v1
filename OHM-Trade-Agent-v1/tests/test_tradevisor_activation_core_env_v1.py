@@ -131,6 +131,7 @@ esac
 
 
 def test_ac_016_enable_refreshes_filtered_env_and_recreates_running_core(tmp_path):
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-016: enabled runtime must consume filtered .env.core."""
     result, app, runtime, log = _run(tmp_path, "enable")
     assert result.returncode == 0, result.stderr
     assert "OPIP_TRADEVISOR_ENABLED=true" in (app / ".env").read_text()
@@ -142,6 +143,7 @@ def test_ac_016_enable_refreshes_filtered_env_and_recreates_running_core(tmp_pat
 
 
 def test_ac_016_rollback_refreshes_env_and_recreates_core_disabled(tmp_path):
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-016: rollback must recreate a disabled core."""
     result, app, runtime, log = _run(tmp_path, "rollback")
     assert result.returncode == 0, result.stderr
     assert "OPIP_TRADEVISOR_ENABLED=false" in (app / ".env").read_text()
@@ -152,6 +154,7 @@ def test_ac_016_rollback_refreshes_env_and_recreates_core_disabled(tmp_path):
 
 
 def test_ac_016_generator_failure_refuses_activation_and_restores_owner_flag(tmp_path):
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-016: failed filtering must refuse admission."""
     result, app, runtime, _ = _run(tmp_path, "enable", broken_provider=True)
     assert result.returncode != 0
     assert "OPIP_TRADEVISOR_ENABLED=false" in (app / ".env").read_text()
@@ -160,6 +163,7 @@ def test_ac_016_generator_failure_refuses_activation_and_restores_owner_flag(tmp
 
 
 def test_ac_016_runtime_mismatch_refuses_activation_and_rolls_back(tmp_path):
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-016: a healthy stale core must be refused."""
     result, app, runtime, _ = _run(tmp_path, "enable", stuck_runtime=True)
     assert result.returncode != 0
     assert "running core did not accept" in result.stderr
@@ -169,6 +173,7 @@ def test_ac_016_runtime_mismatch_refuses_activation_and_rolls_back(tmp_path):
 
 
 def test_ac_016_explicit_rollback_repairs_stale_core_even_if_owner_env_is_false(tmp_path):
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-016: explicit rollback heals stale runtime."""
     result, app, runtime, log = _run(tmp_path, "explicit_rollback")
     assert result.returncode == 0, result.stderr
     assert "OPIP_TRADEVISOR_ENABLED=false" in (app / ".env.core").read_text()
