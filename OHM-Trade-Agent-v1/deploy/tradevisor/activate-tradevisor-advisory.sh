@@ -744,13 +744,14 @@ edge_render_is_current() {
 
 recreate_edge() {
   step "APPLY replace the edge with the validated configuration"
-  if edge_render_is_current; then
-    pass "edge already runs the validated webhook vhost (idempotent skip)"
+  if edge_render_is_current && wait_dashboard 10; then
+    pass "edge already runs the validated webhook vhost and dashboard is reachable (idempotent skip)"
     return 0
   fi
-  compose up -d --no-deps "$EDGE_SERVICE" || die "edge recreation failed"
+  compose up -d --no-deps --force-recreate "$EDGE_SERVICE" || die "edge recreation failed"
   EDGE_RECREATED=1
   wait_dashboard 120 || die "dashboard did not answer on 8443 after the edge restart"
+  edge_render_is_current || die "recreated edge did not render the validated webhook vhost"
   pass "dashboard answers on 8443 after the edge restart"
   compose exec -T "$EDGE_SERVICE" nginx -t >/dev/null 2>&1 \
     || die "nginx inside the recreated edge rejects its own configuration"
@@ -1030,7 +1031,7 @@ restore_pre_activation_posture() {
     ENABLED_FLIPPED=0
   fi
   if [[ "$EDGE_RECREATED" == "1" ]]; then
-    compose up -d --no-deps "$EDGE_SERVICE" || return 3
+    compose up -d --no-deps --force-recreate "$EDGE_SERVICE" || return 3
     wait_dashboard 120 || return 3
   fi
   if is_true "$(env_value "$ENABLE_KEY")"; then
