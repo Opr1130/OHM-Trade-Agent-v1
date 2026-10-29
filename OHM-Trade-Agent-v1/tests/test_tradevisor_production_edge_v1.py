@@ -213,9 +213,12 @@ def test_ac_015_compose_preserves_edge_shell_variables_after_interpolation(tmp_p
     for name in ("value", "cert", "tpl", "out"):
         assert f'The "{name}" variable is not set' not in result.stderr
     rendered = json.loads(result.stdout)["services"]["edge"]["entrypoint"][-1]
-    assert 'case "$value" in' in rendered
-    assert 'if [ ! -s "$cert" ]; then' in rendered
-    assert '"$tpl" > "$out"' in rendered
+    # Compose config may retain $ to round-trip the escape; either way the
+    # container shell must receive variable references, not empty substitutions.
+    shell_script = rendered.replace("$", "$")
+    assert 'case "$value" in' in shell_script
+    assert 'if [ ! -s "$cert" ]; then' in shell_script
+    assert '"$tpl" > "$out"' in shell_script
 
 
 def test_ac_006_both_ends_of_the_webhook_path_have_pinned_addresses():
