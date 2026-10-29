@@ -32,7 +32,26 @@ from app.scanner.universe import (
 
 
 MIN_CANDLES_REQUIRED = 200
+#: Historical hard-coded concurrency. Retained as the absolute ceiling: the
+#: operator-facing setting may only tighten it, never widen it.
 MAX_WORKERS = 8
+
+
+def configured_max_workers() -> int:
+    """Return the bounded acquisition concurrency for this process.
+
+    Resolved lazily so this module stays importable without settings (tests
+    import it directly) and so a malformed or over-wide configured value
+    degrades to the previous behaviour instead of raising mid-scan.
+    """
+    try:
+        from app.core.config import get_settings
+
+        configured = int(getattr(get_settings(), "opip_scan_max_workers", MAX_WORKERS))
+    except Exception:  # noqa: BLE001 - configuration must never break acquisition
+        return MAX_WORKERS
+    return max(1, min(MAX_WORKERS, configured))
+
 EXECUTION_VALIDATION_MAX_POSITION_FRACTION = 0.20
 MOVEMENT_COMPRESSION_PREFILTER_PERCENTILE = 40.0
 MOVEMENT_MIN_CANDLES = 120
@@ -338,7 +357,7 @@ def scan_market(limit: int = DEFAULT_UNIQUE_ASSET_LIMIT) -> ScanResult:
     failures: list[str] = []
     data_rejections: list[str] = []
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    with ThreadPoolExecutor(max_workers=configured_max_workers()) as executor:
         futures = {executor.submit(analyze_symbol, asset.primary_pair, asset): asset.primary_pair for asset in universe.assets}
         for future in as_completed(futures):
             status, snapshot, message = future.result()
@@ -378,7 +397,7 @@ def confirm_secondary_markets(candidates: list[MarketSnapshot], usdt_usd_rate: f
 
     analyzed = 0
     failed = 0
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    with ThreadPoolExecutor(max_workers=configured_max_workers()) as executor:
         futures = {executor.submit(analyze_symbol, candidate.secondary_pair): candidate for candidate in requested_candidates}
         for future in as_completed(futures):
             candidate = futures[future]

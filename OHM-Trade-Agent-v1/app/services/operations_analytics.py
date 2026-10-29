@@ -4,7 +4,7 @@ import io
 import json
 import re
 import sys
-from collections import Counter
+from collections import Counter, deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -36,6 +36,130 @@ class _Tee(io.TextIOBase):
     def flush(self) -> None:
         for target in self.targets:
             target.flush()
+
+
+class _BoundedCapture(io.TextIOBase):
+    """Bounded stdout capture: a retained head, a retained tail, and a count.
+
+    The previous implementation retained every byte the scan printed for the
+    whole duration of the scan. Scan output is unbounded in principle (per
+    symbol and per rejection), so the buffer was a direct contributor to the
+    scanning process's resident set. This keeps the head (where the scanner's
+    summary fields are printed, so ``parse_scan_output`` keeps working), a
+    bounded tail, and an explicit truncation marker with a dropped-row count.
+    """
+
+    TRUNCATION_MARKER = "[OPIP_TELEMETRY_TRUNCATED]"
+
+    def __init__(self, *, max_lines: int, max_bytes: int) -> None:
+        self._max_lines = max(1, int(max_lines))
+        self._max_bytes = max(1, int(max_bytes))
+        # Split the byte budget between the retained head and the retained
+        # tail. Bounding only the line count would let a scan that prints very
+        # long lines retain far more than the byte budget intends.
+        self._head_budget = max(1, self._max_bytes * 3 // 4)
+        self._tail_budget = max(1, self._max_bytes - self._head_budget)
+        self._head: deque[str] = deque()
+        self._tail: deque[str] = deque()
+        self._tail_max_lines = max(1, self._max_lines // 4)
+        self._head_bytes = 0
+        self._tail_bytes = 0
+        self._line_count = 0
+        self._dropped_lines = 0
+        self._overflowed = False
+        self._pending = ""
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, value: str) -> int:
+        if not value:
+            return 0
+        text = self._pending + value
+        *complete, self._pending = text.split("\n")
+        for line in complete:
+            self._store(line + "\n")
+        return len(value)
+
+    def _store(self, line: str) -> None:
+        self._line_count += 1
+        encoded = len(line.encode("utf-8", "replace"))
+        if (
+            not self._overflowed
+            and len(self._head) < self._max_lines
+            and self._head_bytes + encoded <= self._head_budget
+        ):
+            self._head.append(line)
+            self._head_bytes += encoded
+            return
+        self._overflowed = True
+        self._tail.append(line)
+        self._tail_bytes += encoded
+        while self._tail and (
+            len(self._tail) > self._tail_max_lines
+            or self._tail_bytes > self._tail_budget
+        ):
+            discarded = self._tail.popleft()
+            self._tail_bytes -= len(discarded.encode("utf-8", "replace"))
+            self._dropped_lines += 1
+
+    def flush(self) -> None:
+        return
+
+    def getvalue(self) -> str:
+        parts = list(self._head)
+        if self._pending:
+            parts.append(self._pending)
+        if self._overflowed:
+            parts.append(
+                f"{self.TRUNCATION_MARKER} dropped={self._dropped_lines}\n"
+            )
+            parts.extend(self._tail)
+        return "".join(parts)
+
+    @property
+    def dropped_lines(self) -> int:
+        return self._dropped_lines
+
+    @property
+    def line_count(self) -> int:
+        return self._line_count
+
+
+def _telemetry_bounds() -> tuple[int, int]:
+    """Return (max_lines, max_bytes) with a conservative fallback."""
+    try:
+        from app.core.config import get_settings
+
+        settings = get_settings()
+        return (
+            int(getattr(settings, "opip_scan_telemetry_max_lines", 4000)),
+            int(getattr(settings, "opip_scan_telemetry_max_bytes", 1_048_576)),
+        )
+    except Exception:  # noqa: BLE001 - telemetry bounds must never break a scan
+        return 4000, 1_048_576
+
+
+def derive_scan_outcome(result: Any) -> str:
+    """Return the explicit scan outcome for a completed callable result.
+
+    ``ScanResult`` exposes coverage counters, so a scan that ran but lost
+    symbols is ``PARTIAL`` and can never be recorded as ``COMPLETED``. A
+    callable that returns no counters is recorded as ``COMPLETED`` only because
+    it returned without raising; the caller still owns richer classification.
+    """
+    if result is None:
+        return "COMPLETED"
+    requested = getattr(result, "requested", None)
+    analyzed = getattr(result, "analyzed", None)
+    failed = getattr(result, "failed", None)
+    skipped = getattr(result, "skipped", None)
+    counters = (requested, analyzed, failed, skipped)
+    if not all(isinstance(value, int) for value in counters):
+        return "COMPLETED"
+    if requested <= 0 or failed or skipped or analyzed != requested:
+        return "PARTIAL"
+    return "COMPLETED"
 
 
 def _now() -> datetime:
@@ -145,10 +269,20 @@ def parse_scan_output(text: str) -> dict[str, Any]:
     return result
 
 
-def record_scan_output(text: str, *, started_at: datetime | None = None) -> dict[str, Any]:
+def record_scan_output(
+    text: str,
+    *,
+    started_at: datetime | None = None,
+    outcome: str = "UNAVAILABLE",
+    dropped_lines: int = 0,
+) -> dict[str, Any]:
     row = parse_scan_output(text)
     row["timestamp_utc"] = (started_at or _now()).isoformat()
     row["completed_at_utc"] = _now().isoformat()
+    # Explicit terminal classification. Without this a scan that raised, timed
+    # out or lost symbols still appended a row that read like a healthy scan.
+    row["outcome"] = str(outcome or "UNAVAILABLE").strip().upper()
+    row["telemetry_dropped_lines"] = int(dropped_lines)
     try:
         SCAN_ACTIVITY_FILE.parent.mkdir(parents=True, exist_ok=True)
         with registry_lock(SCAN_ACTIVITY_LOCK):
@@ -163,14 +297,23 @@ def record_scan_output(text: str, *, started_at: datetime | None = None) -> dict
 
 def run_scan_with_telemetry(scan_callable: Callable[[], Any]) -> Any:
     started = _now()
-    buffer = io.StringIO()
+    max_lines, max_bytes = _telemetry_bounds()
+    capture = _BoundedCapture(max_lines=max_lines, max_bytes=max_bytes)
     previous_stdout = sys.stdout
-    sys.stdout = _Tee(previous_stdout, buffer)
+    sys.stdout = _Tee(previous_stdout, capture)
+    outcome = "FAILED"
     try:
-        return scan_callable()
+        result = scan_callable()
+        outcome = derive_scan_outcome(result)
+        return result
     finally:
         sys.stdout = previous_stdout
-        record_scan_output(buffer.getvalue(), started_at=started)
+        record_scan_output(
+            capture.getvalue(),
+            started_at=started,
+            outcome=outcome,
+            dropped_lines=capture.dropped_lines,
+        )
 
 
 def _sum(rows: list[dict[str, Any]], field: str) -> int:
