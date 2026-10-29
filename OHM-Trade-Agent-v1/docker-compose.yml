@@ -52,7 +52,7 @@ services:
         tpl=/etc/nginx/templates/tradevisor-webhook.conf.template
         out=/etc/nginx/tradevisor/tradevisor-webhook.conf
         value="$${OPIP_TRADEVISOR_INTERNAL_VERIFICATION_VALUE:-}"
-        case "$value" in
+        case "$$value" in
           ""|*[!A-Za-z0-9_-]*)
             echo "tradevisor edge: no usable verification value; webhook vhost disabled" >&2
             ;;
@@ -63,11 +63,11 @@ services:
             # name* (161-35-106-207.sslip.io) whose SAN covers the served name
             # 178-128-147-125.sslip.io; the two strings are not interchangeable.
             cert=/etc/letsencrypt/live/161-35-106-207.sslip.io/fullchain.pem
-            if [ ! -s "$cert" ]; then
-              echo "tradevisor edge: certificate missing at $cert; webhook vhost disabled" >&2
+            if [ ! -s "$$cert" ]; then
+              echo "tradevisor edge: certificate missing at $$cert; webhook vhost disabled" >&2
             else
-              sed "s|__EDGE_VERIFICATION_VALUE__|$value|g" "$tpl" > "$out" 2>/dev/null \
-                || rm -f "$out"
+              sed "s|__EDGE_VERIFICATION_VALUE__|$$value|g" "$$tpl" > "$$out" 2>/dev/null \
+                || rm -f "$$out"
             fi
             ;;
         esac
