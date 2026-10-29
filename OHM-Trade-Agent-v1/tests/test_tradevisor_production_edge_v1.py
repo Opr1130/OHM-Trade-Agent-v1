@@ -182,8 +182,8 @@ def test_ac_005_the_edge_stamp_is_interpolated_from_the_host_env_file():
     )
 
 
-def test_ac_005_compose_preserves_edge_shell_variables_after_interpolation(tmp_path):
-    """The Compose render must preserve shell variables used at edge startup."""
+def test_ac_015_compose_preserves_edge_shell_variables_after_interpolation(tmp_path):
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-015: Compose preserves edge-local shell names."""
     edge_block = _text(COMPOSE).split("ohm-dashboard-edge:", 1)[1].split(
         "ohm-trade-agent:", 1
     )[0]
