@@ -184,6 +184,14 @@ E. Approve deployment of the exact merged `main` SHA through the existing owner-
 F. Validate F11 in the running core and the Tradevisor activation gate in read-only mode.
 G. Activate Tradevisor only with a separate explicit owner approval.
 
+AC-015:
+GIVEN:
+the existing production dashboard edge service is rendered by Docker Compose with a shell startup script, and the Tradevisor activation gate must replace the running edge configuration without touching trading or learning authority
+WHEN:
+Compose resolves the edge entrypoint and an owner-approved Tradevisor activation attempts to introduce the webhook virtual host
+THEN:
+every shell-local variable used to validate the edge verification value, certificate and template output survives Compose interpolation literally (using doubled dollar signs), and the activation re-creates the edge container when its vhost is absent or stale, independently verifies the rendered vhost, preserves a healthy already-current edge idempotently, and uses the same re-create behavior for rollback; the dashboard must remain reachable and failure must refuse activation rather than claiming success
+
 ACCEPTANCE TEST TRACEABILITY:
 AC-001 -> tests/test_opip_release_tree_controller_v1.py::test_release_tree_mode_is_selected_when_no_git_metadata_exists
 AC-002 -> tests/test_opip_release_tree_controller_v1.py::test_exact_commit_artifact_is_staged_and_manifest_verified
@@ -205,6 +213,7 @@ AC-011 -> tests/test_tradevisor_activation_release_tree_v1.py::test_git_worktree
 AC-011 -> tests/test_tradevisor_activation_release_tree_v1.py::test_source_listing_runtime_only_exclusions_match_the_controller
 AC-011 -> tests/test_tradevisor_activation_release_tree_v1.py::test_source_listing_keeps_unexpected_files_and_drops_runtime_only_paths
 AC-011 -> tests/test_tradevisor_activation_release_tree_v1.py::test_runtime_only_core_env_is_accepted_by_the_release_tree_gate
+AC-015 -> tests/test_tradevisor_production_edge_v1.py::test_ac_015_compose_preserves_edge_shell_variables_after_interpolation
 AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_funded_credential_names_match_the_python_authority
 AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_generator_removes_funded_names_and_keeps_the_rest
 AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_generator_is_idempotent_and_follows_rotation
@@ -304,6 +313,9 @@ AC-010 -> OHM-Trade-Agent-v1/app/opip/canonical/schema.py
 AC-010 -> OHM-Trade-Agent-v1/tests/test_opip_canonical_cursor_read_plan_v1.py
 AC-011 -> OHM-Trade-Agent-v1/deploy/tradevisor/activate-tradevisor-advisory.sh
 AC-011 -> OHM-Trade-Agent-v1/tests/test_tradevisor_activation_release_tree_v1.py
+AC-015 -> OHM-Trade-Agent-v1/docker-compose.yml
+AC-015 -> OHM-Trade-Agent-v1/deploy/tradevisor/activate-tradevisor-advisory.sh
+AC-015 -> OHM-Trade-Agent-v1/tests/test_tradevisor_production_edge_v1.py
 AC-012 -> OHM-Trade-Agent-v1/deploy/remote/lib/opip_release_tree.sh
 AC-012 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
 AC-012 -> OHM-Trade-Agent-v1/docker-compose.yml
