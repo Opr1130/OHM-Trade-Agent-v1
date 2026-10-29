@@ -18,6 +18,7 @@ validated on the host before traffic is enabled.
 """
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import subprocess
@@ -165,7 +166,7 @@ def test_ac_005_an_unprovisioned_or_unsafe_value_leaves_the_vhost_dark():
         "ohm-trade-agent:", 1
     )[0]
     assert '""|*[!A-Za-z0-9_-]*)' in edge_block
-    assert 'rm -f "$out"' in edge_block
+    assert 'rm -f "$$out"' in edge_block
     assert "exec nginx -g 'daemon off;'" in edge_block
     assert "$${OPIP_TRADEVISOR_INTERNAL_VERIFICATION_VALUE:-}" in edge_block
 
@@ -179,6 +180,45 @@ def test_ac_005_the_edge_stamp_is_interpolated_from_the_host_env_file():
         "OPIP_TRADEVISOR_INTERNAL_VERIFICATION_VALUE: "
         "${OPIP_TRADEVISOR_INTERNAL_VERIFICATION_VALUE:-}" in edge_block
     )
+
+
+def test_ac_015_compose_preserves_edge_shell_variables_after_interpolation(tmp_path):
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-015: Compose preserves edge-local shell names."""
+    edge_block = _text(COMPOSE).split("ohm-dashboard-edge:", 1)[1].split(
+        "ohm-trade-agent:", 1
+    )[0]
+    entrypoint = edge_block.split("    entrypoint:", 1)[1]
+    for name in ("value", "cert", "tpl", "out"):
+        assert f"$${name}" in entrypoint, name
+        assert f"${name}" not in entrypoint.replace(f"$${name}", ""), name
+
+    docker = shutil.which("docker")
+    if docker is None:
+        pytest.skip("Docker Compose CLI unavailable; source assertions passed")
+
+    # Isolated Compose service: never read a host .env or emit a secret.
+    mini = tmp_path / "compose.yml"
+    mini.write_text(
+        "services:\n  edge:\n    image: nginx:1.27-alpine\n    entrypoint:"
+        + entrypoint,
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [docker, "compose", "-f", str(mini), "config", "--format", "json"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    for name in ("value", "cert", "tpl", "out"):
+        assert f'The "{name}" variable is not set' not in result.stderr
+    rendered = json.loads(result.stdout)["services"]["edge"]["entrypoint"][-1]
+    # Compose config may retain escaped dollars for round-tripping; normalize
+    # the representation before asserting the shell-local references survive.
+    shell_script = rendered.replace(chr(36) * 2, chr(36))
+    assert 'case "$value" in' in shell_script
+    assert 'if [ ! -s "$cert" ]; then' in shell_script
+    assert '"$tpl" > "$out"' in shell_script
 
 
 def test_ac_006_both_ends_of_the_webhook_path_have_pinned_addresses():
@@ -256,7 +296,7 @@ def test_ac_002_a_missing_certificate_leaves_the_vhost_dark():
         "ohm-trade-agent:", 1
     )[0]
     assert f"cert={CERTBOT_LIVE_DIR}fullchain.pem" in edge_block
-    assert 'if [ ! -s "$cert" ]; then' in edge_block
+    assert 'if [ ! -s "$$cert" ]; then' in edge_block
     assert "webhook vhost disabled" in edge_block
     # nginx still starts for the dashboard: the guard never exits early.
     assert "exec nginx -g 'daemon off;'" in edge_block
@@ -295,7 +335,7 @@ def test_ac_002_the_render_gate_checks_one_certbot_path_and_stays_fail_closed():
         "ohm-trade-agent:", 1
     )[0]
     assert f"cert={CERTBOT_LIVE_DIR}fullchain.pem" in edge_block
-    assert 'if [ ! -s "$cert" ]; then' in edge_block
+    assert 'if [ ! -s "$$cert" ]; then' in edge_block
     assert "webhook vhost disabled" in edge_block
     assert "exec nginx -g 'daemon off;'" in edge_block
     # No stale live directory survives anywhere in the deployed contract.
@@ -367,6 +407,8 @@ def test_ac_003_the_activation_script_orders_gates_before_enabling_ingress():
     # One atomic flip of the master switch, and no earlier write to it.
     assert text.count('set_env_value "$ENABLE_KEY" "true"') == 1
     # Failure restores the pre-activation posture instead of leaving ingress lit.
+    assert 'compose up -d --no-deps --force-recreate "$EDGE_SERVICE"' in text
+    assert "recreated edge did not render the validated webhook vhost" in text
     assert "restore_pre_activation_posture" in text
     assert "trap 'on_error $LINENO' ERR" in text
     # The only authenticated probe is a refusal path that writes no durable row.

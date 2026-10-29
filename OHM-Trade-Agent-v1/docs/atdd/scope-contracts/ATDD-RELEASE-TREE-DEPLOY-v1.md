@@ -143,6 +143,14 @@ AND the preflight derives its environment file from the CANDIDATE core service: 
 AND `EVIDENCE_SHADOW` REQUIRES a verified read-only protection credential: an absent credential refuses the release in the preflight, before any mutation, and the credential-less posture remains an explicitly `SAFE_BASELINE`-only exception that can never be borrowed as an `EVIDENCE_SHADOW` success; the Tradevisor activation gate applies the same decision, refuses a half pair, and does all of it before any ingress is enabled
 AND the durable `KRAKEN:READ_ONLY_AUTH` incident - `AUTH_CONFIG`-owned, not monitor-owned - is closed only by an owner-run operation that first proves the credential identity, both read-only queries and the matching incident row through the existing `system_incidents.observe_recovery` authority, refuses on any failure leaving the row `OPEN`/`CHANGED` with admissions suspended, is idempotent when already recovered, and can never close an unrelated scope; because the in-release recovery operation cannot exist in the release that the incident blocks, one exact owner-executable command exists that performs the same proof and the same single transition against the CURRENTLY RUNNING release, executes the running core's own content-addressed image only after proving that exact image is present locally (a pruned or removed image is refused by name, never substituted with an unverified one), mounts production data read-only for the plan and read-write only for the owner-approved apply, receives only the two dedicated names (never the owner's whole `.env`), never deploys, restarts, activates or trades, and the owner order that makes it usable is the bootstrap of the exact merged SHA's release-tree controller and provider library BEFORE any deployment, because the preflight and the running-core proof decide through that library and a library that predates it refuses at start-up
 
+AC-015:
+GIVEN:
+the existing production dashboard edge service is rendered by Docker Compose with a shell startup script, and the Tradevisor activation gate must replace the running edge configuration without touching trading or learning authority
+WHEN:
+Compose resolves the edge entrypoint and an owner-approved Tradevisor activation attempts to introduce the webhook virtual host
+THEN:
+every shell-local variable used to validate the edge verification value, certificate and template output survives Compose interpolation literally (using doubled dollar signs), and the activation re-creates the edge container when its vhost is absent or stale, independently verifies the rendered vhost, preserves a healthy already-current edge idempotently, and uses the same re-create behavior for rollback; the dashboard must remain reachable and failure must refuse activation rather than claiming success
+
 EXPLICITLY OUT OF SCOPE:
 - Converting the production source root into a Git worktree, or creating any `.git` there.
 - Fabricating commits, refs, trees or a previous-good SHA.
@@ -205,6 +213,7 @@ AC-011 -> tests/test_tradevisor_activation_release_tree_v1.py::test_git_worktree
 AC-011 -> tests/test_tradevisor_activation_release_tree_v1.py::test_source_listing_runtime_only_exclusions_match_the_controller
 AC-011 -> tests/test_tradevisor_activation_release_tree_v1.py::test_source_listing_keeps_unexpected_files_and_drops_runtime_only_paths
 AC-011 -> tests/test_tradevisor_activation_release_tree_v1.py::test_runtime_only_core_env_is_accepted_by_the_release_tree_gate
+AC-015 -> tests/test_tradevisor_production_edge_v1.py::test_ac_015_compose_preserves_edge_shell_variables_after_interpolation
 AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_funded_credential_names_match_the_python_authority
 AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_generator_removes_funded_names_and_keeps_the_rest
 AC-012 -> tests/test_tradevisor_core_env_isolation_v1.py::test_generator_is_idempotent_and_follows_rotation
@@ -304,6 +313,9 @@ AC-010 -> OHM-Trade-Agent-v1/app/opip/canonical/schema.py
 AC-010 -> OHM-Trade-Agent-v1/tests/test_opip_canonical_cursor_read_plan_v1.py
 AC-011 -> OHM-Trade-Agent-v1/deploy/tradevisor/activate-tradevisor-advisory.sh
 AC-011 -> OHM-Trade-Agent-v1/tests/test_tradevisor_activation_release_tree_v1.py
+AC-015 -> OHM-Trade-Agent-v1/docker-compose.yml
+AC-015 -> OHM-Trade-Agent-v1/deploy/tradevisor/activate-tradevisor-advisory.sh
+AC-015 -> OHM-Trade-Agent-v1/tests/test_tradevisor_production_edge_v1.py
 AC-012 -> OHM-Trade-Agent-v1/deploy/remote/lib/opip_release_tree.sh
 AC-012 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
 AC-012 -> OHM-Trade-Agent-v1/docker-compose.yml
