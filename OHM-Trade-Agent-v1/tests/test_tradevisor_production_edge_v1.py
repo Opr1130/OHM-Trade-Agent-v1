@@ -213,9 +213,9 @@ def test_ac_015_compose_preserves_edge_shell_variables_after_interpolation(tmp_p
     for name in ("value", "cert", "tpl", "out"):
         assert f'The "{name}" variable is not set' not in result.stderr
     rendered = json.loads(result.stdout)["services"]["edge"]["entrypoint"][-1]
-    # Compose config may retain $ to round-trip the escape; either way the
-    # container shell must receive variable references, not empty substitutions.
-    shell_script = rendered.replace("$", "$")
+    # Compose config may retain escaped dollars for round-tripping; normalize
+    # the representation before asserting the shell-local references survive.
+    shell_script = rendered.replace(chr(36) * 2, chr(36))
     assert 'case "$value" in' in shell_script
     assert 'if [ ! -s "$cert" ]; then' in shell_script
     assert '"$tpl" > "$out"' in shell_script
