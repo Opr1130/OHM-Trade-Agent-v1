@@ -386,6 +386,24 @@ class ScanAttemptStore:
         rows = self._rows(self._load_index())
         return sorted(rows, key=lambda item: item.created_at)[-1] if rows else None
 
+    def attempts(self) -> list[ScanAttempt]:
+        """Return every projected attempt, oldest first.
+
+        Promotion must not depend on the newest attempt: a completed scan can
+        legitimately be followed by a RESERVED, RUNNING or SKIPPED one, and the
+        earlier result still has to be consumed.
+        """
+        rows = self._rows(self._load_index())
+        return sorted(rows, key=lambda item: (item.created_at, item.fence))
+
+    def pending_results(self) -> list[ScanAttempt]:
+        """Return consumable attempts (COMPLETED/PARTIAL) that are terminal."""
+        return [
+            item
+            for item in self.attempts()
+            if item.terminal and item.outcome in {"COMPLETED", "PARTIAL"}
+        ]
+
     def has_active(self) -> bool:
         return self.active() is not None
 

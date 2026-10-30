@@ -101,8 +101,11 @@ AC-005 -> tests/test_opip_scan_remediation_v1.py::test_telemetry_bounds_producer
 AC-005 -> tests/test_opip_scan_remediation_v1.py::test_batching_is_bounded_and_ordered
 AC-006 -> tests/test_opip_scan_lifecycle_v1.py::test_admission_refused_while_breaker_is_open
 AC-002 -> tests/test_opip_scan_remediation_v1.py::test_launch_failure_is_classified_and_recoverable
+AC-002 -> tests/test_opip_scan_remediation_v1.py::test_launch_uncertainty_is_quarantined_not_terminalised
 AC-004 -> tests/test_opip_scan_remediation_v1.py::test_promotion_claim_is_exclusive_and_idempotent
-AC-004 -> tests/test_opip_scan_remediation_v1.py::test_expired_claim_is_reclaimed_once
+AC-004 -> tests/test_opip_scan_remediation_v1.py::test_expired_lease_never_reclaims_a_possibly_live_worker
+AC-004 -> tests/test_opip_scan_remediation_v1.py::test_stale_claim_owner_cannot_write_the_outcome
+AC-004 -> tests/test_opip_scan_remediation_v1.py::test_completed_scan_is_consumed_despite_a_newer_reserved_attempt
 AC-004 -> tests/test_opip_scan_remediation_v1.py::test_repeated_promotion_run_qualifies_exactly_once
 AC-005 -> tests/test_opip_scan_remediation_v1.py::test_read_only_store_refuses_operational_writes
 AC-006 -> tests/test_opip_scan_remediation_v1.py::test_promotion_refused_when_policy_forbids_output

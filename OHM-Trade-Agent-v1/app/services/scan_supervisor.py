@@ -392,8 +392,8 @@ def reconcile(
     launch_failure = read_launch_failure(settings, attempt_id)
     if launch_failure is not None:
         # A launch request that Docker refused: the dispatcher observed zero
-        # containers for this attempt, so no worker can exist. That is positive
-        # evidence, unlike a bare absence of a running container.
+        # containers for this attempt *after* its launcher terminated, so no
+        # worker can exist. That is positive evidence, unlike a bare absence.
         return [
             store.terminalize(
                 attempt_id,
@@ -403,6 +403,11 @@ def reconcile(
                 now=moment,
             )
         ]
+
+    if read_quarantine(settings, attempt_id) is not None:
+        # Uncertainty (launcher still alive, or a container that would not die).
+        # Never terminalise and never start another worker.
+        return []
 
     if launch is None:
         token = read_token(settings)

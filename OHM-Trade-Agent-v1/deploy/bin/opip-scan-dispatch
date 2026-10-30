@@ -111,14 +111,19 @@ done < <(docker ps -aq --filter "label=${LABEL}" --filter "status=exited" 2>/dev
 # so they run detached under their own lock. A hung qualification therefore
 # cannot hold the unified-cycle lock and cannot delay the next protection pass.
 # This stage runs every tick, independent of any new acquisition.
-exec 8>"/var/run/ohm-qualify.lock" 2>/dev/null || true
-if flock -n 8 2>/dev/null; then
-  nohup setsid docker compose exec -T ohm-trade-agent \
-    python -m app.services.scan_promotion_runner \
-    >> "${LOG_DIR}/ohm-scan-qualify.log" 2>&1 &
-  log "qualification stage dispatched"
+# This stage runs every tick — independent of scan cadence — but only when
+# isolated execution is actually configured. In the legacy or suspended modes
+# there is nothing to promote and no detached job should be started at all.
+if [ "${OPIP_SCAN_EXECUTION_MODE:-}" = "isolated" ]; then
+  exec 8>"/var/run/ohm-qualify.lock" 2>/dev/null || true
+  if flock -n 8 2>/dev/null; then
+    nohup setsid docker compose exec -T ohm-trade-agent \
+      python -m app.services.scan_promotion_runner \
+      >> "${LOG_DIR}/ohm-scan-qualify.log" 2>&1 &
+    log "qualification stage dispatched"
+  fi
+  exec 8>&-
 fi
-exec 8>&-
 
 # --- 4. Act only on an authorised, unexpired token -------------------------
 [ -s "$TOKEN" ] || exit 0
@@ -168,26 +173,36 @@ OPIP_SCAN_ATTEMPT_ID="$attempt_id" nohup setsid docker compose run \
   --no-deps \
   "$SERVICE" python -m app.jobs.scan_worker --attempt-id "$attempt_id" \
   >> "${LOG_DIR}/ohm-scan-worker-${container_name}.log" 2>&1 &
+launcher_pid=$!
+launcher_alive() { kill -0 "$1" 2>/dev/null; }
 
-# Distinguish a real launch from a merely issued request. If Docker refuses to
-# create the container, record that fact so the core can classify it instead of
-# waiting for evidence that will never arrive.
+# Distinguish a real launch from a merely issued request. A fixed observation
+# window is NOT proof of failure: Docker may still be starting the container.
+# Failure is only declared once the launcher has terminated AND no container
+# carrying this attempt's label exists. Anything else is uncertainty, which is
+# quarantined rather than terminalised.
 started=""
-for _ in $(seq 1 15); do
+for _ in $(seq 1 "${LAUNCH_WAIT:-30}"); do
   for cid in $(docker ps -aq --filter "label=${LABEL}" 2>/dev/null || true); do
     if [ "$(label_of "$cid")" = "${attempt_id}" ]; then started="$cid"; break; fi
   done
   [ -n "$started" ] && break
+  if ! launcher_alive "$launcher_pid"; then break; fi
   sleep 1
 done
 
-if [ -z "$started" ]; then
-  printf '{"schema_version":1,"attempt_id":"%s","container_name":"%s","observed_containers":0,"reason_code":"DOCKER_START_FAILED","observed_at":"%s"}\n' \
+if [ -n "$started" ]; then
+  log "dispatched attempt ${attempt_id} as ${started} (detached)"
+elif launcher_alive "$launcher_pid"; then
+  printf '{"schema_version":1,"attempt_id":"%s","container_name":"%s","reason_code":"LAUNCH_UNCERTAIN","observed_at":"%s"}\n' \
+    "$attempt_id" "$container_name" "$(utc)" > "${out}/.quarantine.json.tmp"
+  mv -f "${out}/.quarantine.json.tmp" "${out}/quarantine.json"
+  log "attempt ${attempt_id}: launcher still alive with no container; quarantined as uncertain"
+else
+  printf '{"schema_version":1,"attempt_id":"%s","container_name":"%s","observed_containers":0,"launcher_terminated":true,"reason_code":"DOCKER_START_FAILED","observed_at":"%s"}\n' \
     "$attempt_id" "$container_name" "$(utc)" > "${out}/.launch_failed.json.tmp"
   mv -f "${out}/.launch_failed.json.tmp" "${out}/launch_failed.json"
-  log "attempt ${attempt_id} failed to start; recorded launch failure"
-else
-  log "dispatched attempt ${attempt_id} as ${started} (detached)"
+  log "attempt ${attempt_id} failed to start; launcher terminated with no container"
 fi
 
 # Single use: the token must not start a second worker on the next tick.

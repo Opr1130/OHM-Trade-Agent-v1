@@ -16,8 +16,10 @@ from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 from typing import Any, Mapping
+import uuid
 
 from app.scanner.models import MarketSnapshot
+from app.services.registry_io import registry_lock
 from app.services.scan_manifest import (
     ManifestError,
     is_complete,
@@ -275,80 +277,86 @@ def revalidate_policy(settings: Any, *, now: datetime | None = None) -> tuple[bo
     return True, "APPROVED"
 
 
+def promotion_lock_path(settings: Any, attempt_id: str) -> Path:
+    return attempt_evidence_dir(settings, attempt_id) / ".promotion.lock"
+
+
 def claim_promotion(
     settings: Any,
     attempt_id: str,
     *,
     now: datetime | None = None,
-) -> tuple[bool, str]:
-    """Take exclusive ownership of one promotion, or explain why not.
+    force_reclaim: bool = False,
+) -> tuple[bool, str, str | None]:
+    """Take exclusive ownership of one promotion, atomically.
 
-    A durable claim is written before qualification begins. A live claim means
-    another process is already working; a completed claim means the business
-    outcome already exists and must not be produced twice. Only a claim whose
-    lease has expired (its owner died) may be retaken.
+    Returns ``(claimed, reason, claim_token)``. Claim creation is serialised by a
+    per-attempt lock so two qualifiers cannot both win, and the returned token
+    fences the outcome writes: a stale owner cannot complete or reject a claim
+    that has since been taken over.
+
+    An expired lease is **not** on its own evidence that the previous qualifier
+    died — a live worker can simply be slow. Reclaim therefore requires an
+    explicit ``force_reclaim`` from an operator decision; otherwise the attempt
+    parks as inconclusive instead of risking a duplicated actionable outcome.
     """
     moment = now or _now()
-    existing = read_promotion(settings, attempt_id)
-    if existing is not None:
-        state = str(existing.get("state") or "")
-        if state == STATE_COMPLETED:
-            return False, "ALREADY_COMPLETED"
-        if state == STATE_REJECTED:
-            return False, "ALREADY_REJECTED"
-        if state == STATE_CLAIMED:
-            try:
-                expires = datetime.fromisoformat(
-                    str(existing.get("claim_expires_at")).replace("Z", "+00:00")
-                )
-            except (TypeError, ValueError):
-                expires = None
-            if expires is not None:
-                if expires.tzinfo is None:
-                    expires = expires.replace(tzinfo=timezone.utc)
-                if moment < expires:
-                    return False, "CLAIM_IN_FLIGHT"
-            # Lease expired: the previous owner died mid-qualification.
-            _write_promotion(
-                settings,
-                attempt_id,
-                {
-                    **{k: v for k, v in existing.items() if k != "claim_expires_at"},
-                    "state": STATE_CLAIMED,
-                    "attempt_id": attempt_id,
-                    "claimed_at": moment.isoformat(),
-                    "claim_expires_at": (
-                        moment + timedelta(seconds=PROMOTION_LEASE_SECONDS)
-                    ).isoformat(),
-                    "recovered_from_expired_claim": True,
-                },
-            )
-            return True, "RECLAIMED_EXPIRED"
-    _write_promotion(
-        settings,
-        attempt_id,
-        {
-            "schema_version": 1,
-            "attempt_id": attempt_id,
-            "state": STATE_CLAIMED,
-            "claimed_at": moment.isoformat(),
-            "claim_expires_at": (
-                moment + timedelta(seconds=PROMOTION_LEASE_SECONDS)
-            ).isoformat(),
-        },
-    )
-    return True, "CLAIMED"
+    lock_path = promotion_lock_path(settings, attempt_id)
+    with registry_lock(lock_path):
+        existing = read_promotion(settings, attempt_id)
+        if existing is not None:
+            state = str(existing.get("state") or "")
+            if state == STATE_COMPLETED:
+                return False, "ALREADY_COMPLETED", None
+            if state == STATE_REJECTED:
+                return False, "ALREADY_REJECTED", None
+            if state == STATE_CLAIMED:
+                if not force_reclaim:
+                    return False, "RECLAIM_BLOCKED_INCONCLUSIVE", None
+        token = uuid.uuid4().hex
+        _write_promotion(
+            settings,
+            attempt_id,
+            {
+                "schema_version": 1,
+                "attempt_id": attempt_id,
+                "state": STATE_CLAIMED,
+                "claim_token": token,
+                "claimed_at": moment.isoformat(),
+                "claim_expires_at": (
+                    moment + timedelta(seconds=PROMOTION_LEASE_SECONDS)
+                ).isoformat(),
+                "reclaimed": bool(existing),
+            },
+        )
+        return True, "RECLAIMED" if existing else "CLAIMED", token
+
+
+def _finish_promotion(
+    settings: Any,
+    attempt_id: str,
+    payload: Mapping[str, Any],
+    *,
+    claim_token: str | None,
+) -> Path:
+    """Write a terminal promotion state, fenced by the claim token."""
+    with registry_lock(promotion_lock_path(settings, attempt_id)):
+        current = read_promotion(settings, attempt_id) or {}
+        if claim_token is not None and str(current.get("claim_token") or "") != claim_token:
+            raise PromotionRejected("CLAIM_FENCE_MISMATCH")
+        return _write_promotion(settings, attempt_id, payload)
 
 
 def complete_promotion(
     settings: Any,
     attempt_id: str,
     *,
+    claim_token: str | None = None,
     degraded_fields: tuple[str, ...] = (),
     now: datetime | None = None,
 ) -> Path:
     moment = now or _now()
-    return _write_promotion(
+    return _finish_promotion(
         settings,
         attempt_id,
         {
@@ -360,6 +368,7 @@ def complete_promotion(
             "degraded_fields": list(degraded_fields),
             "recorded_at": moment.isoformat(),
         },
+        claim_token=claim_token,
     )
 
 
@@ -369,10 +378,11 @@ def reject_promotion(
     *,
     reason_code: str,
     actionable: bool = False,
+    claim_token: str | None = None,
     now: datetime | None = None,
 ) -> Path:
     moment = now or _now()
-    return _write_promotion(
+    return _finish_promotion(
         settings,
         attempt_id,
         {
@@ -384,6 +394,7 @@ def reject_promotion(
             "reason_code": str(reason_code),
             "recorded_at": moment.isoformat(),
         },
+        claim_token=claim_token,
     )
 
 

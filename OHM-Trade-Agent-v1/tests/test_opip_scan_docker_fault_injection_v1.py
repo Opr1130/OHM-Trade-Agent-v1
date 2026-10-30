@@ -96,10 +96,11 @@ def test_oom_killed_flag_is_observable():
             f"opip.attempt_id={attempt}",
             "--memory",
             "32m",
-            "alpine:3.20",
-            "sh",
+            "python:3.12-slim",
+            "python",
             "-c",
-            "dd if=/dev/zero of=/dev/null bs=1M count=4000",
+            # Allocate real memory; /dev/zero writes to /dev/null would not.
+            "import time; b = bytearray(200 * 1024 * 1024); time.sleep(60)",
         )
         flags: set[str] = set()
         for _ in range(60):

@@ -27,7 +27,12 @@ from app.services.scan_result_promotion import (
     reject_promotion,
     revalidate_policy,
 )
-from app.services.scan_supervisor import state_dir, store_for
+from app.services.scan_supervisor import (
+    MODE_ISOLATED,
+    execution_mode,
+    state_dir,
+    store_for,
+)
 
 
 QUALIFY_LOCK_NAME = ".opip_qualify.lock"
@@ -36,6 +41,7 @@ STATUS_NONE = "NONE"
 STATUS_COMPLETED = "COMPLETED"
 STATUS_REJECTED = "REJECTED"
 STATUS_NOOP = "NOOP"
+STATUS_BLOCKED = "BLOCKED"
 
 
 def _utc(value: datetime | None = None) -> datetime:
@@ -51,19 +57,42 @@ def qualify_lock_path(settings: Any) -> Path:
 
 
 def pending_attempt(settings: Any, store: ScanAttemptStore) -> Any | None:
-    """Return the attempt awaiting a promotion decision, if any."""
-    latest = store.latest()
-    if latest is None or not latest.terminal:
-        return None
-    if latest.outcome not in {"COMPLETED", "PARTIAL"}:
-        return None
-    decision = read_promotion(settings, latest.attempt_id)
-    if decision is not None and str(decision.get("state") or "") in {
-        "COMPLETED",
-        "REJECTED",
-    }:
-        return None
-    return latest
+    """Return the oldest consumable attempt awaiting a promotion decision.
+
+    Deliberately not "the latest attempt": a completed scan can be followed by a
+    RESERVED, RUNNING or SKIPPED record, and its result must still be consumed.
+    """
+    for attempt in store.pending_results():
+        decision = read_promotion(settings, attempt.attempt_id)
+        if decision is not None and str(decision.get("state") or "") in {
+            "COMPLETED",
+            "REJECTED",
+        }:
+            continue
+        return attempt
+    return None
+
+
+def core_headroom_ok(settings: Any) -> tuple[bool, str]:
+    """Refuse to start qualification when the core cgroup is already tight.
+
+    Qualification shares the protection container's cgroup. Starting a heavy AI
+    review and notification burst when that cgroup is near its ceiling would put
+    protection itself at risk, so it is deferred to a later tick instead.
+    """
+    from app.services.scan_preflight import collect_snapshot
+
+    try:
+        snapshot = collect_snapshot(data_dir=state_dir(settings).parent)
+    except Exception:  # noqa: BLE001 - unreadable headroom is not permission
+        return False, "CORE_HEADROOM_UNKNOWN"
+    utilisation = snapshot.core_utilization_pct
+    ceiling = float(getattr(settings, "opip_scan_core_memory_ceiling_pct", 70.0))
+    if utilisation is None:
+        return False, "CORE_HEADROOM_UNKNOWN"
+    if utilisation > ceiling:
+        return False, "CORE_CGROUP_PRESSURE"
+    return True, "OK"
 
 
 def _default_qualify(scan_result: Any) -> Any:
@@ -83,12 +112,23 @@ def run_pending_promotion(
     """Promote and qualify one acquired scan, at most once per attempt."""
     moment = _utc(now)
     store = store_for(settings)
+    if execution_mode(settings) != MODE_ISOLATED:
+        # Isolated execution is disabled: there is nothing to promote, and the
+        # detached job must not be doing work in that configuration.
+        return {"status": STATUS_NONE, "reason_code": "ISOLATED_DISABLED"}
+
     attempt = pending_attempt(settings, store)
     if attempt is None:
         return {"status": STATUS_NONE}
 
-    def _reject(reason: str) -> dict[str, Any]:
-        reject_promotion(settings, attempt.attempt_id, reason_code=reason, now=moment)
+    def _reject(reason: str, token: str | None = None) -> dict[str, Any]:
+        reject_promotion(
+            settings,
+            attempt.attempt_id,
+            reason_code=reason,
+            claim_token=token,
+            now=moment,
+        )
         return {"status": STATUS_REJECTED, "reason_code": reason}
 
     if attempt.outcome == "PARTIAL":
@@ -98,7 +138,13 @@ def run_pending_promotion(
     if not allowed:
         return _reject(reason)
 
-    claimed, claim_reason = claim_promotion(settings, attempt.attempt_id, now=moment)
+    room, room_reason = core_headroom_ok(settings)
+    if not room:
+        # Defer without claiming, so the attempt stays eligible next tick and no
+        # lease is burned by a qualification we never started.
+        return {"status": STATUS_BLOCKED, "reason_code": room_reason}
+
+    claimed, claim_reason, token = claim_promotion(settings, attempt.attempt_id, now=moment)
     if not claimed:
         return {"status": STATUS_NOOP, "reason_code": claim_reason}
 
@@ -106,10 +152,7 @@ def run_pending_promotion(
         try:
             promoted = load_promoted(settings=settings, attempt=attempt, now=moment)
         except PromotionRejected as exc:
-            reject_promotion(
-                settings, attempt.attempt_id, reason_code=exc.reason, now=moment
-            )
-            return {"status": STATUS_REJECTED, "reason_code": exc.reason}
+            return _reject(exc.reason, token)
 
         from app.services.scan_result_promotion import to_scan_result
 
@@ -118,6 +161,7 @@ def run_pending_promotion(
         complete_promotion(
             settings,
             attempt.attempt_id,
+            claim_token=token,
             degraded_fields=promoted.degraded_fields,
             now=moment,
         )

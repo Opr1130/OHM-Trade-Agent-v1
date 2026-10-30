@@ -268,34 +268,53 @@ def test_promotion_claim_is_exclusive_and_idempotent(tmp_path: Path):
     """ATDD-SCANNER-RELIABILITY-M01/AC-004 one claim, one business outcome."""
     settings, _ = _completed_attempt(tmp_path)
 
-    first, first_reason = promo.claim_promotion(settings, "SCAN:C", now=NOW)
-    second, second_reason = promo.claim_promotion(
+    first, first_reason, token = promo.claim_promotion(settings, "SCAN:C", now=NOW)
+    second, second_reason, _ = promo.claim_promotion(
         settings, "SCAN:C", now=NOW + timedelta(seconds=30)
     )
-    promo.complete_promotion(settings, "SCAN:C", now=NOW)
-    third, third_reason = promo.claim_promotion(
+    promo.complete_promotion(settings, "SCAN:C", claim_token=token, now=NOW)
+    third, third_reason, _ = promo.claim_promotion(
         settings, "SCAN:C", now=NOW + timedelta(seconds=60)
     )
 
-    assert first is True and first_reason == "CLAIMED"
-    assert second is False and second_reason == "CLAIM_IN_FLIGHT"
+    assert first is True and first_reason == "CLAIMED" and token
+    assert second is False and second_reason == "RECLAIM_BLOCKED_INCONCLUSIVE"
     assert third is False and third_reason == "ALREADY_COMPLETED"
 
 
 @pytest.mark.acceptance(f"{INCREMENT}/AC-004")
-def test_expired_claim_is_reclaimed_once(tmp_path: Path):
-    """ATDD-SCANNER-RELIABILITY-M01/AC-004 a dead owner's claim can be retaken."""
+def test_expired_lease_never_reclaims_a_possibly_live_worker(tmp_path: Path):
+    """ATDD-SCANNER-RELIABILITY-M01/AC-004 an expired lease is not proof of death."""
     settings, _ = _completed_attempt(tmp_path)
     promo.claim_promotion(settings, "SCAN:C", now=NOW)
 
-    reclaimed, reason = promo.claim_promotion(
+    reclaimed, reason, token = promo.claim_promotion(
         settings,
         "SCAN:C",
         now=NOW + timedelta(seconds=promo.PROMOTION_LEASE_SECONDS + 1),
     )
 
-    assert reclaimed is True
-    assert reason == "RECLAIMED_EXPIRED"
+    assert reclaimed is False
+    assert reason == "RECLAIM_BLOCKED_INCONCLUSIVE"
+    assert token is None
+
+
+@pytest.mark.acceptance(f"{INCREMENT}/AC-004")
+def test_stale_claim_owner_cannot_write_the_outcome(tmp_path: Path):
+    """ATDD-SCANNER-RELIABILITY-M01/AC-004 a superseded owner is fenced out."""
+    settings, _ = _completed_attempt(tmp_path)
+    _, _, first_token = promo.claim_promotion(settings, "SCAN:C", now=NOW)
+    ok, _, second_token = promo.claim_promotion(
+        settings, "SCAN:C", now=NOW, force_reclaim=True
+    )
+    assert ok is True and second_token != first_token
+
+    with pytest.raises(promo.PromotionRejected) as excinfo:
+        promo.complete_promotion(settings, "SCAN:C", claim_token=first_token, now=NOW)
+    assert excinfo.value.reason == "CLAIM_FENCE_MISMATCH"
+
+    promo.complete_promotion(settings, "SCAN:C", claim_token=second_token, now=NOW)
+    assert promo.read_promotion(settings, "SCAN:C")["state"] == promo.STATE_COMPLETED
 
 
 @pytest.mark.acceptance(f"{INCREMENT}/AC-004")
@@ -306,6 +325,9 @@ def test_repeated_promotion_run_qualifies_exactly_once(tmp_path: Path, monkeypat
 
     monkeypatch.setattr(
         runner, "revalidate_policy", lambda settings, now=None: (True, "APPROVED")
+    )
+    monkeypatch.setattr(
+        runner, "core_headroom_ok", lambda settings: (True, "OK")
     )
 
     calls: list[int] = []
@@ -367,6 +389,7 @@ def test_qualification_holds_only_its_own_lock(tmp_path, monkeypatch):
     monkeypatch.setattr(
         runner, "revalidate_policy", lambda settings, now=None: (True, "APPROVED")
     )
+    monkeypatch.setattr(runner, "core_headroom_ok", lambda settings: (True, "OK"))
 
     entered = threading.Event()
     release = threading.Event()
@@ -402,6 +425,62 @@ def test_qualification_holds_only_its_own_lock(tmp_path, monkeypatch):
 
     with pytest.raises(RuntimeError):
         run_cycle._promote_and_qualify(settings=settings)
+
+
+@pytest.mark.acceptance(f"{INCREMENT}/AC-004")
+def test_completed_scan_is_consumed_despite_a_newer_reserved_attempt(tmp_path, monkeypatch):
+    """ATDD-SCANNER-RELIABILITY-M01/AC-004 consumption is not tied to the newest attempt."""
+    settings, _ = _completed_attempt(tmp_path)
+    from app.services import scan_promotion_runner as runner
+
+    store = sa.ScanAttemptStore(settings.opip_scan_state_dir)
+    # Scan B is reserved immediately after scan A completed.
+    store.create(attempt_id="SCAN:B", deadline_seconds=300, now=NOW)
+
+    monkeypatch.setattr(
+        runner, "revalidate_policy", lambda settings, now=None: (True, "APPROVED")
+    )
+    monkeypatch.setattr(runner, "core_headroom_ok", lambda settings: (True, "OK"))
+
+    calls: list[str] = []
+    result = runner.run_pending_promotion(
+        settings,
+        now=_real_now(),
+        qualify=lambda scan_result: calls.append(scan_result.snapshots[0].symbol),
+    )
+
+    assert result["status"] == runner.STATUS_COMPLETED
+    assert result["attempt_id"] == "SCAN:C"
+    assert calls == ["BTCUSD"]
+
+
+@pytest.mark.acceptance(f"{INCREMENT}/AC-002")
+def test_launch_uncertainty_is_quarantined_not_terminalised(tmp_path: Path):
+    """ATDD-SCANNER-RELIABILITY-M01/AC-002 uncertainty withholds instead of guessing."""
+    from app.services import scan_supervisor as sup
+
+    settings = _settings(tmp_path)
+    store = sa.ScanAttemptStore(settings.opip_scan_state_dir)
+    store.create(attempt_id="SCAN:Q", deadline_seconds=300, now=NOW)
+    directory = attempt_evidence_dir(settings, "SCAN:Q")
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "launch_request.json").write_text(
+        json.dumps({"attempt_id": "SCAN:Q", "launched_at": NOW.isoformat()}),
+        encoding="utf-8",
+    )
+    (directory / "quarantine.json").write_text(
+        json.dumps(
+            {"attempt_id": "SCAN:Q", "reason_code": "LAUNCH_UNCERTAIN"},
+        ),
+        encoding="utf-8",
+    )
+
+    reconciled = sup.reconcile(store, settings=settings, now=NOW + timedelta(hours=1))
+
+    assert reconciled == []
+    assert store.active() is not None, "quarantine must never terminalise"
+    with pytest.raises(sa.ScanAttemptError):
+        store.create(attempt_id="SCAN:R", deadline_seconds=300, now=NOW)
 
 
 @pytest.mark.acceptance(f"{INCREMENT}/AC-005")
