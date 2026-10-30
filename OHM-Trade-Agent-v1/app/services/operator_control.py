@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 import logging
 from pathlib import Path
+from typing import Callable
 from zoneinfo import ZoneInfo
 
 from app.services.active_trade_registry import get_active_trades
@@ -149,15 +150,42 @@ def search_due(decision: OperatorDecision, now: datetime | None = None) -> bool:
     return last is None or (now - last).total_seconds() >= decision.search_interval_seconds
 
 
-def recover_interrupted_search(now: datetime | None = None) -> bool:
+def recover_interrupted_search(
+    now: datetime | None = None,
+    *,
+    live_attempt_probe: Callable[[], bool] | None = None,
+) -> bool:
     """Close a stale STARTED lifecycle after the prior canonical cycle ended.
 
+    With isolated execution, ``STARTED`` is also the legitimate state of an
+    asynchronous scan whose worker is still running. Marking that FAILED would
+    fabricate a failure and, worse, could invite a second attempt. The probe
+    therefore has the final say: while a live attempt exists, nothing is
+    recovered.
+
     Recovery is best-effort and must never outrank active-position protection.
-    The caller holds the canonical cycle lock, so a persisted STARTED state can
-    only belong to an interrupted prior process. Storage/lock failures are
-    logged and allowed to fall through to the normal operator-state safety path.
+    Storage/lock failures are logged and fall through to the normal
+    operator-state safety path.
     """
     now = now or _now()
+    if live_attempt_probe is None:
+        live_attempt_probe = _default_live_attempt_probe
+    try:
+        if live_attempt_probe():
+            logger.info(
+                "Interrupted-search recovery skipped: a scan attempt is still live."
+            )
+            return False
+    except Exception as exc:  # noqa: BLE001 - an unreadable probe means unknown
+        # Unknown liveness must not be treated as "no live attempt": declaring
+        # the scan failed while it may be running is the more dangerous error,
+        # so recovery is withheld rather than guessed.
+        logger.error(
+            "Interrupted-search liveness probe unavailable; withholding recovery: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
+        return False
     try:
         with registry_lock(LOCK_FILE):
             state = _load_state()
@@ -175,6 +203,14 @@ def recover_interrupted_search(now: datetime | None = None) -> bool:
             exc,
         )
         return False
+
+
+def _default_live_attempt_probe() -> bool:
+    """Return whether the durable attempt ledger holds a live attempt."""
+    from app.core.config import get_settings
+    from app.services.scan_supervisor import store_for
+
+    return store_for(get_settings()).has_active()
 
 
 def mark_search_started(now: datetime | None = None) -> None:

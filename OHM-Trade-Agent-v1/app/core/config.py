@@ -1,4 +1,5 @@
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -407,6 +408,40 @@ class Settings(BaseSettings):
     # ships no cron entry for app.jobs.scan_movers; 600s mirrors the only
     # shipped scan-class schedule (deploy/cron.d/ohm-wave5-explosion-learning).
     signal_quality_scan_interval_seconds: int = Field(default=600, ge=30, le=7200)
+
+    # === Scanner resource controls (R04/R05) ===============================
+    # Concurrency bound for market-data acquisition. Two OHLC requests are
+    # issued per symbol, so this number, not the asset count, sets the peak
+    # number of simultaneously-live candle windows. The ceiling is deliberately
+    # the previously hard-coded value so this setting can only ever tighten.
+    opip_scan_max_workers: int = Field(default=4, ge=1, le=8)
+    # Symbols submitted to the acquisition pool at a time. Batching bounds how
+    # many per-symbol working sets can coexist; it never changes the candidate
+    # population, because selection runs over the complete snapshot set.
+    opip_scan_batch_assets: int = Field(default=50, ge=1, le=200)
+    # Hard wall-clock budget for one acquisition attempt.
+    opip_scan_deadline_seconds: int = Field(default=300, ge=60, le=1800)
+    # Memory ceiling the isolated scanner container is configured with. Used by
+    # preflight admission; it is PROVISIONAL until a measured peak exists.
+    opip_scan_memory_cap_mib: int = Field(default=224, ge=128, le=2048)
+    # Host headroom that must remain free beyond the scanner's ceiling.
+    opip_scan_host_reserve_mib: int = Field(default=64, ge=16, le=2048)
+    # Core-cgroup utilisation above which discovery is not admitted.
+    opip_scan_core_memory_ceiling_pct: float = Field(default=70.0, gt=0, le=100)
+    # Telemetry capture bounds. Scan stdout is retained for parsing; without a
+    # cap a chatty scan retains its entire output in memory until it exits.
+    opip_scan_telemetry_max_lines: int = Field(default=4000, ge=100, le=100_000)
+    opip_scan_telemetry_max_bytes: int = Field(default=1_048_576, ge=65_536, le=16_777_216)
+    # Execution mode. ``legacy_inprocess`` preserves the pre-existing in-process
+    # scan exactly, so merging this change is not itself a production behaviour
+    # change. ``isolated`` hands discovery to the supervised ephemeral worker.
+    # ``suspended`` stops discovery safely and NEVER falls back to the
+    # unbounded in-process scanner.
+    opip_scan_execution_mode: Literal["legacy_inprocess", "isolated", "suspended"] = "legacy_inprocess"
+    # How long a written admission token stays actionable for the dispatcher.
+    opip_scan_dispatch_token_seconds: int = Field(default=120, ge=30, le=600)
+    # Durable scan attempt/manifest root.
+    opip_scan_state_dir: str = "/app/data/scan"
     # A persistence chain survives a gap of up to interval * multiplier, so one
     # late scan does not reset it but a real outage does.
     signal_quality_continuity_multiplier: float = Field(default=2.5, ge=1.0, le=10.0)

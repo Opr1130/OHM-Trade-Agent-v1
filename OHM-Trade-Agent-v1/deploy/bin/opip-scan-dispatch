@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# O'Pip isolated scan dispatcher (R01/R02/R06).
+#
+# NOT a scheduler. It is invoked once per existing cron tick, owns no cadence,
+# keeps no queue and performs no retry loop. It acts only on a single-use token
+# that the core has already authorised, so the cadence authority stays exactly
+# where it was: operator_control.search_due inside the unified cycle.
+#
+# The dispatch is detached. The cron invocation therefore returns immediately
+# and never holds the unified-cycle lock for the duration of a scan, which is
+# what keeps active-position protection timely during a slow, hung or
+# OOM-killed acquisition.
+set -Eeuo pipefail
+
+REPO_DIR="${OPIP_REPO_DIR:-/opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1}"
+STATE_DIR="${REPO_DIR}/data/scan"
+STAGING_DIR="${STATE_DIR}/staging"
+EVIDENCE_DIR="${STATE_DIR}/evidence"
+TOKEN="${STATE_DIR}/admission_token.json"
+EVIDENCE="${STATE_DIR}/container_evidence.json"
+SCAN_LOCK="${OPIP_SCAN_LOCK:-/var/run/ohm-scan.lock}"
+SERVICE="${OPIP_SCAN_SERVICE:-opip-scan-worker}"
+LABEL="opip.attempt_id"
+DEADLINE="${OPIP_SCAN_DEADLINE_SECONDS:-300}"
+STOP_GRACE="${OPIP_SCAN_STOP_GRACE_SECONDS:-20}"
+LOG_DIR="${OPIP_SCAN_LOG_DIR:-/var/log}"
+
+cd "$REPO_DIR"
+mkdir -p "$STAGING_DIR"
+mkdir -p "$EVIDENCE_DIR"
+
+log() { printf '%s opip-scan-dispatch %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
+utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+safe_name() { printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '-'; }
+label_of() { docker inspect -f "{{ index .Config.Labels \"${LABEL}\" }}" "$1" 2>/dev/null || true; }
+is_running() { [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null || echo false)" = "true" ]; }
+
+age_exceeds() {
+  python3 - "$1" "$2" <<'PY'
+import datetime as d, sys
+started, limit = sys.argv[1], int(sys.argv[2])
+try:
+    began = d.datetime.fromisoformat(started.replace("Z", "+00:00"))
+except ValueError:
+    raise SystemExit(0)          # unreadable start time: treat as overdue
+if began.tzinfo is None:
+    began = began.replace(tzinfo=d.timezone.utc)
+age = (d.datetime.now(d.timezone.utc) - began).total_seconds()
+raise SystemExit(0 if age > limit else 1)
+PY
+}
+
+# Capture exit state for one container. Written before removal, always.
+capture_exit() {
+  cid="$1"; attempt="$2"
+  out="${EVIDENCE_DIR}/$(safe_name "$attempt")"
+  mkdir -p "$out"
+  tmp="${out}/.container_exit.json.tmp"
+  if { printf '{"schema_version":1,"container_id":"%s","captured_at":"%s","attempt_id":"%s","state":' \
+         "$cid" "$(utc)" "$attempt"
+       docker inspect -f '{{ json .State }}' "$cid"
+       printf '}'; } > "$tmp" 2>/dev/null; then
+    mv -f "$tmp" "${out}/container_exit.json"
+    return 0
+  fi
+  rm -f "$tmp"
+  log "evidence capture failed for ${cid}"
+  return 1
+}
+
+# --- 1. Enforce the deadline against real container lifetime --------------
+while IFS= read -r cid; do
+  [ -n "$cid" ] || continue
+  attempt="$(label_of "$cid")"
+  case "$attempt" in ""|"<no value>"|"UNSET") log "unlabelled container ${cid}; leaving for an operator"; continue ;; esac
+  started="$(docker inspect -f '{{.State.StartedAt}}' "$cid" 2>/dev/null || echo '')"
+  age_exceeds "$started" "$DEADLINE" || continue
+
+  log "attempt ${attempt} exceeded ${DEADLINE}s; stopping container ${cid}"
+  docker stop -t "$STOP_GRACE" "$cid" >/dev/null 2>&1 || true
+  for _ in $(seq 1 "$STOP_GRACE"); do is_running "$cid" || break; sleep 1; done
+  if is_running "$cid"; then
+    log "attempt ${attempt} ignored SIGTERM; killing ${cid}"
+    docker kill "$cid" >/dev/null 2>&1 || true
+    sleep 3
+  fi
+  if is_running "$cid"; then
+    # Uninterruptible or wedged. Never start a second worker: quarantine and
+    # keep admission blocked until the container actually disappears.
+    out="${EVIDENCE_DIR}/$(safe_name "$attempt")"
+    mkdir -p "$out"
+    printf '{"schema_version":1,"attempt_id":"%s","container_id":"%s","reason_code":"CONTAINER_UNKILLABLE","observed_at":"%s"}\n' \
+      "$attempt" "$cid" "$(utc)" > "${out}/.quarantine.json.tmp"
+    mv -f "${out}/.quarantine.json.tmp" "${out}/quarantine.json"
+    log "attempt ${attempt} is unkillable; quarantined, admission withheld"
+    continue
+  fi
+  capture_exit "$cid" "$attempt" && docker rm -f "$cid" >/dev/null 2>&1 || true
+  log "attempt ${attempt} terminated and evidence captured"
+done < <(docker ps -q --filter "label=${LABEL}" 2>/dev/null || true)
+
+# --- 2. Capture and remove already-exited attempts ------------------------
+while IFS= read -r cid; do
+  [ -n "$cid" ] || continue
+  attempt="$(label_of "$cid")"
+  case "$attempt" in ""|"<no value>"|"UNSET") log "unlabelled exited container ${cid}; leaving for an operator"; continue ;; esac
+  capture_exit "$cid" "$attempt" && docker rm -f "$cid" >/dev/null 2>&1 || true
+  log "captured and removed exited container ${cid} for ${attempt}"
+done < <(docker ps -aq --filter "label=${LABEL}" --filter "status=exited" 2>/dev/null || true)
+
+# --- 3. Qualification stage -------------------------------------------------
+# AI review, market validation and notification delivery are unbounded in time,
+# so they run detached under their own lock. A hung qualification therefore
+# cannot hold the unified-cycle lock and cannot delay the next protection pass.
+# This stage runs every tick, independent of any new acquisition.
+# This stage runs every tick — independent of scan cadence — but only when
+# isolated execution is actually configured. In the legacy or suspended modes
+# there is nothing to promote and no detached job should be started at all.
+if [ "${OPIP_SCAN_EXECUTION_MODE:-}" = "isolated" ]; then
+  exec 8>"/var/run/ohm-qualify.lock" 2>/dev/null || true
+  if flock -n 8 2>/dev/null; then
+    nohup setsid docker compose exec -T ohm-trade-agent \
+      python -m app.services.scan_promotion_runner \
+      >> "${LOG_DIR}/ohm-scan-qualify.log" 2>&1 &
+    log "qualification stage dispatched"
+  fi
+  exec 8>&-
+fi
+
+# --- 4. Act only on an authorised, unexpired token -------------------------
+[ -s "$TOKEN" ] || exit 0
+
+attempt_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("attempt_id",""))' "$TOKEN" 2>/dev/null || true)"
+expires_at="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("expires_at",""))' "$TOKEN" 2>/dev/null || true)"
+[ -n "$attempt_id" ] || { log "token unreadable; ignoring"; exit 0; }
+
+if [ -n "$expires_at" ]; then
+  if ! python3 -c 'import sys,datetime as d; e=d.datetime.fromisoformat(sys.argv[1].replace("Z","+00:00")); sys.exit(0 if d.datetime.now(d.timezone.utc) < e else 1)' "$expires_at" 2>/dev/null; then
+    log "token for ${attempt_id} expired; not dispatching"
+    exit 0
+  fi
+fi
+
+# Refuse overlap: any container for this attempt, or any scan-scoped lock.
+while IFS= read -r cid; do
+  [ -n "$cid" ] || continue
+  existing="$(label_of "$cid")"
+  if [ "${existing}" = "${attempt_id}" ]; then
+    log "attempt ${attempt_id} already exists as ${cid}; refusing overlap"
+    exit 0
+  fi
+done < <(docker ps -aq --filter "label=${LABEL}" 2>/dev/null || true)
+
+exec 9>"$SCAN_LOCK"
+if ! flock -n 9; then
+  log "another scan holds ${SCAN_LOCK}; refusing overlap"
+  exit 0
+fi
+
+out="${EVIDENCE_DIR}/$(safe_name "$attempt_id")"
+mkdir -p "$out"
+container_name="opip-scan-$(safe_name "$attempt_id")"
+
+# A launch *request* is recorded before the container exists. It is not proof of
+# a launch: the core waits for exit evidence, and a failed start writes a
+# separate failure record so discovery is not blocked forever.
+printf '{"schema_version":1,"attempt_id":"%s","container_name":"%s","launched_at":"%s","deadline_seconds":%s}\n' \
+  "$attempt_id" "$container_name" "$(utc)" "$DEADLINE" > "${out}/.launch_request.json.tmp"
+mv -f "${out}/.launch_request.json.tmp" "${out}/launch_request.json"
+
+# No --rm: the container must outlive this invocation so steps 1 and 2 can
+# capture its exit code and OOM flag before removal.
+OPIP_SCAN_ATTEMPT_ID="$attempt_id" nohup setsid docker compose run \
+  --name "$container_name" \
+  --no-deps \
+  "$SERVICE" python -m app.jobs.scan_worker --attempt-id "$attempt_id" \
+  >> "${LOG_DIR}/ohm-scan-worker-${container_name}.log" 2>&1 &
+launcher_pid=$!
+launcher_alive() { kill -0 "$1" 2>/dev/null; }
+
+# Distinguish a real launch from a merely issued request. A fixed observation
+# window is NOT proof of failure: Docker may still be starting the container.
+# Failure is only declared once the launcher has terminated AND no container
+# carrying this attempt's label exists. Anything else is uncertainty, which is
+# quarantined rather than terminalised.
+started=""
+for _ in $(seq 1 "${LAUNCH_WAIT:-30}"); do
+  for cid in $(docker ps -aq --filter "label=${LABEL}" 2>/dev/null || true); do
+    if [ "$(label_of "$cid")" = "${attempt_id}" ]; then started="$cid"; break; fi
+  done
+  [ -n "$started" ] && break
+  if ! launcher_alive "$launcher_pid"; then break; fi
+  sleep 1
+done
+
+if [ -n "$started" ]; then
+  log "dispatched attempt ${attempt_id} as ${started} (detached)"
+elif launcher_alive "$launcher_pid"; then
+  printf '{"schema_version":1,"attempt_id":"%s","container_name":"%s","reason_code":"LAUNCH_UNCERTAIN","observed_at":"%s"}\n' \
+    "$attempt_id" "$container_name" "$(utc)" > "${out}/.quarantine.json.tmp"
+  mv -f "${out}/.quarantine.json.tmp" "${out}/quarantine.json"
+  log "attempt ${attempt_id}: launcher still alive with no container; quarantined as uncertain"
+else
+  printf '{"schema_version":1,"attempt_id":"%s","container_name":"%s","observed_containers":0,"launcher_terminated":true,"reason_code":"DOCKER_START_FAILED","observed_at":"%s"}\n' \
+    "$attempt_id" "$container_name" "$(utc)" > "${out}/.launch_failed.json.tmp"
+  mv -f "${out}/.launch_failed.json.tmp" "${out}/launch_failed.json"
+  log "attempt ${attempt_id} failed to start; launcher terminated with no container"
+fi
+
+# Single use: the token must not start a second worker on the next tick.
+rm -f "$TOKEN"

@@ -276,6 +276,60 @@ services:
       retries: 3
       start_period: 30s
 
+  # Isolated acquisition scanner (R01/R06). Ephemeral: created per attempt by
+  # the host dispatcher, never started by `docker compose up` (profile gated),
+  # and removed only after its exit/OOM evidence has been captured. Its own
+  # memory cgroup is the point of the exercise: an acquisition OOM must not be
+  # able to select the API process or the protection workload as a victim.
+  #
+  # Deliberately no env_file: the scanner receives no funded credentials, no
+  # Telegram token and no AI provider key, so it cannot acquire notification,
+  # paper or exchange authority.
+  opip-scan-worker:
+    build: .
+    restart: "no"
+    profiles:
+      - scanner
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      OPIP_SCAN_EXECUTION_MODE: "isolated"
+    command:
+      - python
+      - -m
+      - app.jobs.scan_worker
+      - --attempt-id
+      - UNSET
+    # The attempt label is what lets the dispatcher find *this* attempt's
+    # container. It is declared on the service rather than passed to
+    # `run --label` so it cannot be lost if a CLI version lacks that flag.
+    labels:
+      opip.attempt_id: "${OPIP_SCAN_ATTEMPT_ID:-UNSET}"
+    # Acquisition scratch is the ONLY writable path. The rest of the scan state
+    # (attempt ledger, index, admission token) is mounted read-only so the worker
+    # can validate its own attempt but cannot mutate operational state. No paper
+    # state, canonical evidence or control registry is exposed at all.
+    volumes:
+      - ./data/scan:/app/data/scan:ro
+      - ./data/scan/staging:/app/data/scan/staging
+    read_only: true
+    tmpfs:
+      - /tmp
+    mem_limit: 224m
+    memswap_limit: 224m
+    cpus: "0.35"
+    pids_limit: 128
+    oom_score_adj: 300
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 20s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 networks:
   # Dedicated edge<->application network. It exists only so both ends carry a
   # pinned address: the webhook vhost proxies to 172.31.240.3 and the application

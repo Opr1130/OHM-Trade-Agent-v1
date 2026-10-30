@@ -11,7 +11,9 @@ def test_interrupted_search_is_terminalized_on_next_canonical_cycle(tmp_path, mo
     recovered = datetime(2026, 9, 6, 2, 30, 0, tzinfo=timezone.utc)
     control.mark_search_started(started)
 
-    assert control.recover_interrupted_search(recovered) is True
+    assert control.recover_interrupted_search(
+        recovered, live_attempt_probe=lambda: False
+    ) is True
     state = control._load_state()
     assert state["last_search_status"] == "FAILED"
     assert state["last_search_failure_reason"] == "INTERRUPTED_PREVIOUS_CYCLE"
@@ -19,7 +21,10 @@ def test_interrupted_search_is_terminalized_on_next_canonical_cycle(tmp_path, mo
     assert state["last_search_finished_at"] == recovered.isoformat()
 
     # Recovery is idempotent once the prior lifecycle has been terminalized.
-    assert control.recover_interrupted_search(recovered) is False
+    assert (
+        control.recover_interrupted_search(recovered, live_attempt_probe=lambda: False)
+        is False
+    )
 
 
 def test_new_search_clears_prior_interruption_reason(tmp_path, monkeypatch):

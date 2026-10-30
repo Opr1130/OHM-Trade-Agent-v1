@@ -570,6 +570,27 @@ def _run_broad_discovery_if_due(*, decision, entry_watch_ready: bool, settings) 
             print("Retried:", tradingview_summary.get("retried", 0))
             print("Poisoned:", tradingview_summary.get("poisoned", 0))
 
+    from app.services import scan_supervisor
+
+    mode = scan_supervisor.execution_mode(settings)
+    if mode == scan_supervisor.MODE_SUSPENDED:
+        # Suspension is an explicit operator decision. It must never fall back
+        # to the previous unbounded in-process scanner.
+        try:
+            scan_supervisor.store_for(settings).record_skip(
+                attempt_id=scan_supervisor.new_attempt_id(),
+                reason_code=scan_supervisor.REASON_SUSPENDED,
+            )
+        except Exception as exc:  # noqa: BLE001 - bookkeeping must not abort a cycle
+            print("O'Pip scan suspension bookkeeping failed:", type(exc).__name__)
+        print(
+            "Broad opportunity scan suspended by OPIP_SCAN_EXECUTION_MODE; "
+            "protection unaffected and no in-process fallback is used."
+        )
+        return False
+    if mode == scan_supervisor.MODE_ISOLATED:
+        return _reserve_isolated_attempt(settings=settings)
+
     mark_search_started()
     try:
         run_scan_with_telemetry(scan_main)
@@ -577,6 +598,56 @@ def _run_broad_discovery_if_due(*, decision, entry_watch_ready: bool, settings) 
         mark_search_finished("FAILED")
         raise
     mark_search_finished("COMPLETED")
+    return True
+
+
+def _promote_and_qualify(*, settings) -> bool:  # pragma: no cover - removed
+    """Removed: qualification now runs in ``app.services.scan_promotion_runner``.
+
+    Keeping qualification inside this cycle meant a hung AI review or
+    notification storm could hold the unified-cycle lock and delay the next
+    protection pass. The detached qualification job owns that work instead.
+    """
+    raise RuntimeError("in-cycle qualification was removed; use scan_promotion_runner")
+
+
+def _reserve_isolated_attempt(*, settings) -> bool:
+    """Reserve an attempt and hand it to the isolated dispatcher.
+
+    The cycle never waits for acquisition, so protection cannot be delayed by a
+    slow, hung or OOM-killed scan. Reservation is refused while any attempt is
+    active — an expired deadline alone never authorises overlap.
+    """
+    from app.services import scan_supervisor
+
+    store = scan_supervisor.store_for(settings)
+    try:
+        for attempt in scan_supervisor.reconcile(store, settings=settings):
+            print(
+                "O'Pip scan attempt reconciled:",
+                attempt.attempt_id,
+                attempt.outcome,
+                attempt.reason_code,
+            )
+    except Exception as exc:  # noqa: BLE001 - never abort the cycle on bookkeeping
+        print("Scan attempt reconciliation unavailable:", type(exc).__name__, exc)
+        return False
+
+    outcome = scan_supervisor.evaluate_admission(settings=settings, store=store)
+    if not outcome.admitted or outcome.attempt is None:
+        try:
+            store.record_skip(
+                attempt_id=scan_supervisor.new_attempt_id(),
+                reason_code=outcome.reason_code,
+            )
+        except Exception:  # noqa: BLE001 - skip bookkeeping is best effort
+            pass
+        print("Broad opportunity scan not admitted:", outcome.reason_code)
+        return False
+
+    scan_supervisor.write_token(settings, outcome.attempt)
+    mark_search_started()
+    print("O'Pip scan attempt reserved for isolated dispatch:", outcome.attempt.attempt_id)
     return True
 
 
@@ -648,6 +719,12 @@ def _run_cycle_once() -> bool:
         monitor_active_main()
     finally:
         _run_paper_v2_protection_fail_open()
+
+    # Qualification (AI review, market validation, notification delivery) runs
+    # in its own detached job. It must never execute under this cycle's lock: a
+    # slow or hung qualification would otherwise delay the next protection
+    # cycle. The cycle only records that a promotion is pending.
+    _cycle_phase("SCAN_RESULT_PROMOTION_PENDING")
 
     if decision.effective_mode == "MAINTENANCE":
         _cycle_phase("MAINTENANCE_WORKLOADS")

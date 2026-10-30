@@ -74,10 +74,61 @@ def parse_json_object_line(line: bytes) -> dict[str, Any]:
     return payload
 
 
+def iter_lines(path: Path, *, chunk_size: int = 1024 * 1024) -> Iterator[bytes]:
+    """Yield newline-terminated rows without loading the whole file.
+
+    Bounded-memory replacement for ``path.read_bytes().splitlines()``. Each
+    yielded row keeps its terminator so ``write_atomic_lines`` round-trips
+    byte-for-byte, and blank rows are skipped exactly as before.
+    """
+    with path.open("rb") as handle:
+        remainder = b""
+        while True:
+            chunk = handle.read(chunk_size)
+            if not chunk:
+                break
+            remainder += chunk
+            parts = remainder.split(b"\n")
+            remainder = parts.pop()
+            for part in parts:
+                if part.strip():
+                    yield part + b"\n"
+        if remainder.strip():
+            yield remainder
+
+
 def read_lines(path: Path) -> list[bytes]:
+    """Return every non-blank row of ``path`` (streaming, single-pass)."""
     if not path.exists():
         return []
-    return [line for line in path.read_bytes().splitlines(keepends=True) if line.strip()]
+    return list(iter_lines(path))
+
+
+def read_tail_lines(
+    path: Path,
+    max_lines: int,
+    *,
+    chunk_size: int = 64 * 1024,
+) -> list[bytes]:
+    """Return at most ``max_lines`` trailing rows by seeking, not full reads.
+
+    Used by retention and integrity checks so that inspecting the end of a
+    large archive never costs its size in RSS.
+    """
+    max_lines = max(1, int(max_lines))
+    if not path.exists():
+        return []
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        position = handle.tell()
+        buffer = b""
+        while position > 0 and buffer.count(b"\n") <= max_lines:
+            step = min(chunk_size, position)
+            position -= step
+            handle.seek(position)
+            buffer = handle.read(step) + buffer
+    lines = [row + b"\n" for row in buffer.split(b"\n") if row.strip()]
+    return lines[-max_lines:]
 
 
 def write_atomic_lines(path: Path, lines: Iterable[bytes]) -> None:
@@ -125,14 +176,31 @@ def repair_truncated_tail(
     if not path.exists() or path.stat().st_size <= 0:
         return
 
-    raw = path.read_bytes()
-    if raw.endswith(b"\n"):
-        return
+    # Only the final row can be torn. Reading the whole segment into RSS to
+    # inspect one byte is itself the hazard this module exists to prevent, so
+    # the tail is located by seeking and the boundary is grown only when a
+    # single row is larger than the initial window.
+    size = path.stat().st_size
+    window = 64 * 1024
+    while True:
+        start = max(0, size - window)
+        with path.open("rb") as handle:
+            handle.seek(start)
+            tail_bytes = handle.read(size - start)
+        if tail_bytes.endswith(b"\n"):
+            return
+        last_newline = tail_bytes.rfind(b"\n")
+        if last_newline >= 0 or start == 0:
+            break
+        if window >= 8 * 1024 * 1024:
+            # Refuse rather than truncate at offset 0: an unlocatable row
+            # boundary must never destroy completed evidence.
+            raise ValueError(f"cannot locate JSONL row boundary in {path}")
+        window *= 2
 
+    prefix_end = start + last_newline + 1 if last_newline >= 0 else 0
+    tail = tail_bytes[last_newline + 1 :]
     parser = parse_line or parse_json_object_line
-    last_newline = raw.rfind(b"\n")
-    prefix_end = last_newline + 1 if last_newline >= 0 else 0
-    tail = raw[prefix_end:]
     try:
         parser(tail + b"\n")
     except (ValueError, KeyError, TypeError, json.JSONDecodeError):
