@@ -160,5 +160,4 @@ DEFERRED DISCOVERIES:
 - real Docker fault injection is authored but gated on a Docker host
 
 UNAPPROVED SCOPE CHANGES:
-
 NONE
