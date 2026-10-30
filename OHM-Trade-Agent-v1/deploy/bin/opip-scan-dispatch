@@ -20,52 +20,91 @@ EVIDENCE="${STATE_DIR}/container_evidence.json"
 SCAN_LOCK="${OPIP_SCAN_LOCK:-/var/run/ohm-scan.lock}"
 SERVICE="${OPIP_SCAN_SERVICE:-opip-scan-worker}"
 LABEL="opip.attempt_id"
+DEADLINE="${OPIP_SCAN_DEADLINE_SECONDS:-300}"
+STOP_GRACE="${OPIP_SCAN_STOP_GRACE_SECONDS:-20}"
 LOG_DIR="${OPIP_SCAN_LOG_DIR:-/var/log}"
 
 cd "$REPO_DIR"
 mkdir -p "$STAGING_DIR"
 
 log() { printf '%s opip-scan-dispatch %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
+utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+safe_name() { printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '-'; }
+label_of() { docker inspect -f "{{ index .Config.Labels \"${LABEL}\" }}" "$1" 2>/dev/null || true; }
+is_running() { [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null || echo false)" = "true" ]; }
 
-# --- 1. Capture postmortem evidence for exited attempts, then remove them ---
-while IFS= read -r cid; do
-  [ -n "$cid" ] || continue
-  attempt="$(docker inspect -f "{{ index .Config.Labels \"${LABEL}\" }}" "$cid" 2>/dev/null || true)"
-  [ -n "$attempt" ] || continue
-  [ "$attempt" != "<no value>" ] || continue
-  # Attempt ids carry a 'SCAN:' prefix; the colon is not path-safe everywhere,
-  # so the directory name is normalised exactly as the Python sanitiser does.
-  safe_attempt="$(printf '%s' "$attempt" | tr -c 'A-Za-z0-9_.-' '-')"
-  out="${STAGING_DIR}/${safe_attempt}"
+age_exceeds() {
+  python3 - "$1" "$2" <<'PY'
+import datetime as d, sys
+started, limit = sys.argv[1], int(sys.argv[2])
+try:
+    began = d.datetime.fromisoformat(started.replace("Z", "+00:00"))
+except ValueError:
+    raise SystemExit(0)          # unreadable start time: treat as overdue
+if began.tzinfo is None:
+    began = began.replace(tzinfo=d.timezone.utc)
+age = (d.datetime.now(d.timezone.utc) - began).total_seconds()
+raise SystemExit(0 if age > limit else 1)
+PY
+}
+
+# Capture exit state for one container. Written before removal, always.
+capture_exit() {
+  cid="$1"; attempt="$2"
+  out="${STAGING_DIR}/$(safe_name "$attempt")"
   mkdir -p "$out"
-  tmp="${out}/container_exit.json.tmp"
-  {
-    printf '{"schema_version":1,"container_id":"%s",' "$cid"
-    printf '"captured_at":"%s",' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    docker inspect -f '"attempt_id":"{{ index .Config.Labels \"'"${LABEL}"'\" }}","state":{{ json .State }},"host_config_limits":{"memory":{{ .HostConfig.Memory }},"nano_cpus":{{ .HostConfig.NanoCpus }},"pids_limit":{{ .HostConfig.PidsLimit }}}}' "$cid"
-  } > "$tmp" 2>/dev/null || { log "evidence capture failed for ${cid}"; rm -f "$tmp"; continue; }
-  mv -f "$tmp" "${out}/container_exit.json"
-  docker rm -f "$cid" >/dev/null 2>&1 || true
-  log "captured and removed exited container ${cid} for ${attempt}"
-done < <(docker ps -aq --filter "label=${LABEL}" --filter "status=exited" 2>/dev/null || true)
+  tmp="${out}/.container_exit.json.tmp"
+  if { printf '{"schema_version":1,"container_id":"%s","captured_at":"%s","attempt_id":"%s","state":' \
+         "$cid" "$(utc)" "$attempt"
+       docker inspect -f '{{ json .State }}' "$cid"
+       printf '}'; } > "$tmp" 2>/dev/null; then
+    mv -f "$tmp" "${out}/container_exit.json"
+    return 0
+  fi
+  rm -f "$tmp"
+  log "evidence capture failed for ${cid}"
+  return 1
+}
 
-# --- 2. Publish observed liveness for the core's reconciliation -------------
-running_ids=()
+# --- 1. Enforce the deadline against real container lifetime --------------
 while IFS= read -r cid; do
   [ -n "$cid" ] || continue
-  attempt="$(docker inspect -f "{{ index .Config.Labels \"${LABEL}\" }}" "$cid" 2>/dev/null || true)"
-  [ -n "$attempt" ] && [ "$attempt" != "<no value>" ] && running_ids+=("$attempt")
+  attempt="$(label_of "$cid")"
+  case "$attempt" in ""|"<no value>"|"UNSET") log "unlabelled container ${cid}; leaving for an operator"; continue ;; esac
+  started="$(docker inspect -f '{{.State.StartedAt}}' "$cid" 2>/dev/null || echo '')"
+  age_exceeds "$started" "$DEADLINE" || continue
+
+  log "attempt ${attempt} exceeded ${DEADLINE}s; stopping container ${cid}"
+  docker stop -t "$STOP_GRACE" "$cid" >/dev/null 2>&1 || true
+  for _ in $(seq 1 "$STOP_GRACE"); do is_running "$cid" || break; sleep 1; done
+  if is_running "$cid"; then
+    log "attempt ${attempt} ignored SIGTERM; killing ${cid}"
+    docker kill "$cid" >/dev/null 2>&1 || true
+    sleep 3
+  fi
+  if is_running "$cid"; then
+    # Uninterruptible or wedged. Never start a second worker: quarantine and
+    # keep admission blocked until the container actually disappears.
+    out="${STAGING_DIR}/$(safe_name "$attempt")"
+    mkdir -p "$out"
+    printf '{"schema_version":1,"attempt_id":"%s","container_id":"%s","reason_code":"CONTAINER_UNKILLABLE","observed_at":"%s"}\n' \
+      "$attempt" "$cid" "$(utc)" > "${out}/.quarantine.json.tmp"
+    mv -f "${out}/.quarantine.json.tmp" "${out}/quarantine.json"
+    log "attempt ${attempt} is unkillable; quarantined, admission withheld"
+    continue
+  fi
+  capture_exit "$cid" "$attempt" && docker rm -f "$cid" >/dev/null 2>&1 || true
+  log "attempt ${attempt} terminated and evidence captured"
 done < <(docker ps -q --filter "label=${LABEL}" 2>/dev/null || true)
 
-if [ "${#running_ids[@]}" -eq 0 ]; then
-  alive='[]'
-else
-  alive="$(printf '"%s",' "${running_ids[@]}")"
-  alive="[${alive%,}]"
-fi
-printf '{"schema_version":1,"observed_at":"%s","source":"dispatcher","alive_attempt_ids":%s}\n' \
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$alive" > "${EVIDENCE}.tmp"
-mv -f "${EVIDENCE}.tmp" "$EVIDENCE"
+# --- 2. Capture and remove already-exited attempts ------------------------
+while IFS= read -r cid; do
+  [ -n "$cid" ] || continue
+  attempt="$(label_of "$cid")"
+  case "$attempt" in ""|"<no value>"|"UNSET") log "unlabelled exited container ${cid}; leaving for an operator"; continue ;; esac
+  capture_exit "$cid" "$attempt" && docker rm -f "$cid" >/dev/null 2>&1 || true
+  log "captured and removed exited container ${cid} for ${attempt}"
+done < <(docker ps -aq --filter "label=${LABEL}" --filter "status=exited" 2>/dev/null || true)
 
 # --- 3. Act only on an authorised, unexpired token -------------------------
 [ -s "$TOKEN" ] || exit 0
@@ -81,31 +120,42 @@ if [ -n "$expires_at" ]; then
   fi
 fi
 
-# Never start a second container for the same attempt.
-for existing in "${running_ids[@]:-}"; do
+# Refuse overlap: any container for this attempt, or any scan-scoped lock.
+while IFS= read -r cid; do
+  [ -n "$cid" ] || continue
+  existing="$(label_of "$cid")"
   if [ "${existing}" = "${attempt_id}" ]; then
-    log "attempt ${attempt_id} already running; refusing overlap"
+    log "attempt ${attempt_id} already exists as ${cid}; refusing overlap"
     exit 0
   fi
-done
+done < <(docker ps -aq --filter "label=${LABEL}" 2>/dev/null || true)
 
-# --- 4. Launch detached under a scan-scoped lock ---------------------------
 exec 9>"$SCAN_LOCK"
 if ! flock -n 9; then
   log "another scan holds ${SCAN_LOCK}; refusing overlap"
   exit 0
 fi
 
-# No --rm: the container must survive long enough for step 1 to capture its
-# exit state and OOM flag on a later tick.
-nohup setsid docker compose run \
-  --name "opip-scan-$(printf '%s' "$attempt_id" | tr -c 'A-Za-z0-9_.-' '-')" \
-  --label "${LABEL}=${attempt_id}" \
+out="${STAGING_DIR}/$(safe_name "$attempt_id")"
+mkdir -p "$out"
+container_name="opip-scan-$(safe_name "$attempt_id")"
+
+# Launch evidence is written *before* the container exists. The core will not
+# terminalise this attempt from an "absent" observation; it waits for the exit
+# record that only a real launch can produce.
+printf '{"schema_version":1,"attempt_id":"%s","container_name":"%s","launched_at":"%s","deadline_seconds":%s}\n' \
+  "$attempt_id" "$container_name" "$(utc)" "$DEADLINE" > "${out}/.launch.json.tmp"
+mv -f "${out}/.launch.json.tmp" "${out}/launch.json"
+
+# No --rm: the container must outlive this invocation so steps 1 and 2 can
+# capture its exit code and OOM flag before removal.
+OPIP_SCAN_ATTEMPT_ID="$attempt_id" nohup setsid docker compose run \
+  --name "$container_name" \
   --no-deps \
   "$SERVICE" python -m app.jobs.scan_worker --attempt-id "$attempt_id" \
-  >> "${LOG_DIR}/ohm-scan-worker-${attempt_id//[^A-Za-z0-9_.-]/-}.log" 2>&1 &
+  >> "${LOG_DIR}/ohm-scan-worker-${container_name}.log" 2>&1 &
 
-log "dispatched attempt ${attempt_id} (detached)"
+log "dispatched attempt ${attempt_id} as ${container_name} (detached)"
 
 # Single use: the token must not start a second worker on the next tick.
 rm -f "$TOKEN"

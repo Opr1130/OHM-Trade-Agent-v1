@@ -17,7 +17,11 @@ from typing import Any, Iterable, Mapping
 import tempfile
 
 from app.services.scan_attempt import (
+    OUTCOME_CANCELLED,
+    OUTCOME_COMPLETED,
     OUTCOME_FAILED,
+    OUTCOME_OOM_KILLED,
+    OUTCOME_PARTIAL,
     OUTCOME_TIMED_OUT,
     ScanAttempt,
     ScanAttemptStore,
@@ -113,6 +117,10 @@ def evaluate_admission(
     own (R02).
     """
     moment = _utc(now)
+    if store.is_discovery_blocked(moment):
+        # Repeated isolated-workflow failures suspend discovery. They never
+        # restore the legacy in-process scanner.
+        return AdmissionOutcome(False, REASON_CIRCUIT_OPEN, store.active())
     active = store.active()
     if active is not None:
         return AdmissionOutcome(False, REASON_LIVE_ATTEMPT, active)
@@ -217,6 +225,64 @@ def clear_token(settings: Any) -> bool:
 
 
 EVIDENCE_NAME = "container_evidence.json"
+LAUNCH_NAME = "launch.json"
+EXIT_NAME = "container_exit.json"
+QUARANTINE_NAME = "quarantine.json"
+
+REASON_NEVER_LAUNCHED = "NEVER_LAUNCHED"
+REASON_CIRCUIT_OPEN = "DISCOVERY_CIRCUIT_OPEN"
+REASON_AWAITING_EVIDENCE = "AWAITING_CONTAINER_EVIDENCE"
+
+
+def attempt_evidence_dir(settings: Any, attempt_id: str) -> Path:
+    return state_dir(settings) / "staging" / attempt_dir_name(attempt_id)
+
+
+def _read_json(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def read_launch_evidence(settings: Any, attempt_id: str) -> dict[str, Any] | None:
+    """Return the dispatcher's launch record for this exact attempt."""
+    return _read_json(attempt_evidence_dir(settings, attempt_id) / LAUNCH_NAME)
+
+
+def read_exit_evidence(settings: Any, attempt_id: str) -> dict[str, Any] | None:
+    """Return the dispatcher's post-launch exit record for this exact attempt."""
+    return _read_json(attempt_evidence_dir(settings, attempt_id) / EXIT_NAME)
+
+
+def read_quarantine(settings: Any, attempt_id: str) -> dict[str, Any] | None:
+    """Return the quarantine record for an attempt that could not be killed."""
+    return _read_json(attempt_evidence_dir(settings, attempt_id) / QUARANTINE_NAME)
+
+
+def launch_is_post_dated(
+    launch: Mapping[str, Any] | None, exit_evidence: Mapping[str, Any] | None
+) -> bool:
+    """True only when the exit record is not older than the launch record."""
+    if not isinstance(launch, Mapping) or not isinstance(exit_evidence, Mapping):
+        return False
+    try:
+        launched = datetime.fromisoformat(
+            str(launch.get("launched_at")).replace("Z", "+00:00")
+        )
+        captured = datetime.fromisoformat(
+            str(exit_evidence.get("captured_at")).replace("Z", "+00:00")
+        )
+    except (TypeError, ValueError):
+        return False
+    if launched.tzinfo is None:
+        launched = launched.replace(tzinfo=timezone.utc)
+    if captured.tzinfo is None:
+        captured = captured.replace(tzinfo=timezone.utc)
+    return captured >= launched
 
 
 def write_container_evidence(
@@ -279,34 +345,88 @@ def evidence_is_fresh(
 def reconcile(
     store: ScanAttemptStore,
     *,
-    live_attempt_ids: Iterable[str] | None = None,
-    evidence_fresh: bool = True,
+    settings: Any,
     now: datetime | None = None,
 ) -> list[ScanAttempt]:
-    """Close attempts that can no longer be running, before any new admission.
+    """Close an attempt only on attempt-specific, post-launch disappearance.
 
-    ``live_attempt_ids`` is authoritative container evidence supplied by the
-    host dispatcher. When that evidence is missing or stale
-    (``evidence_fresh=False``) nothing is terminalised: ambiguous process
-    identity must withhold, never guess, because a wrongly closed attempt is an
-    overlap invitation.
+    The previous version terminalised from a generic ``alive=[]`` snapshot,
+    which is a *pre-launch* observation: an attempt whose container had not yet
+    started looked identical to one that had finished. Terminalisation now
+    requires the dispatcher's own exit record for this exact attempt, captured
+    after its launch. Anything less is ambiguity, and ambiguity withholds.
     """
     moment = _utc(now)
-    reconciled: list[ScanAttempt] = []
     active = store.active()
-    if active is None or not evidence_fresh:
-        return reconciled
-    live = {str(item) for item in (live_attempt_ids or ())}
-    if active.attempt_id in live:
-        return reconciled
-    timed_out = active.deadline_passed(moment)
-    reconciled.append(
-        store.terminalize(
-            active.attempt_id,
-            OUTCOME_TIMED_OUT if timed_out else OUTCOME_FAILED,
-            "DEADLINE_EXCEEDED_WITHOUT_CONTAINER" if timed_out else "CONTAINER_ABSENT",
-            evidence={"reconciled_at": moment.isoformat()},
-            now=moment,
+    if active is None:
+        return []
+
+    attempt_id = active.attempt_id
+    exit_evidence = read_exit_evidence(settings, attempt_id)
+    launch = read_launch_evidence(settings, attempt_id)
+
+    if exit_evidence is not None:
+        if not launch_is_post_dated(launch, exit_evidence):
+            # Exit evidence that predates the launch belongs to a previous
+            # attempt or a recycled name; it proves nothing about this one.
+            return []
+        outcome, reason = classify_exit(
+            exit_evidence, attempt_evidence_dir(settings, attempt_id)
         )
-    )
-    return reconciled
+        return [
+            store.terminalize(
+                attempt_id,
+                outcome,
+                reason,
+                evidence={"container_exit": exit_evidence},
+                now=moment,
+            )
+        ]
+
+    if launch is None:
+        token = read_token(settings)
+        if token is None or not token_is_actionable(token, now=moment):
+            # The dispatcher deletes the token when it launches. An expired or
+            # absent token without a launch record is positive evidence that
+            # this attempt was never started, so no container can exist.
+            return [
+                store.terminalize(
+                    attempt_id,
+                    OUTCOME_CANCELLED,
+                    REASON_NEVER_LAUNCHED,
+                    evidence={"reconciled_at": moment.isoformat()},
+                    now=moment,
+                )
+            ]
+        return []
+
+    # Launched, but no exit record yet: the container may still be running.
+    return []
+
+
+def classify_exit(
+    exit_evidence: Mapping[str, Any], evidence_dir: Path
+) -> tuple[str, str | None]:
+    """Map observed container exit state to a terminal outcome."""
+    state = exit_evidence.get("state") if isinstance(exit_evidence, Mapping) else None
+    if not isinstance(state, Mapping):
+        return OUTCOME_FAILED, "EXIT_STATE_UNREADABLE"
+    if bool(state.get("OOMKilled")):
+        return OUTCOME_OOM_KILLED, "CGROUP_OOM_KILL"
+    try:
+        code = int(state.get("ExitCode"))
+    except (TypeError, ValueError):
+        return OUTCOME_FAILED, "EXIT_CODE_UNREADABLE"
+    if code == 0:
+        from app.services.scan_manifest import ManifestError, is_complete, read_manifest
+
+        try:
+            manifest = read_manifest(evidence_dir)
+        except ManifestError as exc:
+            return OUTCOME_FAILED, f"MANIFEST_{exc.reason}"
+        if is_complete(manifest):
+            return OUTCOME_COMPLETED, None
+        return OUTCOME_PARTIAL, "COVERAGE_INCOMPLETE"
+    if code in (137, 143):
+        return OUTCOME_TIMED_OUT, "DEADLINE_KILLED"
+    return OUTCOME_FAILED, f"CONTAINER_EXIT_{code}"

@@ -1340,10 +1340,17 @@ def _apply_ranked_action_gates(ranked_opportunities, *, settings, opip=None, aut
     return eligible
 
 
-def main():
+def main(scan_override=None):
     settings = get_settings()
     compute = ScanComputeTracker.start()
-    scan = scan_market(limit=DEFAULT_UNIQUE_ASSET_LIMIT)
+    # Acquisition seam: when the isolated worker produced this result, the
+    # caller passes it in and no market data is fetched here. Everything below
+    # this line - selection, ranking, AI review, gates, notifications - is the
+    # unchanged production path.
+    if scan_override is not None:
+        scan = scan_override
+    else:
+        scan = scan_market(limit=DEFAULT_UNIQUE_ASSET_LIMIT)
     decision_at = datetime.now(timezone.utc)
     market_regime = evaluate_market_regime(scan.snapshots)
     local_movement_signals = [

@@ -52,6 +52,22 @@ def configured_max_workers() -> int:
         return MAX_WORKERS
     return max(1, min(MAX_WORKERS, configured))
 
+
+def configured_batch_assets() -> int:
+    """Return the acquisition batch size for this process.
+
+    Batching bounds how many per-symbol working sets can coexist. It never
+    changes the candidate population: selection runs after every batch has been
+    collected.
+    """
+    try:
+        from app.core.config import get_settings
+
+        configured = int(getattr(get_settings(), "opip_scan_batch_assets", 50))
+    except Exception:  # noqa: BLE001 - configuration must never break acquisition
+        return 50
+    return max(1, min(DEFAULT_UNIQUE_ASSET_LIMIT, configured))
+
 EXECUTION_VALIDATION_MAX_POSITION_FRACTION = 0.20
 MOVEMENT_COMPRESSION_PREFILTER_PERCENTILE = 40.0
 MOVEMENT_MIN_CANDLES = 120
@@ -357,18 +373,28 @@ def scan_market(limit: int = DEFAULT_UNIQUE_ASSET_LIMIT) -> ScanResult:
     failures: list[str] = []
     data_rejections: list[str] = []
 
-    with ThreadPoolExecutor(max_workers=configured_max_workers()) as executor:
-        futures = {executor.submit(analyze_symbol, asset.primary_pair, asset): asset.primary_pair for asset in universe.assets}
-        for future in as_completed(futures):
-            status, snapshot, message = future.result()
-            if status == "ok" and snapshot is not None:
-                snapshots.append(snapshot)
-            elif status == "skip" and message:
-                skips.append(message)
-            elif status == "data_reject" and message:
-                data_rejections.append(message)
-            elif status == "fail" and message:
-                failures.append(message)
+    # Real batching: assets are submitted in bounded batches so the number of
+    # simultaneously-live per-symbol working sets is capped by the batch size as
+    # well as by worker count. Selection still runs later over the complete
+    # snapshot set, so batching cannot change coverage or ranking.
+    batch_size = configured_batch_assets()
+    for start in range(0, len(universe.assets), batch_size):
+        batch = universe.assets[start : start + batch_size]
+        with ThreadPoolExecutor(max_workers=configured_max_workers()) as executor:
+            futures = {
+                executor.submit(analyze_symbol, asset.primary_pair, asset): asset.primary_pair
+                for asset in batch
+            }
+            for future in as_completed(futures):
+                status, snapshot, message = future.result()
+                if status == "ok" and snapshot is not None:
+                    snapshots.append(snapshot)
+                elif status == "skip" and message:
+                    skips.append(message)
+                elif status == "data_reject" and message:
+                    data_rejections.append(message)
+                elif status == "fail" and message:
+                    failures.append(message)
 
     snapshots.sort(key=lambda item: item.technical_score, reverse=True)
     return ScanResult(

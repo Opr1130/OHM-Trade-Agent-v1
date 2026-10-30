@@ -299,8 +299,20 @@ services:
       - app.jobs.scan_worker
       - --attempt-id
       - UNSET
+    # The attempt label is what lets the dispatcher find *this* attempt's
+    # container. It is declared on the service rather than passed to
+    # `run --label` so it cannot be lost if a CLI version lacks that flag.
+    labels:
+      opip.attempt_id: "${OPIP_SCAN_ATTEMPT_ID:-UNSET}"
+    # Acquisition scratch only. The scanner must not be able to write paper
+    # state, canonical evidence, operational control registries or bridge files,
+    # so the whole data tree is NOT mounted: only the scan staging subtree is.
+    # Public market-data access needs no local state.
     volumes:
-      - ./data:/app/data
+      - ./data/scan:/app/data/scan
+    read_only: true
+    tmpfs:
+      - /tmp
     mem_limit: 224m
     memswap_limit: 224m
     cpus: "0.35"

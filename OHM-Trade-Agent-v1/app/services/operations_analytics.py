@@ -59,6 +59,10 @@ class _BoundedCapture(io.TextIOBase):
         # long lines retain far more than the byte budget intends.
         self._head_budget = max(1, self._max_bytes * 3 // 4)
         self._tail_budget = max(1, self._max_bytes - self._head_budget)
+        # A producer that never emits a newline would otherwise grow the
+        # pending fragment without limit, so an unterminated fragment is
+        # flushed as its own line once it reaches this size.
+        self._pending_limit = max(256, self._head_budget // 4)
         self._head: deque[str] = deque()
         self._tail: deque[str] = deque()
         self._tail_max_lines = max(1, self._max_lines // 4)
@@ -79,6 +83,12 @@ class _BoundedCapture(io.TextIOBase):
         *complete, self._pending = text.split("\n")
         for line in complete:
             self._store(line + "\n")
+        # A producer that streams one enormous unterminated line is bounded by
+        # flushing oversized fragments as synthetic lines.
+        while len(self._pending) >= self._pending_limit:
+            fragment = self._pending[: self._pending_limit]
+            self._pending = self._pending[self._pending_limit :]
+            self._store(fragment + "\n")
         return len(value)
 
     def _store(self, line: str) -> None:

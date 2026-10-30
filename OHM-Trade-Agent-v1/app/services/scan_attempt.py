@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from app.opip.storage.bounded_jsonl import iter_lines, read_tail_lines
 from app.services.registry_io import load_json, registry_lock, save_json_atomic
 
 
@@ -57,6 +58,20 @@ SUCCESSFUL_OUTCOMES: frozenset[str] = frozenset({OUTCOME_COMPLETED})
 
 MAX_INDEX_ATTEMPTS = 50
 MAX_REASON_CHARS = 96
+
+#: Consecutive isolated-workflow failures before discovery is suspended, and
+#: for how long. A suspended discovery never falls back to the in-process
+#: scanner; it simply stops until the breaker expires or an operator acts.
+BREAKER_FAILURE_THRESHOLD = 3
+BREAKER_COOLDOWN_SECONDS = 900
+BREAKER_OUTCOMES: frozenset[str] = frozenset(
+    {
+        "FAILED",
+        "TIMED_OUT",
+        "OOM_KILLED",
+        "CANCELLED",
+    }
+)
 
 
 class ScanAttemptError(RuntimeError):
@@ -153,28 +168,141 @@ class ScanAttemptStore:
 
     # -- low level ---------------------------------------------------------
 
-    def _append_event(self, event: dict[str, Any]) -> None:
+    def _append_event(self, event: dict[str, Any]) -> int:
+        """Append one event, assigning the next monotonic sequence number."""
         self.root.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(event, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        seq = self._next_seq()
+        payload = dict(event)
+        payload["seq"] = seq
+        line = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
         with self.ledger_file.open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
             handle.flush()
             os.fsync(handle.fileno())
+        return seq
 
-    def _load_index(self) -> dict[str, Any]:
+    def _next_seq(self) -> int:
+        """Return the next ledger sequence number.
+
+        Derived from the ledger itself, never from the index, so a crash after
+        an event append but before an index save cannot reuse a sequence number.
+        """
+        last = self._last_ledger_seq()
+        return 1 if last <= 0 else last + 1
+
+    def _last_ledger_seq(self) -> int:
+        """Return the highest committed ``seq``, or -1 when undeterminable."""
+        if not self.ledger_file.exists():
+            return 0
+        try:
+            rows = read_tail_lines(self.ledger_file, 8)
+        except OSError:
+            return -1
+        for row in reversed(rows):
+            try:
+                parsed = json.loads(row)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if isinstance(parsed, dict) and isinstance(parsed.get("seq"), int):
+                return int(parsed["seq"])
+        return -1
+
+    def _read_index_file(self) -> dict[str, Any] | None:
         try:
             payload = load_json(self.index_file)
         except Exception:  # noqa: BLE001 - index is a projection, never authority
-            payload = {}
+            return None
         if not isinstance(payload, dict):
-            return {"schema_version": SCHEMA_VERSION, "attempts": {}}
+            return None
         attempts = payload.get("attempts")
+        if not isinstance(attempts, dict):
+            return None
         return {
             "schema_version": SCHEMA_VERSION,
-            "attempts": attempts if isinstance(attempts, dict) else {},
+            "last_seq": int(payload.get("last_seq") or 0),
+            "fence_high_water": int(payload.get("fence_high_water") or 0),
+            "attempts": attempts,
+            "discovery_blocked_until": payload.get("discovery_blocked_until"),
+            "consecutive_failures": int(payload.get("consecutive_failures") or 0),
         }
 
-    def _save_index(self, index: dict[str, Any]) -> None:
+    def _load_index(self) -> dict[str, Any]:
+        """Return the projection, rebuilding it from the ledger when stale.
+
+        The ledger is the authority. A crash between "event appended" and
+        "index saved" leaves the index behind by one sequence number, which is
+        detected here and repaired by replay rather than silently trusted.
+        """
+        last_seq = self._last_ledger_seq()
+        index = self._read_index_file()
+        if last_seq < 0:
+            # The tail is unreadable (torn write). Replay, which skips
+            # unparseable rows, so a single torn line cannot wedge the ledger.
+            return self._rebuild_index()
+        if index is None or int(index.get("last_seq") or 0) != last_seq:
+            return self._rebuild_index()
+        return index
+
+    def _rebuild_index(self) -> dict[str, Any]:
+        """Replay the append-only ledger into a fresh projection."""
+        attempts: dict[str, Any] = {}
+        last_seq = 0
+        fence_high = 0
+        blocked_until: str | None = None
+        failures = 0
+
+        def apply(event: dict[str, Any]) -> None:
+            nonlocal fence_high, blocked_until, failures
+            attempt_id = event.get("attempt_id")
+            if not isinstance(attempt_id, str) or not attempt_id:
+                return
+            if event.get("event") == "SKIP":
+                fence_high = max(fence_high, int(event.get("fence") or 0))
+                return
+            attempts[attempt_id] = {
+                key: event.get(key)
+                for key in (
+                    "attempt_id",
+                    "state",
+                    "outcome",
+                    "reason_code",
+                    "fence",
+                    "created_at",
+                    "deadline_at",
+                    "finished_at",
+                    "container_id",
+                    "evidence",
+                )
+            }
+            fence_high = max(fence_high, int(event.get("fence") or 0))
+            blocked_until = event.get("discovery_blocked_until") or blocked_until
+            failures = int(event.get("consecutive_failures") or failures)
+
+        if self.ledger_file.exists():
+            for row in iter_lines(self.ledger_file):
+                try:
+                    parsed = json.loads(row)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(parsed, dict):
+                    continue
+                seq = parsed.get("seq")
+                if isinstance(seq, int):
+                    last_seq = max(last_seq, seq)
+                apply(parsed)
+
+        index = {
+            "schema_version": SCHEMA_VERSION,
+            "last_seq": last_seq,
+            "fence_high_water": fence_high,
+            "attempts": attempts,
+            "discovery_blocked_until": blocked_until,
+            "consecutive_failures": failures,
+        }
+        self._write_index(index)
+        return index
+
+    def _write_index(self, index: dict[str, Any]) -> None:
         attempts = index.get("attempts") or {}
         if len(attempts) > MAX_INDEX_ATTEMPTS:
             ordered = sorted(
@@ -185,13 +313,37 @@ class ScanAttemptStore:
             index["attempts"] = dict(ordered)
         save_json_atomic(self.index_file, index)
 
+    def _save_index(self, index: dict[str, Any]) -> None:
+        self._write_index(index)
+
     def _next_fence(self, index: dict[str, Any]) -> int:
         current = [
             int(row.get("fence") or 0)
             for row in (index.get("attempts") or {}).values()
             if isinstance(row, dict)
         ]
-        return (max(current) + 1) if current else 1
+        current.append(int(index.get("fence_high_water") or 0))
+        return max(current) + 1
+
+    def discovery_blocked_until(self, now: datetime | None = None) -> datetime | None:
+        """Return the circuit-breaker deadline, or None when closed."""
+        raw = self._load_index().get("discovery_blocked_until")
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def is_discovery_blocked(self, now: datetime | None = None) -> bool:
+        blocked_until = self.discovery_blocked_until()
+        return blocked_until is not None and _utc(now) < blocked_until
+
+    def consecutive_failures(self) -> int:
+        return int(self._load_index().get("consecutive_failures") or 0)
 
     def _rows(self, index: dict[str, Any]) -> list[ScanAttempt]:
         return [
@@ -256,7 +408,7 @@ class ScanAttemptStore:
                 container_id=container_id,
                 evidence=dict(evidence or {}),
             )
-            self._append_event(
+            seq = self._append_event(
                 {
                     "schema_version": SCHEMA_VERSION,
                     "event": "CREATE",
@@ -265,6 +417,10 @@ class ScanAttemptStore:
                 }
             )
             index.setdefault("attempts", {})[record.attempt_id] = record.as_dict()
+            index["last_seq"] = seq
+            index["fence_high_water"] = max(
+                int(index.get("fence_high_water") or 0), record.fence
+            )
             self._save_index(index)
         return record
 
@@ -305,15 +461,30 @@ class ScanAttemptStore:
                 container_id=current.container_id,
                 evidence=merged,
             )
-            self._append_event(
-                {
-                    "schema_version": SCHEMA_VERSION,
-                    "event": "TERMINAL",
-                    **updated.as_dict(),
-                    "at": moment.isoformat(),
-                }
-            )
+            event = {
+                "schema_version": SCHEMA_VERSION,
+                "event": "TERMINAL",
+                **updated.as_dict(),
+                "at": moment.isoformat(),
+            }
+            failures = int(index.get("consecutive_failures") or 0)
+            blocked = index.get("discovery_blocked_until")
+            if normalized == OUTCOME_COMPLETED:
+                failures = 0
+                blocked = None
+            elif normalized in BREAKER_OUTCOMES:
+                failures += 1
+                if failures >= BREAKER_FAILURE_THRESHOLD:
+                    blocked = (
+                        moment + timedelta(seconds=BREAKER_COOLDOWN_SECONDS)
+                    ).isoformat()
+            event["consecutive_failures"] = failures
+            event["discovery_blocked_until"] = blocked
+            seq = self._append_event(event)
             index["attempts"][updated.attempt_id] = updated.as_dict()
+            index["last_seq"] = seq
+            index["consecutive_failures"] = failures
+            index["discovery_blocked_until"] = blocked
             self._save_index(index)
         return updated
 
@@ -349,7 +520,7 @@ class ScanAttemptStore:
                 container_id=container_id or current.container_id,
                 evidence=merged,
             )
-            self._append_event(
+            seq = self._append_event(
                 {
                     "schema_version": SCHEMA_VERSION,
                     "event": "TRANSITION",
@@ -358,6 +529,7 @@ class ScanAttemptStore:
                 }
             )
             index["attempts"][updated.attempt_id] = updated.as_dict()
+            index["last_seq"] = seq
             self._save_index(index)
         return updated
 
@@ -387,7 +559,7 @@ class ScanAttemptStore:
                 finished_at=moment.isoformat(),
                 evidence=dict(evidence or {}),
             )
-            self._append_event(
+            seq = self._append_event(
                 {
                     "schema_version": SCHEMA_VERSION,
                     "event": "SKIP",
@@ -396,6 +568,10 @@ class ScanAttemptStore:
                 }
             )
             index.setdefault("attempts", {})[record.attempt_id] = record.as_dict()
+            index["last_seq"] = seq
+            index["fence_high_water"] = max(
+                int(index.get("fence_high_water") or 0), record.fence
+            )
             self._save_index(index)
         return record
 
