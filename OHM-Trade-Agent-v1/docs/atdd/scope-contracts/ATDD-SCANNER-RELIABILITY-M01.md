@@ -108,6 +108,9 @@ AC-004 -> tests/test_opip_scan_remediation_v1.py::test_stale_claim_owner_cannot_
 AC-004 -> tests/test_opip_scan_remediation_v1.py::test_completed_scan_is_consumed_despite_a_newer_reserved_attempt
 AC-004 -> tests/test_opip_scan_remediation_v1.py::test_repeated_promotion_run_qualifies_exactly_once
 AC-005 -> tests/test_opip_scan_remediation_v1.py::test_read_only_store_refuses_operational_writes
+AC-005 -> tests/test_opip_scan_remediation_v1.py::test_worker_namespace_is_disjoint_from_evidence_namespace
+AC-005 -> tests/test_opip_scan_remediation_v1.py::test_forged_exit_evidence_in_staging_cannot_terminalise
+AC-005 -> tests/test_opip_scan_remediation_v1.py::test_forged_promotion_claim_in_staging_cannot_block_or_grant
 AC-006 -> tests/test_opip_scan_remediation_v1.py::test_promotion_refused_when_policy_forbids_output
 AC-006 -> tests/test_opip_scan_remediation_v1.py::test_qualification_holds_only_its_own_lock
 

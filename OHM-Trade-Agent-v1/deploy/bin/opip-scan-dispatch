@@ -15,6 +15,7 @@ set -Eeuo pipefail
 REPO_DIR="${OPIP_REPO_DIR:-/opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1}"
 STATE_DIR="${REPO_DIR}/data/scan"
 STAGING_DIR="${STATE_DIR}/staging"
+EVIDENCE_DIR="${STATE_DIR}/evidence"
 TOKEN="${STATE_DIR}/admission_token.json"
 EVIDENCE="${STATE_DIR}/container_evidence.json"
 SCAN_LOCK="${OPIP_SCAN_LOCK:-/var/run/ohm-scan.lock}"
@@ -26,6 +27,7 @@ LOG_DIR="${OPIP_SCAN_LOG_DIR:-/var/log}"
 
 cd "$REPO_DIR"
 mkdir -p "$STAGING_DIR"
+mkdir -p "$EVIDENCE_DIR"
 
 log() { printf '%s opip-scan-dispatch %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -51,7 +53,7 @@ PY
 # Capture exit state for one container. Written before removal, always.
 capture_exit() {
   cid="$1"; attempt="$2"
-  out="${STAGING_DIR}/$(safe_name "$attempt")"
+  out="${EVIDENCE_DIR}/$(safe_name "$attempt")"
   mkdir -p "$out"
   tmp="${out}/.container_exit.json.tmp"
   if { printf '{"schema_version":1,"container_id":"%s","captured_at":"%s","attempt_id":"%s","state":' \
@@ -85,7 +87,7 @@ while IFS= read -r cid; do
   if is_running "$cid"; then
     # Uninterruptible or wedged. Never start a second worker: quarantine and
     # keep admission blocked until the container actually disappears.
-    out="${STAGING_DIR}/$(safe_name "$attempt")"
+    out="${EVIDENCE_DIR}/$(safe_name "$attempt")"
     mkdir -p "$out"
     printf '{"schema_version":1,"attempt_id":"%s","container_id":"%s","reason_code":"CONTAINER_UNKILLABLE","observed_at":"%s"}\n' \
       "$attempt" "$cid" "$(utc)" > "${out}/.quarantine.json.tmp"
@@ -155,7 +157,7 @@ if ! flock -n 9; then
   exit 0
 fi
 
-out="${STAGING_DIR}/$(safe_name "$attempt_id")"
+out="${EVIDENCE_DIR}/$(safe_name "$attempt_id")"
 mkdir -p "$out"
 container_name="opip-scan-$(safe_name "$attempt_id")"
 

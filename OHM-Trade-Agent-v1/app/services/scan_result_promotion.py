@@ -26,7 +26,7 @@ from app.services.scan_manifest import (
     read_manifest,
     sha256_path,
 )
-from app.services.scan_supervisor import attempt_evidence_dir
+from app.services.scan_supervisor import attempt_evidence_dir, attempt_staging_dir
 
 
 SNAPSHOTS_NAME = "snapshots.jsonl"
@@ -143,9 +143,9 @@ def load_promoted(
     if getattr(attempt, "outcome", None) not in {"COMPLETED", "PARTIAL"}:
         raise PromotionRejected(f"ATTEMPT_OUTCOME_{getattr(attempt, 'outcome', 'UNKNOWN')}")
 
-    evidence_dir = attempt_evidence_dir(settings, attempt.attempt_id)
+    staging_dir = attempt_staging_dir(settings, attempt.attempt_id)
     try:
-        manifest = read_manifest(evidence_dir)
+        manifest = read_manifest(staging_dir)
     except ManifestError as exc:
         raise PromotionRejected(f"MANIFEST_{exc.reason}") from exc
 
@@ -176,7 +176,7 @@ def load_promoted(
     snapshots_meta = manifest.get("snapshots")
     if not isinstance(snapshots_meta, Mapping):
         raise PromotionRejected("MANIFEST_SNAPSHOTS_MISSING")
-    snapshots_path = evidence_dir / str(snapshots_meta.get("file") or SNAPSHOTS_NAME)
+    snapshots_path = staging_dir / str(snapshots_meta.get("file") or SNAPSHOTS_NAME)
     if not snapshots_path.exists():
         raise PromotionRejected("SNAPSHOTS_ABSENT")
     if str(snapshots_meta.get("sha256") or "") != sha256_path(snapshots_path):

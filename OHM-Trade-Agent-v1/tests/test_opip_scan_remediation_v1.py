@@ -65,8 +65,10 @@ def _snapshot(**overrides):
 
 
 def _publish(settings, attempt_id: str, *, complete=True, coverage=None, snapshots=None):
-    """Write a manifest + snapshots exactly as the worker does."""
-    directory = attempt_evidence_dir(settings, attempt_id)
+    """Write a manifest + snapshots exactly as the worker does (staging only)."""
+    from app.services.scan_supervisor import attempt_staging_dir
+
+    directory = attempt_staging_dir(settings, attempt_id)
     directory.mkdir(parents=True, exist_ok=True)
     rows = snapshots if snapshots is not None else [_snapshot()]
     lines = b"".join(
@@ -481,6 +483,89 @@ def test_launch_uncertainty_is_quarantined_not_terminalised(tmp_path: Path):
     assert store.active() is not None, "quarantine must never terminalise"
     with pytest.raises(sa.ScanAttemptError):
         store.create(attempt_id="SCAN:R", deadline_seconds=300, now=NOW)
+
+
+# --- AC-005: trusted lifecycle evidence is not worker-writable -----------
+
+
+@pytest.mark.acceptance(f"{INCREMENT}/AC-005")
+def test_worker_namespace_is_disjoint_from_evidence_namespace(tmp_path: Path):
+    """ATDD-SCANNER-RELIABILITY-M01/AC-005 staging can never contain evidence."""
+    from app.services.scan_supervisor import attempt_evidence_dir, attempt_staging_dir
+
+    settings = _settings(tmp_path)
+    staging = attempt_staging_dir(settings, "SCAN:A")
+    evidence = attempt_evidence_dir(settings, "SCAN:A")
+
+    assert staging != evidence
+    assert staging.parent.name == "staging"
+    assert evidence.parent.name == "evidence"
+    assert evidence.is_relative_to(staging) is False
+    assert staging.is_relative_to(evidence) is False
+
+
+@pytest.mark.acceptance(f"{INCREMENT}/AC-005")
+def test_forged_exit_evidence_in_staging_cannot_terminalise(tmp_path: Path):
+    """ATDD-SCANNER-RELIABILITY-M01/AC-005 a worker-written exit record is ignored."""
+    from app.services import scan_supervisor as sup
+    from app.services.scan_supervisor import attempt_staging_dir
+
+    settings = _settings(tmp_path)
+    store = sa.ScanAttemptStore(settings.opip_scan_state_dir)
+    store.create(attempt_id="SCAN:F", deadline_seconds=300, now=NOW)
+
+    forged = attempt_staging_dir(settings, "SCAN:F")
+    forged.mkdir(parents=True, exist_ok=True)
+    (forged / "container_exit.json").write_text(
+        json.dumps(
+            {
+                "attempt_id": "SCAN:F",
+                "captured_at": NOW.isoformat(),
+                "state": {"ExitCode": 0, "OOMKilled": False},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (forged / "launch_failed.json").write_text(
+        json.dumps({"attempt_id": "SCAN:F", "observed_containers": 0}),
+        encoding="utf-8",
+    )
+    (forged / "quarantine.json").write_text(
+        json.dumps({"attempt_id": "SCAN:F"}), encoding="utf-8"
+    )
+
+    # A legitimate host-side launch record exists: the attempt is genuinely in
+    # flight, so only a forged staging record could have "finished" it.
+    from app.services.scan_supervisor import attempt_evidence_dir
+
+    evidence = attempt_evidence_dir(settings, "SCAN:F")
+    evidence.mkdir(parents=True, exist_ok=True)
+    (evidence / "launch_request.json").write_text(
+        json.dumps({"attempt_id": "SCAN:F", "launched_at": NOW.isoformat()}),
+        encoding="utf-8",
+    )
+
+    assert sup.reconcile(store, settings=settings, now=NOW + timedelta(minutes=1)) == []
+    assert store.active() is not None, "admission authority is unchanged by staging writes"
+    assert sup.read_exit_evidence(settings, "SCAN:F") is None
+    assert sup.read_launch_failure(settings, "SCAN:F") is None
+    assert sup.read_quarantine(settings, "SCAN:F") is None
+
+
+@pytest.mark.acceptance(f"{INCREMENT}/AC-005")
+def test_forged_promotion_claim_in_staging_cannot_block_or_grant(tmp_path: Path):
+    """ATDD-SCANNER-RELIABILITY-M01/AC-005 a worker-written claim has no authority."""
+    from app.services.scan_supervisor import attempt_staging_dir
+
+    settings, _ = _completed_attempt(tmp_path)
+    forged = attempt_staging_dir(settings, "SCAN:C")
+    (forged / "promotion.json").write_text(
+        json.dumps({"attempt_id": "SCAN:C", "state": "COMPLETED"}), encoding="utf-8"
+    )
+
+    assert promo.read_promotion(settings, "SCAN:C") is None, "evidence namespace only"
+    claimed, reason, token = promo.claim_promotion(settings, "SCAN:C", now=NOW)
+    assert claimed is True and reason == "CLAIMED" and token
 
 
 @pytest.mark.acceptance(f"{INCREMENT}/AC-005")

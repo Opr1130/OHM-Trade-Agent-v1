@@ -92,7 +92,19 @@ def attempt_dir_name(attempt_id: str) -> str:
 
 
 def attempt_staging_dir(settings: Any, attempt_id: str) -> Path:
+    """Worker-writable namespace: this attempt's market-data artifacts only."""
     return state_dir(settings) / "staging" / attempt_dir_name(attempt_id)
+
+
+def attempt_evidence_dir(settings: Any, attempt_id: str) -> Path:
+    """Host/core-owned namespace: lifecycle and promotion evidence.
+
+    Deliberately a sibling of ``staging`` and never inside it. The acquisition
+    worker can write only its own staging directory, so it cannot fabricate,
+    overwrite or delete exit evidence, launch failure/quarantine records,
+    promotion claims or the promotion lock they are guarded by.
+    """
+    return state_dir(settings) / "evidence" / attempt_dir_name(attempt_id)
 
 
 @dataclass(frozen=True)
@@ -235,10 +247,6 @@ REASON_CIRCUIT_OPEN = "DISCOVERY_CIRCUIT_OPEN"
 REASON_AWAITING_EVIDENCE = "AWAITING_CONTAINER_EVIDENCE"
 
 
-def attempt_evidence_dir(settings: Any, attempt_id: str) -> Path:
-    return state_dir(settings) / "staging" / attempt_dir_name(attempt_id)
-
-
 def _read_json(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
@@ -377,7 +385,7 @@ def reconcile(
             # attempt or a recycled name; it proves nothing about this one.
             return []
         outcome, reason = classify_exit(
-            exit_evidence, attempt_evidence_dir(settings, attempt_id)
+            exit_evidence, attempt_staging_dir(settings, attempt_id)
         )
         return [
             store.terminalize(
