@@ -149,6 +149,7 @@ AC-006 -> OHM-Trade-Agent-v1/app/services/operator_control.py
 AC-006 -> OHM-Trade-Agent-v1/app/jobs/run_cycle.py
 AC-006 -> OHM-Trade-Agent-v1/deploy/cron.d/ohm-unified-cycle
 AC-006 -> OHM-Trade-Agent-v1/tests/test_opip_scan_lifecycle_v1.py
+AC-006 -> OHM-Trade-Agent-v1/tests/test_p0_discovery_liveness.py
 AC-004 -> OHM-Trade-Agent-v1/app/services/scan_promotion_runner.py
 AC-006 -> OHM-Trade-Agent-v1/app/services/scan_promotion_runner.py
 
