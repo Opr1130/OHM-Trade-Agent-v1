@@ -106,7 +106,21 @@ while IFS= read -r cid; do
   log "captured and removed exited container ${cid} for ${attempt}"
 done < <(docker ps -aq --filter "label=${LABEL}" --filter "status=exited" 2>/dev/null || true)
 
-# --- 3. Act only on an authorised, unexpired token -------------------------
+# --- 3. Qualification stage -------------------------------------------------
+# AI review, market validation and notification delivery are unbounded in time,
+# so they run detached under their own lock. A hung qualification therefore
+# cannot hold the unified-cycle lock and cannot delay the next protection pass.
+# This stage runs every tick, independent of any new acquisition.
+exec 8>"/var/run/ohm-qualify.lock" 2>/dev/null || true
+if flock -n 8 2>/dev/null; then
+  nohup setsid docker compose exec -T ohm-trade-agent \
+    python -m app.services.scan_promotion_runner \
+    >> "${LOG_DIR}/ohm-scan-qualify.log" 2>&1 &
+  log "qualification stage dispatched"
+fi
+exec 8>&-
+
+# --- 4. Act only on an authorised, unexpired token -------------------------
 [ -s "$TOKEN" ] || exit 0
 
 attempt_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("attempt_id",""))' "$TOKEN" 2>/dev/null || true)"
@@ -140,12 +154,12 @@ out="${STAGING_DIR}/$(safe_name "$attempt_id")"
 mkdir -p "$out"
 container_name="opip-scan-$(safe_name "$attempt_id")"
 
-# Launch evidence is written *before* the container exists. The core will not
-# terminalise this attempt from an "absent" observation; it waits for the exit
-# record that only a real launch can produce.
+# A launch *request* is recorded before the container exists. It is not proof of
+# a launch: the core waits for exit evidence, and a failed start writes a
+# separate failure record so discovery is not blocked forever.
 printf '{"schema_version":1,"attempt_id":"%s","container_name":"%s","launched_at":"%s","deadline_seconds":%s}\n' \
-  "$attempt_id" "$container_name" "$(utc)" "$DEADLINE" > "${out}/.launch.json.tmp"
-mv -f "${out}/.launch.json.tmp" "${out}/launch.json"
+  "$attempt_id" "$container_name" "$(utc)" "$DEADLINE" > "${out}/.launch_request.json.tmp"
+mv -f "${out}/.launch_request.json.tmp" "${out}/launch_request.json"
 
 # No --rm: the container must outlive this invocation so steps 1 and 2 can
 # capture its exit code and OOM flag before removal.
@@ -155,7 +169,26 @@ OPIP_SCAN_ATTEMPT_ID="$attempt_id" nohup setsid docker compose run \
   "$SERVICE" python -m app.jobs.scan_worker --attempt-id "$attempt_id" \
   >> "${LOG_DIR}/ohm-scan-worker-${container_name}.log" 2>&1 &
 
-log "dispatched attempt ${attempt_id} as ${container_name} (detached)"
+# Distinguish a real launch from a merely issued request. If Docker refuses to
+# create the container, record that fact so the core can classify it instead of
+# waiting for evidence that will never arrive.
+started=""
+for _ in $(seq 1 15); do
+  for cid in $(docker ps -aq --filter "label=${LABEL}" 2>/dev/null || true); do
+    if [ "$(label_of "$cid")" = "${attempt_id}" ]; then started="$cid"; break; fi
+  done
+  [ -n "$started" ] && break
+  sleep 1
+done
+
+if [ -z "$started" ]; then
+  printf '{"schema_version":1,"attempt_id":"%s","container_name":"%s","observed_containers":0,"reason_code":"DOCKER_START_FAILED","observed_at":"%s"}\n' \
+    "$attempt_id" "$container_name" "$(utc)" > "${out}/.launch_failed.json.tmp"
+  mv -f "${out}/.launch_failed.json.tmp" "${out}/launch_failed.json"
+  log "attempt ${attempt_id} failed to start; recorded launch failure"
+else
+  log "dispatched attempt ${attempt_id} as ${started} (detached)"
+fi
 
 # Single use: the token must not start a second worker on the next tick.
 rm -f "$TOKEN"

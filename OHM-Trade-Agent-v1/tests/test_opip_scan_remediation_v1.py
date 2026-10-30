@@ -8,8 +8,6 @@ result promotion, worker volume isolation, resource bounds and safe suspension.
 from __future__ import annotations
 
 import json
-import shutil
-import subprocess
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -187,11 +185,223 @@ def test_worker_service_mounts_only_scan_staging():
     compose = (APP_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     block = compose.split("opip-scan-worker:", 1)[1].split("\nnetworks:", 1)[0]
 
-    assert "./data/scan:/app/data/scan" in block
-    assert "./data:/app/data" not in block
+    assert "./data/scan/staging:/app/data/scan/staging" in block, "staging is writable"
+    assert "./data/scan:/app/data/scan:ro" in block, "attempt metadata is read-only"
+    assert "./data:/app/data\n" not in block
     assert "env_file" not in block
     assert "read_only: true" in block
     assert "mem_limit: 224m" in block
+
+
+@pytest.mark.acceptance(f"{INCREMENT}/AC-005")
+def test_read_only_store_refuses_operational_writes(tmp_path: Path):
+    """ATDD-SCANNER-RELIABILITY-M01/AC-005 the worker cannot mutate the ledger."""
+    writer = sa.ScanAttemptStore(tmp_path / "scan")
+    writer.create(attempt_id="SCAN:A", deadline_seconds=300, now=NOW)
+    ledger_before = writer.ledger_file.read_bytes()
+
+    reader = sa.ScanAttemptStore(tmp_path / "scan", read_only=True)
+    assert reader.active().attempt_id == "SCAN:A", "read-only readers still resolve state"
+
+    for call in (
+        lambda: reader.create(attempt_id="SCAN:B", deadline_seconds=300, now=NOW),
+        lambda: reader.terminalize("SCAN:A", sa.OUTCOME_FAILED, "X", now=NOW),
+        lambda: reader.transition("SCAN:A", state=sa.STATE_RUNNING, now=NOW),
+        lambda: reader.record_skip(attempt_id="SCAN:C", reason_code="X", now=NOW),
+    ):
+        with pytest.raises(sa.ScanAttemptError):
+            call()
+
+    assert writer.ledger_file.read_bytes() == ledger_before
+
+
+# --- AC-002: launch request vs successful launch -------------------------
+
+
+@pytest.mark.acceptance(f"{INCREMENT}/AC-002")
+def test_launch_failure_is_classified_and_recoverable(tmp_path: Path):
+    """ATDD-SCANNER-RELIABILITY-M01/AC-002 a refused start is classified, not hung."""
+    settings = _settings(tmp_path)
+    store = sa.ScanAttemptStore(settings.opip_scan_state_dir)
+    store.create(attempt_id="SCAN:L", deadline_seconds=300, now=NOW)
+    directory = attempt_evidence_dir(settings, "SCAN:L")
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "launch_request.json").write_text(
+        json.dumps({"attempt_id": "SCAN:L", "launched_at": NOW.isoformat()}),
+        encoding="utf-8",
+    )
+    (directory / "launch_failed.json").write_text(
+        json.dumps(
+            {
+                "attempt_id": "SCAN:L",
+                "observed_containers": 0,
+                "reason_code": "DOCKER_START_FAILED",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    from app.services import scan_supervisor as sup
+
+    reconciled = sup.reconcile(store, settings=settings, now=NOW + timedelta(minutes=1))
+
+    assert reconciled[0].outcome == sa.OUTCOME_FAILED
+    assert reconciled[0].reason_code == "LAUNCH_FAILED"
+    follow_up = store.create(attempt_id="SCAN:M", deadline_seconds=300, now=NOW)
+    assert follow_up.attempt_id == "SCAN:M", "discovery is not blocked by a failed start"
+
+
+# --- AC-004: crash-recoverable, idempotent promotion ---------------------
+
+
+def _completed_attempt(tmp_path: Path):
+    settings = _settings(tmp_path)
+    store = sa.ScanAttemptStore(settings.opip_scan_state_dir)
+    store.create(attempt_id="SCAN:C", deadline_seconds=300, now=NOW)
+    attempt = store.terminalize("SCAN:C", sa.OUTCOME_COMPLETED, None, now=NOW)
+    _publish(settings, "SCAN:C")
+    return settings, attempt
+
+
+@pytest.mark.acceptance(f"{INCREMENT}/AC-004")
+def test_promotion_claim_is_exclusive_and_idempotent(tmp_path: Path):
+    """ATDD-SCANNER-RELIABILITY-M01/AC-004 one claim, one business outcome."""
+    settings, _ = _completed_attempt(tmp_path)
+
+    first, first_reason = promo.claim_promotion(settings, "SCAN:C", now=NOW)
+    second, second_reason = promo.claim_promotion(
+        settings, "SCAN:C", now=NOW + timedelta(seconds=30)
+    )
+    promo.complete_promotion(settings, "SCAN:C", now=NOW)
+    third, third_reason = promo.claim_promotion(
+        settings, "SCAN:C", now=NOW + timedelta(seconds=60)
+    )
+
+    assert first is True and first_reason == "CLAIMED"
+    assert second is False and second_reason == "CLAIM_IN_FLIGHT"
+    assert third is False and third_reason == "ALREADY_COMPLETED"
+
+
+@pytest.mark.acceptance(f"{INCREMENT}/AC-004")
+def test_expired_claim_is_reclaimed_once(tmp_path: Path):
+    """ATDD-SCANNER-RELIABILITY-M01/AC-004 a dead owner's claim can be retaken."""
+    settings, _ = _completed_attempt(tmp_path)
+    promo.claim_promotion(settings, "SCAN:C", now=NOW)
+
+    reclaimed, reason = promo.claim_promotion(
+        settings,
+        "SCAN:C",
+        now=NOW + timedelta(seconds=promo.PROMOTION_LEASE_SECONDS + 1),
+    )
+
+    assert reclaimed is True
+    assert reason == "RECLAIMED_EXPIRED"
+
+
+@pytest.mark.acceptance(f"{INCREMENT}/AC-004")
+def test_repeated_promotion_run_qualifies_exactly_once(tmp_path: Path, monkeypatch):
+    """ATDD-SCANNER-RELIABILITY-M01/AC-004 retries never duplicate qualification."""
+    settings, _ = _completed_attempt(tmp_path)
+    from app.services import scan_promotion_runner as runner
+
+    monkeypatch.setattr(
+        runner, "revalidate_policy", lambda settings, now=None: (True, "APPROVED")
+    )
+
+    calls: list[int] = []
+
+    def _qualify(scan_result):
+        calls.append(1)
+
+    first = runner.run_pending_promotion(settings, now=_real_now(), qualify=_qualify)
+    second = runner.run_pending_promotion(settings, now=_real_now(), qualify=_qualify)
+
+    assert first["status"] == runner.STATUS_COMPLETED
+    assert second["status"] == runner.STATUS_NONE
+    assert len(calls) == 1, "qualification must not run twice for one attempt"
+
+
+# --- AC-006: policy revalidation and lock separation --------------------
+
+
+@pytest.mark.acceptance(f"{INCREMENT}/AC-006")
+@pytest.mark.parametrize(
+    "decision, expected",
+    [
+        ({"effective_mode": "MAINTENANCE", "search_allowed": True, "quiet_hours": False}, "MODE_MAINTENANCE"),
+        ({"effective_mode": "MONITOR", "search_allowed": True, "quiet_hours": False}, "MODE_MONITOR"),
+        ({"effective_mode": "SEARCH", "search_allowed": False, "quiet_hours": False}, "SEARCH_NOT_ALLOWED"),
+        ({"effective_mode": "SEARCH", "search_allowed": True, "quiet_hours": True}, "QUIET_HOURS"),
+    ],
+)
+def test_promotion_refused_when_policy_forbids_output(tmp_path, monkeypatch, decision, expected):
+    """ATDD-SCANNER-RELIABILITY-M01/AC-006 stale policy never authorises an entry."""
+    settings, _ = _completed_attempt(tmp_path)
+    from app.services import operator_control
+    from app.services import scan_promotion_runner as runner
+
+    monkeypatch.setattr(
+        operator_control,
+        "get_operator_decision",
+        lambda now=None: SimpleNamespace(**decision),
+    )
+    calls: list[int] = []
+    result = runner.run_pending_promotion(
+        settings, now=_real_now(), qualify=lambda scan_result: calls.append(1)
+    )
+
+    assert result["status"] == runner.STATUS_REJECTED
+    assert result["reason_code"] == expected
+    assert calls == [], "no qualification may run when policy forbids it"
+
+
+@pytest.mark.acceptance(f"{INCREMENT}/AC-006")
+def test_qualification_holds_only_its_own_lock(tmp_path, monkeypatch):
+    """ATDD-SCANNER-RELIABILITY-M01/AC-006 a hung qualification blocks nothing else."""
+    import threading
+
+    from app.services import scan_promotion_runner as runner
+    from app.services.registry_io import registry_lock
+
+    settings, _ = _completed_attempt(tmp_path)
+    monkeypatch.setattr(
+        runner, "revalidate_policy", lambda settings, now=None: (True, "APPROVED")
+    )
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _hang(scan_result):
+        entered.set()
+        release.wait(5)
+
+    thread = threading.Thread(
+        target=lambda: runner.run_pending_promotion(
+            settings, now=_real_now(), qualify=_hang
+        ),
+        daemon=True,
+    )
+    thread.start()
+    try:
+        assert entered.wait(5), "qualification should start"
+
+        qualify_lock = runner.qualify_lock_path(settings)
+        with pytest.raises(TimeoutError):
+            with registry_lock(qualify_lock, timeout=0.0):
+                pass
+
+        # Any other lock — including the unified cycle's — is still available.
+        with registry_lock(tmp_path / ".unified_cycle.lock", timeout=0.0):
+            pass
+    finally:
+        release.set()
+        thread.join(5)
+
+    # The cycle itself never performs promotion any more.
+    from app.jobs import run_cycle
+
+    with pytest.raises(RuntimeError):
+        run_cycle._promote_and_qualify(settings=settings)
 
 
 @pytest.mark.acceptance(f"{INCREMENT}/AC-005")

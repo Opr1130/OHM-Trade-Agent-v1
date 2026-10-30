@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Mapping
 
 from app.opip.storage.bounded_jsonl import iter_lines, read_tail_lines
 from app.services.registry_io import load_json, registry_lock, save_json_atomic
@@ -160,16 +160,25 @@ class ScanAttempt:
 class ScanAttemptStore:
     """Append-only attempt ledger plus a rebuildable projection index."""
 
-    def __init__(self, root: Path | str) -> None:
+    def __init__(self, root: Path | str, *, read_only: bool = False) -> None:
         self.root = Path(root)
         self.ledger_file = self.root / "scan_attempts.jsonl"
         self.index_file = self.root / "scan_attempt_index.json"
         self.lock_file = self.root / ".scan_attempts.lock"
+        # The acquisition worker reads attempt metadata but must never mutate
+        # operational state. In read-only mode a stale or missing index is
+        # resolved in memory and nothing is persisted or locked.
+        self.read_only = bool(read_only)
+
+    def _require_writable(self) -> None:
+        if self.read_only:
+            raise ScanAttemptError("attempt store is read-only in this process")
 
     # -- low level ---------------------------------------------------------
 
     def _append_event(self, event: dict[str, Any]) -> int:
         """Append one event, assigning the next monotonic sequence number."""
+        self._require_writable()
         self.root.mkdir(parents=True, exist_ok=True)
         seq = self._next_seq()
         payload = dict(event)
@@ -303,6 +312,9 @@ class ScanAttemptStore:
         return index
 
     def _write_index(self, index: dict[str, Any]) -> None:
+        if self.read_only:
+            # Read-only processes must not create or mutate the projection.
+            return
         attempts = index.get("attempts") or {}
         if len(attempts) > MAX_INDEX_ATTEMPTS:
             ordered = sorted(

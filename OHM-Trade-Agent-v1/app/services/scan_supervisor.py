@@ -225,7 +225,8 @@ def clear_token(settings: Any) -> bool:
 
 
 EVIDENCE_NAME = "container_evidence.json"
-LAUNCH_NAME = "launch.json"
+LAUNCH_NAME = "launch_request.json"
+LAUNCH_FAILED_NAME = "launch_failed.json"
 EXIT_NAME = "container_exit.json"
 QUARANTINE_NAME = "quarantine.json"
 
@@ -249,8 +250,13 @@ def _read_json(path: Path) -> dict[str, Any] | None:
 
 
 def read_launch_evidence(settings: Any, attempt_id: str) -> dict[str, Any] | None:
-    """Return the dispatcher's launch record for this exact attempt."""
+    """Return the dispatcher's launch *request* record for this attempt."""
     return _read_json(attempt_evidence_dir(settings, attempt_id) / LAUNCH_NAME)
+
+
+def read_launch_failure(settings: Any, attempt_id: str) -> dict[str, Any] | None:
+    """Return the record proving Docker refused to start this attempt."""
+    return _read_json(attempt_evidence_dir(settings, attempt_id) / LAUNCH_FAILED_NAME)
 
 
 def read_exit_evidence(settings: Any, attempt_id: str) -> dict[str, Any] | None:
@@ -379,6 +385,21 @@ def reconcile(
                 outcome,
                 reason,
                 evidence={"container_exit": exit_evidence},
+                now=moment,
+            )
+        ]
+
+    launch_failure = read_launch_failure(settings, attempt_id)
+    if launch_failure is not None:
+        # A launch request that Docker refused: the dispatcher observed zero
+        # containers for this attempt, so no worker can exist. That is positive
+        # evidence, unlike a bare absence of a running container.
+        return [
+            store.terminalize(
+                attempt_id,
+                OUTCOME_FAILED,
+                "LAUNCH_FAILED",
+                evidence={"launch_failure": launch_failure},
                 now=moment,
             )
         ]

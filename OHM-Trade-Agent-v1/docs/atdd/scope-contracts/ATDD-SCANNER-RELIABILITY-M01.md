@@ -100,6 +100,13 @@ AC-005 -> tests/test_opip_scan_remediation_v1.py::test_worker_service_mounts_onl
 AC-005 -> tests/test_opip_scan_remediation_v1.py::test_telemetry_bounds_producer_without_newline
 AC-005 -> tests/test_opip_scan_remediation_v1.py::test_batching_is_bounded_and_ordered
 AC-006 -> tests/test_opip_scan_lifecycle_v1.py::test_admission_refused_while_breaker_is_open
+AC-002 -> tests/test_opip_scan_remediation_v1.py::test_launch_failure_is_classified_and_recoverable
+AC-004 -> tests/test_opip_scan_remediation_v1.py::test_promotion_claim_is_exclusive_and_idempotent
+AC-004 -> tests/test_opip_scan_remediation_v1.py::test_expired_claim_is_reclaimed_once
+AC-004 -> tests/test_opip_scan_remediation_v1.py::test_repeated_promotion_run_qualifies_exactly_once
+AC-005 -> tests/test_opip_scan_remediation_v1.py::test_read_only_store_refuses_operational_writes
+AC-006 -> tests/test_opip_scan_remediation_v1.py::test_promotion_refused_when_policy_forbids_output
+AC-006 -> tests/test_opip_scan_remediation_v1.py::test_qualification_holds_only_its_own_lock
 
 IMPLEMENTATION MAP:
 
@@ -137,6 +144,8 @@ AC-006 -> OHM-Trade-Agent-v1/app/services/operator_control.py
 AC-006 -> OHM-Trade-Agent-v1/app/jobs/run_cycle.py
 AC-006 -> OHM-Trade-Agent-v1/deploy/cron.d/ohm-unified-cycle
 AC-006 -> OHM-Trade-Agent-v1/tests/test_opip_scan_lifecycle_v1.py
+AC-004 -> OHM-Trade-Agent-v1/app/services/scan_promotion_runner.py
+AC-006 -> OHM-Trade-Agent-v1/app/services/scan_promotion_runner.py
 
 DEFERRED DISCOVERIES:
 

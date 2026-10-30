@@ -24,7 +24,7 @@ from app.services.scan_manifest import (
     read_manifest,
     sha256_path,
 )
-from app.services.scan_supervisor import attempt_evidence_dir, state_dir
+from app.services.scan_supervisor import attempt_evidence_dir
 
 
 SNAPSHOTS_NAME = "snapshots.jsonl"
@@ -219,6 +219,172 @@ def load_promoted(
 
 def promotion_marker(settings: Any, attempt_id: str) -> Path:
     return attempt_evidence_dir(settings, attempt_id) / PROMOTION_NAME
+
+
+PROMOTION_LEASE_SECONDS = 900
+STATE_CLAIMED = "CLAIMED"
+STATE_COMPLETED = "COMPLETED"
+STATE_REJECTED = "REJECTED"
+
+REASON_POLICY_OPERATOR_UNAVAILABLE = "OPERATOR_STATE_UNAVAILABLE"
+REASON_POLICY_SEARCH_NOT_ALLOWED = "SEARCH_NOT_ALLOWED"
+REASON_POLICY_QUIET_HOURS = "QUIET_HOURS"
+
+
+def read_promotion(settings: Any, attempt_id: str) -> dict[str, Any] | None:
+    path = promotion_marker(settings, attempt_id)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _write_promotion(settings: Any, attempt_id: str, payload: Mapping[str, Any]) -> Path:
+    path = promotion_marker(settings, attempt_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.tmp")
+    temp.write_text(json.dumps(dict(payload), sort_keys=True), encoding="utf-8")
+    temp.replace(path)
+    return path
+
+
+def revalidate_policy(settings: Any, *, now: datetime | None = None) -> tuple[bool, str]:
+    """Re-check operator policy immediately before promotion.
+
+    An attempt acquired under SEARCH may be promoted only if policy still
+    allows discovery and actionable output. Maintenance mode, a disabled search
+    or quiet hours suppress promotion entirely rather than letting a stale
+    acquisition authorise an entry.
+    """
+    from app.services.operator_control import get_operator_decision
+
+    try:
+        decision = get_operator_decision(now)
+    except Exception:  # noqa: BLE001 - unreadable policy is not permission
+        return False, REASON_POLICY_OPERATOR_UNAVAILABLE
+    mode = str(getattr(decision, "effective_mode", "") or "").upper()
+    if mode != "SEARCH":
+        return False, f"MODE_{mode or 'UNKNOWN'}"
+    if not bool(getattr(decision, "search_allowed", False)):
+        return False, REASON_POLICY_SEARCH_NOT_ALLOWED
+    if bool(getattr(decision, "quiet_hours", False)):
+        return False, REASON_POLICY_QUIET_HOURS
+    return True, "APPROVED"
+
+
+def claim_promotion(
+    settings: Any,
+    attempt_id: str,
+    *,
+    now: datetime | None = None,
+) -> tuple[bool, str]:
+    """Take exclusive ownership of one promotion, or explain why not.
+
+    A durable claim is written before qualification begins. A live claim means
+    another process is already working; a completed claim means the business
+    outcome already exists and must not be produced twice. Only a claim whose
+    lease has expired (its owner died) may be retaken.
+    """
+    moment = now or _now()
+    existing = read_promotion(settings, attempt_id)
+    if existing is not None:
+        state = str(existing.get("state") or "")
+        if state == STATE_COMPLETED:
+            return False, "ALREADY_COMPLETED"
+        if state == STATE_REJECTED:
+            return False, "ALREADY_REJECTED"
+        if state == STATE_CLAIMED:
+            try:
+                expires = datetime.fromisoformat(
+                    str(existing.get("claim_expires_at")).replace("Z", "+00:00")
+                )
+            except (TypeError, ValueError):
+                expires = None
+            if expires is not None:
+                if expires.tzinfo is None:
+                    expires = expires.replace(tzinfo=timezone.utc)
+                if moment < expires:
+                    return False, "CLAIM_IN_FLIGHT"
+            # Lease expired: the previous owner died mid-qualification.
+            _write_promotion(
+                settings,
+                attempt_id,
+                {
+                    **{k: v for k, v in existing.items() if k != "claim_expires_at"},
+                    "state": STATE_CLAIMED,
+                    "attempt_id": attempt_id,
+                    "claimed_at": moment.isoformat(),
+                    "claim_expires_at": (
+                        moment + timedelta(seconds=PROMOTION_LEASE_SECONDS)
+                    ).isoformat(),
+                    "recovered_from_expired_claim": True,
+                },
+            )
+            return True, "RECLAIMED_EXPIRED"
+    _write_promotion(
+        settings,
+        attempt_id,
+        {
+            "schema_version": 1,
+            "attempt_id": attempt_id,
+            "state": STATE_CLAIMED,
+            "claimed_at": moment.isoformat(),
+            "claim_expires_at": (
+                moment + timedelta(seconds=PROMOTION_LEASE_SECONDS)
+            ).isoformat(),
+        },
+    )
+    return True, "CLAIMED"
+
+
+def complete_promotion(
+    settings: Any,
+    attempt_id: str,
+    *,
+    degraded_fields: tuple[str, ...] = (),
+    now: datetime | None = None,
+) -> Path:
+    moment = now or _now()
+    return _write_promotion(
+        settings,
+        attempt_id,
+        {
+            "schema_version": 1,
+            "attempt_id": attempt_id,
+            "state": STATE_COMPLETED,
+            "qualified": True,
+            "actionable": True,
+            "degraded_fields": list(degraded_fields),
+            "recorded_at": moment.isoformat(),
+        },
+    )
+
+
+def reject_promotion(
+    settings: Any,
+    attempt_id: str,
+    *,
+    reason_code: str,
+    actionable: bool = False,
+    now: datetime | None = None,
+) -> Path:
+    moment = now or _now()
+    return _write_promotion(
+        settings,
+        attempt_id,
+        {
+            "schema_version": 1,
+            "attempt_id": attempt_id,
+            "state": STATE_REJECTED,
+            "qualified": False,
+            "actionable": bool(actionable),
+            "reason_code": str(reason_code),
+            "recorded_at": moment.isoformat(),
+        },
+    )
 
 
 def to_scan_result(promoted: PromotedScan) -> Any:

@@ -125,7 +125,7 @@ def _write_evidence(settings, attempt_id: str, *, launched=True, exit_state=None
     directory = attempt_evidence_dir(settings, attempt_id)
     directory.mkdir(parents=True, exist_ok=True)
     if launched:
-        (directory / "launch.json").write_text(
+        (directory / "launch_request.json").write_text(
             json.dumps(
                 {
                     "schema_version": 1,

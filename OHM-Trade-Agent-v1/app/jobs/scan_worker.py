@@ -80,7 +80,9 @@ def _coverage(result: Any, requested: int) -> dict[str, int]:
 def run(*, attempt_id: str, limit: int | None = None) -> int:
     settings = get_settings()
     root = state_dir(settings)
-    store = ScanAttemptStore(root)
+    # Read-only: the worker validates its own attempt but must never mutate the
+    # ledger, the admission token or any operational registry.
+    store = ScanAttemptStore(root, read_only=True)
     attempt = store.get(attempt_id)
     if attempt is None:
         print(f"scan_worker: unknown attempt {attempt_id}", file=sys.stderr)

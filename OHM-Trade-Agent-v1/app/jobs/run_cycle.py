@@ -601,75 +601,14 @@ def _run_broad_discovery_if_due(*, decision, entry_watch_ready: bool, settings) 
     return True
 
 
-def _promote_and_qualify(*, settings) -> bool:
-    """Consume one verified acquisition result through the existing path.
+def _promote_and_qualify(*, settings) -> bool:  # pragma: no cover - removed
+    """Removed: qualification now runs in ``app.services.scan_promotion_runner``.
 
-    The isolated worker only acquired data. This function verifies the evidence
-    and then hands the snapshots to the unchanged qualification entry point, so
-    ranking, AI review, risk gates, notifications and canonical writes keep their
-    existing owners. A partial, stale or unverifiable result is recorded and
-    never qualified, which is what makes "no actionable entries from partial
-    scans" structural rather than aspirational.
+    Keeping qualification inside this cycle meant a hung AI review or
+    notification storm could hold the unified-cycle lock and delay the next
+    protection pass. The detached qualification job owns that work instead.
     """
-    from app.services import scan_result_promotion as promotion
-    from app.services import scan_supervisor
-
-    if scan_supervisor.execution_mode(settings) != scan_supervisor.MODE_ISOLATED:
-        return False
-
-    store = scan_supervisor.store_for(settings)
-    latest = store.latest()
-    if latest is None or not latest.terminal:
-        return False
-    if latest.outcome not in {"COMPLETED", "PARTIAL"}:
-        return False
-    if promotion.already_promoted(settings, latest.attempt_id):
-        return False
-
-    if latest.outcome == "PARTIAL":
-        promotion.record_promotion(
-            settings,
-            latest.attempt_id,
-            qualified=False,
-            actionable=False,
-            reason_code="PARTIAL_SCAN_NOT_ACTIONABLE",
-        )
-        print(
-            "O'Pip scan result not qualified: partial acquisition",
-            latest.attempt_id,
-        )
-        return False
-
-    try:
-        promoted = promotion.load_promoted(settings=settings, attempt=latest)
-    except promotion.PromotionRejected as exc:
-        promotion.record_promotion(
-            settings,
-            latest.attempt_id,
-            qualified=False,
-            actionable=False,
-            reason_code=exc.reason,
-        )
-        print("O'Pip scan result rejected:", exc.reason)
-        return False
-
-    scan_result = promotion.to_scan_result(promoted)
-    run_scan_with_telemetry(lambda: scan_main(scan_override=scan_result))
-    promotion.record_promotion(
-        settings,
-        latest.attempt_id,
-        qualified=True,
-        actionable=True,
-        degraded_fields=promoted.degraded_fields,
-    )
-    mark_search_finished("COMPLETED")
-    print(
-        "O'Pip scan result promoted:",
-        latest.attempt_id,
-        f"snapshots={len(promoted.snapshots)}",
-        f"degraded={list(promoted.degraded_fields)}",
-    )
-    return True
+    raise RuntimeError("in-cycle qualification was removed; use scan_promotion_runner")
 
 
 def _reserve_isolated_attempt(*, settings) -> bool:
@@ -781,16 +720,11 @@ def _run_cycle_once() -> bool:
     finally:
         _run_paper_v2_protection_fail_open()
 
-    # Acquisition results are consumed only after protection has completed, so a
-    # finished scan can never delay or displace the protection phase.
-    _cycle_phase("SCAN_RESULT_PROMOTION")
-    try:
-        _promote_and_qualify(settings=get_settings())
-    except Exception as exc:  # noqa: BLE001 - must not abort the cycle
-        print(
-            "O'Pip scan result promotion unavailable; production unaffected:",
-            f"{type(exc).__name__}: {exc}",
-        )
+    # Qualification (AI review, market validation, notification delivery) runs
+    # in its own detached job. It must never execute under this cycle's lock: a
+    # slow or hung qualification would otherwise delay the next protection
+    # cycle. The cycle only records that a promotion is pending.
+    _cycle_phase("SCAN_RESULT_PROMOTION_PENDING")
 
     if decision.effective_mode == "MAINTENANCE":
         _cycle_phase("MAINTENANCE_WORKLOADS")

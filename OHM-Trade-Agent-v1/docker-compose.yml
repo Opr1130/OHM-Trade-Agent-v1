@@ -304,12 +304,13 @@ services:
     # `run --label` so it cannot be lost if a CLI version lacks that flag.
     labels:
       opip.attempt_id: "${OPIP_SCAN_ATTEMPT_ID:-UNSET}"
-    # Acquisition scratch only. The scanner must not be able to write paper
-    # state, canonical evidence, operational control registries or bridge files,
-    # so the whole data tree is NOT mounted: only the scan staging subtree is.
-    # Public market-data access needs no local state.
+    # Acquisition scratch is the ONLY writable path. The rest of the scan state
+    # (attempt ledger, index, admission token) is mounted read-only so the worker
+    # can validate its own attempt but cannot mutate operational state. No paper
+    # state, canonical evidence or control registry is exposed at all.
     volumes:
-      - ./data/scan:/app/data/scan
+      - ./data/scan:/app/data/scan:ro
+      - ./data/scan/staging:/app/data/scan/staging
     read_only: true
     tmpfs:
       - /tmp
