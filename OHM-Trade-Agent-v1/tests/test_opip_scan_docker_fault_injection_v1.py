@@ -99,8 +99,12 @@ def test_oom_killed_flag_is_observable():
             "python:3.12-slim",
             "python",
             "-c",
-            # Allocate real memory; /dev/zero writes to /dev/null would not.
-            "import time; b = bytearray(200 * 1024 * 1024); time.sleep(60)",
+            # Touch each page: zero-filled allocation can remain lazily mapped.
+            "import time\n"
+            "b = bytearray(200 * 1024 * 1024)\n"
+            "for offset in range(0, len(b), 4096):\n"
+            "    b[offset] = 1\n"
+            "time.sleep(60)\n",
         )
         flags: set[str] = set()
         for _ in range(60):
