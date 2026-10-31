@@ -80,7 +80,8 @@ THEN:
 the mode is resolved from the same derived environment the core reads, promotion
 runs for isolated execution, an unprovable mode is recorded with an explicit
 reason instead of being silently skipped, and legacy or suspended modes remain
-authorised no-ops
+authorised no-ops. The deployment transaction also restores the previous
+installed dispatcher (or its absence) on release rollback.
 
 EXPLICITLY OUT OF SCOPE:
 
@@ -127,6 +128,8 @@ AC-006 -> tests/test_opip_scan_remediation_v1.py::test_qualification_holds_only_
 AC-007 -> tests/test_opip_scan_dispatch_promotion_v1.py::test_the_dispatcher_no_longer_reads_only_its_process_environment
 AC-007 -> tests/test_opip_scan_dispatch_promotion_v1.py::test_unresolvable_modes_are_recorded_with_distinct_reasons
 AC-007 -> tests/test_opip_scan_dispatch_promotion_v1.py::test_the_release_controller_installs_the_dispatcher
+AC-007 -> tests/test_opip_scan_dispatch_promotion_v1.py::test_dispatcher_is_in_both_deploy_snapshot_and_restore_contracts
+AC-007 -> tests/test_opip_scan_dispatch_promotion_v1.py::test_deployment_rollback_restores_dispatcher_presence
 AC-007 -> tests/test_opip_scan_dispatch_promotion_v1.py::test_promotion_remains_the_only_qualification_path
 AC-007 -> tests/test_opip_scan_dispatch_promotion_v1.py::test_isolated_is_resolved_from_the_derived_core_env
 AC-007 -> tests/test_opip_scan_dispatch_promotion_v1.py::test_legacy_and_suspended_resolve_verbatim
@@ -166,6 +169,7 @@ AC-005 -> OHM-Trade-Agent-v1/app/services/operations_analytics.py
 AC-005 -> OHM-Trade-Agent-v1/app/core/config.py
 AC-007 -> OHM-Trade-Agent-v1/deploy/bin/opip-scan-dispatch
 AC-007 -> OHM-Trade-Agent-v1/deploy/remote/reconcile-scheduler.sh
+AC-007 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
 AC-007 -> OHM-Trade-Agent-v1/tests/test_opip_scan_dispatch_promotion_v1.py
 AC-007 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-SCANNER-RELIABILITY-M01.md
 AC-005 -> OHM-Trade-Agent-v1/tests/test_opip_scan_remediation_v1.py
