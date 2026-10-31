@@ -101,6 +101,30 @@ it records QUEUE_EXPIRED with no reservation, no provider call and no charge,
 while a fresh request still proceeds through the unchanged identity,
 reservation, ledger and idempotence path
 
+AC-007:
+GIVEN:
+an authorized IRR scheduler installation and the approved release SHA
+WHEN:
+the deploy prepares the worker image and the scheduler reconciliation runs
+THEN:
+the image is built from the release SHA on the success and rollback paths, the
+reconciliation verifies the deterministic alias and its revision label before
+snapshotting or installing anything, it records a root-owned 0600 image pin, and
+the scheduled entry delegates to a runner that refuses to start unless the alias
+still resolves to that exact image, so no scheduler tick can build an image
+
+AC-008:
+GIVEN:
+the scheduler authorization marker
+WHEN:
+its ownership, permissions, type or content are inspected
+THEN:
+only a root-owned, non-executable, non-group/world-writable regular file holding
+exactly `installed` or `absent` (optional final newline) is accepted, every other
+owner, mode, type or byte sequence fails closed before any mutation, and a
+missing marker still means "not installed"
+
+
 EXPLICITLY OUT OF SCOPE:
 
 - enabling IRR, installing the cron entry, deploying, or activating anything
@@ -134,6 +158,16 @@ AC-004 -> tests/test_opip_irr_activation_v1.py::test_scheduler_snapshots_install
 AC-005 -> tests/test_opip_irr_activation_v1.py::test_irr_remains_disabled_by_default
 AC-006 -> tests/test_opip_irr_shadow_v1.py::test_expired_queue_request_is_refused_without_spend
 AC-006 -> tests/test_opip_irr_shadow_v1.py::test_queue_request_without_a_usable_timestamp_fails_closed
+AC-007 -> tests/test_opip_irr_activation_v1.py::test_worker_image_is_prepared_by_the_deploy_from_the_release_sha
+AC-007 -> tests/test_opip_irr_activation_v1.py::test_reconcile_verifies_the_image_before_installing_the_entry
+AC-007 -> tests/test_opip_irr_activation_v1.py::test_scheduled_entry_delegates_to_the_verified_runner
+AC-008 -> tests/test_opip_irr_activation_v1.py::test_marker_accepts_only_the_two_exact_tokens
+AC-008 -> tests/test_opip_irr_activation_v1.py::test_marker_rejects_malformed_tokens
+AC-008 -> tests/test_opip_irr_activation_v1.py::test_marker_rejects_unsafe_permissions
+AC-008 -> tests/test_opip_irr_activation_v1.py::test_marker_accepts_safe_permissions
+AC-008 -> tests/test_opip_irr_activation_v1.py::test_marker_rejects_symlinks_directories_and_foreign_owners
+AC-008 -> tests/test_opip_irr_activation_v1.py::test_marker_absence_means_not_installed
+AC-008 -> tests/test_opip_irr_activation_v1.py::test_reconcile_delegates_the_marker_contract_to_the_library
 
 IMPLEMENTATION MAP:
 
@@ -153,6 +187,16 @@ AC-005 -> OHM-Trade-Agent-v1/tests/test_opip_irr_activation_v1.py
 AC-006 -> OHM-Trade-Agent-v1/app/services/independent_research_review.py
 AC-006 -> OHM-Trade-Agent-v1/tests/test_opip_irr_shadow_v1.py
 AC-006 -> OHM-Trade-Agent-v1/OPIP_TWO_STAGE_ADVISORY_AI_V1.md
+AC-007 -> OHM-Trade-Agent-v1/docker-compose.yml
+AC-007 -> OHM-Trade-Agent-v1/deploy/bin/opip-irr-shadow-run
+AC-007 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
+AC-007 -> OHM-Trade-Agent-v1/deploy/remote/reconcile-scheduler.sh
+AC-007 -> OHM-Trade-Agent-v1/deploy/cron.d/opip-irr-shadow
+AC-007 -> OHM-Trade-Agent-v1/tests/test_opip_irr_activation_v1.py
+AC-008 -> OHM-Trade-Agent-v1/deploy/remote/lib/opip_scheduler_authorization.sh
+AC-008 -> OHM-Trade-Agent-v1/deploy/remote/reconcile-scheduler.sh
+AC-008 -> OHM-Trade-Agent-v1/tests/test_opip_irr_activation_v1.py
+AC-008 -> OHM-Trade-Agent-v1/OPIP_TWO_STAGE_ADVISORY_AI_V1.md
 AC-001 -> OHM-Trade-Agent-v1/OPIP_TWO_STAGE_ADVISORY_AI_V1.md
 AC-004 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-IRR-ACTIVATION-INFRA-v1.md
 AC-004 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT

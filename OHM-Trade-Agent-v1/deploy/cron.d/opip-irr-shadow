@@ -20,15 +20,24 @@
 # it, so a deploy neither installs nor removes this entry:
 #
 #   1. Scheduler authorization. reconcile-scheduler.sh installs this entry only
-#      when the root-owned authorization marker
-#      /var/lib/ohm-deploy/irr-shadow-scheduler.enabled contains exactly
-#      `installed`. With no marker (the default) it installs nothing and removes
-#      any previously installed entry; any other content fails closed.
-#   2. Memory isolation. The worker runs as the isolated `opip-irr-shadow`
-#      Compose service (profile `irr-shadow`, mem_limit 96m, read_only, cap_drop
-#      ALL, no env_file, only ./data/irr mounted) and never `exec`s into the core
-#      container's 384 MB cgroup. The in-container `timeout` (150s) lives in the
-#      service command, so a hung provider is terminated inside that cgroup.
+#      when the root-owned marker
+#      /var/lib/ohm-deploy/irr-shadow-scheduler.enabled is a regular,
+#      non-executable, non-group/world-writable file containing exactly
+#      `installed` (an optional final newline is allowed). With no marker (the
+#      default) it installs nothing and removes any existing entry; any other
+#      token, owner or mode fails closed before mutation.
+#   2. Prepared image. Before the entry may exist, the deploy builds
+#      `opip-irr-shadow:worker` from the approved release SHA
+#      (OPIP_RELEASE_SHA label), and reconcile records its immutable image ID and
+#      revision. The entry below does not call Compose to build anything: it
+#      runs /usr/local/bin/opip-irr-shadow-run, which refuses (exit 78) unless
+#      the alias still resolves to that recorded image.
+#
+# Memory isolation: the worker runs as the isolated `opip-irr-shadow` Compose
+# service (profile `irr-shadow`, mem_limit 96m, read_only, cap_drop ALL, no
+# shared environment file, only ./data/irr mounted) and never `exec`s into the
+# core container's 384 MB cgroup. The in-container `timeout` (150s) lives in the
+# service command, so a hung provider is terminated inside that cgroup.
 #
 # Non-overlap: host `flock -n` plus the in-container consumer lock. Bounds: one
 # batch per pass (OPIP_IRR_DRAIN_BATCH, max 5), one bounded attempt per request,
@@ -36,5 +45,6 @@
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-* * * * * root flock -n /var/run/opip-irr-shadow.lock -c 'cd /opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1 && /usr/bin/docker compose --profile irr-shadow run --rm --no-deps -T opip-irr-shadow >> /var/log/opip-irr-shadow.log 2>&1'
+* * * * * root flock -n /var/run/opip-irr-shadow.lock -c '/usr/local/bin/opip-irr-shadow-run >> /var/log/opip-irr-shadow.log 2>&1'
+
 

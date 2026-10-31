@@ -1387,7 +1387,7 @@ rollback() {
     config --services 2>/dev/null | grep -qx 'opip-canonical-writer'; then
     docker compose -f docker-compose.yml -f "$SAFE_BASELINE_OVERRIDE" \
       build --build-arg "OPIP_RELEASE_SHA=$PREVIOUS_SHA" \
-      opip-canonical-writer ohm-trade-agent
+      opip-canonical-writer ohm-trade-agent opip-irr-shadow
     docker compose -f docker-compose.yml -f "$SAFE_BASELINE_OVERRIDE" \
       up -d --remove-orphans opip-canonical-writer
     docker compose -f docker-compose.yml -f "$SAFE_BASELINE_OVERRIDE" \
@@ -1407,7 +1407,7 @@ rollback() {
     fi
   else
     docker compose -f docker-compose.yml -f "$SAFE_BASELINE_OVERRIDE" \
-      build --build-arg "OPIP_RELEASE_SHA=$PREVIOUS_SHA" ohm-trade-agent
+      build --build-arg "OPIP_RELEASE_SHA=$PREVIOUS_SHA" ohm-trade-agent opip-irr-shadow
     # --remove-orphans drops a writer left from the failed PR 2 attempt.
     docker compose -f docker-compose.yml -f "$SAFE_BASELINE_OVERRIDE" \
       up -d --remove-orphans ohm-trade-agent
@@ -2062,7 +2062,7 @@ opip_write_core_env || {
 stop_paper_stack
 
 docker compose build --build-arg "OPIP_RELEASE_SHA=$TARGET_SHA" \
-  opip-canonical-writer ohm-trade-agent
+  opip-canonical-writer ohm-trade-agent opip-irr-shadow
 # Writer and core are independent services. Build/start both; validate each
 # separately. Never introduce Compose depends_on: condition=service_healthy
 # from ohm-trade-agent onto opip-canonical-writer.
@@ -2087,7 +2087,10 @@ if [[ ! -s "$SCHEDULER_RECONCILE" ]]; then
   echo "scheduler reconciliation script missing" >&2
   false
 fi
-bash "$SCHEDULER_RECONCILE"
+# The approved release SHA is handed to the reconciliation so the IRR scheduler
+# entry can only be installed when the worker image prepared above carries that
+# exact revision. Nothing else about the reconciliation changes.
+OPIP_RELEASE_SHA="$TARGET_SHA" bash "$SCHEDULER_RECONCILE"
 
 # Applying the SHA is not complete until the paper topology from that same SHA
 # has been recreated and both authoritative dry-run workers are healthy.

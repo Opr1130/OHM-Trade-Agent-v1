@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# O'Pip Stage-2 IRR advisory worker runner.
+#
+# The ONLY scheduled entry point for the isolated worker. It exists so a cron
+# tick can never build an image: the deploy prepares `opip-irr-shadow:worker`
+# from the approved release SHA, reconcile records its immutable image ID and
+# revision label, and this runner refuses to start unless the alias still
+# resolves to exactly that image.
+#
+# Exit codes:
+#   78  IMAGE_UNAVAILABLE / IMAGE_PIN_MISMATCH / PIN_UNREADABLE (no build, no run)
+#   *   the worker's own exit status
+set -Eeuo pipefail
+
+APP_ROOT="/opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1"
+ALIAS="opip-irr-shadow:worker"
+SERVICE="opip-irr-shadow"
+PIN_FILE="/var/lib/ohm-deploy/irr-worker-image.env"
+
+log() {
+  printf 'IRR_SHADOW_RUN %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
+}
+
+refuse() {
+  # refuse <code> <reason>
+  log "RUN_REFUSED reason=$2"
+  exit "$1"
+}
+
+[[ "${EUID:-$(id -u)}" -eq 0 ]] || refuse 77 "NOT_ROOT"
+
+if [[ ! -r "$PIN_FILE" || -L "$PIN_FILE" ]]; then
+  refuse 78 "PIN_UNREADABLE"
+fi
+pin_uid="$(stat -c '%u' -- "$PIN_FILE" 2>/dev/null || true)"
+pin_mode="$(stat -c '%a' -- "$PIN_FILE" 2>/dev/null || true)"
+[[ "$pin_uid" == "0" ]] || refuse 78 "PIN_NOT_ROOT_OWNED"
+[[ "$pin_mode" =~ ^[0-7]{3,4}$ ]] || refuse 78 "PIN_MODE_INVALID"
+(( (8#$pin_mode & 8#077) == 0 )) || refuse 78 "PIN_MODE_UNSAFE"
+
+pinned_id="$(sed -n 's/^image_id=//p' "$PIN_FILE" | head -n 1)"
+pinned_revision="$(sed -n 's/^revision=//p' "$PIN_FILE" | head -n 1)"
+[[ "$pinned_id" =~ ^sha256:[0-9a-f]{64}$ ]] || refuse 78 "PIN_ID_INVALID"
+[[ "$pinned_revision" =~ ^[0-9a-f]{40}$ ]] || refuse 78 "PIN_REVISION_INVALID"
+
+# The alias must resolve on the daemon; a missing image is a refusal, never a
+# build. `docker inspect` on the alias is the same resolution Compose uses.
+alias_id="$(docker image inspect --format '{{.Id}}' "$ALIAS" 2>/dev/null || true)"
+[[ "$alias_id" == "$pinned_id" ]] || refuse 78 "IMAGE_PIN_MISMATCH"
+alias_revision="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$ALIAS" 2>/dev/null || true)"
+[[ "$alias_revision" == "$pinned_revision" ]] || refuse 78 "IMAGE_LABEL_MISMATCH"
+# The pinned, content-addressed image must itself still exist.
+[[ "$(docker image inspect --format '{{.Id}}' "$pinned_id" 2>/dev/null || true)" == "$pinned_id" ]] \
+  || refuse 78 "IMAGE_UNAVAILABLE"
+
+cd "$APP_ROOT"
+log "RUN_STARTED image_id=$pinned_id revision=$pinned_revision"
+# The image is proven present above and the service is profile gated, so this
+# invocation never builds and a `docker compose up` never starts it.
+exec docker compose --profile irr-shadow run --rm --no-deps -T "$SERVICE"

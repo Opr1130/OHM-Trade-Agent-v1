@@ -337,14 +337,19 @@ authorization are two independent, owner-gated acts.
    creates the root-owned authorization marker on the trading host
 
    ```bash
-   # owner, via the approved control plane; content is exactly one token
-   install -o root -g root -m 0644 /dev/null /var/lib/ohm-deploy/irr-shadow-scheduler.enabled
+   # owner, via the approved control plane; exactly one token, 0600, root-owned
+   install -o root -g root -m 0600 /dev/null /var/lib/ohm-deploy/irr-shadow-scheduler.enabled
    printf 'installed\n' > /var/lib/ohm-deploy/irr-shadow-scheduler.enabled
+   chown root:root /var/lib/ohm-deploy/irr-shadow-scheduler.enabled
+   chmod 0600 /var/lib/ohm-deploy/irr-shadow-scheduler.enabled
    ```
 
-   The next owner-gated deploy then installs `/etc/cron.d/opip-irr-shadow`
-   (printing `irr_shadow_scheduler=INSTALLED`). Without the marker the same
-   deploy removes any stale entry (`irr_shadow_scheduler=ABSENT`).
+   The next owner-gated deploy then builds `opip-irr-shadow:worker` from that
+   exact SHA, verifies it, installs `/etc/cron.d/opip-irr-shadow` and the
+   root-owned runner, and prints `irr_shadow_scheduler=INSTALLED` with the image
+   ID and revision. Without the marker the same deploy removes any stale entry,
+   runner and image pin (`irr_shadow_scheduler=ABSENT`). A marker with any other
+   owner, mode, type or content aborts the reconciliation before mutation.
 5. `OPIP_IRR_MODE=shadow` in the owner `.env` is the final, independent switch:
    with the mode still `off`, an installed cron entry and a configured key are
    an inert no-op that spends nothing.
@@ -373,27 +378,45 @@ authorization are two independent, owner-gated acts.
 script is an explicit allowlist (fixed artifact set, pre-install snapshot,
 `trap rollback ERR`) and it now owns the IRR entry:
 
-* **Authorization is explicit.** The entry is installed only when the root-owned
-  marker `/var/lib/ohm-deploy/irr-shadow-scheduler.enabled` contains exactly
-  `installed`. No marker (the default) means "not installed", and that run also
-  removes any stale `/etc/cron.d/opip-irr-shadow`. Any other content, or a
-  marker that is not a readable regular file, fails closed (exit 65) before any
-  mutation, so a typo can neither activate nor silently drop the entry.
-* **Snapshot** happens before any mutation (`irr-shadow.before` in the
-  reconciliation temp directory, plus a `had_irr_shadow` flag), whether or not
-  the entry is currently authorized.
-* **Rollback** (`trap rollback ERR`) restores that snapshot when one existed and
-  removes the entry when this run created it.
-* **Removal** is the same path with the marker deleted or set to `absent`; the
-  script also carries the explicit `rm -f /etc/cron.d/opip-irr-shadow`, so
-  revoking authorization is a normal owner-gated deploy.
-* **Post-condition.** An installed entry must reference `opip-irr-shadow` and
-  `--profile irr-shadow run --rm --no-deps`, and is refused if it would
-  `compose exec` inside the core container. An unauthorized run must leave no
-  entry at all.
+* **Authorization is explicit and hardened.** The entry is installed only when
+  the root-owned marker `/var/lib/ohm-deploy/irr-shadow-scheduler.enabled` is a
+  regular, non-executable, non-group/world-writable file owned by uid 0 that
+  contains exactly `installed` or `absent` (an optional final newline is
+  allowed). No marker (the default) means "not installed", and that run also
+  removes any stale entry, runner and image pin. Any other owner, mode, type or
+  byte sequence fails closed (exit 65) before any mutation, so a typo can
+  neither activate nor silently drop the entry. The contract lives in
+  `deploy/remote/lib/opip_scheduler_authorization.sh` so it can be exercised
+  directly by focused tests.
+* **Image preparation is a pre-install gate.** The deploy builds
+  `opip-irr-shadow:worker` with `OPIP_RELEASE_SHA=$TARGET_SHA` (and with
+  `$PREVIOUS_SHA` on every rollback path). Only then does the reconciliation
+  resolve that alias, require a `sha256:` image ID and a matching
+  `org.opencontainers.image.revision` label, and record a root-owned `0600` pin
+  at `/var/lib/ohm-deploy/irr-worker-image.env`. An unprovable image means the
+  entry is removed and the reconciliation fails: the scheduler is never armed
+  against an image that was not prepared from the approved SHA.
+* **A scheduled tick can never build.** The cron entry runs
+  `/usr/local/bin/opip-irr-shadow-run` (installed by the reconciliation from
+  `deploy/bin/opip-irr-shadow-run`). The runner re-resolves the alias, requires
+  it to equal the pinned image ID, re-checks the revision label, and only then
+  execs `docker compose --profile irr-shadow run --rm --no-deps`. Missing,
+  replaced or relabelled images exit 78 (`IMAGE_PIN_MISMATCH` /
+  `IMAGE_LABEL_MISMATCH` / `IMAGE_UNAVAILABLE`) with no build and no run.
+* **Snapshot** happens before any mutation (`irr-shadow.before`,
+  `irr-runner.before`, `irr-pin.before` plus their `had_*` flags), whether or
+  not the entry is currently authorized.
+* **Rollback** (`trap rollback ERR`) restores those three snapshots when they
+  existed and removes whichever this run created.
+* **Removal** is the same path with the marker deleted or set to `absent`.
+* **Post-condition.** An installed entry must reference the runner and contain
+  no `docker compose`, the runner must be an executable regular file carrying
+  the isolated invocation, and the pin must be root-owned `0600` and match the
+  verified image and revision. An unauthorized run must leave no entry, runner
+  or pin at all.
 
-The run prints `irr_shadow_scheduler=INSTALLED|ABSENT` and
-`irr_shadow_authorization=<marker path>`. Nothing is installed by this PR.
+The run prints `irr_shadow_scheduler=INSTALLED|ABSENT`, the verified image ID and
+revision, and the runner path. Nothing is installed by this PR.
 
 ## Memory and resource isolation (resolved by design, pending live measurement)
 
@@ -431,24 +454,33 @@ a future change raises the batch size or output cap, re-measure before raising
 ```text
 tests/test_opip_two_stage_stage1_openai_v1.py   6 test functions (9 cases)  Stage-1 contract
 tests/test_opip_irr_shadow_v1.py               37 tests                     Stage-2 ATDD
-tests/test_opip_irr_activation_v1.py            8 tests                     activation infrastructure
+tests/test_opip_irr_activation_v1.py           12 tests + 21 bash-gated        activation infrastructure
 ```
 
 Activation-infrastructure coverage (this increment):
 
+* `test_worker_image_is_prepared_by_the_deploy_from_the_release_sha`,
+  `test_reconcile_verifies_the_image_before_installing_the_entry`,
+  `test_scheduled_entry_delegates_to_the_verified_runner` — prepared alias,
+  revision-labelled build on the success and rollback paths, pre-install
+  verification, root-owned `0600` pin, and a tick that cannot build.
+* `test_marker_accepts_only_the_two_exact_tokens`,
+  `test_marker_rejects_malformed_tokens`,
+  `test_marker_rejects_unsafe_permissions`,
+  `test_marker_accepts_safe_permissions`,
+  `test_marker_rejects_symlinks_directories_and_foreign_owners`,
+  `test_marker_absence_means_not_installed`,
+  `test_reconcile_delegates_the_marker_contract_to_the_library` — executed
+  against the real library under bash (skipped where bash is absent).
 * `test_worker_has_its_own_bounded_memory_cgroup`,
-  `test_worker_command_is_the_bounded_drain_job` — own 96 MB cgroup, profile
-  gated, read-only, capability-free, OOM-first, bounded command.
-* `test_worker_receives_no_funded_or_core_authority_credentials`,
-  `test_worker_mounts_only_the_irr_state_subtree` — one secret, no funded /
-  exchange / notification / OpenAI credential, no core authority switch, only
-  `./data/irr` mounted.
-* `test_cron_entry_runs_the_isolated_worker` — profile-gated one-shot container
-  under flock, never `compose exec` in the core.
-* `test_scheduler_authorization_is_explicit_and_absent_by_default`,
-  `test_scheduler_snapshots_installs_rolls_back_and_removes` — explicit marker,
-  snapshot, rollback restore/removal and default-absent posture.
-* `test_irr_remains_disabled_by_default` — code, Compose and scheduler default.
+  `test_worker_command_is_the_bounded_drain_job`,
+  `test_worker_receives_no_funded_or_core_authority_credentials`,
+  `test_worker_mounts_only_the_irr_state_subtree`,
+  `test_cron_entry_runs_the_isolated_worker`,
+  `test_scheduler_authorization_is_explicit_and_absent_by_default`,
+  `test_scheduler_snapshots_installs_rolls_back_and_removes`,
+  `test_irr_remains_disabled_by_default` — isolation, credentials, mounts,
+  scheduler wiring, rollback and default-OFF posture.
 * `test_expired_queue_request_is_refused_without_spend`,
   `test_queue_request_without_a_usable_timestamp_fails_closed` — stale or
   undatable evidence never reaches a reservation.
@@ -490,12 +522,18 @@ mandated proofs):
 2. Remove the scheduler entry by deleting the authorization marker
    `/var/lib/ohm-deploy/irr-shadow-scheduler.enabled` (or writing `absent`) and
    redeploying the approved SHA. The reconciliation then removes
-   `/etc/cron.d/opip-irr-shadow` itself; manual `rm -f` of that file is safe but
-   the marker path is the governed one. Any in-flight worker container exits on
-   its own bounded timeout and is removed by `run --rm`.
-3. Stage 1 is config-only: restoring the previous `OPENAI_MODEL` value returns
+   `/etc/cron.d/opip-irr-shadow`, `/usr/local/bin/opip-irr-shadow-run` and the
+   image pin itself; manual `rm -f` of the entry is safe but the marker path is
+   the governed one. Any in-flight worker container exits on its own bounded
+   timeout and is removed by `run --rm`.
+3. A release rollback rebuilds `opip-irr-shadow:worker` from the restored SHA,
+   which changes the image ID against the pin. The runner then refuses with exit
+   78 (`IMAGE_PIN_MISMATCH`, logged) instead of running new code against old
+   state, so IRR stays dormant until the next authorized deploy re-verifies the
+   image. No other rollback behaviour changes.
+4. Stage 1 is config-only: restoring the previous `OPENAI_MODEL` value returns
    the prior Chief behaviour; no code revert is required.
-4. The queue, spend ledger, evidence journal and idempotence ledger are durable
+5. The queue, spend ledger, evidence journal and idempotence ledger are durable
    evidence. Do not truncate, rewrite or delete them; they record advisory
    attempts and reservations only and carry no authority.
 

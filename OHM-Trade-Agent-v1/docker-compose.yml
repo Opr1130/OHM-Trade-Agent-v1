@@ -349,6 +349,11 @@ services:
   # command, so a hung provider is terminated inside this container's cgroup.
   opip-irr-shadow:
     build: .
+    # Deterministic, deploy-controlled image alias. The deploy builds this alias
+    # from the approved release SHA (with OPIP_RELEASE_SHA) before the scheduler
+    # entry may exist, and the host runner refuses to start unless the alias still
+    # resolves to the recorded image ID. A scheduled run therefore never builds.
+    image: opip-irr-shadow:worker
     restart: "no"
     profiles:
       - irr-shadow
