@@ -70,6 +70,18 @@ THEN:
 discovery is suspended with an explicit reason and the in-process scanner is
 never restored
 
+AC-007:
+GIVEN:
+the application is configured for isolated execution while the only installed
+scheduler exports no execution mode in its process environment
+WHEN:
+the dispatcher reaches its qualification stage
+THEN:
+the mode is resolved from the same derived environment the core reads, promotion
+runs for isolated execution, an unprovable mode is recorded with an explicit
+reason instead of being silently skipped, and legacy or suspended modes remain
+authorised no-ops
+
 EXPLICITLY OUT OF SCOPE:
 
 - any change to ranking, candle windows, universe size or AI review inputs
@@ -112,6 +124,15 @@ AC-005 -> tests/test_opip_scan_remediation_v1.py::test_forged_exit_evidence_in_s
 AC-005 -> tests/test_opip_scan_remediation_v1.py::test_forged_promotion_claim_in_staging_cannot_block_or_grant
 AC-006 -> tests/test_opip_scan_remediation_v1.py::test_promotion_refused_when_policy_forbids_output
 AC-006 -> tests/test_opip_scan_remediation_v1.py::test_qualification_holds_only_its_own_lock
+AC-007 -> tests/test_opip_scan_dispatch_promotion_v1.py::test_the_dispatcher_no_longer_reads_only_its_process_environment
+AC-007 -> tests/test_opip_scan_dispatch_promotion_v1.py::test_unresolvable_modes_are_recorded_with_distinct_reasons
+AC-007 -> tests/test_opip_scan_dispatch_promotion_v1.py::test_the_release_controller_installs_the_dispatcher
+AC-007 -> tests/test_opip_scan_dispatch_promotion_v1.py::test_promotion_remains_the_only_qualification_path
+AC-007 -> tests/test_opip_scan_dispatch_promotion_v1.py::test_isolated_promotion_runs_from_the_derived_core_env
+AC-007 -> tests/test_opip_scan_dispatch_promotion_v1.py::test_legacy_and_suspended_never_promote
+AC-007 -> tests/test_opip_scan_dispatch_promotion_v1.py::test_missing_mode_is_recorded_not_silently_skipped
+AC-007 -> tests/test_opip_scan_dispatch_promotion_v1.py::test_ambiguous_mode_is_recorded_not_guessed
+AC-007 -> tests/test_opip_scan_dispatch_promotion_v1.py::test_owner_env_is_the_last_resort_source
 
 IMPLEMENTATION MAP:
 
@@ -142,6 +163,10 @@ AC-005 -> OHM-Trade-Agent-v1/docker-compose.yml
 AC-005 -> OHM-Trade-Agent-v1/app/scanner/market_scanner.py
 AC-005 -> OHM-Trade-Agent-v1/app/services/operations_analytics.py
 AC-005 -> OHM-Trade-Agent-v1/app/core/config.py
+AC-007 -> OHM-Trade-Agent-v1/deploy/bin/opip-scan-dispatch
+AC-007 -> OHM-Trade-Agent-v1/deploy/remote/reconcile-scheduler.sh
+AC-007 -> OHM-Trade-Agent-v1/tests/test_opip_scan_dispatch_promotion_v1.py
+AC-007 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-SCANNER-RELIABILITY-M01.md
 AC-005 -> OHM-Trade-Agent-v1/tests/test_opip_scan_remediation_v1.py
 AC-006 -> OHM-Trade-Agent-v1/app/services/scan_attempt.py
 AC-006 -> OHM-Trade-Agent-v1/app/services/scan_supervisor.py
