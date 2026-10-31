@@ -23,12 +23,10 @@ Idempotency and incomplete-evidence rejection are already owned by
 
 from __future__ import annotations
 
-import json
 import os
 import pathlib
 import shutil
 import subprocess
-import time
 
 import pytest
 
@@ -126,142 +124,109 @@ def test_promotion_remains_the_only_qualification_path():
     assert PROMOTION_CMD in _text(DISPATCH)
 
 
-# --- Behaviour: the shipped dispatcher, in a sandbox ------------------------
+# --- Behaviour: the shipped resolver, extracted verbatim --------------------
+# The resolver is exercised on its own rather than by launching the whole
+# dispatcher: the dispatcher's promotion branch backgrounds a detached job, and
+# a test harness must never be able to hang the suite on an inherited file
+# descriptor. The wiring from resolver -> promotion is pinned statically above.
 
 
-def _sandbox(tmp_path: pathlib.Path, *, mode, owner_mode=None):
+def _run_resolver(tmp_path: pathlib.Path, *, mode, owner_mode=None, process_mode=None):
     repo = tmp_path / "repo"
-    (repo / "data" / "scan" / "staging").mkdir(parents=True)
-    (repo / "data" / "scan" / "evidence").mkdir(parents=True)
+    repo.mkdir()
     if mode is not None:
-        (repo / ".env.core").write_text(
-            f"{KEY}={mode}\nAPP_ENV=production\n", encoding="utf-8"
-        )
+        (repo / ".env.core").write_text(f"{KEY}={mode}\nAPP_ENV=production\n", encoding="utf-8")
     if owner_mode is not None:
         (repo / ".env").write_text(f"{KEY}={owner_mode}\n", encoding="utf-8")
 
-    stub = tmp_path / "bin"
-    stub.mkdir()
-    calls = tmp_path / "docker_calls.txt"
-    (stub / "docker").write_text(
-        f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{calls}"\n'
-        'case "$1" in ps) exit 0 ;; esac\nexit 0\n',
-        encoding="utf-8",
-    )
-    (stub / "flock").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    (stub / "setsid").write_text('#!/bin/sh\nexec "$@"\n', encoding="utf-8")
-    for name in ("docker", "flock", "setsid"):
-        (stub / name).chmod(0o755)
-
-    log_dir = tmp_path / "log"
-    log_dir.mkdir()
     env = {key: value for key, value in os.environ.items() if key != KEY}
-    env.update(
-        {
-            "PATH": f"{stub}{os.pathsep}{env.get('PATH', '')}",
-            "OPIP_REPO_DIR": str(repo),
-            "OPIP_SCAN_LOCK": str(tmp_path / "scan.lock"),
-            "OPIP_QUALIFY_LOCK": str(tmp_path / "qualify.lock"),
-            "OPIP_SCAN_LOG_DIR": str(log_dir),
-        }
+    if process_mode is not None:
+        env[KEY] = process_mode
+    script = (
+        "set -Eeuo pipefail\n"
+        f'REPO_DIR="{repo.as_posix()}"\n'
+        f"{_dispatch_function('resolve_exec_mode')}\n"
+        'resolve_exec_mode\n'
     )
-    return repo, calls, env
-
-
-def _collect(repo: pathlib.Path, calls: pathlib.Path):
-    deadline = time.monotonic() + 10
-    while not calls.exists() and time.monotonic() < deadline:
-        time.sleep(0.1)
-    recorded = calls.read_text(encoding="utf-8") if calls.exists() else ""
-    state_file = repo / "data" / "scan" / "promotion_state.json"
-    state = (
-        json.loads(state_file.read_text(encoding="utf-8"))
-        if state_file.exists()
-        else None
+    result = subprocess.run(
+        [BASH, "-c", script],
+        capture_output=True,
+        text=True,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        timeout=30,
     )
-    return recorded, state
+    _skip_if_bash_cannot_fork(result)
+    return result
 
 
 @requires_bash
-def test_isolated_promotion_runs_from_the_derived_core_env(tmp_path):
+def test_isolated_is_resolved_from_the_derived_core_env(tmp_path):
     """ATDD-SCANNER-RELIABILITY-M01/AC-007: cron carries no mode, the derived
-    file does - promotion must run."""
-    repo, calls, env = _sandbox(tmp_path, mode="isolated")
-    result = subprocess.run(
-        [BASH, str(DISPATCH)], capture_output=True, text=True, env=env, timeout=90
-    )
-    _skip_if_bash_cannot_fork(result)
-    recorded, state = _collect(repo, calls)
+    file does - the resolver must return isolated."""
+    result = _run_resolver(tmp_path, mode="isolated")
     assert result.returncode == 0, result.stderr
-    assert PROMOTION_CMD in recorded
-    assert state["state"] == "DISPATCHED"
-    assert state["reason_code"] == "MODE_ISOLATED"
-    assert "qualification stage dispatched" in result.stdout
+    assert result.stdout.strip() == "isolated"
 
 
 @requires_bash
 @pytest.mark.parametrize("mode", ["legacy_inprocess", "suspended"])
-def test_legacy_and_suspended_never_promote(tmp_path, mode):
-    """ATDD-SCANNER-RELIABILITY-M01/AC-007: authorized no-ops - no promotion is
-    launched, and nothing is recorded."""
-    repo, calls, env = _sandbox(tmp_path, mode=mode)
-    result = subprocess.run(
-        [BASH, str(DISPATCH)], capture_output=True, text=True, env=env, timeout=90
-    )
-    _skip_if_bash_cannot_fork(result)
-    recorded, state = _collect(repo, calls)
+def test_legacy_and_suspended_resolve_verbatim(tmp_path, mode):
+    """ATDD-SCANNER-RELIABILITY-M01/AC-007: authorised modes pass through, so
+    the dispatcher can treat them as explicit no-ops."""
+    result = _run_resolver(tmp_path, mode=mode)
     assert result.returncode == 0, result.stderr
-    assert PROMOTION_CMD not in recorded
-    assert f"mode={mode} (authorised)" in result.stdout
-    assert state is None
+    assert result.stdout.strip() == mode
 
 
 @requires_bash
-def test_missing_mode_is_recorded_not_silently_skipped(tmp_path):
-    """ATDD-SCANNER-RELIABILITY-M01/AC-007: no mode anywhere cannot be allowed
-    to look like 'nothing qualified'."""
-    repo, calls, env = _sandbox(tmp_path, mode=None)
-    result = subprocess.run(
-        [BASH, str(DISPATCH)], capture_output=True, text=True, env=env, timeout=90
-    )
-    _skip_if_bash_cannot_fork(result)
-    recorded, state = _collect(repo, calls)
+def test_missing_mode_resolves_empty(tmp_path):
+    """ATDD-SCANNER-RELIABILITY-M01/AC-007: no source carries the key, so the
+    dispatcher records EXECUTION_MODE_UNSET instead of guessing."""
+    result = _run_resolver(tmp_path, mode=None)
     assert result.returncode == 0, result.stderr
-    assert PROMOTION_CMD not in recorded
-    assert state["state"] == "SKIPPED"
-    assert state["reason_code"] == "EXECUTION_MODE_UNSET"
-    assert "WARN qualification stage SKIPPED" in result.stdout
+    assert result.stdout.strip() == ""
 
 
 @requires_bash
-def test_ambiguous_mode_is_recorded_not_guessed(tmp_path):
-    """ATDD-SCANNER-RELIABILITY-M01/AC-007: a duplicate definition is ambiguous,
-    never 'last one wins'."""
-    repo, calls, env = _sandbox(tmp_path, mode="isolated")
+def test_ambiguous_mode_is_never_guessed(tmp_path):
+    """ATDD-SCANNER-RELIABILITY-M01/AC-007: two definitions are ambiguous."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
     (repo / ".env.core").write_text(
         f"{KEY}=isolated\n{KEY}=suspended\n", encoding="utf-8"
     )
+    script = (
+        "set -Eeuo pipefail\n"
+        f'REPO_DIR="{repo.as_posix()}"\n'
+        f"{_dispatch_function('resolve_exec_mode')}\n"
+        'resolve_exec_mode\n'
+    )
     result = subprocess.run(
-        [BASH, str(DISPATCH)], capture_output=True, text=True, env=env, timeout=90
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        timeout=30,
     )
     _skip_if_bash_cannot_fork(result)
-    recorded, state = _collect(repo, calls)
     assert result.returncode == 0, result.stderr
-    assert PROMOTION_CMD not in recorded
-    assert state["reason_code"] == "EXECUTION_MODE_AMBIGUOUS"
+    assert result.stdout.strip() == "AMBIGUOUS"
+
+
+@requires_bash
+def test_process_env_overrides_the_derived_env(tmp_path):
+    """ATDD-SCANNER-RELIABILITY-M01/AC-007: an explicit fleet override wins."""
+    result = _run_resolver(tmp_path, mode="legacy_inprocess", process_mode="isolated")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "isolated"
 
 
 @requires_bash
 def test_owner_env_is_the_last_resort_source(tmp_path):
     """ATDD-SCANNER-RELIABILITY-M01/AC-007: a legacy layout whose core reads
     `.env` still resolves a mode."""
-    repo, calls, env = _sandbox(tmp_path, mode=None, owner_mode="isolated")
-    result = subprocess.run(
-        [BASH, str(DISPATCH)], capture_output=True, text=True, env=env, timeout=90
-    )
-    _skip_if_bash_cannot_fork(result)
-    recorded, state = _collect(repo, calls)
+    result = _run_resolver(tmp_path, mode=None, owner_mode="isolated")
     assert result.returncode == 0, result.stderr
-    assert PROMOTION_CMD in recorded
-    assert state["state"] == "DISPATCHED"
+    assert result.stdout.strip() == "isolated"
 

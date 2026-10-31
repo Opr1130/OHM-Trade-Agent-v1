@@ -128,10 +128,11 @@ AC-007 -> tests/test_opip_scan_dispatch_promotion_v1.py::test_the_dispatcher_no_
 AC-007 -> tests/test_opip_scan_dispatch_promotion_v1.py::test_unresolvable_modes_are_recorded_with_distinct_reasons
 AC-007 -> tests/test_opip_scan_dispatch_promotion_v1.py::test_the_release_controller_installs_the_dispatcher
 AC-007 -> tests/test_opip_scan_dispatch_promotion_v1.py::test_promotion_remains_the_only_qualification_path
-AC-007 -> tests/test_opip_scan_dispatch_promotion_v1.py::test_isolated_promotion_runs_from_the_derived_core_env
-AC-007 -> tests/test_opip_scan_dispatch_promotion_v1.py::test_legacy_and_suspended_never_promote
-AC-007 -> tests/test_opip_scan_dispatch_promotion_v1.py::test_missing_mode_is_recorded_not_silently_skipped
-AC-007 -> tests/test_opip_scan_dispatch_promotion_v1.py::test_ambiguous_mode_is_recorded_not_guessed
+AC-007 -> tests/test_opip_scan_dispatch_promotion_v1.py::test_isolated_is_resolved_from_the_derived_core_env
+AC-007 -> tests/test_opip_scan_dispatch_promotion_v1.py::test_legacy_and_suspended_resolve_verbatim
+AC-007 -> tests/test_opip_scan_dispatch_promotion_v1.py::test_missing_mode_resolves_empty
+AC-007 -> tests/test_opip_scan_dispatch_promotion_v1.py::test_ambiguous_mode_is_never_guessed
+AC-007 -> tests/test_opip_scan_dispatch_promotion_v1.py::test_process_env_overrides_the_derived_env
 AC-007 -> tests/test_opip_scan_dispatch_promotion_v1.py::test_owner_env_is_the_last_resort_source
 
 IMPLEMENTATION MAP:
