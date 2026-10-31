@@ -11,6 +11,7 @@ DEPLOY_SCRIPT_DST="/usr/local/sbin/ohm-deploy"
 SSH_GATEWAY_DST="/usr/local/sbin/ohm-deploy-ssh"
 LEARNING_READER_DST="/usr/local/sbin/opip-learning-read-export"
 LEARNING_DIAGNOSTICS_DST="/usr/local/sbin/diagnose-opip-learning"
+SCAN_DISPATCH_DST="/usr/local/bin/opip-scan-dispatch"
 P1_RETIRE_SCRIPT="$APP_ROOT/deploy/remote/retire-p1-shadow-outbox.sh"
 LEARNING_EXPORTER="$APP_ROOT/deploy/remote/export-opip-learning-evidence.sh"
 
@@ -308,6 +309,7 @@ $DEPLOY_SCRIPT_DST|remote-op-ohm-deploy
 $SSH_GATEWAY_DST|remote-op-ohm-deploy-ssh
 $LEARNING_READER_DST|remote-op-learning-reader
 $LEARNING_DIAGNOSTICS_DST|remote-op-learning-diagnostics
+$SCAN_DISPATCH_DST|remote-op-scan-dispatch
 OPS
 
   if crontab -l > "$SCHEDULER_SNAPSHOT/root.crontab" 2>/dev/null; then
@@ -340,6 +342,7 @@ $DEPLOY_SCRIPT_DST|remote-op-ohm-deploy
 $SSH_GATEWAY_DST|remote-op-ohm-deploy-ssh
 $LEARNING_READER_DST|remote-op-learning-reader
 $LEARNING_DIAGNOSTICS_DST|remote-op-learning-diagnostics
+$SCAN_DISPATCH_DST|remote-op-scan-dispatch
 OPS
 
   if [[ -e "$SCHEDULER_SNAPSHOT/root.crontab.present" ]]; then
