@@ -270,7 +270,25 @@ def check_contracts(
     if changed_files is None:
         scope_reasons.append("changed-file set was not provided")
     else:
-        _authorize_changed_files(changed_files, _allow_paths(selected), scope_reasons)
+        allowed = _allow_paths(selected)
+        # CI maintenance may run alongside an active product increment without
+        # moving its pointer. Only an exclusively mapped, traced maintenance
+        # change set qualifies; mixed/unmapped changes still fail closed.
+        ci_contracts = [
+            item for item in contracts
+            if item.increment == "ATDD-CI-STABILIZATION-M01"
+        ]
+        if len(ci_contracts) == 1 and changed_files:
+            ci_paths = _allow_paths(ci_contracts[0])
+            try:
+                normalized = tuple(
+                    normalize_repo_path(path) for path in changed_files
+                )
+            except ValueError:
+                normalized = ()
+            if normalized and all(path in ci_paths for path in normalized):
+                allowed = ci_paths
+        _authorize_changed_files(changed_files, allowed, scope_reasons)
     return _result(scope_reasons, trace_reasons)
 
 
