@@ -137,4 +137,4 @@ jobs:
         run: |
           gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -f body="## Gemini Independent Review
 
-REVIEW_WORKFLOW_FAILED. Inspect the Gemini PR Review Actions run before relying on this review gate." >/dev/null || true
+          REVIEW_WORKFLOW_FAILED. Inspect the Gemini PR Review Actions run before relying on this review gate." >/dev/null || true
