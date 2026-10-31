@@ -102,3 +102,67 @@ opip_scheduler_authorization_state() {
   echo "IRR shadow scheduler authorization must be exactly 'installed' or 'absent' (optional final newline)" >&2
   return 65
 }
+
+# IRR activation-state snapshot contract.
+#
+# /etc/cron.d/opip-irr-shadow, /usr/local/bin/opip-irr-shadow-run and the image
+# pin are ONE activation state. Worker-image verification can fail, and a
+# failure must never destroy state that was not captured first, so the caller
+# captures with `opip_irr_capture_activation_state` BEFORE it verifies anything
+# and restores exactly what was there with `opip_irr_restore_activation_state`.
+# A file that existed comes back with its content, mode and owner; a file that
+# did not exist stays absent. Both take a capture directory plus the three
+# artifact paths, so they can be exercised directly by focused tests and never
+# touch any path they were not given.
+
+opip_irr_capture_activation_state() {
+  # opip_irr_capture_activation_state <capture-dir> <entry> <runner> <pin>
+  local dir="${1:-}" entry="${2:-}" runner="${3:-}" pin="${4:-}"
+  if [[ -z "$dir" || -z "$entry" || -z "$runner" || -z "$pin" ]]; then
+    echo "IRR activation-state capture arguments are incomplete" >&2
+    return 65
+  fi
+  if ! mkdir -p -- "$dir"; then
+    echo "IRR activation-state capture directory is unusable: $dir" >&2
+    return 69
+  fi
+  local pair name path
+  for pair in "entry:$entry" "runner:$runner" "pin:$pin"; do
+    name="${pair%%:*}"
+    path="${pair#*:}"
+    if [[ -e "$path" ]]; then
+      if ! cp -a -- "$path" "$dir/$name.before"; then
+        echo "IRR activation state could not be captured: $path" >&2
+        return 69
+      fi
+      : > "$dir/$name.present"
+    else
+      rm -f -- "$dir/$name.present"
+    fi
+  done
+  return 0
+}
+
+opip_irr_restore_activation_state() {
+  # opip_irr_restore_activation_state <capture-dir> <entry> <runner> <pin>
+  local dir="${1:-}" entry="${2:-}" runner="${3:-}" pin="${4:-}"
+  if [[ -z "$dir" || -z "$entry" || -z "$runner" || -z "$pin" ]]; then
+    echo "IRR activation-state restore arguments are incomplete" >&2
+    return 65
+  fi
+  local pair name path
+  for pair in "entry:$entry" "runner:$runner" "pin:$pin"; do
+    name="${pair%%:*}"
+    path="${pair#*:}"
+    if [[ -e "$dir/$name.present" ]]; then
+      if ! cp -a -- "$dir/$name.before" "$path"; then
+        echo "IRR activation state could not be restored: $path" >&2
+        return 69
+      fi
+    elif ! rm -f -- "$path"; then
+      echo "IRR activation state could not be cleared: $path" >&2
+      return 69
+    fi
+  done
+  return 0
+}

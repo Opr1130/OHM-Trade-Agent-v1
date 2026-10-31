@@ -52,7 +52,7 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exit 77
 fi
 
-for cmd in install crontab grep awk mktemp cp mv rm id tr stat head sed chown; do
+for cmd in install crontab grep awk mktemp cp mv rm mkdir id tr stat head sed chown; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "missing required command: $cmd" >&2
     exit 69
@@ -68,10 +68,13 @@ if [[ ! -s "$IRR_AUTH_LIB" ]]; then
 fi
 # shellcheck source=/dev/null
 source "$IRR_AUTH_LIB"
-if ! declare -F opip_scheduler_authorization_state >/dev/null; then
-  echo "scheduler authorization library does not define the marker contract" >&2
-  exit 69
-fi
+for irr_contract in opip_scheduler_authorization_state \
+  opip_irr_capture_activation_state opip_irr_restore_activation_state; do
+  if ! declare -F "$irr_contract" >/dev/null; then
+    echo "scheduler authorization library does not define $irr_contract" >&2
+    exit 69
+  fi
+done
 
 # Explicit installation authorization for the IRR advisory scheduler entry.
 # Default is ABSENT (nothing installed, and any stale entry is removed). The
@@ -121,6 +124,34 @@ for required in "${required_artifacts[@]}"; do
   fi
 done
 
+# The entry, its runner and the image pin are captured HERE, before anything is
+# verified. A failed verification must never destroy an existing activation
+# state whose previous value was not recorded first: that turned an unprovable
+# image into the loss of the owner's authorization record. Every failure path
+# below restores exactly what was there and then fails closed (exit 65), so the
+# scheduler stays dormant and recoverable - the runner refuses to start without
+# a verified image, so preserving the entry grants no execution.
+irr_preflight_dir="$(mktemp -d)"
+if ! opip_irr_capture_activation_state "$irr_preflight_dir" \
+  "$IRR_SHADOW_DST" "$IRR_RUNNER_DST" "$IRR_WORKER_PIN"; then
+  echo "IRR activation state could not be captured before image verification" >&2
+  rm -rf "$irr_preflight_dir"
+  exit 69
+fi
+irr_preflight_fail() {
+  # irr_preflight_fail <message> -> restore the captured state, then exit 65.
+  echo "$1" >&2
+  if ! opip_irr_restore_activation_state "$irr_preflight_dir" \
+    "$IRR_SHADOW_DST" "$IRR_RUNNER_DST" "$IRR_WORKER_PIN"; then
+    echo "IRR activation state could not be restored after a failed image verification" >&2
+    rm -rf "$irr_preflight_dir"
+    exit 69
+  fi
+  echo "OPIP_IRR_IMAGE_PREFLIGHT=FAILED_STATE_PRESERVED"
+  rm -rf "$irr_preflight_dir"
+  exit 65
+}
+
 if [[ "$irr_shadow_state" == "INSTALLED" ]]; then
   # Prepare-and-verify gate: the worker image must already exist and carry the
   # approved release revision. A scheduled `docker compose run` must never build
@@ -130,25 +161,20 @@ if [[ "$irr_shadow_state" == "INSTALLED" ]]; then
     irr_release_sha="$(git -c safe.directory='*' -C "$APP_ROOT" rev-parse --verify HEAD 2>/dev/null || true)"
   fi
   if [[ ! "$irr_release_sha" =~ ^[0-9a-f]{40}$ ]]; then
-    echo "IRR shadow worker image cannot be verified: the approved release SHA is not provable" >&2
-    rm -f "$IRR_SHADOW_DST"
-    exit 65
+    irr_preflight_fail "IRR shadow worker image cannot be verified: the approved release SHA is not provable"
   fi
   irr_worker_image_id="$(docker image inspect --format '{{.Id}}' "$IRR_WORKER_ALIAS" 2>/dev/null || true)"
   irr_worker_revision="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IRR_WORKER_ALIAS" 2>/dev/null || true)"
   if [[ ! "$irr_worker_image_id" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-    echo "IRR shadow worker image is not prepared: $IRR_WORKER_ALIAS is absent" >&2
-    rm -f "$IRR_SHADOW_DST"
-    exit 65
+    irr_preflight_fail "IRR shadow worker image is not prepared: $IRR_WORKER_ALIAS is absent"
   fi
   if [[ "$irr_worker_revision" != "$irr_release_sha" ]]; then
-    echo "IRR shadow worker image revision mismatch: expected=$irr_release_sha actual=$irr_worker_revision" >&2
-    rm -f "$IRR_SHADOW_DST"
-    exit 65
+    irr_preflight_fail "IRR shadow worker image revision mismatch: expected=$irr_release_sha actual=$irr_worker_revision"
   fi
   echo "OPIP_IRR_WORKER_IMAGE_VERIFIED=$irr_worker_image_id"
   echo "OPIP_IRR_WORKER_IMAGE_REVISION=$irr_worker_revision"
 fi
+rm -rf "$irr_preflight_dir"
 
 
 
@@ -414,6 +440,9 @@ rollback() {
   fi
 
   rm -rf "$tmpdir"
+  if [[ -n "${irr_preflight_dir:-}" && -d "$irr_preflight_dir" ]]; then
+    rm -rf "$irr_preflight_dir"
+  fi
   exit "$rc"
 }
 trap rollback ERR

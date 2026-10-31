@@ -299,15 +299,16 @@ def test_worker_image_is_prepared_by_the_deploy_from_the_release_sha(worker):
         'build --build-arg "OPIP_RELEASE_SHA=$TARGET_SHA" \\\n'
         "  opip-canonical-writer ohm-trade-agent opip-irr-shadow"
     ) in deploy
-    # ...and on every rollback path from the restored previous SHA, so a
-    # rollback re-provisions the worker from the code it restores.
+    # ...and on both rollback paths from the restored previous SHA, so a rollback
+    # re-provisions the worker from the code it restores - but only when the
+    # restored release declares the service (AC-009).
     assert (
         'build --build-arg "OPIP_RELEASE_SHA=$PREVIOUS_SHA" \\\n'
-        "      opip-canonical-writer ohm-trade-agent opip-irr-shadow"
+        '      opip-canonical-writer ohm-trade-agent "${irr_rollback_build_targets[@]}"'
     ) in deploy
     assert (
-        'build --build-arg "OPIP_RELEASE_SHA=$PREVIOUS_SHA" '
-        "ohm-trade-agent opip-irr-shadow"
+        'build --build-arg "OPIP_RELEASE_SHA=$PREVIOUS_SHA" ohm-trade-agent \\\n'
+        '      "${irr_rollback_build_targets[@]}"'
     ) in deploy
     # The reconciliation receives the exact approved SHA it must verify against.
     assert 'OPIP_RELEASE_SHA="$TARGET_SHA" bash "$SCHEDULER_RECONCILE"' in deploy
@@ -504,7 +505,7 @@ def test_reconcile_delegates_the_marker_contract_to_the_library(reconcile_text):
     assert "tr -d '\\r\\n'" not in reconcile_text
     # A missing library fails closed before any mutation.
     assert "scheduler authorization library missing" in reconcile_text
-    assert "does not define the marker contract" in reconcile_text
+    assert "does not define $irr_contract" in reconcile_text
 
     assert 'install -o root -g root -m 0755 "$IRR_RUNNER_SRC" "$IRR_RUNNER_DST"' in (
         reconcile_text
@@ -512,3 +513,211 @@ def test_reconcile_delegates_the_marker_contract_to_the_library(reconcile_text):
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# AC-009: a rollback restores a release that may predate the IRR worker
+# ---------------------------------------------------------------------------
+
+ROLLBACK_DETECTION_START = "# >>> opip-irr-rollback-detection"
+ROLLBACK_DETECTION_END = "# <<< opip-irr-rollback-detection"
+
+
+def _sentinel_block(text: str, start: str, end: str) -> str:
+    """Return the shipped shell between two sentinel comments."""
+    begin = text.index(start) + len(start)
+    return text[begin : text.index(end, begin)]
+
+
+def _rollback_section(deploy_text: str) -> str:
+    begin = deploy_text.index("rollback() {")
+    return deploy_text[begin : deploy_text.index("trap rollback ERR", begin)]
+
+
+def test_rollback_only_requests_the_irr_service_the_restored_release_declares():
+    """ATDD-IRR-ACTIVATION-INFRA-v1/AC-009: c60bbbd1, which has no IRR service."""
+    deploy = DEPLOY.read_text(encoding="utf-8")
+    rollback_body = _rollback_section(deploy)
+    assert ROLLBACK_DETECTION_START in rollback_body
+    assert ROLLBACK_DETECTION_END in rollback_body
+    # No rollback build may list the worker unconditionally: both build calls
+    # consume the detected targets instead.
+    assert "ohm-trade-agent opip-irr-shadow" not in rollback_body
+    assert rollback_body.count('"${irr_rollback_build_targets[@]}"') == 2
+    # Both rollback builds still rebuild from the restored release SHA.
+    assert rollback_body.count(
+        'build --build-arg "OPIP_RELEASE_SHA=$PREVIOUS_SHA"'
+    ) == 2
+    # A restored release without the worker removes the activation it inherited
+    # from the abandoned candidate release: entry, runner and pin together.
+    assert "OPIP_ROLLBACK_IRR_ACTIVATION=REMOVED" in rollback_body
+    for artifact in (
+        "/etc/cron.d/opip-irr-shadow",
+        "/usr/local/bin/opip-irr-shadow-run",
+        "/var/lib/ohm-deploy/irr-worker-image.env",
+    ):
+        assert artifact in rollback_body, artifact
+    # The success path is unchanged: the target release always declares it.
+    assert (
+        'build --build-arg "OPIP_RELEASE_SHA=$TARGET_SHA" \\\n'
+        "  opip-canonical-writer ohm-trade-agent opip-irr-shadow"
+    ) in deploy
+
+
+@needs_bash
+@pytest.mark.parametrize(
+    ("services", "expected"),
+    [
+        # A release that predates the worker declares neither service pairing
+        # beyond the core and the writer.
+        ("ohm-trade-agent\nopip-canonical-writer\n", []),
+        (
+            "ohm-trade-agent\nopip-canonical-writer\nopip-irr-shadow\n",
+            ["opip-irr-shadow"],
+        ),
+        # An unresolvable Compose model is treated as "not declared", so the
+        # rollback can never request a service that may not exist.
+        ("", []),
+    ],
+)
+def test_rollback_service_detection_executes_against_the_restored_model(
+    tmp_path, services, expected
+):
+    """ATDD-IRR-ACTIVATION-INFRA-v1/AC-009: the shipped detection block runs."""
+    block = _sentinel_block(
+        DEPLOY.read_text(encoding="utf-8"),
+        ROLLBACK_DETECTION_START,
+        ROLLBACK_DETECTION_END,
+    )
+    services_file = tmp_path / "services"
+    services_file.write_text(services, encoding="utf-8")
+    script = "\n".join(
+        [
+            'docker() { cat "$OPIP_TEST_SERVICES"; }',
+            "SAFE_BASELINE_OVERRIDE=/dev/null",
+            block,
+            'printf "TARGETS=%s\\n" "${irr_rollback_build_targets[*]}"',
+        ]
+    )
+    env = dict(os.environ)
+    env["OPIP_TEST_SERVICES"] = str(services_file)
+    result = subprocess.run(
+        [BASH, "-c", script], capture_output=True, text=True, env=env, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    targets = next(
+        line.split("=", 1)[1]
+        for line in result.stdout.splitlines()
+        if line.startswith("TARGETS=")
+    )
+    assert targets.split() == expected
+    marker = (
+        "DECLARED_BY_RESTORED_RELEASE" if expected else "ABSENT_FROM_RESTORED_RELEASE"
+    )
+    assert marker in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# AC-010: a failed image verification cannot drop uncaptured scheduler state
+# ---------------------------------------------------------------------------
+
+PREFLIGHT_CAPTURE = "opip_irr_capture_activation_state"
+PREFLIGHT_RESTORE = "opip_irr_restore_activation_state"
+
+
+def test_failed_image_verification_restores_the_captured_scheduler_state(
+    reconcile_text,
+):
+    """ATDD-IRR-ACTIVATION-INFRA-v1/AC-010: capture first, restore on failure."""
+    capture_at = reconcile_text.index(f'{PREFLIGHT_CAPTURE} "$irr_preflight_dir"')
+    verify_at = reconcile_text.index("docker image inspect --format '{{.Id}}'")
+    # The capture precedes the very first verification.
+    assert capture_at < verify_at
+    # Nothing between capture and verification may delete the entry: a failure
+    # used to `rm -f` a state whose previous value had never been recorded.
+    assert 'rm -f "$IRR_SHADOW_DST"' not in reconcile_text[capture_at:verify_at]
+    # Every failure path restores instead, and the reconciliation still fails
+    # closed with the operator-visible marker.
+    assert reconcile_text.count(f'{PREFLIGHT_RESTORE} "$irr_preflight_dir"') == 1
+    helper_at = reconcile_text.index("irr_preflight_fail() {")
+    gate_at = reconcile_text.index(
+        'if [[ "$irr_shadow_state" == "INSTALLED" ]]; then', helper_at
+    )
+    fail_helper = reconcile_text[helper_at:gate_at]
+    assert f"{PREFLIGHT_RESTORE} \"$irr_preflight_dir\"" in fail_helper
+    assert "OPIP_IRR_IMAGE_PREFLIGHT=FAILED_STATE_PRESERVED" in fail_helper
+    assert "exit 65" in fail_helper
+    assert reconcile_text.count("    irr_preflight_fail \"") == 3
+    # The failure messages the operator reads are unchanged.
+    for message in (
+        "IRR shadow worker image cannot be verified: the approved release SHA is not provable",
+        "IRR shadow worker image is not prepared: $IRR_WORKER_ALIAS is absent",
+        "IRR shadow worker image revision mismatch: expected=$irr_release_sha",
+    ):
+        assert message in reconcile_text, message
+    # The capture directory is never leaked, on success or on the ERR rollback.
+    assert reconcile_text.count('rm -rf "$irr_preflight_dir"') >= 3
+
+
+@needs_bash
+def test_activation_state_survives_a_failed_preflight_byte_for_byte(tmp_path):
+    """ATDD-IRR-ACTIVATION-INFRA-v1/AC-010: capture/restore keeps the state."""
+    entry, runner, pin = (tmp_path / name for name in ("entry", "runner", "pin"))
+    entry.write_text("* * * * * root /usr/local/bin/opip-irr-shadow-run\n", "utf-8")
+    runner.write_text("#!/usr/bin/env bash\nexit 0\n", "utf-8")
+    os.chmod(runner, 0o755)
+    pin.write_text("image_id=sha256:aaa\nrevision=bbb\nalias=opip-irr-shadow:worker\n", "utf-8")
+    capture = tmp_path / "capture"
+    script = "\n".join(
+        [
+            "set -Eeuo pipefail",
+            'source "$1"',
+            'opip_irr_capture_activation_state "$2" "$3" "$4" "$5"',
+            # Anything after the capture may destroy the state (that is what the
+            # old preflight did); the restore must put it back exactly.
+            'rm -f "$3" "$4" "$5"',
+            'opip_irr_restore_activation_state "$2" "$3" "$4" "$5"',
+        ]
+    )
+    result = subprocess.run(
+        [BASH, "-c", script, "_", str(AUTH_LIB), str(capture), str(entry), str(runner), str(pin)],
+        capture_output=True,
+        text=True,
+        env=dict(os.environ),
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert entry.read_text("utf-8") == "* * * * * root /usr/local/bin/opip-irr-shadow-run\n"
+    assert runner.read_text("utf-8").endswith("exit 0\n")
+    assert (runner.stat().st_mode & 0o111) == 0o111
+    assert pin.read_text("utf-8").startswith("image_id=sha256:aaa\n")
+
+
+@needs_bash
+def test_state_absent_at_capture_stays_absent_after_a_failed_preflight(tmp_path):
+    """ATDD-IRR-ACTIVATION-INFRA-v1/AC-010: a first install is not half-created."""
+    entry, runner, pin = (tmp_path / name for name in ("entry", "runner", "pin"))
+    capture = tmp_path / "capture"
+    script = "\n".join(
+        [
+            "set -Eeuo pipefail",
+            'source "$1"',
+            'opip_irr_capture_activation_state "$2" "$3" "$4" "$5"',
+            # A partial install must not survive a failed verification.
+            'printf x > "$3"',
+            'printf x > "$4"',
+            'printf x > "$5"',
+            'opip_irr_restore_activation_state "$2" "$3" "$4" "$5"',
+        ]
+    )
+    result = subprocess.run(
+        [BASH, "-c", script, "_", str(AUTH_LIB), str(capture), str(entry), str(runner), str(pin)],
+        capture_output=True,
+        text=True,
+        env=dict(os.environ),
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not entry.exists()
+    assert not runner.exists()
+    assert not pin.exists()

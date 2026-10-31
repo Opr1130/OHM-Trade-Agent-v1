@@ -388,14 +388,21 @@ script is an explicit allowlist (fixed artifact set, pre-install snapshot,
   neither activate nor silently drop the entry. The contract lives in
   `deploy/remote/lib/opip_scheduler_authorization.sh` so it can be exercised
   directly by focused tests.
-* **Image preparation is a pre-install gate.** The deploy builds
-  `opip-irr-shadow:worker` with `OPIP_RELEASE_SHA=$TARGET_SHA` (and with
-  `$PREVIOUS_SHA` on every rollback path). Only then does the reconciliation
+* **Image preparation is a pre-install gate that destroys nothing when it
+  fails.** The deploy builds `opip-irr-shadow:worker` with
+  `OPIP_RELEASE_SHA=$TARGET_SHA` (and with `$PREVIOUS_SHA` on every rollback
+  path that still declares the service). Only then does the reconciliation
   resolve that alias, require a `sha256:` image ID and a matching
   `org.opencontainers.image.revision` label, and record a root-owned `0600` pin
-  at `/var/lib/ohm-deploy/irr-worker-image.env`. An unprovable image means the
-  entry is removed and the reconciliation fails: the scheduler is never armed
-  against an image that was not prepared from the approved SHA.
+  at `/var/lib/ohm-deploy/irr-worker-image.env`. The entry, the runner and the
+  pin are captured *before* the verification starts; an unprovable image
+  restores exactly what was there, prints
+  `OPIP_IRR_IMAGE_PREFLIGHT=FAILED_STATE_PRESERVED` and fails closed. The
+  scheduler is therefore never armed against an image that was not prepared
+  from the approved SHA, and a failed verification can never destroy an
+  authorization record whose previous value was not recorded first. Preserving
+  the entry grants no execution: the runner refuses to start without a verified
+  image.
 * **A scheduled tick can never build.** The cron entry runs
   `/usr/local/bin/opip-irr-shadow-run` (installed by the reconciliation from
   `deploy/bin/opip-irr-shadow-run`). The runner re-resolves the alias, requires
@@ -454,7 +461,7 @@ a future change raises the batch size or output cap, re-measure before raising
 ```text
 tests/test_opip_two_stage_stage1_openai_v1.py   6 test functions (9 cases)  Stage-1 contract
 tests/test_opip_irr_shadow_v1.py               37 tests                     Stage-2 ATDD
-tests/test_opip_irr_activation_v1.py           12 tests + 21 bash-gated        activation infrastructure
+tests/test_opip_irr_activation_v1.py           14 tests + 26 bash-gated        activation infrastructure
 ```
 
 Activation-infrastructure coverage (this increment):
@@ -472,6 +479,17 @@ Activation-infrastructure coverage (this increment):
   `test_marker_absence_means_not_installed`,
   `test_reconcile_delegates_the_marker_contract_to_the_library` — executed
   against the real library under bash (skipped where bash is absent).
+* `test_rollback_only_requests_the_irr_service_the_restored_release_declares`,
+  `test_rollback_service_detection_executes_against_the_restored_model` — a
+  rollback to a release without the worker (`c60bbbd1`) rebuilds the core and
+  the writer only, removes the inherited activation, and never requests a
+  service that does not exist; the shipped detection block is executed against
+  declared, absent and unresolvable Compose models.
+* `test_failed_image_verification_restores_the_captured_scheduler_state`,
+  `test_activation_state_survives_a_failed_preflight_byte_for_byte`,
+  `test_state_absent_at_capture_stays_absent_after_a_failed_preflight` — the
+  activation state is captured before verification, a failed preflight restores
+  it byte-for-byte (mode included), and a partial first install is removed.
 * `test_worker_has_its_own_bounded_memory_cgroup`,
   `test_worker_command_is_the_bounded_drain_job`,
   `test_worker_receives_no_funded_or_core_authority_credentials`,
@@ -526,14 +544,22 @@ mandated proofs):
    image pin itself; manual `rm -f` of the entry is safe but the marker path is
    the governed one. Any in-flight worker container exits on its own bounded
    timeout and is removed by `run --rm`.
-3. A release rollback rebuilds `opip-irr-shadow:worker` from the restored SHA,
-   which changes the image ID against the pin. The runner then refuses with exit
-   78 (`IMAGE_PIN_MISMATCH`, logged) instead of running new code against old
-   state, so IRR stays dormant until the next authorized deploy re-verifies the
-   image. No other rollback behaviour changes.
-4. Stage 1 is config-only: restoring the previous `OPENAI_MODEL` value returns
+3. A release rollback rebuilds `opip-irr-shadow:worker` from the restored SHA
+   only when the restored release declares that service. The rebuild changes the
+   image ID against the pin, so the runner refuses with exit 78
+   (`IMAGE_PIN_MISMATCH`, logged) instead of running new code against old state;
+   IRR stays dormant until the next authorized deploy re-verifies the image.
+4. A rollback to a release that predates the worker - `c60bbbd1` is the approved
+   example, it declares no `opip-irr-shadow` service - never requests that
+   service: the core and the canonical writer are rebuilt and restored normally,
+   and the entry, runner and pin inherited from the abandoned candidate release
+   are removed (`OPIP_ROLLBACK_IRR_ACTIVATION=REMOVED`). A Compose model that
+   cannot be resolved at all is treated the same way, so a rollback can never
+   fail on a service that may not exist, and it can only remove an advisory
+   entry - never add one.
+5. Stage 1 is config-only: restoring the previous `OPENAI_MODEL` value returns
    the prior Chief behaviour; no code revert is required.
-5. The queue, spend ledger, evidence journal and idempotence ledger are durable
+6. The queue, spend ledger, evidence journal and idempotence ledger are durable
    evidence. Do not truncate, rewrite or delete them; they record advisory
    attempts and reservations only and carry no authority.
 

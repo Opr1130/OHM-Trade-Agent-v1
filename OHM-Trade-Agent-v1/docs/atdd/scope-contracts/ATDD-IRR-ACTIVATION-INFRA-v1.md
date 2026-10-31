@@ -124,6 +124,34 @@ exactly `installed` or `absent` (optional final newline) is accepted, every othe
 owner, mode, type or byte sequence fails closed before any mutation, and a
 missing marker still means "not installed"
 
+AC-009:
+GIVEN:
+a rollback to a restored release that predates the IRR worker (the approved
+example is c60bbbd1, which declares no `opip-irr-shadow` Compose service)
+WHEN:
+the rollback rebuilds the restored release
+THEN:
+the worker joins the build only when the restored Compose model declares it, so
+the core and the canonical writer are restored without ever requesting a
+service that does not exist; when it is not declared (or the model cannot be
+resolved at all) the IRR entry, runner and image pin inherited from the
+abandoned candidate release are removed instead of left firing, and nothing is
+added to any authority
+
+AC-010:
+GIVEN:
+an existing IRR activation state - the scheduler entry, its runner and the
+image pin - and an approved release SHA
+WHEN:
+the worker-image preflight cannot verify the image
+THEN:
+that state is captured before the verification begins, every failure path
+restores it exactly and then fails closed (exit 65) with
+`OPIP_IRR_IMAGE_PREFLIGHT=FAILED_STATE_PRESERVED`, so a verification failure can
+never destroy an entry whose previous value was not recorded first, and the
+scheduler remains dormant and recoverable because the runner refuses to start
+without a verified image
+
 
 EXPLICITLY OUT OF SCOPE:
 
@@ -168,6 +196,11 @@ AC-008 -> tests/test_opip_irr_activation_v1.py::test_marker_accepts_safe_permiss
 AC-008 -> tests/test_opip_irr_activation_v1.py::test_marker_rejects_symlinks_directories_and_foreign_owners
 AC-008 -> tests/test_opip_irr_activation_v1.py::test_marker_absence_means_not_installed
 AC-008 -> tests/test_opip_irr_activation_v1.py::test_reconcile_delegates_the_marker_contract_to_the_library
+AC-009 -> tests/test_opip_irr_activation_v1.py::test_rollback_only_requests_the_irr_service_the_restored_release_declares
+AC-009 -> tests/test_opip_irr_activation_v1.py::test_rollback_service_detection_executes_against_the_restored_model
+AC-010 -> tests/test_opip_irr_activation_v1.py::test_failed_image_verification_restores_the_captured_scheduler_state
+AC-010 -> tests/test_opip_irr_activation_v1.py::test_activation_state_survives_a_failed_preflight_byte_for_byte
+AC-010 -> tests/test_opip_irr_activation_v1.py::test_state_absent_at_capture_stays_absent_after_a_failed_preflight
 
 IMPLEMENTATION MAP:
 
@@ -197,6 +230,11 @@ AC-008 -> OHM-Trade-Agent-v1/deploy/remote/lib/opip_scheduler_authorization.sh
 AC-008 -> OHM-Trade-Agent-v1/deploy/remote/reconcile-scheduler.sh
 AC-008 -> OHM-Trade-Agent-v1/tests/test_opip_irr_activation_v1.py
 AC-008 -> OHM-Trade-Agent-v1/OPIP_TWO_STAGE_ADVISORY_AI_V1.md
+AC-009 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
+AC-009 -> OHM-Trade-Agent-v1/tests/test_opip_irr_activation_v1.py
+AC-010 -> OHM-Trade-Agent-v1/deploy/remote/lib/opip_scheduler_authorization.sh
+AC-010 -> OHM-Trade-Agent-v1/deploy/remote/reconcile-scheduler.sh
+AC-010 -> OHM-Trade-Agent-v1/tests/test_opip_irr_activation_v1.py
 AC-001 -> OHM-Trade-Agent-v1/OPIP_TWO_STAGE_ADVISORY_AI_V1.md
 AC-004 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-IRR-ACTIVATION-INFRA-v1.md
 AC-004 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT

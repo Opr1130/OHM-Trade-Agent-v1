@@ -1383,11 +1383,40 @@ rollback() {
 
   # First PR 2 deploy may roll back to a SHA that does not declare the writer.
   # Detect Compose services after reset; never require a missing service.
+  #
+  # The same rule covers the Stage-2 IRR advisory worker: a rollback can restore
+  # a release that predates it (the approved example is c60bbbd1, which declares
+  # no `opip-irr-shadow` service). Asking Compose to build a service the restored
+  # tree does not declare fails the whole build, which would leave the core and
+  # the canonical writer unrestored. A model that cannot be resolved at all is
+  # treated as "not declared": fail closed rather than request a service that may
+  # not exist.
+  # >>> opip-irr-rollback-detection
+  irr_rollback_build_targets=()
+  if docker compose -f docker-compose.yml -f "$SAFE_BASELINE_OVERRIDE" \
+    config --services 2>/dev/null | grep -qx 'opip-irr-shadow'; then
+    irr_rollback_build_targets=(opip-irr-shadow)
+    echo "OPIP_ROLLBACK_IRR_WORKER=DECLARED_BY_RESTORED_RELEASE"
+  else
+    echo "OPIP_ROLLBACK_IRR_WORKER=ABSENT_FROM_RESTORED_RELEASE"
+  fi
+  # <<< opip-irr-rollback-detection
+  if [[ "${#irr_rollback_build_targets[@]}" -eq 0 ]]; then
+    # The restored release cannot run the worker, so its activation state goes
+    # with it: an entry, runner and pin that belong to the abandoned candidate
+    # release must not keep firing against the older host. The runner refuses to
+    # start without its own pin, so this can only remove an advisory entry -
+    # never add one, and never widen authority.
+    rm -f /etc/cron.d/opip-irr-shadow \
+      /usr/local/bin/opip-irr-shadow-run \
+      /var/lib/ohm-deploy/irr-worker-image.env
+    echo "OPIP_ROLLBACK_IRR_ACTIVATION=REMOVED"
+  fi
   if docker compose -f docker-compose.yml -f "$SAFE_BASELINE_OVERRIDE" \
     config --services 2>/dev/null | grep -qx 'opip-canonical-writer'; then
     docker compose -f docker-compose.yml -f "$SAFE_BASELINE_OVERRIDE" \
       build --build-arg "OPIP_RELEASE_SHA=$PREVIOUS_SHA" \
-      opip-canonical-writer ohm-trade-agent opip-irr-shadow
+      opip-canonical-writer ohm-trade-agent "${irr_rollback_build_targets[@]}"
     docker compose -f docker-compose.yml -f "$SAFE_BASELINE_OVERRIDE" \
       up -d --remove-orphans opip-canonical-writer
     docker compose -f docker-compose.yml -f "$SAFE_BASELINE_OVERRIDE" \
@@ -1407,7 +1436,8 @@ rollback() {
     fi
   else
     docker compose -f docker-compose.yml -f "$SAFE_BASELINE_OVERRIDE" \
-      build --build-arg "OPIP_RELEASE_SHA=$PREVIOUS_SHA" ohm-trade-agent opip-irr-shadow
+      build --build-arg "OPIP_RELEASE_SHA=$PREVIOUS_SHA" ohm-trade-agent \
+      "${irr_rollback_build_targets[@]}"
     # --remove-orphans drops a writer left from the failed PR 2 attempt.
     docker compose -f docker-compose.yml -f "$SAFE_BASELINE_OVERRIDE" \
       up -d --remove-orphans ohm-trade-agent
