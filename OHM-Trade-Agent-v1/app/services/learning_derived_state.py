@@ -812,8 +812,13 @@ def bind_state_connection(
         for table in tables:
             if table == "metadata":
                 continue
+            # SQLite identifiers cannot be bound using '?' placeholders.
+            # Names come from sqlite_master, but even a local table containing
+            # a quote must be queried as that EXACT identifier, never parsed
+            # as an extra predicate or a different table.
+            quoted_table = '"' + table.replace('"', '""') + '"'
             count = connection.execute(
-                f'SELECT count(*) FROM "{table}"'
+                f"SELECT count(*) FROM {quoted_table}"
             ).fetchone()[0]
             if count:
                 populated = True
