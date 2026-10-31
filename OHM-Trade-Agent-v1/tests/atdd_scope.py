@@ -276,18 +276,25 @@ def check_contracts(
         # change set qualifies; mixed/unmapped changes still fail closed.
         ci_contracts = [
             item for item in contracts
-            if item.increment == "ATDD-CI-STABILIZATION-M01"
+            if item.increment in {
+                "ATDD-CI-STABILIZATION-M01",
+                "ATDD-RUFF-IMPORT-CLEANUP-M01",
+            }
         ]
-        if len(ci_contracts) == 1 and changed_files:
-            ci_paths = _allow_paths(ci_contracts[0])
+        if changed_files:
             try:
                 normalized = tuple(
                     normalize_repo_path(path) for path in changed_files
                 )
             except ValueError:
                 normalized = ()
-            if normalized and all(path in ci_paths for path in normalized):
-                allowed = ci_paths
+            if normalized:
+                matching = [
+                    item for item in ci_contracts
+                    if all(path in _allow_paths(item) for path in normalized)
+                ]
+                if len(matching) == 1:
+                    allowed = _allow_paths(matching[0])
         _authorize_changed_files(changed_files, allowed, scope_reasons)
     return _result(scope_reasons, trace_reasons)
 
