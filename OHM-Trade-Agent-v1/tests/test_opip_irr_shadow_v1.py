@@ -15,7 +15,7 @@ import json
 import threading
 import time
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -443,6 +443,41 @@ def test_worker_refuses_queue_evidence_that_does_not_match_its_digest(monkeypatc
     assert second["results"][0]["error_type"] == "REQUEST_ID"
     assert post.calls == []
     assert _ledger() == []
+
+
+def test_expired_queue_request_is_refused_without_spend(monkeypatch):
+    """ATDD-IRR-ACTIVATION-INFRA-v1/AC-006: stale evidence never buys a call."""
+    _enable_shadow(monkeypatch)
+    now = datetime.now(timezone.utc)
+    _enqueue(now=now - timedelta(hours=2))
+    post = make_post(challenge=_challenge())
+
+    result = irr.drain_queue(post=post, now=now)
+
+    row = result["results"][0]
+    assert row["status"] == irr.STATUS_QUEUE_EXPIRED
+    assert row["error_type"] == "EXPIRED"
+    assert row["charged_cost_usd"] == 0.0
+    assert post.calls == []
+    assert _ledger() == []
+
+
+def test_queue_request_without_a_usable_timestamp_fails_closed(monkeypatch):
+    """ATDD-IRR-ACTIVATION-INFRA-v1/AC-006: unprovable age is refused, not billed."""
+    _enable_shadow(monkeypatch)
+    _enqueue()
+    row = _journal(irr.QUEUE_FILE)[0]
+    row.pop("enqueued_at", None)
+    irr.QUEUE_FILE.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    post = make_post(challenge=_challenge())
+
+    result = irr.drain_queue(post=post)
+
+    assert result["results"][0]["status"] == irr.STATUS_QUEUE_EXPIRED
+    assert result["results"][0]["error_type"] == "TIMESTAMP"
+    assert post.calls == []
+    assert _ledger() == []
+
 
 
 

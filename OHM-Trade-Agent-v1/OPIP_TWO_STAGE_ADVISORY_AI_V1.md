@@ -100,13 +100,14 @@ re-size anything, and it is never shown as an approval.
 
 | Stage | Process | I/O | Failure behaviour |
 | --- | --- | --- | --- |
-| Producer | the scan, after final qualification and after Telegram delivery | one bounded local append to `/app/data/opip_irr_queue.jsonl` (no network, no credential read) | fail-soft: a contended or unavailable queue is recorded and the scan continues |
-| Consumer | `python -m app.jobs.drain_irr_shadow`, its own cron entry | the only DeepSeek network call | never raises; a global failure leaves the checkpoint unadvanced |
+| Producer | the scan, after final qualification and after Telegram delivery | one bounded local append to `/app/data/irr/queue.jsonl` (no network, no credential read) | fail-soft: a contended or unavailable queue is recorded and the scan continues |
+| Consumer | the isolated `opip-irr-shadow` Compose service (`python -m app.jobs.drain_irr_shadow`), one pass per scheduler entry | the only DeepSeek network call, in its own 96 MB cgroup | never raises; a global failure leaves the checkpoint unadvanced |
 
-The worker takes neither the unified-cycle lock nor the scan lock, so a slow or
-hung provider cannot delay a scan, a Chief review, a Telegram delivery or an F11
-protection cycle. `chief_analyst.review_candidates()` performs no Stage-2 work
-at all and adds no Stage-2 field.
+The worker takes neither the unified-cycle lock nor the scan lock and never
+shares the core container's cgroup, so a slow, hung or OOM-ing provider cannot
+delay a scan, a Chief review, a Telegram delivery or an F11 protection cycle.
+`chief_analyst.review_candidates()` performs no Stage-2 work at all and adds no
+Stage-2 field.
 
 ### When it runs (selective trigger)
 
@@ -185,8 +186,8 @@ anything is persisted and only their **names** are recorded in
 
 Two append-only journals, both read strictly:
 
-* `/app/data/opip_irr_spend_ledger.jsonl` — `RESERVE` and `SETTLE` records.
-* `/app/data/opip_irr_shadow_evidence.jsonl` — one audit row per disposition.
+* `/app/data/irr/spend_ledger.jsonl` — `RESERVE` and `SETTLE` records.
+* `/app/data/irr/shadow_evidence.jsonl` — one audit row per disposition.
 
 Before every attempt the worker, under one lock, reads today's committed spend,
 checks the three daily budgets plus the per-call worst case, and appends a
@@ -234,7 +235,7 @@ exception message or stdout.
 ### Idempotence
 
 `idempotency_key = sha256(evidence_digest | model | prompt_version)`, kept in
-`/app/data/opip_irr_idempotence.json` (bounded to 256 keys). A repeated identical
+`/app/data/irr/idempotence.json` (bounded to 256 keys). A repeated identical
 evidence copy returns `IDEMPOTENT_REPLAY` with the previous verdict and no
 provider call and no charge. The queue uses a byte-offset checkpoint; a failed
 checkpoint write only re-processes, and the idempotence ledger still prevents a
@@ -251,6 +252,7 @@ second paid call.
 | endpoint not approved | `CONFIGURATION_ERROR` (no call) |
 | evidence lacks final qualification | `NOT_QUALIFIED` (no spend) |
 | evidence/digest/identity mismatch | `EVIDENCE_MISMATCH` (no spend, no call) |
+| queue request expired, future-dated or undatable | `QUEUE_EXPIRED` (no spend, no call) |
 | timeout / transport / non-200 | `FAILED` with `TIMEOUT` / `TRANSPORT_ERROR` / `HTTP_ERROR`, charged |
 | malformed or blank answer | `FAILED` with `MALFORMED_RESPONSE`, charged |
 | spend unverifiable | `SPEND_UNVERIFIABLE` (no call) |
@@ -299,110 +301,161 @@ OPENAI_DAILY_TOKEN_BUDGET=<n>         # existing Stage-1 spend guard
 | `OPIP_IRR_REASONING_EFFORT` | `high` | `low`, `high` or `max` (documented values). |
 | `OPIP_IRR_MAX_CANDIDATES` | `2` | Producer cap per scan (1–3). |
 | `OPIP_IRR_DRAIN_BATCH` | `2` | Requests per worker pass (1–5). |
+| `OPIP_IRR_QUEUE_MAX_AGE_SECONDS` | `1800` | Refuse a queued request older than this (60–86400); prevents paid calls on stale evidence. |
 | `OPIP_IRR_DAILY_CALL_BUDGET` | `24` | Reserved calls per UTC day. |
 | `OPIP_IRR_DAILY_TOKEN_BUDGET` | `60000` | Reserved tokens per UTC day. |
 | `OPIP_IRR_DAILY_COST_BUDGET_USD` | `1.0` | Reserved USD per UTC day (peak prices). |
 | `OPIP_IRR_MAX_CALL_COST_USD` | `0.05` | Refuse a call whose worst case exceeds this. |
 
-No variable is added to `docker-compose.yml` and no literal is added to the
-`environment` block, so a stale `.env` cannot activate Stage 2 silently.
+No variable is added to the core service's `environment` block, so a stale
+`.env` cannot activate Stage 2 silently. The isolated `opip-irr-shadow` service
+declares these names explicitly; `OPIP_IRR_MODE` defaults to `off` and
+`OPIP_IRR_MODEL` / `OPIP_IRR_BASE_URL` are pinned literals in Compose, so even a
+stale `.env` cannot change the provider or the model. `DEEPSEEK_API_KEY` reaches
+only that service, never the core container.
 
-## Key installation procedure (owner only)
+## Key and authorization installation procedure (owner only)
 
 Nothing below is executed by this PR. No paid API is invoked, and no credential
-is created, changed or read here.
+is created, changed or read here. The provider key and the scheduler
+authorization are two independent, owner-gated acts.
 
 1. Owner creates a DeepSeek API key in the provider console and sets a spend
    limit appropriate to the $1.00/day ceiling above.
-2. Owner adds `DEEPSEEK_API_KEY=<value>` and `OPIP_IRR_MODE=shadow` to the
-   deployment `.env` on the trading host (the single source of truth). The deploy
-   controller generates `.env.core` from it; `.env*` files are docker-ignored and
-   never committed. Do not paste the value into shell history, a log, a ticket, a
+2. Owner adds `DEEPSEEK_API_KEY=<value>` to the deployment `.env` on the trading
+   host (the single source of truth). The deploy controller generates
+   `.env.core` for the core container; `docker-compose.yml` interpolates only
+   this one variable into the isolated `opip-irr-shadow` service, so the core
+   container never receives it. `.env*` files are docker-ignored and never
+   committed. Do not paste the value into shell history, a log, a ticket, a
    prompt, or any file under version control.
 3. Owner deploys the exact approved `main` SHA through the existing owner-gated
-   `/deploy <sha>` path (EVIDENCE_SHADOW profile). The release tree now contains
-   `deploy/cron.d/opip-irr-shadow`; install it through the same approved
-   scheduler/release-tree control plane as the other `deploy/cron.d/*` entries.
-   This PR does not deploy and does not install cron entries.
-4. Verification without printing the secret:
+   `/deploy <sha>` path (EVIDENCE_SHADOW profile). The scheduler reconciliation
+   runs inside that deploy and installs the IRR entry **only** if step 4 has
+   already authorized it.
+4. Optional, later, separate activation of the scheduler entry: the owner
+   creates the root-owned authorization marker on the trading host
+
+   ```bash
+   # owner, via the approved control plane; content is exactly one token
+   install -o root -g root -m 0644 /dev/null /var/lib/ohm-deploy/irr-shadow-scheduler.enabled
+   printf 'installed\n' > /var/lib/ohm-deploy/irr-shadow-scheduler.enabled
+   ```
+
+   The next owner-gated deploy then installs `/etc/cron.d/opip-irr-shadow`
+   (printing `irr_shadow_scheduler=INSTALLED`). Without the marker the same
+   deploy removes any stale entry (`irr_shadow_scheduler=ABSENT`).
+5. `OPIP_IRR_MODE=shadow` in the owner `.env` is the final, independent switch:
+   with the mode still `off`, an installed cron entry and a configured key are
+   an inert no-op that spends nothing.
+6. Verification without printing the secret:
 
    ```bash
    # presence only; never echo the value
    test -n "$DEEPSEEK_API_KEY" && echo DEEPSEEK_PRESENT
-   grep -c 'DEEPSEEK_API_KEY' /app/data/opip_irr_shadow_evidence.jsonl || true   # must be 0
-   tail -n 1 /app/data/opip_irr_shadow_evidence.jsonl    # provider=deepseek, model=deepseek-flash
-   tail -n 2 /app/data/opip_irr_spend_ledger.jsonl       # RESERVE then SETTLE
+   grep -c 'DEEPSEEK_API_KEY' /app/data/irr/shadow_evidence.jsonl || true   # must be 0
+   tail -n 1 /app/data/irr/shadow_evidence.jsonl    # provider=deepseek, model=deepseek-flash
+   tail -n 2 /app/data/irr/spend_ledger.jsonl       # RESERVE then SETTLE
+   docker stats --no-stream opip-irr-shadow         # memory well under 96 MiB
    ```
 
-5. Rotation/removal: replace or delete the value in the owner `.env`, redeploy
+7. Rotation/removal: replace or delete the value in the owner `.env`, redeploy
    the approved SHA, and revoke the old key in the provider console. Removing
    `OPIP_IRR_MODE` (or setting it to `off`) makes both the producer and the
-   worker inert without a code change.
+   worker inert without a code change; deleting the authorization marker and
+   redeploying removes the scheduler entry.
 
-## Scheduler installation and removal (verified, not executed)
 
-`deploy/cron.d/opip-irr-shadow` is a release-tree artifact only. The approved
-scheduler process is `deploy/remote/reconcile-scheduler.sh`, and it is an
-**explicit allowlist**, not a directory scan:
+## Scheduler installation and removal (authorized, not executed)
 
-* it requires an exact set of source artifacts, snapshots the known
-  `/etc/cron.d` destinations plus the root crontab, installs
-  `ohm-unified-cycle`, `opip-learning-export`, `opip-feature-bus-capture` and
-  `opip-feasibility-evidence-capture` with `install -o root -g root -m 0644`,
-  removes `opip-ml-evidence` and `ohm-movement-discovery`, prunes legacy root
-  crontab lines, and restores the snapshot on any error (`trap rollback ERR`);
-* `opip-irr-shadow` is **not** in that allowlist, so a deploy of this SHA will
-  neither install nor remove it. As merged, Stage 2 is therefore inert by
-  omission: no cron entry, no worker, no spend.
+`deploy/cron.d/opip-irr-shadow` is a release-tree artifact, and
+`deploy/remote/reconcile-scheduler.sh` is the approved scheduler process. That
+script is an explicit allowlist (fixed artifact set, pre-install snapshot,
+`trap rollback ERR`) and it now owns the IRR entry:
 
-Activation therefore needs a separate, approved change to
-`deploy/remote/reconcile-scheduler.sh` that adds an `IRR_SHADOW_SRC`/`_DST` pair
-to the required-artifact check, the pre-install snapshot, the `install -m 0644`
-line and the `rollback` restore branch — exactly the pattern used for
-`opip-feature-bus-capture`. Removal is the matching rollback/allowlist removal,
-plus `rm -f /etc/cron.d/opip-irr-shadow`; both stay inside the existing
-owner-gated deploy path. **This PR does not modify the scheduler script and does
-not install anything.**
+* **Authorization is explicit.** The entry is installed only when the root-owned
+  marker `/var/lib/ohm-deploy/irr-shadow-scheduler.enabled` contains exactly
+  `installed`. No marker (the default) means "not installed", and that run also
+  removes any stale `/etc/cron.d/opip-irr-shadow`. Any other content, or a
+  marker that is not a readable regular file, fails closed (exit 65) before any
+  mutation, so a typo can neither activate nor silently drop the entry.
+* **Snapshot** happens before any mutation (`irr-shadow.before` in the
+  reconciliation temp directory, plus a `had_irr_shadow` flag), whether or not
+  the entry is currently authorized.
+* **Rollback** (`trap rollback ERR`) restores that snapshot when one existed and
+  removes the entry when this run created it.
+* **Removal** is the same path with the marker deleted or set to `absent`; the
+  script also carries the explicit `rm -f /etc/cron.d/opip-irr-shadow`, so
+  revoking authorization is a normal owner-gated deploy.
+* **Post-condition.** An installed entry must reference `opip-irr-shadow` and
+  `--profile irr-shadow run --rm --no-deps`, and is refused if it would
+  `compose exec` inside the core container. An unauthorized run must leave no
+  entry at all.
 
-## Memory and resource isolation (finding: not yet demonstrable)
+The run prints `irr_shadow_scheduler=INSTALLED|ABSENT` and
+`irr_shadow_authorization=<marker path>`. Nothing is installed by this PR.
 
-The planned invocation is `docker compose exec -T ohm-trade-agent ...`, which
-starts a **second process inside the core container**, so it is accounted to the
-core's `mem_limit: 384m` cgroup. Measured worker footprint (local probe, one
-queued request and one full drain):
+## Memory and resource isolation (resolved by design, pending live measurement)
+
+The worker no longer shares the core container's 384 MB cgroup. It is the
+isolated `opip-irr-shadow` Compose service, created per scheduler pass:
+
+| Control | Value |
+| --- | --- |
+| Memory / swap cgroup | `mem_limit: 96m`, `memswap_limit: 96m` (own container) |
+| Lifecycle | `profiles: [irr-shadow]`, `restart: "no"`, removed by `run --rm` |
+| Filesystem | `read_only: true`, `tmpfs: /tmp`, only `./data/irr` mounted rw |
+| Privileges | `cap_drop: ALL`, `no-new-privileges:true`, `pids_limit: 64` |
+| OOM posture | `oom_score_adj: 300` (dies first, never the core or protection) |
+| Wall clock | in-container `timeout --signal=TERM --kill-after=5s 150` |
+
+Representative max-load probe (five queued requests, 8 KB evidence each,
+`OPIP_IRR_MAX_OUTPUT_TOKENS=4096`, 0.5 s provider latency per call):
 
 | Metric | Value |
 | --- | --- |
-| Python heap peak (`tracemalloc`, whole pass) | ~68 KB |
-| RSS after importing the worker module | ~32 MB (Windows working set) |
-| RSS after enqueue + full drain | ~33 MB; delta over import ≈ 0.6 MB |
-| Dominant contributor | interpreter + `httpx`/`ssl` import |
+| Peak working set | 33.5 MB |
+| Python heap peak (`tracemalloc`) | ~210 KB |
+| Growth from import to full batch | ~1.0 MB |
+| Headroom at the 96 MB limit | ~64 MB (~3x the measured peak) |
 
-The worker itself is small, but it consumes **shared** headroom: a batch of two
-attempts, each bounded by `OPIP_IRR_TIMEOUT_SECONDS` (up to 60 s) and an
-in-container `timeout 150`, can coexist with a transient core spike, and the
-cgroup OOM killer selects the largest task — normally the core's Python. The
-scanner already has its own 224 MB cgroup for exactly this reason, so sharing
-the core's allowance with an advisory worker contradicts the established
-isolation posture and cannot be demonstrated safe from here (no production
-headroom measurement, no cgroup instrumentation).
-
-**Minimal correction required before activation:** run the worker in its own
-memory cgroup instead of `exec`-ing into the core — a `opip-irr-shadow` compose
-service on the same image with `mem_limit: 96m`, `restart: "no"`, no
-`env_file: .env.core` (only `OPIP_IRR_*` and `DEEPSEEK_API_KEY`), invoked as
-`docker compose --profile irr-shadow run --rm -T opip-irr-shadow python -m
-app.jobs.drain_irr_shadow`. That bounds an IRR OOM to the worker container and
-keeps the core's 384 MB untouched. It is a compose + scheduler-allowlist change
-and is deliberately **not** included in this PR.
-
+The Windows probe understates a Linux container; a Linux CPython 3.12 + httpx
+worker typically sits at 45-55 MB, which still leaves roughly 40 MB (>= 1.7x)
+headroom. If the limit is ever reached, the cgroup OOM can only select this
+container. The first authorized pass should confirm `docker stats` headroom; if
+a future change raises the batch size or output cap, re-measure before raising
+`mem_limit`.
 
 ## Tests added by this PR
 
 ```text
 tests/test_opip_two_stage_stage1_openai_v1.py   6 test functions (9 cases)  Stage-1 contract
-tests/test_opip_irr_shadow_v1.py               34 tests                     Stage-2 ATDD
+tests/test_opip_irr_shadow_v1.py               37 tests                     Stage-2 ATDD
+tests/test_opip_irr_activation_v1.py            8 tests                     activation infrastructure
 ```
+
+Activation-infrastructure coverage (this increment):
+
+* `test_worker_has_its_own_bounded_memory_cgroup`,
+  `test_worker_command_is_the_bounded_drain_job` — own 96 MB cgroup, profile
+  gated, read-only, capability-free, OOM-first, bounded command.
+* `test_worker_receives_no_funded_or_core_authority_credentials`,
+  `test_worker_mounts_only_the_irr_state_subtree` — one secret, no funded /
+  exchange / notification / OpenAI credential, no core authority switch, only
+  `./data/irr` mounted.
+* `test_cron_entry_runs_the_isolated_worker` — profile-gated one-shot container
+  under flock, never `compose exec` in the core.
+* `test_scheduler_authorization_is_explicit_and_absent_by_default`,
+  `test_scheduler_snapshots_installs_rolls_back_and_removes` — explicit marker,
+  snapshot, rollback restore/removal and default-absent posture.
+* `test_irr_remains_disabled_by_default` — code, Compose and scheduler default.
+* `test_expired_queue_request_is_refused_without_spend`,
+  `test_queue_request_without_a_usable_timestamp_fails_closed` — stale or
+  undatable evidence never reaches a reservation.
+
+Earlier rounds (retained): hung provider, evidence identity, qualification
+gate, reservation ledger, concurrency, chargeable failures, approved endpoint,
+credential hygiene and the AST import boundary.
 
 Focus of the remediation round (one test per corrected finding, plus the two
 mandated proofs):
@@ -434,8 +487,12 @@ mandated proofs):
 1. Set `OPIP_IRR_MODE=off` (or remove `DEEPSEEK_API_KEY`) in the owner `.env`
    and deploy the approved exact SHA. The producer stops queueing and the worker
    exits `DISABLED` / `MISSING_CREDENTIAL` with no provider call.
-2. Remove the `deploy/cron.d/opip-irr-shadow` entry through the same approved
-   scheduler control plane if the worker itself must stop.
+2. Remove the scheduler entry by deleting the authorization marker
+   `/var/lib/ohm-deploy/irr-shadow-scheduler.enabled` (or writing `absent`) and
+   redeploying the approved SHA. The reconciliation then removes
+   `/etc/cron.d/opip-irr-shadow` itself; manual `rm -f` of that file is safe but
+   the marker path is the governed one. Any in-flight worker container exits on
+   its own bounded timeout and is removed by `run --rm`.
 3. Stage 1 is config-only: restoring the previous `OPENAI_MODEL` value returns
    the prior Chief behaviour; no code revert is required.
 4. The queue, spend ledger, evidence journal and idempotence ledger are durable
@@ -445,8 +502,8 @@ mandated proofs):
 ## Remaining blockers and open risks
 
 1. **Owner activation is not approved.** `OPIP_IRR_MODE` is unset everywhere, no
-   DeepSeek credential exists in this repository or its CI, and the cron entry is
-   not installed on the host.
+   DeepSeek credential exists in this repository or its CI, no authorization
+   marker exists on the host, and no scheduler entry is installed.
 2. **Live provider compatibility is unverified.** No paid API call was made, so
    the documented request shape is validated against provider documentation and
    injected-transport tests only. The first live shadow call is the acceptance
@@ -456,10 +513,10 @@ mandated proofs):
    routing change that requires its own approved PR.
 4. **`gpt-6.1-sol` is not the code default.** `Settings.openai_model` remains
    `gpt-5.6`; switching is an owner configuration change.
-5. **Two activation prerequisites are unmet and out of this PR's scope** (details
-   above): the `opip-irr-shadow` entry is not in the approved scheduler
-   allowlist, and the worker still shares the core's 384 MB cgroup instead of
-   running in its own memory cgroup.
+5. **Container memory headroom is measured, not yet observed in production.**
+   The 96 MB limit carries ~3x headroom against the representative probe and the
+   worker can only OOM its own container, but the first authorized pass should
+   confirm `docker stats` before the batch or output caps are ever raised.
 6. **Queue retention.** The IRR queue is append-only and bounded per scan; it is
    not compacted. Compaction/archival is a separate retention decision.
 7. **No operator surface yet.** The verdict is available in the evidence journal

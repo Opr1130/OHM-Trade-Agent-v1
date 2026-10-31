@@ -99,30 +99,46 @@ STATUS_IDEMPOTENT_REPLAY = "IDEMPOTENT_REPLAY"
 STATUS_SPEND_UNVERIFIABLE = "SPEND_UNVERIFIABLE"
 STATUS_QUEUE_UNAVAILABLE = "QUEUE_UNAVAILABLE"
 STATUS_QUEUE_RECORD_UNREADABLE = "QUEUE_RECORD_UNREADABLE"
+STATUS_QUEUE_EXPIRED = "QUEUE_EXPIRED"
 
 #: Documented DeepSeek ``deepseek-flash`` peak list prices, USD per 1M tokens.
 #: Peak rates are used for every estimate so budgeting is never optimistic.
 PRICE_INPUT_USD_PER_MTOK = 0.30
 PRICE_OUTPUT_USD_PER_MTOK = 1.20
 
-QUEUE_FILE = Path("/app/data/opip_irr_queue.jsonl")
-QUEUE_LOCK = QUEUE_FILE.parent / ".opip_irr_queue.lock"
-QUEUE_CHECKPOINT_FILE = Path("/app/data/opip_irr_queue_checkpoint.json")
-QUEUE_CONSUMER_LOCK = QUEUE_FILE.parent / ".opip_irr_queue.consumer.lock"
+#: All Stage-2 state lives in ONE dedicated directory. The producer (core) and
+#: the isolated worker both write only here, so the worker container can mount
+#: exactly this subtree and receive no alert, order, paper, canonical or
+#: exchange registry at all.
+IRR_STATE_DIR = Path("/app/data/irr")
 
-EVIDENCE_FILE = Path("/app/data/opip_irr_shadow_evidence.jsonl")
-EVIDENCE_LOCK = EVIDENCE_FILE.parent / ".opip_irr_shadow_evidence.lock"
+QUEUE_FILE = IRR_STATE_DIR / "queue.jsonl"
+QUEUE_LOCK = IRR_STATE_DIR / ".queue.lock"
+QUEUE_CHECKPOINT_FILE = IRR_STATE_DIR / "queue_checkpoint.json"
+QUEUE_CONSUMER_LOCK = IRR_STATE_DIR / ".queue.consumer.lock"
 
-SPEND_LEDGER_FILE = Path("/app/data/opip_irr_spend_ledger.jsonl")
-SPEND_LEDGER_LOCK = SPEND_LEDGER_FILE.parent / ".opip_irr_spend_ledger.lock"
+EVIDENCE_FILE = IRR_STATE_DIR / "shadow_evidence.jsonl"
+EVIDENCE_LOCK = IRR_STATE_DIR / ".shadow_evidence.lock"
 
-IDEMPOTENCE_FILE = Path("/app/data/opip_irr_idempotence.json")
-IDEMPOTENCE_LOCK = IDEMPOTENCE_FILE.parent / ".opip_irr_idempotence.lock"
+SPEND_LEDGER_FILE = IRR_STATE_DIR / "spend_ledger.jsonl"
+SPEND_LEDGER_LOCK = IRR_STATE_DIR / ".spend_ledger.lock"
+
+IDEMPOTENCE_FILE = IRR_STATE_DIR / "idempotence.json"
+IDEMPOTENCE_LOCK = IRR_STATE_DIR / ".idempotence.lock"
 IDEMPOTENCE_MAX_KEYS = 256
+
+#: A queue request is only worth paying for while its evidence is still current.
+#: The producer's immutable ``enqueued_at`` is the only timestamp used; a
+#: request older than this window (or with no usable timestamp) is disposed as
+#: ``QUEUE_EXPIRED`` without a reservation or a provider call.
+DEFAULT_QUEUE_MAX_AGE_SECONDS = 1800
+MIN_QUEUE_MAX_AGE_SECONDS = 60
+MAX_QUEUE_MAX_AGE_SECONDS = 86400
 
 #: A local queue append must never delay a Telegram delivery. A contended lock
 #: is abandoned (fail-soft) rather than waited out.
 PRODUCER_LOCK_TIMEOUT_SECONDS = 0.25
+
 
 #: Field names that a provider answer may not contribute. They are dropped
 #: before anything is persisted, so a model cannot smuggle an executable
@@ -273,6 +289,7 @@ class IRRConfig:
     reasoning_effort: str
     max_candidates: int
     drain_batch: int
+    queue_max_age_seconds: int
     daily_call_budget: int
     daily_token_budget: int
     daily_cost_budget_usd: float
@@ -290,6 +307,7 @@ class IRRConfig:
             "reasoning_effort": self.reasoning_effort,
             "max_candidates": self.max_candidates,
             "drain_batch": self.drain_batch,
+            "queue_max_age_seconds": self.queue_max_age_seconds,
             "daily_call_budget": self.daily_call_budget,
             "daily_token_budget": self.daily_token_budget,
             "daily_cost_budget_usd": self.daily_cost_budget_usd,
@@ -384,6 +402,12 @@ def resolve_config() -> IRRConfig:
         reasoning_effort=effort,
         max_candidates=_env_int("OPIP_IRR_MAX_CANDIDATES", 2, minimum=1, maximum=3),
         drain_batch=_env_int("OPIP_IRR_DRAIN_BATCH", 2, minimum=1, maximum=5),
+        queue_max_age_seconds=_env_int(
+            "OPIP_IRR_QUEUE_MAX_AGE_SECONDS",
+            DEFAULT_QUEUE_MAX_AGE_SECONDS,
+            minimum=MIN_QUEUE_MAX_AGE_SECONDS,
+            maximum=MAX_QUEUE_MAX_AGE_SECONDS,
+        ),
         daily_call_budget=_env_int(
             "OPIP_IRR_DAILY_CALL_BUDGET", 24, minimum=1, maximum=1000
         ),
@@ -542,6 +566,48 @@ def evidence_identity_problem(
     if stored_provider is not None and stored_provider != PROVIDER:
         return "PROVIDER"
     return None
+
+
+def queue_request_age_seconds(
+    request: Mapping[str, Any],
+    *,
+    now: datetime,
+) -> float | None:
+    """Return the immutable queue age in seconds, or ``None`` if unprovable."""
+    raw = request.get("enqueued_at")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return (now.astimezone(timezone.utc) - stamp.astimezone(timezone.utc)).total_seconds()
+
+
+def request_staleness_problem(
+    request: Mapping[str, Any],
+    *,
+    config: IRRConfig,
+    now: datetime,
+) -> str | None:
+    """Return why a queued request is not worth paying for, or ``None``.
+
+    Uses only the producer's immutable ``enqueued_at``. A request with no usable
+    timestamp, a timestamp in the future, or an age beyond
+    ``OPIP_IRR_QUEUE_MAX_AGE_SECONDS`` is refused before any reservation, so a
+    backlog can never drain into paid calls on stale evidence.
+    """
+    age = queue_request_age_seconds(request, now=now)
+    if age is None:
+        return "TIMESTAMP"
+    if age < 0:
+        return "FUTURE"
+    if age > config.queue_max_age_seconds:
+        return "EXPIRED"
+    return None
+
 
 
 
@@ -1281,6 +1347,23 @@ def _process_queue_row(
             "symbol": request.get("symbol"),
             "direction": request.get("direction"),
             "error_type": identity_problem,
+        }
+        _append_evidence(row, now=now)
+        return row
+
+    staleness_problem = request_staleness_problem(request, config=config, now=now)
+    if staleness_problem is not None:
+        # Stale or unprovable evidence never reaches a reservation, so a backlog
+        # or a skewed clock cannot buy provider credit.
+        row = {
+            **base,
+            "status": STATUS_QUEUE_EXPIRED,
+            "symbol": request.get("symbol"),
+            "direction": request.get("direction"),
+            "enqueued_at": request.get("enqueued_at"),
+            "error_type": staleness_problem,
+            "charged_tokens": 0,
+            "charged_cost_usd": 0.0,
         }
         _append_evidence(row, now=now)
         return row

@@ -14,6 +14,15 @@ CAPTURE_DST="/etc/cron.d/opip-feature-bus-capture"
 FEV_CAPTURE_SRC="$APP_ROOT/deploy/cron.d/opip-feasibility-evidence-capture"
 FEV_CAPTURE_DST="/etc/cron.d/opip-feasibility-evidence-capture"
 LEGACY_MOVEMENT="/etc/cron.d/ohm-movement-discovery"
+# Stage-2 IRR advisory worker (v1.5.0 F12, SHADOW only). Installed ONLY when the
+# root-owned authorization marker explicitly authorizes it; an absent marker (the
+# default) means "not installed" and REMOVES any previously installed entry.
+IRR_SHADOW_SRC="$APP_ROOT/deploy/cron.d/opip-irr-shadow"
+IRR_SHADOW_DST="/etc/cron.d/opip-irr-shadow"
+IRR_SHADOW_AUTH_FILE="/var/lib/ohm-deploy/irr-shadow-scheduler.enabled"
+if [[ "${OPIP_DEPLOY_TEST_SEAMS:-0}" == "1" && -n "${OPIP_IRR_SHADOW_AUTH_FILE:-}" ]]; then
+  IRR_SHADOW_AUTH_FILE="$OPIP_IRR_SHADOW_AUTH_FILE"
+fi
 STREAM_RECONCILE="$APP_ROOT/deploy/remote/reconcile-stream-worker.sh"
 LEARNING_EXPORTER="$APP_ROOT/deploy/remote/export-opip-learning-evidence.sh"
 DEPLOY_SCRIPT_SRC="$APP_ROOT/deploy/remote/ohm-deploy"
@@ -38,30 +47,61 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exit 77
 fi
 
-for cmd in install crontab grep awk mktemp cp mv rm id; do
+for cmd in install crontab grep awk mktemp cp mv rm id tr; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "missing required command: $cmd" >&2
     exit 69
   }
 done
 
-for required in \
-  "$CANONICAL_SRC" \
-  "$CAPTURE_SRC" \
-  "$FEV_CAPTURE_SRC" \
-  "$LEARNING_EXPORT_SRC" \
-  "$STREAM_RECONCILE" \
-  "$LEARNING_EXPORTER" \
-  "$DEPLOY_SCRIPT_SRC" \
-  "$SSH_GATEWAY_SRC" \
-  "$LIBRARY_SRC" \
-  "$LEARNING_READER_SRC" \
-  "$LEARNING_DIAGNOSTICS_SRC"; do
+# Explicit installation authorization for the IRR advisory scheduler entry.
+# Default is ABSENT (nothing installed, and any stale entry is removed). A marker
+# that is not a readable regular file, or that holds anything other than exactly
+# `installed` or `absent`, fails closed BEFORE any mutation: a typo can neither
+# silently activate the worker nor silently drop an authorized one.
+irr_shadow_state="ABSENT"
+if [[ -e "$IRR_SHADOW_AUTH_FILE" ]]; then
+  if [[ ! -f "$IRR_SHADOW_AUTH_FILE" || -L "$IRR_SHADOW_AUTH_FILE" || ! -r "$IRR_SHADOW_AUTH_FILE" ]]; then
+    echo "IRR shadow scheduler authorization is not a readable regular file" >&2
+    exit 65
+  fi
+  irr_shadow_token="$(tr -d '\r\n' < "$IRR_SHADOW_AUTH_FILE")"
+  case "$irr_shadow_token" in
+    installed) irr_shadow_state="INSTALLED" ;;
+    absent) irr_shadow_state="ABSENT" ;;
+    *)
+      echo "IRR shadow scheduler authorization value is invalid" >&2
+      exit 65
+      ;;
+  esac
+fi
+
+required_artifacts=(
+  "$CANONICAL_SRC"
+  "$CAPTURE_SRC"
+  "$FEV_CAPTURE_SRC"
+  "$LEARNING_EXPORT_SRC"
+  "$STREAM_RECONCILE"
+  "$LEARNING_EXPORTER"
+  "$DEPLOY_SCRIPT_SRC"
+  "$SSH_GATEWAY_SRC"
+  "$LIBRARY_SRC"
+  "$LEARNING_READER_SRC"
+  "$LEARNING_DIAGNOSTICS_SRC"
+)
+# The IRR entry is required only when it is authorized; without authorization its
+# absence is the expected state and no install may happen.
+if [[ "$irr_shadow_state" == "INSTALLED" ]]; then
+  required_artifacts+=("$IRR_SHADOW_SRC")
+fi
+
+for required in "${required_artifacts[@]}"; do
   if [[ ! -s "$required" ]]; then
     echo "required production scheduler artifact missing: $required" >&2
     exit 69
   fi
 done
+
 
 # The deploy controller snapshots /usr/local/sbin/ohm-deploy before this script
 # runs, then keeps executing the old controller. A later rollback restores that
@@ -197,6 +237,7 @@ had_ml_evidence=0
 had_legacy=0
 had_capture=0
 had_fev_capture=0
+had_irr_shadow=0
 had_root_crontab=0
 
 snapshot_file() {
@@ -227,6 +268,13 @@ fi
 if [[ -e "$FEV_CAPTURE_DST" ]]; then
   cp -a "$FEV_CAPTURE_DST" "$tmpdir/fev-capture.before"
   had_fev_capture=1
+fi
+# The IRR entry is snapshotted whatever the authorization says: revoking
+# authorization must be able to restore exactly what was there before, and a
+# first-time install must be able to remove what it created.
+if [[ -e "$IRR_SHADOW_DST" ]]; then
+  cp -a "$IRR_SHADOW_DST" "$tmpdir/irr-shadow.before"
+  had_irr_shadow=1
 fi
 if [[ -e "$LEGACY_MOVEMENT" ]]; then
   cp -a "$LEGACY_MOVEMENT" "$tmpdir/legacy.before"
@@ -277,6 +325,11 @@ rollback() {
   else
     rm -f "$FEV_CAPTURE_DST"
   fi
+  if [[ "$had_irr_shadow" == "1" ]]; then
+    cp -a "$tmpdir/irr-shadow.before" "$IRR_SHADOW_DST"
+  else
+    rm -f "$IRR_SHADOW_DST"
+  fi
   if [[ "$had_legacy" == "1" ]]; then
     cp -a "$tmpdir/legacy.before" "$LEGACY_MOVEMENT"
   else
@@ -298,6 +351,15 @@ install -o root -g root -m 0644 "$CANONICAL_SRC" "$CANONICAL_DST"
 install -o root -g root -m 0644 "$LEARNING_EXPORT_SRC" "$LEARNING_EXPORT_DST"
 install -o root -g root -m 0644 "$CAPTURE_SRC" "$CAPTURE_DST"
 install -o root -g root -m 0644 "$FEV_CAPTURE_SRC" "$FEV_CAPTURE_DST"
+
+# Stage-2 IRR advisory scheduler entry: installed ONLY under explicit owner
+# authorization, otherwise guaranteed absent. Either way the entry runs the
+# isolated `opip-irr-shadow` Compose worker; it must never exec into the core.
+if [[ "$irr_shadow_state" == "INSTALLED" ]]; then
+  install -o root -g root -m 0644 "$IRR_SHADOW_SRC" "$IRR_SHADOW_DST"
+else
+  rm -f "$IRR_SHADOW_DST"
+fi
 
 # Refresh forced-command remote operations from the exact deployed SHA. This
 # keeps the production deploy gateway and read-only learning observability in
@@ -322,6 +384,23 @@ crontab "$tmpdir/root.after"
 grep -q 'app.jobs.run_cycle' "$CANONICAL_DST"
 grep -q 'export-opip-learning-evidence.sh' "$LEARNING_EXPORT_DST"
 grep -q 'capture_feasibility_evidence_shadow' "$FEV_CAPTURE_DST"
+
+# Post-condition for the IRR advisory entry: authorized => installed and running
+# the isolated worker; unauthorized => absent. `compose exec` inside the core is
+# always refused, because that would put the worker back into the core's 384 MB
+# cgroup and defeat the isolation this entry exists to provide.
+if [[ "$irr_shadow_state" == "INSTALLED" ]]; then
+  grep -q 'opip-irr-shadow' "$IRR_SHADOW_DST"
+  grep -q -- '--profile irr-shadow run --rm --no-deps' "$IRR_SHADOW_DST"
+  if grep -q 'compose exec' "$IRR_SHADOW_DST"; then
+    echo "IRR shadow scheduler entry must not exec inside the core container" >&2
+    false
+  fi
+elif [[ -e "$IRR_SHADOW_DST" ]]; then
+  echo "IRR shadow scheduler entry exists without authorization" >&2
+  false
+fi
+
 
 if [[ -e "$ML_EVIDENCE_DST" ]]; then
   echo "production ML evidence cron still exists" >&2
@@ -394,3 +473,11 @@ echo "learning_export_cadence=2 minutes + 40s offset"
 echo "learning_reader_observability=ENABLED"
 echo "fev_capture=$FEV_CAPTURE_DST"
 echo "fev_capture_cadence=1 minute (dual-gated SHADOW; inert unless Feature Bus AND writer are shadow)"
+echo "irr_shadow_scheduler=$irr_shadow_state"
+echo "irr_shadow_authorization=$IRR_SHADOW_AUTH_FILE"
+if [[ "$irr_shadow_state" == "INSTALLED" ]]; then
+  echo "irr_shadow_worker=docker compose --profile irr-shadow run --rm --no-deps opip-irr-shadow"
+  echo "irr_shadow_cadence=1 minute (bounded batch; OPIP_IRR_MODE=off is an inert no-op)"
+else
+  echo "irr_shadow_worker=ABSENT"
+fi

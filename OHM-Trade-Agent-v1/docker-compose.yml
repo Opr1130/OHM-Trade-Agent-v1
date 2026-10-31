@@ -330,6 +330,72 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # Isolated Stage-2 IRR advisory worker (v1.5.0 F12, shadow only). Ephemeral:
+  # created per scheduler pass, never started by `docker compose up` (profile
+  # gated) and removed on exit. Its own 96 MB memory cgroup is the point of the
+  # exercise: an advisory OOM must have no claim on the core's 384 MB allowance
+  # or on the protection workload, so it is never `exec`-ed into the core.
+  #
+  # Deliberately no shared environment file: the worker receives no funded or
+  # exchange credential, no Telegram token, no OpenAI key and no core
+  # release-profile switch. It gets exactly one secret (`DEEPSEEK_API_KEY`,
+  # interpolated from the owner `.env`) plus bounded `OPIP_IRR_*` controls. The
+  # provider origin and model are pinned as literals, so a stale `.env` cannot
+  # widen the endpoint or the model.
+  #
+  # The only writable host path is the dedicated IRR state subtree (queue in,
+  # evidence/spend/idempotence out). No alert, order, paper, canonical, trading
+  # or exchange registry is mounted at all. `timeout` lives in the service
+  # command, so a hung provider is terminated inside this container's cgroup.
+  opip-irr-shadow:
+    build: .
+    restart: "no"
+    profiles:
+      - irr-shadow
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      OPIP_IRR_MODE: "${OPIP_IRR_MODE:-off}"
+      OPIP_IRR_MODEL: "deepseek-flash"
+      OPIP_IRR_BASE_URL: "https://api.deepseek.com"
+      OPIP_IRR_TIMEOUT_SECONDS: "${OPIP_IRR_TIMEOUT_SECONDS:-20}"
+      OPIP_IRR_MAX_OUTPUT_TOKENS: "${OPIP_IRR_MAX_OUTPUT_TOKENS:-700}"
+      OPIP_IRR_REASONING_EFFORT: "${OPIP_IRR_REASONING_EFFORT:-high}"
+      OPIP_IRR_DRAIN_BATCH: "${OPIP_IRR_DRAIN_BATCH:-2}"
+      OPIP_IRR_QUEUE_MAX_AGE_SECONDS: "${OPIP_IRR_QUEUE_MAX_AGE_SECONDS:-1800}"
+      OPIP_IRR_DAILY_CALL_BUDGET: "${OPIP_IRR_DAILY_CALL_BUDGET:-24}"
+      OPIP_IRR_DAILY_TOKEN_BUDGET: "${OPIP_IRR_DAILY_TOKEN_BUDGET:-60000}"
+      OPIP_IRR_DAILY_COST_BUDGET_USD: "${OPIP_IRR_DAILY_COST_BUDGET_USD:-1.0}"
+      OPIP_IRR_MAX_CALL_COST_USD: "${OPIP_IRR_MAX_CALL_COST_USD:-0.05}"
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:-}"
+    command:
+      - timeout
+      - --signal=TERM
+      - --kill-after=5s
+      - "150"
+      - python
+      - -m
+      - app.jobs.drain_irr_shadow
+    volumes:
+      - ./data/irr:/app/data/irr
+    read_only: true
+    tmpfs:
+      - /tmp
+    mem_limit: 96m
+    memswap_limit: 96m
+    cpus: "0.15"
+    pids_limit: 64
+    oom_score_adj: 300
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 20s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
 networks:
   # Dedicated edge<->application network. It exists only so both ends carry a
   # pinned address: the webhook vhost proxies to 172.31.240.3 and the application

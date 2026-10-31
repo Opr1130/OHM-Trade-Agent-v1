@@ -14,33 +14,27 @@
 # (default 2, max 5), one attempt each with no retry, and every attempt reserves
 # its worst-case spend before the call.
 #
-# NOT INSTALLABLE YET -- two pre-activation requirements are unmet, and this file
-# is deliberately not in the approved scheduler allowlist
-# (deploy/remote/reconcile-scheduler.sh), so a deploy does not install it:
+# NOT INSTALLABLE YET -- activation requires BOTH of the following, and this
+# file stays out of the approved scheduler allowlist
+# (deploy/remote/reconcile-scheduler.sh) until an owner-authorized change adds
+# it, so a deploy neither installs nor removes this entry:
 #
-#   1. Scheduler allowlist. The approved scheduler reconciliation is an explicit
-#      allowlist (it installs ohm-unified-cycle, opip-learning-export,
-#      opip-feature-bus-capture and opip-feasibility-evidence-capture, and removes
-#      opip-ml-evidence / ohm-movement-discovery). Installing or removing THIS
-#      entry needs an approved change adding an IRR_SHADOW_SRC/DST pair plus the
-#      matching snapshot/rollback branch there. Until then it is inert by
-#      omission and no worker runs.
-#   2. Memory isolation. `docker compose exec` starts this process INSIDE the
-#      core container's 384 MB cgroup, so a worker spike is accounted against the
-#      core and the cgroup OOM killer may take the core's Python. The measured
-#      worker footprint is small (~33 MB working set on a Windows probe,
-#      ~68 KB Python heap peak, dominated by the httpx/ssl import), but it is
-#      still shared headroom the scanner was deliberately given its own 224 MB
-#      cgroup to avoid. Before activation this must run in its own memory cgroup
-#      (e.g. a `opip-irr-shadow` compose service with `mem_limit: 96m`,
-#      `restart: "no"`, no `.env.core`, invoked with
-#      `docker compose --profile irr-shadow run --rm -T ...`).
+#   1. Scheduler authorization. reconcile-scheduler.sh installs this entry only
+#      when the root-owned authorization marker
+#      /var/lib/ohm-deploy/irr-shadow-scheduler.enabled contains exactly
+#      `installed`. With no marker (the default) it installs nothing and removes
+#      any previously installed entry; any other content fails closed.
+#   2. Memory isolation. The worker runs as the isolated `opip-irr-shadow`
+#      Compose service (profile `irr-shadow`, mem_limit 96m, read_only, cap_drop
+#      ALL, no env_file, only ./data/irr mounted) and never `exec`s into the core
+#      container's 384 MB cgroup. The in-container `timeout` (150s) lives in the
+#      service command, so a hung provider is terminated inside that cgroup.
 #
-# Non-overlap: host `flock -n` plus the in-container consumer lock. Bounds: the
-# in-container `timeout` covers the whole batch, and each request has its own
-# bounded provider timeout, so a hung provider cannot hold the slot open.
-
+# Non-overlap: host `flock -n` plus the in-container consumer lock. Bounds: one
+# batch per pass (OPIP_IRR_DRAIN_BATCH, max 5), one bounded attempt per request,
+# and stale queue requests are refused before any paid call.
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-* * * * * root flock -n /var/run/opip-irr-shadow.lock -c 'cd /opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1 && /usr/bin/docker compose exec -T ohm-trade-agent timeout --signal=TERM --kill-after=5s 150 python -m app.jobs.drain_irr_shadow >> /var/log/opip-irr-shadow.log 2>&1'
+* * * * * root flock -n /var/run/opip-irr-shadow.lock -c 'cd /opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1 && /usr/bin/docker compose --profile irr-shadow run --rm --no-deps -T opip-irr-shadow >> /var/log/opip-irr-shadow.log 2>&1'
+
