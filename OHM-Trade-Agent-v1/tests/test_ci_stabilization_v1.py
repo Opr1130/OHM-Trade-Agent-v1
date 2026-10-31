@@ -17,7 +17,6 @@ from tests.atdd_scope import (  # noqa: E402
     check_contracts,
     load_acceptance_index,
     load_scope_contracts,
-    read_increment_pointer,
 )
 
 pytestmark = pytest.mark.acceptance
@@ -71,20 +70,20 @@ def test_ci_scope_coexists_without_repointing_active_increment():
     """ATDD-CI-STABILIZATION-M01/AC-003: CI paths approved; mixed scopes rejected."""
     contracts = load_scope_contracts(APP_ROOT / "docs" / "atdd" / "scope-contracts")
     acceptance = load_acceptance_index(APP_ROOT / "tests")
-    pointer = read_increment_pointer()
-    assert pointer != "ATDD-CI-STABILIZATION-M01"
+    scanner_increment = "ATDD-SCANNER-RELIABILITY-M01"
+    assert any(c.increment == scanner_increment for c in contracts)
     path = ".github/workflows/semgrep.yml"
-    good = check_contracts(contracts, acceptance, (path,), active_increment=pointer)
+    good = check_contracts(contracts, acceptance, (path,), active_increment=scanner_increment)
     assert good.passed, good.reasons
     unmapped = check_contracts(
         contracts, acceptance, ("OHM-Trade-Agent-v1/app/jobs/unapproved_ci.py",),
-        active_increment=pointer,
+        active_increment=scanner_increment,
     )
     assert unmapped.status == SCOPE_CHANGE_REQUIRED
     mixed = check_contracts(
         contracts,
         acceptance,
         (path, "OHM-Trade-Agent-v1/app/core/config.py"),
-        active_increment=pointer,
+        active_increment=scanner_increment,
     )
     assert mixed.status == SCOPE_CHANGE_REQUIRED
