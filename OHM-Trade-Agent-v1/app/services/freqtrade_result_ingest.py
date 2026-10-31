@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
-from typing import Any, Iterable
+from typing import Any
 
 from app.services.intelligence_journey import (
     EVENT_FILE as JOURNEY_EVENT_FILE,
