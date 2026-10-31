@@ -41,6 +41,10 @@ from app.opip.storage.bounded_jsonl import (
     encode_row,
     parse_json_object_line,
 )
+from app.opip.storage.producer_stream_epoch import (
+    StreamEpochError,
+    recover_compaction_locked,
+)
 from app.services.jsonl_retention import compact_jsonl_recent
 from app.services.registry_io import registry_lock
 
@@ -377,6 +381,10 @@ def _append_rows(
         lock = path.parent / f".{path.name}.lock"
         archive = _archive_for(path, max_bytes=max_bytes, keep_lines=keep_lines)
         with registry_lock(lock):
+            # Do not append to an unproven partially committed HOT rewrite.
+            # The safe choice is to drop this measurement batch rather than
+            # alter trading/scanner authority. A later invocation may recover.
+            recover_compaction_locked(path, archive.archive_dir)
             # One-time legacy backfill; steady state reads a tiny
             # cryptographic manifest-version sidecar. Learning window selection
             # never scans the lifetime archive.
@@ -401,7 +409,7 @@ def _append_rows(
                     path,
                     type(exc).__name__,
                 )
-    except (OSError, TimeoutError) as exc:
+    except (OSError, TimeoutError, StreamEpochError) as exc:
         logger.error(
             "O'Pip qualification append failed open; possible disk pressure "
             "path=%s error=%s",
