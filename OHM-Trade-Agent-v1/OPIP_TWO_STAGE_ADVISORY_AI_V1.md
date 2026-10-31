@@ -431,7 +431,7 @@ a future change raises the batch size or output cap, re-measure before raising
 ```text
 tests/test_opip_two_stage_stage1_openai_v1.py   6 test functions (9 cases)  Stage-1 contract
 tests/test_opip_irr_shadow_v1.py               36 tests                     Stage-2 ATDD
-tests/test_opip_irr_activation_v1.py            7 tests                     activation infrastructure
+tests/test_opip_irr_activation_v1.py            8 tests                     activation infrastructure
 ```
 
 Activation-infrastructure coverage (this increment):
