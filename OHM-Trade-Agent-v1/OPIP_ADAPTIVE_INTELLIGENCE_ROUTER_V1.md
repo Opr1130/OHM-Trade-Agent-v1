@@ -144,6 +144,19 @@ That allows later outcome analysis to compare signal quality and realized
 paper-trade performance by provider/model without letting historical learning
 alter current funded-trade authority.
 
+## Stage 2 — Independent Research & Risk Review (shadow only)
+
+Stage 2 (DeepSeek `deepseek-flash`) is documented separately in
+[`OPIP_TWO_STAGE_ADVISORY_AI_V1.md`](OPIP_TWO_STAGE_ADVISORY_AI_V1.md). It is
+default-`off`, shadow-only, and consumes exactly one provider credential
+(`DEEPSEEK_API_KEY`). The scan only queues immutable evidence for candidates
+that passed the final target, economic and portfolio gates; a dedicated bounded
+worker (`app.jobs.drain_irr_shadow`) performs the only provider call, so no scan,
+Chief review, Telegram delivery or protection cycle ever waits on it. It never
+changes a route, a gate, a ranking, an alert or an order; its only output is
+advisory metadata plus append-only shadow evidence.
+
+
 ## Safety boundaries
 
 The router module imports no exchange, order, position, Telegram, or execution
