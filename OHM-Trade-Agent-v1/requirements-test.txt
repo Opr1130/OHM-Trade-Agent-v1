@@ -1,0 +1,3 @@
+# Test runner only. Not installed by the production Dockerfile.
+# 9.0.3 fixes CVE-2025-71176; preserve a reproducible CI baseline.
+pytest==9.0.3
