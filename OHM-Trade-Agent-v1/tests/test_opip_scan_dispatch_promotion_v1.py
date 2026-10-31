@@ -230,3 +230,87 @@ def test_owner_env_is_the_last_resort_source(tmp_path):
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "isolated"
 
+
+
+# --- Deployment rollback: installed dispatcher belongs to the transaction ----
+
+DEPLOY = APP / "deploy" / "remote" / "ohm-deploy"
+
+
+def _deploy_function(name: str) -> str:
+    lines = _text(DEPLOY).splitlines()
+    start = next(
+        (i for i, line in enumerate(lines) if line.startswith(f"{name}() {{")), None
+    )
+    assert start is not None, f"{name} is missing from {DEPLOY.name}"
+    end = start
+    while lines[end] != "}":
+        end += 1
+    return "\n".join(lines[start : end + 1])
+
+
+def test_dispatcher_is_in_both_deploy_snapshot_and_restore_contracts():
+    """AC-007: the host dispatcher must roll back with scheduler state."""
+    text = _text(DEPLOY)
+    assert 'SCAN_DISPATCH_DST="/usr/local/bin/opip-scan-dispatch"' in text
+    mapping = "$SCAN_DISPATCH_DST|remote-op-scan-dispatch"
+    assert _deploy_function("snapshot_scheduler_state").count(mapping) == 1
+    assert _deploy_function("restore_scheduler_state").count(mapping) == 1
+
+
+@requires_bash
+@pytest.mark.parametrize("previous_exists", [True, False])
+def test_deployment_rollback_restores_dispatcher_presence(tmp_path, previous_exists):
+    """AC-007: rollback restores prior dispatcher bytes or removes a new install.
+
+    Exercise the real deploy functions, substituting only sandbox destinations
+    and a harmless crontab stub. Never touch real cron, installed scripts or
+    production state.
+    """
+    state = tmp_path / "state"
+    cron = tmp_path / "cron"
+    state.mkdir()
+    cron.mkdir()
+    dest = tmp_path / "scan-dispatch"
+    # Replace only the real cron directory with a sandbox; every other
+    # install target is defined as a separate file under tmp_path.
+    functions = "\n".join(
+        _deploy_function(name).replace("/etc/cron.d/", f"{cron.as_posix()}/")
+        for name in (
+            "replace_file_atomically",
+            "snapshot_scheduler_state",
+            "restore_scheduler_state",
+        )
+    )
+    setup = "\n".join(
+        f'{name}="{(tmp_path / name.lower()).as_posix()}"'
+        for name in (
+            "DEPLOY_SCRIPT_DST",
+            "SSH_GATEWAY_DST",
+            "LEARNING_READER_DST",
+            "LEARNING_DIAGNOSTICS_DST",
+        )
+    )
+    script = (
+        "set -Eeuo pipefail\n"
+        f'STATE_DIR="{state.as_posix()}"\n'
+        f'SCAN_DISPATCH_DST="{dest.as_posix()}"\n'
+        'SCHEDULER_SNAPSHOT=""\n'
+        f"{setup}\n"
+        "crontab() { return 1; }\n"
+        f"{functions}\n"
+        + ('printf "previous\\n" > "$SCAN_DISPATCH_DST"\n' if previous_exists else "")
+        + 'snapshot_scheduler_state\n'
+        + 'printf "candidate\\n" > "$SCAN_DISPATCH_DST"\n'
+        + 'restore_scheduler_state\n'
+        + ('grep -qx previous "$SCAN_DISPATCH_DST"\n' if previous_exists else 'test ! -e "$SCAN_DISPATCH_DST"\n')
+    )
+    result = subprocess.run(
+        [BASH, "-c", script],
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        timeout=30,
+    )
+    _skip_if_bash_cannot_fork(result)
+    assert result.returncode == 0, result.stderr
