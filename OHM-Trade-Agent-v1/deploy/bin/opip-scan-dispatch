@@ -50,6 +50,43 @@ raise SystemExit(0 if age > limit else 1)
 PY
 }
 
+resolve_exec_mode() {
+  # The execution mode is resolved from the SAME environment the core reads.
+  #
+  # The one scheduler this release installs is cron, and cron exports nothing
+  # from `.env`; reading this process's environment alone made the qualification
+  # stage unreachable whenever the application was configured for isolated
+  # execution. Acquisition would still complete (stage 4 needs no mode), the
+  # result would be promoted by nobody — in-cycle qualification is removed, so
+  # `scan_promotion_runner` is the only path — and the symptom would look exactly
+  # like "the market produced no qualified signals".
+  #
+  # Precedence: explicit process environment, then the derived core environment
+  # the application actually consumes (`.env.core`), then the owner's `.env`.
+  # Exactly one definition per file; a duplicate is ambiguous and never guessed.
+  local file count line
+  if [ -n "${OPIP_SCAN_EXECUTION_MODE:-}" ]; then
+    printf '%s' "$OPIP_SCAN_EXECUTION_MODE"
+    return 0
+  fi
+  for file in "${OPIP_CORE_ENV_FILE:-$REPO_DIR/.env.core}" "$REPO_DIR/.env"; do
+    [ -f "$file" ] || continue
+    count="$(grep -cE '^[[:space:]]*(export[[:space:]]+)?OPIP_SCAN_EXECUTION_MODE[[:space:]]*=' "$file" 2>/dev/null || true)"
+    case "${count:-0}" in
+      0) continue ;;
+      1) line="$(grep -m 1 -E '^[[:space:]]*(export[[:space:]]+)?OPIP_SCAN_EXECUTION_MODE[[:space:]]*=' "$file")"
+         line="${line#*=}"
+         line="$(printf '%s' "$line" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+         case "$line" in \"*\") line="${line#\"}"; line="${line%\"}" ;; \'*\') line="${line#\'}"; line="${line%\'}" ;; esac
+         printf '%s' "$line"
+         return 0 ;;
+      *) printf '%s' "AMBIGUOUS"
+         return 0 ;;
+    esac
+  done
+  printf '%s' ""
+}
+
 # Capture exit state for one container. Written before removal, always.
 capture_exit() {
   cid="$1"; attempt="$2"
@@ -112,20 +149,57 @@ done < <(docker ps -aq --filter "label=${LABEL}" --filter "status=exited" 2>/dev
 # AI review, market validation and notification delivery are unbounded in time,
 # so they run detached under their own lock. A hung qualification therefore
 # cannot hold the unified-cycle lock and cannot delay the next protection pass.
-# This stage runs every tick, independent of any new acquisition.
 # This stage runs every tick — independent of scan cadence — but only when
 # isolated execution is actually configured. In the legacy or suspended modes
 # there is nothing to promote and no detached job should be started at all.
-if [ "${OPIP_SCAN_EXECUTION_MODE:-}" = "isolated" ]; then
-  exec 8>"/var/run/ohm-qualify.lock" 2>/dev/null || true
-  if flock -n 8 2>/dev/null; then
-    nohup setsid docker compose exec -T ohm-trade-agent \
-      python -m app.services.scan_promotion_runner \
-      >> "${LOG_DIR}/ohm-scan-qualify.log" 2>&1 &
-    log "qualification stage dispatched"
-  fi
-  exec 8>&-
-fi
+QUALIFY_LOCK="${OPIP_QUALIFY_LOCK:-/var/run/ohm-qualify.lock}"
+MODE="$(resolve_exec_mode)"
+
+record_promotion_state() {
+  # <state> <reason_code>: durable, atomic, and never fatal to the dispatcher
+  # (delivery telemetry must not become a control-plane failure). No value from
+  # `.env` is ever printed beyond the already-non-secret mode string.
+  local tmp="${STATE_DIR}/.promotion_state.$$"
+  printf '{"schema_version":1,"state":"%s","reason_code":"%s","resolved_mode":"%s","observed_at":"%s"}\n' \
+    "$1" "$2" "$MODE" "$(utc)" > "$tmp" 2>/dev/null || return 0
+  mv -f "$tmp" "${STATE_DIR}/promotion_state.json" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+  return 0
+}
+
+case "$MODE" in
+  isolated)
+    exec 8>"$QUALIFY_LOCK" 2>/dev/null || true
+    if flock -n 8 2>/dev/null; then
+      nohup setsid docker compose exec -T ohm-trade-agent \
+        python -m app.services.scan_promotion_runner \
+        >> "${LOG_DIR}/ohm-scan-qualify.log" 2>&1 &
+      record_promotion_state DISPATCHED MODE_ISOLATED
+      log "qualification stage dispatched"
+    else
+      record_promotion_state DEFERRED QUALIFY_LOCK_HELD
+      log "qualification stage deferred: another promotion holds ${QUALIFY_LOCK}"
+    fi
+    exec 8>&-
+    ;;
+  legacy_inprocess | suspended)
+    log "qualification stage skipped: mode=${MODE} (authorised)"
+    ;;
+  "")
+    record_promotion_state SKIPPED EXECUTION_MODE_UNSET
+    log "WARN qualification stage SKIPPED: no execution mode in the process env, .env.core or .env"
+    ;;
+  AMBIGUOUS)
+    record_promotion_state SKIPPED EXECUTION_MODE_AMBIGUOUS
+    log "WARN qualification stage SKIPPED: OPIP_SCAN_EXECUTION_MODE is defined more than once; refusing to guess"
+    ;;
+  *)
+    # Never a silent suppression: an unprovable mode is recorded where an
+    # operator looks, so "promotion never ran" can never masquerade as
+    # "nothing qualified".
+    record_promotion_state SKIPPED EXECUTION_MODE_UNRESOLVED
+    log "WARN qualification stage SKIPPED: execution mode '${MODE}' is not one of isolated|legacy_inprocess|suspended"
+    ;;
+esac
 
 # --- 4. Act only on an authorised, unexpired token -------------------------
 [ -s "$TOKEN" ] || exit 0
