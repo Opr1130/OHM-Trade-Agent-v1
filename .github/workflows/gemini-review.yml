@@ -7,10 +7,6 @@ on:
         description: "Pull request number to review"
         required: true
         type: string
-  push:
-    branches: [main]
-    paths:
-      - .github/ai-review-pr69.trigger
 
 permissions:
   contents: read
@@ -23,7 +19,7 @@ jobs:
     timeout-minutes: 15
     env:
       GEMINI_MODEL: gemini-3.7-flash
-      PR_NUMBER: ${{ github.event_name == 'workflow_dispatch' && inputs.pr_number || '69' }}
+      PR_NUMBER: ${{ inputs.pr_number }}
 
     steps:
       - name: Checkout trusted review configuration
@@ -141,4 +137,4 @@ jobs:
         run: |
           gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -f body="## Gemini Independent Review
 
-REVIEW_WORKFLOW_FAILED. Inspect the Gemini PR Review Actions run before relying on this review gate." >/dev/null || true
+          REVIEW_WORKFLOW_FAILED. Inspect the Gemini PR Review Actions run before relying on this review gate." >/dev/null || true
