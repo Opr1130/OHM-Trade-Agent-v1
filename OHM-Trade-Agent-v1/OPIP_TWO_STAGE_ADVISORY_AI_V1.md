@@ -116,9 +116,23 @@ at all and adds no Stage-2 field.
    `target_quality_qualified is True`, `economic_qualified is True`, and a
    portfolio rank from the capital/portfolio gate.
 3. The worker **re-checks** that qualification before spending, so a buggy or
-   tampered queue record cannot buy a call.
+   tampered queue record cannot buy a call, and it verifies the persisted
+   evidence against the stored digest and request identity (see below).
 4. The worker drains at most `OPIP_IRR_DRAIN_BATCH` (default 2, max 5) requests
    per pass.
+
+### Pre-request evidence verification (before any spend)
+
+For every queued row the worker recomputes `evidence_digest(evidence)` and
+requires it to equal the digest the producer stored, requires
+`request_id == sha256(digest|model|prompt_version)` (the expected request
+identity), and requires the declared `stage`, `evidence_copy_version`,
+`authority`, provider, symbol and direction to match the evidence itself. Any
+mismatch returns `EVIDENCE_MISMATCH` with the failing field as `error_type`
+(`DIGEST`, `REQUEST_ID`, `SYMBOL`, `DIRECTION`, `PROVIDER`, `STAGE`, `VERSION`,
+`AUTHORITY`) and **no** reservation and **no** provider call. Proven by
+`test_worker_refuses_queue_evidence_that_does_not_match_its_digest`.
+
 
 ### Immutable evidence copy
 
@@ -236,6 +250,7 @@ second paid call.
 | model not provider-documented | `UNVERIFIED_MODEL` |
 | endpoint not approved | `CONFIGURATION_ERROR` (no call) |
 | evidence lacks final qualification | `NOT_QUALIFIED` (no spend) |
+| evidence/digest/identity mismatch | `EVIDENCE_MISMATCH` (no spend, no call) |
 | timeout / transport / non-200 | `FAILED` with `TIMEOUT` / `TRANSPORT_ERROR` / `HTTP_ERROR`, charged |
 | malformed or blank answer | `FAILED` with `MALFORMED_RESPONSE`, charged |
 | spend unverifiable | `SPEND_UNVERIFIABLE` (no call) |
@@ -324,6 +339,64 @@ is created, changed or read here.
    `OPIP_IRR_MODE` (or setting it to `off`) makes both the producer and the
    worker inert without a code change.
 
+## Scheduler installation and removal (verified, not executed)
+
+`deploy/cron.d/opip-irr-shadow` is a release-tree artifact only. The approved
+scheduler process is `deploy/remote/reconcile-scheduler.sh`, and it is an
+**explicit allowlist**, not a directory scan:
+
+* it requires an exact set of source artifacts, snapshots the known
+  `/etc/cron.d` destinations plus the root crontab, installs
+  `ohm-unified-cycle`, `opip-learning-export`, `opip-feature-bus-capture` and
+  `opip-feasibility-evidence-capture` with `install -o root -g root -m 0644`,
+  removes `opip-ml-evidence` and `ohm-movement-discovery`, prunes legacy root
+  crontab lines, and restores the snapshot on any error (`trap rollback ERR`);
+* `opip-irr-shadow` is **not** in that allowlist, so a deploy of this SHA will
+  neither install nor remove it. As merged, Stage 2 is therefore inert by
+  omission: no cron entry, no worker, no spend.
+
+Activation therefore needs a separate, approved change to
+`deploy/remote/reconcile-scheduler.sh` that adds an `IRR_SHADOW_SRC`/`_DST` pair
+to the required-artifact check, the pre-install snapshot, the `install -m 0644`
+line and the `rollback` restore branch — exactly the pattern used for
+`opip-feature-bus-capture`. Removal is the matching rollback/allowlist removal,
+plus `rm -f /etc/cron.d/opip-irr-shadow`; both stay inside the existing
+owner-gated deploy path. **This PR does not modify the scheduler script and does
+not install anything.**
+
+## Memory and resource isolation (finding: not yet demonstrable)
+
+The planned invocation is `docker compose exec -T ohm-trade-agent ...`, which
+starts a **second process inside the core container**, so it is accounted to the
+core's `mem_limit: 384m` cgroup. Measured worker footprint (local probe, one
+queued request and one full drain):
+
+| Metric | Value |
+| --- | --- |
+| Python heap peak (`tracemalloc`, whole pass) | ~68 KB |
+| RSS after importing the worker module | ~32 MB (Windows working set) |
+| RSS after enqueue + full drain | ~33 MB; delta over import ≈ 0.6 MB |
+| Dominant contributor | interpreter + `httpx`/`ssl` import |
+
+The worker itself is small, but it consumes **shared** headroom: a batch of two
+attempts, each bounded by `OPIP_IRR_TIMEOUT_SECONDS` (up to 60 s) and an
+in-container `timeout 150`, can coexist with a transient core spike, and the
+cgroup OOM killer selects the largest task — normally the core's Python. The
+scanner already has its own 224 MB cgroup for exactly this reason, so sharing
+the core's allowance with an advisory worker contradicts the established
+isolation posture and cannot be demonstrated safe from here (no production
+headroom measurement, no cgroup instrumentation).
+
+**Minimal correction required before activation:** run the worker in its own
+memory cgroup instead of `exec`-ing into the core — a `opip-irr-shadow` compose
+service on the same image with `mem_limit: 96m`, `restart: "no"`, no
+`env_file: .env.core` (only `OPIP_IRR_*` and `DEEPSEEK_API_KEY`), invoked as
+`docker compose --profile irr-shadow run --rm -T opip-irr-shadow python -m
+app.jobs.drain_irr_shadow`. That bounds an IRR OOM to the worker container and
+keeps the core's 384 MB untouched. It is a compose + scheduler-allowlist change
+and is deliberately **not** included in this PR.
+
+
 ## Tests added by this PR
 
 ```text
@@ -338,6 +411,7 @@ mandated proofs):
   `test_hung_provider_never_delays_the_primary_pipeline` (slow/hung provider).
 * `test_producer_enqueues_only_finally_qualified_survivors`,
   `test_worker_refuses_evidence_without_final_qualification`,
+  `test_worker_refuses_queue_evidence_that_does_not_match_its_digest`,
   `test_evidence_copy_is_immutable_and_digest_verifiable`.
 * `test_reservation_is_written_before_the_provider_call`,
   `test_concurrent_attempts_cannot_overspend`,
@@ -382,9 +456,10 @@ mandated proofs):
    routing change that requires its own approved PR.
 4. **`gpt-6.1-sol` is not the code default.** `Settings.openai_model` remains
    `gpt-5.6`; switching is an owner configuration change.
-5. **The worker needs its own scheduler entry.** Until `opip-irr-shadow` is
-   installed, queued evidence accumulates and is drained later; nothing is lost,
-   nothing is spent.
+5. **Two activation prerequisites are unmet and out of this PR's scope** (details
+   above): the `opip-irr-shadow` entry is not in the approved scheduler
+   allowlist, and the worker still shares the core's 384 MB cgroup instead of
+   running in its own memory cgroup.
 6. **Queue retention.** The IRR queue is append-only and bounded per scan; it is
    not compacted. Compaction/archival is a separate retention decision.
 7. **No operator surface yet.** The verdict is available in the evidence journal

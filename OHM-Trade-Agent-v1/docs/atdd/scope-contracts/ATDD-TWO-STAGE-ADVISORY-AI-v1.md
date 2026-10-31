@@ -144,6 +144,7 @@ AC-003 -> tests/test_opip_irr_shadow_v1.py::test_chief_review_performs_no_provid
 AC-003 -> tests/test_opip_irr_shadow_v1.py::test_hung_provider_never_delays_the_primary_pipeline
 AC-004 -> tests/test_opip_irr_shadow_v1.py::test_producer_enqueues_only_finally_qualified_survivors
 AC-004 -> tests/test_opip_irr_shadow_v1.py::test_worker_refuses_evidence_without_final_qualification
+AC-004 -> tests/test_opip_irr_shadow_v1.py::test_worker_refuses_queue_evidence_that_does_not_match_its_digest
 AC-004 -> tests/test_opip_irr_shadow_v1.py::test_evidence_copy_is_immutable_and_digest_verifiable
 AC-004 -> tests/test_opip_irr_shadow_v1.py::test_non_advisory_provider_fields_are_dropped
 AC-005 -> tests/test_opip_irr_shadow_v1.py::test_reservation_is_written_before_the_provider_call

@@ -90,6 +90,7 @@ STATUS_CONFIGURATION_ERROR = "CONFIGURATION_ERROR"
 STATUS_MISSING_CREDENTIAL = "MISSING_CREDENTIAL"
 STATUS_UNVERIFIED_MODEL = "UNVERIFIED_MODEL"
 STATUS_NOT_QUALIFIED = "NOT_QUALIFIED"
+STATUS_EVIDENCE_MISMATCH = "EVIDENCE_MISMATCH"
 STATUS_SUCCEEDED = "SUCCEEDED"
 STATUS_FAILED = "FAILED"
 STATUS_BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
@@ -503,6 +504,45 @@ def qualification_passed(evidence: Mapping[str, Any]) -> bool:
     if qualification.get("economic_qualified") is not True:
         return False
     return _portfolio_rank(qualification.get("portfolio_rank")) is not None
+
+
+def evidence_identity_problem(
+    request: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+) -> str | None:
+    """Return why a queued row does not match its stored identity, or ``None``.
+
+    The worker verifies the persisted evidence against the digest and request id
+    the producer wrote, and against the declared provider/stage/identity, before
+    it may reserve or spend anything. A mutated or mis-filed queue row is
+    refused without a provider call.
+    """
+    if evidence.get("stage") != STAGE:
+        return "STAGE"
+    if evidence.get("evidence_copy_version") != "IRR-EVIDENCE-COPY-V2":
+        return "VERSION"
+    if evidence.get("authority") != "advisory_only":
+        return "AUTHORITY"
+
+    recomputed = evidence_digest(evidence)
+    stored_digest = request.get("evidence_digest")
+    if not isinstance(stored_digest, str) or stored_digest != recomputed:
+        return "DIGEST"
+    expected_request_id = idempotency_key(digest=recomputed, model=DEFAULT_MODEL)
+    if request.get("request_id") != expected_request_id:
+        return "REQUEST_ID"
+
+    if str(request.get("symbol") or "") != str(evidence.get("symbol") or ""):
+        return "SYMBOL"
+    if str(request.get("direction") or "").upper() != str(
+        evidence.get("direction") or ""
+    ).upper():
+        return "DIRECTION"
+    stored_provider = request.get("provider")
+    if stored_provider is not None and stored_provider != PROVIDER:
+        return "PROVIDER"
+    return None
+
 
 
 def estimate_cost_usd(*, input_tokens: int, output_tokens: int) -> float:
@@ -1229,6 +1269,18 @@ def _process_queue_row(
             "symbol": request.get("symbol"),
             "direction": request.get("direction"),
             "error_type": "QUALIFICATION",
+        }
+        _append_evidence(row, now=now)
+        return row
+
+    identity_problem = evidence_identity_problem(request, evidence)
+    if identity_problem is not None:
+        row = {
+            **base,
+            "status": STATUS_EVIDENCE_MISMATCH,
+            "symbol": request.get("symbol"),
+            "direction": request.get("direction"),
+            "error_type": identity_problem,
         }
         _append_evidence(row, now=now)
         return row

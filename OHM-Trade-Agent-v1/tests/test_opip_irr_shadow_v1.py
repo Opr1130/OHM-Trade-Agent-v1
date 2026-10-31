@@ -412,6 +412,40 @@ def test_worker_refuses_evidence_without_final_qualification(monkeypatch):
     assert _ledger() == []
 
 
+def test_worker_refuses_queue_evidence_that_does_not_match_its_digest(monkeypatch):
+    """ATDD-TWO-STAGE-ADVISORY-AI-v1/AC-004: a mutated queue row never spends."""
+    _enable_shadow(monkeypatch)
+    _enqueue()
+    row = _journal(irr.QUEUE_FILE)[0]
+    row["evidence"]["deterministic_candidate_evidence"]["technical_score"] = 1
+    irr.QUEUE_FILE.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    post = make_post(challenge=_challenge())
+
+    result = irr.drain_queue(post=post)
+
+    refused = result["results"][0]
+    assert refused["status"] == irr.STATUS_EVIDENCE_MISMATCH
+    assert refused["error_type"] == "DIGEST"
+    assert post.calls == []
+    assert _ledger() == []
+
+    # The same applies when the stored request identity was rewritten.
+    irr.QUEUE_FILE.write_text("", encoding="utf-8")
+    irr.QUEUE_CHECKPOINT_FILE.unlink(missing_ok=True)
+    _enqueue(_alert(symbol="ADAUSD"))
+    tampered = _journal(irr.QUEUE_FILE)[-1]
+    tampered["request_id"] = "0" * 64
+    irr.QUEUE_FILE.write_text(json.dumps(tampered) + "\n", encoding="utf-8")
+
+    second = irr.drain_queue(post=post)
+
+    assert second["results"][0]["status"] == irr.STATUS_EVIDENCE_MISMATCH
+    assert second["results"][0]["error_type"] == "REQUEST_ID"
+    assert post.calls == []
+    assert _ledger() == []
+
+
+
 def test_evidence_copy_is_immutable_and_digest_verifiable(monkeypatch):
     """ATDD-TWO-STAGE-ADVISORY-AI-v1/AC-004: evidence is immutable and digested."""
     _enable_shadow(monkeypatch)
