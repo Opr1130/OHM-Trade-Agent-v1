@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -1015,19 +1016,45 @@ class CaptureProcessLock:
         self.acquired = False
 
     def acquire(self) -> bool:
-        fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o644)
+        # Both evidence producers share this lock implementation but retain
+        # distinct, stable lock PATHS. Never unlink/recreate a live lock inode.
+        # A predictable /tmp filename must not follow an attacker-owned link,
+        # block opening a FIFO, or write to a nonregular or unowned inode.
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NONBLOCK", 0)
+        if os.name == "posix":
+            if not hasattr(os, "O_NOFOLLOW"):
+                raise RuntimeError("capture lock requires O_NOFOLLOW on POSIX")
+            flags |= os.O_NOFOLLOW
+        elif os.path.islink(self._path):
+            # Windows has no POSIX O_NOFOLLOW; reject known reparse/symlink
+            # paths. The production Linux runtime uses the atomic OS flag.
+            raise OSError("capture lock cannot be a symbolic link")
+
+        fd = os.open(self._path, flags, 0o600)
         try:
-            # Some platforms (Windows msvcrt) require the locked region to exist.
-            if os.fstat(fd).st_size == 0:
+            identity = os.fstat(fd)
+            if (
+                not stat.S_ISREG(identity.st_mode)
+                or identity.st_nlink != 1
+                or (hasattr(os, "geteuid") and identity.st_uid != os.geteuid())
+                or identity.st_mode & 0o022
+            ):
+                raise PermissionError(
+                    "capture lock must be a singly linked, owned, "
+                    "non-group-writable regular file"
+                )
+            # Some platforms (Windows msvcrt) require one byte in the region.
+            if identity.st_size == 0:
                 os.write(fd, b"\0")
-        except OSError:
-            pass
-        if not _try_lock_fd(fd):
-            os.close(fd)
-            return False
-        self._fd = fd
-        self.acquired = True
-        return True
+            if not _try_lock_fd(fd):
+                return False
+            self._fd = fd
+            self.acquired = True
+            fd = -1  # Transfer the open descriptor to this lock instance.
+            return True
+        finally:
+            if fd >= 0:
+                os.close(fd)
 
     def release(self) -> None:
         fd = self._fd
