@@ -25,6 +25,8 @@ import yaml
 from app.services import independent_research_review as irr
 
 
+pytestmark = pytest.mark.acceptance
+
 ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = ROOT / "docker-compose.yml"
 CRON = ROOT / "deploy/cron.d/opip-irr-shadow"
