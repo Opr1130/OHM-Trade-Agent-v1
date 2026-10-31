@@ -363,6 +363,23 @@ install -o root -g root -m 0644 "$LIBRARY_SRC" "$LIBRARY_STAGED"
 mv -f "$LIBRARY_STAGED" "$LIBRARY_DST"
 echo "OPIP_RELEASE_TREE_LIBRARY_INSTALLED=$LIBRARY_DST"
 
+# The canonical cron entry invokes /usr/local/bin/opip-scan-dispatch. No other
+# part of the release installs it, so the dispatcher must arrive from the exact
+# deployed SHA and be syntax-gated, exactly like the source library above:
+# a dispatcher that does not parse is never installed at all.
+DISPATCH_SRC="$APP_ROOT/deploy/bin/opip-scan-dispatch"
+DISPATCH_DST="/usr/local/bin/opip-scan-dispatch"
+if ! bash -n "$DISPATCH_SRC"; then
+  echo "scan dispatcher fails syntax validation; refusing to install it" >&2
+  false
+fi
+install -d -o root -g root -m 0755 "$(dirname "$DISPATCH_DST")"
+DISPATCH_STAGED="$(mktemp "$(dirname "$DISPATCH_DST")/.opip-scan-dispatch.stage.XXXXXX")"
+rm -f "$DISPATCH_STAGED"
+install -o root -g root -m 0755 "$DISPATCH_SRC" "$DISPATCH_STAGED"
+mv -f "$DISPATCH_STAGED" "$DISPATCH_DST"
+echo "OPIP_SCAN_DISPATCH_INSTALLED=$DISPATCH_DST"
+
 trap - ERR
 rm -rf "$tmpdir"
 
