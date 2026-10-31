@@ -274,12 +274,15 @@ def check_contracts(
         # CI maintenance may run alongside an active product increment without
         # moving its pointer. Only an exclusively mapped, traced maintenance
         # change set qualifies; mixed/unmapped changes still fail closed.
-        ci_contracts = [
-            item for item in contracts
-            if item.increment in {
-                "ATDD-CI-STABILIZATION-M01",
-                "ATDD-RUFF-IMPORT-CLEANUP-M01",
-            }
+        maintenance_ids = frozenset({
+            "ATDD-CI-STABILIZATION-M01",
+            "ATDD-PYTEST-ISOLATION-M01",
+            "ATDD-RUFF-IMPORT-CLEANUP-M01",
+        })
+        # The entire change set must match ONE fully traced maintenance scope.
+        # A mixed application/CI patch or path from different scopes fails closed.
+        maintenance_contracts = [
+            item for item in contracts if item.increment in maintenance_ids
         ]
         if changed_files:
             try:
@@ -289,12 +292,12 @@ def check_contracts(
             except ValueError:
                 normalized = ()
             if normalized:
-                matching = [
-                    item for item in ci_contracts
+                matches = [
+                    item for item in maintenance_contracts
                     if all(path in _allow_paths(item) for path in normalized)
                 ]
-                if len(matching) == 1:
-                    allowed = _allow_paths(matching[0])
+                if len(matches) == 1:
+                    allowed = _allow_paths(matches[0])
         _authorize_changed_files(changed_files, allowed, scope_reasons)
     return _result(scope_reasons, trace_reasons)
 
