@@ -250,7 +250,7 @@ def _deploy_function(name: str) -> str:
 
 
 def test_dispatcher_is_in_both_deploy_snapshot_and_restore_contracts():
-    """AC-007: the host dispatcher must roll back with scheduler state."""
+    """ATDD-SCANNER-RELIABILITY-M01/AC-007: dispatcher rollback contract."""
     text = _text(DEPLOY)
     assert 'SCAN_DISPATCH_DST="/usr/local/bin/opip-scan-dispatch"' in text
     mapping = "$SCAN_DISPATCH_DST|remote-op-scan-dispatch"
@@ -261,7 +261,7 @@ def test_dispatcher_is_in_both_deploy_snapshot_and_restore_contracts():
 @requires_bash
 @pytest.mark.parametrize("previous_exists", [True, False])
 def test_deployment_rollback_restores_dispatcher_presence(tmp_path, previous_exists):
-    """AC-007: rollback restores prior dispatcher bytes or removes a new install.
+    """ATDD-SCANNER-RELIABILITY-M01/AC-007: restore prior dispatcher bytes or absence.
 
     Exercise the real deploy functions, substituting only sandbox destinations
     and a harmless crontab stub. Never touch real cron, installed scripts or
