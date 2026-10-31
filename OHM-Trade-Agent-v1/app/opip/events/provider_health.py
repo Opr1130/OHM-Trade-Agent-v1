@@ -11,7 +11,7 @@ MISSING_CREDENTIALS / DEGRADED.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable

@@ -7,7 +7,7 @@ O'Pip knew the mapping by the event ingestion time being evaluated.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 import re
 from typing import Any

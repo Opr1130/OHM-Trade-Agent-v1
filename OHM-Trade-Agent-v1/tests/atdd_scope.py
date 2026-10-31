@@ -277,6 +277,7 @@ def check_contracts(
         maintenance_ids = frozenset({
             "ATDD-CI-STABILIZATION-M01",
             "ATDD-PYTEST-ISOLATION-M01",
+            "ATDD-RUFF-IMPORT-CLEANUP-M01",
         })
         # The entire change set must match ONE fully traced maintenance scope.
         # A mixed application/CI patch or path from different scopes fails closed.

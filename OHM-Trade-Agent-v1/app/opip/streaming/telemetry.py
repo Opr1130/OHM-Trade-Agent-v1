@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
 
 from app.opip.streaming.contract import StreamProvider, StreamTransportState
 from app.opip.streaming.queueing import QueueSnapshot
