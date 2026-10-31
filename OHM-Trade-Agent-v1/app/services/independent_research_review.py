@@ -1,39 +1,52 @@
-"""O'Pip Stage-2 Independent Research & Risk Review (IRR).
+"""O'Pip Stage-2 Independent Research & Risk Review (IRR), shadow-only.
 
-This is the F12 advisory-research surface of architecture v1.5.0: an
-independent, *shadow-only* challenge to an already-qualified Chief
-recommendation. It exists to produce evidence, never influence.
+F12 advisory research for architecture v1.5.0. An independent provider is asked
+to challenge an **already finally-qualified** recommendation. The answer is
+evidence, never influence.
+
+Pipeline shape (this is what makes the advisory paths independent):
+
+* **Producer** — :func:`enqueue_final_qualified` runs inside the scan after the
+  final deterministic target, economic and portfolio/capital gates have passed.
+  It performs bounded local append-only I/O only: **no network call ever runs on
+  the scan, Chief or Telegram path**.
+* **Consumer** — :func:`drain_queue` runs in its own bounded process/job
+  (``python -m app.jobs.drain_irr_shadow``) on the existing scheduler, so a slow
+  or hung provider cannot delay a scan, a Chief review, a Telegram delivery or
+  an F11 protection cycle.
 
 Hard boundaries (proven by ``tests/test_opip_irr_shadow_v1.py``):
 
-* the Chief conclusion, ranking, alert set, risk limits, capital, canonical
-  decisions and exchange/paper paths are never modified;
-* this module imports no ranking, risk, execution, exchange, Telegram or
-  canonical-writer module;
-* any provider failure, malformed answer or exhausted budget is contained and
-  can never block or fail the Chief review;
-* the provider credential is read from ``DEEPSEEK_API_KEY`` only, is never
-  written to the evidence journal, and is never printed.
+* the Chief conclusion, ranking, alert set, risk, capital, canonical decisions,
+  paper state, order paths and Telegram delivery are never modified;
+* this module imports no ranking, risk, execution, exchange, Telegram, canonical
+  or learning module;
+* provider failures, malformed answers, exhausted budgets or an unreadable spend
+  ledger are contained and can never block or fail the primary pipeline;
+* the credential is read from ``DEEPSEEK_API_KEY`` only and is never written to
+  a journal, a message or stdout;
+* requests go to the one explicitly approved provider endpoint. An arbitrary
+  HTTPS host is refused before any credential is attached.
 
-The adapter is deliberately a direct, single-attempt HTTP call to the
-provider's documented OpenAI-compatible Chat Completions endpoint. It adds no
-dependency (``httpx`` is already a runtime dependency) and no new architecture.
+No new dependency (``httpx`` is already a runtime dependency), no new agent
+framework, no new service.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
+from urllib.parse import urlsplit
 
 import httpx
 
-from app.services.recommendation_gate import candidate_alert_authorized
 from app.services.registry_io import load_json, registry_lock, save_json_atomic
 
 
@@ -46,7 +59,12 @@ STAGE = "STAGE_2_INDEPENDENT_RESEARCH_REVIEW"
 #: documented current id, so O'Pip refuses it until it is verified again.
 DEFAULT_MODEL = "deepseek-flash"
 VERIFIED_MODEL_IDS = frozenset({"deepseek-flash"})
-DEFAULT_BASE_URL = "https://api.deepseek.com"
+
+#: The explicitly approved provider origin. Nothing else is reachable: the
+#: credential may only ever be sent to this host, over TLS, on the default port,
+#: with no path, query, fragment or userinfo. See :func:`approved_base_url`.
+APPROVED_PROVIDER_HOST = "api.deepseek.com"
+APPROVED_BASE_URL = f"https://{APPROVED_PROVIDER_HOST}"
 CHAT_COMPLETIONS_PATH = "/chat/completions"
 
 MODE_OFF = "off"
@@ -71,24 +89,39 @@ STATUS_INVALID_MODE = "INVALID_MODE"
 STATUS_CONFIGURATION_ERROR = "CONFIGURATION_ERROR"
 STATUS_MISSING_CREDENTIAL = "MISSING_CREDENTIAL"
 STATUS_UNVERIFIED_MODEL = "UNVERIFIED_MODEL"
-STATUS_NO_ELIGIBLE_RECOMMENDATIONS = "NO_ELIGIBLE_RECOMMENDATIONS"
+STATUS_NOT_QUALIFIED = "NOT_QUALIFIED"
 STATUS_SUCCEEDED = "SUCCEEDED"
 STATUS_FAILED = "FAILED"
 STATUS_BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
 STATUS_CALL_COST_LIMIT = "CALL_COST_LIMIT"
 STATUS_IDEMPOTENT_REPLAY = "IDEMPOTENT_REPLAY"
+STATUS_SPEND_UNVERIFIABLE = "SPEND_UNVERIFIABLE"
+STATUS_QUEUE_UNAVAILABLE = "QUEUE_UNAVAILABLE"
+STATUS_QUEUE_RECORD_UNREADABLE = "QUEUE_RECORD_UNREADABLE"
 
 #: Documented DeepSeek ``deepseek-flash`` peak list prices, USD per 1M tokens.
 #: Peak rates are used for every estimate so budgeting is never optimistic.
 PRICE_INPUT_USD_PER_MTOK = 0.30
 PRICE_OUTPUT_USD_PER_MTOK = 1.20
 
+QUEUE_FILE = Path("/app/data/opip_irr_queue.jsonl")
+QUEUE_LOCK = QUEUE_FILE.parent / ".opip_irr_queue.lock"
+QUEUE_CHECKPOINT_FILE = Path("/app/data/opip_irr_queue_checkpoint.json")
+QUEUE_CONSUMER_LOCK = QUEUE_FILE.parent / ".opip_irr_queue.consumer.lock"
+
 EVIDENCE_FILE = Path("/app/data/opip_irr_shadow_evidence.jsonl")
 EVIDENCE_LOCK = EVIDENCE_FILE.parent / ".opip_irr_shadow_evidence.lock"
+
+SPEND_LEDGER_FILE = Path("/app/data/opip_irr_spend_ledger.jsonl")
+SPEND_LEDGER_LOCK = SPEND_LEDGER_FILE.parent / ".opip_irr_spend_ledger.lock"
+
 IDEMPOTENCE_FILE = Path("/app/data/opip_irr_idempotence.json")
 IDEMPOTENCE_LOCK = IDEMPOTENCE_FILE.parent / ".opip_irr_idempotence.lock"
 IDEMPOTENCE_MAX_KEYS = 256
 
+#: A local queue append must never delay a Telegram delivery. A contended lock
+#: is abandoned (fail-soft) rather than waited out.
+PRODUCER_LOCK_TIMEOUT_SECONDS = 0.25
 
 #: Field names that a provider answer may not contribute. They are dropped
 #: before anything is persisted, so a model cannot smuggle an executable
@@ -127,24 +160,6 @@ CREDENTIAL_FIELD_NAMES = frozenset(
     }
 )
 
-_CANDIDATE_EVIDENCE_FIELDS: tuple[str, ...] = (
-    "technical_score",
-    "price",
-    "trend",
-    "rsi",
-    "macd_histogram",
-    "atr_pct",
-    "volume_ratio",
-    "strengths",
-    "warnings",
-    "weaknesses",
-    "market_structure",
-    "execution_evidence",
-    "price_movement_intelligence",
-    "deterministic_quality_by_risk_level",
-    "margin_evidence",
-)
-
 _CHIEF_CONCLUSION_FIELDS: tuple[str, ...] = (
     "rank",
     "decision",
@@ -153,11 +168,33 @@ _CHIEF_CONCLUSION_FIELDS: tuple[str, ...] = (
     "reason",
 )
 
+_QUALIFICATION_FIELDS: tuple[str, ...] = (
+    "target_attainability_score",
+    "economic_target_2_move_pct",
+    "economic_validation_net_t2",
+    "economic_validation_capital",
+    "economic_position_notional",
+    "profit_rank_score",
+    "liquidity_capacity_status",
+    "liquidity_capacity_ceiling_usd",
+)
+
+DETERMINISTIC_EVIDENCE_FIELDS: tuple[str, ...] = (
+    "technical_score",
+    "market_regime",
+    "market_intelligence",
+    "price_movement",
+    "execution_evidence",
+    "entry_plan",
+)
+
 SYSTEM_PROMPT = """You are O'Pip's STAGE-2 Independent Research & Risk Reviewer.
 
-You receive an immutable evidence copy of ONE already-screened crypto setup and
-the Chief Analyst's advisory conclusion for it. Your only job is to challenge
-that conclusion independently, using the supplied deterministic evidence.
+You receive an immutable evidence copy of ONE crypto setup that has already
+passed O'Pip's final deterministic target-quality, economic and portfolio gates,
+together with the Chief Analyst's advisory conclusion for it. Your only job is
+to challenge that conclusion independently, using the supplied deterministic
+evidence.
 
 You have no authority. You cannot place, modify or cancel an order, cannot set
 or change size, stops, leverage, risk or capital, cannot veto or approve any
@@ -208,6 +245,10 @@ class IRRUnverifiedModel(IRRConfigurationError):
     """The configured model id is not provider-documented; no call is made."""
 
 
+class IRRUnapprovedEndpoint(IRRConfigurationError):
+    """The configured endpoint is not the explicitly approved provider."""
+
+
 class IRRProviderError(IndependentReviewError):
     """The provider rejected the request at the HTTP layer."""
 
@@ -216,8 +257,8 @@ class IRRResponseError(IndependentReviewError):
     """The provider answered, but not with the advisory schema."""
 
 
-class IRRUsageUnavailable(IndependentReviewError):
-    """Spend cannot be proven, so no further spend is allowed."""
+class IRRSpendUnavailable(IndependentReviewError):
+    """Spend cannot be read or written, so no further spend is allowed."""
 
 
 @dataclass(frozen=True)
@@ -230,6 +271,7 @@ class IRRConfig:
     max_output_tokens: int
     reasoning_effort: str
     max_candidates: int
+    drain_batch: int
     daily_call_budget: int
     daily_token_budget: int
     daily_cost_budget_usd: float
@@ -240,11 +282,13 @@ class IRRConfig:
         """Return the auditable configuration, with no credential material."""
         return {
             "provider": PROVIDER,
+            "endpoint": self.base_url,
             "model": self.model,
             "timeout_seconds": self.timeout_seconds,
             "max_output_tokens": self.max_output_tokens,
             "reasoning_effort": self.reasoning_effort,
             "max_candidates": self.max_candidates,
+            "drain_batch": self.drain_batch,
             "daily_call_budget": self.daily_call_budget,
             "daily_token_budget": self.daily_token_budget,
             "daily_cost_budget_usd": self.daily_cost_budget_usd,
@@ -273,6 +317,36 @@ def _env_float(name: str, default: float, *, minimum: float, maximum: float) -> 
     return max(minimum, min(maximum, value))
 
 
+def approved_base_url(raw: str | None) -> str:
+    """Return the approved provider origin, or refuse the endpoint.
+
+    Only the explicitly approved provider host is reachable. An arbitrary
+    ``https://`` host, a non-default port, a path, a query, a fragment or
+    embedded userinfo all raise :class:`IRRUnapprovedEndpoint` before any
+    credential is attached to a request.
+    """
+    candidate = (raw or APPROVED_BASE_URL).strip()
+    if "@" in candidate:
+        raise IRRUnapprovedEndpoint("OPIP_IRR_BASE_URL must not embed credentials")
+    try:
+        parts = urlsplit(candidate)
+    except ValueError as exc:
+        raise IRRUnapprovedEndpoint("OPIP_IRR_BASE_URL is not a valid URL") from exc
+    if parts.scheme != "https":
+        raise IRRUnapprovedEndpoint("OPIP_IRR_BASE_URL must use https")
+    if (parts.hostname or "").lower() != APPROVED_PROVIDER_HOST:
+        raise IRRUnapprovedEndpoint(
+            f"OPIP_IRR_BASE_URL must be {APPROVED_BASE_URL}"
+        )
+    if parts.port not in (None, 443):
+        raise IRRUnapprovedEndpoint("OPIP_IRR_BASE_URL must use the default TLS port")
+    if parts.path not in ("", "/") or parts.query or parts.fragment:
+        raise IRRUnapprovedEndpoint(
+            "OPIP_IRR_BASE_URL must be an origin with no path, query or fragment"
+        )
+    return APPROVED_BASE_URL
+
+
 def resolve_config() -> IRRConfig:
     """Resolve the bounded Stage-2 configuration or fail closed.
 
@@ -285,9 +359,7 @@ def resolve_config() -> IRRConfig:
             "OPIP_IRR_MODEL is not a provider-documented model id; "
             "configure " + ", ".join(sorted(VERIFIED_MODEL_IDS))
         )
-    base_url = (os.getenv("OPIP_IRR_BASE_URL") or DEFAULT_BASE_URL).strip().rstrip("/")
-    if not base_url.startswith("https://"):
-        raise IRRConfigurationError("OPIP_IRR_BASE_URL must be an https:// URL")
+    base_url = approved_base_url(os.getenv("OPIP_IRR_BASE_URL"))
 
     effort = (os.getenv("OPIP_IRR_REASONING_EFFORT") or "high").strip().lower()
     if effort not in {"low", "high", "max"}:
@@ -310,6 +382,7 @@ def resolve_config() -> IRRConfig:
         ),
         reasoning_effort=effort,
         max_candidates=_env_int("OPIP_IRR_MAX_CANDIDATES", 2, minimum=1, maximum=3),
+        drain_batch=_env_int("OPIP_IRR_DRAIN_BATCH", 2, minimum=1, maximum=5),
         daily_call_budget=_env_int(
             "OPIP_IRR_DAILY_CALL_BUDGET", 24, minimum=1, maximum=1000
         ),
@@ -335,8 +408,8 @@ def freeze_evidence_copy(value: Any) -> Any:
     """Return a detached by-value copy of ``value``.
 
     The copy is built from a canonical JSON round-trip, so later mutation of the
-    live Chief review or candidate payload cannot alter the evidence that was
-    reviewed or the digest that was recorded.
+    live alert or ranking cannot alter the evidence that was reviewed or the
+    digest that was recorded.
     """
     return json.loads(canonical_json(value))
 
@@ -346,24 +419,52 @@ def evidence_digest(evidence: Any) -> str:
     return hashlib.sha256(canonical_json(evidence).encode("utf-8")).hexdigest()
 
 
+def idempotency_key(*, digest: str, model: str) -> str:
+    material = f"{digest}|{model}|{PROMPT_VERSION}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _portfolio_rank(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        rank = int(value)
+    except (TypeError, ValueError):
+        return None
+    return rank if rank >= 1 else None
+
+
 def build_evidence_copy(
     *,
-    recommendation: Mapping[str, Any],
-    candidate_evidence: Mapping[str, Any] | None,
+    alert: Mapping[str, Any],
     chief_route: Mapping[str, Any] | None,
-    market_regime_context: Any = None,
+    market_regime: Any = None,
 ) -> dict[str, Any]:
-    """Build the immutable Stage-2 evidence copy for one recommendation."""
+    """Build the immutable Stage-2 evidence copy for one final survivor.
+
+    Only a candidate that carries the final deterministic target, economic and
+    portfolio/capital qualification evidence can produce a copy that passes
+    :func:`qualification_passed`.
+    """
     conclusion = {
-        field: recommendation.get(field)
+        field: alert.get(field)
         for field in _CHIEF_CONCLUSION_FIELDS
-        if field in recommendation
+        if field in alert
     }
-    evidence_source = candidate_evidence if isinstance(candidate_evidence, Mapping) else {}
+    qualification = {
+        "target_quality_qualified": alert.get("target_quality_qualified") is True,
+        "economic_qualified": alert.get("economic_qualified") is True,
+        "portfolio_rank": _portfolio_rank(alert.get("opportunity_rank")),
+        **{
+            field: alert.get(field)
+            for field in _QUALIFICATION_FIELDS
+            if field in alert
+        },
+    }
     deterministic = {
-        field: evidence_source.get(field)
-        for field in _CANDIDATE_EVIDENCE_FIELDS
-        if field in evidence_source
+        field: alert.get(field)
+        for field in DETERMINISTIC_EVIDENCE_FIELDS
+        if field in alert
     }
     route = None
     if isinstance(chief_route, Mapping):
@@ -373,18 +474,35 @@ def build_evidence_copy(
         }
     return freeze_evidence_copy(
         {
-            "evidence_copy_version": "IRR-EVIDENCE-COPY-V1",
+            "evidence_copy_version": "IRR-EVIDENCE-COPY-V2",
             "stage": STAGE,
-            "symbol": str(recommendation.get("symbol") or ""),
-            "direction": str(recommendation.get("direction") or "").upper(),
+            "symbol": str(alert.get("symbol") or ""),
+            "direction": str(alert.get("direction") or "").upper(),
             "chief_conclusion": conclusion,
             "chief_route": route,
+            "final_qualification": qualification,
             "deterministic_candidate_evidence": deterministic,
-            "market_regime_context": freeze_evidence_copy(market_regime_context),
+            "market_regime_context": freeze_evidence_copy(market_regime),
             "authority": "advisory_only",
             "funded_trade_authority_changed": False,
         }
     )
+
+
+def qualification_passed(evidence: Mapping[str, Any]) -> bool:
+    """Return whether the copy proves final target, economic and portfolio pass.
+
+    The consumer re-checks this rather than trusting the producer: an
+    unqualified or tampered queue record can never spend provider money.
+    """
+    qualification = evidence.get("final_qualification")
+    if not isinstance(qualification, Mapping):
+        return False
+    if qualification.get("target_quality_qualified") is not True:
+        return False
+    if qualification.get("economic_qualified") is not True:
+        return False
+    return _portfolio_rank(qualification.get("portfolio_rank")) is not None
 
 
 def estimate_cost_usd(*, input_tokens: int, output_tokens: int) -> float:
@@ -401,61 +519,372 @@ def input_token_upper_bound(text: str) -> int:
     return max(1, (len(text) + 2) // 3)
 
 
-def _today_usage(*, now: datetime) -> tuple[int, int, float]:
-    """Return (calls, tokens, cost) already spent on the current UTC day.
+def _bounded_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    return _env_int(name, default, minimum=minimum, maximum=maximum)
 
-    Only this provider's own journal is read. The OpenAI usage journal belongs
-    to Stage 1 and is never consulted or written here, so the two provider
-    budgets stay strictly separate.
+
+def _ensure_record_boundary(path: Path) -> None:
+    """Terminate a crashed partial tail so a later append cannot merge rows."""
+    if not path.exists() or path.stat().st_size <= 0:
+        return
+    with path.open("rb") as reader:
+        reader.seek(-1, os.SEEK_END)
+        if reader.read(1) == b"\n":
+            return
+    with path.open("ab") as handle:
+        handle.write(b"\n")
+        handle.flush()
+
+
+def _append_jsonl(path: Path, lock: Path, rows: list[dict], *, timeout: float) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with registry_lock(lock, timeout=timeout):
+        _ensure_record_boundary(path)
+        with path.open("a", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(
+                    json.dumps(row, sort_keys=True, separators=(",", ":"), default=str)
+                    + "\n"
+                )
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                pass
+
+
+def enqueue_final_qualified(
+    *,
+    alerts: Iterable[Mapping[str, Any]],
+    chief_route: Mapping[str, Any] | None = None,
+    market_regime: Any = None,
+    max_candidates: int | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Queue immutable evidence for the finally-qualified recommendations.
+
+    Called from the scan **after** the final deterministic target, economic and
+    portfolio/capital gates. Local append-only I/O only: no provider call, no
+    credential read, and never an exception into the scan.
     """
-    if not EVIDENCE_FILE.exists():
-        return 0, 0, 0.0
+    now = now or datetime.now(timezone.utc)
+    mode = irr_mode()
+    if mode not in ALLOWED_MODES:
+        return {"status": STATUS_INVALID_MODE, "enqueued": 0}
+    if mode == MODE_OFF:
+        return {"status": STATUS_DISABLED, "enqueued": 0}
+
+    limit = (
+        max_candidates
+        if max_candidates is not None
+        else _bounded_int("OPIP_IRR_MAX_CANDIDATES", 2, minimum=1, maximum=3)
+    )
+    rows: list[dict[str, Any]] = []
+    unqualified = 0
+    over_limit = 0
+    for alert in alerts:
+        if not isinstance(alert, Mapping):
+            continue
+        evidence = build_evidence_copy(
+            alert=alert,
+            chief_route=chief_route,
+            market_regime=market_regime,
+        )
+        if not qualification_passed(evidence):
+            unqualified += 1
+            continue
+        if len(rows) >= limit:
+            over_limit += 1
+            continue
+        digest = evidence_digest(evidence)
+        rows.append(
+            {
+                "record": "REQUEST",
+                "stage": STAGE,
+                "provider": PROVIDER,
+                "request_id": idempotency_key(digest=digest, model=DEFAULT_MODEL),
+                "evidence_digest": digest,
+                "evidence": evidence,
+                "symbol": evidence["symbol"],
+                "direction": evidence["direction"],
+                "enqueued_at": now.astimezone(timezone.utc).isoformat(),
+                "shadow_only": True,
+                "advisory_only": True,
+                "authority_changed": False,
+            }
+        )
+
+    summary: dict[str, Any] = {
+        "enqueued": 0,
+        "skipped_unqualified": unqualified,
+        "skipped_over_limit": over_limit,
+    }
+    if not rows:
+        return {"status": STATUS_NOT_QUALIFIED, **summary}
+    try:
+        _append_jsonl(
+            QUEUE_FILE,
+            QUEUE_LOCK,
+            rows,
+            timeout=PRODUCER_LOCK_TIMEOUT_SECONDS,
+        )
+    except (OSError, TimeoutError):
+        # Advisory evidence only: a contended or unavailable queue never blocks
+        # a scan, a Telegram delivery or a protection cycle.
+        return {"status": STATUS_QUEUE_UNAVAILABLE, **summary}
+    summary["enqueued"] = len(rows)
+    return {"status": "ENQUEUED", **summary}
+
+
+#: Ledger lock budget. A reservation is the money gate, so it waits for the
+#: lock; a stalled lock still fails closed (no call).
+LEDGER_LOCK_TIMEOUT_SECONDS = 5.0
+
+
+@dataclass(frozen=True)
+class SpendState:
+    """Committed spend for one UTC day, worst-case until settled."""
+
+    calls: int
+    tokens: int
+    cost_usd: float
+
+
+def _ledger_timestamp(row: Mapping[str, Any]) -> datetime:
+    raw = row.get("timestamp_utc")
+    if not isinstance(raw, str) or not raw:
+        raise IRRSpendUnavailable("spend ledger record has no timestamp")
+    try:
+        stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise IRRSpendUnavailable(
+            "spend ledger record has an invalid timestamp"
+        ) from exc
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp.astimezone(timezone.utc)
+
+
+def _ledger_int(row: Mapping[str, Any], key: str) -> int:
+    value = row.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise IRRSpendUnavailable(f"spend ledger record has an invalid {key}")
+    return int(value)
+
+
+def _ledger_float(row: Mapping[str, Any], key: str) -> float:
+    value = row.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise IRRSpendUnavailable(f"spend ledger record has an invalid {key}")
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        raise IRRSpendUnavailable(f"spend ledger record has an invalid {key}")
+    return number
+
+
+def _ledger_records() -> list[dict[str, Any]]:
+    """Read the ledger strictly. Any malformed record refuses further spend."""
+    if not SPEND_LEDGER_FILE.exists():
+        return []
+    try:
+        raw = SPEND_LEDGER_FILE.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise IRRSpendUnavailable("spend ledger is unreadable") from exc
+    records: list[dict[str, Any]] = []
+    for line in raw.splitlines():
+        if not line.strip():
+            raise IRRSpendUnavailable(
+                "spend ledger contains a blank or partial record"
+            )
+        try:
+            row = json.loads(line)
+        except ValueError as exc:
+            raise IRRSpendUnavailable("spend ledger contains malformed JSON") from exc
+        if not isinstance(row, dict):
+            raise IRRSpendUnavailable("spend ledger record is not an object")
+        records.append(row)
+    return records
+
+
+def spend_state(*, now: datetime) -> SpendState:
+    """Return today's committed calls, tokens and cost.
+
+    An open reservation counts at its worst case until it is settled, so a
+    crashed, hung or concurrent attempt can never look like unspent budget.
+    """
+    records = _ledger_records()
+    reservations: dict[str, dict[str, Any]] = {}
+    for row in records:
+        kind = row.get("record")
+        if kind == "RESERVE":
+            reservation_id = row.get("reservation_id")
+            if not isinstance(reservation_id, str) or not reservation_id:
+                raise IRRSpendUnavailable("reservation record has no id")
+            reservations[reservation_id] = row
+        elif kind != "SETTLE":
+            raise IRRSpendUnavailable("spend ledger contains an unknown record type")
+
     today = now.astimezone(timezone.utc).date()
     calls = 0
     tokens = 0
     cost = 0.0
-    try:
-        with EVIDENCE_FILE.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                try:
-                    row = json.loads(line)
-                except (TypeError, ValueError):
-                    continue
-                if not isinstance(row, dict) or row.get("status") != STATUS_SUCCEEDED:
-                    continue
-                if row.get("provider") not in (None, PROVIDER):
-                    continue
-                try:
-                    stamp = datetime.fromisoformat(
-                        str(row.get("timestamp_utc") or "").replace("Z", "+00:00")
-                    )
-                except (TypeError, ValueError):
-                    continue
-                if stamp.tzinfo is None:
-                    stamp = stamp.replace(tzinfo=timezone.utc)
-                if stamp.astimezone(timezone.utc).date() != today:
-                    continue
-                calls += 1
-                tokens += int(row.get("total_tokens") or 0)
-                cost += float(row.get("estimated_cost_usd") or 0.0)
-    except OSError as exc:
-        raise IRRUsageUnavailable("IRR usage journal is unreadable") from exc
-    return calls, tokens, round(cost, 6)
+    for row in records:
+        if row["record"] == "RESERVE":
+            if _ledger_timestamp(row).date() != today:
+                continue
+            calls += 1
+            tokens += _ledger_int(row, "reserved_tokens")
+            cost += _ledger_float(row, "reserved_cost_usd")
+            continue
+        reservation_id = row.get("reservation_id")
+        reserved = (
+            reservations.get(reservation_id)
+            if isinstance(reservation_id, str)
+            else None
+        )
+        if reserved is None:
+            raise IRRSpendUnavailable("settlement has no matching reservation")
+        if _ledger_timestamp(reserved).date() != today:
+            continue
+        tokens += _ledger_int(row, "actual_tokens") - _ledger_int(
+            reserved, "reserved_tokens"
+        )
+        cost += _ledger_float(row, "actual_cost_usd") - _ledger_float(
+            reserved, "reserved_cost_usd"
+        )
+    return SpendState(
+        calls=calls,
+        tokens=max(0, tokens),
+        cost_usd=round(max(0.0, cost), 6),
+    )
 
 
-def budget_block_reason(config: IRRConfig, *, now: datetime) -> str | None:
-    """Return why no further Stage-2 spend is allowed, or ``None``."""
-    calls, tokens, cost = _today_usage(now=now)
-    if calls >= config.daily_call_budget:
-        return f"daily IRR call budget reached ({calls}/{config.daily_call_budget})"
-    if tokens >= config.daily_token_budget:
-        return f"daily IRR token budget reached ({tokens}/{config.daily_token_budget})"
-    if cost >= config.daily_cost_budget_usd:
+def _append_ledger_record(record: Mapping[str, Any]) -> None:
+    SPEND_LEDGER_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_record_boundary(SPEND_LEDGER_FILE)
+    with SPEND_LEDGER_FILE.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                dict(record), sort_keys=True, separators=(",", ":"), default=str
+            )
+            + "\n"
+        )
+        handle.flush()
+        try:
+            os.fsync(handle.fileno())
+        except OSError:
+            pass
+
+
+def budget_block_reason(
+    config: IRRConfig,
+    state: SpendState,
+    *,
+    extra_tokens: int,
+    extra_cost_usd: float,
+) -> str | None:
+    """Return why one more attempt would exceed a budget, or ``None``."""
+    if state.calls + 1 > config.daily_call_budget:
         return (
-            "daily IRR cost budget reached "
-            f"(${cost:.4f}/${config.daily_cost_budget_usd:.2f})"
+            "daily IRR call budget reached "
+            f"({state.calls}/{config.daily_call_budget})"
+        )
+    if state.tokens + extra_tokens > config.daily_token_budget:
+        return (
+            "daily IRR token budget would be exceeded "
+            f"({state.tokens}+{extra_tokens}/{config.daily_token_budget})"
+        )
+    if state.cost_usd + extra_cost_usd > config.daily_cost_budget_usd:
+        return (
+            "daily IRR cost budget would be exceeded "
+            f"(${state.cost_usd:.4f}+${extra_cost_usd:.4f}/"
+            f"${config.daily_cost_budget_usd:.2f})"
         )
     return None
+
+
+def reserve_spend(
+    config: IRRConfig,
+    *,
+    reserved_tokens: int,
+    reserved_cost_usd: float,
+    now: datetime,
+) -> tuple[str | None, str | None]:
+    """Atomically reserve the worst-case cost of one attempt.
+
+    Returns ``(reservation_id, None)`` when the attempt may proceed, or
+    ``(None, reason)`` when a budget forbids it. Any read or write failure
+    raises :class:`IRRSpendUnavailable`, so spend fails closed.
+    """
+    try:
+        with registry_lock(SPEND_LEDGER_LOCK, timeout=LEDGER_LOCK_TIMEOUT_SECONDS):
+            state = spend_state(now=now)
+            reason = budget_block_reason(
+                config,
+                state,
+                extra_tokens=reserved_tokens,
+                extra_cost_usd=reserved_cost_usd,
+            )
+            if reason is not None:
+                return None, reason
+            reservation_id = os.urandom(16).hex()
+            _append_ledger_record(
+                {
+                    "record": "RESERVE",
+                    "reservation_id": reservation_id,
+                    "timestamp_utc": now.astimezone(timezone.utc).isoformat(),
+                    "provider": PROVIDER,
+                    "model": config.model,
+                    "reserved_tokens": int(reserved_tokens),
+                    "reserved_cost_usd": round(float(reserved_cost_usd), 6),
+                }
+            )
+            return reservation_id, None
+    except (OSError, TimeoutError) as exc:
+        raise IRRSpendUnavailable("spend ledger is unavailable") from exc
+
+
+def settle_spend(
+    *,
+    reservation_id: str,
+    actual_tokens: int,
+    actual_cost_usd: float,
+    outcome: str,
+    usage_available: bool,
+    now: datetime,
+) -> bool:
+    """Settle a reservation with the charged usage.
+
+    Returns whether the settlement reached durable storage. A failure leaves the
+    reservation counted at its worst case, which over-charges but never
+    overspends.
+    """
+    try:
+        with registry_lock(SPEND_LEDGER_LOCK, timeout=LEDGER_LOCK_TIMEOUT_SECONDS):
+            _append_ledger_record(
+                {
+                    "record": "SETTLE",
+                    "reservation_id": reservation_id,
+                    "timestamp_utc": now.astimezone(timezone.utc).isoformat(),
+                    "provider": PROVIDER,
+                    "actual_tokens": int(actual_tokens),
+                    "actual_cost_usd": round(float(actual_cost_usd), 6),
+                    "outcome": outcome,
+                    "usage_available": bool(usage_available),
+                }
+            )
+        return True
+    except (OSError, TimeoutError):
+        return False
+
+
+@dataclass(frozen=True)
+class ProviderAnswer:
+    """One provider answer, before any schema validation."""
+
+    content: str
+    usage: Mapping[str, Any]
+    latency_ms: int
 
 
 def build_request(*, config: IRRConfig, evidence: Mapping[str, Any]) -> dict[str, Any]:
@@ -483,6 +912,8 @@ def _error_code(exc: BaseException) -> str:
         return "TIMEOUT"
     if isinstance(exc, httpx.HTTPError):
         return "TRANSPORT_ERROR"
+    if isinstance(exc, IRRSpendUnavailable):
+        return "SPEND_UNAVAILABLE"
     if isinstance(exc, IRRProviderError):
         return "HTTP_ERROR"
     if isinstance(exc, IRRResponseError):
@@ -495,9 +926,14 @@ def _invoke(
     body: Mapping[str, Any],
     *,
     post: Callable[..., Any] | None = None,
-) -> tuple[dict[str, Any], dict[str, Any], int]:
-    """Perform exactly one bounded provider call; never retry."""
-    url = f"{config.base_url}{CHAT_COMPLETIONS_PATH}"
+) -> ProviderAnswer:
+    """Perform exactly one bounded provider call; never retry.
+
+    The credential is only ever attached to the approved provider endpoint.
+    """
+    if config.base_url != APPROVED_BASE_URL:
+        raise IRRUnapprovedEndpoint("provider endpoint is not approved")
+    url = f"{APPROVED_BASE_URL}{CHAT_COMPLETIONS_PATH}"
     timeout = httpx.Timeout(
         config.timeout_seconds,
         connect=min(5.0, config.timeout_seconds),
@@ -530,32 +966,58 @@ def _invoke(
     if not isinstance(payload, dict):
         raise IRRResponseError("provider response was not a JSON object")
 
-    choices = payload.get("choices")
-    if not isinstance(choices, list) or not choices:
-        raise IRRResponseError("provider response carried no choices")
-    first = choices[0] if isinstance(choices[0], dict) else {}
-    message = first.get("message") if isinstance(first.get("message"), dict) else {}
-    content = message.get("content")
-    if not isinstance(content, str) or not content.strip():
-        # Documented JSON-mode caveat: the provider may return blank content.
-        raise IRRResponseError("provider returned empty advisory content")
-    try:
-        parsed = json.loads(content)
-    except ValueError as exc:
-        raise IRRResponseError("provider returned malformed advisory JSON") from exc
-    if not isinstance(parsed, dict):
-        raise IRRResponseError("provider advisory JSON was not an object")
-
     usage = payload.get("usage")
-    return parsed, usage if isinstance(usage, dict) else {}, latency_ms
+    choices = payload.get("choices")
+    content = ""
+    if isinstance(choices, list) and choices:
+        first = choices[0] if isinstance(choices[0], dict) else {}
+        message = first.get("message") if isinstance(first.get("message"), dict) else {}
+        raw_content = message.get("content")
+        if isinstance(raw_content, str):
+            content = raw_content
+    return ProviderAnswer(
+        content=content,
+        usage=usage if isinstance(usage, dict) else {},
+        latency_ms=latency_ms,
+    )
 
 
-def _text_list(
-    value: Any,
+def _usage_charge(
+    usage: Mapping[str, Any],
     *,
-    limit: int,
-    max_length: int,
-) -> list[str]:
+    reserved_tokens: int,
+    reserved_cost_usd: float,
+) -> tuple[int, float, bool]:
+    """Return the chargeable (tokens, cost, usage_available) for one attempt.
+
+    A provider may bill a call even when the answer is unusable, and usage may
+    be missing. Anything unprovable is charged at the reserved worst case, so
+    spend can never be understated.
+    """
+    prompt = usage.get("prompt_tokens")
+    completion = usage.get("completion_tokens")
+    total = usage.get("total_tokens")
+    valid = all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        for value in (prompt, completion)
+    )
+    if not valid:
+        return reserved_tokens, reserved_cost_usd, False
+    tokens = (
+        int(total)
+        if isinstance(total, int) and not isinstance(total, bool) and total > 0
+        else int(prompt) + int(completion)
+    )
+    if tokens <= 0:
+        return reserved_tokens, reserved_cost_usd, False
+    return (
+        tokens,
+        estimate_cost_usd(input_tokens=int(prompt), output_tokens=int(completion)),
+        True,
+    )
+
+
+def _text_list(value: Any, *, limit: int, max_length: int) -> list[str]:
     if not isinstance(value, list):
         return []
     items: list[str] = []
@@ -569,6 +1031,20 @@ def _text_list(
         if len(items) >= limit:
             break
     return items
+
+
+def parse_challenge(content: str) -> Mapping[str, Any]:
+    """Parse the provider content into a JSON object or refuse it."""
+    if not isinstance(content, str) or not content.strip():
+        # Documented JSON-mode caveat: the provider may return blank content.
+        raise IRRResponseError("provider returned empty advisory content")
+    try:
+        parsed = json.loads(content)
+    except ValueError as exc:
+        raise IRRResponseError("provider returned malformed advisory JSON") from exc
+    if not isinstance(parsed, dict):
+        raise IRRResponseError("provider advisory JSON was not an object")
+    return parsed
 
 
 def validate_challenge(
@@ -620,10 +1096,29 @@ def validate_challenge(
     }
 
 
-
-def _idempotency_key(*, digest: str, model: str) -> str:
-    material = f"{digest}|{model}|{PROMPT_VERSION}"
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+def _append_evidence(record: Mapping[str, Any], *, now: datetime) -> None:
+    """Append one audit row; never raise into the consumer loop."""
+    row = {
+        "timestamp_utc": now.astimezone(timezone.utc).isoformat(),
+        "stage": STAGE,
+        "provider": PROVIDER,
+        "prompt_version": PROMPT_VERSION,
+        "shadow_only": True,
+        "advisory_only": True,
+        "authority_changed": False,
+        "funded_trade_authority_changed": False,
+        **dict(record),
+    }
+    row = {
+        key: value
+        for key, value in row.items()
+        if str(key).strip().lower() not in CREDENTIAL_FIELD_NAMES
+    }
+    try:
+        _append_jsonl(EVIDENCE_FILE, EVIDENCE_LOCK, [row], timeout=LEDGER_LOCK_TIMEOUT_SECONDS)
+    except (OSError, TimeoutError):
+        # Evidence is append-only and fail-open; it must never block the worker.
+        return
 
 
 def _idempotence_lookup(key: str) -> dict[str, Any] | None:
@@ -651,163 +1146,114 @@ def _idempotence_store(key: str, row: Mapping[str, Any], *, now: datetime) -> No
             save_json_atomic(IDEMPOTENCE_FILE, state)
     except Exception:
         # A missing ledger can only cause a repeated call, never a missed gate;
-        # the daily budget still bounds the total spend.
+        # the reservation ledger still bounds the total spend.
         return
 
 
-def _append_evidence(record: Mapping[str, Any], *, now: datetime) -> None:
-    """Append one audit row; never raise into the Chief review."""
-    row = {
-        "timestamp_utc": now.astimezone(timezone.utc).isoformat(),
-        "stage": STAGE,
-        "provider": PROVIDER,
-        "prompt_version": PROMPT_VERSION,
-        "shadow_only": True,
-        "advisory_only": True,
-        "authority_changed": False,
-        "funded_trade_authority_changed": False,
-        **dict(record),
-    }
-    row = {
-        key: value
-        for key, value in row.items()
-        if str(key).strip().lower() not in CREDENTIAL_FIELD_NAMES
-    }
+def _load_checkpoint() -> int:
     try:
-        EVIDENCE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with registry_lock(EVIDENCE_LOCK):
-            with EVIDENCE_FILE.open("a", encoding="utf-8") as handle:
-                handle.write(
-                    json.dumps(row, separators=(",", ":"), default=str) + "\n"
-                )
-                handle.flush()
-    except Exception:
-        # Evidence is append-only and fail-open; it must never block a scan.
-        return
+        raw = QUEUE_CHECKPOINT_FILE.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return 0
+    except OSError as exc:
+        raise IndependentReviewError("queue checkpoint is unreadable") from exc
+    try:
+        payload = json.loads(raw)
+        return max(0, int(payload.get("next_line", 0)))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise IndependentReviewError("queue checkpoint is unreadable") from exc
 
 
-def _select_recommendations(
-    review: Mapping[str, Any],
-    *,
+def _save_checkpoint(next_line: int) -> None:
+    save_json_atomic(QUEUE_CHECKPOINT_FILE, {"next_line": int(next_line)})
+
+
+def queue_slice(
+    start: int,
     limit: int,
-) -> list[dict[str, Any]]:
-    """Return the eligible, already-qualified Chief recommendations to review.
-
-    Selection reuses the deterministic recommendation gate
-    (:func:`candidate_alert_authorized`); Stage 2 never widens it.
-    """
-    selected: list[dict[str, Any]] = []
-    rows = review.get("top_candidates")
-    if not isinstance(rows, list):
-        return selected
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        if not candidate_alert_authorized(row):
-            continue
-        if not str(row.get("symbol") or "").strip():
-            continue
-        selected.append(dict(row))
-        if len(selected) >= limit:
-            break
-    return selected
+) -> tuple[list[tuple[int, str]], int]:
+    """Return up to ``limit`` queue rows from ``start`` and the total row count."""
+    if not QUEUE_FILE.exists():
+        return [], 0
+    rows: list[tuple[int, str]] = []
+    total = 0
+    try:
+        with QUEUE_FILE.open("r", encoding="utf-8") as handle:
+            for index, line in enumerate(handle):
+                total = index + 1
+                if index < start:
+                    continue
+                if len(rows) >= limit:
+                    continue
+                rows.append((index, line))
+    except OSError as exc:
+        raise IndependentReviewError("queue is unreadable") from exc
+    return rows, total
 
 
-def _candidate_evidence(
-    request_payload: Mapping[str, Any] | None,
+def _process_queue_row(
+    raw: str,
     *,
-    symbol: str,
-    direction: str,
-) -> dict[str, Any] | None:
-    if not isinstance(request_payload, Mapping):
-        return None
-    rows = request_payload.get("candidates")
-    if not isinstance(rows, list):
-        return None
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        if str(row.get("symbol") or "").strip().upper() != symbol.upper():
-            continue
-        if str(row.get("direction") or "").strip().upper() != direction.upper():
-            continue
-        return dict(row)
-    return None
-
-
-def _empty_summary(
-    status: str,
-    *,
-    config: IRRConfig | None = None,
-    now: datetime,
-    skipped_reason: str | None = None,
-) -> dict[str, Any]:
-    summary: dict[str, Any] = {
-        "status": status,
-        "stage": STAGE,
-        "shadow_only": True,
-        "advisory_only": True,
-        "authority_changed": False,
-        "funded_trade_authority_changed": False,
-        "provider": PROVIDER,
-        "model": config.model if config is not None else None,
-        "prompt_version": PROMPT_VERSION,
-        "evaluated_at": now.astimezone(timezone.utc).isoformat(),
-        "reviews": [],
-        "budget": config.public_evidence() if config is not None else None,
-    }
-    if skipped_reason:
-        summary["skipped_reason"] = skipped_reason
-    return summary
-
-
-
-def _review_one(
-    *,
-    recommendation: Mapping[str, Any],
     config: IRRConfig,
-    request_payload: Mapping[str, Any] | None,
-    chief_route: Mapping[str, Any] | None,
     post: Callable[..., Any] | None,
     now: datetime,
 ) -> dict[str, Any]:
-    symbol = str(recommendation.get("symbol") or "").strip()
-    direction = str(recommendation.get("direction") or "").strip().upper()
+    """Dispose exactly one queue row: review it, or record why it cannot be."""
     base: dict[str, Any] = {
-        "symbol": symbol,
-        "direction": direction,
         "provider": PROVIDER,
         "model": config.model,
         "reasoning_effort": config.reasoning_effort,
-        "chief_route": dict(chief_route) if isinstance(chief_route, Mapping) else None,
         "advisory_only": True,
         "authority_changed": False,
     }
-
     try:
-        evidence = build_evidence_copy(
-            recommendation=recommendation,
-            candidate_evidence=_candidate_evidence(
-                request_payload, symbol=symbol, direction=direction
-            ),
-            chief_route=chief_route,
-            market_regime_context=(
-                request_payload.get("market_regime_context")
-                if isinstance(request_payload, Mapping)
-                else None
-            ),
-        )
-    except (TypeError, ValueError):
-        row = {**base, "status": STATUS_FAILED, "error_type": "EVIDENCE_COPY_ERROR"}
+        request = json.loads(raw)
+    except ValueError:
+        row = {**base, "status": STATUS_QUEUE_RECORD_UNREADABLE, "error_type": "JSON"}
+        _append_evidence(row, now=now)
+        return row
+    if not isinstance(request, dict) or request.get("record") != "REQUEST":
+        row = {
+            **base,
+            "status": STATUS_QUEUE_RECORD_UNREADABLE,
+            "error_type": "SCHEMA",
+        }
         _append_evidence(row, now=now)
         return row
 
+    evidence = request.get("evidence")
+    if not isinstance(evidence, dict) or not qualification_passed(evidence):
+        row = {
+            **base,
+            "status": STATUS_NOT_QUALIFIED,
+            "symbol": request.get("symbol"),
+            "direction": request.get("direction"),
+            "error_type": "QUALIFICATION",
+        }
+        _append_evidence(row, now=now)
+        return row
+
+    symbol = str(evidence.get("symbol") or "").strip()
+    direction = str(evidence.get("direction") or "").strip().upper()
+    if not symbol or direction not in {"LONG", "SHORT"}:
+        row = {
+            **base,
+            "status": STATUS_NOT_QUALIFIED,
+            "error_type": "IDENTITY",
+            "symbol": symbol,
+            "direction": direction,
+        }
+        _append_evidence(row, now=now)
+        return row
     digest = evidence_digest(evidence)
-    key = _idempotency_key(digest=digest, model=config.model)
+    key = idempotency_key(digest=digest, model=config.model)
     base.update(
         {
+            "symbol": symbol,
+            "direction": direction,
             "evidence_digest": digest,
             "evidence_idempotency_key": key,
+            "chief_route": evidence.get("chief_route"),
             "evidence": evidence,
         }
     )
@@ -819,89 +1265,118 @@ def _review_one(
             "status": STATUS_IDEMPOTENT_REPLAY,
             "verdict": replayed.get("verdict"),
             "reasons": list(replayed.get("reasons") or []),
-            "estimated_cost_usd": 0.0,
-            "latency_ms": 0,
-        }
-        _append_evidence(row, now=now)
-        return row
-
-    try:
-        blocked = budget_block_reason(config, now=now)
-    except IRRUsageUnavailable as exc:
-        row = {
-            **base,
-            "status": STATUS_FAILED,
-            "error_type": "USAGE_UNAVAILABLE",
-            "skipped_reason": str(exc),
-        }
-        _append_evidence(row, now=now)
-        return row
-    if blocked:
-        row = {
-            **base,
-            "status": STATUS_BUDGET_EXHAUSTED,
-            "skipped_reason": blocked,
-            "estimated_cost_usd": 0.0,
+            "charged_tokens": 0,
+            "charged_cost_usd": 0.0,
             "latency_ms": 0,
         }
         _append_evidence(row, now=now)
         return row
 
     body = build_request(config=config, evidence=evidence)
-    worst_case = estimate_cost_usd(
-        input_tokens=input_token_upper_bound(
-            SYSTEM_PROMPT + canonical_json(evidence)
-        ),
-        output_tokens=config.max_output_tokens,
+    reserved_input = input_token_upper_bound(SYSTEM_PROMPT + canonical_json(evidence))
+    reserved_output = config.max_output_tokens
+    reserved_tokens = reserved_input + reserved_output
+    reserved_cost = estimate_cost_usd(
+        input_tokens=reserved_input, output_tokens=reserved_output
     )
-    base["worst_case_cost_usd"] = worst_case
-    if worst_case > config.max_call_cost_usd:
+    base["worst_case_cost_usd"] = reserved_cost
+    base["worst_case_tokens"] = reserved_tokens
+    if reserved_cost > config.max_call_cost_usd:
         row = {
             **base,
             "status": STATUS_CALL_COST_LIMIT,
             "skipped_reason": (
-                "worst-case call cost "
-                f"${worst_case:.4f} exceeds OPIP_IRR_MAX_CALL_COST_USD "
-                f"${config.max_call_cost_usd:.4f}"
+                f"worst-case call cost ${reserved_cost:.4f} exceeds "
+                f"OPIP_IRR_MAX_CALL_COST_USD ${config.max_call_cost_usd:.4f}"
             ),
-            "estimated_cost_usd": 0.0,
+            "charged_tokens": 0,
+            "charged_cost_usd": 0.0,
             "latency_ms": 0,
         }
         _append_evidence(row, now=now)
         return row
 
     try:
-        parsed, usage, latency_ms = _invoke(config, body, post=post)
-        challenge = validate_challenge(parsed, symbol=symbol, direction=direction)
-    except Exception as exc:  # contained: Stage 2 may never fail the scan
+        reservation_id, blocked = reserve_spend(
+            config,
+            reserved_tokens=reserved_tokens,
+            reserved_cost_usd=reserved_cost,
+            now=now,
+        )
+    except IRRSpendUnavailable as exc:
         row = {
             **base,
-            "status": STATUS_FAILED,
-            "error_type": _error_code(exc),
-            "estimated_cost_usd": 0.0,
+            "status": STATUS_SPEND_UNVERIFIABLE,
+            "skipped_reason": str(exc),
+            "charged_tokens": 0,
+            "charged_cost_usd": 0.0,
+            "latency_ms": 0,
+        }
+        _append_evidence(row, now=now)
+        return row
+    if reservation_id is None:
+        row = {
+            **base,
+            "status": STATUS_BUDGET_EXHAUSTED,
+            "skipped_reason": blocked,
+            "charged_tokens": 0,
+            "charged_cost_usd": 0.0,
             "latency_ms": 0,
         }
         _append_evidence(row, now=now)
         return row
 
-    input_tokens = int(usage.get("prompt_tokens") or 0)
-    output_tokens = int(usage.get("completion_tokens") or 0)
-    total_tokens = int(usage.get("total_tokens") or (input_tokens + output_tokens))
-    cost = estimate_cost_usd(
-        input_tokens=input_tokens, output_tokens=output_tokens
+    usage: Mapping[str, Any] = {}
+    latency_ms = 0
+    challenge: dict[str, Any] | None = None
+    error_type: str | None = None
+    try:
+        answer = _invoke(config, body, post=post)
+        usage = answer.usage
+        latency_ms = answer.latency_ms
+        challenge = validate_challenge(
+            parse_challenge(answer.content), symbol=symbol, direction=direction
+        )
+    except Exception as exc:  # contained: Stage 2 may never fail the primary path
+        error_type = _error_code(exc)
+
+    charged_tokens, charged_cost, usage_available = _usage_charge(
+        usage,
+        reserved_tokens=reserved_tokens,
+        reserved_cost_usd=reserved_cost,
     )
+    settled = settle_spend(
+        reservation_id=reservation_id,
+        actual_tokens=charged_tokens,
+        actual_cost_usd=charged_cost,
+        outcome="SUCCEEDED" if challenge is not None else "CHARGED_FAILURE",
+        usage_available=usage_available,
+        now=now,
+    )
+
     row = {
         **base,
-        "status": STATUS_SUCCEEDED,
         "latency_ms": latency_ms,
-        "challenge": challenge,
-        "verdict": challenge["verdict"],
-        "reasons": challenge["reasons"],
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "total_tokens": total_tokens,
-        "estimated_cost_usd": cost,
+        "charged_tokens": int(charged_tokens),
+        "charged_cost_usd": round(float(charged_cost), 6),
+        "usage_available": usage_available,
+        "spend_settled": settled,
     }
+    if challenge is None:
+        row["status"] = STATUS_FAILED
+        row["error_type"] = error_type or "MALFORMED_RESPONSE"
+        _append_evidence(row, now=now)
+        return row
+
+    row.update(
+        {
+            "status": STATUS_SUCCEEDED,
+            "challenge": challenge,
+            "verdict": challenge["verdict"],
+            "reasons": challenge["reasons"],
+            "error_type": None,
+        }
+    )
     _append_evidence(row, now=now)
     _idempotence_store(
         key,
@@ -915,95 +1390,114 @@ def _review_one(
     return row
 
 
-
 def _overall_status(rows: list[dict[str, Any]]) -> str:
     statuses = {str(row.get("status") or "") for row in rows}
     if not statuses:
-        return STATUS_NO_ELIGIBLE_RECOMMENDATIONS
+        return "EMPTY"
     if statuses <= {STATUS_SUCCEEDED, STATUS_IDEMPOTENT_REPLAY}:
         return STATUS_SUCCEEDED
     if statuses & {STATUS_SUCCEEDED, STATUS_IDEMPOTENT_REPLAY}:
         return "PARTIAL"
-    for status in (STATUS_FAILED, STATUS_BUDGET_EXHAUSTED, STATUS_CALL_COST_LIMIT):
+    for status in (
+        STATUS_SPEND_UNVERIFIABLE,
+        STATUS_BUDGET_EXHAUSTED,
+        STATUS_CALL_COST_LIMIT,
+        STATUS_FAILED,
+    ):
         if status in statuses:
             return status
     return STATUS_FAILED
 
 
-def run_independent_shadow_review(
+def drain_queue(
     *,
-    review: Mapping[str, Any],
-    request_payload: Mapping[str, Any] | None = None,
+    batch_limit: int | None = None,
     post: Callable[..., Any] | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Run Stage 2 for the eligible, qualified Chief recommendations.
+    """Process a bounded batch of queued requests in the dedicated worker.
 
-    This is the only public entry point. It never raises and never returns
-    authority: the result is advisory metadata for the shadow evidence journal
-    and for operator inspection only.
+    This is the only place Stage 2 performs provider I/O. It never raises, and a
+    global configuration or spend failure leaves the checkpoint unadvanced so no
+    evidence is silently dropped.
     """
     now = now or datetime.now(timezone.utc)
     mode = irr_mode()
     if mode not in ALLOWED_MODES:
-        return _empty_summary(
-            STATUS_INVALID_MODE,
-            now=now,
-            skipped_reason="OPIP_IRR_MODE must be one of: off, shadow",
-        )
+        return {"status": STATUS_INVALID_MODE, "processed": 0}
     if mode == MODE_OFF:
-        return _empty_summary(STATUS_DISABLED, now=now)
+        return {"status": STATUS_DISABLED, "processed": 0}
 
     try:
         config = resolve_config()
     except IRRMissingCredential as exc:
-        return _empty_summary(STATUS_MISSING_CREDENTIAL, now=now, skipped_reason=str(exc))
+        return {
+            "status": STATUS_MISSING_CREDENTIAL,
+            "processed": 0,
+            "skipped_reason": str(exc),
+        }
     except IRRUnverifiedModel as exc:
-        return _empty_summary(STATUS_UNVERIFIED_MODEL, now=now, skipped_reason=str(exc))
+        return {
+            "status": STATUS_UNVERIFIED_MODEL,
+            "processed": 0,
+            "skipped_reason": str(exc),
+        }
     except IRRConfigurationError as exc:
-        return _empty_summary(
-            STATUS_CONFIGURATION_ERROR, now=now, skipped_reason=str(exc)
-        )
+        return {
+            "status": STATUS_CONFIGURATION_ERROR,
+            "processed": 0,
+            "skipped_reason": str(exc),
+        }
 
-    recommendations = _select_recommendations(review, limit=config.max_candidates)
-    if not recommendations:
-        summary = _empty_summary(
-            STATUS_NO_ELIGIBLE_RECOMMENDATIONS, config=config, now=now
-        )
-        return summary
+    limit = batch_limit if batch_limit is not None else config.drain_batch
+    limit = max(1, min(int(limit), 5))
 
-    chief_route = review.get("opip_ai_route")
-    rows: list[dict[str, Any]] = []
-    for recommendation in recommendations:
-        try:
-            rows.append(
-                _review_one(
-                    recommendation=recommendation,
-                    config=config,
-                    request_payload=request_payload,
-                    chief_route=chief_route if isinstance(chief_route, Mapping) else None,
-                    post=post,
-                    now=now,
-                )
-            )
-        except Exception as exc:  # the whole stage stays contained
-            rows.append(
-                {
-                    "symbol": str(recommendation.get("symbol") or ""),
-                    "direction": str(recommendation.get("direction") or "").upper(),
-                    "provider": PROVIDER,
-                    "model": config.model,
-                    "status": STATUS_FAILED,
-                    "error_type": type(exc).__name__,
-                    "advisory_only": True,
-                    "authority_changed": False,
-                }
-            )
+    try:
+        with registry_lock(QUEUE_CONSUMER_LOCK, timeout=LEDGER_LOCK_TIMEOUT_SECONDS):
+            start = _load_checkpoint()
+            rows, total = queue_slice(start, limit)
+            results = [
+                _process_queue_row(raw, config=config, post=post, now=now)
+                for _index, raw in rows
+            ]
+            next_line = start + len(rows)
+            if rows:
+                try:
+                    _save_checkpoint(next_line)
+                except OSError:
+                    # A failed checkpoint only re-processes; the idempotence
+                    # ledger prevents a second paid call for the same evidence.
+                    next_line = start
+    except TimeoutError:
+        return {"status": STATUS_QUEUE_UNAVAILABLE, "processed": 0}
+    except IndependentReviewError as exc:
+        return {
+            "status": STATUS_QUEUE_UNAVAILABLE,
+            "processed": 0,
+            "skipped_reason": str(exc),
+        }
 
-    summary = _empty_summary(_overall_status(rows), config=config, now=now)
-    summary["reviews"] = rows
-    summary["recommendation_count"] = len(recommendations)
-    summary["estimated_cost_usd"] = round(
-        sum(float(row.get("estimated_cost_usd") or 0.0) for row in rows), 6
-    )
-    return summary
+    return {
+        "status": _overall_status(results),
+        "processed": len(results),
+        "queue_total_rows": total,
+        "next_line": next_line,
+        "results": results,
+        "budget": config.public_evidence(),
+        "shadow_only": True,
+        "advisory_only": True,
+        "authority_changed": False,
+        "funded_trade_authority_changed": False,
+    }
+
+
+
+
+
+
+
+
+
+
+
+

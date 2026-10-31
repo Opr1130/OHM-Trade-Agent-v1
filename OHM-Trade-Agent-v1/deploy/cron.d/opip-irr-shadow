@@ -1,0 +1,23 @@
+# O'Pip Stage-2 Independent Research & Risk Review (IRR) shadow worker
+# Dedicated, bounded, non-overlapping consumer for the IRR advisory queue.
+# This is NOT the protected unified cycle: it runs as its own process on the one
+# scheduler (cron) and never takes the unified-cycle lock, so a slow or hung
+# provider can never delay or skip a protection cycle, a scan, a Chief review or
+# a Telegram delivery.
+#
+# Producer: the scan appends immutable evidence AFTER the final deterministic
+# target, economic and portfolio/capital gates, with a bounded local append and
+# no network I/O. This worker is the only process that calls the provider.
+#
+# Dark by default: OPIP_IRR_MODE=off (the default) makes this an inert recorded
+# no-op that spends nothing. A pass is bounded to OPIP_IRR_DRAIN_BATCH requests
+# (default 2, max 5), one attempt each with no retry, and every attempt reserves
+# its worst-case spend before the call.
+#
+# Non-overlap: host `flock -n` plus the in-container consumer lock. Bounds: the
+# in-container `timeout` covers the whole batch, and each request has its own
+# bounded provider timeout, so a hung provider cannot hold the slot open.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+* * * * * root flock -n /var/run/opip-irr-shadow.lock -c 'cd /opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1 && /usr/bin/docker compose exec -T ohm-trade-agent timeout --signal=TERM --kill-after=5s 150 python -m app.jobs.drain_irr_shadow >> /var/log/opip-irr-shadow.log 2>&1'

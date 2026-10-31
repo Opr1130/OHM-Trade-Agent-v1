@@ -29,7 +29,6 @@ from app.services.economic_quality_gate import (
     evaluate_economic_quality,
 )
 from app.services.entry_exit_advisor import build_entry_exit_plan
-from app.services.independent_research_review import run_independent_shadow_review
 from app.services.openai_usage_telemetry import append_usage_record
 from app.services.opip_ai_router import (
     invoke_chief_review,
@@ -496,36 +495,6 @@ def _apply_cached_route_stage(
         ]
 
 
-def _attach_independent_shadow_review(
-    review: dict,
-    *,
-    request_payload: dict,
-) -> None:
-    """Attach Stage-2 independent research evidence, shadow-only.
-
-    Architecture v1.5.0 UI-02: AI review state and stance remain separate
-    optional metadata. Missing or failed Stage-2 evidence is never favourable
-    analysis and never creates an approval or a veto. The Chief conclusion,
-    ranking, alert set, learning capture and canonical decisions are read-only
-    inputs here and are never modified.
-    """
-    try:
-        review["opip_irr_shadow"] = run_independent_shadow_review(
-            review=review,
-            request_payload=request_payload,
-        )
-    except Exception as exc:
-        review["opip_irr_shadow"] = {
-            "status": "FAILED",
-            "stage": "STAGE_2_INDEPENDENT_RESEARCH_REVIEW",
-            "error_type": type(exc).__name__,
-            "shadow_only": True,
-            "advisory_only": True,
-            "authority_changed": False,
-            "funded_trade_authority_changed": False,
-        }
-
-
 def review_candidates(
     candidates: list[MarketSnapshot],
     model: str,
@@ -868,8 +837,4 @@ def review_candidates(
             "not_selected": 0,
             "unmatched": 0,
         }
-    # Stage 2 runs last, so the cache entry and the learning capture above see
-    # exactly the same evidence they saw before this stage existed. It is
-    # additive advisory metadata only; it cannot change any decision.
-    _attach_independent_shadow_review(review, request_payload=request_payload)
     return review

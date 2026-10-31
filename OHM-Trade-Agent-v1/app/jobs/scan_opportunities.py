@@ -65,6 +65,7 @@ from app.services.economic_quality_gate import (
 from app.services.entry_exit_advisor import build_entry_exit_plan
 from app.services.entry_watch_queue import enqueue_entry_watch, remove_entry_watch
 from app.services.freqtrade_signal_bridge import build_signal_id, to_freqtrade_pair
+from app.services.independent_research_review import enqueue_final_qualified
 from app.services.market_intelligence_integration import enrich_finalist_market_intelligence
 from app.services.price_movement_learning import (
     get_latest_price_movement,
@@ -2280,6 +2281,26 @@ def main(scan_override=None):
                     "O'Pip new-trade suppression audit failed:",
                     f"{type(exc).__name__}: {exc}",
                 )
+
+    # Stage 2 advisory research (v1.5.0 F12): queue immutable evidence for the
+    # FINAL survivors only (deterministic target + economic + portfolio/capital
+    # gates already applied above, and Telegram already delivered). This is a
+    # bounded local append: no provider call runs on the scan, Chief or Telegram
+    # path, and a failure here is never fatal.
+    try:
+        irr_queue = enqueue_final_qualified(
+            alerts=[ranked.opportunity.alert for ranked in ranked_opportunities],
+            chief_route=review.get("opip_ai_route"),
+            market_regime={"regime": getattr(market_regime, "regime", None)},
+        )
+        print(
+            "IRR shadow queue:",
+            irr_queue.get("status"),
+            "enqueued:",
+            irr_queue.get("enqueued"),
+        )
+    except Exception as exc:
+        print("IRR shadow queue unavailable:", type(exc).__name__)
 
     print("")
     print("===== OHM HIGH-CONVICTION SUMMARY =====")
