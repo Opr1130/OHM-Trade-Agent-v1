@@ -38,9 +38,11 @@ jobs:
         with:
           python-version: '3.12'
           cache: pip
-          cache-dependency-path: OHM-Trade-Agent-v1/requirements.txt
+          cache-dependency-path: |
+            OHM-Trade-Agent-v1/requirements.txt
+            OHM-Trade-Agent-v1/requirements-test.txt
       - run: python -m pip install --upgrade pip
-      - run: pip install -r requirements.txt
+      - run: pip install -r requirements.txt -r requirements-test.txt
       - run: python -m pytest -q
       - run: python -m compileall -q app
       - name: Validate production Compose
@@ -84,6 +86,11 @@ jobs:
       # executed here exactly once, with root, against a real learning image.
       - name: Build learning image for replica E2E
         run: docker build -t "opip-learning:ci-${{ github.sha }}" .
+      - name: Verify production image excludes pytest
+        run: |
+          docker run --rm --network none --entrypoint python \
+            "opip-learning:ci-${{ github.sha }}" -c \
+            'import importlib.util; assert importlib.util.find_spec("pytest") is None, "pytest must not be installed in the production image"'
       - name: Canonical learning-replica transfer E2E (root)
         env:
           OPIP_LEARNING_TEST_IMAGE: opip-learning:ci-${{ github.sha }}
