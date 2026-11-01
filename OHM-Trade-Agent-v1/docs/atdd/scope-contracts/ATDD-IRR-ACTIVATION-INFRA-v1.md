@@ -153,6 +153,19 @@ scheduler remains dormant and recoverable because the runner refuses to start
 without a verified image
 
 
+AC-011:
+GIVEN:
+the owner `.env` contains a DeepSeek provider credential and a shadow-mode
+producer switch, and the isolated worker reads the owner's Compose interpolation
+WHEN:
+the deploy controller derives the running core's `.env.core`
+THEN:
+the DeepSeek credential never appears in the derived core file or logs,
+`OPIP_IRR_MODE=shadow` remains available to the core/scan producer, the
+owner `.env` stays unchanged, the dedicated worker continues to receive its
+key through its isolated Compose environment, and funded-credential parity
+and the original F11 read-only credential allowlist remain unchanged
+
 EXPLICITLY OUT OF SCOPE:
 
 - enabling IRR, installing the cron entry, deploying, or activating anything
@@ -173,6 +186,8 @@ FROZEN BOUNDARIES:
 - the spend ledger, evidence identity verification and idempotence protections
   are preserved unchanged, and no paid call is made by this increment
 - F11 protection independence unchanged
+- DeepSeek's credential remains worker-only; the core may receive the mode switch
+  but must not receive the provider key
 
 ACCEPTANCE TEST TRACEABILITY:
 
@@ -201,6 +216,7 @@ AC-009 -> tests/test_opip_irr_activation_v1.py::test_rollback_service_detection_
 AC-010 -> tests/test_opip_irr_activation_v1.py::test_failed_image_verification_restores_the_captured_scheduler_state
 AC-010 -> tests/test_opip_irr_activation_v1.py::test_activation_state_survives_a_failed_preflight_byte_for_byte
 AC-010 -> tests/test_opip_irr_activation_v1.py::test_state_absent_at_capture_stays_absent_after_a_failed_preflight
+AC-011 -> tests/test_tradevisor_core_env_isolation_v1.py::test_irr_deepseek_key_is_worker_only_but_shadow_mode_reaches_core
 
 IMPLEMENTATION MAP:
 
@@ -235,6 +251,8 @@ AC-009 -> OHM-Trade-Agent-v1/tests/test_opip_irr_activation_v1.py
 AC-010 -> OHM-Trade-Agent-v1/deploy/remote/lib/opip_scheduler_authorization.sh
 AC-010 -> OHM-Trade-Agent-v1/deploy/remote/reconcile-scheduler.sh
 AC-010 -> OHM-Trade-Agent-v1/tests/test_opip_irr_activation_v1.py
+AC-011 -> OHM-Trade-Agent-v1/deploy/remote/lib/opip_release_tree.sh
+AC-011 -> OHM-Trade-Agent-v1/tests/test_tradevisor_core_env_isolation_v1.py
 AC-001 -> OHM-Trade-Agent-v1/OPIP_TWO_STAGE_ADVISORY_AI_V1.md
 AC-004 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-IRR-ACTIVATION-INFRA-v1.md
 AC-004 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
