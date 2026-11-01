@@ -411,6 +411,8 @@ class Settings(BaseSettings):
 
     # Opt-in evidence-only V2 computation; never switches production selection.
     opip_score_v2_evaluation_enabled: bool = False
+    # Controlled release selection; V1 remains default. No funded-order authority.
+    opip_production_scoring_version: str = Field(default="v1", pattern=r"^(v1|v2)$")
     # Separate, opt-in private config-editor credential; never authorizes trades.
     strategy_admin_secret: str | None = None
 
