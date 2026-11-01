@@ -78,6 +78,10 @@ def save_policy_draft(
         if before.digest != expected_digest:
             raise StrategyDraftConflict("STRATEGY_DRAFT_STALE")
         initial = json.loads(current)
+        if any(not isinstance(proposed.get(section), dict) for section in (
+            'scoring', 'advisory_economics', 'ai_advisory', 'protection'
+        )):
+            raise ValueError('INVALID_STRATEGY_DRAFT_SECTION')
         allowed_shape = deepcopy(initial)
         for section, field in _EDITABLE:
             allowed_shape[section][field] = proposed.get(section, {}).get(field)
