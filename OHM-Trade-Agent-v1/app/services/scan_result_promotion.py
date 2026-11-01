@@ -14,6 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, fields, is_dataclass
 from datetime import datetime, timedelta, timezone
 import json
+import math
 from pathlib import Path
 from typing import Any, Mapping
 import uuid
@@ -97,6 +98,18 @@ def _rebuild_snapshot(payload: Mapping[str, Any]) -> tuple[MarketSnapshot, list[
     degraded: list[str] = []
     for name, value in payload.items():
         if name not in known:
+            continue
+        if name in {"v2_long_components", "v2_short_components"} and isinstance(value, dict):
+            # Explicitly supported scalar-score evidence. Other unknown nested
+            # mappings continue to degrade rather than gaining new authority.
+            if all(
+                isinstance(key, str) and type(score) in (float, int)
+                and math.isfinite(score) and 0 <= score <= 100
+                for key, score in value.items()
+            ):
+                kwargs[name] = dict(value)
+            else:
+                degraded.append(name)
             continue
         if value is not None and is_dataclass(known[name].type) is False and isinstance(
             value, dict
