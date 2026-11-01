@@ -47,13 +47,22 @@ GIVEN: the operator wants self-service tuning and production trading must remain
 WHEN: the owner loads, edits or saves strategy settings from the private dashboard
 THEN: only approved advisory fields can change, a distinct admin credential is required, stale versions fail closed, saves are durable and auditable, and no draft activates trading.
 
+AC-006:
+V2 selection honors deterministic direction, qualified recovery and matched audit thresholds.
+GIVEN: V2 feature scores are computed on completed candles and independently qualified
+WHEN: the scorer version is explicitly selected in a controlled release
+THEN: the V2 score determines top candidates, missing V2 features fail closed,
+the same V2 threshold is recorded in admission evidence, a rejected SHORT
+can only recover an independently qualified LONG, and the V1 comparison
+remains read-only.
+
 EXPLICITLY OUT OF SCOPE:
-V2 as live production authority, live activation via the UI, auto-trading,
+V2 activation in a live deployment without release certification, auto-trading,
 margin/portfolio policy relaxation, multi-tenant settings, code-driven learning,
 changing global economic gate defaults, and a new dashboard service.
 
 FROZEN BOUNDARIES:
-V1 threshold 80 and Top 8 remain authoritative; per-direction cap 5,
+V1 remains active by default; Top 8 and per-direction cap 5,
 zero-overlap scanner, bounded memory, operator modes, deterministic safety,
 AI qualification, paper controls, and funded-order protections unchanged.
 
@@ -67,6 +76,11 @@ AC-005 -> tests/test_strategy_admin_drafts.py::test_protected_trading_authority_
 AC-005 -> tests/test_strategy_admin_drafts.py::test_stale_expected_digest_is_rejected
 AC-005 -> tests/test_strategy_admin_drafts.py::test_separate_admin_credential_required
 AC-005 -> tests/test_strategy_admin_drafts.py::test_only_allowed_economic_and_v2_fields_are_editable
+AC-006 -> tests/test_v2_production_selection_contract.py::test_v2_selection_uses_v2_long_and_short_not_v1_scores
+AC-006 -> tests/test_v2_production_selection_contract.py::test_missing_v2_features_are_unavailable_not_v1_fallback
+AC-006 -> tests/test_v2_production_selection_contract.py::test_v2_margin_fallback_requires_independent_v2_long_qualification
+AC-006 -> tests/test_v2_production_selection_contract.py::test_selector_and_screening_rows_share_v2_threshold
+AC-006 -> tests/test_v2_production_selection_contract.py::test_comparison_relabels_authority_correctly_on_v2_cutover
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/core/config.py
@@ -98,13 +112,17 @@ AC-005 -> OHM-Trade-Agent-v1/app/core/strategy_policy.py
 AC-005 -> OHM-Trade-Agent-v1/app/services/strategy_admin_drafts.py
 AC-005 -> OHM-Trade-Agent-v1/tests/test_strategy_admin_drafts.py
 
+AC-006 -> OHM-Trade-Agent-v1/app/scanner/directional_candidates.py
+AC-006 -> OHM-Trade-Agent-v1/app/jobs/scan_opportunities.py
+AC-006 -> OHM-Trade-Agent-v1/app/scanner/market_scanner.py
+AC-006 -> OHM-Trade-Agent-v1/app/core/config.py
+AC-006 -> OHM-Trade-Agent-v1/app/services/technical_scoring_comparison.py
+AC-006 -> OHM-Trade-Agent-v1/tests/test_v2_production_selection_contract.py
+
 DEFERRED DISCOVERIES:
-Production cutover requires coordinated updates to directional selection,
-long recovery, screening admission/reconciliation evidence and ranking gates,
-plus secure configuration activation/rollback. Draft editing is not runtime
-activation; to activate a profile requires separate review and deployment.
-These will require a follow-up
-bounded increment and exact-head validation. No claim of live V2 readiness here.
+Production V2 cutover is guarded behind a disabled-by-default configuration
+and requires owner deployment approval. Dashboard configuration activation,
+rollback and downstream outcome certification remain release blockers.
 
 UNAPPROVED SCOPE CHANGES:
 NONE
