@@ -413,6 +413,8 @@ class Settings(BaseSettings):
     opip_score_v2_evaluation_enabled: bool = False
     # Controlled release selection; V1 remains default. No funded-order authority.
     opip_production_scoring_version: str = Field(default="v1", pattern=r"^(v1|v2)$")
+    # Advisory economic policy remains off pending release certification.
+    opip_advisory_profile_enabled: bool = False
     # Separate, opt-in private config-editor credential; never authorizes trades.
     strategy_admin_secret: str | None = None
 
