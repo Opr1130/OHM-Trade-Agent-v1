@@ -1392,8 +1392,9 @@ def main(scan_override=None):
     screening_scan_id = _screening_scan_id(opip)
     advisory_policy = None
     if bool(getattr(settings, "opip_advisory_profile_enabled", False)):
-        from app.core.strategy_policy import load_strategy_policy
-        economics = load_strategy_policy().advisory_economics
+        from app.core.strategy_policy import load_active_strategy_policy
+        active_strategy = load_active_strategy_policy()
+        economics = active_strategy.advisory_economics
         advisory_policy = {
             "min_net_profit": economics["min_net_profit_usd"],
             "min_target_2_move_pct": economics["min_target_2_move_pct"],
@@ -1406,7 +1407,20 @@ def main(scan_override=None):
     scoring_threshold = 80
     if scoring_version == "v2":
         from app.scanner.technical_score_v2 import load_v2_config
-        scoring_threshold = int(load_v2_config().threshold)
+        from app.core.strategy_policy import load_strategy_policy
+
+        policy = (
+            active_strategy
+            if advisory_policy is not None
+            else load_strategy_policy()
+        )
+        scoring_threshold = int(policy.scoring["v2_threshold"])
+        # Isolated workers can have a cached profile. Never apply a new
+        # admission threshold to candidates scored under a previous profile.
+        for item in scan.snapshots:
+            if getattr(item, "v2_feature_status", None) == "READY":
+                if getattr(item, "v2_profile_digest", None) != policy.digest:
+                    raise ValueError("V2_SCORING_POLICY_DIGEST_MISMATCH")
     candidates = _select_production_candidates(
         scan.snapshots,
         telemetry_enabled=bool(opip.telemetry_enabled),
