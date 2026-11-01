@@ -64,6 +64,16 @@ THEN: the optional $0 net floor may remove advisory prefilter rejections, the sh
 execution $75 default is unchanged, and model-estimated movement is bounded,
 conditional, not a win probability and never bypasses deterministic risk gates.
 
+AC-008:
+A protected strategy policy draft can be promoted to an active advisory
+configuration and rolled back without affecting funded trading.
+GIVEN: an authenticated administrator, an explicitly enabled advisory consumer
+and a saved validated draft with an expected SHA256
+WHEN: the owner deliberately activates or rolls back that profile
+THEN: a durable audit intent precedes a restricted atomic replace, stale edits
+fail closed, the previous advisory profile is recoverable, malformed policies
+are rejected, and execution authority remains unchanged.
+
 EXPLICITLY OUT OF SCOPE:
 V2 activation in a live deployment without release certification, auto-trading,
 margin/portfolio policy relaxation, multi-tenant settings, code-driven learning,
@@ -91,6 +101,9 @@ AC-006 -> tests/test_v2_production_selection_contract.py::test_selector_and_scre
 AC-006 -> tests/test_v2_production_selection_contract.py::test_comparison_relabels_authority_correctly_on_v2_cutover
 AC-007 -> tests/test_advisory_policy_v2.py::test_fixed_profit_floor_remains_in_execution_default_but_not_advisory_override
 AC-007 -> tests/test_advisory_policy_v2.py::test_invalid_ai_return_potential_cannot_become_trade_claim
+AC-008 -> tests/test_strategy_admin_drafts.py::test_advisory_activation_and_rollback_are_atomic_and_versioned
+AC-008 -> tests/test_strategy_admin_drafts.py::test_activation_refuses_drafts_without_saved_version
+AC-008 -> tests/test_strategy_admin_drafts.py::test_unapproved_activation_endpoint_is_disabled
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/core/config.py
@@ -133,6 +146,16 @@ AC-007 -> OHM-Trade-Agent-v1/app/core/config.py
 AC-007 -> OHM-Trade-Agent-v1/app/jobs/scan_opportunities.py
 AC-007 -> OHM-Trade-Agent-v1/app/services/chief_analyst.py
 AC-007 -> OHM-Trade-Agent-v1/tests/test_advisory_policy_v2.py
+
+AC-008 -> OHM-Trade-Agent-v1/app/api/dashboard.py
+AC-008 -> OHM-Trade-Agent-v1/app/api/strategy_admin.html
+AC-008 -> OHM-Trade-Agent-v1/app/core/config.py
+AC-008 -> OHM-Trade-Agent-v1/app/core/strategy_policy.py
+AC-008 -> OHM-Trade-Agent-v1/app/scanner/market_scanner.py
+AC-008 -> OHM-Trade-Agent-v1/app/scanner/models.py
+AC-008 -> OHM-Trade-Agent-v1/app/jobs/scan_opportunities.py
+AC-008 -> OHM-Trade-Agent-v1/app/services/strategy_admin_drafts.py
+AC-008 -> OHM-Trade-Agent-v1/tests/test_strategy_admin_drafts.py
 
 DEFERRED DISCOVERIES:
 Production V2 cutover is guarded behind a disabled-by-default configuration
