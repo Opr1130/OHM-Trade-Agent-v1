@@ -1,7 +1,6 @@
 """Bounded, read-only V1/V2 scanner comparisons, never an admission source."""
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import logging
@@ -9,7 +8,6 @@ import os
 from pathlib import Path
 from typing import Any, Sequence
 
-from app.scanner.directional_candidates import select_directional_candidates
 from app.scanner.short_technical_scorer import score_short_snapshot
 
 logger = logging.getLogger(__name__)
