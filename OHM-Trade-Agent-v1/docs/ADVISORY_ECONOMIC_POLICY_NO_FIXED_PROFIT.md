@@ -1,24 +1,19 @@
-# Advisory economic gate policy: fixed-dollar threshold removal
+# Advisory economics policy change (draft, not deployed)
 
-Owner direction (2026-11-01): eliminate the $75 fixed minimum from
-candidate economics. `MIN_NET_PROFIT` is now **0**, meaning a candidate
-must still achieve nonnegative *estimated* net return at Target 2 after
-configured transaction and margin costs. A zero minimum is not a profit
-forecast and does not mean execution is guaranteed profitable.
+**Do not globally change `MIN_NET_PROFIT=75`**: that default is shared by
+trade-action, Tradevisor, and other execution-adjacent contracts. A blanket
+zero change caused seven failing regression tests and can weaken an unrelated
+production policy.
 
-Other gates are unchanged: stop exposure, capital envelope used for
-validation, target movement, 2.5:1 reward/risk, margin eligibility,
-target attainability, execution evidence, risk approval and Chief AI
-recommendation. This change does not enable autonomous orders, adjust
-risk limits, or switch V1/V2 scoring.
+The approved direction is **advisory-only**: use a validated strategy profile
+for `advisory_economics.min_net_profit_usd=0` and explicitly pass this value to
+the Chief Analyst's screening path. Retain the execution-compatible default
+until a separate, explicitly authorized auto-trading policy is developed.
 
-The Chief currently receives deterministic price targets and context,
-and returns ALERT/WATCH/REJECT and reasons. It **does not** yet output
-independent numerical upside scenarios with horizons. Add a strictly
-structured, evidence-based optional potential-move scenario in a follow-up
-reviewed integration, as an advisory field only. Avoid inventing
-win probabilities or treating model confidence as a probability.
+A zero advisory floor means the estimate must be nonnegative after configured
+costs. All target geometry, reward-to-risk, attainability, margin, liquidity,
+stop-risk and operator vetoes remain in force. No trading activation.
 
-The impact must be measured: compare historical prefilter veto reasons
-and confirm candidates under the former $75 constraint can reach
-AI without bypassing deterministic safety.
+Integration must use the shared strategy policy loader from draft PR #486,
+with independent verification of missing config, profile hash and replay. The
+Chief's numerical AI upside scenarios are a separate additive output schema.
