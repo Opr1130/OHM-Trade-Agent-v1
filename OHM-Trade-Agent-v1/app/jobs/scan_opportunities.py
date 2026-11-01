@@ -1165,12 +1165,13 @@ def _target_quality(plan, snapshot):
     return evaluate_target_attainability(plan, snapshot)
 
 
-def _economic_quality(plan, snapshot, account_equity):
+def _economic_quality(plan, snapshot, account_equity, advisory_policy: dict | None = None):
     if snapshot.trade_direction == "SHORT":
         return evaluate_economic_quality(
             plan,
             available_capital=account_equity,
             max_capital_fraction=PRODUCTION_MAX_CAPITAL_FRACTION,
+            **(advisory_policy or {}),
             direction="SHORT",
             leverage=SHORT_VALIDATION_LEVERAGE,
             estimated_margin_cost_pct=SHORT_MARGIN_COST_RESERVE_PCT,
@@ -1180,6 +1181,7 @@ def _economic_quality(plan, snapshot, account_equity):
         plan,
         available_capital=account_equity,
         max_capital_fraction=PRODUCTION_MAX_CAPITAL_FRACTION,
+        **(advisory_policy or {}),
     )
 
 
@@ -1388,6 +1390,16 @@ def main(scan_override=None):
     )
     screening_rows: list[dict] = []
     screening_scan_id = _screening_scan_id(opip)
+    advisory_policy = None
+    if bool(getattr(settings, "opip_advisory_profile_enabled", False)):
+        from app.core.strategy_policy import load_strategy_policy
+        economics = load_strategy_policy().advisory_economics
+        advisory_policy = {
+            "min_net_profit": economics["min_net_profit_usd"],
+            "min_target_2_move_pct": economics["min_target_2_move_pct"],
+            "min_reward_to_risk": economics["min_reward_to_risk"],
+            "estimated_round_trip_cost_pct": economics["estimated_round_trip_cost_pct"],
+        }
     scoring_version = getattr(settings, "opip_production_scoring_version", "v1")
     if scoring_version not in {"v1", "v2"}:
         raise ValueError("INVALID_PRODUCTION_SCORING_VERSION")
@@ -1784,6 +1796,7 @@ def main(scan_override=None):
         settings.account_equity,
         market_regime_context=intelligence.chief_market_regime_context,
         coingecko_global_context=coingecko_global,
+        **({"economic_policy": advisory_policy} if advisory_policy is not None else {}),
     )
     opip.record_ai_stage(review)
     alerts = qualified_alerts(review)
@@ -2010,7 +2023,10 @@ def main(scan_override=None):
             f"T2 move={target_quality.target_2_move_pct:.2f}%"
         )
 
-        economic = _economic_quality(plan, snapshot, settings.account_equity)
+        economic = _economic_quality(
+            plan, snapshot, settings.account_equity,
+            **({"advisory_policy": advisory_policy} if advisory_policy is not None else {}),
+        )
         opip.record_economic_quality(snapshot, economic)
         if not economic.qualified:
             economic_rejected += 1
