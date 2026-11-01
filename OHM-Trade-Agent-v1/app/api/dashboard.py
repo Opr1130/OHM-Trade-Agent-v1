@@ -10,6 +10,7 @@ from app.opip.decision.explanations import build_zero_trade_explanation
 from app.services.dashboard_read_model import build_dashboard_read_model
 from app.services.operations_analytics import build_operations_summary
 from app.services.secret_auth import secret_matches
+from app.services.technical_scoring_comparison import read_recent_comparisons
 
 
 router = APIRouter()
@@ -63,3 +64,10 @@ def opip_zero_trade_explanation(
 @router.get("/dashboard", response_class=HTMLResponse)
 def dashboard() -> str:
     return DASHBOARD_FILE.read_text(encoding="utf-8")
+
+
+@router.get("/api/opip/scoring-comparison")
+def scoring_comparison(x_webhook_secret: str | None = Header(default=None)) -> dict:
+    """Read-only V1/V2 paired-scoring evidence. Never activates a strategy."""
+    _require_secret(x_webhook_secret)
+    return read_recent_comparisons()
