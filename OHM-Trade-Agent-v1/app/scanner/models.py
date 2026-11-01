@@ -145,3 +145,6 @@ class MarketSnapshot:
     v2_feature_status: str = "NOT_COMPUTED"
     v2_profile_version: str | None = None
     v2_profile_digest: str | None = None
+    v2_long_components: dict[str, float] | None = None
+    v2_short_components: dict[str, float] | None = None
+    technical_score_version: str = "v1"
