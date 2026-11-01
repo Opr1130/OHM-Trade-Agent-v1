@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import os
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
@@ -73,12 +74,15 @@ Return JSON only in this exact shape:
       "confidence": 0,
       "risk_level": "low|medium|high",
       "decision": "alert|watch|reject",
-      "reason": ""
+      "reason": "",
+      "potential_move_pct": null,
+      "potential_timeframe_hours": null,
+      "potential_rationale": ""
     }
   ],
   "summary": ""
 }
-Maximum 3 top_candidates. Confidence must be 0-100. Be conservative.
+Maximum 3 top_candidates. Confidence must be 0-100. Be conservative. If supportable, estimate an illustrative, directional move (0–30% absolute; SHORT means price decline) and timeframe (1–168 hours); null if not supportable. Cite trend, levels, volatility and market regime in potential_rationale. This is conditional advisory upside, not a return promise, probability, or trade target. Keep supplied deterministic Target 2 values unchanged.
 """
 
 _ALLOWED_REASONING_EFFORTS = {"low", "medium", "high"}
@@ -95,6 +99,30 @@ SHORT_VALIDATION_LEVERAGE = 2.0
 SHORT_MARGIN_COST_RESERVE_PCT = 0.28
 SHORT_MAX_ACCOUNT_RISK_AT_STOP_PCT = 5.0
 
+
+
+def _normalize_chief_potential(review: dict) -> None:
+    """Sanitize optional model estimates; invalid or absent fields stay unknown.
+
+    A model's stated upside is not a win probability or trading authorization.
+    """
+    entries = review.get("top_candidates")
+    if not isinstance(entries, list):
+        return
+    for entry in entries[:3]:
+        if not isinstance(entry, dict):
+            continue
+        move, hours = entry.get("potential_move_pct"), entry.get("potential_timeframe_hours")
+        if (type(move) not in (int, float) or type(hours) not in (int, float)
+                or not math.isfinite(move) or not math.isfinite(hours)
+                or not 0 < move <= 30 or not 1 <= hours <= 168):
+            entry["potential_move_pct"] = None
+            entry["potential_timeframe_hours"] = None
+            entry["potential_rationale"] = ""
+            continue
+        entry["potential_move_pct"] = round(float(move), 2)
+        entry["potential_timeframe_hours"] = int(hours)
+        entry["potential_rationale"] = str(entry.get("potential_rationale") or "")[:500]
 
 def _reasoning_effort() -> str:
     effort = os.getenv("OPENAI_REASONING_EFFORT", "medium").strip().lower()
@@ -114,7 +142,7 @@ def _max_output_tokens() -> int:
     return value
 
 
-def _quality_by_risk_level(candidate: MarketSnapshot, account_equity: float) -> tuple[dict, bool]:
+def _quality_by_risk_level(candidate: MarketSnapshot, account_equity: float, economic_policy: dict | None = None) -> tuple[dict, bool]:
     quality_by_risk_level: dict = {}
     viable_any = False
     direction = candidate.trade_direction.upper()
@@ -130,6 +158,7 @@ def _quality_by_risk_level(candidate: MarketSnapshot, account_equity: float) -> 
                 plan,
                 account_equity,
                 max_capital_fraction=PRODUCTION_MAX_CAPITAL_FRACTION,
+                **(economic_policy or {}),
                 direction="SHORT",
                 leverage=SHORT_VALIDATION_LEVERAGE,
                 estimated_margin_cost_pct=SHORT_MARGIN_COST_RESERVE_PCT,
@@ -141,6 +170,7 @@ def _quality_by_risk_level(candidate: MarketSnapshot, account_equity: float) -> 
                 plan,
                 account_equity,
                 max_capital_fraction=PRODUCTION_MAX_CAPITAL_FRACTION,
+                **(economic_policy or {}),
             )
         viable = target.qualified and economic.qualified
         viable_any = viable_any or viable
@@ -502,6 +532,7 @@ def review_candidates(
     account_equity: float | None = None,
     market_regime_context: object | None = None,
     coingecko_global_context: object | None = None,
+    economic_policy: dict | None = None,
 ) -> dict:
     stage_evidence = _new_stage_evidence()
     stage_evidence["model"] = model
@@ -521,7 +552,11 @@ def review_candidates(
     for candidate in unique_candidates:
         quality_by_risk_level = None
         if account_equity is not None:
-            quality_by_risk_level, viable = _quality_by_risk_level(candidate, account_equity)
+            quality_by_risk_level, viable = (
+                _quality_by_risk_level(candidate, account_equity, economic_policy)
+                if economic_policy is not None
+                else _quality_by_risk_level(candidate, account_equity)
+            )
             if not viable:
                 prefilter_evaluated_at = datetime.now(
                     timezone.utc
@@ -787,6 +822,8 @@ def review_candidates(
         review = json.loads(routed.output_text)
         if not isinstance(review, dict):
             raise ValueError("Chief response JSON was not an object")
+        # AI upside is descriptive and must never alter deterministic gates.
+        _normalize_chief_potential(review)
         review["opip_ai_route"] = routed.route_evidence()
         _attach_ai_route_context(
             chief_eligible_candidates,
