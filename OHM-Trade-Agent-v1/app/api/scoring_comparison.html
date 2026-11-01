@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>O'Pip Scoring Comparison</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,Segoe UI,sans-serif}
+body{background:#0c1625;color:#e8eef7;max-width:1200px;margin:0 auto;padding:24px}
+a{color:#90c8ff}header{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+h1{font-size:23px}.sub,small{color:#a5b4c8}.panel{background:#13243a;border:1px solid #34506d;border-radius:12px;padding:16px;margin:16px 0}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}.cards>div{background:#0e1e31;padding:14px;border-radius:8px}
+strong{font-size:25px}table{border-collapse:collapse;width:100%;overflow:auto}th,td{padding:10px;border-bottom:1px solid #31455c;text-align:left;font-size:13px}th{color:#9fb4cc}
+button,input{padding:9px;border:1px solid #6385a5;border-radius:8px;background:#162f49;color:#fff}
+button{cursor:pointer}input{min-width:220px}.status{color:#e6c789}.controls{display:flex;gap:10px;flex-wrap:wrap}
+</style></head><body>
+<header><div><h1>O'Pip — V1 / V2 Scoring</h1><div class="sub">Observational comparison • Not a trade recommendation • V2 not production active</div></div><a href="/dashboard">Back to Intelligence Cockpit</a></header>
+<div class="panel"><div class="controls"><input type="password" id="secret" placeholder="Existing OHM operator secret" autocomplete="off"><button id="unlock">Unlock / refresh</button><button id="refresh">Refresh</button></div><p id="status" class="status" role="status">No data loaded</p><small>Uses the same restricted, read-only dashboard API. Updates every 30 seconds; market scans run on their own schedule.</small></div>
+<div class="cards" id="cards"></div>
+<div class="panel"><h2>Paired candidate selection</h2><div id="compare">No recorded comparison yet.</div></div>
+<div class="panel"><h2>Indicator-level scores</h2><div style="overflow:auto"><table><thead><tr><th>Coin</th><th>V1 LONG</th><th>V1 SHORT</th><th>V2 LONG</th><th>V2 SHORT</th><th>V2 evidence</th></tr></thead><tbody id="scores"></tbody></table></div></div>
+<div class="panel"><h2>Recent scan timestamps</h2><ul id="history"></ul><small>Forward-outcome and profitability results are not available in this view until independently matured and joined.</small></div>
+<script>
+"use strict";
+const $=id=>document.getElementById(id);
+const build=(tag,text)=>{const el=document.createElement(tag);el.textContent=String(text);return el;};
+function cell(row,tag,value){row.appendChild(build(tag,value===null||value===undefined?"—":value));}
+function render(row,all){
+ $('cards').replaceChildren();
+ for(const [name,value] of [
+  ["Scan",row.scan_id],["Time (UTC)",row.observed_at_utc],["Scanned",row.scanned],
+  ["V2 features ready",row.v2_ready+" / "+row.scanned],
+  ["V1 shortlisted",(row.v1_top||[]).length],["V2 hypothetical shortlist",(row.v2_top||[]).length],
+  ["V1-only",(row.v1_only||[]).length],["V2-only",(row.v2_only||[]).length],
+ ]){
+  const box=build("div","");box.append(build("small",name),document.createElement("br"),build("strong",value));
+  $('cards').appendChild(box);
+ }
+ const p=$('compare');p.replaceChildren();
+ for(const [name,items] of [["V1 production",row.v1_top||[]],["V2 hypothetical (not active)",row.v2_top||[]]]){
+  const div=document.createElement("div");div.append(build("h3",name));
+  div.append(build("p",items.map(i=>i.symbol+" "+i.direction+" ("+i.score+")").join(" • ")||"No candidates"));
+  p.appendChild(div);
+ }
+ const tbody=$('scores');tbody.replaceChildren();
+ for(const c of row.candidates||[]){
+  const tr=document.createElement("tr");
+  for(const field of ["symbol","v1_long","v1_short","v2_long","v2_short","v2_status"])cell(tr,"td",c[field]);
+  tbody.appendChild(tr);
+ }
+ const history=$('history');history.replaceChildren();
+ for(const item of all){const li=build("li",item.observed_at_utc+" — scan "+item.scan_id);history.appendChild(li);}
+}
+async function load(){
+ const secret=sessionStorage.getItem("ohmDashboardSecret");
+ if(!secret){$('status').textContent="Enter the existing operator secret.";return;}
+ try{
+  const result=await fetch("/api/opip/scoring-comparison",{headers:{"X-Webhook-Secret":secret},cache:"no-store"});
+  if(!result.ok)throw Error("Dashboard API returned "+result.status);
+  const payload=await result.json();
+  if(!Array.isArray(payload.rows)||!payload.rows.length){$('status').textContent="No comparison evidence yet. V2 evaluation may still be disabled.";return;}
+  $('status').textContent="Read-only comparison loaded. Outcome labels pending.";
+  render(payload.rows[0],payload.rows);
+ }catch(e){$('status').textContent="Unable to load: "+e.message;}
+}
+$('unlock').onclick=()=>{const value=$('secret').value.trim();if(value){sessionStorage.setItem("ohmDashboardSecret",value);$('secret').value="";}load();};
+$('refresh').onclick=load;
+setInterval(load,30000);
+load();
+</script></body></html>
