@@ -73,7 +73,7 @@ cleanup_abandoned_replica_staging() {
     [[ ! -L "$candidate" ]] || continue
     pid="${candidate##*.}"
     [[ "$pid" =~ ^[0-9]+$ ]] || continue
-    [[ "$pid" != "$" ]] || continue
+    [[ "$pid" != "$$" ]] || continue
     owner_mode="$(stat -c '%u:%a' -- "$candidate" 2>/dev/null || true)"
     [[ "$owner_mode" == "${EUID}:700" ]] || continue
     if kill -0 "$pid" 2>/dev/null; then
