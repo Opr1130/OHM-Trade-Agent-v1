@@ -56,6 +56,14 @@ the same V2 threshold is recorded in admission evidence, a rejected SHORT
 can only recover an independently qualified LONG, and the V1 comparison
 remains read-only.
 
+AC-007:
+Configurable advisory economic floors and AI possible movement remain non-execution evidence.
+GIVEN: historical $75 execution-compatible policy and a validated advisory-only proposal
+WHEN: Chief review and final advisory economics use a selected policy and model suggests upside
+THEN: the optional $0 net floor may remove advisory prefilter rejections, the shared
+execution $75 default is unchanged, and model-estimated movement is bounded,
+conditional, not a win probability and never bypasses deterministic risk gates.
+
 EXPLICITLY OUT OF SCOPE:
 V2 activation in a live deployment without release certification, auto-trading,
 margin/portfolio policy relaxation, multi-tenant settings, code-driven learning,
@@ -81,6 +89,8 @@ AC-006 -> tests/test_v2_production_selection_contract.py::test_missing_v2_featur
 AC-006 -> tests/test_v2_production_selection_contract.py::test_v2_margin_fallback_requires_independent_v2_long_qualification
 AC-006 -> tests/test_v2_production_selection_contract.py::test_selector_and_screening_rows_share_v2_threshold
 AC-006 -> tests/test_v2_production_selection_contract.py::test_comparison_relabels_authority_correctly_on_v2_cutover
+AC-007 -> tests/test_advisory_policy_v2.py::test_fixed_profit_floor_remains_in_execution_default_but_not_advisory_override
+AC-007 -> tests/test_advisory_policy_v2.py::test_invalid_ai_return_potential_cannot_become_trade_claim
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/core/config.py
@@ -118,6 +128,11 @@ AC-006 -> OHM-Trade-Agent-v1/app/scanner/market_scanner.py
 AC-006 -> OHM-Trade-Agent-v1/app/core/config.py
 AC-006 -> OHM-Trade-Agent-v1/app/services/technical_scoring_comparison.py
 AC-006 -> OHM-Trade-Agent-v1/tests/test_v2_production_selection_contract.py
+
+AC-007 -> OHM-Trade-Agent-v1/app/core/config.py
+AC-007 -> OHM-Trade-Agent-v1/app/jobs/scan_opportunities.py
+AC-007 -> OHM-Trade-Agent-v1/app/services/chief_analyst.py
+AC-007 -> OHM-Trade-Agent-v1/tests/test_advisory_policy_v2.py
 
 DEFERRED DISCOVERIES:
 Production V2 cutover is guarded behind a disabled-by-default configuration
