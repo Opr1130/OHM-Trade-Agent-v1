@@ -74,6 +74,14 @@ THEN: a durable audit intent precedes a restricted atomic replace, stale edits
 fail closed, the previous advisory profile is recoverable, malformed policies
 are rejected, and execution authority remains unchanged.
 
+AC-009:
+Isolated scanner output retains verified V2 component evidence through promotion.
+GIVEN: a scanner worker serializes snapshots as JSON and a separate process
+rebuilds dataclass snapshots from the integrity-checked manifest
+WHEN: V2 component maps and the version digest cross the worker boundary
+THEN: finite bounded V2 components survive intact, malformed values are
+degraded, and production V2 refuses incomplete or cross-version evidence.
+
 EXPLICITLY OUT OF SCOPE:
 V2 activation in a live deployment without release certification, auto-trading,
 margin/portfolio policy relaxation, multi-tenant settings, code-driven learning,
@@ -105,6 +113,8 @@ AC-007 -> tests/test_advisory_policy_v2.py::test_conditional_ai_move_is_visible_
 AC-008 -> tests/test_strategy_admin_drafts.py::test_advisory_activation_and_rollback_are_atomic_and_versioned
 AC-008 -> tests/test_strategy_admin_drafts.py::test_activation_refuses_drafts_without_saved_version
 AC-008 -> tests/test_strategy_admin_drafts.py::test_unapproved_activation_endpoint_is_disabled
+AC-009 -> tests/test_v2_production_selection_contract.py::test_isolated_worker_round_trip_preserves_v2_scoring_components
+AC-009 -> tests/test_v2_production_selection_contract.py::test_invalid_v2_component_map_is_not_promoted_as_valid_evidence
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/core/config.py
@@ -158,6 +168,12 @@ AC-008 -> OHM-Trade-Agent-v1/app/scanner/models.py
 AC-008 -> OHM-Trade-Agent-v1/app/jobs/scan_opportunities.py
 AC-008 -> OHM-Trade-Agent-v1/app/services/strategy_admin_drafts.py
 AC-008 -> OHM-Trade-Agent-v1/tests/test_strategy_admin_drafts.py
+
+AC-009 -> OHM-Trade-Agent-v1/app/services/scan_result_promotion.py
+AC-009 -> OHM-Trade-Agent-v1/app/scanner/models.py
+AC-009 -> OHM-Trade-Agent-v1/app/scanner/market_scanner.py
+AC-009 -> OHM-Trade-Agent-v1/app/jobs/scan_opportunities.py
+AC-009 -> OHM-Trade-Agent-v1/tests/test_v2_production_selection_contract.py
 
 DEFERRED DISCOVERIES:
 Production V2 cutover is guarded behind a disabled-by-default configuration
