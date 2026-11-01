@@ -135,6 +135,19 @@ GIVEN: main has an immutable tooling SHA with required pytest, quality-security 
 WHEN: the initial and pre-mutation recovery gates query GitHub Actions CI
 THEN: they query the repository-level GitHub Actions runs on main (avoiding unreliable workflow-scoped head_sha query filters), independently filter returned exact SHA/branch/workflow path, select the newest run and attempt, require completed/success, refuse missing, stale, failed, pending, wrong-SHA, wrong-workflow, wrong-branch or API-error results, and retain the protected environment and owner-attestation gates.
 
+AC-021:
+The production export must never publish a manifest bound to a superseded release.
+GIVEN: the export lock is held by this run, but the release receipt is written by
+       ohm-deploy outside that lock
+WHEN: a release is committed between the point the generation identity is
+      captured and the point the manifest is committed
+THEN: the receipt is re-read at the commit point, immediately before the atomic
+      rename; on any disagreement the generation is discarded rather than
+      relabelled, the committed manifest is left byte-identical so the previous
+      valid generation stays authoritative, only a replica directory this run
+      itself published is removed, and the run fails closed with rc=75 so the
+      next scheduled run regenerates against the deployed release.
+
 EXPLICITLY OUT OF SCOPE:
 - Deploying, rebuilding, or restarting production containers or systemd units.
 - Executing the provenance reconciler against production; that remains owner-gated.
@@ -322,6 +335,21 @@ AC-020 -> tests/test_learning_recovery_ci_discovery_v1.py::test_workflow_path_wi
 AC-020 -> tests/test_learning_recovery_ci_discovery_v1.py::test_d4_successful_runs_survive_many_unrelated_workflow_results
 AC-020 -> tests/test_learning_recovery_ci_discovery_v1.py::test_d4_same_run_newer_attempt_must_not_resurrect_prior_success
 
+AC-021 -> tests/test_opip_learning_export_release_race_v1.py::test_generation_identity_has_exactly_one_reader
+AC-021 -> tests/test_opip_learning_export_release_race_v1.py::test_generation_identity_is_captured_before_the_replica_is_built
+AC-021 -> tests/test_opip_learning_export_release_race_v1.py::test_revalidation_is_the_last_step_before_the_manifest_commit
+AC-021 -> tests/test_opip_learning_export_release_race_v1.py::test_revalidation_reads_the_receipt_again_at_the_commit_point
+AC-021 -> tests/test_opip_learning_export_release_race_v1.py::test_release_change_fails_closed_without_publishing_a_manifest
+AC-021 -> tests/test_opip_learning_export_release_race_v1.py::test_discard_never_deletes_the_committed_generation
+AC-021 -> tests/test_opip_learning_export_release_race_v1.py::test_manifest_publication_stays_atomic_and_never_rewritten
+AC-021 -> tests/test_opip_learning_export_release_race_v1.py::test_legitimate_lock_skip_and_locks_are_preserved
+AC-021 -> tests/test_opip_learning_export_release_race_v1.py::test_proof_wait_covers_a_lock_skip_followed_by_regeneration
+AC-021 -> tests/test_opip_learning_export_release_race_v1.py::test_proof_freshness_bound_is_unchanged
+AC-021 -> tests/test_opip_learning_export_release_race_v1.py::test_release_change_discards_the_uncommitted_generation
+AC-021 -> tests/test_opip_learning_export_release_race_v1.py::test_unchanged_release_commits_untouched
+AC-021 -> tests/test_opip_learning_export_release_race_v1.py::test_reused_content_addressed_directory_is_never_deleted
+AC-021 -> tests/test_opip_learning_export_release_race_v1.py::test_vanished_receipt_fails_closed
+
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/deploy/remote/configure-opip-learning-reader.sh
 AC-001 -> OHM-Trade-Agent-v1/deploy/remote/opip-learning-reader-permissions.sh
@@ -397,9 +425,16 @@ AC-020 -> OHM-Trade-Agent-v1/tests/test_learning_recovery_ci_discovery_v1.py
 AC-020 -> OHM-Trade-Agent-v1/tests/test_learning_recovery_attestation_v1.py
 AC-020 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-LEARNING-RECOVERY-v1.md
 
+AC-021 -> OHM-Trade-Agent-v1/deploy/remote/export-opip-learning-evidence.sh
+AC-021 -> OHM-Trade-Agent-v1/app/opip/learning/canonical_replica.py
+AC-021 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
+AC-021 -> OHM-Trade-Agent-v1/tests/test_opip_learning_export_release_race_v1.py
+AC-021 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-LEARNING-RECOVERY-v1.md
+
 DEFERRED DISCOVERIES:
 - The production export tree contains historical generations from the previous canonical store (220,721 events) while current production runs a fresh genesis (8,819 events at capture). Retention and archival review remain owner work.
 - Learning timers are disabled during recovery and require one-shot acceptance before re-enabling.
+- AC-021 closes the export-side release-identity race only. The learning WORKER plane remains unverified on production release 20b9f394: the reader state file records worker_status_protocol=1 with worker_deployed_sha=UNKNOWN and no recurring opip-export-v2 sync since 2026-10-23T00:03:42Z, which is the signature of the recovery one-shot probe being the last writer rather than of incompatibility. Restoring verified worker readiness requires exactly one owner-authorized /deploy-learning <main sha> (exact-SHA gated); enabling recurring timers remains a separate owner decision.
 
 UNAPPROVED SCOPE CHANGES:
 NONE
