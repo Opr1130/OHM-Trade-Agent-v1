@@ -372,7 +372,7 @@ def analyze_symbol(symbol: str, universe_asset: UniverseAsset | None = None) -> 
         # V1 remains the production ranking and qualification authority.
         from app.core.config import get_settings
 
-        if bool(get_settings().opip_score_v2_evaluation_enabled):
+        if bool(get_settings().opip_score_v2_evaluation_enabled) or get_settings().opip_production_scoring_version == "v2":
             try:
                 profile = _read_v2_profile()
                 evidence = extract_v2_features(completed)
