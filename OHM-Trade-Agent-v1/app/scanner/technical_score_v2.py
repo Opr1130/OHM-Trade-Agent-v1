@@ -160,16 +160,16 @@ def score_long_v2(snapshot: Any, features: V2Features, config: V2Config) -> V2Sc
                 missing.append(name)
         elif not isinstance(value, (float, int)) or not math.isfinite(float(value)):
             missing.append(name)
-    if (
-        inputs["atr"] is not None and inputs["atr"] <= 0
-        or inputs["last_price"] is not None and inputs["last_price"] <= 0
-        or features.candle_close_location is not None and not 0 <= features.candle_close_location <= 1
-        or features.atr_percentile is not None and not 0 <= features.atr_percentile <= 100
-        or features.adx is not None and not 0 <= features.adx <= 100
-    ):
-        missing.append("INVALID_FEATURE_VALUE")
     if missing:
         return V2Score(config.version, config.mode, None, config.threshold, {}, tuple(dict.fromkeys(missing)))
+    if (
+        inputs["atr"] <= 0
+        or inputs["last_price"] <= 0
+        or not 0 <= features.candle_close_location <= 1
+        or not 0 <= features.atr_percentile <= 100
+        or not 0 <= features.adx <= 100
+    ):
+        return V2Score(config.version, config.mode, None, config.threshold, {}, ("INVALID_FEATURE_VALUE",))
 
     p, w = config.parameters, config.weights
     price = float(inputs["last_price"])
