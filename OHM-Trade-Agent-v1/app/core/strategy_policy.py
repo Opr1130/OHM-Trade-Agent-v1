@@ -28,8 +28,10 @@ class StrategyPolicy:
     ai_advisory: dict
 
 
-def load_strategy_policy(path: Path | None = None) -> StrategyPolicy:
-    source = (path or DEFAULT_POLICY_PATH).read_bytes()
+def parse_strategy_policy(source: bytes | str) -> StrategyPolicy:
+    """Validate an in-memory policy without making it active."""
+    if isinstance(source, str):
+        source = source.encode("utf-8")
     doc = json.loads(source)
     if not isinstance(doc, dict) or set(doc) != EXPECTED_ROOT or doc["schema_version"] != 1:
         raise ValueError("INVALID_STRATEGY_POLICY_SCHEMA")
@@ -47,11 +49,17 @@ def load_strategy_policy(path: Path | None = None) -> StrategyPolicy:
             raise ValueError("INVALID_SCORING_BOUND")
     if s["max_candidates"] != 8 or s["max_per_direction"] != 5 or s["v1_threshold"] != 80:
         raise ValueError("PRODUCTION_CAP_DRIFT")
+    if not 50 <= s["v2_threshold"] <= 95:
+        raise ValueError("INVALID_V2_THRESHOLD")
     if set(e) != {"min_net_profit_usd", "min_target_2_move_pct", "min_reward_to_risk", "estimated_round_trip_cost_pct"}:
         raise ValueError("INVALID_ECONOMIC_POLICY")
     for key, value in e.items():
         if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
             raise ValueError("INVALID_ECONOMIC_BOUND")
+    if not (e["min_net_profit_usd"] <= 10000 and e["min_target_2_move_pct"] <= 25
+            and 1 <= e["min_reward_to_risk"] <= 10
+            and e["estimated_round_trip_cost_pct"] <= 5):
+        raise ValueError("ECONOMIC_PROFILE_BOUND_EXCEEDED")
     if set(a) != {"potential_move_scenarios", "mode"} or type(a["potential_move_scenarios"]) is not bool or a["mode"] != "advisory_only":
         raise ValueError("AI_ADVISORY_AUTHORITY_DRIFT")
     if set(p) != {"allow_funded_orders", "allow_auto_trading_activation"} or p != {
@@ -65,3 +73,8 @@ def load_strategy_policy(path: Path | None = None) -> StrategyPolicy:
         advisory_economics=dict(e),
         ai_advisory=dict(a),
     )
+
+
+def load_strategy_policy(path: Path | None = None) -> StrategyPolicy:
+    """Read the repository-bundled reference policy, not an admin draft."""
+    return parse_strategy_policy((path or DEFAULT_POLICY_PATH).read_bytes())
