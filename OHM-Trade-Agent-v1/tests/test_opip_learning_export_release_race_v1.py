@@ -523,7 +523,7 @@ def test_release_flip_retries_in_run_and_second_flip_fails_closed(tmp_path, flip
         + '  production_deployed_sha="$(read_authoritative_release_sha)"\n'
         + '  if (( generation_attempt == 1 )); then\n'
         + '    printf "%s\\n" "$NEXT_SHA" > "$RELEASE_RECEIPT"\n'
-        + '  elif [[ "\${1:-}" == "twice" ]]; then\n'
+        + '  elif [[ "${1:-}" == "twice" ]]; then\n'
         + '    printf "%s\\n" "$THIRD_SHA" > "$RELEASE_RECEIPT"\n'
         + '  fi\n'
         + f'  printf "%s\\n" "$production_deployed_sha" > "{fx["manifest_tmp"]}"\n'
