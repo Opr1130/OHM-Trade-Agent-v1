@@ -131,3 +131,110 @@ def save_policy_draft(
             "digest": after.digest,
             "active_runtime_changed": False,
         }
+
+
+def _atomic_write(directory: Path, target: str, content: bytes) -> None:
+    """Restricted durable replace; caller must hold draft lock."""
+    final = directory / target
+    if final.is_symlink():
+        raise ValueError("STRATEGY_ADMIN_UNSAFE_TARGET")
+    temp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="wb", prefix=".strategy-", dir=directory, delete=False) as fd:
+            temp_name = fd.name
+            os.chmod(fd.name, 0o600)
+            fd.write(content)
+            fd.flush()
+            os.fsync(fd.fileno())
+        os.replace(temp_name, final)
+        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temp_name and os.path.exists(temp_name):
+            os.unlink(temp_name)
+
+
+def _audit_intent(directory: Path, action: str, before: str, after: str) -> None:
+    """Durable intent receipt *before* activating; audit failures abort mutation."""
+    record = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "action": action,
+        "before_sha256": before,
+        "after_sha256": after,
+    }
+    fd = os.open(directory / "audit.jsonl", os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        raw = (json.dumps(record, sort_keys=True) + "\n").encode()
+        if os.write(fd, raw) != len(raw):
+            raise OSError("STRATEGY_ADMIN_AUDIT_SHORT_WRITE")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def activate_policy_draft(*, expected_digest: str, directory: Path = DRAFT_DIR) -> dict:
+    """Promote a saved draft atomically; activated policy affects advisory only.
+
+    Active profile selection is controlled by an independent runtime setting.
+    No model switch or trading permission can be conveyed by the JSON.
+    """
+    with _locked(directory):
+        draft = directory / "draft.json"
+        if not draft.is_file() or draft.is_symlink():
+            raise ValueError("STRATEGY_ADMIN_NO_SAVED_DRAFT")
+        proposed = draft.read_bytes()
+        validated = parse_strategy_policy(proposed)
+        if validated.digest != expected_digest:
+            raise StrategyDraftConflict("STRATEGY_ADMIN_DRAFT_STALE")
+        active = directory / "active.json"
+        if active.is_symlink():
+            raise ValueError("STRATEGY_ADMIN_UNSAFE_ACTIVE")
+        previous = active.read_bytes() if active.is_file() else DEFAULT_POLICY_PATH.read_bytes()
+        previous_digest = parse_strategy_policy(previous).digest
+        _audit_intent(directory, "ACTIVATE_ADVISORY_PROFILE_INTENT", previous_digest, validated.digest)
+        _atomic_write(directory, "previous.json", previous)
+        _atomic_write(directory, "active.json", proposed)
+        _audit_intent(directory, "ACTIVATE_ADVISORY_PROFILE_COMPLETE", previous_digest, validated.digest)
+        return {
+            "status": "ACTIVATED_ADVISORY_PROFILE",
+            "digest": validated.digest,
+            "funded_trading_activated": False,
+        }
+
+
+def rollback_active_policy(*, expected_digest: str, directory: Path = DRAFT_DIR) -> dict:
+    """Reapply the single previous version; never changes funded-trading state."""
+    with _locked(directory):
+        active, previous = directory / "active.json", directory / "previous.json"
+        if not active.is_file() or not previous.is_file() or active.is_symlink() or previous.is_symlink():
+            raise ValueError("STRATEGY_ADMIN_NO_SAFE_ROLLBACK")
+        current_bytes, previous_bytes = active.read_bytes(), previous.read_bytes()
+        current = parse_strategy_policy(current_bytes)
+        restored = parse_strategy_policy(previous_bytes)
+        if current.digest != expected_digest:
+            raise StrategyDraftConflict("STRATEGY_ADMIN_ACTIVE_STALE")
+        _audit_intent(directory, "ROLLBACK_ADVISORY_PROFILE_INTENT", current.digest, restored.digest)
+        _atomic_write(directory, "active.json", previous_bytes)
+        _audit_intent(directory, "ROLLBACK_ADVISORY_PROFILE_COMPLETE", current.digest, restored.digest)
+        return {
+            "status": "ROLLED_BACK_ADVISORY_PROFILE",
+            "digest": restored.digest,
+            "funded_trading_activated": False,
+        }
+
+
+def read_active_policy_status(directory: Path = DRAFT_DIR) -> dict:
+    path = directory / "active.json"
+    if path.is_symlink():
+        raise ValueError("STRATEGY_ADMIN_UNSAFE_ACTIVE")
+    content = path.read_bytes() if path.is_file() else DEFAULT_POLICY_PATH.read_bytes()
+    policy = parse_strategy_policy(content)
+    return {
+        "status": "ACTIVE_PROFILE" if path.is_file() else "BUNDLED_DEFAULT",
+        "digest": policy.digest,
+        "document": json.loads(content),
+        "funded_trading_activated": False,
+    }
