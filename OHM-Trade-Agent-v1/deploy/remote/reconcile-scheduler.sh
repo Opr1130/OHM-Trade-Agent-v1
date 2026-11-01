@@ -14,6 +14,20 @@ CAPTURE_DST="/etc/cron.d/opip-feature-bus-capture"
 FEV_CAPTURE_SRC="$APP_ROOT/deploy/cron.d/opip-feasibility-evidence-capture"
 FEV_CAPTURE_DST="/etc/cron.d/opip-feasibility-evidence-capture"
 LEGACY_MOVEMENT="/etc/cron.d/ohm-movement-discovery"
+# Stage-2 IRR advisory worker (v1.5.0 F12, SHADOW only). Installed ONLY when the
+# root-owned authorization marker explicitly authorizes it; an absent marker (the
+# default) means "not installed" and REMOVES any previously installed entry.
+IRR_SHADOW_SRC="$APP_ROOT/deploy/cron.d/opip-irr-shadow"
+IRR_SHADOW_DST="/etc/cron.d/opip-irr-shadow"
+IRR_SHADOW_AUTH_FILE="/var/lib/ohm-deploy/irr-shadow-scheduler.enabled"
+IRR_AUTH_LIB="$APP_ROOT/deploy/remote/lib/opip_scheduler_authorization.sh"
+IRR_RUNNER_SRC="$APP_ROOT/deploy/bin/opip-irr-shadow-run"
+IRR_RUNNER_DST="/usr/local/bin/opip-irr-shadow-run"
+IRR_WORKER_ALIAS="opip-irr-shadow:worker"
+IRR_WORKER_PIN="/var/lib/ohm-deploy/irr-worker-image.env"
+if [[ "${OPIP_DEPLOY_TEST_SEAMS:-0}" == "1" && -n "${OPIP_IRR_SHADOW_AUTH_FILE:-}" ]]; then
+  IRR_SHADOW_AUTH_FILE="$OPIP_IRR_SHADOW_AUTH_FILE"
+fi
 STREAM_RECONCILE="$APP_ROOT/deploy/remote/reconcile-stream-worker.sh"
 LEARNING_EXPORTER="$APP_ROOT/deploy/remote/export-opip-learning-evidence.sh"
 DEPLOY_SCRIPT_SRC="$APP_ROOT/deploy/remote/ohm-deploy"
@@ -38,30 +52,131 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exit 77
 fi
 
-for cmd in install crontab grep awk mktemp cp mv rm id; do
+for cmd in install crontab grep awk mktemp cp mv rm mkdir id tr stat head sed chown; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "missing required command: $cmd" >&2
     exit 69
   }
 done
 
-for required in \
-  "$CANONICAL_SRC" \
-  "$CAPTURE_SRC" \
-  "$FEV_CAPTURE_SRC" \
-  "$LEARNING_EXPORT_SRC" \
-  "$STREAM_RECONCILE" \
-  "$LEARNING_EXPORTER" \
-  "$DEPLOY_SCRIPT_SRC" \
-  "$SSH_GATEWAY_SRC" \
-  "$LIBRARY_SRC" \
-  "$LEARNING_READER_SRC" \
-  "$LEARNING_DIAGNOSTICS_SRC"; do
+# The marker contract lives in a small sourced library so it can be exercised
+# directly by focused tests. A missing or unusable library fails closed before
+# any scheduler mutation.
+if [[ ! -s "$IRR_AUTH_LIB" ]]; then
+  echo "scheduler authorization library missing: $IRR_AUTH_LIB" >&2
+  exit 69
+fi
+# shellcheck source=/dev/null
+source "$IRR_AUTH_LIB"
+for irr_contract in opip_scheduler_authorization_state \
+  opip_irr_capture_activation_state opip_irr_restore_activation_state; do
+  if ! declare -F "$irr_contract" >/dev/null; then
+    echo "scheduler authorization library does not define $irr_contract" >&2
+    exit 69
+  fi
+done
+
+# Explicit installation authorization for the IRR advisory scheduler entry.
+# Default is ABSENT (nothing installed, and any stale entry is removed). The
+# marker must be root-owned, non-executable, not group/world-writable and hold
+# exactly `installed` or `absent` (optional final newline). Anything else exits
+# 65 BEFORE any mutation: a typo can neither silently activate the worker nor
+# silently drop an authorized one.
+irr_shadow_state="ABSENT"
+if ! irr_shadow_marker="$(opip_scheduler_authorization_state "$IRR_SHADOW_AUTH_FILE")"; then
+  exit 65
+fi
+case "$irr_shadow_marker" in
+  INSTALLED) irr_shadow_state="INSTALLED" ;;
+  ABSENT) irr_shadow_state="ABSENT" ;;
+  *)
+    echo "IRR shadow scheduler authorization value is invalid" >&2
+    exit 65
+    ;;
+esac
+
+required_artifacts=(
+  "$CANONICAL_SRC"
+  "$CAPTURE_SRC"
+  "$FEV_CAPTURE_SRC"
+  "$LEARNING_EXPORT_SRC"
+  "$STREAM_RECONCILE"
+  "$LEARNING_EXPORTER"
+  "$DEPLOY_SCRIPT_SRC"
+  "$SSH_GATEWAY_SRC"
+  "$LIBRARY_SRC"
+  "$LEARNING_READER_SRC"
+  "$LEARNING_DIAGNOSTICS_SRC"
+)
+# The IRR entry, its runner and the prepared worker image are required only when
+# the entry is authorized; without authorization their absence is the expected
+# state and no install may happen.
+irr_worker_image_id=""
+irr_worker_revision=""
+if [[ "$irr_shadow_state" == "INSTALLED" ]]; then
+  required_artifacts+=("$IRR_SHADOW_SRC" "$IRR_RUNNER_SRC")
+fi
+
+for required in "${required_artifacts[@]}"; do
   if [[ ! -s "$required" ]]; then
     echo "required production scheduler artifact missing: $required" >&2
     exit 69
   fi
 done
+
+# The entry, its runner and the image pin are captured HERE, before anything is
+# verified. A failed verification must never destroy an existing activation
+# state whose previous value was not recorded first: that turned an unprovable
+# image into the loss of the owner's authorization record. Every failure path
+# below restores exactly what was there and then fails closed (exit 65), so the
+# scheduler stays dormant and recoverable - the runner refuses to start without
+# a verified image, so preserving the entry grants no execution.
+irr_preflight_dir="$(mktemp -d)"
+if ! opip_irr_capture_activation_state "$irr_preflight_dir" \
+  "$IRR_SHADOW_DST" "$IRR_RUNNER_DST" "$IRR_WORKER_PIN"; then
+  echo "IRR activation state could not be captured before image verification" >&2
+  rm -rf "$irr_preflight_dir"
+  exit 69
+fi
+irr_preflight_fail() {
+  # irr_preflight_fail <message> -> restore the captured state, then exit 65.
+  echo "$1" >&2
+  if ! opip_irr_restore_activation_state "$irr_preflight_dir" \
+    "$IRR_SHADOW_DST" "$IRR_RUNNER_DST" "$IRR_WORKER_PIN"; then
+    echo "IRR activation state could not be restored after a failed image verification" >&2
+    rm -rf "$irr_preflight_dir"
+    exit 69
+  fi
+  echo "OPIP_IRR_IMAGE_PREFLIGHT=FAILED_STATE_PRESERVED"
+  rm -rf "$irr_preflight_dir"
+  exit 65
+}
+
+if [[ "$irr_shadow_state" == "INSTALLED" ]]; then
+  # Prepare-and-verify gate: the worker image must already exist and carry the
+  # approved release revision. A scheduled `docker compose run` must never build
+  # an image, so an unprovable image means "do not install the entry".
+  irr_release_sha="${OPIP_RELEASE_SHA:-}"
+  if [[ -z "$irr_release_sha" ]]; then
+    irr_release_sha="$(git -c safe.directory='*' -C "$APP_ROOT" rev-parse --verify HEAD 2>/dev/null || true)"
+  fi
+  if [[ ! "$irr_release_sha" =~ ^[0-9a-f]{40}$ ]]; then
+    irr_preflight_fail "IRR shadow worker image cannot be verified: the approved release SHA is not provable"
+  fi
+  irr_worker_image_id="$(docker image inspect --format '{{.Id}}' "$IRR_WORKER_ALIAS" 2>/dev/null || true)"
+  irr_worker_revision="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IRR_WORKER_ALIAS" 2>/dev/null || true)"
+  if [[ ! "$irr_worker_image_id" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    irr_preflight_fail "IRR shadow worker image is not prepared: $IRR_WORKER_ALIAS is absent"
+  fi
+  if [[ "$irr_worker_revision" != "$irr_release_sha" ]]; then
+    irr_preflight_fail "IRR shadow worker image revision mismatch: expected=$irr_release_sha actual=$irr_worker_revision"
+  fi
+  echo "OPIP_IRR_WORKER_IMAGE_VERIFIED=$irr_worker_image_id"
+  echo "OPIP_IRR_WORKER_IMAGE_REVISION=$irr_worker_revision"
+fi
+rm -rf "$irr_preflight_dir"
+
+
 
 # The deploy controller snapshots /usr/local/sbin/ohm-deploy before this script
 # runs, then keeps executing the old controller. A later rollback restores that
@@ -197,6 +312,9 @@ had_ml_evidence=0
 had_legacy=0
 had_capture=0
 had_fev_capture=0
+had_irr_shadow=0
+had_irr_runner=0
+had_irr_pin=0
 had_root_crontab=0
 
 snapshot_file() {
@@ -227,6 +345,23 @@ fi
 if [[ -e "$FEV_CAPTURE_DST" ]]; then
   cp -a "$FEV_CAPTURE_DST" "$tmpdir/fev-capture.before"
   had_fev_capture=1
+fi
+# The IRR entry is snapshotted whatever the authorization says: revoking
+# authorization must be able to restore exactly what was there before, and a
+# first-time install must be able to remove what it created.
+if [[ -e "$IRR_SHADOW_DST" ]]; then
+  cp -a "$IRR_SHADOW_DST" "$tmpdir/irr-shadow.before"
+  had_irr_shadow=1
+fi
+# The runner and the image pin are part of the same activation state: a rollback
+# must restore them exactly, and an unauthorized run must leave neither behind.
+if [[ -e "$IRR_RUNNER_DST" ]]; then
+  cp -a "$IRR_RUNNER_DST" "$tmpdir/irr-runner.before"
+  had_irr_runner=1
+fi
+if [[ -e "$IRR_WORKER_PIN" ]]; then
+  cp -a "$IRR_WORKER_PIN" "$tmpdir/irr-pin.before"
+  had_irr_pin=1
 fi
 if [[ -e "$LEGACY_MOVEMENT" ]]; then
   cp -a "$LEGACY_MOVEMENT" "$tmpdir/legacy.before"
@@ -277,6 +412,21 @@ rollback() {
   else
     rm -f "$FEV_CAPTURE_DST"
   fi
+  if [[ "$had_irr_shadow" == "1" ]]; then
+    cp -a "$tmpdir/irr-shadow.before" "$IRR_SHADOW_DST"
+  else
+    rm -f "$IRR_SHADOW_DST"
+  fi
+  if [[ "$had_irr_runner" == "1" ]]; then
+    cp -a "$tmpdir/irr-runner.before" "$IRR_RUNNER_DST"
+  else
+    rm -f "$IRR_RUNNER_DST"
+  fi
+  if [[ "$had_irr_pin" == "1" ]]; then
+    cp -a "$tmpdir/irr-pin.before" "$IRR_WORKER_PIN"
+  else
+    rm -f "$IRR_WORKER_PIN"
+  fi
   if [[ "$had_legacy" == "1" ]]; then
     cp -a "$tmpdir/legacy.before" "$LEGACY_MOVEMENT"
   else
@@ -290,6 +440,9 @@ rollback() {
   fi
 
   rm -rf "$tmpdir"
+  if [[ -n "${irr_preflight_dir:-}" && -d "$irr_preflight_dir" ]]; then
+    rm -rf "$irr_preflight_dir"
+  fi
   exit "$rc"
 }
 trap rollback ERR
@@ -298,6 +451,27 @@ install -o root -g root -m 0644 "$CANONICAL_SRC" "$CANONICAL_DST"
 install -o root -g root -m 0644 "$LEARNING_EXPORT_SRC" "$LEARNING_EXPORT_DST"
 install -o root -g root -m 0644 "$CAPTURE_SRC" "$CAPTURE_DST"
 install -o root -g root -m 0644 "$FEV_CAPTURE_SRC" "$FEV_CAPTURE_DST"
+
+# Stage-2 IRR advisory scheduler entry: installed ONLY under explicit owner
+# authorization, otherwise guaranteed absent. The entry runs the root-owned
+# runner, which refuses to start unless the prepared worker image still resolves
+# to the recorded ID; it never execs into the core container.
+if [[ "$irr_shadow_state" == "INSTALLED" ]]; then
+  install -o root -g root -m 0755 "$IRR_RUNNER_SRC" "$IRR_RUNNER_DST"
+  install -d -o root -g root -m 0755 "$(dirname "$IRR_WORKER_PIN")"
+  pin_staged="$(mktemp "$(dirname "$IRR_WORKER_PIN")/.irr-worker-image.XXXXXX")"
+  rm -f "$pin_staged"
+  printf 'image_id=%s\nrevision=%s\nalias=%s\n' \
+    "$irr_worker_image_id" "$irr_worker_revision" "$IRR_WORKER_ALIAS" > "$pin_staged"
+  chmod 0600 "$pin_staged"
+  chown root:root "$pin_staged"
+  mv -f "$pin_staged" "$IRR_WORKER_PIN"
+  install -o root -g root -m 0644 "$IRR_SHADOW_SRC" "$IRR_SHADOW_DST"
+else
+  rm -f "$IRR_SHADOW_DST"
+  rm -f "$IRR_RUNNER_DST"
+  rm -f "$IRR_WORKER_PIN"
+fi
 
 # Refresh forced-command remote operations from the exact deployed SHA. This
 # keeps the production deploy gateway and read-only learning observability in
@@ -322,6 +496,69 @@ crontab "$tmpdir/root.after"
 grep -q 'app.jobs.run_cycle' "$CANONICAL_DST"
 grep -q 'export-opip-learning-evidence.sh' "$LEARNING_EXPORT_DST"
 grep -q 'capture_feasibility_evidence_shadow' "$FEV_CAPTURE_DST"
+
+# Post-condition for the IRR advisory entry: authorized => entry, runner and
+# image pin installed together; unauthorized => all three absent. The entry may
+# only reference the root-owned runner (never `compose exec` in the core), the
+# runner must carry the isolated invocation, and the pin must still match the
+# prepared image so no scheduled pass can build one.
+if [[ "$irr_shadow_state" == "INSTALLED" ]]; then
+  grep -q '/usr/local/bin/opip-irr-shadow-run' "$IRR_SHADOW_DST"
+  if grep -q 'compose exec' "$IRR_SHADOW_DST"; then
+    echo "IRR shadow scheduler entry must not exec inside the core container" >&2
+    false
+  fi
+  if grep -q 'docker compose' "$IRR_SHADOW_DST"; then
+    echo "IRR shadow scheduler entry must delegate to the verified runner" >&2
+    false
+  fi
+  [[ -x "$IRR_RUNNER_DST" && ! -L "$IRR_RUNNER_DST" ]] || {
+    echo "IRR shadow runner is not an executable regular file" >&2
+    false
+  }
+  grep -q -- '--profile irr-shadow run --rm --no-deps' "$IRR_RUNNER_DST" || {
+    echo "IRR shadow runner does not use the isolated invocation" >&2
+    false
+  }
+  [[ -f "$IRR_WORKER_PIN" && ! -L "$IRR_WORKER_PIN" ]] || {
+    echo "IRR shadow image pin is not a regular file" >&2
+    false
+  }
+  [[ "$(stat -c '%u' -- "$IRR_WORKER_PIN")" == "0" ]] || {
+    echo "IRR shadow image pin is not root-owned" >&2
+    false
+  }
+  [[ "$(stat -c '%a' -- "$IRR_WORKER_PIN")" == "600" ]] || {
+    echo "IRR shadow image pin is not mode 0600" >&2
+    false
+  }
+  grep -qx "image_id=$irr_worker_image_id" "$IRR_WORKER_PIN" || {
+    echo "IRR shadow image pin does not record the verified image" >&2
+    false
+  }
+  grep -qx "revision=$irr_worker_revision" "$IRR_WORKER_PIN" || {
+    echo "IRR shadow image pin does not record the verified revision" >&2
+    false
+  }
+  [[ "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IRR_WORKER_ALIAS" 2>/dev/null || true)" == "$irr_worker_revision" ]] || {
+    echo "IRR shadow worker image changed after verification" >&2
+    false
+  }
+else
+  if [[ -e "$IRR_SHADOW_DST" ]]; then
+    echo "IRR shadow scheduler entry exists without authorization" >&2
+    false
+  fi
+  if [[ -e "$IRR_RUNNER_DST" ]]; then
+    echo "IRR shadow runner exists without authorization" >&2
+    false
+  fi
+  if [[ -e "$IRR_WORKER_PIN" ]]; then
+    echo "IRR shadow image pin exists without authorization" >&2
+    false
+  fi
+fi
+
 
 if [[ -e "$ML_EVIDENCE_DST" ]]; then
   echo "production ML evidence cron still exists" >&2
@@ -394,3 +631,13 @@ echo "learning_export_cadence=2 minutes + 40s offset"
 echo "learning_reader_observability=ENABLED"
 echo "fev_capture=$FEV_CAPTURE_DST"
 echo "fev_capture_cadence=1 minute (dual-gated SHADOW; inert unless Feature Bus AND writer are shadow)"
+echo "irr_shadow_scheduler=$irr_shadow_state"
+echo "irr_shadow_authorization=$IRR_SHADOW_AUTH_FILE"
+if [[ "$irr_shadow_state" == "INSTALLED" ]]; then
+  echo "irr_shadow_worker=$IRR_RUNNER_DST"
+  echo "irr_shadow_image=$irr_worker_image_id"
+  echo "irr_shadow_image_revision=$irr_worker_revision"
+  echo "irr_shadow_cadence=1 minute (bounded batch; OPIP_IRR_MODE=off is an inert no-op)"
+else
+  echo "irr_shadow_worker=ABSENT"
+fi
