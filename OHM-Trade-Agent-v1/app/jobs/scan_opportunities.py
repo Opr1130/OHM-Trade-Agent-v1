@@ -86,6 +86,9 @@ from app.services.trade_action_gate import apply_action_gate
 from app.services.trade_feature_snapshot import build_trade_feature_snapshot
 from app.services.trade_quality_assessor import assess_trade_quality
 from app.services.trade_quality_evidence_registry import record_trade_quality_evidence
+from app.services.technical_scoring_comparison import (
+    build_scoring_comparison, record_comparison_fail_soft,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -1381,6 +1384,17 @@ def main(scan_override=None):
         scan_id=screening_scan_id,
         universe_count=len(scan.snapshots),
     )
+    # Observational comparison only. No paths below ever consume the result.
+    if bool(getattr(settings, "opip_score_v2_evaluation_enabled", False)):
+        try:
+            record_comparison_fail_soft(build_scoring_comparison(
+                scan.snapshots,
+                candidates,
+                scan_id=screening_scan_id,
+                observed_at=decision_at,
+            ))
+        except Exception as exc:
+            logger.warning("V2 score comparison unavailable: %s", type(exc).__name__)
     try:
         scan_compute_context = compute.finish(
             scan=scan,
