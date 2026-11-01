@@ -1,5 +1,6 @@
 from dataclasses import replace
 import logging
+import math
 from typing import Callable
 
 from app.scanner.candidates import MIN_TECHNICAL_SCORE, MAX_CANDIDATES
@@ -13,14 +14,14 @@ MAX_PER_DIRECTION = 5
 logger = logging.getLogger(__name__)
 
 
-EvaluationCallback = Callable[[MarketSnapshot, int, int, str | None], None]
+EvaluationCallback = Callable[[MarketSnapshot, int | None, int | None, str | None], None]
 
 
 def _emit_evaluation_fail_soft(
     callback: EvaluationCallback | None,
     snapshot: MarketSnapshot,
-    long_score: int,
-    short_score: int,
+    long_score: int | None,
+    short_score: int | None,
     advanced_direction: str | None,
     scan_id: str | None,
 ) -> None:
@@ -31,8 +32,8 @@ def _emit_evaluation_fail_soft(
         # that production later ranks or qualifies.
         callback(
             replace(snapshot),
-            int(long_score),
-            int(short_score),
+            int(long_score) if long_score is not None else None,
+            int(short_score) if short_score is not None else None,
             advanced_direction,
         )
     except Exception as exc:
@@ -52,6 +53,7 @@ def select_directional_candidates(
     limit: int = MAX_CANDIDATES,
     on_evaluated: EvaluationCallback | None = None,
     scan_id: str | None = None,
+    scoring_version: str = "v1",
 ) -> list[MarketSnapshot]:
     """Return a maximum-eight mixed LONG/SHORT shortlist.
 
@@ -59,12 +61,27 @@ def select_directional_candidates(
     qualify, the stronger direction wins. This prevents contradictory signals
     and keeps the single Chief call bounded to the existing maximum.
     """
+    if scoring_version not in {"v1", "v2"}:
+        raise ValueError("UNSUPPORTED_SCORING_VERSION")
     best_by_asset: dict[str, MarketSnapshot] = {}
 
     for snapshot in snapshots:
         asset = snapshot.underlying_asset or snapshot.symbol
-        long_score = snapshot.technical_score
-        short_score = score_short_snapshot(snapshot).score
+        if scoring_version == "v2":
+            if getattr(snapshot, "v2_feature_status", None) != "READY":
+                _emit_evaluation_fail_soft(on_evaluated, snapshot, None, None, None, scan_id)
+                continue
+            values = (getattr(snapshot, "v2_long_score", None), getattr(snapshot, "v2_short_score", None))
+            if any(
+                type(v) not in (int, float) or not math.isfinite(v) or not 0 <= v <= 100
+                for v in values
+            ):
+                _emit_evaluation_fail_soft(on_evaluated, snapshot, None, None, None, scan_id)
+                continue
+            long_score, short_score = (int(v) for v in values)
+        else:
+            long_score = snapshot.technical_score
+            short_score = score_short_snapshot(snapshot).score
 
         options: list[MarketSnapshot] = []
         if long_score >= min_score:
@@ -72,6 +89,7 @@ def select_directional_candidates(
                 replace(
                     snapshot,
                     trade_direction="LONG",
+                    technical_score=int(long_score),
                     directional_long_score=int(long_score),
                     directional_short_score=int(short_score),
                 )
@@ -142,8 +160,11 @@ def qualifying_long_alternatives(
     *,
     excluded_assets: set[str] | None = None,
     min_score: int = MIN_TECHNICAL_SCORE,
+    scoring_version: str = "v1",
 ) -> list[MarketSnapshot]:
     """Return every independently qualifying LONG option in deterministic rank order."""
+    if scoring_version not in {"v1", "v2"}:
+        raise ValueError("UNSUPPORTED_SCORING_VERSION")
     excluded = {str(asset) for asset in (excluded_assets or set())}
     best_by_asset: dict[str, MarketSnapshot] = {}
 
@@ -151,10 +172,20 @@ def qualifying_long_alternatives(
         asset = str(snapshot.underlying_asset or snapshot.symbol)
         if asset in excluded:
             continue
-        long_score = int(snapshot.technical_score)
+        if scoring_version == "v2":
+            if getattr(snapshot, "v2_feature_status", None) != "READY":
+                continue
+            long_value = getattr(snapshot, "v2_long_score", None)
+            short_value = getattr(snapshot, "v2_short_score", None)
+            if any(type(v) not in (int, float) or not math.isfinite(v) or not 0 <= v <= 100
+                   for v in (long_value, short_value)):
+                continue
+            long_score, short_score = int(long_value), int(short_value)
+        else:
+            long_score = int(snapshot.technical_score)
+            short_score = int(score_short_snapshot(snapshot).score)
         if long_score < int(min_score):
             continue
-        short_score = int(score_short_snapshot(snapshot).score)
         candidate = replace(
             snapshot,
             trade_direction="LONG",
