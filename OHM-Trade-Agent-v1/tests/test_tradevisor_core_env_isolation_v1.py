@@ -117,7 +117,7 @@ def test_generator_removes_funded_names_and_keeps_the_rest(sandbox) -> None:
 
 
 def test_irr_deepseek_key_is_worker_only_but_shadow_mode_reaches_core(sandbox) -> None:
-    """Regression: the core/scan producer sees mode, but never the provider key."""
+    """ATDD-IRR-ACTIVATION-INFRA-v1/AC-011: core sees mode, not DeepSeek key."""
     app_root, state = sandbox
     owner_before = (app_root / ".env").read_bytes()
 
