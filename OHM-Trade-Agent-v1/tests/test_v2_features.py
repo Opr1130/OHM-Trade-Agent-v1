@@ -12,7 +12,9 @@ def candles(n: int = 240, direction: int = 1):
             high=101 + direction * i * 0.1,
             low=99 + direction * i * 0.1,
             close=100 + direction * i * 0.1,
+            vwap=100 + direction * i * 0.1,
             volume=1000,
+            trade_count=10,
         )
         for i in range(n)
     ]
@@ -41,7 +43,7 @@ def test_insufficient_four_hour_history_is_explicit():
 
 def test_recent_hourly_gap_causes_no_score():
     rows = candles()
-    rows[-4] = Candle(timestamp=rows[-4].timestamp - 30, open=1, high=2, low=0.5, close=1, volume=1)
+    rows[-4] = Candle(timestamp=rows[-4].timestamp - 30, open=1, high=2, low=0.5, close=1, vwap=1, volume=1, trade_count=1)
     features = extract_v2_features(rows)
     assert features.adx is None
 
