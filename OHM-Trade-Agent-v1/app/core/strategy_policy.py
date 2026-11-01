@@ -78,3 +78,18 @@ def parse_strategy_policy(source: bytes | str) -> StrategyPolicy:
 def load_strategy_policy(path: Path | None = None) -> StrategyPolicy:
     """Read the repository-bundled reference policy, not an admin draft."""
     return parse_strategy_policy((path or DEFAULT_POLICY_PATH).read_bytes())
+
+ACTIVE_POLICY_PATH = Path("/app/data/opip/strategy-admin/active.json")
+
+
+def load_active_strategy_policy(path: Path = ACTIVE_POLICY_PATH) -> StrategyPolicy:
+    """Read an atomically installed advisory-scoring policy.
+
+    Admin drafts are NOT consumed. A malformed active profile is a hard error:
+    callers must not silently substitute an unreviewed default.
+    """
+    if path.is_symlink():
+        raise ValueError("UNSAFE_ACTIVE_STRATEGY_POLICY_LINK")
+    if not path.is_file():
+        return load_strategy_policy()
+    return parse_strategy_policy(path.read_bytes())
