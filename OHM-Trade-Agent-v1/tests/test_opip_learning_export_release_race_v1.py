@@ -42,6 +42,9 @@ DEPLOY_SCRIPT = ROOT / "deploy" / "remote" / "ohm-deploy"
 GENERATION_SHA = "83d087619c9990a616cfb75c793558efbb7a675d"
 DEPLOYED_SHA = "20b9f394f1bcf896705f28663d34cc92a49156f4"
 
+#: Every test here proves ATDD-OPIP-LEARNING-RECOVERY-v1/AC-021.
+pytestmark = pytest.mark.acceptance
+
 #: Behavioural tests execute the real function; they need bash and POSIX
 #: coreutils, so they skip on Windows (the repository's shell-suite convention).
 pytestmark_posix = pytest.mark.skipif(
@@ -71,6 +74,8 @@ def test_generation_identity_has_exactly_one_reader():
 
     A second inline ``cat`` of the receipt is how the two drift apart, so exactly
     one read site is allowed and it must be the helper.
+
+    ATDD-OPIP-LEARNING-RECOVERY-v1/AC-021.
     """
     source = _script()
     assert source.count("last-good-sha") == 1
@@ -90,6 +95,8 @@ def test_generation_identity_is_captured_before_the_replica_is_built():
 
     If the capture moved after the replica export the two layers could disagree,
     which the deploy gate rejects as a replica provenance mismatch.
+
+    ATDD-OPIP-LEARNING-RECOVERY-v1/AC-021.
     """
     source = _script()
     capture = 'production_deployed_sha="$(read_authoritative_release_sha)"'
@@ -105,7 +112,10 @@ def test_generation_identity_is_captured_before_the_replica_is_built():
 
 
 def test_revalidation_is_the_last_step_before_the_manifest_commit():
-    """The unvalidated window must be a single rename, not a whole code block."""
+    """The unvalidated window must be a single rename, not a whole code block.
+
+    ATDD-OPIP-LEARNING-RECOVERY-v1/AC-021.
+    """
     source = _script()
     call = 'commit_export_or_discard "$production_deployed_sha" "$manifest_tmp"'
     commit = 'mv -f -- "$manifest_tmp" "$EXPORT_MANIFEST"'
@@ -123,6 +133,10 @@ def test_revalidation_is_the_last_step_before_the_manifest_commit():
 
 
 def test_revalidation_reads_the_receipt_again_at_the_commit_point():
+    """Re-read, not reuse: reusing the captured value would validate nothing.
+
+    ATDD-OPIP-LEARNING-RECOVERY-v1/AC-021.
+    """
     body = _function_body("commit_export_or_discard")
     # Re-read, not reuse: reusing the captured value would validate nothing.
     assert 'commit_sha="$(read_authoritative_release_sha)"' in body
@@ -132,7 +146,10 @@ def test_revalidation_reads_the_receipt_again_at_the_commit_point():
 
 
 def test_release_change_fails_closed_without_publishing_a_manifest():
-    """The mismatch path must publish nothing and leave the commit marker alone."""
+    """The mismatch path must publish nothing and leave the commit marker alone.
+
+    ATDD-OPIP-LEARNING-RECOVERY-v1/AC-021.
+    """
     body = _function_body("commit_export_or_discard")
     # It never writes or renames the manifest...
     assert '> "$EXPORT_MANIFEST"' not in body
@@ -152,6 +169,8 @@ def test_discard_never_deletes_the_committed_generation():
 
     Removing it would destroy the last valid evidence - the exact opposite of the
     guarantee this change is supposed to add.
+
+    ATDD-OPIP-LEARNING-RECOVERY-v1/AC-021.
     """
     body = _function_body("commit_export_or_discard")
     assert "REPLICA_CREATED_THIS_RUN" in body
@@ -171,6 +190,10 @@ def test_discard_never_deletes_the_committed_generation():
 
 
 def test_manifest_publication_stays_atomic_and_never_rewritten():
+    """The commit marker is replaced atomically and never edited in place.
+
+    ATDD-OPIP-LEARNING-RECOVERY-v1/AC-021.
+    """
     source = _script()
     assert 'manifest_tmp="$EXPORT_ROOT/.manifest.env.tmp.$$"' in source
     assert source.count('mv -f -- "$manifest_tmp" "$EXPORT_MANIFEST"') == 1
@@ -188,7 +211,10 @@ def test_manifest_publication_stays_atomic_and_never_rewritten():
 
 
 def test_legitimate_lock_skip_and_locks_are_preserved():
-    """A concurrent cron run legitimately wins the lock; that must still succeed."""
+    """A concurrent cron run legitimately wins the lock; that must still succeed.
+
+    ATDD-OPIP-LEARNING-RECOVERY-v1/AC-021.
+    """
     source = _script()
     assert 'exec 9>"$TRIGGER_LOCK"' in source
     assert "flock -n 9" in source
@@ -212,7 +238,10 @@ EXPORT_CYCLE_SECONDS = 160
 
 
 def test_proof_wait_covers_a_lock_skip_followed_by_regeneration():
-    """One lock-skipped attempt plus one regeneration is a legitimate outcome."""
+    """One lock-skipped attempt plus one regeneration is a legitimate outcome.
+
+    ATDD-OPIP-LEARNING-RECOVERY-v1/AC-021.
+    """
     import app.opip.learning.canonical_replica as replica_module
 
     wait = replica_module.EXPORT_PROOF_WAIT_SECONDS
@@ -231,7 +260,10 @@ def test_proof_wait_covers_a_lock_skip_followed_by_regeneration():
 
 
 def test_proof_freshness_bound_is_unchanged():
-    """The wait may grow; the freshness a committed export must meet may not."""
+    """The wait may grow; the freshness a committed export must meet may not.
+
+    ATDD-OPIP-LEARNING-RECOVERY-v1/AC-021.
+    """
     import app.opip.learning.canonical_replica as replica_module
 
     assert replica_module.EXPORT_PROOF_FRESHNESS_SECONDS == 600
@@ -329,6 +361,8 @@ def test_release_change_discards_the_uncommitted_generation(tmp_path):
 
     A fresh, complete generation built for the previous release must not be
     published, and the previous valid evidence must survive untouched.
+
+    ATDD-OPIP-LEARNING-RECOVERY-v1/AC-021.
     """
     fx = _fixture(tmp_path, receipt_sha=DEPLOYED_SHA)
     before = fx["manifest"].read_bytes()
@@ -353,6 +387,10 @@ def test_release_change_discards_the_uncommitted_generation(tmp_path):
 
 @pytestmark_posix
 def test_unchanged_release_commits_untouched(tmp_path):
+    """An unchanged release must proceed, and nothing may be removed.
+
+    ATDD-OPIP-LEARNING-RECOVERY-v1/AC-021.
+    """
     fx = _fixture(tmp_path, receipt_sha=GENERATION_SHA)
     before = fx["manifest"].read_bytes()
 
@@ -369,7 +407,10 @@ def test_unchanged_release_commits_untouched(tmp_path):
 
 @pytestmark_posix
 def test_reused_content_addressed_directory_is_never_deleted(tmp_path):
-    """A content-address hit must not let the discard path delete live evidence."""
+    """A content-address hit must not let the discard path delete live evidence.
+
+    ATDD-OPIP-LEARNING-RECOVERY-v1/AC-021.
+    """
     fx = _fixture(tmp_path, receipt_sha=DEPLOYED_SHA)
     # This run reused an existing directory instead of publishing its own, and
     # the committed manifest happens to reference that same directory.
@@ -388,7 +429,10 @@ def test_reused_content_addressed_directory_is_never_deleted(tmp_path):
 
 @pytestmark_posix
 def test_vanished_receipt_fails_closed(tmp_path):
-    """A receipt that disappears mid-generation is a change, not a pass."""
+    """A receipt that disappears mid-generation is a change, not a pass.
+
+    ATDD-OPIP-LEARNING-RECOVERY-v1/AC-021.
+    """
     fx = _fixture(tmp_path, receipt_sha=None)
     before = fx["manifest"].read_bytes()
 

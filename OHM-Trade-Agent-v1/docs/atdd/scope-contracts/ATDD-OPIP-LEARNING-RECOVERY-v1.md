@@ -349,8 +349,6 @@ AC-021 -> tests/test_opip_learning_export_release_race_v1.py::test_release_chang
 AC-021 -> tests/test_opip_learning_export_release_race_v1.py::test_unchanged_release_commits_untouched
 AC-021 -> tests/test_opip_learning_export_release_race_v1.py::test_reused_content_addressed_directory_is_never_deleted
 AC-021 -> tests/test_opip_learning_export_release_race_v1.py::test_vanished_receipt_fails_closed
-AC-021 -> tests/test_opip_deployment_transaction_boundary_v1.py::test_bounded_wait_accepts_a_later_target_sha_commit
-AC-021 -> tests/test_opip_deployment_transaction_boundary_v1.py::test_bounded_wait_terminates_when_the_target_never_commits
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/deploy/remote/configure-opip-learning-reader.sh
