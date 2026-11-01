@@ -73,6 +73,8 @@ def sandbox(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
         "KRAKEN_API_SECRET=fake-secret-value\n"
         "KRKN_API_KEY=fake-legacy-value\n"
         "KRAKEN_RECONCILIATION_ENABLED=false\n"
+        "OPIP_IRR_MODE=shadow\n"
+        "DEEPSEEK_API_KEY=fake-deepseek-key\n"
         "OPIP_TRADEVISOR_WEBHOOK_TOKEN=token-value\n",
         encoding="utf-8",
     )
@@ -88,7 +90,7 @@ def test_funded_credential_names_match_the_python_authority() -> None:
 
 
 def test_generator_removes_funded_names_and_keeps_the_rest(sandbox) -> None:
-    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-012: only funded names are removed."""
+    """ATDD-RELEASE-TREE-DEPLOY-v1/AC-012: funded and worker-only secrets are removed."""
     app_root, state = sandbox
     source_before = (app_root / ".env").read_bytes()
 
@@ -103,12 +105,34 @@ def test_generator_removes_funded_names_and_keeps_the_rest(sandbox) -> None:
     assert "OPIP_RELEASE_PROFILE=EVIDENCE_SHADOW" in text
     assert "KRAKEN_RECONCILIATION_ENABLED=false" in text
     assert "OPIP_TRADEVISOR_WEBHOOK_TOKEN=token-value" in text
+    assert "OPIP_IRR_MODE=shadow" in text
+    assert "DEEPSEEK_API_KEY" not in text
 
     assert (app_root / ".env").read_bytes() == source_before
     assert oct(dest.stat().st_mode & 0o777) == "0o600"
     assert "fake-key-value" not in result.stdout + result.stderr
     assert "fake-secret-value" not in result.stdout + result.stderr
+    assert "fake-deepseek-key" not in result.stdout + result.stderr
     assert f"excluded_count={len(_library_keys())}" in result.stdout
+
+
+def test_irr_deepseek_key_is_worker_only_but_shadow_mode_reaches_core(sandbox) -> None:
+    """Regression: the core/scan producer sees mode, but never the provider key."""
+    app_root, state = sandbox
+    owner_before = (app_root / ".env").read_bytes()
+
+    result = _run(app_root, state)
+    assert result.returncode == 0, result.stderr
+
+    core = (app_root / ".env.core").read_text(encoding="utf-8")
+    assert "OPIP_IRR_MODE=shadow" in core
+    assert "DEEPSEEK_API_KEY" not in core
+    assert "fake-deepseek-key" not in core
+    assert (app_root / ".env").read_bytes() == owner_before
+
+    compose = COMPOSE.read_text(encoding="utf-8")
+    worker = compose[compose.index("  opip-irr-shadow:"):compose.index("\nnetworks:")]
+    assert 'DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:-}"' in worker
 
 
 def test_generator_is_idempotent_and_follows_rotation(sandbox) -> None:
