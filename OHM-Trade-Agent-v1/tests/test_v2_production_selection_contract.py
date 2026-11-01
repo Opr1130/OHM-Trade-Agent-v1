@@ -90,7 +90,10 @@ def test_comparison_relabels_authority_correctly_on_v2_cutover():
     )
     assert row["model_authority"] == "V2_PRODUCTION_V1_OBSERVATION"
     assert row["v2_top"][0]["score"] == 82
-    assert row["v1_top"] == []
+    # The same bearish snapshot independently qualifies in V1 as SHORT.
+    # V1 is recorded as shadow, not silently dropped or used as V2 authority.
+    assert row["v1_top"][0]["direction"] == "SHORT"
+    assert row["v2_top"][0]["direction"] == "LONG"
 
 
 def test_v2_scoring_rejects_invalid_version():
