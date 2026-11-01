@@ -10,6 +10,8 @@ from app.scanner.directional_candidates import (
 from app.scanner.models import MarketSnapshot
 from app.services.technical_scoring_comparison import build_scoring_comparison
 from app.jobs.scan_opportunities import _select_production_candidates
+from app.jobs.scan_worker import _jsonable
+from app.services.scan_result_promotion import _rebuild_snapshot
 
 
 def snapshot(symbol="TESTUSD", **kw):
@@ -99,3 +101,29 @@ def test_comparison_relabels_authority_correctly_on_v2_cutover():
 def test_v2_scoring_rejects_invalid_version():
     with pytest.raises(ValueError, match="UNSUPPORTED_SCORING_VERSION"):
         select_directional_candidates([snapshot()], scoring_version="v3")
+
+
+@pytest.mark.acceptance
+def test_isolated_worker_round_trip_preserves_v2_scoring_components():
+    """ATDD-OPIP-CONFIGURABLE-SCORING-v1/AC-009: isolated scan retains V2 evidence."""
+    sample = snapshot(
+        technical_score_version="v1",v2_profile_digest="0"*64,
+        v2_long_components={"higher_timeframe_adx": 20.0, "rsi": 13.2},
+        v2_short_components={"higher_timeframe_adx": 9.0, "rsi": 12.1},
+    )
+    restored, degraded = _rebuild_snapshot(_jsonable(sample))
+    assert "v2_long_components" not in degraded
+    assert "v2_short_components" not in degraded
+    assert restored.v2_long_components == sample.v2_long_components
+    assert restored.v2_short_components == sample.v2_short_components
+    assert restored.v2_profile_digest == "0"*64
+
+
+@pytest.mark.acceptance
+def test_invalid_v2_component_map_is_not_promoted_as_valid_evidence():
+    """ATDD-OPIP-CONFIGURABLE-SCORING-v1/AC-009: malformed evidence is rejected."""
+    payload = _jsonable(snapshot(v2_long_components={"rsi": 12.0}))
+    payload["v2_long_components"] = {"rsi": float("nan")}
+    rebuilt, degraded = _rebuild_snapshot(payload)
+    assert "v2_long_components" in degraded
+    assert rebuilt.v2_long_components is None
