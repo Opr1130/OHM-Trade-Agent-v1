@@ -17,10 +17,6 @@ READER_GROUP="opiplearn"
 # Authoritative production release receipt, published by ohm-deploy at its commit
 # point. Every artifact this exporter publishes is bound to it.
 RELEASE_RECEIPT="/var/lib/ohm-deploy/last-good-sha"
-# Committed export manifest. Written only through an atomic rename, so it is the
-# generation commit marker: a reader either sees the previous generation in full
-# or the new one in full, never a mixture.
-EXPORT_MANIFEST="$EXPORT_ROOT/manifest.env"
 
 # Read the authoritative production release SHA, or print nothing when the
 # receipt is absent or malformed.
@@ -405,8 +401,8 @@ commit_export_or_discard() {
   # directory can still be the one the committed manifest references, so
   # deleting it would destroy the last valid evidence instead of protecting it.
   local committed_dir=""
-  if [[ -r "$EXPORT_MANIFEST" ]]; then
-    committed_dir="$(awk -F= '$1 == "canonical_learning_replica_dir" { sub(/^[^=]*=/, ""); print; exit }' "$EXPORT_MANIFEST" 2>/dev/null || true)"
+  if [[ -r "$EXPORT_ROOT/manifest.env" ]]; then
+    committed_dir="$(awk -F= '$1 == "canonical_learning_replica_dir" { sub(/^[^=]*=/, ""); print; exit }' "$EXPORT_ROOT/manifest.env" 2>/dev/null || true)"
   fi
   if [[ -n "$REPLICA_CREATED_THIS_RUN" && -n "$REPLICA_PUBLISH_NAME" \
     && "$committed_dir" != "$REPLICA_PUBLISH_NAME" ]]; then
@@ -472,7 +468,7 @@ commit_export_or_discard "$production_deployed_sha" "$manifest_tmp" || revalidat
 if (( revalidation_rc != 0 )); then
   exit 75
 fi
-mv -f -- "$manifest_tmp" "$EXPORT_MANIFEST"
+mv -f -- "$manifest_tmp" "$EXPORT_ROOT/manifest.env"
 
 # manifest.env is the commit marker. Only after it points at the new immutable
 # directory may older/uncommitted replica directories be removed. Therefore an

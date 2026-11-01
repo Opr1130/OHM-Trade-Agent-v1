@@ -118,7 +118,7 @@ def test_revalidation_is_the_last_step_before_the_manifest_commit():
     """
     source = _script()
     call = 'commit_export_or_discard "$production_deployed_sha" "$manifest_tmp"'
-    commit = 'mv -f -- "$manifest_tmp" "$EXPORT_MANIFEST"'
+    commit = 'mv -f -- "$manifest_tmp" "$EXPORT_ROOT/manifest.env"'
     assert call in source
     assert commit in source
     assert source.count(commit) == 1
@@ -152,10 +152,11 @@ def test_release_change_fails_closed_without_publishing_a_manifest():
     """
     body = _function_body("commit_export_or_discard")
     # It never writes or renames the manifest...
-    assert '> "$EXPORT_MANIFEST"' not in body
+    assert '> "$EXPORT_ROOT/manifest.env"' not in body
     assert "mv " not in body
-    assert "manifest.env" not in body
-    # ...it removes the unpublished temporary manifest instead.
+    # ...it only reads the committed marker, to protect it...
+    assert '-r "$EXPORT_ROOT/manifest.env"' in body
+    # ...and removes the unpublished temporary manifest instead.
     assert 'rm -f -- "$manifest_tmp"' in body
     assert "discarding uncommitted export" in body
 
@@ -186,7 +187,7 @@ def test_discard_never_deletes_the_committed_generation():
     moved = source.index('mv -- "$REPLICA_STAGING" "$REPLICA_PUBLISH_DIR"')
     assert moved < source.index("REPLICA_CREATED_THIS_RUN=1")
     # The committed directory is read, never written, to decide ownership.
-    assert '-r "$EXPORT_MANIFEST"' in body
+    assert '-r "$EXPORT_ROOT/manifest.env"' in body
 
 
 def test_manifest_publication_stays_atomic_and_never_rewritten():
@@ -196,13 +197,13 @@ def test_manifest_publication_stays_atomic_and_never_rewritten():
     """
     source = _script()
     assert 'manifest_tmp="$EXPORT_ROOT/.manifest.env.tmp.$$"' in source
-    assert source.count('mv -f -- "$manifest_tmp" "$EXPORT_MANIFEST"') == 1
+    assert source.count('mv -f -- "$manifest_tmp" "$EXPORT_ROOT/manifest.env"') == 1
     # Never edit committed evidence in place (no SHA substitution, no truncation).
     assert "sed -i" not in source
-    assert '>"$EXPORT_MANIFEST"' not in source
-    assert '>>"$EXPORT_MANIFEST"' not in source
+    assert '>"$EXPORT_ROOT/manifest.env"' not in source
+    assert '>>"$EXPORT_ROOT/manifest.env"' not in source
     # The previous generation is read to make the discard decision.
-    assert '-r "$EXPORT_MANIFEST"' in source
+    assert '-r "$EXPORT_ROOT/manifest.env"' in source
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +225,7 @@ def test_legitimate_lock_skip_and_locks_are_preserved():
     skip_start = source.index("flock -n 9")
     assert source.index("exit 0", skip_start) < source.index("commit_export_or_discard() {")
     # Retention still prunes only after the commit marker moved.
-    assert source.index('mv -f -- "$manifest_tmp" "$EXPORT_MANIFEST"') < source.index(
+    assert source.index('mv -f -- "$manifest_tmp" "$EXPORT_ROOT/manifest.env"') < source.index(
         'find "$EXPORT_ROOT" -mindepth 1 -maxdepth 1 -type d'
     )
 
@@ -322,7 +323,6 @@ def _run_revalidation(
         [
             "set -Eeuo pipefail",
             f'EXPORT_ROOT="{fx["export_root"]}"',
-            f'EXPORT_MANIFEST="{fx["manifest"]}"',
             f'RELEASE_RECEIPT="{fx["receipt"]}"',
             f'REPLICA_STAGING="{fx["staging"]}"',
             f'REPLICA_PUBLISH_NAME="{fx["new_dir"].name}"',
