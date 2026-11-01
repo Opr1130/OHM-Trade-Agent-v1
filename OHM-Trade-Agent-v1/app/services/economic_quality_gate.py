@@ -8,12 +8,12 @@ DEFAULT_MAX_ACCOUNT_RISK_AT_STOP_PCT = 5.0
 DEFAULT_MAX_CAPITAL_FRACTION = 1.0
 PRODUCTION_MAX_CAPITAL_FRACTION = 0.20
 
-# The economic gate's policy numbers, named so that telemetry can report how
-# far a candidate was from the bar without restating the value. These are the
-# keyword defaults below; production never overrides them.
+# Advisory economic policy: require nonnegative estimated net economics rather
+# than an arbitrary fixed-dollar target. Execution and risk gates remain intact.
+# Production auto-trading requires separate sizing and owner authorization.
 MIN_TARGET_2_MOVE_PCT = 4.0
 PREFERRED_TARGET_2_MOVE_PCT = 7.0
-MIN_NET_PROFIT = 75.0
+MIN_NET_PROFIT = 0.0
 MIN_REWARD_TO_RISK = 2.5
 ESTIMATED_ROUND_TRIP_COST_PCT = 0.60
 
