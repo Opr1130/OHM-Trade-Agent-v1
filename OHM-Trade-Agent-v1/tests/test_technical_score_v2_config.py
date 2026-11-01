@@ -1,11 +1,11 @@
 """Focused V2 scoring contract: pure, config-driven, fail-closed, no authority."""
 import json
-from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from app.scanner.candidates import MIN_TECHNICAL_SCORE
 from app.scanner.technical_score_v2 import V2Features, load_v2_config, score_long_v2
 
 
@@ -76,3 +76,13 @@ def test_production_authority_from_json_rejected(tmp_path: Path):
     altered.write_text(json.dumps(doc))
     with pytest.raises(ValueError, match="V2_CONFIG_AUTHORITY"):
         load_v2_config(altered)
+
+
+def test_production_v1_threshold_remains_frozen():
+    assert MIN_TECHNICAL_SCORE == 80
+
+
+def test_malformed_feature_type_fails_closed():
+    result = score_long_v2(snapshot(atr="bad"), features(), load_v2_config())
+    assert result.score is None
+    assert "atr" in result.missing
