@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from app.scanner.short_technical_scorer import score_short_snapshot
+from app.scanner.directional_candidates import select_directional_candidates
 
 logger = logging.getLogger(__name__)
 COMPARISON_FILE = Path("/app/data/opip/qualification/scoring_comparison.jsonl")
@@ -54,13 +55,28 @@ def build_scoring_comparison(
     scan_id: str,
     observed_at: datetime,
     v2_threshold: float = 75.0,
+    production_version: str = "v1",
 ) -> dict:
-    """Summarize actual V1 selection and hypothetical V2 scoring at same timestamp."""
+    """Compare actual selected scorer to its independently computed shadow."""
+    if production_version not in {"v1", "v2"}:
+        raise ValueError("INVALID_COMPARISON_SCORING_VERSION")
+    v1_selection = (
+        production_selected if production_version == "v1"
+        else select_directional_candidates(list(snapshots))
+    )
     v1 = [
         {"symbol": str(x.symbol), "direction": str(x.trade_direction), "score": int(x.technical_score)}
-        for x in production_selected[:8]
+        for x in v1_selection[:8]
     ]
-    v2 = _v2_shortlist(snapshots, threshold=v2_threshold)
+    v2 = (
+        _v2_shortlist(snapshots, threshold=v2_threshold)
+        if production_version == "v1"
+        else [
+            {"symbol": str(x.symbol), "direction": str(x.trade_direction),
+             "score": int(x.technical_score)}
+            for x in production_selected[:8]
+        ]
+    )
     v1_pairs = {(x["symbol"], x["direction"]) for x in v1}
     v2_pairs = {(x["symbol"], x["direction"]) for x in v2}
     by_symbol = []
@@ -82,7 +98,8 @@ def build_scoring_comparison(
         "schema_version": 1,
         "scan_id": str(scan_id),
         "observed_at_utc": observed_at.astimezone(timezone.utc).isoformat(),
-        "model_authority": "V1_PRODUCTION_V2_OBSERVATION",
+        "model_authority": ("V1_PRODUCTION_V2_OBSERVATION" if production_version == "v1"
+                            else "V2_PRODUCTION_V1_OBSERVATION"),
         "v1_threshold": 80,
         "v2_threshold": v2_threshold,
         "scanned": len(snapshots),
