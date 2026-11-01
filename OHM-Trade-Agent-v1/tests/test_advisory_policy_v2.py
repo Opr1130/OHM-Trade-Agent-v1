@@ -6,6 +6,7 @@ import pytest
 from app.jobs.scan_opportunities import _economic_quality
 from app.services.chief_analyst import _normalize_chief_potential
 from app.services.economic_quality_gate import MIN_NET_PROFIT
+from app.services.chief_alert_notifier import format_trade_plan
 from app.services.entry_exit_advisor import EntryExitPlan
 
 
@@ -53,3 +54,18 @@ def test_invalid_ai_return_potential_cannot_become_trade_claim():
     assert entries[1]["potential_move_pct"] is None
     assert entries[2]["potential_move_pct"] == pytest.approx(6.2)
     assert entries[2]["potential_timeframe_hours"] == 48
+
+
+@pytest.mark.acceptance
+def test_conditional_ai_move_is_visible_but_not_claimed_as_guaranteed_return():
+    """ATDD-OPIP-CONFIGURABLE-SCORING-v1/AC-007: advisory communicates uncertainty."""
+    candidate = {
+        "direction": "LONG", "symbol": "TESTUSD", "decision": "alert",
+        "confidence": 90, "potential_move_pct": 5.5,
+        "potential_timeframe_hours": 48,
+        "potential_rationale": "4h trend, support retest and volatility",
+    }
+    text = format_trade_plan(candidate, plan(), "Regime neutral")
+    assert "Conditional AI upside: 5.50% over ~48h" in text
+    assert "not a trade target or guarantee" in text
+    assert "AI scenario basis: 4h trend" in text
