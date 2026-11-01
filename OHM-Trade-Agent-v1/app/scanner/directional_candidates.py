@@ -92,6 +92,7 @@ def select_directional_candidates(
                     technical_score=int(long_score),
                     directional_long_score=int(long_score),
                     directional_short_score=int(short_score),
+                    technical_score_version=scoring_version,
                 )
             )
         if short_score >= min_score:
@@ -192,6 +193,7 @@ def qualifying_long_alternatives(
             technical_score=long_score,
             directional_long_score=long_score,
             directional_short_score=short_score,
+            technical_score_version=scoring_version,
         )
         previous = best_by_asset.get(asset)
         if (
