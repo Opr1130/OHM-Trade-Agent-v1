@@ -238,6 +238,7 @@ def _persist_broad_screening_fail_open(
     scan_id,
     universe_count,
     telemetry_enabled: bool,
+    min_score: int = 80,
 ) -> None:
     """Finalise rank/threshold evidence and persist. Never raises."""
     try:
@@ -246,6 +247,7 @@ def _persist_broad_screening_fail_open(
             selected=selected,
             observed_at=observed_at,
             universe_count=universe_count,
+            min_score=min_score,
             canonicalize_asset=canonicalize_asset,
             split_canonical_pair=split_canonical_pair,
         )
@@ -1386,6 +1388,13 @@ def main(scan_override=None):
     )
     screening_rows: list[dict] = []
     screening_scan_id = _screening_scan_id(opip)
+    scoring_version = getattr(settings, "opip_production_scoring_version", "v1")
+    if scoring_version not in {"v1", "v2"}:
+        raise ValueError("INVALID_PRODUCTION_SCORING_VERSION")
+    scoring_threshold = 80
+    if scoring_version == "v2":
+        from app.scanner.technical_score_v2 import load_v2_config
+        scoring_threshold = int(load_v2_config().threshold)
     candidates = _select_production_candidates(
         scan.snapshots,
         telemetry_enabled=bool(opip.telemetry_enabled),
@@ -1393,15 +1402,18 @@ def main(scan_override=None):
         observed_at=decision_at,
         scan_id=screening_scan_id,
         universe_count=len(scan.snapshots),
+        **({"scoring_version": scoring_version, "min_score": scoring_threshold} if scoring_version == "v2" else {}),
     )
     # Observational comparison only. No paths below ever consume the result.
-    if bool(getattr(settings, "opip_score_v2_evaluation_enabled", False)):
+    if bool(getattr(settings, "opip_score_v2_evaluation_enabled", False)) or scoring_version == "v2":
         try:
             record_comparison_fail_soft(build_scoring_comparison(
                 scan.snapshots,
                 candidates,
                 scan_id=screening_scan_id,
                 observed_at=decision_at,
+                production_version=scoring_version,
+                v2_threshold=scoring_threshold if scoring_version == "v2" else 75,
             ))
         except Exception as exc:
             logger.warning("V2 score comparison unavailable: %s", type(exc).__name__)
@@ -1422,6 +1434,7 @@ def main(scan_override=None):
             scan_id=screening_scan_id,
             universe_count=len(scan.snapshots),
             telemetry_enabled=True,
+            **({"min_score": scoring_threshold} if scoring_version == "v2" else {}),
         )
 
     # Wave 8.2 TradingView Intelligence Bridge: augmentation only. This can
@@ -1540,6 +1553,7 @@ def main(scan_override=None):
         qualifying_long_alternatives(
             scan.snapshots,
             excluded_assets=existing_assets,
+            **({"scoring_version": "v2", "min_score": scoring_threshold} if scoring_version == "v2" else {}),
         )
         if margin_opened_slots > 0
         else []
