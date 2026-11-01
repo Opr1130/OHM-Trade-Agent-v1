@@ -1421,6 +1421,9 @@ def main(scan_override=None):
             if getattr(item, "v2_feature_status", None) == "READY":
                 if getattr(item, "v2_profile_digest", None) != policy.digest:
                     raise ValueError("V2_SCORING_POLICY_DIGEST_MISMATCH")
+                if (not isinstance(getattr(item, "v2_long_components", None), dict)
+                        or not isinstance(getattr(item, "v2_short_components", None), dict)):
+                    raise ValueError("V2_SCORING_COMPONENT_EVIDENCE_MISSING")
     candidates = _select_production_candidates(
         scan.snapshots,
         telemetry_enabled=bool(opip.telemetry_enabled),
