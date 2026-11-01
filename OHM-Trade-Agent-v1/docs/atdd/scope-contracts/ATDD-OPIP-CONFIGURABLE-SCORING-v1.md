@@ -50,10 +50,10 @@ zero-overlap scanner, bounded memory, operator modes, deterministic safety,
 AI qualification, paper controls, and funded-order protections unchanged.
 
 ACCEPTANCE TEST TRACEABILITY:
-AC-001 -> OHM-Trade-Agent-v1/tests/test_strategy_scoring_scope_v1.py::test_strategy_profile_does_not_change_live_trading_authority
-AC-002 -> OHM-Trade-Agent-v1/tests/test_strategy_scoring_scope_v1.py::test_v2_requires_complete_point_in_time_feature_evidence
-AC-003 -> OHM-Trade-Agent-v1/tests/test_strategy_scoring_scope_v1.py::test_comparison_is_observational_and_has_no_qualified_outcome_claim
-AC-004 -> OHM-Trade-Agent-v1/tests/test_strategy_scoring_scope_v1.py::test_active_increment_scope_contract_resolves
+AC-001 -> tests/test_strategy_scoring_scope_v1.py::test_strategy_profile_does_not_change_live_trading_authority
+AC-002 -> tests/test_strategy_scoring_scope_v1.py::test_v2_requires_complete_point_in_time_feature_evidence
+AC-003 -> tests/test_strategy_scoring_scope_v1.py::test_comparison_is_observational_and_has_no_qualified_outcome_claim
+AC-004 -> tests/test_strategy_scoring_scope_v1.py::test_active_increment_scope_contract_resolves
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/core/config.py
