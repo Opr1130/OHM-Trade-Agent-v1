@@ -29,13 +29,13 @@ button:disabled{opacity:.5;cursor:not-allowed}small{color:#a3b4c6}
 <div><label for="cost">Estimated round-trip costs (0–5%)</label><input id="cost" type="number" min="0" max="5" step="0.01"></div>
 </div>
 <p><small id="version"></small></p>
-<button id="save">Save validated draft</button><button id="reload">Discard local changes</button>
+<button id="save">Save validated draft</button><button id="reload">Discard local changes</button><button id="activate">Activate advisory settings</button><button id="rollback">Rollback active settings</button><p><small id="activeVersion">Active profile not loaded.</small></p>
 <p class="warn">Protected: model authority, position limits, funded execution, risk ceilings and strategy activation cannot be changed here. Active production behavior is unchanged.</p>
 </section>
 <script>
 "use strict";
 const el=id=>document.getElementById(id);
-let original=null,digest="",adminKey="";
+let original=null,digest="",adminKey="",activeDigest="";
 function auth(){
  const operator=el("operator").value.trim()||sessionStorage.getItem("ohmDashboardSecret")||"";
  const headers={"X-Webhook-Secret":operator,"X-Strategy-Admin-Secret":adminKey};
@@ -59,8 +59,39 @@ async function load(){
   original=payload.document;digest=payload.digest;
   setFields(original);el("editor").hidden=false;
   el("version").textContent="Profile: "+original.profile_id+" • SHA256: "+digest;
-  status(payload.status+" — no active runtime change");
+  status(payload.status+" — draft loaded, no active runtime change");
+  await loadActive();
  }catch(e){status(e.message);el("editor").hidden=true;}
+}
+async function loadActive(){
+ try{
+  const response=await fetch("/api/opip/strategy-admin/active",{headers:auth(),cache:"no-store"});
+  if(!response.ok)throw Error("Active profile unavailable ("+response.status+")");
+  const payload=await response.json();
+  activeDigest=payload.digest;
+  el("activeVersion").textContent="Active advisory policy: "+payload.status+" • SHA256 "+activeDigest;
+ }catch(e){activeDigest="";el("activeVersion").textContent=e.message;}
+}
+async function performActivation(action){
+ if(!digest||!adminKey){status("Load and save a validated draft first.");return;}
+ const isApply=action==="activate";
+ const expected=isApply?digest:activeDigest;
+ if(!expected){status("Active policy version unknown; refresh.");return;}
+ const label=isApply?"activate the saved advisory profile":"restore the previous advisory profile";
+ if(!confirm("Confirm you want to "+label+"? This does not enable auto-trading."))return;
+ const acknowledgment=isApply?"ACTIVATE_ADVISORY_ONLY":"ROLLBACK_ADVISORY_ONLY";
+ try{
+  const response=await fetch("/api/opip/strategy-admin/"+action,{
+   method:"POST",
+   headers:{...auth(),"Content-Type":"application/json"},
+   body:JSON.stringify({expected_digest:expected,acknowledgment}),
+   cache:"no-store",
+  });
+  if(!response.ok)throw Error("Not applied (HTTP "+response.status+"). Activation may be disabled.");
+  const payload=await response.json();
+  status(payload.status+" — live funded trading unchanged.");
+  await loadActive();
+ }catch(e){status(e.message);}
 }
 function number(id){const input=el(id);if(!input.reportValidity())throw Error("Invalid "+id);const value=Number(input.value);if(!Number.isFinite(value))throw Error("Invalid "+id);return value;}
 async function save(){
@@ -81,4 +112,6 @@ async function save(){
  }catch(e){status(e.message);}
 }
 el("load").onclick=load;el("save").onclick=save;el("reload").onclick=load;
+el("activate").onclick=()=>performActivation("activate");
+el("rollback").onclick=()=>performActivation("rollback");
 </script></body></html>
