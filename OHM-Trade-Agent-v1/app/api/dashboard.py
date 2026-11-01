@@ -13,6 +13,7 @@ from app.services.secret_auth import secret_matches
 from app.services.technical_scoring_comparison import read_recent_comparisons
 from app.services.strategy_admin_drafts import (
     StrategyDraftConflict, read_policy_draft, save_policy_draft,
+    activate_policy_draft, rollback_active_policy, read_active_policy_status,
 )
 
 
@@ -129,3 +130,62 @@ def strategy_admin_save_draft(
 def strategy_admin_page() -> str:
     """Page contains no secrets and cannot write without dual headers."""
     return Path(__file__).with_name("strategy_admin.html").read_text(encoding="utf-8")
+
+
+@router.get("/api/opip/strategy-admin/active")
+def strategy_admin_current_active(
+    x_webhook_secret: str | None = Header(default=None),
+    x_strategy_admin_secret: str | None = Header(default=None),
+) -> dict:
+    _require_strategy_admin(x_webhook_secret, x_strategy_admin_secret)
+    try:
+        return read_active_policy_status()
+    except (OSError, ValueError):
+        raise HTTPException(status_code=503, detail="Active strategy policy unavailable")
+
+
+def _require_strategy_activation() -> None:
+    if not bool(getattr(get_settings(), "strategy_admin_activation_enabled", False)):
+        raise HTTPException(status_code=404, detail="Strategy activation not enabled")
+
+
+@router.post("/api/opip/strategy-admin/activate")
+def strategy_admin_activate(
+    expected_digest: str = Body(..., embed=True),
+    acknowledgment: str = Body(..., embed=True),
+    x_webhook_secret: str | None = Header(default=None),
+    x_strategy_admin_secret: str | None = Header(default=None),
+) -> dict:
+    _require_strategy_admin(x_webhook_secret, x_strategy_admin_secret)
+    _require_strategy_activation()
+    if acknowledgment != "ACTIVATE_ADVISORY_ONLY":
+        raise HTTPException(status_code=422, detail="Explicit advisory-only acknowledgment required")
+    try:
+        return activate_policy_draft(expected_digest=expected_digest)
+    except StrategyDraftConflict:
+        raise HTTPException(status_code=409, detail="Draft version changed; refresh")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except OSError:
+        raise HTTPException(status_code=503, detail="Strategy activation unavailable")
+
+
+@router.post("/api/opip/strategy-admin/rollback")
+def strategy_admin_rollback(
+    expected_digest: str = Body(..., embed=True),
+    acknowledgment: str = Body(..., embed=True),
+    x_webhook_secret: str | None = Header(default=None),
+    x_strategy_admin_secret: str | None = Header(default=None),
+) -> dict:
+    _require_strategy_admin(x_webhook_secret, x_strategy_admin_secret)
+    _require_strategy_activation()
+    if acknowledgment != "ROLLBACK_ADVISORY_ONLY":
+        raise HTTPException(status_code=422, detail="Explicit advisory rollback acknowledgment required")
+    try:
+        return rollback_active_policy(expected_digest=expected_digest)
+    except StrategyDraftConflict:
+        raise HTTPException(status_code=409, detail="Active policy changed; refresh")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except OSError:
+        raise HTTPException(status_code=503, detail="Strategy rollback unavailable")
