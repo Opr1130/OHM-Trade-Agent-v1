@@ -118,8 +118,8 @@ def test_production_memory_budget_is_bounded_for_2gb_host():
     core = COMPOSE.read_text(encoding="utf-8")
     paper = PAPER_COMPOSE.read_text(encoding="utf-8")
 
-    assert "mem_limit: 384m" in core
-    assert "memswap_limit: 384m" in core
+    assert "mem_limit: 640m" in core
+    assert "memswap_limit: 640m" in core
     assert "mem_limit: 192m" in core
     assert "memswap_limit: 192m" in core
     assert "mem_limit: 64m" in core

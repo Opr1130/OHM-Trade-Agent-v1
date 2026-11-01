@@ -101,7 +101,7 @@ def test_worker_has_its_own_bounded_memory_cgroup(compose, worker):
     assert worker["mem_limit"] == "96m"
     assert worker["memswap_limit"] == "96m"
     assert worker["mem_limit"] != core["mem_limit"]
-    assert core["mem_limit"] == "384m"
+    assert core["mem_limit"] == "640m"
     assert worker["restart"] == "no"
     assert worker["profiles"] == ["irr-shadow"]
     assert worker["read_only"] is True
