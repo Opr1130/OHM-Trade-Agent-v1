@@ -51,7 +51,10 @@ def _read_v2_bundle():
         if get_settings().opip_advisory_profile_enabled
         else load_strategy_policy()
     )
-    profile = replace(load_v2_config(), threshold=active.scoring["v2_threshold"])
+    authority = "production" if get_settings().opip_production_scoring_version == "v2" else "shadow"
+    profile = replace(
+        load_v2_config(), threshold=active.scoring["v2_threshold"], mode=authority,
+    )
     return profile, active.digest
 
 
