@@ -923,8 +923,7 @@ def test_economic_gate_defaults_are_the_named_policy_constants():
     assert (
         signature.parameters["min_reward_to_risk"].default == gate.MIN_REWARD_TO_RISK
     )
-    # Owner-approved advisory policy: no fixed dollar-profit minimum.
-    # Net economics still include costs; target/return/risk vetoes remain.
-    assert gate.MIN_NET_PROFIT == 0.0
+    # Execution-compatible default remains unchanged; advisory override is separate.
+    assert gate.MIN_NET_PROFIT == 75.0
     assert gate.MIN_TARGET_2_MOVE_PCT == 4.0
     assert gate.MIN_REWARD_TO_RISK == 2.5
