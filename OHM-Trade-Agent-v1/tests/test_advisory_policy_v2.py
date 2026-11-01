@@ -1,0 +1,55 @@
+"""Advisory-only economic and AI move-scenario contract tests."""
+from types import SimpleNamespace
+
+import pytest
+
+from app.jobs.scan_opportunities import _economic_quality
+from app.services.chief_analyst import _normalize_chief_potential
+from app.services.economic_quality_gate import MIN_NET_PROFIT
+from app.services.entry_exit_advisor import EntryExitPlan
+
+
+def plan():
+    return EntryExitPlan(
+        symbol="TESTUSD",valid_now=True,entry_style="ready",entry_low=100,
+        entry_high=100,chase_limit=101,stop_price=98,target_1=103,target_2=106,
+        reward_to_risk_1=1.5,reward_to_risk_2=3,risk_level="low",
+        reason="test",direction="LONG",
+    )
+
+
+@pytest.mark.acceptance
+def test_fixed_profit_floor_remains_in_execution_default_but_not_advisory_override():
+    """ATDD-OPIP-CONFIGURABLE-SCORING-v1/AC-007: advisor is not execution policy."""
+    old = _economic_quality(plan(), SimpleNamespace(trade_direction="LONG"), 500)
+    new = _economic_quality(
+        plan(), SimpleNamespace(trade_direction="LONG"), 500,
+        advisory_policy={
+            "min_net_profit": 0,
+            "min_target_2_move_pct": 4,
+            "min_reward_to_risk": 2.5,
+            "estimated_round_trip_cost_pct": 0.6,
+        },
+    )
+    assert MIN_NET_PROFIT == 75.0
+    assert old.qualified is False
+    assert new.qualified is True
+    assert new.target_2_net_profit > 0
+    assert new.target_2_net_profit < 75
+
+
+@pytest.mark.acceptance
+def test_invalid_ai_return_potential_cannot_become_trade_claim():
+    """ATDD-OPIP-CONFIGURABLE-SCORING-v1/AC-007: AI potential is bounded evidence."""
+    review = {"top_candidates": [
+        {"potential_move_pct": 150, "potential_timeframe_hours": 8, "potential_rationale": "unsupported"},
+        {"potential_move_pct": float("nan"), "potential_timeframe_hours": 24},
+        {"potential_move_pct": 6.2, "potential_timeframe_hours": 48,
+         "potential_rationale": "conditional momentum"},
+    ]}
+    _normalize_chief_potential(review)
+    entries = review["top_candidates"]
+    assert entries[0]["potential_move_pct"] is None
+    assert entries[1]["potential_move_pct"] is None
+    assert entries[2]["potential_move_pct"] == pytest.approx(6.2)
+    assert entries[2]["potential_timeframe_hours"] == 48
