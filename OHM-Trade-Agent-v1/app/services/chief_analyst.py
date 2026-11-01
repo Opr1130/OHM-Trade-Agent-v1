@@ -52,7 +52,7 @@ Each payload item is one unique underlying asset/direction. Use the exact primar
 
 Consider trend quality, RSI extension, MACD confirmation, volume quality, volatility, relative strength/weakness, chase risk, execution evidence, deterministic target-quality and economic context. For SHORT candidates, favor bearish continuation with realistic downside room; do not recommend shorting merely because the broad regime is RISK_OFF.
 
-Target-quality scores are deterministic opportunity-quality scores, not probabilities. AI confidence is comparative review confidence, not win probability. Do not recalculate supplied deterministic metrics.
+If a candidate's technical_score_version is v2, use only the supplied v2_technical_components as the technical scoring explanation. V1 diagnostic scores may be present only as shadow context and must not be represented as the reason V2 admitted the candidate. Target-quality scores are deterministic opportunity-quality scores, not probabilities. AI confidence is comparative review confidence, not win probability. Do not recalculate supplied deterministic metrics.
 
 Kraken market-data and execution values are deterministic evidence. PreTrade contains only the top 10 aggregated levels; incomplete depth is partial observed liquidity, never zero liquidity. SHORT entry depends on bid-side sellability and eventual cover depends on ask-side buyback liquidity. Never convert execution coverage into probability.
 
@@ -576,19 +576,29 @@ def review_candidates(
 
         direction = candidate.trade_direction.upper()
         card = score_short_snapshot(candidate) if direction == "SHORT" else score_snapshot(candidate)
+        scoring_version = getattr(candidate, "technical_score_version", "v1")
+        v2_components = (
+            getattr(candidate, "v2_long_components", None)
+            if direction == "LONG"
+            else getattr(candidate, "v2_short_components", None)
+        ) if scoring_version == "v2" else None
         candidate_context = {
             "symbol": candidate.symbol,
             "direction": direction,
             "technical_score": candidate.technical_score,
+            "technical_score_version": scoring_version,
+            "v2_technical_components": v2_components,
+            "v2_policy_sha256": getattr(candidate, "v2_profile_digest", None),
+            "v1_shadow_score": card.score if scoring_version == "v2" else None,
             "price": candidate.last_price,
             "trend": candidate.trend,
             "rsi": round(candidate.rsi, 2),
             "macd_histogram": round(candidate.macd_histogram, 6),
             "atr_pct": round(candidate.atr_pct, 3),
             "volume_ratio": round(candidate.volume_ratio, 2),
-            "strengths": card.strengths,
-            "warnings": card.warnings,
-            "weaknesses": card.weaknesses,
+            "strengths": card.strengths if scoring_version == "v1" else [],
+            "warnings": card.warnings if scoring_version == "v1" else ["V1 scorecard is shadow evidence; V2 components are authoritative"],
+            "weaknesses": card.weaknesses if scoring_version == "v1" else [],
             "margin_evidence": {
                 "eligible": candidate.margin_eligible,
                 "status": candidate.margin_validation_status,
