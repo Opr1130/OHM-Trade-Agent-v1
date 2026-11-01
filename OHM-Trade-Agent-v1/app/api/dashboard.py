@@ -71,3 +71,9 @@ def scoring_comparison(x_webhook_secret: str | None = Header(default=None)) -> d
     """Read-only V1/V2 paired-scoring evidence. Never activates a strategy."""
     _require_secret(x_webhook_secret)
     return read_recent_comparisons()
+
+
+@router.get("/dashboard/scoring", response_class=HTMLResponse)
+def scoring_comparison_page() -> str:
+    """Static read-only page; comparison data requires dashboard auth."""
+    return Path(__file__).with_name("scoring_comparison.html").read_text(encoding="utf-8")
