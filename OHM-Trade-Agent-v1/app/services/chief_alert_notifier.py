@@ -320,11 +320,11 @@ def format_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan, summary: s
         label = "downside" if direction == "SHORT" else "upside"
         potential_note = (
             f"Conditional AI {label}: {float(potential):.2f}% over "
-            f"~{int(horizon)}h (scenario, not a trade target or guarantee)\\n"
+            f"~{int(horizon)}h (scenario, not a trade target or guarantee)\n"
         )
-        rationale = str(candidate.get("potential_rationale") or "").replace("\\n", " ").strip()[:200]
+        rationale = str(candidate.get("potential_rationale") or "").replace("\n", " ").strip()[:200]
         if rationale:
-            potential_note += f"AI scenario basis: {rationale}\\n"
+            potential_note += f"AI scenario basis: {rationale}\n"
 
     movement_note = ""
     movement = candidate.get("price_movement")
