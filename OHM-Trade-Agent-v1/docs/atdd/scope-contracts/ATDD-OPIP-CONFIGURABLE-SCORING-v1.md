@@ -101,6 +101,7 @@ AC-006 -> tests/test_v2_production_selection_contract.py::test_selector_and_scre
 AC-006 -> tests/test_v2_production_selection_contract.py::test_comparison_relabels_authority_correctly_on_v2_cutover
 AC-007 -> tests/test_advisory_policy_v2.py::test_fixed_profit_floor_remains_in_execution_default_but_not_advisory_override
 AC-007 -> tests/test_advisory_policy_v2.py::test_invalid_ai_return_potential_cannot_become_trade_claim
+AC-007 -> tests/test_advisory_policy_v2.py::test_conditional_ai_move_is_visible_but_not_claimed_as_guaranteed_return
 AC-008 -> tests/test_strategy_admin_drafts.py::test_advisory_activation_and_rollback_are_atomic_and_versioned
 AC-008 -> tests/test_strategy_admin_drafts.py::test_activation_refuses_drafts_without_saved_version
 AC-008 -> tests/test_strategy_admin_drafts.py::test_unapproved_activation_endpoint_is_disabled
@@ -145,6 +146,7 @@ AC-006 -> OHM-Trade-Agent-v1/tests/test_v2_production_selection_contract.py
 AC-007 -> OHM-Trade-Agent-v1/app/core/config.py
 AC-007 -> OHM-Trade-Agent-v1/app/jobs/scan_opportunities.py
 AC-007 -> OHM-Trade-Agent-v1/app/services/chief_analyst.py
+AC-007 -> OHM-Trade-Agent-v1/app/services/chief_alert_notifier.py
 AC-007 -> OHM-Trade-Agent-v1/tests/test_advisory_policy_v2.py
 
 AC-008 -> OHM-Trade-Agent-v1/app/api/dashboard.py
