@@ -417,6 +417,8 @@ class Settings(BaseSettings):
     opip_advisory_profile_enabled: bool = False
     # Separate, opt-in private config-editor credential; never authorizes trades.
     strategy_admin_secret: str | None = None
+    # Separate owner-gated switch; remains false after build/deploy by default.
+    strategy_admin_activation_enabled: bool = False
 
     # === Scanner resource controls (R04/R05) ===============================
     # Concurrency bound for market-data acquisition. Two OHLC requests are
