@@ -61,6 +61,35 @@ if ! flock -n 9; then
   exit 0
 fi
 
+# Remove at most one abandoned *staging* tree per export, never a committed
+# content-addressed replica. This runs after winning the sole exporter lock,
+# but before the reader-facing publish lock. Require a full 24-hour grace
+# period, the root-owned 0700 staging contract, and a non-live originating PID.
+# Fresh, live, nonconforming and symlinked paths are never removed. Cleanup is
+# advisory: a filesystem cleanup failure must not prevent valid evidence.
+cleanup_abandoned_replica_staging() {
+  local candidate pid owner_mode
+  while IFS= read -r -d '' candidate; do
+    [[ ! -L "$candidate" ]] || continue
+    pid="${candidate##*.}"
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    [[ "$pid" != "$" ]] || continue
+    owner_mode="$(stat -c '%u:%a' -- "$candidate" 2>/dev/null || true)"
+    [[ "$owner_mode" == "${EUID}:700" ]] || continue
+    if kill -0 "$pid" 2>/dev/null; then
+      continue
+    fi
+    if rm -rf -- "$candidate"; then
+      echo "O'Pip learning export: pruned one abandoned staging tree"
+    else
+      echo "O'Pip learning export: abandoned staging cleanup failed" >&2
+    fi
+    break
+  done < <(find "$EXPORT_ROOT" -mindepth 1 -maxdepth 1 -type d \
+    -name '.canonical_learning_replica.staging.*' -mmin +1440 -print0)
+}
+cleanup_abandoned_replica_staging
+
 touch "$PUBLISH_LOCK"
 if getent group "$READER_GROUP" >/dev/null 2>&1; then
   chown root:"$READER_GROUP" "$PUBLISH_LOCK"
