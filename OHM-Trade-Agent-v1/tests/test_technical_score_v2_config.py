@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.scanner.candidates import MIN_TECHNICAL_SCORE
-from app.scanner.technical_score_v2 import V2Features, load_v2_config, score_long_v2
+from app.scanner.technical_score_v2 import V2Features, load_v2_config, score_long_v2, score_short_v2
 
 
 def snapshot(**changes):
@@ -86,3 +86,22 @@ def test_malformed_feature_type_fails_closed():
     result = score_long_v2(snapshot(atr="bad"), features(), load_v2_config())
     assert result.score is None
     assert "atr" in result.missing
+
+
+def test_directional_short_scoring_mirrors_long_for_bearish_trend():
+    candidate = snapshot(last_price=98, ema20=100, ema50=110, ema200=120,
+                         rsi=44, macd_line=-0.5, macd_signal=-0.3)
+    evidence = features(higher_timeframe_ema50_rising=False,
+                        higher_timeframe_ema50_falling=True,
+                        candle_close_location=0.1,
+                        macd_histogram_rising=False,
+                        macd_histogram_falling=True)
+    cfg = load_v2_config()
+    assert score_short_v2(candidate, evidence, cfg).score == 100.0
+    assert score_long_v2(candidate, evidence, cfg).score < 50.0
+
+
+def test_short_without_bearish_htf_data_does_not_score():
+    result = score_short_v2(snapshot(), features(), load_v2_config())
+    assert result.status == "INSUFFICIENT_FEATURES"
+    assert "higher_timeframe_ema50_aligned" in result.missing
