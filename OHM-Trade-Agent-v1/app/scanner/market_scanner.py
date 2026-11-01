@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
 from app.exchanges.kraken import Candle, KrakenClient
@@ -23,6 +24,8 @@ from app.scanner.execution_validation import (
 from app.scanner.market_data_validation import validate_market_data
 from app.scanner.cross_pair_confirmation import evaluate_cross_pair_confirmation
 from app.scanner.technical_scorer import score_snapshot
+from app.scanner.technical_score_v2 import load_v2_config, score_long_v2, score_short_v2
+from app.scanner.v2_features import extract_v2_features
 from app.scanner.universe import (
     DEFAULT_UNIQUE_ASSET_LIMIT,
     UniverseAsset,
@@ -35,6 +38,11 @@ MIN_CANDLES_REQUIRED = 200
 #: Historical hard-coded concurrency. Retained as the absolute ceiling: the
 #: operator-facing setting may only tighten it, never widen it.
 MAX_WORKERS = 8
+
+
+@lru_cache(maxsize=1)
+def _read_v2_profile():
+    return load_v2_config()
 
 
 def configured_max_workers() -> int:
@@ -360,6 +368,25 @@ def analyze_symbol(symbol: str, universe_asset: UniverseAsset | None = None) -> 
             snapshot.ticker_ask = universe_asset.primary_ticker_ask
 
         snapshot.technical_score = score_snapshot(snapshot).score
+        # Parallel V2 evidence is opt-in and makes no extra market-data requests.
+        # V1 remains the production ranking and qualification authority.
+        from app.core.config import get_settings
+
+        if bool(get_settings().opip_score_v2_evaluation_enabled):
+            try:
+                profile = _read_v2_profile()
+                evidence = extract_v2_features(completed)
+                long = score_long_v2(snapshot, evidence, profile)
+                short = score_short_v2(snapshot, evidence, profile)
+                snapshot.v2_profile_version = profile.version
+                snapshot.v2_long_score = long.score
+                snapshot.v2_short_score = short.score
+                snapshot.v2_feature_status = (
+                    "READY" if long.status == "READY" and short.status == "READY"
+                    else "INSUFFICIENT_FEATURES"
+                )
+            except Exception as exc:
+                snapshot.v2_feature_status = f"ERROR:{type(exc).__name__}"
         return "ok", snapshot, None
     except Exception as exc:
         return "fail", None, f"{symbol}: {exc}"
