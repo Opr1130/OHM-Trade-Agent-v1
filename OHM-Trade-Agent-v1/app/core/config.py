@@ -411,6 +411,8 @@ class Settings(BaseSettings):
 
     # Opt-in evidence-only V2 computation; never switches production selection.
     opip_score_v2_evaluation_enabled: bool = False
+    # Separate, opt-in private config-editor credential; never authorizes trades.
+    strategy_admin_secret: str | None = None
 
     # === Scanner resource controls (R04/R05) ===============================
     # Concurrency bound for market-data acquisition. Two OHLC requests are

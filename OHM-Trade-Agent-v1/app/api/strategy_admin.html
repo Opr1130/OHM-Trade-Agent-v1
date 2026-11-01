@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>O'Pip Private Strategy Configuration</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,Segoe UI,sans-serif}
+body{background:#0c1625;color:#e8eef7;max-width:860px;margin:auto;padding:24px}
+h1{font-size:24px}.info{color:#b5c7d8}.warn{color:#e5c887;font-size:14px}
+a{color:#89bbf5}.panel{border:1px solid #3b536a;background:#12243a;border-radius:12px;padding:18px;margin:16px 0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px}
+label{display:block;font-size:14px;color:#dce8fa;margin-bottom:6px}
+input{width:100%;box-sizing:border-box;color:#fff;background:#0e2034;border:1px solid #66839c;border-radius:6px;padding:10px}
+button{color:white;background:#295b8a;border:1px solid #5a93ca;border-radius:7px;padding:10px 16px;cursor:pointer;margin:6px 7px 6px 0}
+button:disabled{opacity:.5;cursor:not-allowed}small{color:#a3b4c6}
+</style></head><body>
+<a href="/dashboard">← Dashboard</a><h1>Strategy Configuration</h1>
+<p class="info">Private administrator draft editor. Settings are validated and saved with a version digest. <b>Saving never activates them.</b></p>
+<section class="panel">
+<label for="operator">Operator secret (required)</label><input id="operator" type="password" autocomplete="off" placeholder="Existing OHM operator secret">
+<label for="admin">Separate strategy administrator secret</label><input id="admin" type="password" autocomplete="off" placeholder="Configured on the server">
+<button id="load">Load current draft</button><p class="warn" id="status" role="status">Administration is disabled until a separate secret is configured on the server.</p>
+</section>
+<section class="panel" id="editor" hidden>
+<h2>Adjust advisory strategy draft</h2>
+<div class="grid">
+<div><label for="threshold">V2 minimum technical score (50–95)</label><input id="threshold" type="number" min="50" max="95" step="1"></div>
+<div><label for="profit">Minimum projected net profit ($0–$10,000)</label><input id="profit" type="number" min="0" max="10000" step="0.01"></div>
+<div><label for="move">Minimum Target 2 movement (0–25%)</label><input id="move" type="number" min="0" max="25" step="0.1"></div>
+<div><label for="rr">Minimum reward / risk (1–10)</label><input id="rr" type="number" min="1" max="10" step="0.1"></div>
+<div><label for="cost">Estimated round-trip costs (0–5%)</label><input id="cost" type="number" min="0" max="5" step="0.01"></div>
+</div>
+<p><small id="version"></small></p>
+<button id="save">Save validated draft</button><button id="reload">Discard local changes</button>
+<p class="warn">Protected: model authority, position limits, funded execution, risk ceilings and strategy activation cannot be changed here. Active production behavior is unchanged.</p>
+</section>
+<script>
+"use strict";
+const el=id=>document.getElementById(id);
+let original=null,digest="",adminKey="";
+function auth(){
+ const operator=el("operator").value.trim()||sessionStorage.getItem("ohmDashboardSecret")||"";
+ const headers={"X-Webhook-Secret":operator,"X-Strategy-Admin-Secret":adminKey};
+ return headers;
+}
+function setFields(d){
+ el("threshold").value=d.scoring.v2_threshold;
+ el("profit").value=d.advisory_economics.min_net_profit_usd;
+ el("move").value=d.advisory_economics.min_target_2_move_pct;
+ el("rr").value=d.advisory_economics.min_reward_to_risk;
+ el("cost").value=d.advisory_economics.estimated_round_trip_cost_pct;
+}
+function status(t){el("status").textContent=t;}
+async function load(){
+ adminKey=el("admin").value||adminKey;
+ if(!adminKey){status("Separate administrator secret required.");return;}
+ try{
+  const response=await fetch("/api/opip/strategy-admin/draft",{headers:auth(),cache:"no-store"});
+  if(!response.ok)throw Error("Access refused or unavailable (HTTP "+response.status+")");
+  const payload=await response.json();
+  original=payload.document;digest=payload.digest;
+  setFields(original);el("editor").hidden=false;
+  el("version").textContent="Profile: "+original.profile_id+" • SHA256: "+digest;
+  status(payload.status+" — no active runtime change");
+ }catch(e){status(e.message);el("editor").hidden=true;}
+}
+function number(id){const input=el(id);if(!input.reportValidity())throw Error("Invalid "+id);const value=Number(input.value);if(!Number.isFinite(value))throw Error("Invalid "+id);return value;}
+async function save(){
+ if(!original||!digest){status("Load a draft first.");return;}
+ try{
+  const proposed=JSON.parse(JSON.stringify(original));
+  proposed.scoring.v2_threshold=number("threshold");
+  proposed.advisory_economics.min_net_profit_usd=number("profit");
+  proposed.advisory_economics.min_target_2_move_pct=number("move");
+  proposed.advisory_economics.min_reward_to_risk=number("rr");
+  proposed.advisory_economics.estimated_round_trip_cost_pct=number("cost");
+  const headers={...auth(),"X-Expected-Profile-Sha256":digest,"Content-Type":"application/json"};
+  const response=await fetch("/api/opip/strategy-admin/draft",{
+   method:"PUT",headers,body:JSON.stringify(proposed),cache:"no-store"
+  });
+  if(!response.ok)throw Error("Save rejected (HTTP "+response.status+"). Refresh and verify changes.");
+  await load();status("Draft saved and audited. No strategy or trading behavior activated.");
+ }catch(e){status(e.message);}
+}
+el("load").onclick=load;el("save").onclick=save;el("reload").onclick=load;
+</script></body></html>
