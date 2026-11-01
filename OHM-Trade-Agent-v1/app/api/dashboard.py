@@ -145,7 +145,9 @@ def strategy_admin_current_active(
 
 
 def _require_strategy_activation() -> None:
-    if not bool(getattr(get_settings(), "strategy_admin_activation_enabled", False)):
+    settings = get_settings()
+    if not (bool(getattr(settings, "strategy_admin_activation_enabled", False))
+            and bool(getattr(settings, "opip_advisory_profile_enabled", False))):
         raise HTTPException(status_code=404, detail="Strategy activation not enabled")
 
 
