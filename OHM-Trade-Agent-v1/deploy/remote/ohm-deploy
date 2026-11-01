@@ -36,7 +36,7 @@ PAPER_COMPOSE="$APP_ROOT/docker-compose.paper.yml"
 # helper. Kept explicit here so the deploy gate cannot drift from them.
 EXPORT_ROOT="/var/lib/opip-learning-export"
 EXPORT_PROOF_FRESHNESS_SECONDS=600
-EXPORT_PROOF_WAIT_SECONDS=360
+EXPORT_PROOF_WAIT_SECONDS=480
 SCHEDULER_SNAPSHOT=""
 # Set immediately BEFORE the runtime verifier runs, so the rollback handler can
 # emit the capture producers' own durable disposition when the verifier is the

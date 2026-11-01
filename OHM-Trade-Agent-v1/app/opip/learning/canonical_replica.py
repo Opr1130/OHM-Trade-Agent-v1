@@ -1176,11 +1176,16 @@ _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 #: contract, which governs learning consumption rather than deploy proof.
 EXPORT_PROOF_FRESHNESS_SECONDS = 600
 
-#: Bounded wait for a committed target-SHA export. Also derived from the cadence
-#: (two cycles plus slack) so a skipped-due-to-lock run has a chance to be
-#: superseded by the next scheduled run, and so the wait stays well inside the
-#: deploy's SSH keepalive budget. Never unbounded.
-EXPORT_PROOF_WAIT_SECONDS = 360
+#: Bounded wait for a committed target-SHA export. Derived from the export cadence
+#: (2 minutes + 40s offset, so ~160s per cycle) plus the lock-skip recovery path
+#: the exporter can legitimately take: one cycle for an in-flight concurrent run
+#: to finish and release the lock, one cycle to the next scheduled start, and one
+#: full regeneration that can now commit the target release. Three cycles plus
+#: slack therefore covers the worst legitimate case - a deploy whose own export
+#: attempt was lock-skipped while the concurrent run was still bound to the
+#: previous release - while staying strictly bounded and well inside the deploy's
+#: SSH keepalive budget. Never unbounded.
+EXPORT_PROOF_WAIT_SECONDS = 480
 EXPORT_PROOF_POLL_INTERVAL_SECONDS = 10.0
 
 REASON_EXPORT_MANIFEST_MISSING = "LEARNING_EXPORT_MANIFEST_MISSING"

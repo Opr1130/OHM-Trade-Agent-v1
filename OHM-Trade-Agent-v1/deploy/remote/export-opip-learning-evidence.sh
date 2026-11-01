@@ -14,6 +14,28 @@ PYTHON_BIN="${OPIP_PYTHON_BIN:-/usr/bin/python3}"
 TRIGGER_LOCK="/var/run/opip-learning-export.lock"
 PUBLISH_LOCK="$EXPORT_ROOT/.publish.lock"
 READER_GROUP="opiplearn"
+# Authoritative production release receipt, published by ohm-deploy at its commit
+# point. Every artifact this exporter publishes is bound to it.
+RELEASE_RECEIPT="/var/lib/ohm-deploy/last-good-sha"
+# Committed export manifest. Written only through an atomic rename, so it is the
+# generation commit marker: a reader either sees the previous generation in full
+# or the new one in full, never a mixture.
+EXPORT_MANIFEST="$EXPORT_ROOT/manifest.env"
+
+# Read the authoritative production release SHA, or print nothing when the
+# receipt is absent or malformed.
+#
+# One implementation only: the generation identity, the empty-export attestation
+# and the pre-commit revalidation must never disagree about which release the
+# evidence belongs to. Never falls back to the checked-out revision - an export
+# that cannot be attributed to a release must stay unattributable, not guessed.
+read_authoritative_release_sha() {
+  local sha
+  sha="$(cat "$RELEASE_RECEIPT" 2>/dev/null || true)"
+  if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+    printf '%s' "$sha"
+  fi
+}
 
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   echo "run O'Pip learning evidence export as root" >&2
@@ -122,10 +144,7 @@ write_empty_export_attestation_if_canonical() {
   fi
 
   local sha
-  sha="$(cat /var/lib/ohm-deploy/last-good-sha 2>/dev/null || true)"
-  if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
-    sha=""
-  fi
+  sha="$(read_authoritative_release_sha)"
   local exported_at
   exported_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf '%s\n' "{\"archive_prefix\":\"${prefix}\",\"exported_at_utc\":\"${exported_at}\",\"hot_bytes\":0,\"kind\":\"empty_export_attestation_v1\",\"manifest_present\":false,\"production_deployed_sha\":\"${sha}\",\"schema_version\":1,\"segment_count\":0,\"signature_present\":false}" > "$archive_dir/empty_export_attestation_v1.json"
@@ -260,16 +279,16 @@ read_replica_tree_digest() {
 #
 # All snapshot/manifest logic lives in Python. This shell only orchestrates.
 # ---------------------------------------------------------------------------
-production_deployed_sha="$(cat /var/lib/ohm-deploy/last-good-sha 2>/dev/null || true)"
-if [[ ! "$production_deployed_sha" =~ ^[0-9a-f]{40}$ ]]; then
-  # Leave empty so workers report UNVERIFIED and fail closed until the
-  # authoritative deploy receipt exists. Do not fall back to git HEAD.
-  production_deployed_sha=""
-fi
+production_deployed_sha="$(read_authoritative_release_sha)"
 
 REPLICA_EXPORT_NAME="canonical_learning_replica"
 REPLICA_STAGING="$EXPORT_ROOT/.$REPLICA_EXPORT_NAME.staging.$$"
 REPLICA_PUBLISH_NAME=""
+REPLICA_PUBLISH_DIR=""
+# Set only when this run moved its own staging tree into place. A reused
+# content-addressed directory may still be the live generation, so cleanup after
+# a refused commit must never assume it owns an existing directory.
+REPLICA_CREATED_THIS_RUN=""
 REPLICA_MARKER_LINES=""
 
 rm -rf -- "$REPLICA_STAGING"
@@ -334,6 +353,7 @@ else
     rm -rf -- "$REPLICA_STAGING"
   else
     mv -- "$REPLICA_STAGING" "$REPLICA_PUBLISH_DIR"
+    REPLICA_CREATED_THIS_RUN=1
   fi
 
   REPLICA_MARKER_LINES="canonical_learning_replica_version=1
@@ -342,6 +362,58 @@ canonical_learning_replica_bytes=${replica_bytes}
 canonical_learning_replica_sha256=${replica_sha}"
   echo "O'Pip learning export: canonical replica bundle OK bytes=${replica_bytes}"
 fi
+
+# ---------------------------------------------------------------------------
+# Commit-point release revalidation.
+#
+# The generation identity is captured once and then baked into the copied
+# artifacts, the inner replica manifest and the outer manifest. Publishing that
+# generation happens only after the artifact copy and the canonical replica
+# export - tens of seconds, sometimes minutes. For that whole window this run
+# holds the export lock, but ohm-deploy does *not*: it publishes
+# RELEASE_RECEIPT at its own commit point without participating in this lock.
+#
+# Re-reading the receipt at the commit point is therefore the only way to know
+# the generation still describes the deployed release. Without it a deploy that
+# flips the receipt mid-generation receives a fresh, internally consistent
+# export bound to the *previous* release, which the deploy-side readiness gate
+# must then reject as LEARNING_EXPORT_RELEASE_SHA_MISMATCH even though nothing
+# about the export is actually stale.
+#
+# When the identity has moved, the generation is discarded rather than
+# relabelled: rewriting the SHA into evidence that was built for another release
+# would mint a provenance claim the artifacts cannot support. The committed
+# manifest is left exactly as it was, so the previous valid generation stays
+# authoritative; the unpublished replica directory is removed so retention stays
+# bounded; and the run fails closed with rc=75 so the next scheduled run
+# regenerates against the release that is now deployed.
+# ---------------------------------------------------------------------------
+commit_export_or_discard() {
+  local generation_sha="$1"
+  local manifest_tmp="$2"
+  local commit_sha
+  commit_sha="$(read_authoritative_release_sha)"
+  if [[ "$commit_sha" == "$generation_sha" ]]; then
+    return 0
+  fi
+
+  echo "O'Pip learning export: production release changed during generation (was ${generation_sha:-none}, now ${commit_sha:-none}); discarding uncommitted export and preserving the previous committed export" >&2
+  rm -f -- "$manifest_tmp"
+  rm -rf -- "$REPLICA_STAGING"
+
+  # Only a directory this run created may be removed. A reused content-addressed
+  # directory can still be the one the committed manifest references, so
+  # deleting it would destroy the last valid evidence instead of protecting it.
+  local committed_dir=""
+  if [[ -r "$EXPORT_MANIFEST" ]]; then
+    committed_dir="$(awk -F= '$1 == "canonical_learning_replica_dir" { sub(/^[^=]*=/, ""); print; exit }' "$EXPORT_MANIFEST" 2>/dev/null || true)"
+  fi
+  if [[ -n "$REPLICA_CREATED_THIS_RUN" && -n "$REPLICA_PUBLISH_NAME" \
+    && "$committed_dir" != "$REPLICA_PUBLISH_NAME" ]]; then
+    rm -rf -- "$REPLICA_PUBLISH_DIR"
+  fi
+  return 75
+}
 
 manifest_tmp="$EXPORT_ROOT/.manifest.env.tmp.$$"
 
@@ -390,7 +462,17 @@ else
   chown root:root "$manifest_tmp"
   chmod 0600 "$manifest_tmp"
 fi
-mv -f -- "$manifest_tmp" "$EXPORT_ROOT/manifest.env"
+
+# The commit point. Everything above is still unpublishable, and this is the last
+# moment at which the release identity can still disagree with the generation.
+# Placed immediately before the rename so the unvalidated window is a single
+# syscall rather than an attribute update plus a rename.
+revalidation_rc=0
+commit_export_or_discard "$production_deployed_sha" "$manifest_tmp" || revalidation_rc=$?
+if (( revalidation_rc != 0 )); then
+  exit 75
+fi
+mv -f -- "$manifest_tmp" "$EXPORT_MANIFEST"
 
 # manifest.env is the commit marker. Only after it points at the new immutable
 # directory may older/uncommitted replica directories be removed. Therefore an
