@@ -42,6 +42,11 @@ GIT=()
 #: Python authority fails CI instead of silently widening the core environment.
 OPIP_FUNDED_CREDENTIAL_KEYS="KRAKEN_API_KEY KRAKEN_API_SECRET KRAKEN_PRIVATE_KEY KRKN_API_KEY LIVE_TRADING_KEY"
 
+#: IRR provider credential is worker-only. The core/scan producers consume
+#: OPIP_IRR_MODE, but must NEVER inherit the DeepSeek credential from .env.
+#: This list is independent of the funded-exchange credential parity contract.
+OPIP_IRR_WORKER_ONLY_CREDENTIAL_KEYS="DEEPSEEK_API_KEY"
+
 #: F11 protection credential NAMES that the core IS allowed to carry. A literal
 #: mirror of ``app.exchanges.kraken_protection_credentials``; the ATDD contract
 #: test asserts both name pairs are identical, so the Python authority cannot
@@ -67,7 +72,7 @@ opip_core_env_path() {
 
 opip_write_core_env() {
   # Generate the core-only environment from the owner's `.env`, excluding every
-  # funded credential name. The owner's `.env` is never modified and no value is
+  # funded credential name and the worker-only DeepSeek provider credential. The owner's `.env` is never modified and no value is
   # ever printed - only the destination path and the number of excluded names.
   #
   # The file is written atomically (temp file on the deploy state filesystem,
@@ -75,21 +80,26 @@ opip_write_core_env() {
   # context by `.dockerignore` (`.env.*`). Regenerating with unchanged input is
   # idempotent; a rotated `.env` produces a new file on the next activation.
   local src="$APP_ROOT/.env" dest tmp key
-  local -a keys
+  local -a keys worker_only_keys
   dest="$(opip_core_env_path)"
   if [[ ! -f "$src" || -L "$src" || ! -r "$src" ]]; then
     echo "refusing core environment: $src is missing, unreadable or a symlink" >&2
     return 1
   fi
   read -r -a keys <<<"$OPIP_FUNDED_CREDENTIAL_KEYS"
+  read -r -a worker_only_keys <<<"$OPIP_IRR_WORKER_ONLY_CREDENTIAL_KEYS"
   if ((${#keys[@]} == 0)); then
     echo "refusing core environment: no funded credential names are configured" >&2
     return 1
   fi
   install -d -m 0700 "$STATE_DIR"
   tmp="$(mktemp "$STATE_DIR/.core-env.XXXXXX")" || return 1
-  if ! awk -F= -v keys="$OPIP_FUNDED_CREDENTIAL_KEYS" '
-      BEGIN { n = split(keys, a, " "); for (i = 1; i <= n; i++) skip[a[i]] = 1 }
+  if ! awk -F= -v keys="$OPIP_FUNDED_CREDENTIAL_KEYS" \
+      -v worker_only="$OPIP_IRR_WORKER_ONLY_CREDENTIAL_KEYS" '
+      BEGIN {
+        n = split(keys, a, " "); for (i = 1; i <= n; i++) skip[a[i]] = 1
+        m = split(worker_only, b, " "); for (j = 1; j <= m; j++) skip[b[j]] = 1
+      }
       { name = $1; gsub(/^[ \t]+|[ \t]+$/, "", name); if (name in skip) next; print }
     ' "$src" > "$tmp"; then
     rm -f -- "$tmp"
@@ -98,7 +108,7 @@ opip_write_core_env() {
   fi
   # Defence in depth: a funded name must not survive filtering under any
   # spelling (leading whitespace, padding around the separator).
-  for key in "${keys[@]}"; do
+  for key in "${keys[@]}" "${worker_only_keys[@]}"; do
     if grep -qE "^[[:space:]]*${key}[[:space:]]*=" "$tmp" 2>/dev/null; then
       rm -f -- "$tmp"
       echo "refusing core environment: ${key} survived filtering" >&2
