@@ -396,6 +396,8 @@ def analyze_symbol(symbol: str, universe_asset: UniverseAsset | None = None) -> 
                 snapshot.v2_profile_digest = policy_digest
                 snapshot.v2_long_score = long.score
                 snapshot.v2_short_score = short.score
+                snapshot.v2_long_components = dict(long.components)
+                snapshot.v2_short_components = dict(short.components)
                 snapshot.v2_feature_status = (
                     "READY" if long.status == "READY" and short.status == "READY"
                     else "INSUFFICIENT_FEATURES"
