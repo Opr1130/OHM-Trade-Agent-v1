@@ -152,8 +152,13 @@ services:
       - ./data/freqtrade/state:/app/freqtrade_paper:ro
     # The deterministic core was small after the evidence jobs were moved out
     # of this cgroup. Bound it so a future leak cannot consume the whole 2 GB host.
-    mem_limit: 384m
-    memswap_limit: 384m
+    # Raised 384m -> 640m after the isolated scanner proved 200/200 candidate
+    # coverage without an OOM kill at the higher ceiling; 384m was the operating
+    # constraint, not a measured requirement. Source now records the ceiling
+    # production actually runs, so the Compose file is the source of truth again
+    # rather than drifting behind an out-of-band host change.
+    mem_limit: 640m
+    memswap_limit: 640m
     cpus: "0.45"
     oom_score_adj: 100
     pids_limit: 256
