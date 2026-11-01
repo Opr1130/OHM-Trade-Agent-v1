@@ -144,3 +144,4 @@ class MarketSnapshot:
     v2_short_score: float | None = None
     v2_feature_status: str = "NOT_COMPUTED"
     v2_profile_version: str | None = None
+    v2_profile_digest: str | None = None
