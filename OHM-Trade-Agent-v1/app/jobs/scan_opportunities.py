@@ -99,7 +99,7 @@ logger = logging.getLogger(__name__)
 select_candidates = select_directional_candidates
 
 
-def _broad_screening_callback(*, rows, observed_at, scan_id, universe_count):
+def _broad_screening_callback(*, rows, observed_at, scan_id, universe_count, min_score: int = 80):
     """Build the fail-soft, evidence-only Broad Search callback."""
     def capture(snapshot, long_score, short_score, advanced_direction) -> None:
         raw = str(
@@ -115,6 +115,7 @@ def _broad_screening_callback(*, rows, observed_at, scan_id, universe_count):
                 observed_at=observed_at,
                 scan_id=scan_id,
                 universe_count=universe_count,
+                min_score=min_score,
                 canonicalize_asset=canonicalize_asset,
                 split_canonical_pair=split_canonical_pair,
             )
@@ -189,6 +190,8 @@ def _select_production_candidates(
     observed_at,
     scan_id: str,
     universe_count: int,
+    scoring_version: str = "v1",
+    min_score: int = 80,
 ):
     """Invoke the production selector exactly once.
 
@@ -203,6 +206,7 @@ def _select_production_candidates(
                 observed_at=observed_at,
                 scan_id=scan_id,
                 universe_count=universe_count,
+                min_score=min_score,
             )
             parameters = inspect.signature(select_candidates).parameters
             if "on_evaluated" in parameters:
@@ -216,6 +220,12 @@ def _select_production_candidates(
                 type(exc).__name__,
             )
             kwargs = {}
+    if scoring_version == "v2":
+        parameters = inspect.signature(select_candidates).parameters
+        if "scoring_version" not in parameters or "min_score" not in parameters:
+            raise ValueError("V2_SELECTOR_NOT_SUPPORTED")
+        kwargs["scoring_version"] = "v2"
+        kwargs["min_score"] = min_score
     return select_candidates(snapshots, **kwargs)
 
 
