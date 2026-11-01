@@ -1,5 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import Any
 
@@ -41,8 +41,22 @@ MAX_WORKERS = 8
 
 
 @lru_cache(maxsize=1)
+def _read_v2_bundle():
+    # Snapshot profile once per isolated worker; never mix versions per coin.
+    from app.core.config import get_settings
+    from app.core.strategy_policy import load_active_strategy_policy, load_strategy_policy
+
+    active = (
+        load_active_strategy_policy()
+        if get_settings().opip_advisory_profile_enabled
+        else load_strategy_policy()
+    )
+    profile = replace(load_v2_config(), threshold=active.scoring["v2_threshold"])
+    return profile, active.digest
+
+
 def _read_v2_profile():
-    return load_v2_config()
+    return _read_v2_bundle()[0]
 
 
 def configured_max_workers() -> int:
@@ -374,11 +388,12 @@ def analyze_symbol(symbol: str, universe_asset: UniverseAsset | None = None) -> 
 
         if bool(get_settings().opip_score_v2_evaluation_enabled) or get_settings().opip_production_scoring_version == "v2":
             try:
-                profile = _read_v2_profile()
+                profile, policy_digest = _read_v2_bundle()
                 evidence = extract_v2_features(completed)
                 long = score_long_v2(snapshot, evidence, profile)
                 short = score_short_v2(snapshot, evidence, profile)
                 snapshot.v2_profile_version = profile.version
+                snapshot.v2_profile_digest = policy_digest
                 snapshot.v2_long_score = long.score
                 snapshot.v2_short_score = short.score
                 snapshot.v2_feature_status = (
