@@ -88,13 +88,24 @@ GIVEN: production was operating with a 640 MB core memory/swap cap and a non-cre
 WHEN: these exact owner-approved Compose settings are incorporated into the next versioned release
 THEN: the core cap and swap cap are both 640 MB, the acquisition worker retains its 224 MB isolated read-only cgroup and scanner-only profile with no owner env file or funded/provider credentials, and the placeholder is never treated as a trading credential; the production deployment verifier enforces the same core memory/swap ceilings in bytes as certified Compose, and the release-tree integrity gate remains intact.
 
+AC-011:
+Owner-authorized production V2 scoring retains isolated scanner parity and V1 observation.
+GIVEN: the core uses the filtered environment while the scanner is isolated without
+a shared environment file, and the versioned scorer default remains V1
+WHEN: the owner activates V2 selection through a certified EVIDENCE_SHADOW release
+THEN: both service environments explicitly select V2, the independent comparison
+records V1 as observation only, and the worker receives no funded/provider secrets.
+New-entry suspensions, F11 protection, paper-v2 OFF and funded authority ABSENT
+remain unchanged. This release does not promise a BUY candidate or authorize orders.
+
 EXPLICITLY OUT OF SCOPE:
 V2 activation in a live deployment without release certification, auto-trading,
 margin/portfolio policy relaxation, multi-tenant settings, code-driven learning,
 changing global economic gate defaults, and a new dashboard service.
 
 FROZEN BOUNDARIES:
-V1 remains active by default; Top 8 and per-direction cap 5,
+V1 remains the code-level default unless explicitly overridden by an owner-approved
+versioned release; Top 8 and per-direction cap 5,
 zero-overlap scanner, bounded memory, operator modes, deterministic safety,
 AI qualification, paper controls, and funded-order protections unchanged.
 
@@ -126,6 +137,7 @@ AC-010 -> tests/test_opip_irr_activation_v1.py::test_worker_has_its_own_bounded_
 AC-010 -> tests/test_platform_foundation_v1.py::test_production_memory_budget_is_bounded_for_2gb_host
 AC-010 -> tests/test_platform_foundation_v1.py::test_deploy_resource_verifier_matches_core_compose_memory_limits
 AC-010 -> tests/test_platform_foundation_v1.py::test_isolated_scanner_preserves_credential_boundary_with_placeholder
+AC-011 -> tests/test_platform_foundation_v1.py::test_v2_scoring_release_pins_core_and_isolated_worker_with_v1_observation_only
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/core/config.py
@@ -192,6 +204,9 @@ AC-010 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
 AC-010 -> OHM-Trade-Agent-v1/tests/test_opip_irr_activation_v1.py
 AC-010 -> OHM-Trade-Agent-v1/tests/test_platform_foundation_v1.py
 AC-010 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-CONFIGURABLE-SCORING-v1.md
+AC-011 -> OHM-Trade-Agent-v1/docker-compose.yml
+AC-011 -> OHM-Trade-Agent-v1/tests/test_platform_foundation_v1.py
+AC-011 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-CONFIGURABLE-SCORING-v1.md
 
 DEFERRED DISCOVERIES:
 Production V2 cutover is guarded behind a disabled-by-default configuration

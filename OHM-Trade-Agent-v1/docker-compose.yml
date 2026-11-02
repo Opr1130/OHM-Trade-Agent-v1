@@ -107,6 +107,10 @@ services:
       # qualification, or funded execution authority.
       # Core must start independently of writer health (no hard depends_on).
       OPIP_RELEASE_PROFILE: "EVIDENCE_SHADOW"
+      # Owner-authorized V2 scoring cutover, separate from funded trading.
+      # Explicit Compose override defeats stale .env.core V1 values.
+      # V1 remains the read-only comparison scorer; no order authority is added.
+      OPIP_PRODUCTION_SCORING_VERSION: "v2"
       OPIP_COMMITTEE_MODE: "off"
       OPIP_CANONICAL_WRITER_MODE: "shadow"
       # Pin Paper-v2 off at the Compose service level so a stale .env cannot
@@ -293,6 +297,8 @@ services:
     environment:
       PYTHONDONTWRITEBYTECODE: "1"
       OPIP_SCAN_EXECUTION_MODE: "isolated"
+      # Must match core scoring authority: no .env.core or funded secrets here.
+      OPIP_PRODUCTION_SCORING_VERSION: "v2"
       WEBHOOK_SECRET: "unused-acquisition-worker-only"
     command:
       - python
