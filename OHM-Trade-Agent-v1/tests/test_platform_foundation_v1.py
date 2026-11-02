@@ -178,6 +178,25 @@ def test_isolated_scanner_preserves_credential_boundary_with_placeholder():
     }
 
 
+@pytest.mark.acceptance
+def test_v2_scoring_release_pins_core_and_isolated_worker_with_v1_observation_only():
+    """ATDD-OPIP-CONFIGURABLE-SCORING-v1/AC-011: V2 must cross both process boundaries."""
+    services = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))["services"]
+    core = services["ohm-trade-agent"]
+    worker = services["opip-scan-worker"]
+    assert core["env_file"] == [".env.core"]
+    assert "env_file" not in worker
+    assert core["environment"]["OPIP_PRODUCTION_SCORING_VERSION"] == "v2"
+    assert worker["environment"]["OPIP_PRODUCTION_SCORING_VERSION"] == "v2"
+    assert core["environment"]["OPIP_PAPER_V2_MODE"] == "off"
+    assert core["environment"]["OPIP_COMMITTEE_MODE"] == "off"
+    assert worker["read_only"] is True
+    assert worker["profiles"] == ["scanner"]
+    # V1 comparison has its own read-only path; do not give the worker execution authority.
+    assert "KRAKEN_API_KEY" not in worker["environment"]
+    assert "LIVE_TRADING_KEY" not in worker["environment"]
+
+
 def test_platform_backup_excludes_sqlite_transient_sidecars(tmp_path):
     source = tmp_path / "data"
     source.mkdir()
