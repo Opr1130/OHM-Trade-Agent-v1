@@ -52,15 +52,32 @@ function ConfigAdmin({secret}){
  function changes(next){
   if(!draft?.document)return[];
   const old=draft.document,results=[];
-  for(const cat of Object.keys(next)){const group=next[cat];if(!group||typeof group!=='object'||Array.isArray(group))continue;
-   for(const [key,value]of Object.entries(group)){if(JSON.stringify(old[cat]?.[key])!==JSON.stringify(value))results.push({path:cat+'.'+key,before:old[cat]?.[key],after:value});}
-  }return results;
+  const isObj=value=>value!==null&&typeof value==='object'&&!Array.isArray(value);
+  for(const cat of new Set([...Object.keys(old),...Object.keys(next)])){
+   const before=old[cat],after=next[cat];
+   if(!isObj(before)||!isObj(after)){
+    if(JSON.stringify(before)!==JSON.stringify(after))results.push({path:cat,before,after});
+    continue;
+   }
+   for(const key of new Set([...Object.keys(before),...Object.keys(after)])){
+    if(JSON.stringify(before[key])!==JSON.stringify(after[key]))
+     results.push({path:cat+'.'+key,before:before[key],after:after[key]});
+   }
+  }
+  return results;
  }
  function validate(){try{const next=sanitizeJsonExport(document);const changeset=changes(next);if(!changeset.length)throw Error('No changed fields to stage');setDiff(changeset);setMessage('Review the changes below. The server enforces protected-field validation.');return next}catch(e){setMessage(e.message);setDiff([]);return null}}
- async function save(){const next=validate();if(!next||!reason.trim())return setMessage('A non-empty change reason is required before staging.');setBusy(true);try{
-  const saved=await apiRequest('/api/opip/strategy-admin/draft',{...baseHeaders,method:'PUT',expectedDigest:draft.digest,json:next});
-  setMessage('Draft staged without runtime activation. Reason (local only): '+reason);setDraft({...draft,digest:saved.digest,document:next});setDiff([]);
- }catch(e){setMessage(e.message)}finally{setBusy(false)}}
+ async function save(){const next=validate();if(!next||!reason.trim())return setMessage('A non-empty change reason is required before staging.');
+  const generation=authGeneration.current;
+  setBusy(true);
+  try{
+   const saved=await apiRequest('/api/opip/strategy-admin/draft',{...baseHeaders,method:'PUT',expectedDigest:draft.digest,json:next});
+   if(generation!==authGeneration.current)return;
+   setMessage('Draft staged without runtime activation. Reason (local only): '+reason);
+   setDraft({...draft,digest:saved.digest,document:next});setDiff([]);
+  }catch(e){if(generation===authGeneration.current)setMessage(e.message)}
+  finally{if(generation===authGeneration.current)setBusy(false)}
+ }
  async function activate(rollback=false){if(!draft||!active)return setMessage('Load configuration first');
   const exact=rollback?'ROLLBACK_ADVISORY_ONLY':'ACTIVATE_ADVISORY_ONLY';
   if(ack!==exact)return setMessage('Type the exact advisory acknowledgment before proceeding.');
@@ -68,11 +85,15 @@ function ConfigAdmin({secret}){
   // Activation secret is not accepted by the legacy backend: the configured admin secret
   // is the server's second factor; this field is deliberately a local confirmation only.
   if(activationSecret!==adminSecret)return setMessage('Activation confirmation must match the protected admin credential.');
+  const generation=authGeneration.current;
   setBusy(true);
   try{
    const result=await apiRequest('/api/opip/strategy-admin/'+(rollback?'rollback':'activate'),{...baseHeaders,method:'POST',json:{expected_digest:rollback?active.digest:draft.digest,acknowledgment:exact}});
-   setMessage(result.status+' — funded trading not activated.');setAck('');setActivationSecret('');await load();
-  }catch(e){setMessage(e.message)}finally{setBusy(false)}
+   if(generation!==authGeneration.current)return;
+   setMessage(result.status+' — funded trading not activated.');setAck('');setActivationSecret('');
+   await load();
+  }catch(e){if(generation===authGeneration.current)setMessage(e.message)}
+  finally{if(generation===authGeneration.current)setBusy(false)}
  }
  return <div className="stack">
  <Card title="Protected advisory configuration"><p className="muted">Existing O’Pip backend controls runtime validation and authorized advisory-only activation. This console cannot alter funded trading, F11, or hard-coded provider secrets.</p>
