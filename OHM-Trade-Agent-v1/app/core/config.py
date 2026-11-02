@@ -409,6 +409,17 @@ class Settings(BaseSettings):
     # shipped scan-class schedule (deploy/cron.d/ohm-wave5-explosion-learning).
     signal_quality_scan_interval_seconds: int = Field(default=600, ge=30, le=7200)
 
+    # Opt-in evidence-only V2 computation; never switches production selection.
+    opip_score_v2_evaluation_enabled: bool = False
+    # Controlled release selection; V1 remains default. No funded-order authority.
+    opip_production_scoring_version: str = Field(default="v1", pattern=r"^(v1|v2)$")
+    # Advisory economic policy remains off pending release certification.
+    opip_advisory_profile_enabled: bool = False
+    # Separate, opt-in private config-editor credential; never authorizes trades.
+    strategy_admin_secret: str | None = None
+    # Separate owner-gated switch; remains false after build/deploy by default.
+    strategy_admin_activation_enabled: bool = False
+
     # === Scanner resource controls (R04/R05) ===============================
     # Concurrency bound for market-data acquisition. Two OHLC requests are
     # issued per symbol, so this number, not the asset count, sets the peak

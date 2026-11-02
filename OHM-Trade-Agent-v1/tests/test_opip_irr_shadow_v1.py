@@ -262,6 +262,31 @@ def _chief_output() -> dict:
     }
 
 
+def _normalized_chief_candidates() -> list[dict]:
+    """The Chief candidates exactly as the normalizer must emit them.
+
+    ``_chief_output()`` deliberately omits the three optional potential fields
+    (``potential_move_pct``, ``potential_timeframe_hours``,
+    ``potential_rationale``). That is the backward-compatible case a provider may
+    still produce, and ``_normalize_chief_potential`` guarantees it by
+    materialising them as explicit ``None``/``None``/``""`` instead of dropping
+    the keys, so no consumer has to distinguish "absent" from "unknown".
+
+    Deriving the expectation here instead of hard-coding the fields into the
+    provider payload keeps that defaulting path under test rather than editing it
+    out of existence.
+    """
+    return [
+        {
+            **candidate,
+            "potential_move_pct": None,
+            "potential_timeframe_hours": None,
+            "potential_rationale": "",
+        }
+        for candidate in _chief_output()["top_candidates"]
+    ]
+
+
 def _install_chief(monkeypatch) -> None:
     """Install a deterministic Stage-1 client without touching /app/data."""
     output = _chief_output()
@@ -318,7 +343,7 @@ def test_chief_review_performs_no_provider_io(monkeypatch):
         [_snapshot()], "gpt-6.1-sol", "openai-test-key"
     )
 
-    assert result["top_candidates"] == _chief_output()["top_candidates"]
+    assert result["top_candidates"] == _normalized_chief_candidates()
     assert "opip_irr_shadow" not in result
 
 
@@ -358,7 +383,7 @@ def test_hung_provider_never_delays_the_primary_pipeline(monkeypatch):
     worker.join(timeout=10)
 
     assert elapsed < 1.0, f"primary pipeline waited {elapsed:.3f}s on the provider"
-    assert review["top_candidates"] == _chief_output()["top_candidates"]
+    assert review["top_candidates"] == _normalized_chief_candidates()
     assert queued["status"] == "ENQUEUED"
     assert queued["enqueued"] == 1
 

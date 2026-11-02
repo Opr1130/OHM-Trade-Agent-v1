@@ -138,3 +138,13 @@ class MarketSnapshot:
     margin_max_leverage: float | None = None
     margin_validation_status: str = "NOT_REQUIRED"
     margin_warnings: list[str] | None = None
+
+    # Shadow V2 evidence. The authoritative V1 technical_score is untouched.
+    v2_long_score: float | None = None
+    v2_short_score: float | None = None
+    v2_feature_status: str = "NOT_COMPUTED"
+    v2_profile_version: str | None = None
+    v2_profile_digest: str | None = None
+    v2_long_components: dict[str, float] | None = None
+    v2_short_components: dict[str, float] | None = None
+    technical_score_version: str = "v1"

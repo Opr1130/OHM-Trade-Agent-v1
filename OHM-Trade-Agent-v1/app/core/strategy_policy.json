@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "profile_id": "opip-strategy-2026-11-v2-candidate",
+  "scoring": {
+    "production": "v1",
+    "target_production": "v2",
+    "shadow": "v1",
+    "v1_threshold": 80,
+    "v2_threshold": 75,
+    "max_candidates": 8,
+    "max_per_direction": 5
+  },
+  "advisory_economics": {
+    "min_net_profit_usd": 0,
+    "min_target_2_move_pct": 4,
+    "min_reward_to_risk": 2.5,
+    "estimated_round_trip_cost_pct": 0.6
+  },
+  "ai_advisory": {
+    "potential_move_scenarios": true,
+    "mode": "advisory_only"
+  },
+  "protection": {
+    "allow_funded_orders": false,
+    "allow_auto_trading_activation": false
+  }
+}

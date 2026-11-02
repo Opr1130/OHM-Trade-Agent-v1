@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import os
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
@@ -51,7 +52,7 @@ Each payload item is one unique underlying asset/direction. Use the exact primar
 
 Consider trend quality, RSI extension, MACD confirmation, volume quality, volatility, relative strength/weakness, chase risk, execution evidence, deterministic target-quality and economic context. For SHORT candidates, favor bearish continuation with realistic downside room; do not recommend shorting merely because the broad regime is RISK_OFF.
 
-Target-quality scores are deterministic opportunity-quality scores, not probabilities. AI confidence is comparative review confidence, not win probability. Do not recalculate supplied deterministic metrics.
+If a candidate's technical_score_version is v2, use only the supplied v2_technical_components as the technical scoring explanation. V1 diagnostic scores may be present only as shadow context and must not be represented as the reason V2 admitted the candidate. Target-quality scores are deterministic opportunity-quality scores, not probabilities. AI confidence is comparative review confidence, not win probability. Do not recalculate supplied deterministic metrics.
 
 Kraken market-data and execution values are deterministic evidence. PreTrade contains only the top 10 aggregated levels; incomplete depth is partial observed liquidity, never zero liquidity. SHORT entry depends on bid-side sellability and eventual cover depends on ask-side buyback liquidity. Never convert execution coverage into probability.
 
@@ -73,12 +74,15 @@ Return JSON only in this exact shape:
       "confidence": 0,
       "risk_level": "low|medium|high",
       "decision": "alert|watch|reject",
-      "reason": ""
+      "reason": "",
+      "potential_move_pct": null,
+      "potential_timeframe_hours": null,
+      "potential_rationale": ""
     }
   ],
   "summary": ""
 }
-Maximum 3 top_candidates. Confidence must be 0-100. Be conservative.
+Maximum 3 top_candidates. Confidence must be 0-100. Be conservative. If supportable, estimate an illustrative, directional move (0–30% absolute; SHORT means price decline) and timeframe (1–168 hours); null if not supportable. Cite trend, levels, volatility and market regime in potential_rationale. This is conditional advisory upside, not a return promise, probability, or trade target. Keep supplied deterministic Target 2 values unchanged.
 """
 
 _ALLOWED_REASONING_EFFORTS = {"low", "medium", "high"}
@@ -95,6 +99,30 @@ SHORT_VALIDATION_LEVERAGE = 2.0
 SHORT_MARGIN_COST_RESERVE_PCT = 0.28
 SHORT_MAX_ACCOUNT_RISK_AT_STOP_PCT = 5.0
 
+
+
+def _normalize_chief_potential(review: dict) -> None:
+    """Sanitize optional model estimates; invalid or absent fields stay unknown.
+
+    A model's stated upside is not a win probability or trading authorization.
+    """
+    entries = review.get("top_candidates")
+    if not isinstance(entries, list):
+        return
+    for entry in entries[:3]:
+        if not isinstance(entry, dict):
+            continue
+        move, hours = entry.get("potential_move_pct"), entry.get("potential_timeframe_hours")
+        if (type(move) not in (int, float) or type(hours) not in (int, float)
+                or not math.isfinite(move) or not math.isfinite(hours)
+                or not 0 < move <= 30 or not 1 <= hours <= 168):
+            entry["potential_move_pct"] = None
+            entry["potential_timeframe_hours"] = None
+            entry["potential_rationale"] = ""
+            continue
+        entry["potential_move_pct"] = round(float(move), 2)
+        entry["potential_timeframe_hours"] = int(hours)
+        entry["potential_rationale"] = str(entry.get("potential_rationale") or "")[:500]
 
 def _reasoning_effort() -> str:
     effort = os.getenv("OPENAI_REASONING_EFFORT", "medium").strip().lower()
@@ -114,7 +142,7 @@ def _max_output_tokens() -> int:
     return value
 
 
-def _quality_by_risk_level(candidate: MarketSnapshot, account_equity: float) -> tuple[dict, bool]:
+def _quality_by_risk_level(candidate: MarketSnapshot, account_equity: float, economic_policy: dict | None = None) -> tuple[dict, bool]:
     quality_by_risk_level: dict = {}
     viable_any = False
     direction = candidate.trade_direction.upper()
@@ -130,6 +158,7 @@ def _quality_by_risk_level(candidate: MarketSnapshot, account_equity: float) -> 
                 plan,
                 account_equity,
                 max_capital_fraction=PRODUCTION_MAX_CAPITAL_FRACTION,
+                **(economic_policy or {}),
                 direction="SHORT",
                 leverage=SHORT_VALIDATION_LEVERAGE,
                 estimated_margin_cost_pct=SHORT_MARGIN_COST_RESERVE_PCT,
@@ -141,6 +170,7 @@ def _quality_by_risk_level(candidate: MarketSnapshot, account_equity: float) -> 
                 plan,
                 account_equity,
                 max_capital_fraction=PRODUCTION_MAX_CAPITAL_FRACTION,
+                **(economic_policy or {}),
             )
         viable = target.qualified and economic.qualified
         viable_any = viable_any or viable
@@ -502,6 +532,7 @@ def review_candidates(
     account_equity: float | None = None,
     market_regime_context: object | None = None,
     coingecko_global_context: object | None = None,
+    economic_policy: dict | None = None,
 ) -> dict:
     stage_evidence = _new_stage_evidence()
     stage_evidence["model"] = model
@@ -521,7 +552,11 @@ def review_candidates(
     for candidate in unique_candidates:
         quality_by_risk_level = None
         if account_equity is not None:
-            quality_by_risk_level, viable = _quality_by_risk_level(candidate, account_equity)
+            quality_by_risk_level, viable = (
+                _quality_by_risk_level(candidate, account_equity, economic_policy)
+                if economic_policy is not None
+                else _quality_by_risk_level(candidate, account_equity)
+            )
             if not viable:
                 prefilter_evaluated_at = datetime.now(
                     timezone.utc
@@ -541,19 +576,29 @@ def review_candidates(
 
         direction = candidate.trade_direction.upper()
         card = score_short_snapshot(candidate) if direction == "SHORT" else score_snapshot(candidate)
+        scoring_version = getattr(candidate, "technical_score_version", "v1")
+        v2_components = (
+            getattr(candidate, "v2_long_components", None)
+            if direction == "LONG"
+            else getattr(candidate, "v2_short_components", None)
+        ) if scoring_version == "v2" else None
         candidate_context = {
             "symbol": candidate.symbol,
             "direction": direction,
             "technical_score": candidate.technical_score,
+            "technical_score_version": scoring_version,
+            "v2_technical_components": v2_components,
+            "v2_policy_sha256": getattr(candidate, "v2_profile_digest", None),
+            "v1_shadow_score": card.score if scoring_version == "v2" else None,
             "price": candidate.last_price,
             "trend": candidate.trend,
             "rsi": round(candidate.rsi, 2),
             "macd_histogram": round(candidate.macd_histogram, 6),
             "atr_pct": round(candidate.atr_pct, 3),
             "volume_ratio": round(candidate.volume_ratio, 2),
-            "strengths": card.strengths,
-            "warnings": card.warnings,
-            "weaknesses": card.weaknesses,
+            "strengths": card.strengths if scoring_version == "v1" else [],
+            "warnings": card.warnings if scoring_version == "v1" else ["V1 scorecard is shadow evidence; V2 components are authoritative"],
+            "weaknesses": card.weaknesses if scoring_version == "v1" else [],
             "margin_evidence": {
                 "eligible": candidate.margin_eligible,
                 "status": candidate.margin_validation_status,
@@ -787,6 +832,8 @@ def review_candidates(
         review = json.loads(routed.output_text)
         if not isinstance(review, dict):
             raise ValueError("Chief response JSON was not an object")
+        # AI upside is descriptive and must never alter deterministic gates.
+        _normalize_chief_potential(review)
         review["opip_ai_route"] = routed.route_evidence()
         _attach_ai_route_context(
             chief_eligible_candidates,

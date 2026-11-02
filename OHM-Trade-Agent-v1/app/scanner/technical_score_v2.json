@@ -1,0 +1,29 @@
+{
+  "version": "TECHNICAL_SCORE_V2_1",
+  "mode": "shadow",
+  "threshold": 75,
+  "weights": {
+    "higher_timeframe_adx": 20,
+    "ema_stack_extension": 20,
+    "relative_volume": 20,
+    "rsi": 15,
+    "macd_acceleration": 10,
+    "volatility_percentile": 15
+  },
+  "parameters": {
+    "adx_min": 20,
+    "rvol_zero": 1,
+    "rvol_full": 2,
+    "clv_confirmation": 0.6,
+    "rsi_lower_zero": 42,
+    "rsi_lower_full": 50,
+    "rsi_upper_full": 65,
+    "rsi_upper_zero": 72,
+    "extension_full_atr": 2,
+    "extension_zero_atr": 3,
+    "atr_rank_low_zero": 10,
+    "atr_rank_low_full": 25,
+    "atr_rank_high_full": 80,
+    "atr_rank_high_zero": 95
+  }
+}

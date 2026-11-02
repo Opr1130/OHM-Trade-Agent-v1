@@ -86,6 +86,9 @@ from app.services.trade_action_gate import apply_action_gate
 from app.services.trade_feature_snapshot import build_trade_feature_snapshot
 from app.services.trade_quality_assessor import assess_trade_quality
 from app.services.trade_quality_evidence_registry import record_trade_quality_evidence
+from app.services.technical_scoring_comparison import (
+    build_scoring_comparison, record_comparison_fail_soft,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -96,7 +99,7 @@ logger = logging.getLogger(__name__)
 select_candidates = select_directional_candidates
 
 
-def _broad_screening_callback(*, rows, observed_at, scan_id, universe_count):
+def _broad_screening_callback(*, rows, observed_at, scan_id, universe_count, min_score: int = 80):
     """Build the fail-soft, evidence-only Broad Search callback."""
     def capture(snapshot, long_score, short_score, advanced_direction) -> None:
         raw = str(
@@ -112,6 +115,7 @@ def _broad_screening_callback(*, rows, observed_at, scan_id, universe_count):
                 observed_at=observed_at,
                 scan_id=scan_id,
                 universe_count=universe_count,
+                min_score=min_score,
                 canonicalize_asset=canonicalize_asset,
                 split_canonical_pair=split_canonical_pair,
             )
@@ -186,6 +190,8 @@ def _select_production_candidates(
     observed_at,
     scan_id: str,
     universe_count: int,
+    scoring_version: str = "v1",
+    min_score: int = 80,
 ):
     """Invoke the production selector exactly once.
 
@@ -200,6 +206,7 @@ def _select_production_candidates(
                 observed_at=observed_at,
                 scan_id=scan_id,
                 universe_count=universe_count,
+                min_score=min_score,
             )
             parameters = inspect.signature(select_candidates).parameters
             if "on_evaluated" in parameters:
@@ -213,6 +220,12 @@ def _select_production_candidates(
                 type(exc).__name__,
             )
             kwargs = {}
+    if scoring_version == "v2":
+        parameters = inspect.signature(select_candidates).parameters
+        if "scoring_version" not in parameters or "min_score" not in parameters:
+            raise ValueError("V2_SELECTOR_NOT_SUPPORTED")
+        kwargs["scoring_version"] = "v2"
+        kwargs["min_score"] = min_score
     return select_candidates(snapshots, **kwargs)
 
 
@@ -225,6 +238,7 @@ def _persist_broad_screening_fail_open(
     scan_id,
     universe_count,
     telemetry_enabled: bool,
+    min_score: int = 80,
 ) -> None:
     """Finalise rank/threshold evidence and persist. Never raises."""
     try:
@@ -233,6 +247,7 @@ def _persist_broad_screening_fail_open(
             selected=selected,
             observed_at=observed_at,
             universe_count=universe_count,
+            min_score=min_score,
             canonicalize_asset=canonicalize_asset,
             split_canonical_pair=split_canonical_pair,
         )
@@ -1150,12 +1165,13 @@ def _target_quality(plan, snapshot):
     return evaluate_target_attainability(plan, snapshot)
 
 
-def _economic_quality(plan, snapshot, account_equity):
+def _economic_quality(plan, snapshot, account_equity, advisory_policy: dict | None = None):
     if snapshot.trade_direction == "SHORT":
         return evaluate_economic_quality(
             plan,
             available_capital=account_equity,
             max_capital_fraction=PRODUCTION_MAX_CAPITAL_FRACTION,
+            **(advisory_policy or {}),
             direction="SHORT",
             leverage=SHORT_VALIDATION_LEVERAGE,
             estimated_margin_cost_pct=SHORT_MARGIN_COST_RESERVE_PCT,
@@ -1165,6 +1181,7 @@ def _economic_quality(plan, snapshot, account_equity):
         plan,
         available_capital=account_equity,
         max_capital_fraction=PRODUCTION_MAX_CAPITAL_FRACTION,
+        **(advisory_policy or {}),
     )
 
 
@@ -1373,6 +1390,40 @@ def main(scan_override=None):
     )
     screening_rows: list[dict] = []
     screening_scan_id = _screening_scan_id(opip)
+    advisory_policy = None
+    if bool(getattr(settings, "opip_advisory_profile_enabled", False)):
+        from app.core.strategy_policy import load_active_strategy_policy
+        active_strategy = load_active_strategy_policy()
+        economics = active_strategy.advisory_economics
+        advisory_policy = {
+            "min_net_profit": economics["min_net_profit_usd"],
+            "min_target_2_move_pct": economics["min_target_2_move_pct"],
+            "min_reward_to_risk": economics["min_reward_to_risk"],
+            "estimated_round_trip_cost_pct": economics["estimated_round_trip_cost_pct"],
+        }
+    scoring_version = getattr(settings, "opip_production_scoring_version", "v1")
+    if scoring_version not in {"v1", "v2"}:
+        raise ValueError("INVALID_PRODUCTION_SCORING_VERSION")
+    scoring_threshold = 80
+    if scoring_version == "v2":
+        from app.scanner.technical_score_v2 import load_v2_config
+        from app.core.strategy_policy import load_strategy_policy
+
+        policy = (
+            active_strategy
+            if advisory_policy is not None
+            else load_strategy_policy()
+        )
+        scoring_threshold = int(policy.scoring["v2_threshold"])
+        # Isolated workers can have a cached profile. Never apply a new
+        # admission threshold to candidates scored under a previous profile.
+        for item in scan.snapshots:
+            if getattr(item, "v2_feature_status", None) == "READY":
+                if getattr(item, "v2_profile_digest", None) != policy.digest:
+                    raise ValueError("V2_SCORING_POLICY_DIGEST_MISMATCH")
+                if (not isinstance(getattr(item, "v2_long_components", None), dict)
+                        or not isinstance(getattr(item, "v2_short_components", None), dict)):
+                    raise ValueError("V2_SCORING_COMPONENT_EVIDENCE_MISSING")
     candidates = _select_production_candidates(
         scan.snapshots,
         telemetry_enabled=bool(opip.telemetry_enabled),
@@ -1380,7 +1431,21 @@ def main(scan_override=None):
         observed_at=decision_at,
         scan_id=screening_scan_id,
         universe_count=len(scan.snapshots),
+        **({"scoring_version": scoring_version, "min_score": scoring_threshold} if scoring_version == "v2" else {}),
     )
+    # Observational comparison only. No paths below ever consume the result.
+    if bool(getattr(settings, "opip_score_v2_evaluation_enabled", False)) or scoring_version == "v2":
+        try:
+            record_comparison_fail_soft(build_scoring_comparison(
+                scan.snapshots,
+                candidates,
+                scan_id=screening_scan_id,
+                observed_at=decision_at,
+                production_version=scoring_version,
+                v2_threshold=scoring_threshold if scoring_version == "v2" else 75,
+            ))
+        except Exception as exc:
+            logger.warning("V2 score comparison unavailable: %s", type(exc).__name__)
     try:
         scan_compute_context = compute.finish(
             scan=scan,
@@ -1398,6 +1463,7 @@ def main(scan_override=None):
             scan_id=screening_scan_id,
             universe_count=len(scan.snapshots),
             telemetry_enabled=True,
+            **({"min_score": scoring_threshold} if scoring_version == "v2" else {}),
         )
 
     # Wave 8.2 TradingView Intelligence Bridge: augmentation only. This can
@@ -1516,6 +1582,7 @@ def main(scan_override=None):
         qualifying_long_alternatives(
             scan.snapshots,
             excluded_assets=existing_assets,
+            **({"scoring_version": "v2", "min_score": scoring_threshold} if scoring_version == "v2" else {}),
         )
         if margin_opened_slots > 0
         else []
@@ -1746,6 +1813,7 @@ def main(scan_override=None):
         settings.account_equity,
         market_regime_context=intelligence.chief_market_regime_context,
         coingecko_global_context=coingecko_global,
+        **({"economic_policy": advisory_policy} if advisory_policy is not None else {}),
     )
     opip.record_ai_stage(review)
     alerts = qualified_alerts(review)
@@ -1972,7 +2040,10 @@ def main(scan_override=None):
             f"T2 move={target_quality.target_2_move_pct:.2f}%"
         )
 
-        economic = _economic_quality(plan, snapshot, settings.account_equity)
+        economic = _economic_quality(
+            plan, snapshot, settings.account_equity,
+            **({"advisory_policy": advisory_policy} if advisory_policy is not None else {}),
+        )
         opip.record_economic_quality(snapshot, economic)
         if not economic.qualified:
             economic_rejected += 1

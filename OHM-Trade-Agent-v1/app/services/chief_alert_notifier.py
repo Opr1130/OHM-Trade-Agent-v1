@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import Any
+import math
 
 from app.services.asset_display_identity import display_asset_text, display_market_label
 from app.services.entry_exit_advisor import EntryExitPlan
@@ -310,6 +311,21 @@ def format_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan, summary: s
             f"({float(candidate.get('calibration_multiplier') or 1.0):.2f}x sizing only)\n"
         )
 
+    potential_note = ""
+    potential = candidate.get("potential_move_pct")
+    horizon = candidate.get("potential_timeframe_hours")
+    if (type(potential) in (int, float) and type(horizon) in (int, float)
+            and math.isfinite(potential) and math.isfinite(horizon)
+            and 0 < potential <= 30 and 1 <= horizon <= 168):
+        label = "downside" if direction == "SHORT" else "upside"
+        potential_note = (
+            f"Conditional AI {label}: {float(potential):.2f}% over "
+            f"~{int(horizon)}h (scenario, not a trade target or guarantee)\n"
+        )
+        rationale = str(candidate.get("potential_rationale") or "").replace("\n", " ").strip()[:200]
+        if rationale:
+            potential_note += f"AI scenario basis: {rationale}\n"
+
     movement_note = ""
     movement = candidate.get("price_movement")
     if isinstance(movement, dict) and movement.get("actionable") is True:
@@ -363,7 +379,7 @@ def format_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan, summary: s
         f"Asset: {asset_text}\n"
         f"Market: {market_label}\n"
         f"Direction: {direction}\n"
-        f"{quote_note}{margin_note}{ranking_note}{intelligence_note}{movement_note}{fill_tracking_note}"
+        f"{quote_note}{margin_note}{ranking_note}{intelligence_note}{potential_note}{movement_note}{fill_tracking_note}"
         f"Risk: {plan.risk_level.upper()}\n"
         f"Setup Score: {int(candidate.get('confidence', 0))}/100 (not probability)\n"
         f"Technical Decision: {str(candidate.get('decision', '')).upper()}\n\n"
