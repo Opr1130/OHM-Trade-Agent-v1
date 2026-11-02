@@ -96,3 +96,77 @@ test('configuration preview includes deleted fields, and stale draft save never 
  await expect(page.getByText('Draft staged without runtime activation.',{exact:false})).toHaveCount(0);
  await expect(json).toHaveCount(0);
 });
+
+test('protected advisory stage, activation and rollback enforce request contracts',async({page})=>{
+ const initial='a'.repeat(64), staged='b'.repeat(64), stale='c'.repeat(64);
+ const original={scoring:{v2_threshold:75},advisory_economics:{},ai_advisory:{enabled:false},protection:{}};
+ let draftDigest=initial,activeDigest=initial,draftDocument=original,activeDocument=original;
+ const writes=[];
+ await page.route('**/api/**',async route=>{
+  const req=route.request(),path=new URL(req.url()).pathname,method=req.method(),headers=req.headers();
+  if(headers['x-webhook-secret']!=='viewer-test'||headers['x-strategy-admin-secret']!=='admin-test')
+   return route.fulfill({status:403,json:{detail:'Protected credentials required'}});
+  if(path==='/api/opip/strategy-admin/draft'&&method==='GET')
+   return route.fulfill({json:{status:'REFERENCE_ONLY',digest:draftDigest,document:draftDocument}});
+  if(path==='/api/opip/strategy-admin/active'&&method==='GET')
+   return route.fulfill({json:{status:'ACTIVE',digest:activeDigest,document:activeDocument}});
+  const body=req.postDataJSON();
+  writes.push({path,method,headers,body});
+  if(path==='/api/opip/strategy-admin/draft'&&method==='PUT'){
+   if(headers['x-expected-profile-sha256']!==draftDigest)
+    return route.fulfill({status:409,json:{detail:'Stale draft digest'}});
+   draftDocument=body;draftDigest=staged;
+   return route.fulfill({json:{status:'DRAFT_SAVED',digest:staged}});
+  }
+  if(path==='/api/opip/strategy-admin/activate'&&method==='POST'){
+   if(body.expected_digest!==draftDigest||body.acknowledgment!=='ACTIVATE_ADVISORY_ONLY')
+    return route.fulfill({status:409,json:{detail:'Activation rejected'}});
+   activeDigest=draftDigest;activeDocument=draftDocument;
+   return route.fulfill({json:{status:'ADVISORY_ACTIVATED'}});
+  }
+  if(path==='/api/opip/strategy-admin/rollback'&&method==='POST'){
+   if(body.expected_digest!==activeDigest||body.acknowledgment!=='ROLLBACK_ADVISORY_ONLY')
+    return route.fulfill({status:409,json:{detail:'Rollback rejected'}});
+   activeDigest=initial;activeDocument=original;
+   return route.fulfill({json:{status:'ADVISORY_ROLLED_BACK'}});
+  }
+  return route.fulfill({status:404,json:{detail:'Unavailable'}});
+ });
+ await page.goto('/dashboard/v2/');
+ await page.getByPlaceholder('X-Webhook-Secret (session memory only)').fill('viewer-test');
+ await page.getByRole('button',{name:'Config Admin'}).click();
+ await page.getByPlaceholder('Admin credential (memory only)').fill('admin-test');
+ await page.getByRole('button',{name:'Load Active & Draft'}).click();
+ await expect(page.getByRole('status')).toContainText('Loaded server-side advisory configuration.');
+ const editor=page.getByRole('textbox',{name:'Strategy JSON draft'});
+ const changed=JSON.parse(await editor.inputValue());
+ changed.scoring.v2_threshold=76;
+ await editor.fill(JSON.stringify(changed));
+ await page.getByPlaceholder('Why are you changing this?').fill('Acceptance test');
+ draftDigest=stale;
+ await page.getByRole('button',{name:'Stage draft'}).click();
+ await expect(page.getByRole('status')).toContainText('HTTP 409');
+ draftDigest=initial;
+ await page.getByRole('button',{name:'Stage draft'}).click();
+ await expect(page.getByRole('status')).toContainText('Draft staged without runtime activation.');
+ const ack=page.getByPlaceholder('ACTIVATE_ADVISORY_ONLY');
+ await ack.fill('ACTIVATE_ADVISORY_ONLY');
+ await expect(page.getByRole('button',{name:'Authorize advisory profile'})).toBeEnabled();
+ await page.getByLabel('Re-enter admin credential').fill('admin-test');
+ await page.getByRole('button',{name:'Authorize advisory profile'}).click();
+ await expect(page.getByText(staged,{exact:true})).toBeVisible();
+ await page.getByLabel('Re-enter admin credential').fill('admin-test');
+ await ack.fill('ROLLBACK_ADVISORY_ONLY');
+ await page.getByRole('button',{name:'Roll back advisory profile'}).click();
+ await expect(page.getByText(initial,{exact:true})).toBeVisible();
+ expect(writes.map(w=>w.method)).toEqual(['PUT','PUT','POST','POST']);
+ for(const w of writes){
+  expect(w.headers['x-webhook-secret']).toBe('viewer-test');
+  expect(w.headers['x-strategy-admin-secret']).toBe('admin-test');
+ }
+ expect(writes[0].headers['x-expected-profile-sha256']).toBe(initial);
+ expect(writes[1].headers['x-expected-profile-sha256']).toBe(initial);
+ expect(writes[1].body.scoring.v2_threshold).toBe(76);
+ expect(writes[2].body).toEqual({expected_digest:staged,acknowledgment:'ACTIVATE_ADVISORY_ONLY'});
+ expect(writes[3].body).toEqual({expected_digest:staged,acknowledgment:'ROLLBACK_ADVISORY_ONLY'});
+});
