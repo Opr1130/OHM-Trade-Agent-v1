@@ -138,7 +138,6 @@ AC-010 -> tests/test_platform_foundation_v1.py::test_production_memory_budget_is
 AC-010 -> tests/test_platform_foundation_v1.py::test_deploy_resource_verifier_matches_core_compose_memory_limits
 AC-010 -> tests/test_platform_foundation_v1.py::test_isolated_scanner_preserves_credential_boundary_with_placeholder
 AC-011 -> tests/test_platform_foundation_v1.py::test_v2_scoring_release_pins_core_and_isolated_worker_with_v1_observation_only
-AC-011 -> tests/test_v2_production_selection_contract.py::test_comparison_relabels_authority_correctly_on_v2_cutover
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/core/config.py
