@@ -1,7 +1,7 @@
 import React,{useEffect,useRef,useState} from 'react';
 import{createRoot}from'react-dom/client';
 import{Activity,ArrowDownToLine,BarChart3,BrainCircuit,ChartNoAxesCombined,Check,ChevronRight,CircleAlert,ClipboardList,Database,GitCompareArrows,LockKeyhole,RefreshCw,RotateCcw,Search,Settings2,ShieldCheck,SlidersHorizontal}from'lucide-react';
-import{apiRequest,modelAuthority,evidenceStatus,objectSummary,exportCsv,sanitizeJsonExport}from'./api.mjs';
+import{apiRequest,modelAuthority,evidenceStatus,objectSummary,exportCsv,sanitizeJsonExport,statusLevel}from'./api.mjs';
 import './style.css';
 const NAV=[
  ['Overview',Activity],['V1 / V2 Evidence',GitCompareArrows],['Qualification',SlidersHorizontal],
@@ -17,7 +17,7 @@ function download(text,filename,type){
  const blob=new Blob([text],{type});const url=URL.createObjectURL(blob);
  const a=document.createElement('a');a.href=url;a.download=filename;a.click();URL.revokeObjectURL(url);
 }
-function Status({value}){const level=/PASS|HEALTHY|RECORDED|SUCCESS|READY|ACTIVE/i.test(value)?'good':/UNVERIFIED|UNAVAILABLE|ERROR|BLOCKED|STALE|NO_EVIDENCE|UNKNOWN/i.test(value)?'bad':'neutral';return <span className={'status '+level}>{value}</span>}
+function Status({value}){return <span className={'status '+statusLevel(value)}>{value}</span>}
 function Formatted({value}){return <span>{value===null||value===undefined?'Not verified':typeof value==='object'?JSON.stringify(value):String(value)}</span>}
 function Pairs({data}){const rows=objectSummary(data);return rows.length?<div className="pairs">{rows.map(row=><div className="pair" key={row.key}><span>{row.key}</span><strong>{row.value}</strong></div>)}</div>:<p className="muted">No verified summary fields available</p>}
 function Inspection({object}){return <pre className="json">{JSON.stringify(object,null,2)}</pre>}
