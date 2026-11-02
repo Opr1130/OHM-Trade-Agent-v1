@@ -3,6 +3,9 @@ import sqlite3
 import subprocess
 import sys
 
+import pytest
+import yaml
+
 
 ROOT = Path(__file__).resolve().parents[1]
 BACKUP = ROOT / "tools" / "opip_platform_backup.py"
@@ -114,12 +117,14 @@ def test_core_compose_has_bounded_logs_process_limits_and_healthcheck():
     assert "no-new-privileges:true" in text
 
 
+@pytest.mark.acceptance
 def test_production_memory_budget_is_bounded_for_2gb_host():
+    """ATDD-OPIP-CONFIGURABLE-SCORING-v1/AC-010: approved 640 MB core cap is bounded."""
     core = COMPOSE.read_text(encoding="utf-8")
     paper = PAPER_COMPOSE.read_text(encoding="utf-8")
 
-    assert "mem_limit: 384m" in core
-    assert "memswap_limit: 384m" in core
+    assert "mem_limit: 640m" in core
+    assert "memswap_limit: 640m" in core
     assert "mem_limit: 192m" in core
     assert "memswap_limit: 192m" in core
     assert "mem_limit: 64m" in core
@@ -131,6 +136,25 @@ def test_production_memory_budget_is_bounded_for_2gb_host():
     assert paper.count('cpus: "0.20"') == 2
     assert paper.count("oom_score_adj: 500") == 2
     assert "./data/freqtrade/user_data_usdt:/freqtrade/user_data" in paper
+
+
+@pytest.mark.acceptance
+def test_isolated_scanner_preserves_credential_boundary_with_placeholder():
+    """ATDD-OPIP-CONFIGURABLE-SCORING-v1/AC-010: worker placeholder never inherits owner secrets."""
+    services = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))["services"]
+    worker = services["opip-scan-worker"]
+    assert worker["profiles"] == ["scanner"]
+    assert worker["read_only"] is True
+    assert worker["mem_limit"] == "224m"
+    assert "env_file" not in worker
+    env = worker["environment"]
+    assert env["OPIP_SCAN_EXECUTION_MODE"] == "isolated"
+    assert env["WEBHOOK_SECRET"] == "unused-acquisition-worker-only"
+    assert not set(env) & {
+        "KRAKEN_API_KEY", "KRAKEN_API_SECRET", "KRAKEN_PRIVATE_KEY",
+        "LIVE_TRADING_KEY", "TELEGRAM_BOT_TOKEN", "OPENAI_API_KEY",
+        "DEEPSEEK_API_KEY", "STRATEGY_ADMIN_SECRET",
+    }
 
 
 def test_platform_backup_excludes_sqlite_transient_sidecars(tmp_path):

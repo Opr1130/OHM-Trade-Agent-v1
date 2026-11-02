@@ -82,6 +82,12 @@ WHEN: V2 component maps and the version digest cross the worker boundary
 THEN: finite bounded V2 components survive intact, malformed values are
 degraded, and production V2 refuses incomplete or cross-version evidence.
 
+AC-010:
+Certified Compose release parity must preserve the owner's bounded core capacity and isolated worker environment without widening trading authority.
+GIVEN: production was operating with a 640 MB core memory/swap cap and a non-credential acquisition-worker webhook placeholder, but its certified source manifest still described a 384 MB core without that placeholder
+WHEN: these exact owner-approved Compose settings are incorporated into the next versioned release
+THEN: the core cap and swap cap are both 640 MB, the acquisition worker retains its 224 MB isolated read-only cgroup and scanner-only profile with no owner env file or funded/provider credentials, and the placeholder is never treated as a trading credential; the production release-tree integrity gate remains intact.
+
 EXPLICITLY OUT OF SCOPE:
 V2 activation in a live deployment without release certification, auto-trading,
 margin/portfolio policy relaxation, multi-tenant settings, code-driven learning,
@@ -115,6 +121,10 @@ AC-008 -> tests/test_strategy_admin_drafts.py::test_activation_refuses_drafts_wi
 AC-008 -> tests/test_strategy_admin_drafts.py::test_unapproved_activation_endpoint_is_disabled
 AC-009 -> tests/test_v2_production_selection_contract.py::test_isolated_worker_round_trip_preserves_v2_scoring_components
 AC-009 -> tests/test_v2_production_selection_contract.py::test_invalid_v2_component_map_is_not_promoted_as_valid_evidence
+
+AC-010 -> tests/test_opip_irr_activation_v1.py::test_worker_has_its_own_bounded_memory_cgroup
+AC-010 -> tests/test_platform_foundation_v1.py::test_production_memory_budget_is_bounded_for_2gb_host
+AC-010 -> tests/test_platform_foundation_v1.py::test_isolated_scanner_preserves_credential_boundary_with_placeholder
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/core/config.py
@@ -175,6 +185,11 @@ AC-009 -> OHM-Trade-Agent-v1/app/scanner/models.py
 AC-009 -> OHM-Trade-Agent-v1/app/scanner/market_scanner.py
 AC-009 -> OHM-Trade-Agent-v1/app/jobs/scan_opportunities.py
 AC-009 -> OHM-Trade-Agent-v1/tests/test_v2_production_selection_contract.py
+
+AC-010 -> OHM-Trade-Agent-v1/docker-compose.yml
+AC-010 -> OHM-Trade-Agent-v1/tests/test_opip_irr_activation_v1.py
+AC-010 -> OHM-Trade-Agent-v1/tests/test_platform_foundation_v1.py
+AC-010 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-CONFIGURABLE-SCORING-v1.md
 
 DEFERRED DISCOVERIES:
 Production V2 cutover is guarded behind a disabled-by-default configuration
