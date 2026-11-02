@@ -242,7 +242,7 @@ validate_target_resource_budget() {
       return 1
     fi
   done <<'LIMITS'
-ohm-trade-agent|402653184|402653184
+ohm-trade-agent|671088640|671088640
 ohm-dashboard-edge|67108864|67108864
 opip-canonical-writer|134217728|134217728
 opip-stream-worker|201326592|201326592
