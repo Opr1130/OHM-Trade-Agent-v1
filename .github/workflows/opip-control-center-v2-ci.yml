@@ -1,0 +1,31 @@
+name: opip-control-center-v2-review
+on:
+  pull_request:
+    paths:
+      - 'OHM-Trade-Agent-v1/control-center-v2/**'
+      - '.github/workflows/opip-control-center-v2-ci.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: OHM-Trade-Agent-v1/control-center-v2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install --no-audit --no-fund
+      - run: npm test
+      - run: npm run build
+      - name: Verify static artifact
+        run: test -s dist/index.html && test -d dist/assets
+      - uses: actions/upload-artifact@v4
+        with:
+          name: opip-v2-review-static
+          path: OHM-Trade-Agent-v1/control-center-v2/dist/
+          retention-days: 7
+# Build-only, no deployments, secrets, SSH, or authority changes.
