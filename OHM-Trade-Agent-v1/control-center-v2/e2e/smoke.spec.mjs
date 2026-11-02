@@ -52,3 +52,47 @@ test('late response from previous viewer credential never repopulates the consol
  await expect(page.getByText('SCAN:old-secret')).toHaveCount(0);
  await expect(page.getByText('AWAITING EVIDENCE')).toBeVisible();
 });
+
+test('configuration preview includes deleted fields, and stale draft save never repopulates a new credential session',async({page})=>{
+ const hash='a'.repeat(64);
+ let resolveSave;
+ const saveStarted=new Promise(resolve=>resolveSave=resolve);
+ await page.route('**/api/**',async route=>{
+  const request=route.request();
+  const name=new URL(request.url()).pathname;
+  if(name==='/api/opip/strategy-admin/draft' && request.method()==='PUT'){
+   resolveSave();
+   await new Promise(resolve=>setTimeout(resolve,550));
+   await route.fulfill({json:{status:'DRAFT_SAVED',digest:'b'.repeat(64)}}).catch(()=>{});
+   return;
+  }
+  if(name==='/api/opip/strategy-admin/draft' || name==='/api/opip/strategy-admin/active'){
+   const document={scoring:{v2_threshold:75},ai_advisory:{enabled:false},advisory_economics:{},protection:{}};
+   await route.fulfill({json:{status:'REFERENCE_ONLY',digest:hash,document}});
+   return;
+  }
+  await route.fulfill({status:404,json:{detail:'Unavailable'}});
+ });
+ await page.goto('/dashboard/v2/');
+ const viewer=page.getByPlaceholder('X-Webhook-Secret (session memory only)');
+ await viewer.fill('first-viewer');
+ await page.getByRole('button',{name:'Config Admin'}).click();
+ await page.getByPlaceholder('Admin credential (memory only)').fill('first-admin');
+ await page.getByRole('button',{name:'Load Active & Draft'}).click();
+ await expect(page.getByText('Loaded server-side advisory configuration.')).toBeVisible();
+ const json=page.getByRole('textbox',{name:'Strategy JSON draft'});
+ const edited=JSON.parse(await json.inputValue());
+ delete edited.ai_advisory;
+ edited.scoring.v2_threshold=77;
+ await json.fill(JSON.stringify(edited,null,2));
+ await page.getByRole('button',{name:'Preview changes'}).click();
+ await expect(page.getByText('ai_advisory',{exact:true})).toBeVisible();
+ await expect(page.getByText('scoring.v2_threshold',{exact:true})).toBeVisible();
+ await page.getByPlaceholder('Why are you changing this?').fill('review test');
+ await page.getByRole('button',{name:'Stage draft'}).click();
+ await saveStarted;
+ await viewer.fill('second-viewer');
+ await page.waitForTimeout(800);
+ await expect(page.getByText('Draft staged without runtime activation.',{exact:false})).toHaveCount(0);
+ await expect(json).toHaveCount(0);
+});
