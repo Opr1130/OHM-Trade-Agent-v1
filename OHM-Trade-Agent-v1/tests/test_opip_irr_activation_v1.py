@@ -96,12 +96,16 @@ def auth_lib_text() -> str:
 
 
 def test_worker_has_its_own_bounded_memory_cgroup(compose, worker):
-    """ATDD-IRR-ACTIVATION-INFRA-v1/AC-001: own 96 MB cgroup, not the core's."""
+    """ATDD-IRR-ACTIVATION-INFRA-v1/AC-001: own 96 MB cgroup, not the core's.
+
+    ATDD-OPIP-CONFIGURABLE-SCORING-v1/AC-010: core cap matches the approved 640 MB release.
+    """
     core = compose["services"][CORE]
     assert worker["mem_limit"] == "96m"
     assert worker["memswap_limit"] == "96m"
     assert worker["mem_limit"] != core["mem_limit"]
-    assert core["mem_limit"] == "384m"
+    assert core["mem_limit"] == "640m"
+    assert core["memswap_limit"] == "640m"
     assert worker["restart"] == "no"
     assert worker["profiles"] == ["irr-shadow"]
     assert worker["read_only"] is True
