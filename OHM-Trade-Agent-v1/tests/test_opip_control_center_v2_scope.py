@@ -50,7 +50,15 @@ def test_networked_build_only_ci():
     assert "npm run test:e2e" in workflow
     assert "actions/upload-artifact" in workflow
     assert "contents: read" in workflow
-    assert "deploy" not in workflow.lower().replace("no deployments", "")
+    # Source paths legitimately contain the word deploy (e.g. Nginx overlay).
+    # Reject executable deployment authority rather than that substring.
+    lower_workflow = workflow.lower()
+    for forbidden in (
+        "docker push", "docker compose up", "kubectl apply", "scp ",
+        "rsync ", "ssh ", "doctl ", "secrets.", "id-token: write",
+        "contents: write", "environment: production",
+    ):
+        assert forbidden not in lower_workflow
     assert "playwright" in pkg and "lockfileVersion" in lock
     assert "localStorage.length" in smoke
 
