@@ -1,5 +1,6 @@
 from pathlib import Path
 import sqlite3
+import re
 import subprocess
 import sys
 
@@ -136,6 +137,26 @@ def test_production_memory_budget_is_bounded_for_2gb_host():
     assert paper.count('cpus: "0.20"') == 2
     assert paper.count("oom_score_adj: 500") == 2
     assert "./data/freqtrade/user_data_usdt:/freqtrade/user_data" in paper
+
+
+@pytest.mark.acceptance
+def test_deploy_resource_verifier_matches_core_compose_memory_limits():
+    """ATDD-OPIP-CONFIGURABLE-SCORING-v1/AC-010: reject Compose/verifier drift."""
+    services = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))["services"]
+    core = services["ohm-trade-agent"]
+    controller = (ROOT / "deploy" / "remote" / "ohm-deploy").read_text(
+        encoding="utf-8"
+    )
+    assert core["mem_limit"] == "640m"
+    assert core["memswap_limit"] == "640m"
+
+    def mib_to_bytes(value: str) -> str:
+        assert value.endswith("m")
+        return str(int(value[:-1]) * 1024 * 1024)
+
+    assert re.findall(
+        r"(?m)^ohm-trade-agent\\|(\\d+)\\|(\\d+)$", controller
+    ) == [(mib_to_bytes(core["mem_limit"]), mib_to_bytes(core["memswap_limit"]))]
 
 
 @pytest.mark.acceptance
