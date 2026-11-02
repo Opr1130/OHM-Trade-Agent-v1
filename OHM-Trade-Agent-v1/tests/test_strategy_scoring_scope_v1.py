@@ -48,5 +48,7 @@ def test_active_increment_scope_contract_resolves():
     """ATDD-OPIP-CONFIGURABLE-SCORING-v1/AC-004: owner-approved scope is mapped."""
     root = Path(__file__).resolve().parents[1] / "docs" / "atdd"
     active = (root / "ACTIVE_INCREMENT").read_text(encoding="utf-8").strip()
-    assert active == "ATDD-OPIP-CONFIGURABLE-SCORING-v1"
+    # Historical scoring approval remains present when a later approved
+    # dashboard increment becomes the active changed-file scope.
+    assert (root / "scope-contracts" / "ATDD-OPIP-CONFIGURABLE-SCORING-v1.md").is_file()
     assert (root / "scope-contracts" / (active + ".md")).is_file()
