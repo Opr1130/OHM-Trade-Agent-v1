@@ -152,8 +152,8 @@ services:
       - ./data/freqtrade/state:/app/freqtrade_paper:ro
     # The deterministic core was small after the evidence jobs were moved out
     # of this cgroup. Bound it so a future leak cannot consume the whole 2 GB host.
-    mem_limit: 384m
-    memswap_limit: 384m
+    mem_limit: 640m
+    memswap_limit: 640m
     cpus: "0.45"
     oom_score_adj: 100
     pids_limit: 256
@@ -293,6 +293,7 @@ services:
     environment:
       PYTHONDONTWRITEBYTECODE: "1"
       OPIP_SCAN_EXECUTION_MODE: "isolated"
+      WEBHOOK_SECRET: "unused-acquisition-worker-only"
     command:
       - python
       - -m
