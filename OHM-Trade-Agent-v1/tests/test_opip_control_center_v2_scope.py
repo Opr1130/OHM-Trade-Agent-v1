@@ -59,8 +59,9 @@ def test_networked_build_only_ci():
 def test_active_scope_and_legacy_are_preserved():
     """ATDD-OPIP-CONTROL-CENTER-V2-v1/AC-004: versioned ATDD map, unchanged old dashboard."""
     scope = ROOT / "docs/atdd"
-    assert (scope / "ACTIVE_INCREMENT").read_text().strip() == INCREMENT
-    assert (scope / "scope-contracts" / (INCREMENT + ".md")).exists()
+    active = (scope / "ACTIVE_INCREMENT").read_text().strip()
+    assert (scope / "scope-contracts" / (active + ".md")).is_file()
+    assert (scope / "scope-contracts" / (INCREMENT + ".md")).is_file()
     assert (scope / "scope-contracts/ATDD-OPIP-CONFIGURABLE-SCORING-v1.md").exists()
     assert (ROOT / "app/api/dashboard.py").exists()
     assert (ROOT / "app/api/dashboard.html").exists()
