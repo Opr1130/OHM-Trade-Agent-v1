@@ -1,4 +1,12 @@
 const REQUEST_LIMIT_MS=12000;
+// Only explicitly verified positive states receive a positive visual treatment.
+// Substring matching would misclassify INACTIVE, UNHEALTHY and NOT_READY.
+export function statusLevel(value) {
+  const status=String(value??'').trim().toUpperCase().replace(/[^A-Z0-9]+/g,'_');
+  if (new Set(['UNVERIFIED','UNAVAILABLE','ERROR','BLOCKED','STALE','NO_EVIDENCE','UNKNOWN','FAILED','FAILURE','UNHEALTHY','INACTIVE','NOT_READY','NOT_ACTIVE','NOT_ATTESTED','DEGRADED','DISABLED']).has(status)) return 'bad';
+  if (new Set(['PASS','HEALTHY','RECORDED','SUCCESS','READY','ACTIVE','ACTIVE_VERIFIED']).has(status)) return 'good';
+  return 'neutral';
+}
 export function modelAuthority(row) {
   if (!row || typeof row !== 'object') return 'UNKNOWN';
   const authority=String(row.model_authority||'');
