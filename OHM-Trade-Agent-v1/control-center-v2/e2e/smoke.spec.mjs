@@ -31,3 +31,24 @@ test('dashboard shows real evidence classification and protects admin flow',asyn
  const persisted=await page.evaluate(()=>({local:localStorage.length,session:sessionStorage.length}));
  expect(persisted).toEqual({local:0,session:0});
 });
+
+test('late response from previous viewer credential never repopulates the console',async({page})=>{
+ await page.route('**/api/**',async route=>{
+  await new Promise(resolve=>setTimeout(resolve,450));
+  const path=new URL(route.request().url()).pathname;
+  const data=path==='/api/opip/scoring-comparison'
+    ?{status:'RECORDED',rows:[{scan_id:'SCAN:old-secret',model_authority:'V2_PRODUCTION_V1_OBSERVATION'}]}
+    :{status:'RECORDED',source:'old-secret'};
+  await route.fulfill({json:data}).catch(()=>{});
+ });
+ await page.goto('/dashboard/v2/');
+ const viewer=page.getByPlaceholder('X-Webhook-Secret (session memory only)');
+ await viewer.fill('old-secret');
+ const outgoing=page.waitForRequest(req=>req.url().includes('/api/analytics/summary'));
+ await page.getByRole('button',{name:'Refresh'}).click();
+ await outgoing;
+ await viewer.fill('new-secret');
+ await page.waitForTimeout(850);
+ await expect(page.getByText('SCAN:old-secret')).toHaveCount(0);
+ await expect(page.getByText('AWAITING EVIDENCE')).toBeVisible();
+});
