@@ -158,6 +158,7 @@ AC-007 -> OHM-Trade-Agent-v1/app/jobs/scan_opportunities.py
 AC-007 -> OHM-Trade-Agent-v1/app/services/chief_analyst.py
 AC-007 -> OHM-Trade-Agent-v1/app/services/chief_alert_notifier.py
 AC-007 -> OHM-Trade-Agent-v1/tests/test_advisory_policy_v2.py
+AC-007 -> OHM-Trade-Agent-v1/tests/test_opip_irr_shadow_v1.py
 
 AC-008 -> OHM-Trade-Agent-v1/app/api/dashboard.py
 AC-008 -> OHM-Trade-Agent-v1/app/api/strategy_admin.html
