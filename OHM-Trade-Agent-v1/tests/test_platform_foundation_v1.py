@@ -155,7 +155,7 @@ def test_deploy_resource_verifier_matches_core_compose_memory_limits():
         return str(int(value[:-1]) * 1024 * 1024)
 
     assert re.findall(
-        r"(?m)^ohm-trade-agent\\|(\\d+)\\|(\\d+)$", controller
+        r"(?m)^ohm-trade-agent\|(\d+)\|(\d+)$", controller
     ) == [(mib_to_bytes(core["mem_limit"]), mib_to_bytes(core["memswap_limit"]))]
 
 
