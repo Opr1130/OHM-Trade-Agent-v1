@@ -1,4 +1,4 @@
-import React,{useEffect,useState} from 'react';
+import React,{useEffect,useRef,useState} from 'react';
 import{createRoot}from'react-dom/client';
 import{Activity,ArrowDownToLine,BarChart3,BrainCircuit,ChartNoAxesCombined,Check,ChevronRight,CircleAlert,ClipboardList,Database,GitCompareArrows,LockKeyhole,RefreshCw,RotateCcw,Search,Settings2,ShieldCheck,SlidersHorizontal}from'lucide-react';
 import{apiRequest,modelAuthority,evidenceStatus,objectSummary,exportCsv,sanitizeJsonExport}from'./api.mjs';
@@ -39,14 +39,16 @@ function ConfigAdmin({secret}){
  const[message,setMessage]=useState('');
  const[busy,setBusy]=useState(false);
  const[diff,setDiff]=useState([]);
+ const authGeneration=useRef(0);
  const baseHeaders={secret,adminSecret};
- useEffect(()=>{setDraft(null);setActive(null);setDocument('');setMessage('');setDiff([])},[secret,adminSecret]);
- async function load(){setBusy(true);setMessage('');try{
+ useEffect(()=>{authGeneration.current+=1;setDraft(null);setActive(null);setDocument('');setMessage('');setDiff([]);setBusy(false)},[secret,adminSecret]);
+ async function load(){const generation=++authGeneration.current;setBusy(true);setMessage('');try{
   const [d,a]=await Promise.all([
    apiRequest('/api/opip/strategy-admin/draft',baseHeaders),
    apiRequest('/api/opip/strategy-admin/active',baseHeaders)
-  ]);setDraft(d);setActive(a);setDocument(JSON.stringify(d.document,null,2));setMessage('Loaded server-side advisory configuration.');setDiff([]);
- }catch(e){setMessage(e.message)}finally{setBusy(false)}}
+  ]);if(generation!==authGeneration.current)return;
+  setDraft(d);setActive(a);setDocument(JSON.stringify(d.document,null,2));setMessage('Loaded server-side advisory configuration.');setDiff([]);
+ }catch(e){if(generation===authGeneration.current)setMessage(e.message)}finally{if(generation===authGeneration.current)setBusy(false)}}
  function changes(next){
   if(!draft?.document)return[];
   const old=draft.document,results=[];
@@ -97,9 +99,12 @@ function App(){
  const[busy,setBusy]=useState(false);
  const[selected,setSelected]=useState(null);
  const[search,setSearch]=useState('');
- useEffect(()=>{setRecords({});setErrors({});setLoadedAt('');setSelected(null)},[secret]);
- async function refresh(){if(!secret.trim())return;setBusy(true);const endpoints={...READS,summary:'/api/analytics/summary?scope='+scope,intelligence:'/api/analytics/intelligence?scope='+scope};
-  const results=await Promise.allSettled(Object.entries(endpoints).map(async([key,path])=>[key,await apiRequest(path,{secret})]));
+ const requestGeneration=useRef(0);
+ useEffect(()=>{requestGeneration.current+=1;setRecords({});setErrors({});setLoadedAt('');setSelected(null);setBusy(false)},[secret,scope]);
+ async function refresh(){if(!secret.trim())return;const generation=++requestGeneration.current;setBusy(true);const endpoints={...READS,summary:'/api/analytics/summary?scope='+scope,intelligence:'/api/analytics/intelligence?scope='+scope};
+  const requestedSecret=secret;
+  const results=await Promise.allSettled(Object.entries(endpoints).map(async([key,path])=>[key,await apiRequest(path,{secret:requestedSecret})]));
+  if(generation!==requestGeneration.current)return;
   const got={},errs={};results.forEach((result,i)=>{const key=Object.keys(endpoints)[i];if(result.status==='fulfilled')got[key]=result.value[1];else errs[key]=String(result.reason?.message||'Unavailable')});
   setRecords(got);setErrors(errs);setLoadedAt(new Date().toISOString());setBusy(false)}
  const comparisonStatus=evidenceStatus(records.comparisons);
