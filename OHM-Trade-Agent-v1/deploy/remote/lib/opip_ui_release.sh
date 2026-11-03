@@ -135,19 +135,27 @@ opip_ui_compose_legacy() {
 # ROUTING on the loopback interface, not public trust. The real certificate mount
 # is proven separately by `nginx -t`, and this release changes no TLS directive.
 opip_ui_dashboard_code() {
-  local path="$1" method="${2:-GET}"
-  curl --silent --show-error --output /dev/null \
+  # The probe MUST bypass inherited HTTPS_PROXY/ALL_PROXY. --resolve affects
+  # DNS, not proxy routing; without --noproxy a host proxy can return curl 000
+  # even while its local dashboard answers 200 (observed 2026-11-03).
+  # Normalize curl failures to a SINGLE 000, never the misleading 000000.
+  local path="$1" method="${2:-GET}" code
+  code="$(curl --silent --show-error --output /dev/null \
     --write-out '%{http_code}' \
+    --noproxy '*' \
     --max-time "$opip_ui_http_timeout" \
     --insecure \
     --resolve "${opip_ui_tls_host}:8443:127.0.0.1" \
     --request "$method" \
-    "https://${opip_ui_tls_host}:8443${path}" 2>/dev/null || printf '000'
+    "https://${opip_ui_tls_host}:8443${path}" 2>/dev/null)" || true
+  [[ "$code" =~ ^[0-9]{3}$ ]] || code="000"
+  printf '%s' "$code"
 }
 
 opip_ui_dashboard_body() {
   local path="$1"
   curl --silent --show-error \
+    --noproxy '*' \
     --max-time "$opip_ui_http_timeout" \
     --insecure \
     --resolve "${opip_ui_tls_host}:8443:127.0.0.1" \
@@ -155,17 +163,18 @@ opip_ui_dashboard_body() {
 }
 
 opip_ui_webhook_code() {
-  # GET only, always. A synthetic POST would be a side effect on a live webhook
-  # endpoint, so this probe never sends one; a method-restricted route answered
-  # with 403/404 still proves the listener, the SNI server and the route.
-  local path="$1"
-  curl --silent --show-error --output /dev/null \
+  # GET only; independent 443 listener, with no ambient proxy influence.
+  local path="$1" code
+  code="$(curl --silent --show-error --output /dev/null \
     --write-out '%{http_code}' \
+    --noproxy '*' \
     --max-time "$opip_ui_http_timeout" \
     --insecure \
     --resolve "${opip_ui_tls_host}:443:127.0.0.1" \
     --request GET \
-    "https://${opip_ui_tls_host}:443${path}" 2>/dev/null || printf '000'
+    "https://${opip_ui_tls_host}:443${path}" 2>/dev/null)" || true
+  [[ "$code" =~ ^[0-9]{3}$ ]] || code="000"
+  printf '%s' "$code"
 }
 
 # --- digest of a release tree -------------------------------------------------
@@ -583,9 +592,12 @@ opip_ui_capture_ingress_baseline() {
 # --- post-cutover verification -----------------------------------------------
 
 opip_ui_wait_edge() {
+  # Read-only listener proof independent of either dashboard page. The bare
+  # root is intentionally a 404 on the legacy edge; any HTTP status proves TLS
+  # and Nginx reached us. V2 content and 443 routing have separate hard gates.
   local tries=0 code
   while (( tries < opip_ui_wait_tries )); do
-    code="$(opip_ui_dashboard_code /dashboard)"
+    code="$(opip_ui_dashboard_code /)"
     if [[ "$code" != "000" ]]; then
       return 0
     fi
@@ -605,16 +617,21 @@ opip_ui_first_asset() {
 }
 
 opip_ui_check_legacy_dashboard() {
-  # Reused by cutover verification and by rollback verification, so it reports
-  # only the blockers IT finds instead of the global accumulator.
-  local baseline="$opip_ui_failures" code body
+  # Owner policy (2026-11-03): legacy cockpit is observational only. A broken
+  # legacy marker or redirect may be reported, but MUST NOT roll back a healthy
+  # V2 release. Listener, V2 bundle, API security, 443 and image identity are
+  # independently mandatory checks.
+  local code body redirect
   code="$(opip_ui_dashboard_code /dashboard)"
   body="$(opip_ui_dashboard_body /dashboard)"
-  [[ "$code" == "200" ]] || opip_ui_fail "LEGACY_DASHBOARD_STATUS:${code}"
-  grep -Fq 'Intelligence Cockpit' <<<"$body" || opip_ui_fail "LEGACY_DASHBOARD_BODY_UNRECOGNIZED"
-  # The legacy entry point keeps its redirect contract.
-  [[ "$(opip_ui_dashboard_code /dashboard/)" == "308" ]] || opip_ui_fail "LEGACY_DASHBOARD_REDIRECT_CHANGED"
-  [[ "$opip_ui_failures" == "$baseline" ]]
+  redirect="$(opip_ui_dashboard_code /dashboard/)"
+  if [[ "$code" == "200" && "$redirect" == "308" ]] &&
+     grep -Fq 'Intelligence Cockpit' <<<"$body"; then
+    opip_ui_say "OPIP_UI_LEGACY_DASHBOARD=AVAILABLE"
+  else
+    opip_ui_say "OPIP_UI_LEGACY_DASHBOARD=ADVISORY_ONLY status=${code} redirect=${redirect}"
+  fi
+  return 0
 }
 
 opip_ui_check_v2_bundle() {
@@ -634,27 +651,37 @@ opip_ui_check_v2_bundle() {
 }
 
 opip_ui_check_api_auth() {
-  # Unauthenticated access must be refused, never served. A 200 here would mean
-  # an exposure; a 404/5xx would mean the allowlist no longer reaches the
-  # backend. Method denial is enforced by the edge itself.
-  local path method code delete_code
-  while read -r method path; do
-    [[ -n "$method" ]] || continue
-    code="$(opip_ui_dashboard_code "$path" "$method")"
+  # Mandatory unauthenticated refusal on always-on viewer endpoints.
+  # Disabled strategy admin intentionally returns FastAPI JSON 404, not 401:
+  # this is an owner-controlled off-by-policy posture, not a missing route.
+  # Validate its exact refusal text to distinguish it from an Nginx 404.
+  # Do NOT send malformed PUT/POST activation probes: FastAPI returns 422
+  # before dependency auth when the required body is absent, which is NOT
+  # evidence of a security regression; those methods have side effects with
+  # valid payloads and are covered by static/ATDD contract tests.
+  local path code body delete_code
+  for path in /api/opip/zero-trade-explanation /api/opip/scoring-comparison; do
+    code="$(opip_ui_dashboard_code "$path" GET)"
     case "$code" in
       401|403) ;;
-      *) opip_ui_fail "API_AUTH_UNEXPECTED:${method}:${path}:${code}" ;;
+      *) opip_ui_fail "API_AUTH_UNEXPECTED:GET:${path}:${code}" ;;
     esac
-  done <<'ROUTES'
-GET /api/opip/zero-trade-explanation
-GET /api/opip/scoring-comparison
-GET /api/opip/strategy-admin/draft
-PUT /api/opip/strategy-admin/draft
-GET /api/opip/strategy-admin/active
-POST /api/opip/strategy-admin/activate
-POST /api/opip/strategy-admin/rollback
-ROUTES
-  # A method outside the allowlist is denied by Nginx before it can reach the app.
+  done
+
+  for path in /api/opip/strategy-admin/draft /api/opip/strategy-admin/active; do
+    code="$(opip_ui_dashboard_code "$path" GET)"
+    case "$code" in
+      401|403) ;;
+      404)
+        body="$(opip_ui_dashboard_body "$path")"
+        if ! grep -Fq 'Strategy administration unavailable' <<<"$body"; then
+          opip_ui_fail "API_ADMIN_404_UNPROVEN:${path}"
+        fi
+        ;;
+      *) opip_ui_fail "API_ADMIN_AUTH_UNEXPECTED:GET:${path}:${code}" ;;
+    esac
+  done
+  # Nginx must reject a forbidden method even on a known allowed GET route.
   delete_code="$(opip_ui_dashboard_code /api/opip/scoring-comparison DELETE)"
   [[ "$delete_code" == "403" ]] || opip_ui_fail "API_METHOD_NOT_DENIED:DELETE:${delete_code}"
   opip_ui_ok
