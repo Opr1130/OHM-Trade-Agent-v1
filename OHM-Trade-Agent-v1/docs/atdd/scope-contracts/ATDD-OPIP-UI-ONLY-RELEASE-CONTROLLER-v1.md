@@ -56,11 +56,11 @@ THEN:
 
 AC-006:
 GIVEN:
-a production host whose deployed release predates the controller, gateway and library corrections, so `deploy-ui` is neither forwarded nor loadable
+a release-tree production host whose deployed release predates the bootstrap, controller, gateway and library corrections, has no live Git checkout, has an existing trusted bare cache, and retains the prior controller backup as a regular file; `deploy-ui` is neither forwarded nor loadable
 WHEN:
-the owner runs the one-time first-use bootstrap as root against a committed SHA that equals current `origin/main`
+the owner first extracts the new bootstrap from the trusted bare cache at the exact merged `origin/main` SHA and runs that one-time bootstrap as root
 THEN:
-the bootstrap materializes all four components from that exact commit, validates each before installing, installs them atomically with a bounded backup of the previous set, verifies bytes/mode/ownership/behaviour afterwards, leaves the forced-command wiring and every service, scheduler, credential and data path untouched, reports SUCCESS or NOT_NEEDED with an auditable receipt, restores the previous set (or reports an unproven restore) on any failure, and refuses a missing asset, a non-main SHA or a key wired to a different gateway.
+the bootstrap materializes all four components from that exact commit, validates each before installing, installs them atomically with a bounded backup of the previous set, verifies bytes/mode/ownership/behaviour afterwards, leaves the forced-command wiring and every service, scheduler, credential and data path untouched, reports SUCCESS or NOT_NEEDED with an auditable receipt, restores the previous set (or reports an unproven restore) on any failure, preserves the old controller backup path, requires the trusted bare cache without a checkout `.git`, and refuses a missing asset, a non-main SHA or a key wired to a different gateway.
 
 AC-007:
 GIVEN:
@@ -116,6 +116,8 @@ AC-004 -> tests/test_opip_ui_only_release_controller_v1.py::test_rollback_refuse
 AC-005 -> tests/test_opip_ui_only_release_controller_v1.py::test_successful_cutover_recreates_only_the_edge_and_records_a_receipt
 AC-005 -> tests/test_opip_ui_only_release_controller_v1.py::test_legacy_surface_isolation_and_receipts_are_preserved
 AC-006 -> tests/test_opip_ui_release_controller_bootstrap_v1.py::test_ac_006_bootstrap_installs_the_complete_controller_set
+AC-006 -> tests/test_opip_ui_release_controller_bootstrap_v1.py::test_ac_006_old_release_tree_without_git_and_existing_backup_file_works
+AC-006 -> tests/test_opip_ui_release_controller_bootstrap_v1.py::test_ac_006_bootstrap_refuses_missing_bare_cache
 AC-006 -> tests/test_opip_ui_release_controller_bootstrap_v1.py::test_ac_006_ui_release_is_unreachable_from_the_old_gateway
 AC-006 -> tests/test_opip_ui_release_controller_bootstrap_v1.py::test_ac_006_bootstrap_makes_ui_release_reachable_and_keeps_the_allowlist
 AC-006 -> tests/test_opip_ui_release_controller_bootstrap_v1.py::test_ac_006_missing_component_refuses_without_partial_install
@@ -173,7 +175,7 @@ AC-010 -> OHM-Trade-Agent-v1/deploy/remote/lib/opip_ui_release.sh
 AC-010 -> OHM-Trade-Agent-v1/tests/test_opip_ui_only_release_controller_v1.py
 
 DEFERRED DISCOVERIES:
-- The host runs the pre-merge controller set, so one owner console action (bootstrap-ui-release-controller.sh --apply --sha <merged SHA>) installs all four components before the first `/deploy-ui`; that step performs no deployment and no container mutation.
+- The host runs the pre-merge controller set, so one owner console procedure obtains the missing bootstrap script from the verified merged SHA in the existing bare Git cache and invokes bootstrap-ui-release-controller.sh --apply --sha <merged SHA>; this installs all four components before the first `/deploy-ui`; that step performs no deployment and no container mutation.
 - Public reachability of 8443/443 from an operator workstation is unproven (observation limitation, not an outage); the controller verifies over loopback with SNI, and public certificate trust is unchanged by this release.
 - Live F10 parity, canonical reconciliation and resource measurements remain unverified and are not claimed.
 - The 443 Tradevisor vhost is dark on the host whenever no rendered verification value is provisioned; the controller records that as a baseline and fails only on a CHANGE, so a pre-existing dark vhost is reported rather than certified as healthy ingress.
