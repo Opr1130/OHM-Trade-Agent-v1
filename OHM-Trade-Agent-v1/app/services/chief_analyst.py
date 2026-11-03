@@ -2,6 +2,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 
@@ -27,6 +28,7 @@ from app.services.economic_quality_gate import (
     MIN_REWARD_TO_RISK,
     MIN_TARGET_2_MOVE_PCT,
     PRODUCTION_MAX_CAPITAL_FRACTION,
+    advisory_economic_policy,
     evaluate_economic_quality,
 )
 from app.services.entry_exit_advisor import build_entry_exit_plan
@@ -143,6 +145,15 @@ def _max_output_tokens() -> int:
 
 
 def _quality_by_risk_level(candidate: MarketSnapshot, account_equity: float, economic_policy: dict | None = None) -> tuple[dict, bool]:
+    """The pre-AI deterministic screen that decides whether the AI is consulted.
+
+    This is an advisory screen, so when no explicit policy is supplied it uses the
+    bounded advisory policy - zero fixed dollar/move/reward-risk floors - rather
+    than the execution-compatible defaults. A fixed floor must not reappear here
+    after the scanner already admitted the candidate on positive economic
+    potential.
+    """
+    effective_policy = advisory_economic_policy(economic_policy)
     quality_by_risk_level: dict = {}
     viable_any = False
     direction = candidate.trade_direction.upper()
@@ -158,7 +169,7 @@ def _quality_by_risk_level(candidate: MarketSnapshot, account_equity: float, eco
                 plan,
                 account_equity,
                 max_capital_fraction=PRODUCTION_MAX_CAPITAL_FRACTION,
-                **(economic_policy or {}),
+                **effective_policy,
                 direction="SHORT",
                 leverage=SHORT_VALIDATION_LEVERAGE,
                 estimated_margin_cost_pct=SHORT_MARGIN_COST_RESERVE_PCT,
@@ -170,7 +181,7 @@ def _quality_by_risk_level(candidate: MarketSnapshot, account_equity: float, eco
                 plan,
                 account_equity,
                 max_capital_fraction=PRODUCTION_MAX_CAPITAL_FRACTION,
-                **(economic_policy or {}),
+                **effective_policy,
             )
         viable = target.qualified and economic.qualified
         viable_any = viable_any or viable
@@ -238,6 +249,29 @@ def _new_stage_evidence() -> dict:
     }
 
 
+_REJECTION_THRESHOLD = re.compile(
+    r"(?:below minimum|exceeds maximum)\s*\$?(-?\d+(?:\.\d+)?)"
+)
+
+
+def _rejection_threshold(rejection: str, fallback: float) -> float:
+    """Quote the threshold the recorded rejection message actually names.
+
+    The named policy constants are the execution-compatible defaults, but the
+    advisory screen runs with its own (zero) bounds. Reading the number out of
+    the recorded message keeps nearest-miss telemetry honest for every profile
+    instead of reporting a $75 floor that was never applied. The constant is only
+    a fallback for a message this build cannot parse.
+    """
+    match = _REJECTION_THRESHOLD.search(rejection)
+    if match is not None:
+        try:
+            return float(match.group(1))
+        except ValueError:
+            pass
+    return float(fallback)
+
+
 def _economic_binding_constraint(level: dict) -> dict:
     """Return the numeric policy constraint that actually rejected one plan.
 
@@ -249,19 +283,19 @@ def _economic_binding_constraint(level: dict) -> dict:
     if rejection.startswith("Reward/risk "):
         metric = "ECONOMIC_REWARD_TO_RISK"
         measured = level.get("economic_reward_to_risk_2")
-        threshold = float(MIN_REWARD_TO_RISK)
+        threshold = _rejection_threshold(rejection, MIN_REWARD_TO_RISK)
         higher_is_better = True
     elif rejection.startswith("Projected Target 2 move "):
         metric = "ECONOMIC_TARGET_2_MOVE_PCT"
         measured = level.get("economic_target_2_move_pct")
-        threshold = float(MIN_TARGET_2_MOVE_PCT)
+        threshold = _rejection_threshold(rejection, MIN_TARGET_2_MOVE_PCT)
         higher_is_better = True
     elif rejection.startswith("Projected net profit $"):
         metric = "ECONOMIC_NET_PROFIT_AT_TARGET_2"
         measured = level.get(
             "hypothetical_target_2_net_profit_at_assumed_capital"
         )
-        threshold = float(MIN_NET_PROFIT)
+        threshold = _rejection_threshold(rejection, MIN_NET_PROFIT)
         higher_is_better = True
     elif rejection.startswith("stop exposure "):
         metric = "ECONOMIC_ACCOUNT_RISK_AT_STOP_PCT"

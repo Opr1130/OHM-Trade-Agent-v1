@@ -17,6 +17,58 @@ MIN_NET_PROFIT = 75.0
 MIN_REWARD_TO_RISK = 2.5
 ESTIMATED_ROUND_TRIP_COST_PCT = 0.60
 
+# --- advisory screen policy ---------------------------------------------------
+# The constants above are the EXECUTION-compatible defaults: they still govern
+# whether a candidate may be traded, and they are unchanged.
+#
+# Advisory opportunity discovery is a different question. It asks "is there
+# positive economic potential worth telling the operator about?", not "may we
+# enter?". The owner rejected fixed dollar-profit, percentage-move and
+# reward/risk rejection floors for that screen, so its defaults are zero and its
+# one definition lives here so a fixed floor cannot reappear through a second
+# helper, the Chief review or a selection path.
+ADVISORY_ECONOMIC_KEYS = (
+    "min_net_profit",
+    "min_target_2_move_pct",
+    "min_reward_to_risk",
+)
+ADVISORY_OPTIONAL_KEYS = ("estimated_round_trip_cost_pct",)
+ADVISORY_DEFAULT_MIN_NET_PROFIT = 0.0
+ADVISORY_DEFAULT_MIN_TARGET_2_MOVE_PCT = 0.0
+ADVISORY_DEFAULT_MIN_REWARD_TO_RISK = 0.0
+
+
+def advisory_economic_policy(
+    overrides: dict | None = None,
+) -> dict[str, float]:
+    """Return the bounded advisory-screen policy.
+
+    ``overrides`` are the owner's explicitly configured advisory filters (the
+    versioned ``advisory_economics`` profile). Only bounded, non-negative knobs
+    are accepted; an unknown or invalid key raises rather than being ignored, so
+    a typo cannot silently disable an owner-configured filter.
+    """
+    policy = {
+        "min_net_profit": ADVISORY_DEFAULT_MIN_NET_PROFIT,
+        "min_target_2_move_pct": ADVISORY_DEFAULT_MIN_TARGET_2_MOVE_PCT,
+        "min_reward_to_risk": ADVISORY_DEFAULT_MIN_REWARD_TO_RISK,
+    }
+    if not overrides:
+        return policy
+    allowed = set(ADVISORY_ECONOMIC_KEYS) | set(ADVISORY_OPTIONAL_KEYS)
+    unknown = sorted(set(overrides) - allowed)
+    if unknown:
+        raise ValueError(f"Unsupported advisory economic key(s): {unknown}")
+    for key, value in overrides.items():
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid advisory economic value for {key}") from exc
+        if not math.isfinite(numeric) or numeric < 0:
+            raise ValueError(f"Invalid advisory economic bound for {key}")
+        policy[key] = numeric
+    return policy
+
 
 @dataclass
 class EconomicGateResult:

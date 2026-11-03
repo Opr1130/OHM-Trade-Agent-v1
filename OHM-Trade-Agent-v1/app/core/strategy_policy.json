@@ -12,8 +12,8 @@
   },
   "advisory_economics": {
     "min_net_profit_usd": 0,
-    "min_target_2_move_pct": 4,
-    "min_reward_to_risk": 2.5,
+    "min_target_2_move_pct": 0,
+    "min_reward_to_risk": 0,
     "estimated_round_trip_cost_pct": 0.6
   },
   "ai_advisory": {
