@@ -50,12 +50,13 @@ TARGET_SHA=""
 TEST_SEAMS="${OPIP_UI_BOOTSTRAP_TEST_SEAMS:-0}"
 PRODUCTION_MODE="1"
 
-REPO_ROOT="/opt/OHM-Trade-Agent-v1"
+SOURCE_CACHE="/srv/opip-v2/cache/repo.git"
+EXPECTED_REMOTE="https://github.com/Opr1130/OHM-Trade-Agent-v1.git"
 STATE_DIR="/var/lib/ohm-deploy"
 SBIN_DIR="/usr/local/sbin"
 LIB_DIR="/usr/local/lib/opip"
 LOCK_FILE="/var/lock/ohm-deploy.lock"
-BACKUP_DIR_NAME="controller-bootstrap-previous"
+BACKUP_DIR_NAME="ui-controller-bootstrap-previous"
 RECEIPT_FILE_NAME="ui-controller-bootstrap-receipt.env"
 GATEWAY_WIRING_FILE="/home/ohmdeploy/.ssh/authorized_keys"
 GATEWAY_WIRING_EXPECTED='command="/usr/local/sbin/ohm-deploy-ssh"'
@@ -63,7 +64,7 @@ GATEWAY_WIRING_EXPECTED='command="/usr/local/sbin/ohm-deploy-ssh"'
 if [[ "$TEST_SEAMS" == "1" ]]; then
   PRODUCTION_MODE="0"
   [[ "${OPIP_UI_BOOTSTRAP_PRODUCTION_MODE:-0}" == "1" ]] && PRODUCTION_MODE="1"
-  [[ -n "${OPIP_UI_BOOTSTRAP_REPO_ROOT:-}" ]] && REPO_ROOT="$OPIP_UI_BOOTSTRAP_REPO_ROOT"
+  [[ -n "${OPIP_UI_BOOTSTRAP_SOURCE_CACHE:-}" ]] && SOURCE_CACHE="$OPIP_UI_BOOTSTRAP_SOURCE_CACHE"
   [[ -n "${OPIP_UI_BOOTSTRAP_STATE_DIR:-}" ]] && STATE_DIR="$OPIP_UI_BOOTSTRAP_STATE_DIR"
   [[ -n "${OPIP_UI_BOOTSTRAP_SBIN_DIR:-}" ]] && SBIN_DIR="$OPIP_UI_BOOTSTRAP_SBIN_DIR"
   [[ -n "${OPIP_UI_BOOTSTRAP_LIB_DIR:-}" ]] && LIB_DIR="$OPIP_UI_BOOTSTRAP_LIB_DIR"
@@ -71,7 +72,6 @@ if [[ "$TEST_SEAMS" == "1" ]]; then
   [[ -n "${OPIP_UI_BOOTSTRAP_LOCK_FILE:-}" ]] && LOCK_FILE="$OPIP_UI_BOOTSTRAP_LOCK_FILE"
 fi
 
-APP_ROOT="$REPO_ROOT/OHM-Trade-Agent-v1"
 BACKUP_DIR="$STATE_DIR/$BACKUP_DIR_NAME"
 RECEIPT_FILE="$STATE_DIR/$RECEIPT_FILE_NAME"
 
@@ -280,7 +280,7 @@ fi
 
 # --- 3. required tools (deliberately excludes docker/systemctl/cron) -------
 REQUIRED_TOOLS=(git flock mktemp sha256sum awk cmp stat chmod mv cp mkdir rm
-  dirname grep date id bash install)
+  dirname grep date id bash install cat)
 if [[ "$TEST_SEAMS" != "1" ]]; then
   REQUIRED_TOOLS+=(sudo chown)
 fi
@@ -323,30 +323,40 @@ if [[ "${#ACTIVE_TRANSACTIONS[@]}" -gt 0 ]]; then
   exit 76
 fi
 
-# --- 6. repository owner + git identity ------------------------------------
-if [[ ! -d "$REPO_ROOT/.git" ]]; then
-  echo "repository not found at $REPO_ROOT" >&2
+# --- 6. trusted release-tree object cache (no live checkout .git required) --
+# The host is a manifest-installed release tree, not necessarily a Git
+# worktree. The existing controller uses this bare cache for source provenance.
+if [[ ! -d "$SOURCE_CACHE/objects" || ! -f "$SOURCE_CACHE/HEAD" ]]; then
+  echo "trusted release object cache missing: $SOURCE_CACHE" >&2
   exit 69
 fi
-REPO_OWNER="$(stat -c '%U' "$REPO_ROOT/.git")"
-if [[ "$TEST_SEAMS" == "1" ]]; then
-  GIT=(git -C "$REPO_ROOT")
-else
-  GIT=(sudo -u "$REPO_OWNER" git -C "$REPO_ROOT")
+GIT=(git --git-dir="$SOURCE_CACHE")
+REMOTE_URL="$("${GIT[@]}" remote get-url origin 2>/dev/null || true)"
+if [[ "$PRODUCTION_MODE" == "1" && "$REMOTE_URL" != "$EXPECTED_REMOTE" ]]; then
+  echo "untrusted origin remote: expected $EXPECTED_REMOTE" >&2
+  exit 69
 fi
+[[ -n "$REMOTE_URL" ]] || {
+  echo "trusted cache has no origin remote" >&2
+  exit 69
+}
 
 TMP_DIR="$(mktemp -d)"
 umask 077
 trap '[[ -n "$TMP_DIR" && -d "$TMP_DIR" ]] && rm -rf -- "$TMP_DIR"' EXIT
 
-# --- 7. fetch and resolve origin/main -------------------------------------
-"${GIT[@]}" fetch --prune origin main >/dev/null 2>&1 || {
-  echo "cannot fetch origin/main from the trusted checkout" >&2
+# --- 7. fetch and resolve the exact current origin/main ---------------------
+"${GIT[@]}" fetch --prune --no-tags origin main >/dev/null 2>&1 || {
+  echo "cannot fetch origin/main into the trusted release cache" >&2
   exit 69
 }
-REMOTE_MAIN_SHA="$("${GIT[@]}" rev-parse origin/main)"
+REMOTE_MAIN_SHA="$("${GIT[@]}" ls-remote origin refs/heads/main | awk 'NR==1 { print $1 }')"
 [[ "$REMOTE_MAIN_SHA" =~ ^[0-9a-f]{40}$ ]] || {
   echo "cannot resolve origin/main" >&2
+  exit 69
+}
+"${GIT[@]}" cat-file -e "${REMOTE_MAIN_SHA}^{commit}" || {
+  echo "origin/main commit not present in the verified cache" >&2
   exit 69
 }
 [[ -n "$TARGET_SHA" ]] || TARGET_SHA="$REMOTE_MAIN_SHA"
@@ -356,7 +366,17 @@ if [[ "$TARGET_SHA" != "$REMOTE_MAIN_SHA" ]]; then
   echo "OPIP_UI_BOOTSTRAP_REMOTE_MAIN=$REMOTE_MAIN_SHA" >&2
   die 65 FAILED "target SHA does not match origin/main"
 fi
-LIVE_HEAD_BEFORE="$("${GIT[@]}" rev-parse HEAD)"
+# The bootstrap has no reason to mutate the currently active core release.
+# Monitor its canonical installed-release record rather than assuming a
+# nonexistent live .git worktree.
+live_record_digest() {
+  if [[ -f "$STATE_DIR/current-release.env" ]]; then
+    sha256sum "$STATE_DIR/current-release.env" | awk '{print $1}'
+  else
+    printf 'ABSENT\\n'
+  fi
+}
+LIVE_RECORD_BEFORE="$(live_record_digest)"
 
 # --- 8. forced-command wiring is verified, never rewritten ----------------
 GATEWAY_WIRING_STATE="UNVERIFIED"
@@ -368,6 +388,10 @@ if [[ -f "$GATEWAY_WIRING_FILE" ]]; then
     echo "the deploy key is not wired to $GATEWAY_WIRING_EXPECTED" >&2
     echo "an extended gateway installed there would not be reachable; refusing" >&2
     die 71 FAILED "forced-command wiring does not target the stable gateway path"
+  fi
+else
+  if [[ "$PRODUCTION_MODE" == "1" ]]; then
+    die 71 FAILED "forced-command wiring file is missing"
   fi
 fi
 
@@ -433,9 +457,9 @@ for index in "${!COMPONENT_NAME[@]}"; do
 done
 
 if [[ "$installed" -eq 1 ]]; then
-  LIVE_HEAD_AFTER="$("${GIT[@]}" rev-parse HEAD)"
-  [[ "$LIVE_HEAD_AFTER" == "$LIVE_HEAD_BEFORE" ]] \
-    || die 72 FAILED "live repository HEAD changed before NOT_NEEDED completion"
+  LIVE_RECORD_AFTER="$(live_record_digest)"
+  [[ "$LIVE_RECORD_AFTER" == "$LIVE_RECORD_BEFORE" ]] \
+    || die 72 FAILED "active release record changed before NOT_NEEDED completion"
   if ! emit_receipt "NOT_NEEDED"; then
     die 71 FAILED "controller receipt ownership could not be proven"
   fi
@@ -470,9 +494,9 @@ for index in "${!COMPONENT_NAME[@]}"; do
 done
 
 # --- 14. atomic installation ---------------------------------------------
-LIVE_HEAD_PRE_INSTALL="$("${GIT[@]}" rev-parse HEAD)"
-[[ "$LIVE_HEAD_PRE_INSTALL" == "$LIVE_HEAD_BEFORE" ]] \
-  || die 72 FAILED "live repository HEAD changed before installation"
+LIVE_RECORD_PRE_INSTALL="$(live_record_digest)"
+[[ "$LIVE_RECORD_PRE_INSTALL" == "$LIVE_RECORD_BEFORE" ]] \
+  || die 72 FAILED "active release record changed before installation"
 
 for index in "${!COMPONENT_NAME[@]}"; do
   if ! atomic_install_component "$index" "$TMP_DIR/${COMPONENT_NAME[$index]}"; then
@@ -482,8 +506,8 @@ for index in "${!COMPONENT_NAME[@]}"; do
 done
 
 # --- 15. post-install verification ---------------------------------------
-LIVE_HEAD_AFTER="$("${GIT[@]}" rev-parse HEAD)"
-if ! verify_targets || [[ "$LIVE_HEAD_AFTER" != "$LIVE_HEAD_BEFORE" ]]; then
+LIVE_RECORD_AFTER="$(live_record_digest)"
+if ! verify_targets || [[ "$LIVE_RECORD_AFTER" != "$LIVE_RECORD_BEFORE" ]]; then
   echo "post-install verification failed; restoring the previous controller set" >&2
   report_restore_result || true
   die 71 FAILED "post-install verification failed"
@@ -504,6 +528,6 @@ for index in "${!COMPONENT_NAME[@]}"; do
   say "OPIP_UI_BOOTSTRAP_INSTALLED_${COMPONENT_NAME[$index]}=${TARGET_SHA256[$index]}"
 done
 say "OPIP_UI_BOOTSTRAP_RECEIPT=$RECEIPT_FILE"
-say "OPIP_UI_BOOTSTRAP_LIVE_HEAD=$LIVE_HEAD_AFTER"
+say "OPIP_UI_BOOTSTRAP_ACTIVE_RECORD_DIGEST=$LIVE_RECORD_AFTER"
 say "next: owner-gated /deploy-ui <merged main SHA> through the existing workflow"
 exit 0
