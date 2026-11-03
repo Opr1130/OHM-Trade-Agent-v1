@@ -339,12 +339,16 @@ def test_ac_025_bootstrap_touches_no_forbidden_control_plane():
 
 
 def test_ac_025_ssh_gateway_remains_exactly_two_commands():
-    """ATDD-RELEASE-PIPELINE-v1/AC-025: the forced-command gateway is unchanged and still permits only deploy <sha> and diagnose-learning."""
+    """ATDD-RELEASE-PIPELINE-v1/AC-025: the forced-command gateway permits only its allowlisted exact-SHA actions and diagnose-learning."""
     gateway = GATEWAY.read_text(encoding="utf-8")
     assert "=~ ^deploy[[:space:]]+([0-9a-f]{40})$" in gateway
+    assert "=~ ^deploy-ui[[:space:]]+([0-9a-f]{40})$" in gateway
+    assert "=~ ^rollback-ui[[:space:]]+([0-9a-f]{40})$" in gateway
     assert '== "diagnose-learning"' in gateway
     assert "refusing command" in gateway
-    assert gateway.count("exec sudo") == 2
+    # Issue #496 (owner-approved) adds exactly two bounded UI actions; the surface
+    # stays an allowlist of exact-SHA forms with no caller execution.
+    assert gateway.count("exec sudo") == 4
     for forbidden in ("eval ", "bash -c", "sh -c", "bootstrap", "controller"):
         assert forbidden not in gateway
     # The bootstrap is never reachable through the gateway.

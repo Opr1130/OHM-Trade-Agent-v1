@@ -18,7 +18,10 @@ def test_side_by_side_route_and_exact_api_allowlist():
     assert "include /etc/nginx/tradevisor/*.conf;" in main
     assert "location = /dashboard/v2 {" in routes
     assert "location ^~ /dashboard/v2/ {" in routes
-    assert "/dashboard/v2/index.html" in routes
+    assert "include /etc/nginx/mime.types;" in routes
+    assert "index index.html;" in routes
+    assert "try_files $uri $uri/ =404;" in routes
+    assert "try_files $uri $uri/ /dashboard/v2/index.html;" not in routes
     assert "Content-Security-Policy" in routes
     assert "X-Frame-Options" in routes
     for route in (
