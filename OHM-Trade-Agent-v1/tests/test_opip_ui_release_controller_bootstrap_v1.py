@@ -36,6 +36,7 @@ COMPONENTS = (
     ("deploy/remote/lib/opip_ui_release.sh", "opip_ui_release.sh", 0o644),
 )
 REPO_PREFIX = "OHM-Trade-Agent-v1/"
+BOOTSTRAP_REL = REPO_PREFIX + "deploy/remote/bootstrap-ui-release-controller.sh"
 
 # The pre-#496 gateway: the two bounded actions the deployed host actually has.
 OLD_GATEWAY = """#!/usr/bin/env bash
@@ -163,6 +164,7 @@ class Sandbox:
                 (ROOT / relative).read_text(encoding="utf-8"),
                 mode,
             )
+        _write(self.repo / BOOTSTRAP_REL, BOOTSTRAP.read_text(encoding="utf-8"))
         if extra is not None:
             _write(self.repo / "README.md", extra)
         _git(["add", "-A"], self.repo)
@@ -499,12 +501,29 @@ def test_ac_006_check_mode_reports_without_changing_anything(sandbox):
     assert not sandbox.state.joinpath("ui-controller-bootstrap-receipt.env").exists()
 
 
-def test_ac_006_old_release_tree_without_git_and_existing_backup_file_works(sandbox):
-    """ATDD-OPIP-UI-ONLY-RELEASE-CONTROLLER-v1/AC-006: genuine host layout."""
+def test_ac_006_old_release_tree_without_git_and_existing_backup_file_works(sandbox, tmp_path):
+    """ATDD-OPIP-UI-ONLY-RELEASE-CONTROLLER-v1/AC-006: exact first-use source retrieval."""
     old_backup = sandbox.state / "controller-bootstrap-previous"
     old_backup.write_bytes(b"legacy-controller-backup-retain-exactly")
+    target = sandbox.origin_main()
+    # The running release predates the new bootstrap: there is NO live script
+    # and NO .git, but the trusted object cache carries the merged commit.
     shutil.rmtree(sandbox.repo / ".git")
-    proc = sandbox.run("--apply", "--sha", _git(["rev-parse", "refs/heads/main"], sandbox.origin).stdout.strip())
+    (sandbox.repo / BOOTSTRAP_REL).unlink()  # live tree predates the script
+    _git(["--git-dir", sandbox.cache.as_posix(), "fetch", "origin", "main"], sandbox.root)
+    staged = tmp_path / "bootstrap-from-merged-commit.sh"
+    script = subprocess.run(
+        [_git_bin() or "git", "--git-dir", sandbox.cache.as_posix(),
+         "show", f"{target}:{BOOTSTRAP_REL}"],
+        capture_output=True, timeout=120, check=True,
+    )
+    _write(staged, script.stdout.decode("utf-8"))
+    assert staged.read_bytes() == BOOTSTRAP.read_bytes()
+    proc = subprocess.run(
+        [_bash() or "bash", str(staged), "--apply", "--sha", target],
+        capture_output=True, text=True, encoding="utf-8",
+        timeout=300, env=sandbox.env(),
+    )
     _skip_on_fork(proc)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert old_backup.read_bytes() == b"legacy-controller-backup-retain-exactly"
