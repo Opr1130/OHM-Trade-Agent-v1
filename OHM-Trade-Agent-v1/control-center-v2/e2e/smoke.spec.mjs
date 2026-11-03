@@ -91,7 +91,9 @@ test('configuration preview includes deleted fields, and stale draft save never 
  await page.getByPlaceholder('Why are you changing this?').fill('review test');
  await page.getByRole('button',{name:'Stage draft'}).click();
  await saveStarted;
+ await expect(json).toBeDisabled();
  await viewer.fill('second-viewer');
+ await expect(page.getByPlaceholder('Admin credential (memory only)')).toHaveValue('');
  await page.waitForTimeout(800);
  await expect(page.getByText('Draft staged without runtime activation.',{exact:false})).toHaveCount(0);
  await expect(json).toHaveCount(0);
