@@ -147,7 +147,10 @@ test('protected advisory stage, activation and rollback enforce request contract
  await page.getByPlaceholder('Why are you changing this?').fill('Acceptance test');
  draftDigest=stale;
  await page.getByRole('button',{name:'Stage draft'}).click();
- await expect(page.getByRole('status')).toContainText('HTTP 409');
+ await expect(page.getByRole('alert')).toContainText('HTTP 409');
+ // A refused operation must never be rendered in the confirmation style.
+ await expect(page.getByRole('alert')).toHaveClass(/error/);
+ await expect(page.locator('.notice')).toHaveCount(0);
  draftDigest=initial;
  await page.getByRole('button',{name:'Stage draft'}).click();
  await expect(page.getByRole('status')).toContainText('Draft staged without runtime activation.');
