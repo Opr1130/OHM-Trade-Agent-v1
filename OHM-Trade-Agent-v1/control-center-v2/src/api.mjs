@@ -43,12 +43,29 @@ export function sanitizeJsonExport(text) {
   if(!data || typeof data!=='object' || Array.isArray(data)) throw new Error('Configuration must be a JSON object');
   return data;
 }
+export function readState(response, error) {
+  // One honest classification for a whole-payload read: a request that failed,
+  // a payload that reports its own read failure, an empty evidence set and a
+  // recorded payload are four DIFFERENT states. The truthiness of the response
+  // object is not one of them, because an empty result is still an object.
+  if (error) return 'UNAVAILABLE';
+  if (!response || typeof response !== 'object') return 'NOT LOADED';
+  const status = String(response.status ?? '').trim().toUpperCase();
+  if (['UNAVAILABLE', 'ERROR', 'FAILED', 'READ_FAILED'].includes(status)) return 'UNAVAILABLE';
+  if (status === 'NO_EVIDENCE') return 'NO_EVIDENCE';
+  if (Array.isArray(response.rows) && !response.rows.length) return 'NO_EVIDENCE';
+  return 'RECORDED';
+}
+// A genuine numeric literal is not a formula. Prefixing it would silently turn
+// -12.5 or +3e4 into text and corrupt the exported value, so numbers are exempt
+// from the spreadsheet formula guard below.
+const NUMERIC_LITERAL = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/u;
 export function csvEscape(value) {
   if(value===null || value===undefined) return '';
   let s=typeof value==='object'?JSON.stringify(value):String(value);
   // Spreadsheet importers can ignore leading whitespace/control characters.
   // Prefix the entire cell before quoting so a later formula is still inert.
-  if (/^[\s\u0000-\u001f\u007f]*[=+@-]/u.test(s) || /^[\t\r\n]/.test(s)) s="'"+s;
+  if (!NUMERIC_LITERAL.test(s) && (/^[\s\u0000-\u001f\u007f]*[=+@-]/u.test(s) || /^[\t\r\n]/.test(s))) s="'"+s;
   return /[",\n\r]/.test(s)?'"'+s.replaceAll('"','""')+'"':s;
 }
 export function exportCsv(rows) {
