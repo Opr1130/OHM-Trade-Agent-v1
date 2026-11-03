@@ -108,6 +108,16 @@ def test_versioned_reference_policy_disables_only_advisory_filters():
 
 
 @pytest.mark.acceptance
+def test_private_editor_supports_disabled_advisory_reward_risk_filter():
+    """ATDD-OPIP-ADVISORY-NO-FIXED-PROFIT-v1/AC-005: zero is editable, protected fields stay protected."""
+    from pathlib import Path
+    editor = (Path(__file__).parents[1] / "app/api/strategy_admin.html").read_text()
+    assert 'id="rr" type="number" min="0"' in editor
+    assert "Protected: model authority, position limits" in editor
+    assert "strategy_admin" not in editor.lower() or "funded execution" in editor.lower()
+
+
+@pytest.mark.acceptance
 def test_invalid_ai_return_potential_cannot_become_trade_claim():
     """ATDD-OPIP-CONFIGURABLE-SCORING-v1/AC-007: AI potential is bounded evidence."""
     review = {"top_candidates": [
