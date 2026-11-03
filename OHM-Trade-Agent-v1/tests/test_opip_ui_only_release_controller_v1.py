@@ -471,7 +471,7 @@ def test_successful_cutover_recreates_only_the_edge_and_records_a_receipt(tmp_pa
 
 @pytest.mark.acceptance
 def test_local_loopback_verification_bypasses_proxy_and_does_not_create_000000(tmp_path):
-    """2026-11-03 production regression: ambient proxy must not mask localhost TLS."""
+    """ATDD-OPIP-UI-ONLY-RELEASE-CONTROLLER-v1/AC-009: bypass ambient proxy in loopback probes."""
     if not _bash_ready():
         pytest.skip("a usable bash is not available in this environment")
     harness = _harness(
@@ -489,7 +489,7 @@ def test_local_loopback_verification_bypasses_proxy_and_does_not_create_000000(t
 
 @pytest.mark.acceptance
 def test_legacy_dashboard_404_is_observational_but_v2_and_443_are_mandatory(tmp_path):
-    """The owner no longer makes the legacy cockpit a release gate."""
+    """ATDD-OPIP-UI-ONLY-RELEASE-CONTROLLER-v1/AC-005: legacy cockpit is advisory-only."""
     if not _bash_ready():
         pytest.skip("a usable bash is not available in this environment")
     harness = _harness(tmp_path, FAKE_LEGACY_STATUS="404", FAKE_LEGACY_REDIRECT="404")
@@ -502,7 +502,7 @@ def test_legacy_dashboard_404_is_observational_but_v2_and_443_are_mandatory(tmp_
 
 @pytest.mark.acceptance
 def test_disabled_strategy_admin_404_is_not_mistaken_for_missing_route(tmp_path):
-    """Disabled admin returns a specific protected FastAPI 404 response."""
+    """ATDD-OPIP-UI-ONLY-RELEASE-CONTROLLER-v1/AC-005: exact disabled-admin 404 is permitted."""
     if not _bash_ready():
         pytest.skip("a usable bash is not available in this environment")
     harness = _harness(tmp_path, FAKE_ADMIN_DISABLED="1")
@@ -513,7 +513,7 @@ def test_disabled_strategy_admin_404_is_not_mistaken_for_missing_route(tmp_path)
 
 @pytest.mark.acceptance
 def test_unknown_admin_404_does_not_prove_authentication(tmp_path):
-    """A generic missing route 404 cannot be certified as authorization."""
+    """ATDD-OPIP-UI-ONLY-RELEASE-CONTROLLER-v1/AC-005: generic 404 cannot prove admin refusal."""
     if not _bash_ready():
         pytest.skip("a usable bash is not available in this environment")
     harness = _harness(
