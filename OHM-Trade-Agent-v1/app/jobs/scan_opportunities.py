@@ -1166,12 +1166,20 @@ def _target_quality(plan, snapshot):
 
 
 def _economic_quality(plan, snapshot, account_equity, advisory_policy: dict | None = None):
+    """Qualify scanner advice without a fixed dollar-profit cutoff.
+
+    This is an advisory opportunity screen, not an execution permission.
+    Require nonnegative projected net P&L after modeled costs by default;
+    callers may select a stricter versioned advisory policy explicitly.
+    The shared execution-compatible economic gate keeps its own $75 default.
+    """
+    effective_policy = {"min_net_profit": 0.0, **(advisory_policy or {})}
     if snapshot.trade_direction == "SHORT":
         return evaluate_economic_quality(
             plan,
             available_capital=account_equity,
             max_capital_fraction=PRODUCTION_MAX_CAPITAL_FRACTION,
-            **(advisory_policy or {}),
+            **effective_policy,
             direction="SHORT",
             leverage=SHORT_VALIDATION_LEVERAGE,
             estimated_margin_cost_pct=SHORT_MARGIN_COST_RESERVE_PCT,
@@ -1181,7 +1189,7 @@ def _economic_quality(plan, snapshot, account_equity, advisory_policy: dict | No
         plan,
         available_capital=account_equity,
         max_capital_fraction=PRODUCTION_MAX_CAPITAL_FRACTION,
-        **(advisory_policy or {}),
+        **effective_policy,
     )
 
 
