@@ -63,7 +63,7 @@ comparison, F11 independent refusal and evidence/canonical history remain
 unchanged. Production retains existing authority until separately released.
 
 ACCEPTANCE TEST TRACEABILITY:
-AC-001 -> tests/test_advisory_policy_v2.py::test_fixed_profit_floor_remains_in_execution_default_but_not_advisory_override
+AC-001 -> tests/test_advisory_policy_v2.py::test_advisory_has_no_dollar_cutoff_while_execution_defaults_unchanged
 AC-002 -> tests/test_advisory_policy_v2.py::test_negative_after_costs_is_not_qualified_and_explicit_stricter_policy_is_preserved
 AC-003 -> tests/test_advisory_policy_v2.py::test_optional_move_and_reward_risk_filters_default_off_but_can_be_enabled
 AC-004 -> tests/test_advisory_policy_v2.py::test_versioned_reference_policy_disables_only_advisory_filters
