@@ -41,6 +41,8 @@ function ConfigAdmin({secret}){
  const[diff,setDiff]=useState([]);
  const authGeneration=useRef(0);
  const baseHeaders={secret,adminSecret};
+ // A different viewer must never inherit the previous viewer's admin authority.
+ useEffect(()=>{setAdminSecret('');setActivationSecret('');setAck('');setReason('')},[secret]);
  useEffect(()=>{authGeneration.current+=1;setDraft(null);setActive(null);setDocument('');setMessage('');setDiff([]);setBusy(false)},[secret,adminSecret]);
  async function load(){const generation=++authGeneration.current;setBusy(true);setMessage('');try{
   const [d,a]=await Promise.all([
@@ -100,8 +102,8 @@ function ConfigAdmin({secret}){
  <div className="input-row"><label>Strategy Admin secret<input type="password" autoComplete="off" value={adminSecret} onChange={e=>setAdminSecret(e.target.value)} placeholder="Admin credential (memory only)"/></label><button onClick={load} disabled={busy||!secret||!adminSecret}>Load Active & Draft</button></div>
  {active&&<div className="inline-stats"><Status value={active.status||'UNVERIFIED'}/><span>Active digest: <code>{active.digest}</code></span></div>}
  </Card>
- {draft&&<Card title="Review and stage"><div className="split"><div><span className="muted">Current draft — server-validated JSON</span><textarea aria-label="Strategy JSON draft" rows={16} spellCheck="false" value={document} onChange={e=>{setDocument(e.target.value);setDiff([])}}/></div><div><span className="muted">Active reference</span><Inspection object={active?.document||{}}/></div></div>
- <div className="input-row"><label>Audit reason<input value={reason} onChange={e=>setReason(e.target.value)} placeholder="Why are you changing this?"/></label><button className="secondary" onClick={validate}>Preview changes</button><button onClick={save} disabled={!reason.trim()||busy}>Stage draft</button></div>
+ {draft&&<Card title="Review and stage"><div className="split"><div><span className="muted">Current draft — server-validated JSON</span><textarea aria-label="Strategy JSON draft" rows={16} spellCheck="false" disabled={busy} value={document} onChange={e=>{setDocument(e.target.value);setDiff([])}}/></div><div><span className="muted">Active reference</span><Inspection object={active?.document||{}}/></div></div>
+ <div className="input-row"><label>Audit reason<input value={reason} onChange={e=>setReason(e.target.value)} placeholder="Why are you changing this?"/></label><button className="secondary" disabled={busy} onClick={validate}>Preview changes</button><button onClick={save} disabled={!reason.trim()||busy}>Stage draft</button></div>
  {diff.length>0&&<div className="diff"><strong>Active draft diff ({diff.length} fields)</strong>{diff.map(change=><div key={change.path}><code>{change.path}</code><span>{JSON.stringify(change.before)} → {JSON.stringify(change.after)}</span></div>)}</div>}
  </Card>}
  {draft&&<Card title="Second-step advisory authorization"><p className="muted">Activation and rollback are disabled by the production backend unless separate server-side gates are enabled. These actions cannot authorize funded trading.</p>
