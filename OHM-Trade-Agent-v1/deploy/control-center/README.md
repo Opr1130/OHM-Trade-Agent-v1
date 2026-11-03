@@ -78,14 +78,46 @@ Guarantees of that path:
   atomically written file per attempt, with a nanosecond+PID attempt identity so
   two attempts cannot collide) plus an append-only `history.log`.
 
-One-time owner prerequisite after merge: the host still runs the pre-merge
-controller **set**, so install all four components once from the droplet console
-(no deployment, no container mutation, no scheduler/cron/credential change):
+One-time owner prerequisite **after all approvals and merges**: the live
+installed release predates this script and is not a Git working tree. Therefore
+do NOT invoke a nonexistent script from `/opt/OHM-Trade-Agent-v1`, and do NOT
+run a core deployment just to install the UI controller. The existing, trusted
+bare Git object cache `/srv/opip-v2/cache/repo.git` is the source of the new
+script and all four controller components. From an owner-authorized host console
+only, first establish the **exact final merged main commit** from reviewed CI,
+then use this fail-closed bootstrap. Every command below runs on the droplet;
+the named cache must already exist. No curl-to-shell, checkout mutation or
+container changes:
 
 ```bash
-sudo -n bash /opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1/deploy/remote/bootstrap-ui-release-controller.sh --check
-sudo -n bash /opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1/deploy/remote/bootstrap-ui-release-controller.sh --apply --sha <merged 40-hex>
+set -euo pipefail
+EXPECTED_SHA="<final reviewed merged origin/main 40-hex SHA>"
+CACHE="/srv/opip-v2/cache/repo.git"
+REPO_URL="https://github.com/Opr1130/OHM-Trade-Agent-v1.git"
+test "$EXPECTED_SHA" != "<final reviewed merged origin/main 40-hex SHA>"
+[[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+test "$(sudo -n git --git-dir="$CACHE" remote get-url origin)" = "$REPO_URL"
+sudo -n git --git-dir="$CACHE" fetch --prune --no-tags origin main
+test "$(sudo -n git --git-dir="$CACHE" ls-remote origin refs/heads/main | awk 'NR==1 {print $1}')" = "$EXPECTED_SHA"
+sudo -n git --git-dir="$CACHE" cat-file -e "${EXPECTED_SHA}^{commit}"
+staged="$(mktemp)"
+trap 'rm -f -- "$staged"' EXIT
+sudo -n git --git-dir="$CACHE" show "$EXPECTED_SHA:OHM-Trade-Agent-v1/deploy/remote/bootstrap-ui-release-controller.sh" > "$staged"
+test -s "$staged"
+bash -n "$staged"
+sudo -n bash "$staged" --check --sha "$EXPECTED_SHA"
+sudo -n bash "$staged" --apply --sha "$EXPECTED_SHA"
 ```
+
+The initial bootstrap script is extracted from **that reviewed Git commit**.
+It uses the same bare cache to install all four components, not the running
+release source or a nonexistent checkout `.git`. The previous release-tree
+bootstrap's `/var/lib/ohm-deploy/controller-bootstrap-previous` is a regular
+file and MUST remain intact; the UI bootstrap stores its backup separately in
+`/var/lib/ohm-deploy/ui-controller-bootstrap-previous/`.
+
+Inspect the output and STOP if a trust, SHA, gateway, restore or receipt
+verification fails. Never switch to the general core deploy as a workaround.
 
 That installs, atomically and with a bounded backup of the previous set:
 `/usr/local/sbin/ohm-deploy`, `/usr/local/sbin/ohm-deploy-ssh`,
