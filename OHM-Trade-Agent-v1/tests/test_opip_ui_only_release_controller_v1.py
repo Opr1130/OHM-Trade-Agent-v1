@@ -210,18 +210,24 @@ wants_code=0
 url=""
 method="GET"
 prev=""
+noproxy=0
 for arg in "$@"; do
   case "$arg" in
     '%{http_code}') wants_code=1 ;;
     https://*) url="$arg" ;;
   esac
   if [[ "$prev" == "--request" ]]; then method="$arg"; fi
+  if [[ "$prev" == "--noproxy" && "$arg" == "*" ]]; then noproxy=1; fi
   prev="$arg"
 done
 rest="${url#*://}"
 hostport="${rest%%/*}"
 if [[ "$rest" == */* ]]; then path="/${rest#*/}"; else path="/"; fi
 port="${hostport##*:}"
+if [[ "${FAKE_REQUIRE_NOPROXY:-0}" == "1" && "$noproxy" != "1" ]]; then
+  if [[ "$wants_code" == "1" ]]; then printf 000; fi
+  exit 0
+fi
 status=404
 body=""
 if [[ "$port" == "443" ]]; then
@@ -248,9 +254,17 @@ elif [[ "$path" == "/dashboard/v2/" ]]; then
 elif [[ "$path" == /dashboard/v2/assets/* ]]; then
   status=200
 elif [[ "$path" == "/dashboard/" ]]; then
-  status=308
+  status="${FAKE_LEGACY_REDIRECT:-308}"
 elif [[ "$path" == "/dashboard" ]]; then
-  status=200; body="O'Pip Intelligence Cockpit"
+  status="${FAKE_LEGACY_STATUS:-200}"
+  body="O'Pip Intelligence Cockpit"
+elif [[ "$path" == /api/opip/strategy-admin/* && "$method" == "GET" && "${FAKE_ADMIN_DISABLED:-0}" == "1" ]]; then
+  status=404
+  if [[ -n "${FAKE_ADMIN_BODY:-}" ]]; then
+    body="$FAKE_ADMIN_BODY"
+  else
+    body='{"detail":"Strategy administration unavailable"}'
+  fi
 elif [[ "$path" == /api/opip/* ]]; then
   if [[ "$method" == "DELETE" ]]; then status=403; else status=401; fi
 else
@@ -456,6 +470,63 @@ def test_successful_cutover_recreates_only_the_edge_and_records_a_receipt(tmp_pa
 
 
 @pytest.mark.acceptance
+def test_local_loopback_verification_bypasses_proxy_and_does_not_create_000000(tmp_path):
+    """ATDD-OPIP-UI-ONLY-RELEASE-CONTROLLER-v1/AC-009: bypass ambient proxy in loopback probes."""
+    if not _bash_ready():
+        pytest.skip("a usable bash is not available in this environment")
+    harness = _harness(
+        tmp_path,
+        FAKE_REQUIRE_NOPROXY="1",
+        HTTPS_PROXY="http://127.0.0.1:9",
+        ALL_PROXY="http://127.0.0.1:9",
+    )
+    result = _run(harness, "ui-deploy")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "OPIP_UI_RESULT=DEPLOYED" in result.stdout
+    assert "000000" not in result.stdout + result.stderr
+    assert "OPIP_UI_TRADEVISOR_VHOST=LIVE" in result.stdout
+
+
+@pytest.mark.acceptance
+def test_legacy_dashboard_404_is_observational_but_v2_and_443_are_mandatory(tmp_path):
+    """ATDD-OPIP-UI-ONLY-RELEASE-CONTROLLER-v1/AC-005: legacy cockpit is advisory-only."""
+    if not _bash_ready():
+        pytest.skip("a usable bash is not available in this environment")
+    harness = _harness(tmp_path, FAKE_LEGACY_STATUS="404", FAKE_LEGACY_REDIRECT="404")
+    result = _run(harness, "ui-deploy")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "OPIP_UI_LEGACY_DASHBOARD=ADVISORY_ONLY" in result.stdout
+    assert "OPIP_UI_RESULT=DEPLOYED" in result.stdout
+    assert "LEGACY_DASHBOARD_STATUS" not in _receipts(harness)
+
+
+@pytest.mark.acceptance
+def test_disabled_strategy_admin_404_is_not_mistaken_for_missing_route(tmp_path):
+    """ATDD-OPIP-UI-ONLY-RELEASE-CONTROLLER-v1/AC-005: exact disabled-admin 404 is permitted."""
+    if not _bash_ready():
+        pytest.skip("a usable bash is not available in this environment")
+    harness = _harness(tmp_path, FAKE_ADMIN_DISABLED="1")
+    result = _run(harness, "ui-deploy")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "OPIP_UI_RESULT=DEPLOYED" in result.stdout
+
+
+@pytest.mark.acceptance
+def test_unknown_admin_404_does_not_prove_authentication(tmp_path):
+    """ATDD-OPIP-UI-ONLY-RELEASE-CONTROLLER-v1/AC-005: generic 404 cannot prove admin refusal."""
+    if not _bash_ready():
+        pytest.skip("a usable bash is not available in this environment")
+    harness = _harness(
+        tmp_path, FAKE_ADMIN_DISABLED="1",
+        FAKE_ADMIN_BODY='{"detail":"Not Found"}',
+    )
+    result = _run(harness, "ui-deploy")
+    assert result.returncode == 70, result.stdout + result.stderr
+    assert "API_ADMIN_404_UNPROVEN" in result.stderr
+    assert "OPIP_UI_ROLLBACK=SUCCESS" in result.stdout
+
+
+@pytest.mark.acceptance
 def test_post_cutover_failure_restores_the_previous_edge(tmp_path):
     """ATDD-OPIP-UI-ONLY-RELEASE-CONTROLLER-v1/AC-004: automatic restore."""
     if not _bash_ready():
@@ -509,7 +580,7 @@ def test_legacy_surface_isolation_and_receipts_are_preserved():
     lib = _text(LIB)
     readme = _text(README)
     assert "Intelligence Cockpit" in lib
-    assert "LEGACY_DASHBOARD_REDIRECT_CHANGED" in lib
+    assert "OPIP_UI_LEGACY_DASHBOARD=ADVISORY_ONLY" in lib
     assert "OPIP_UI_TRADEVISOR_VHOST" in lib
     assert "/webhooks/tradevisor/v1" in lib
     assert "API_METHOD_NOT_DENIED" in lib

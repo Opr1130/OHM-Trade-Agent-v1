@@ -2,6 +2,7 @@ INCREMENT:
 ATDD-OPIP-UI-ONLY-RELEASE-CONTROLLER-v1
 
 OWNER-APPROVED INTENT:
+2026-11-03 production hotfix: The initial V2 edge release failed because localhost HTTPS probes used ambient proxy settings (curl 000000) and treated deliberately disabled strategy-admin 404 and malformed write-body 422 as security failures. Owner clarified that legacy dashboard parity is not a requirement. This bounded hotfix makes only the old cockpit observational, preserves V2/443/authorization/rollback gates, and adds focused regressions. No trading permissions, F11, scanner or core architecture changes.
 Issue #496 authorizes extending the EXISTING owner-gated O'Pip release controller with one bounded, allowlisted UI-only action for the merged Control Center V2 source at ca06fa71838a5cd2d586dccb8a3fc1b8bbfdd517. The operator approved preparing that UI-only path in a single draft PR. That approval explicitly authorizes widening the forced-command allowlist by exactly two bounded actions (`deploy-ui`, `rollback-ui`), so the prior "exactly two commands" assertions in four pre-existing contract tests are updated to "exactly these four bounded actions" without weakening the no-shell/no-arbitrary-execution invariants. This increment authorizes controller, workflow, overlay-path, contract and test changes only: it does not deploy, does not merge, does not widen trading, scanner, F11, canonical-writer, paper, learning or analytics authority, and does not change production configuration. A follow-up owner review of the draft identified four genuine release-blocking defects plus two artifact-state defects; correcting them (AC-006 through AC-010: first-use component bootstrap, authorization precedence, exact previous-edge restoration including V2-to-V2, an independent 443 ingress check, and immutable retained artifacts with unique atomic receipts) is within this same increment because each correction is required for the UI-only path to be safe at all. No authority is widened by any of them.
 
 ARCHITECTURE REFERENCES:
@@ -44,7 +45,7 @@ a post-cutover check that fails, or an owner-requested UI rollback
 WHEN:
 the gate does not pass
 THEN:
-the previously captured edge container is restored from the tracked base Compose file with the overlay omitted, the legacy dashboard is re-verified, the failure and rollback outcome are recorded in an exact-SHA receipt, and a rollback targeting a SHA that is not the recorded active UI release is refused without mutation.
+the previously captured edge container is restored from the tracked base Compose file with the overlay omitted, the actual restored image identity and 8443 listener are re-verified, while the retired legacy cockpit page is reported as advisory-only; the failure and rollback outcome are recorded in an exact-SHA receipt, and a rollback targeting a SHA that is not the recorded active UI release is refused without mutation.
 
 AC-005:
 GIVEN:
@@ -52,7 +53,7 @@ the released edge container
 WHEN:
 the UI-only release completes
 THEN:
-`/dashboard`, its redirect and the 443 Tradevisor vhost remain unchanged, `/dashboard/v2/` serves the reviewed bundle, every `/api/opip/*` path stays method-allowlisted and refuses unauthenticated access, the memory/CPU/pid caps and the two published ports are unchanged, and an immutable per-attempt receipt plus an append-only history record the outcome.
+the legacy dashboard page is observational, the 443 Tradevisor vhost remains available, `/dashboard/v2/` serves the reviewed bundle, every `/api/opip/*` path stays method-allowlisted and unauthenticated viewer reads refuse access; intentionally disabled strategy administration returns its exact protected FastAPI 404 (never an arbitrary Nginx 404); no malformed write/activation requests are used as authentication probes, the memory/CPU/pid caps and the two published ports are unchanged, and an immutable per-attempt receipt plus an append-only history record the outcome.
 
 AC-006:
 GIVEN:
@@ -84,7 +85,7 @@ the dashboard on port 8443 and the Tradevisor webhook vhost on port 443 of the s
 WHEN:
 the controller verifies the edge after cutover, after a restore, and before cutover
 THEN:
-the two surfaces are probed independently on their own ports with GET-only requests, the pre-cutover 443 answer is captured as a baseline, a listener that answered before cutover and answers nothing afterwards fails the release even when 8443 is perfect, a vhost that is dark before and after is reported as its pre-existing posture rather than as a failure, and no synthetic webhook POST is ever sent.
+the two surfaces are probed independently on their own ports with GET-only, explicitly no-proxy requests; connection errors yield exactly one 000, never 000000, the pre-cutover 443 answer is captured as a baseline, a listener that answered before cutover and answers nothing afterwards fails the release even when 8443 is perfect, a vhost that is dark before and after is reported as its pre-existing posture rather than as a failure, and no synthetic webhook POST is ever sent.
 
 AC-010:
 GIVEN:
@@ -115,6 +116,9 @@ AC-004 -> tests/test_opip_ui_only_release_controller_v1.py::test_post_cutover_fa
 AC-004 -> tests/test_opip_ui_only_release_controller_v1.py::test_rollback_refuses_a_sha_that_is_not_the_active_release
 AC-005 -> tests/test_opip_ui_only_release_controller_v1.py::test_successful_cutover_recreates_only_the_edge_and_records_a_receipt
 AC-005 -> tests/test_opip_ui_only_release_controller_v1.py::test_legacy_surface_isolation_and_receipts_are_preserved
+AC-005 -> tests/test_opip_ui_only_release_controller_v1.py::test_legacy_dashboard_404_is_observational_but_v2_and_443_are_mandatory
+AC-005 -> tests/test_opip_ui_only_release_controller_v1.py::test_disabled_strategy_admin_404_is_not_mistaken_for_missing_route
+AC-005 -> tests/test_opip_ui_only_release_controller_v1.py::test_unknown_admin_404_does_not_prove_authentication
 AC-006 -> tests/test_opip_ui_release_controller_bootstrap_v1.py::test_ac_006_bootstrap_installs_the_complete_controller_set
 AC-006 -> tests/test_opip_ui_release_controller_bootstrap_v1.py::test_ac_006_old_release_tree_without_git_and_existing_backup_file_works
 AC-006 -> tests/test_opip_ui_release_controller_bootstrap_v1.py::test_ac_006_bootstrap_refuses_missing_bare_cache
@@ -141,6 +145,7 @@ AC-007 -> tests/test_opip_ui_release_authorization_gate_v1.py::test_ac_007_gatew
 AC-008 -> tests/test_opip_ui_only_release_controller_v1.py::test_ac_008_v2_to_v2_rollback_restores_the_previous_v2_release
 AC-008 -> tests/test_opip_ui_only_release_controller_v1.py::test_ac_008_corrupt_rollback_artifact_refuses_the_cutover
 AC-009 -> tests/test_opip_ui_only_release_controller_v1.py::test_ac_009_broken_443_cannot_be_hidden_by_a_healthy_8443
+AC-009 -> tests/test_opip_ui_only_release_controller_v1.py::test_local_loopback_verification_bypasses_proxy_and_does_not_create_000000
 AC-009 -> tests/test_opip_ui_only_release_controller_v1.py::test_ac_009_a_443_that_is_dark_before_and_after_is_not_a_regression
 AC-010 -> tests/test_opip_ui_only_release_controller_v1.py::test_ac_010_repeated_deploy_never_disturbs_the_live_mount
 AC-010 -> tests/test_opip_ui_only_release_controller_v1.py::test_ac_010_receipts_are_unique_and_never_partially_written
