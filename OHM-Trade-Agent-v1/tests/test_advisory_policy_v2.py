@@ -1,5 +1,6 @@
 """Advisory-only economic and AI move-scenario contract tests."""
 from types import SimpleNamespace
+from dataclasses import replace
 
 import pytest
 
@@ -8,6 +9,7 @@ from app.services.chief_analyst import _normalize_chief_potential
 from app.services.economic_quality_gate import (
     MIN_NET_PROFIT, PRODUCTION_MAX_CAPITAL_FRACTION, evaluate_economic_quality,
 )
+from app.core.strategy_policy import load_strategy_policy, parse_strategy_policy
 from app.services.chief_alert_notifier import format_trade_plan
 from app.services.entry_exit_advisor import EntryExitPlan
 
@@ -62,6 +64,47 @@ def test_negative_after_costs_is_not_qualified_and_explicit_stricter_policy_is_p
     assert shortfall.target_2_net_profit < 0
     assert stricter.qualified is False
     assert "below minimum $75.00" in (stricter.rejection_reason or "")
+
+
+
+@pytest.mark.acceptance
+def test_optional_move_and_reward_risk_filters_default_off_but_can_be_enabled():
+    """ATDD-OPIP-ADVISORY-NO-FIXED-PROFIT-v1/AC-003: observation is not a fixed-threshold veto."""
+    smaller_move = replace(
+        plan(), target_1=101, target_2=102,
+        reward_to_risk_1=0.5, reward_to_risk_2=1.0,
+    )
+    default = _economic_quality(
+        smaller_move, SimpleNamespace(trade_direction="LONG"), 500,
+    )
+    stricter = _economic_quality(
+        smaller_move, SimpleNamespace(trade_direction="LONG"), 500,
+        advisory_policy={"min_target_2_move_pct": 4, "min_reward_to_risk": 2.5},
+    )
+    assert default.qualified is True
+    assert 0 < default.target_2_net_profit < 75
+    assert stricter.qualified is False
+
+
+@pytest.mark.acceptance
+def test_versioned_reference_policy_disables_only_advisory_filters():
+    """ATDD-OPIP-ADVISORY-NO-FIXED-PROFIT-v1/AC-004: optional filters stay owner-configurable."""
+    policy = load_strategy_policy()
+    assert policy.advisory_economics["min_net_profit_usd"] == 0
+    assert policy.advisory_economics["min_target_2_move_pct"] == 0
+    assert policy.advisory_economics["min_reward_to_risk"] == 0
+    assert policy.advisory_economics["estimated_round_trip_cost_pct"] > 0
+    assert policy.scoring["v2_threshold"] == 75
+    assert policy.scoring["production"] == "v1"
+    # Preserve the ability to explicitly select a bounded advisory filter.
+    import json
+    from pathlib import Path
+    source = json.loads((Path(__file__).parents[1] / "app/core/strategy_policy.json").read_text())
+    source["advisory_economics"]["min_reward_to_risk"] = 2.5
+    source["advisory_economics"]["min_target_2_move_pct"] = 4
+    strict = parse_strategy_policy(json.dumps(source))
+    assert strict.advisory_economics["min_reward_to_risk"] == 2.5
+    assert strict.advisory_economics["min_target_2_move_pct"] == 4
 
 
 @pytest.mark.acceptance
