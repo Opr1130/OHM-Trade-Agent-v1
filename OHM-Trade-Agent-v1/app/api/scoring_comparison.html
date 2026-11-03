@@ -11,7 +11,7 @@ strong{font-size:25px}table{border-collapse:collapse;width:100%;overflow:auto}th
 button,input{padding:9px;border:1px solid #6385a5;border-radius:8px;background:#162f49;color:#fff}
 button{cursor:pointer}input{min-width:220px}.status{color:#e6c789}.controls{display:flex;gap:10px;flex-wrap:wrap}
 </style></head><body>
-<header><div><h1>O'Pip — V1 / V2 Scoring</h1><div class="sub">Observational comparison • Not a trade recommendation • V2 not production active</div></div><a href="/dashboard">Back to Intelligence Cockpit</a></header>
+<header><div><h1>O'Pip — V1 / V2 Scoring</h1><div class="sub">Read-only comparison • Production authority shown from recorded scan evidence • Not a trade recommendation</div></div><a href="/dashboard">Back to Intelligence Cockpit</a></header>
 <div class="panel"><div class="controls"><input type="password" id="secret" placeholder="Existing OHM operator secret" autocomplete="off"><button id="unlock">Unlock / refresh</button><button id="refresh">Refresh</button></div><p id="status" class="status" role="status">No data loaded</p><small>Uses the same restricted, read-only dashboard API. Updates every 30 seconds; market scans run on their own schedule.</small></div>
 <div class="cards" id="cards"></div>
 <div class="panel"><h2>Paired candidate selection</h2><div id="compare">No recorded comparison yet.</div></div>
@@ -25,16 +25,17 @@ function cell(row,tag,value){row.appendChild(build(tag,value===null||value===und
 function render(row,all){
  $('cards').replaceChildren();
  for(const [name,value] of [
-  ["Scan",row.scan_id],["Time (UTC)",row.observed_at_utc],["Scanned",row.scanned],
+  ["Authority",row.model_authority==="V2_PRODUCTION_V1_OBSERVATION"?"V2 production / V1 shadow":row.model_authority==="V1_PRODUCTION_V2_OBSERVATION"?"V1 production / V2 shadow":"Unknown"],["Scan",row.scan_id],["Time (UTC)",row.observed_at_utc],["Scanned",row.scanned],
   ["V2 features ready",row.v2_ready+" / "+row.scanned],
-  ["V1 shortlisted",(row.v1_top||[]).length],["V2 hypothetical shortlist",(row.v2_top||[]).length],
+  ["V1 shortlisted",(row.v1_top||[]).length],["V2 shortlisted",(row.v2_top||[]).length],
   ["V1-only",(row.v1_only||[]).length],["V2-only",(row.v2_only||[]).length],
  ]){
   const box=build("div","");box.append(build("small",name),document.createElement("br"),build("strong",value));
   $('cards').appendChild(box);
  }
  const p=$('compare');p.replaceChildren();
- for(const [name,items] of [["V1 production",row.v1_top||[]],["V2 hypothetical (not active)",row.v2_top||[]]]){
+ const v2Active=row.model_authority==="V2_PRODUCTION_V1_OBSERVATION";
+ for(const [name,items] of [[v2Active?"V1 shadow":"V1 production",row.v1_top||[]],[v2Active?"V2 production":"V2 shadow",row.v2_top||[]]]){
   const div=document.createElement("div");div.append(build("h3",name));
   div.append(build("p",items.map(i=>i.symbol+" "+i.direction+" ("+i.score+")").join(" • ")||"No candidates"));
   p.appendChild(div);
@@ -55,7 +56,7 @@ async function load(){
   const result=await fetch("/api/opip/scoring-comparison",{headers:{"X-Webhook-Secret":secret},cache:"no-store"});
   if(!result.ok)throw Error("Dashboard API returned "+result.status);
   const payload=await result.json();
-  if(!Array.isArray(payload.rows)||!payload.rows.length){$('status').textContent="No comparison evidence yet. V2 evaluation may still be disabled.";return;}
+  if(!Array.isArray(payload.rows)||!payload.rows.length){$('status').textContent="No comparison records available from this API. Verify completed scanner cycles and evidence persistence; this does not prove V2 is disabled.";return;}
   $('status').textContent="Read-only comparison loaded. Outcome labels pending.";
   render(payload.rows[0],payload.rows);
  }catch(e){$('status').textContent="Unable to load: "+e.message;}
