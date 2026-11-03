@@ -1,0 +1,55 @@
+name: opip-control-center-v2-review
+on:
+  pull_request:
+    paths:
+      - 'OHM-Trade-Agent-v1/control-center-v2/**'
+      - 'OHM-Trade-Agent-v1/deploy/control-center/**'
+      - 'OHM-Trade-Agent-v1/deploy/nginx/dashboard-sidecar.conf'
+      - '.github/workflows/opip-control-center-v2-ci.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: OHM-Trade-Agent-v1/control-center-v2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci --no-audit --no-fund
+      - run: npm test
+      - run: npm run build
+      - name: Build exact optional edge image (no deploy or secrets)
+        working-directory: OHM-Trade-Agent-v1
+        run: docker build -f deploy/control-center/Dockerfile.edge -t opip-dashboard-edge-v2-ci:head .
+      - name: Validate V2 Nginx routing in the compiled edge image
+        run: |
+          set -euo pipefail
+          certdir="$RUNNER_TEMP/opip-ui-cert"
+          mkdir -p "$certdir"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -subj '/CN=161-35-106-207.sslip.io' \
+            -keyout "$certdir/privkey.pem" -out "$certdir/fullchain.pem" >/dev/null 2>&1
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE/OHM-Trade-Agent-v1/deploy/nginx/dashboard-sidecar.conf:/etc/nginx/nginx.conf:ro" \
+            -v "$GITHUB_WORKSPACE/OHM-Trade-Agent-v1/deploy/control-center/nginx:/etc/nginx/opip-control-center:ro" \
+            -v "$certdir:/etc/letsencrypt/live/161-35-106-207.sslip.io:ro" \
+            opip-dashboard-edge-v2-ci:head nginx -t
+      - name: Install headless browser
+        run: npx playwright install --with-deps chromium
+      - name: Browser smoke test
+        run: npm run test:e2e
+      - name: Verify static artifact
+        run: test -s dist/index.html && test -d dist/assets
+      - uses: actions/upload-artifact@v4
+        with:
+          name: opip-v2-review-static
+          path: OHM-Trade-Agent-v1/control-center-v2/dist/
+          retention-days: 7
+# Build-only, no deployments, secrets, SSH, or authority changes.

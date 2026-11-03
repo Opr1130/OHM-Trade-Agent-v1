@@ -1,0 +1,14 @@
+# Owner-gated, two-stage V2 UI build. No runtime Node/npm, trading credentials or API code.
+FROM node:22-alpine AS ui
+WORKDIR /ui
+COPY control-center-v2/package.json control-center-v2/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY control-center-v2/index.html control-center-v2/vite.config.js ./
+COPY control-center-v2/src ./src
+RUN npm run build
+
+FROM nginx:1.27-alpine
+COPY --from=ui --chown=root:root /ui/dist/ /usr/share/nginx/html/opip-control-center/
+# The base Compose service continues to mount its tracked, verified nginx.conf,
+# the Tradevisor template, certificate volume and existing read-only settings.
+# The optional Compose overlay supplies only the narrow V2 path snippets.
