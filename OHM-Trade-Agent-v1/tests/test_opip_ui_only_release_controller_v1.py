@@ -414,8 +414,10 @@ def test_rollback_refuses_a_sha_that_is_not_the_active_release(tmp_path):
     (state / "previous-edge.env").write_text("schema=1\nimage=nginx:1.27-alpine\n", encoding="utf-8")
     result = _run(harness, "rollback-ui")
     assert result.returncode == 65, result.stderr
+    output = result.stdout + result.stderr
     assert "OPIP_UI_RESULT=ROLLBACK_REFUSED" in result.stdout
-    assert "ACTIVE_UI_SHA_MISMATCH" in result.stdout
+    # Blockers are emitted on stderr so they survive a stdout-only pipe.
+    assert "ACTIVE_UI_SHA_MISMATCH" in output
     assert not [line for line in _log_lines(harness) if " up " in f" {line} "]
     receipt = _receipts(harness)
     assert "result=ROLLBACK_REFUSED" in receipt
