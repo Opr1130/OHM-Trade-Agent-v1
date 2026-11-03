@@ -41,6 +41,24 @@ jobs:
             -v "$GITHUB_WORKSPACE/OHM-Trade-Agent-v1/deploy/control-center/nginx:/etc/nginx/opip-control-center:ro" \
             -v "$certdir:/etc/letsencrypt/live/161-35-106-207.sslip.io:ro" \
             opip-dashboard-edge-v2-ci:head nginx -t
+          # Validate actual browser-facing content types, not just nginx syntax.
+          docker run -d --rm --name opip-v2-asset-check \
+            -p 127.0.0.1:18443:8443 \
+            -v "$GITHUB_WORKSPACE/OHM-Trade-Agent-v1/deploy/nginx/dashboard-sidecar.conf:/etc/nginx/nginx.conf:ro" \
+            -v "$GITHUB_WORKSPACE/OHM-Trade-Agent-v1/deploy/control-center/nginx:/etc/nginx/opip-control-center:ro" \
+            -v "$certdir:/etc/letsencrypt/live/161-35-106-207.sslip.io:ro" \
+            opip-dashboard-edge-v2-ci:head
+          trap 'docker rm -f opip-v2-asset-check >/dev/null 2>&1 || true' EXIT
+          for i in 1 2 3 4 5; do
+            if curl -ksS --fail -o /dev/null https://127.0.0.1:18443/dashboard/v2/; then break; fi
+            sleep 1
+          done
+          js_asset="$(docker exec opip-v2-asset-check sh -c 'find /usr/share/nginx/html/opip-control-center/assets -name "*.js" -type f | head -n 1' | xargs basename)"
+          css_asset="$(docker exec opip-v2-asset-check sh -c 'find /usr/share/nginx/html/opip-control-center/assets -name "*.css" -type f | head -n 1' | xargs basename)"
+          curl -ksSI --fail "https://127.0.0.1:18443/dashboard/v2/assets/$js_asset" | grep -qi '^content-type: application/javascript'
+          curl -ksSI --fail "https://127.0.0.1:18443/dashboard/v2/assets/$css_asset" | grep -qi '^content-type: text/css'
+          test "$(curl -ksS -o /dev/null -w '%{http_code}' https://127.0.0.1:18443/dashboard/v2/assets/does-not-exist.js)" = 404
+          test "$(curl -ksS -o /dev/null -w '%{http_code}' https://127.0.0.1:18443/dashboard/v2/unknown)" = 404
       - name: Install headless browser
         run: npx playwright install --with-deps chromium
       - name: Browser smoke test
