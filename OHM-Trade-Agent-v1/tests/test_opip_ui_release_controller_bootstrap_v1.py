@@ -201,6 +201,9 @@ class Sandbox:
         env["OPIP_UI_BOOTSTRAP_LIB_DIR"] = str(self.lib)
         env["OPIP_UI_BOOTSTRAP_LOCK_FILE"] = str(self.lock)
         env["OPIP_UI_BOOTSTRAP_GATEWAY_WIRING_FILE"] = str(self.wiring)
+        env["FAKE_SBIN_DIR"] = str(self.sbin)
+        env["FAKE_LIB_DIR"] = str(self.lib)
+        env["FAKE_BACKUP_DIR"] = str(self.state / "controller-bootstrap-previous")
         env.update(overrides)
         return env
 
@@ -249,13 +252,21 @@ def _real_cp() -> str:
     return shutil.which("cp") or "/bin/cp"
 
 
-def _cp_shim(fail: str, allow: str | None = None) -> str:
-    """Fail `cp` only when the SOURCE matches `fail` (and not `allow`).
+UI_LIB_NAME = "opip_ui_release.sh"
 
-    ``cp [-p] [--] SRC DST``: the first non-flag argument is the source, so the
-    bounded backup (whose source is the installed component) still succeeds while
-    a specific installation or restore copy can be made to fail.
+
+def _cp_shim(*, fail_install: bool = False, fail_restore: bool = False) -> str:
+    """A ``cp`` shim that fails exactly one phase of the bootstrap.
+
+    The bootstrap copies in three distinguishable ways: the extracted commit
+    object becomes the staged target (source is a private temp directory), the
+    installed component is backed up (source is under sbin/lib) and a backup is
+    restored (source is under ``controller-bootstrap-previous``). Matching on the
+    SOURCE lets a test fail the installation, the restore, or both, without
+    guessing a random temporary directory.
     """
+    allow = f'exec {_real_cp()!r} "$@"'
+    restore = "exit 1" if fail_restore else allow
     lines = [
         "#!/usr/bin/env bash",
         'src=""',
@@ -265,11 +276,12 @@ def _cp_shim(fail: str, allow: str | None = None) -> str:
         "  break",
         "done",
         'case "$src" in',
+        f'  "$FAKE_BACKUP_DIR"/*) {restore} ;;',
+        f'  "$FAKE_SBIN_DIR"/*|"$FAKE_LIB_DIR"/*) {allow} ;;',
     ]
-    if allow is not None:
-        lines.append(f"  {allow}) exec {_real_cp()!r} \"$@\" ;;")
-    lines.append(f"  {fail}) exit 1 ;;")
-    lines.extend(["esac", f"exec {_real_cp()!r} \"$@\""])
+    if fail_install:
+        lines.append(f"  */{UI_LIB_NAME}) exit 1 ;;")
+    lines.extend(["esac", allow])
     return "\n".join(lines) + "\n"
 
 
@@ -407,11 +419,7 @@ def test_ac_006_installation_failure_restores_the_previous_set(tmp_path):
     _require_toolchain()
     sandbox = Sandbox(tmp_path / "sb", install_previous=False)
     before = _install_previous_set(tmp_path / "sb", sandbox)
-    shim = _make_shim(
-        tmp_path / "bincp",
-        "cp",
-        _cp_shim("*/opip_ui_release.sh", allow="*controller-bootstrap-previous*"),
-    )
+    shim = _make_shim(tmp_path / "bincp", "cp", _cp_shim(fail_install=True))
     env = sandbox.env()
     env["PATH"] = f"{shim}{os.pathsep}{env['PATH']}"
     proc = sandbox.run("--apply", env=env)
@@ -429,7 +437,9 @@ def test_ac_006_installation_and_restore_failure_is_unproven(tmp_path):
     _require_toolchain()
     sandbox = Sandbox(tmp_path / "sb", install_previous=False)
     _install_previous_set(tmp_path / "sb", sandbox)
-    shim = _make_shim(tmp_path / "bincp", "cp", _cp_shim("*opip_ui_release.sh"))
+    shim = _make_shim(
+        tmp_path / "bincp", "cp", _cp_shim(fail_install=True, fail_restore=True)
+    )
     env = sandbox.env()
     env["PATH"] = f"{shim}{os.pathsep}{env['PATH']}"
     proc = sandbox.run("--apply", env=env)

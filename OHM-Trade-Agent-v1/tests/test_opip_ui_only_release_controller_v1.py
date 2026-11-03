@@ -571,11 +571,11 @@ def test_ac_008_v2_to_v2_rollback_restores_the_previous_v2_release(tmp_path):
         pytest.skip("a usable bash is not available in this environment")
     harness = _harness(tmp_path)
     first = _run(harness, "ui-deploy")
-    assert first.returncode == 0, first.stderr
+    assert first.returncode == 0, first.stdout + first.stderr
     _promote_deployed_release_to_previous(harness)
     harness["log"].write_text("", encoding="utf-8")
     result = _run(harness, "rollback-ui")
-    assert result.returncode == 0, result.stderr
+    assert result.returncode == 0, result.stdout + result.stderr
     up_lines = [line for line in _log_lines(harness) if " up " in f" {line} "]
     assert len(up_lines) == 1, up_lines
     # The recreated edge must come from the V2 overlay and the V2 image, not
@@ -623,7 +623,7 @@ def test_ac_009_broken_443_cannot_be_hidden_by_a_healthy_8443(tmp_path):
         pytest.skip("a usable bash is not available in this environment")
     harness = _harness(tmp_path, FAKE_443_ROOT="404", FAKE_443_ROOT_AFTER="000")
     result = _run(harness, "ui-deploy")
-    assert result.returncode == 70, result.stderr
+    assert result.returncode == 70, result.stdout + result.stderr
     assert "OPIP_UI_RESULT=DEPLOY_FAILED" in result.stdout
     assert "OPIP_UI_INGRESS_BASELINE_443_ROOT=404" in result.stdout
     receipt = _receipts(harness)

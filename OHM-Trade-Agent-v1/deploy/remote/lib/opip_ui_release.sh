@@ -81,6 +81,20 @@ opip_ui_fail() {
 
 opip_ui_ok() { [[ -z "$opip_ui_failures" ]]; }
 
+opip_ui_field() {
+  # opip_ui_field <file> <key> -> the recorded value, or empty when the file or
+  # key is absent.
+  #
+  # This never fails on purpose. A missing state file is a normal "not recorded"
+  # condition, but `sed` on a missing file exits 2 and the caller runs with
+  # `set -o pipefail`, so an inline `sed ... | head -n 1` assignment aborts the
+  # whole release instead of reporting an empty value.
+  local value
+  [[ -r "$1" ]] || return 0
+  value="$(sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n 1)" || true
+  printf '%s' "$value"
+}
+
 # --- governed command wrappers ------------------------------------------------
 # Every external mutation goes through these wrappers so the UI path has a fixed,
 # auditable Compose shape: base file always, overlay only from the frozen
@@ -506,9 +520,9 @@ opip_ui_verify_restore_vehicle() {
     opip_ui_fail "ROLLBACK_VEHICLE_MISSING"
     return 1
   }
-  kind="$(sed -n 's/^kind=//p' "$opip_ui_state/previous-edge.env" | head -n 1)"
-  image="$(sed -n 's/^image=//p' "$opip_ui_state/previous-edge.env" | head -n 1)"
-  image_id="$(sed -n 's/^image_id=//p' "$opip_ui_state/previous-edge.env" | head -n 1)"
+  kind=""$(opip_ui_field "$opip_ui_state/previous-edge.env" kind)""
+  image=""$(opip_ui_field "$opip_ui_state/previous-edge.env" image)""
+  image_id=""$(opip_ui_field "$opip_ui_state/previous-edge.env" image_id)""
   case "$kind" in
     legacy)
       if [[ "$(docker image inspect --format '{{.Id}}' "$opip_ui_base_image" 2>/dev/null || true)" != "$image_id" ]]; then
@@ -516,9 +530,9 @@ opip_ui_verify_restore_vehicle() {
       fi
       ;;
     v2)
-      sha="$(sed -n 's/^sha=//p' "$opip_ui_state/previous-edge.env" | head -n 1)"
+      sha=""$(opip_ui_field "$opip_ui_state/previous-edge.env" sha)""
       tree="$opip_ui_releases_dir/$sha/tree/OHM-Trade-Agent-v1"
-      recorded="$(sed -n 's/^tree_digest=//p' "$opip_ui_releases_dir/$sha/release.env" 2>/dev/null | head -n 1)"
+      recorded=""$(opip_ui_field "$opip_ui_releases_dir/$sha/release.env" tree_digest)""
       if [[ ! -s "$tree/deploy/control-center/docker-compose.v2.yml" ]]; then
         opip_ui_fail "ROLLBACK_ARTIFACT_MISSING:$sha"
       elif [[ -z "$recorded" ]]; then
@@ -572,7 +586,9 @@ opip_ui_wait_edge() {
   local tries=0 code
   while (( tries < opip_ui_wait_tries )); do
     code="$(opip_ui_dashboard_code /dashboard)"
-    [[ "$code" != "000" ]] && return 0
+    if [[ "$code" != "000" ]]; then
+      return 0
+    fi
     tries=$((tries + 1))
     sleep 2
   done
@@ -653,7 +669,7 @@ opip_ui_check_tradevisor_vhost() {
   # GET only. The route is method-restricted by design, so a 403/404 there is a
   # healthy listener+SNI+route proof and a 000 is a failure.
   local baseline root_code route_code live=0
-  baseline="$(sed -n 's/^root=//p' "$opip_ui_state/ingress-baseline.env" 2>/dev/null | head -n 1)"
+  baseline=""$(opip_ui_field "$opip_ui_state/ingress-baseline.env" root)""
   root_code="$(opip_ui_webhook_code /)"
   opip_ui_say "OPIP_UI_TRADEVISOR_443=BASELINE=${baseline:-UNRECORDED} NOW=${root_code}"
   case "$root_code" in
@@ -730,10 +746,10 @@ opip_ui_state_after_restore() {
   # actually running. A V2 restore therefore re-records that release as active,
   # and a legacy restore removes the record because no V2 edge is live.
   local kind sha image_id
-  kind="$(sed -n 's/^kind=//p' "$opip_ui_state/previous-edge.env" 2>/dev/null | head -n 1)"
+  kind=""$(opip_ui_field "$opip_ui_state/previous-edge.env" kind)""
   if [[ "$kind" == "v2" ]]; then
-    sha="$(sed -n 's/^sha=//p' "$opip_ui_state/previous-edge.env" | head -n 1)"
-    image_id="$(sed -n 's/^image_id=//p' "$opip_ui_state/previous-edge.env" | head -n 1)"
+    sha=""$(opip_ui_field "$opip_ui_state/previous-edge.env" sha)""
+    image_id=""$(opip_ui_field "$opip_ui_state/previous-edge.env" image_id)""
     if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
       opip_ui_write_active "$sha" "$image_id" || true
       opip_ui_restored_release="$sha"
@@ -755,9 +771,9 @@ opip_ui_restore_v2_edge() {
   # A V2 -> V2 restore must re-install the PREVIOUS V2 release: the base file
   # alone would silently substitute the legacy image and lose the V2 bundle.
   local sha tree image
-  sha="$(sed -n 's/^sha=//p' "$opip_ui_state/previous-edge.env" | head -n 1)"
-  tree="$(sed -n 's/^tree=//p' "$opip_ui_state/previous-edge.env" | head -n 1)"
-  image="$(sed -n 's/^image=//p' "$opip_ui_state/previous-edge.env" | head -n 1)"
+  sha=""$(opip_ui_field "$opip_ui_state/previous-edge.env" sha)""
+  tree=""$(opip_ui_field "$opip_ui_state/previous-edge.env" tree)""
+  image=""$(opip_ui_field "$opip_ui_state/previous-edge.env" image)""
   [[ -n "$sha" && -n "$tree" && -n "$image" ]] || return 1
   [[ -s "$tree/deploy/control-center/docker-compose.v2.yml" ]] || return 1
   opip_ui_compose_v2 "$sha" "$tree" up -d --no-deps --no-build --force-recreate "$opip_ui_service"
@@ -771,8 +787,8 @@ opip_ui_restore_previous_edge() {
     opip_ui_say "OPIP_UI_ROLLBACK=NO_RESTORE_RECORD"
     return 1
   fi
-  kind="$(sed -n 's/^kind=//p' "$opip_ui_state/previous-edge.env" | head -n 1)"
-  image_id="$(sed -n 's/^image_id=//p' "$opip_ui_state/previous-edge.env" | head -n 1)"
+  kind=""$(opip_ui_field "$opip_ui_state/previous-edge.env" kind)""
+  image_id=""$(opip_ui_field "$opip_ui_state/previous-edge.env" image_id)""
   opip_ui_say "OPIP_UI_ROLLBACK=START"
   opip_ui_say "OPIP_UI_RESTORE_KIND=${kind}"
   case "$kind" in
@@ -824,10 +840,10 @@ opip_ui_write_receipt() {
   dir="$opip_ui_state/receipts"
   install -d -m 0700 "$dir" 2>/dev/null || true
   prov="${OPIP_STAGING_DIR:-}/${TARGET_SHA}/provenance.env"
-  tree="$(sed -n 's/^tree=//p' "$prov" 2>/dev/null | head -n 1)"
-  archive="$(sed -n 's/^archive_digest=//p' "$prov" 2>/dev/null | head -n 1)"
-  manifest="$(sed -n 's/^manifest_digest=//p' "$prov" 2>/dev/null | head -n 1)"
-  kind="$(sed -n 's/^kind=//p' "$opip_ui_state/previous-edge.env" 2>/dev/null | head -n 1)"
+  tree=""$(opip_ui_field "$prov" tree)""
+  archive=""$(opip_ui_field "$prov" archive_digest)""
+  manifest=""$(opip_ui_field "$prov" manifest_digest)""
+  kind=""$(opip_ui_field "$opip_ui_state/previous-edge.env" kind)""
   receipt="$dir/${TARGET_SHA}.${opip_ui_attempt}.env"
   tmp="$dir/.${TARGET_SHA}.${opip_ui_attempt}.partial"
   {
@@ -842,12 +858,12 @@ opip_ui_write_receipt() {
     printf 'artifact_sha256=%s\n' "${archive:-UNRECORDED}"
     printf 'manifest_sha256=%s\n' "${manifest:-UNRECORDED}"
     printf 'active_artifact=%s\n' "${opip_ui_tree:-UNRECORDED}"
-    printf 'active_artifact_digest=%s\n' "$(sed -n 's/^tree_digest=//p' "$opip_ui_releases_dir/$TARGET_SHA/release.env" 2>/dev/null | head -n 1)"
+    printf 'active_artifact_digest=%s\n' ""$(opip_ui_field "$opip_ui_releases_dir/$TARGET_SHA/release.env" tree_digest)""
     printf 'service=%s\n' "$opip_ui_service"
     printf 'image=%s:%s\n' "$opip_ui_image_repo" "$TARGET_SHA"
     printf 'image_id=%s\n' "${opip_ui_image_id:-NONE}"
-    printf 'previous_image=%s\n' "$(sed -n 's/^image=//p' "$opip_ui_state/previous-edge.env" 2>/dev/null | head -n 1)"
-    printf 'previous_image_id=%s\n' "$(sed -n 's/^image_id=//p' "$opip_ui_state/previous-edge.env" 2>/dev/null | head -n 1)"
+    printf 'previous_image=%s\n' ""$(opip_ui_field "$opip_ui_state/previous-edge.env" image)""
+    printf 'previous_image_id=%s\n' ""$(opip_ui_field "$opip_ui_state/previous-edge.env" image_id)""
     printf 'blockers=%s\n' "${opip_ui_failures:-NONE}"
     printf 'attempt=%s\n' "$opip_ui_attempt"
     printf 'recorded_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -957,7 +973,11 @@ opip_ui_deploy() {
     return 0
   fi
 
-  return opip_ui_fail_after_cutover
+  # `return <function-name>` is NOT a call: bash evaluates the word as an
+  # arithmetic expression and returns 2 ("numeric argument required"), so the
+  # handler must be invoked and its status returned explicitly.
+  opip_ui_fail_after_cutover
+  return $?
 }
 
 opip_ui_fail_after_cutover() {
@@ -981,8 +1001,12 @@ opip_ui_fail_after_cutover() {
   fi
   ingress_blockers="$opip_ui_failures"
   opip_ui_failures="$deploy_blockers"
-  [[ -n "$restore_blockers" ]] && opip_ui_failures="${opip_ui_failures}|RESTORE:${restore_blockers}"
-  [[ -n "$ingress_blockers" ]] && opip_ui_failures="${opip_ui_failures}|RESTORE_INGRESS:${ingress_blockers}"
+  if [[ -n "$restore_blockers" ]]; then
+    opip_ui_failures="${opip_ui_failures}|RESTORE:${restore_blockers}"
+  fi
+  if [[ -n "$ingress_blockers" ]]; then
+    opip_ui_failures="${opip_ui_failures}|RESTORE_INGRESS:${ingress_blockers}"
+  fi
   opip_ui_write_receipt DEPLOY_FAILED "$rollback_state"
   opip_ui_say "OPIP_UI_RESULT=DEPLOY_FAILED"
   opip_ui_say "OPIP_UI_ROLLBACK_STATE=${rollback_state}"
@@ -1000,7 +1024,7 @@ opip_ui_rollback() {
     opip_ui_say "OPIP_UI_RESULT=ROLLBACK_REFUSED"
     return 65
   fi
-  active_sha="$(sed -n 's/^sha=//p' "$opip_ui_state/active.env" | head -n 1)"
+  active_sha=""$(opip_ui_field "$opip_ui_state/active.env" sha)""
   if [[ "$active_sha" != "$TARGET_SHA" ]]; then
     # Only the recorded active UI release may be rolled back: an arbitrary SHA
     # can never be used to drive an edge target.
