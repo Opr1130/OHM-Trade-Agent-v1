@@ -5,7 +5,9 @@ import pytest
 
 from app.jobs.scan_opportunities import _economic_quality
 from app.services.chief_analyst import _normalize_chief_potential
-from app.services.economic_quality_gate import MIN_NET_PROFIT
+from app.services.economic_quality_gate import (
+    MIN_NET_PROFIT, PRODUCTION_MAX_CAPITAL_FRACTION, evaluate_economic_quality,
+)
 from app.services.chief_alert_notifier import format_trade_plan
 from app.services.entry_exit_advisor import EntryExitPlan
 
@@ -21,9 +23,15 @@ def plan():
 
 @pytest.mark.acceptance
 def test_fixed_profit_floor_remains_in_execution_default_but_not_advisory_override():
-    """ATDD-OPIP-CONFIGURABLE-SCORING-v1/AC-007: advisor is not execution policy."""
-    old = _economic_quality(plan(), SimpleNamespace(trade_direction="LONG"), 500)
-    new = _economic_quality(
+    """ATDD-OPIP-ADVISORY-NO-FIXED-PROFIT-v1/AC-001: $75 cannot veto scanner advice."""
+    execution_default = evaluate_economic_quality(
+        plan(), available_capital=500,
+        max_capital_fraction=PRODUCTION_MAX_CAPITAL_FRACTION,
+    )
+    advisory_default = _economic_quality(
+        plan(), SimpleNamespace(trade_direction="LONG"), 500,
+    )
+    advisory_configured = _economic_quality(
         plan(), SimpleNamespace(trade_direction="LONG"), 500,
         advisory_policy={
             "min_net_profit": 0,
@@ -33,10 +41,27 @@ def test_fixed_profit_floor_remains_in_execution_default_but_not_advisory_overri
         },
     )
     assert MIN_NET_PROFIT == 75.0
-    assert old.qualified is False
-    assert new.qualified is True
-    assert new.target_2_net_profit > 0
-    assert new.target_2_net_profit < 75
+    assert execution_default.qualified is False
+    assert advisory_default.qualified is True
+    assert advisory_configured.qualified is True
+    assert 0 < advisory_default.target_2_net_profit < 75
+
+
+@pytest.mark.acceptance
+def test_negative_after_costs_is_not_qualified_and_explicit_stricter_policy_is_preserved():
+    """ATDD-OPIP-ADVISORY-NO-FIXED-PROFIT-v1/AC-002: fees and opt-in policy still matter."""
+    shortfall = _economic_quality(
+        plan(), SimpleNamespace(trade_direction="LONG"), 500,
+        advisory_policy={"estimated_round_trip_cost_pct": 7.0},
+    )
+    stricter = _economic_quality(
+        plan(), SimpleNamespace(trade_direction="LONG"), 500,
+        advisory_policy={"min_net_profit": 75},
+    )
+    assert shortfall.qualified is False
+    assert shortfall.target_2_net_profit < 0
+    assert stricter.qualified is False
+    assert "below minimum $75.00" in (stricter.rejection_reason or "")
 
 
 @pytest.mark.acceptance
