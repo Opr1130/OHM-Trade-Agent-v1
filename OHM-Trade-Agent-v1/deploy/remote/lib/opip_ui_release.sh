@@ -185,23 +185,32 @@ opip_ui_require_runtime_inputs() {
 opip_ui_require_composed_overlay() {
   # Resolve base + candidate overlay and prove the edge mount graph is exactly
   # the candidate tree and nothing else. Read-only Compose evaluation.
-  local composed expect_image
+  #
+  # The resolved document is written to a private temporary file and passed by
+  # path: a `heredoc` would claim the script's stdin and the piped JSON would be
+  # silently discarded.
+  local composed expect_image snapshot
   expect_image="${opip_ui_image_repo}:${TARGET_SHA}"
   if ! composed="$(opip_ui_compose_edge config --format json 2>&1)"; then
     opip_ui_fail "COMPOSE_RESOLUTION_FAILED"
     printf '%s\n' "$composed" >&2
     return 1
   fi
-  printf '%s' "$composed" | \
-    OPIP_UI_EXPECT_SERVICE="$opip_ui_service" \
-    OPIP_UI_EXPECT_TREE="$opip_ui_staged" \
-    OPIP_UI_EXPECT_IMAGE="$expect_image" \
-    "$PYTHON_BIN" - <<'PY' || opip_ui_fail "COMPOSE_GRAPH_MISMATCH"
+  if ! snapshot="$(mktemp "${TMPDIR:-/tmp}/opip-ui-compose.XXXXXX" 2>/dev/null)"; then
+    opip_ui_fail "COMPOSE_SNAPSHOT_UNWRITABLE"
+    return 1
+  fi
+  printf '%s' "$composed" > "$snapshot"
+  OPIP_UI_EXPECT_SERVICE="$opip_ui_service" \
+  OPIP_UI_EXPECT_TREE="$opip_ui_staged" \
+  OPIP_UI_EXPECT_IMAGE="$expect_image" \
+    "$PYTHON_BIN" - "$snapshot" <<'PY' || opip_ui_fail "COMPOSE_GRAPH_MISMATCH"
 import json
 import os
 import sys
 
-config = json.load(sys.stdin)["services"]
+with open(sys.argv[1], encoding="utf-8") as handle:
+    config = json.load(handle)["services"]
 name = os.environ["OPIP_UI_EXPECT_SERVICE"]
 tree = os.environ["OPIP_UI_EXPECT_TREE"]
 image = os.environ["OPIP_UI_EXPECT_IMAGE"]
@@ -217,6 +226,7 @@ ports = service.get("ports") or []
 published = {str(port.get("published")) for port in ports}
 assert published == {"8443", "443"}, published
 PY
+  rm -f "$snapshot"
   opip_ui_ok
 }
 
