@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -442,3 +443,167 @@ def test_vanished_receipt_fails_closed(tmp_path):
 
     assert rc == 75
     assert fx["manifest"].read_bytes() == before
+
+
+# ---------------------------------------------------------------------------
+# Post-incident recovery: eliminate the discarded-generation cron gap
+# ---------------------------------------------------------------------------
+
+
+def test_discarded_generation_is_retried_once_with_both_locks_held():
+    """The release-flip recovery is bounded and does not create a new worker.
+
+    ATDD-OPIP-LEARNING-RECOVERY-v1/AC-021.
+    """
+    source = _script()
+    loop = "for generation_attempt in 1 2; do"
+    capture = 'production_deployed_sha="$(read_authoritative_release_sha)"'
+    copy = 'copy_locked_jsonl "$DATA_ROOT/full_market_observations.jsonl"'
+    assert source.count(loop) == 1
+    assert source.index("flock -x 8") < source.index(loop)
+    assert source.index(loop) < source.index(capture) < source.index(copy)
+    assert source.index(copy) < source.index("--release-sha \"$production_deployed_sha\"")
+    assert source.count('mv -f -- "$manifest_tmp" "$EXPORT_ROOT/manifest.env"') == 1
+    assert "if (( generation_attempt == 1 ))" in source
+    assert "continue" in source[source.index("if (( revalidation_rc != 0 )); then"):]
+    assert source.rstrip().endswith("break\ndone")
+    # A second release flip must not cause an unbounded retry.
+    assert source.count("exit 75") == 1
+
+
+def test_empty_archive_attestation_uses_captured_generation_identity():
+    """The attestation must not independently rebind itself during a copy.
+
+    ATDD-OPIP-LEARNING-RECOVERY-v1/AC-021.
+    """
+    body = _function_body("write_empty_export_attestation_if_canonical")
+    assert 'sha="$production_deployed_sha"' in body
+    assert "read_authoritative_release_sha" not in body
+
+
+def _actual_retry_guard() -> str:
+    """The literal production guard between revalidation and atomic publication."""
+    source = _script()
+    start = source.index("if (( revalidation_rc != 0 )); then")
+    stop = source.index('mv -f -- "$manifest_tmp" "$EXPORT_ROOT/manifest.env"', start)
+    return source[start:stop]
+
+
+@pytestmark_posix
+@pytest.mark.parametrize("flip_twice", [False, True])
+def test_release_flip_retries_in_run_and_second_flip_fails_closed(tmp_path, flip_twice):
+    """Execute the real commit-point function and literal bounded-retry guard.
+
+    No Docker, production paths, or synthetic manifest rewrites are used.
+    ATDD-OPIP-LEARNING-RECOVERY-v1/AC-021.
+    """
+    fx = _fixture(tmp_path, receipt_sha=GENERATION_SHA)
+    before = fx["manifest"].read_bytes()
+    third_sha = "a" * 40
+    harness = tmp_path / "retry_harness.sh"
+    harness.write_text(
+        "\n".join(
+            [
+                "set -Eeuo pipefail",
+                f'EXPORT_ROOT="{fx["export_root"]}"',
+                f'RELEASE_RECEIPT="{fx["receipt"]}"',
+                f'REPLICA_STAGING="{fx["staging"]}"',
+                f'REPLICA_PUBLISH_NAME="{fx["new_dir"].name}"',
+                f'REPLICA_PUBLISH_DIR="{fx["new_dir"]}"',
+                'REPLICA_CREATED_THIS_RUN=""',
+                f'NEXT_SHA="{DEPLOYED_SHA}"',
+                f'THIRD_SHA="{third_sha}"',
+                "",
+            ]
+        )
+        + _function_body("read_authoritative_release_sha")
+        + "\n"
+        + _function_body("commit_export_or_discard")
+        + "\n"
+        + "for generation_attempt in 1 2; do\n"
+        + '  production_deployed_sha="$(read_authoritative_release_sha)"\n'
+        + '  if (( generation_attempt == 1 )); then\n'
+        + '    printf "%s\\n" "$NEXT_SHA" > "$RELEASE_RECEIPT"\n'
+        + '  elif [[ "${1:-}" == "twice" ]]; then\n'
+        + '    printf "%s\\n" "$THIRD_SHA" > "$RELEASE_RECEIPT"\n'
+        + '  fi\n'
+        + f'  printf "%s\\n" "$production_deployed_sha" > "{fx["manifest_tmp"]}"\n'
+        + '  manifest_tmp="' + str(fx["manifest_tmp"]) + '"\n'
+        + '  revalidation_rc=0\n'
+        + '  commit_export_or_discard "$production_deployed_sha" "$manifest_tmp" || revalidation_rc=$?\n'
+        + _actual_retry_guard()
+        + '  mv -f -- "$manifest_tmp" "$EXPORT_ROOT/manifest.env"\n'
+        + '  echo "COMMITTED_ATTEMPT=$generation_attempt"\n'
+        + '  break\n'
+        + "done\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        ["bash", str(harness), "twice" if flip_twice else "once"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    if flip_twice:
+        assert proc.returncode == 75, proc.stderr
+        assert fx["manifest"].read_bytes() == before
+    else:
+        assert proc.returncode == 0, proc.stderr
+        assert "COMMITTED_ATTEMPT=2" in proc.stdout
+        assert fx["manifest"].read_text(encoding="utf-8").strip() == DEPLOYED_SHA
+
+
+def test_abandoned_stage_cleanup_runs_only_after_trigger_lock():
+    """Cleanup never competes with an in-flight exporter or touches replicas.
+
+    ATDD-OPIP-LEARNING-RECOVERY-v1/AC-021.
+    """
+    source = _script()
+    call = "cleanup_abandoned_replica_staging\n"
+    assert source.index("flock -n 9") < source.index(call)
+    assert source.index(call) < source.index('touch "$PUBLISH_LOCK"')
+    body = _function_body("cleanup_abandoned_replica_staging")
+    assert "-mmin +1440" in body
+    assert '"${EUID}:700"' in body
+    assert 'kill -0 "$pid"' in body
+    assert "-maxdepth 1 -type d" in body
+    assert 'rm -rf -- "$candidate"' in body
+    assert "canonical_learning_replica.staging" in body
+    assert "canonical_learning_replica.*" not in body
+
+
+@pytestmark_posix
+def test_cleanup_prunes_only_old_dead_owned_staging(tmp_path):
+    """Execute the real cleanup helper; committed and live trees survive.
+
+    ATDD-OPIP-LEARNING-RECOVERY-v1/AC-021.
+    """
+    root = tmp_path / "export"
+    root.mkdir()
+    dead = root / ".canonical_learning_replica.staging.999999999"
+    live = root / f".canonical_learning_replica.staging.{os.getpid()}"
+    recent = root / ".canonical_learning_replica.staging.888888888"
+    committed = root / ("canonical_learning_replica." + "f" * 64)
+    for path in (dead, live, recent, committed):
+        path.mkdir(mode=0o700)
+        path.chmod(0o700)
+    old = time.time() - 48 * 3600
+    for path in (dead, live, committed):
+        os.utime(path, (old, old))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked = root / ".canonical_learning_replica.staging.777777777"
+    linked.symlink_to(outside, target_is_directory=True)
+    harness = tmp_path / "cleanup_harness.sh"
+    harness.write_text(
+        "set -Eeuo pipefail\n"
+        + f'EXPORT_ROOT="{root}"\n'
+        + _function_body("cleanup_abandoned_replica_staging")
+        + "\ncleanup_abandoned_replica_staging\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(["bash", str(harness)], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    assert not dead.exists()
+    for safe in (live, recent, committed, outside, linked):
+        assert safe.exists(), f"cleanup removed a protected path: {safe}"

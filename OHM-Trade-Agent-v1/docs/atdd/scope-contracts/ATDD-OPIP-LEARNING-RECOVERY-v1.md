@@ -145,8 +145,17 @@ THEN: the receipt is re-read at the commit point, immediately before the atomic
       rename; on any disagreement the generation is discarded rather than
       relabelled, the committed manifest is left byte-identical so the previous
       valid generation stays authoritative, only a replica directory this run
-      itself published is removed, and the run fails closed with rc=75 so the
-      next scheduled run regenerates against the deployed release.
+      itself published is removed, and the exporter immediately retries the
+      full generation once while retaining both existing locks, with identity
+      recaptured before copying attestations and the replica. If the receipt
+      disappears or changes again, the second attempt fails closed with rc=75.
+      No stale evidence is relabelled or declared ready, no unbounded retry is
+      introduced, and the existing cron remains the eventual recovery path.
+      Under the exclusive exporter lock, at most one abandoned staging tree
+      older than 24 hours may be pruned when it is owned by the exporter UID,
+      has mode 0700, and its originating PID is no longer alive. Live, fresh,
+      symlinked and content-addressed committed generations are not cleanup
+      candidates; cleanup failures cannot block evidence generation.
 
 EXPLICITLY OUT OF SCOPE:
 - Deploying, rebuilding, or restarting production containers or systemd units.
@@ -349,6 +358,11 @@ AC-021 -> tests/test_opip_learning_export_release_race_v1.py::test_release_chang
 AC-021 -> tests/test_opip_learning_export_release_race_v1.py::test_unchanged_release_commits_untouched
 AC-021 -> tests/test_opip_learning_export_release_race_v1.py::test_reused_content_addressed_directory_is_never_deleted
 AC-021 -> tests/test_opip_learning_export_release_race_v1.py::test_vanished_receipt_fails_closed
+AC-021 -> tests/test_opip_learning_export_release_race_v1.py::test_discarded_generation_is_retried_once_with_both_locks_held
+AC-021 -> tests/test_opip_learning_export_release_race_v1.py::test_empty_archive_attestation_uses_captured_generation_identity
+AC-021 -> tests/test_opip_learning_export_release_race_v1.py::test_release_flip_retries_in_run_and_second_flip_fails_closed
+AC-021 -> tests/test_opip_learning_export_release_race_v1.py::test_abandoned_stage_cleanup_runs_only_after_trigger_lock
+AC-021 -> tests/test_opip_learning_export_release_race_v1.py::test_cleanup_prunes_only_old_dead_owned_staging
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/deploy/remote/configure-opip-learning-reader.sh

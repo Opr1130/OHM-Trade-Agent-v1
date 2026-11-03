@@ -61,6 +61,35 @@ if ! flock -n 9; then
   exit 0
 fi
 
+# Remove at most one abandoned *staging* tree per export, never a committed
+# content-addressed replica. This runs after winning the sole exporter lock,
+# but before the reader-facing publish lock. Require a full 24-hour grace
+# period, the root-owned 0700 staging contract, and a non-live originating PID.
+# Fresh, live, nonconforming and symlinked paths are never removed. Cleanup is
+# advisory: a filesystem cleanup failure must not prevent valid evidence.
+cleanup_abandoned_replica_staging() {
+  local candidate pid owner_mode
+  while IFS= read -r -d '' candidate; do
+    [[ ! -L "$candidate" ]] || continue
+    pid="${candidate##*.}"
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    [[ "$pid" != "$$" ]] || continue
+    owner_mode="$(stat -c '%u:%a' -- "$candidate" 2>/dev/null || true)"
+    [[ "$owner_mode" == "${EUID}:700" ]] || continue
+    if kill -0 "$pid" 2>/dev/null; then
+      continue
+    fi
+    if rm -rf -- "$candidate"; then
+      echo "O'Pip learning export: pruned one abandoned staging tree"
+    else
+      echo "O'Pip learning export: abandoned staging cleanup failed" >&2
+    fi
+    break
+  done < <(find "$EXPORT_ROOT" -mindepth 1 -maxdepth 1 -type d \
+    -name '.canonical_learning_replica.staging.*' -mmin +1440 -print0)
+}
+cleanup_abandoned_replica_staging
+
 touch "$PUBLISH_LOCK"
 if getent group "$READER_GROUP" >/dev/null 2>&1; then
   chown root:"$READER_GROUP" "$PUBLISH_LOCK"
@@ -140,7 +169,9 @@ write_empty_export_attestation_if_canonical() {
   fi
 
   local sha
-  sha="$(read_authoritative_release_sha)"
+  # Bind every copied attestation to the same generation as the replica.
+  # A release flip during copying is rejected at the manifest commit point.
+  sha="$production_deployed_sha"
   local exported_at
   exported_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf '%s\n' "{\"archive_prefix\":\"${prefix}\",\"exported_at_utc\":\"${exported_at}\",\"hot_bytes\":0,\"kind\":\"empty_export_attestation_v1\",\"manifest_present\":false,\"production_deployed_sha\":\"${sha}\",\"schema_version\":1,\"segment_count\":0,\"signature_present\":false}" > "$archive_dir/empty_export_attestation_v1.json"
@@ -218,6 +249,15 @@ copy_locked_jsonl() {
   fi
 }
 
+# A release can change while a scheduled export holds both locks. Retry the
+# entire generation once, under those same locks, immediately after a
+# commit-point refusal instead of waiting for another cron tick. A second
+# release change fails closed; there is never an unbounded regeneration loop.
+# The SHA is captured BEFORE copying any artifact/attestation, so the final
+# revalidation covers the entire generation rather than only the replica.
+for generation_attempt in 1 2; do
+production_deployed_sha="$(read_authoritative_release_sha)"
+
 # P1 shadow outbox was retired after it grew large enough to choke the evidence
 # plane. Never republish the legacy artifact; remove any stale exported copy
 # while holding the exclusive publish lock.
@@ -275,7 +315,7 @@ read_replica_tree_digest() {
 #
 # All snapshot/manifest logic lives in Python. This shell only orchestrates.
 # ---------------------------------------------------------------------------
-production_deployed_sha="$(read_authoritative_release_sha)"
+# The generation SHA was captured before the artifact copies above.
 
 REPLICA_EXPORT_NAME="canonical_learning_replica"
 REPLICA_STAGING="$EXPORT_ROOT/.$REPLICA_EXPORT_NAME.staging.$$"
@@ -466,6 +506,11 @@ fi
 revalidation_rc=0
 commit_export_or_discard "$production_deployed_sha" "$manifest_tmp" || revalidation_rc=$?
 if (( revalidation_rc != 0 )); then
+  if (( generation_attempt == 1 )) && [[ -n "$(read_authoritative_release_sha)" ]]; then
+    echo "O'Pip learning export: bounded retry after release change (attempt 2 of 2)"
+    continue
+  fi
+  # No valid new release or a second concurrent release change: fail closed.
   exit 75
 fi
 mv -f -- "$manifest_tmp" "$EXPORT_ROOT/manifest.env"
@@ -486,3 +531,5 @@ else
 fi
 
 echo "O'Pip learning evidence export: OK"
+break
+done
