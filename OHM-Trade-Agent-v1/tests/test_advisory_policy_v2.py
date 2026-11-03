@@ -25,7 +25,7 @@ def plan():
 
 @pytest.mark.acceptance
 def test_fixed_profit_floor_remains_in_execution_default_but_not_advisory_override():
-    """ATDD-OPIP-ADVISORY-NO-FIXED-PROFIT-v1/AC-001: $75 cannot veto scanner advice."""
+    """ATDD-OPIP-CONFIGURABLE-SCORING-v1/AC-007: advisor is not execution policy."""
     execution_default = evaluate_economic_quality(
         plan(), available_capital=500,
         max_capital_fraction=PRODUCTION_MAX_CAPITAL_FRACTION,
@@ -47,6 +47,17 @@ def test_fixed_profit_floor_remains_in_execution_default_but_not_advisory_overri
     assert advisory_default.qualified is True
     assert advisory_configured.qualified is True
     assert 0 < advisory_default.target_2_net_profit < 75
+
+
+@pytest.mark.acceptance
+def test_advisory_has_no_dollar_cutoff_while_execution_defaults_unchanged():
+    """ATDD-OPIP-ADVISORY-NO-FIXED-PROFIT-v1/AC-001: advisory dollar veto absent."""
+    advice = _economic_quality(
+        plan(), SimpleNamespace(trade_direction="LONG"), 500,
+    )
+    assert advice.qualified is True
+    assert 0 < advice.target_2_net_profit < 75
+    assert MIN_NET_PROFIT == 75.0
 
 
 @pytest.mark.acceptance
