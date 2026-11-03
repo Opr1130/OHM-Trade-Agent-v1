@@ -63,9 +63,14 @@ def _block() -> str:
 
 def test_forced_command_gateway_keeps_exactly_its_two_entry_points():
     gateway = GATEWAY.read_text(encoding="utf-8")
-    # The only two things this key may do, and everything else is refused.
-    assert gateway.count("exec sudo") == 2
+    # Owner-scoped change (issue #496): the allowlist is now exactly the four
+    # bounded forms - deploy <sha>, deploy-ui <sha>, rollback-ui <sha> and
+    # diagnose-learning - each forwarded with an exact 40-hex SHA (or none) and
+    # each still refused otherwise. Nothing here is caller-executed.
+    assert gateway.count("exec sudo") == 4
     assert "=~ ^deploy[[:space:]]+([0-9a-f]{40})$" in gateway
+    assert "=~ ^deploy-ui[[:space:]]+([0-9a-f]{40})$" in gateway
+    assert "=~ ^rollback-ui[[:space:]]+([0-9a-f]{40})$" in gateway
     assert '"$ORIGINAL" == "diagnose-learning"' in gateway
     assert "refusing command" in gateway
     assert "exit 64" in gateway
@@ -76,9 +81,9 @@ def test_gateway_does_not_gain_a_shell_passthrough():
     for forbidden in ("bash -c", "sh -c", "eval ", "$SSH_ORIGINAL_COMMAND/"):
         assert forbidden not in gateway
     # The caller-supplied string is read once and may only be compared against
-    # the two allowed forms: it is never executed.
+    # the four allowlisted forms: it is never executed.
     assert gateway.count("SSH_ORIGINAL_COMMAND") == 1
-    assert gateway.count("$ORIGINAL") == 2
+    assert gateway.count("$ORIGINAL") == 4
 
 
 def test_diagnostics_takes_no_positional_arguments_or_remote_command():

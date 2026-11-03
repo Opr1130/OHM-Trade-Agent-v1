@@ -2,6 +2,17 @@
 set -Eeuo pipefail
 
 TARGET_SHA="${1:-}"
+# Owner-gated UI-only release modes (Control Center V2 edge). They reuse THIS
+# controller - the same forced command, deploy lock, exact-main staging and
+# receipt conventions - and hand off to deploy/remote/lib/opip_ui_release.sh
+# before any core/writer/scanner/F11/paper/learning path can run.
+UI_MODE=""
+case "$TARGET_SHA" in
+  ui-deploy|rollback-ui)
+    UI_MODE="$TARGET_SHA"
+    TARGET_SHA="${2:-}"
+    ;;
+esac
 REPO_ROOT="/opt/OHM-Trade-Agent-v1"
 APP_ROOT="$REPO_ROOT/OHM-Trade-Agent-v1"
 DATA_ROOT="$APP_ROOT/data"
@@ -66,6 +77,10 @@ fi
 # therefore authoritative, and an in-tree copy is accepted for a Git checkout
 # that ships it. A host with neither refuses here, before any gate runs.
 OPIP_STABLE_LIB="/usr/local/lib/opip/opip_release_tree.sh"
+# The UI-only release library is installed beside the controller at the same
+# stable root-controlled location, so a UI release never depends on the running
+# (older) release tree carrying it.
+OPIP_UI_STABLE_LIB="/usr/local/lib/opip/opip_ui_release.sh"
 OPIP_SOURCE_LIB_REQUIRED=(
   opip_source_init
   source_prepare
@@ -88,6 +103,21 @@ opip_source_library_path() {
   local candidate
   for candidate in "${OPIP_RELEASE_TREE_LIB:-}" "$OPIP_STABLE_LIB" \
     "$APP_ROOT/deploy/remote/lib/opip_release_tree.sh"; do
+    [[ -n "$candidate" && -r "$candidate" ]] || continue
+    printf '%s\n' "$candidate"
+    return 0
+  done
+  return 1
+}
+
+opip_ui_library_path() {
+  # Same precedence rule as the release-tree library: explicit test seam, stable
+  # install, in-tree release copy. The staged candidate tree is deliberately NOT
+  # a candidate: controller code always comes from the installed/staged-by-owner
+  # location, exactly like ohm-deploy itself.
+  local candidate
+  for candidate in "${OPIP_UI_RELEASE_LIB:-}" "$OPIP_UI_STABLE_LIB" \
+    "$APP_ROOT/deploy/remote/lib/opip_ui_release.sh"; do
     [[ -n "$candidate" && -r "$candidate" ]] || continue
     printf '%s\n' "$candidate"
     return 0
@@ -122,6 +152,36 @@ if ! declare -F opip_write_core_env >/dev/null; then
   exit 69
 fi
 opip_source_init
+
+# --- owner-gated UI-only edge release hand-off ------------------------------
+# Reached only for `ui-deploy`/`rollback-ui` through the forced command, with the
+# deploy lock already held. `ui-deploy` stages the exact approved commit with the
+# existing verified provider (`source_prepare`, which activates nothing) so the
+# candidate Nginx config and static UI bundle come from the manifest-verified
+# tree. Control then passes to the UI library and this process EXITS: no core,
+# writer, scanner, F11, paper, learning, scheduler or analytics path below this
+# block is ever executed.
+if [[ -n "$UI_MODE" ]]; then
+  if [[ "$UI_MODE" == "ui-deploy" ]]; then
+    source_prepare
+    OPIP_UI_STAGED_APP="$OPIP_STAGING_DIR/$TARGET_SHA/tree/OHM-Trade-Agent-v1"
+    export OPIP_UI_STAGED_APP
+  fi
+  if ! OPIP_UI_LIB="$(opip_ui_library_path)"; then
+    echo "refusing UI release: opip_ui_release.sh is not installed at $OPIP_UI_STABLE_LIB and the running release does not carry it; install the approved controller first: sudo -n bash $APP_ROOT/deploy/remote/bootstrap-release-tree-controller.sh --apply --sha $TARGET_SHA" >&2
+    exit 69
+  fi
+  echo "OPIP_UI_LIBRARY=$OPIP_UI_LIB"
+  # shellcheck source=/dev/null
+  # shellcheck disable=SC1090
+  source "$OPIP_UI_LIB"
+  if ! declare -F opip_ui_run >/dev/null; then
+    echo "refusing UI release: $OPIP_UI_LIB does not provide opip_ui_run" >&2
+    exit 69
+  fi
+  opip_ui_run "$UI_MODE"
+  exit $?
+fi
 
 wait_core_health() {
   local healthy=0

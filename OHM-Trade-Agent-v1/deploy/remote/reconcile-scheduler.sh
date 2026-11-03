@@ -39,6 +39,11 @@ SSH_GATEWAY_SRC="$APP_ROOT/deploy/remote/ohm-deploy-ssh"
 # so it must track the deployed release exactly like the controller does.
 LIBRARY_SRC="$APP_ROOT/deploy/remote/lib/opip_release_tree.sh"
 LIBRARY_DST="/usr/local/lib/opip/opip_release_tree.sh"
+# The UI-only release library is installed beside the controller at the same
+# stable root-controlled location: an owner-gated UI release must never depend on
+# the running (older) release tree carrying it.
+UI_LIBRARY_SRC="$APP_ROOT/deploy/remote/lib/opip_ui_release.sh"
+UI_LIBRARY_DST="/usr/local/lib/opip/opip_ui_release.sh"
 LEARNING_READER_SRC="$APP_ROOT/deploy/remote/opip-learning-read-export.sh"
 LEARNING_DIAGNOSTICS_SRC="$APP_ROOT/deploy/remote/diagnose-opip-learning.sh"
 DEPLOY_SCRIPT_DST="/usr/local/sbin/ohm-deploy"
@@ -105,6 +110,7 @@ required_artifacts=(
   "$DEPLOY_SCRIPT_SRC"
   "$SSH_GATEWAY_SRC"
   "$LIBRARY_SRC"
+  "$UI_LIBRARY_SRC"
   "$LEARNING_READER_SRC"
   "$LEARNING_DIAGNOSTICS_SRC"
 )
@@ -599,6 +605,20 @@ rm -f "$LIBRARY_STAGED"
 install -o root -g root -m 0644 "$LIBRARY_SRC" "$LIBRARY_STAGED"
 mv -f "$LIBRARY_STAGED" "$LIBRARY_DST"
 echo "OPIP_RELEASE_TREE_LIBRARY_INSTALLED=$LIBRARY_DST"
+
+# The UI-only release library follows the exact same rule: syntax-gated, data
+# mode 0644, installed at its stable location so `deploy-ui`/`rollback-ui` work
+# even while the running core application is an older commit.
+if ! bash -n "$UI_LIBRARY_SRC"; then
+  echo "UI release library fails syntax validation; refusing to install it" >&2
+  false
+fi
+install -d -o root -g root -m 0755 "$(dirname "$UI_LIBRARY_DST")"
+UI_LIBRARY_STAGED="$(mktemp "$(dirname "$UI_LIBRARY_DST")/.opip_ui_release.stage.XXXXXX")"
+rm -f "$UI_LIBRARY_STAGED"
+install -o root -g root -m 0644 "$UI_LIBRARY_SRC" "$UI_LIBRARY_STAGED"
+mv -f "$UI_LIBRARY_STAGED" "$UI_LIBRARY_DST"
+echo "OPIP_UI_RELEASE_LIBRARY_INSTALLED=$UI_LIBRARY_DST"
 
 # The canonical cron entry invokes /usr/local/bin/opip-scan-dispatch. No other
 # part of the release installs it, so the dispatcher must arrive from the exact

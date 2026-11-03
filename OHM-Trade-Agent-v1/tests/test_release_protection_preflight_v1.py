@@ -544,13 +544,16 @@ def test_ac_024_markers_are_wired_through_the_receipt():
 
 @pytest.mark.acceptance
 def test_ac_024_ssh_gateway_keeps_exactly_two_commands():
-    """ATDD-RELEASE-PIPELINE-v1/AC-024: the forced command remains deploy <sha> and diagnose-learning, with no shell passthrough."""
+    """ATDD-RELEASE-PIPELINE-v1/AC-024: the forced command remains an allowlist of exact-SHA actions plus diagnose-learning, with no shell passthrough."""
     assert "=~ ^deploy[[:space:]]+([0-9a-f]{40})$" in SSH
+    assert "=~ ^deploy-ui[[:space:]]+([0-9a-f]{40})$" in SSH
+    assert "=~ ^rollback-ui[[:space:]]+([0-9a-f]{40})$" in SSH
     assert '== "diagnose-learning"' in SSH
     assert "refusing command" in SSH
     assert "eval " not in SSH
     assert "bash -c" not in SSH
-    assert SSH.count("exec sudo") == 2
+    # Issue #496 adds exactly two bounded UI actions; nothing else is reachable.
+    assert SSH.count("exec sudo") == 4
 
 
 @pytest.mark.acceptance
