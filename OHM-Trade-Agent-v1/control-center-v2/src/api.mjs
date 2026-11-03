@@ -16,13 +16,26 @@ export function modelAuthority(row) {
 }
 export function evidenceStatus(response) {
   if(!response || typeof response!=='object') return 'UNAVAILABLE';
+  // Explicit read failures are not equivalent to an empty evidence set.
+  if(['UNAVAILABLE','ERROR','FAILED','READ_FAILED'].includes(response.status)) return 'UNAVAILABLE';
   if(response.status==='NO_EVIDENCE' || !Array.isArray(response.rows) || !response.rows.length) return 'NO_EVIDENCE';
   return response.status==='RECORDED'?'RECORDED':'UNVERIFIED';
 }
 export function objectSummary(payload, depth=0) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload) || depth>2) return [];
-  return Object.entries(payload).filter(([key,value])=> value===null || ['number','string','boolean'].includes(typeof value))
-    .slice(0,24).map(([key,value])=>({key:key.replaceAll('_',' '),value:value===null?'Unverified':String(value)}));
+  const rows=[];
+  function visit(object,prefix,level) {
+    for(const [key,value] of Object.entries(object)) {
+      if(rows.length>=24) return;
+      const label=[...prefix,key.replaceAll('_',' ')];
+      if(value===null || ['number','string','boolean'].includes(typeof value))
+        rows.push({key:label.join(' · '),value:value===null?'Unverified':String(value)});
+      else if(value && typeof value==='object' && !Array.isArray(value) && level<2)
+        visit(value,label,level+1);
+    }
+  }
+  visit(payload,[],depth);
+  return rows;
 }
 export function sanitizeJsonExport(text) {
   if(typeof text!=='string' || text.length>65536) throw new Error('Configuration document exceeds allowed size');
@@ -33,7 +46,9 @@ export function sanitizeJsonExport(text) {
 export function csvEscape(value) {
   if(value===null || value===undefined) return '';
   let s=typeof value==='object'?JSON.stringify(value):String(value);
-  if (/^[=+@\-\t\r]/.test(s)) s="'"+s;
+  // Spreadsheet importers can ignore leading whitespace/control characters.
+  // Prefix the entire cell before quoting so a later formula is still inert.
+  if (/^[\s\u0000-\u001f\u007f]*[=+@-]/u.test(s) || /^[\t\r\n]/.test(s)) s="'"+s;
   return /[",\n\r]/.test(s)?'"'+s.replaceAll('"','""')+'"':s;
 }
 export function exportCsv(rows) {
