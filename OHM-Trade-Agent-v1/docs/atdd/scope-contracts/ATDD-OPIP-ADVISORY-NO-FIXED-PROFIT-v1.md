@@ -46,6 +46,26 @@ GIVEN: the existing authenticated draft editor and validator
 WHEN: a non-execution advisory reward-risk filter is set to zero
 THEN: zero is permitted and represented; protected execution and F11 settings cannot be changed from that editor.
 
+AC-006:
+GIVEN: a candidate with usable prices, capital and modeled costs
+WHEN: the advisory projection is computed for LONG or SHORT
+THEN: entry, stop and both targets, the Target 2 percentage move, allocated capital, notional exposure, estimated costs, gross and net P&L, risk to stop and reward/risk are computed from that geometry; a non-finite price, non-positive geometry, zero or negative equity, a missing target or an invalid cost assumption yields an unqualified result with no fabricated profit rather than a profitable candidate.
+
+AC-007:
+GIVEN: the advisory screen admits positive after-cost potential at any size
+WHEN: projected net profit is $10, $20, $50, $74.99, $75 or $100
+THEN: every case is evaluated on the same monotone basis with no discontinuity at $75, while the shared execution-compatible gate still requires its $75 minimum for the same candidate.
+
+AC-008:
+GIVEN: the scanner has admitted a candidate on small positive after-cost potential
+WHEN: the pre-AI deterministic review screen decides whether the AI is consulted
+THEN: it applies the same bounded advisory policy rather than the execution defaults, so a fixed dollar, movement or reward/risk floor cannot reappear after admission; an explicitly configured stricter owner filter is still honoured.
+
+AC-009:
+GIVEN: the advisory screen no longer applies fixed economic vetoes
+WHEN: an operator inspects the execution-side economic paths
+THEN: the named execution constants, the shared gate's keyword defaults, tradeability's independent dollar bar and the Tradevisor evaluation path are provably unchanged, so advisory-only removal is not presented as a system-wide removal.
+
 EXPLICITLY OUT OF SCOPE:
 Activating an advisory profile or trading system, deploying production, removing
 real costs, overriding liquidity/data-quality checks, disabling F11 or other hard
@@ -56,11 +76,13 @@ liquidity and F11 risk settings will require a separately versioned,
 guardrail-bounded specification; this change does not falsely claim it exists.
 
 FROZEN BOUNDARIES:
-This change affects only the scanner's advisory economic-quality wrapper and
+This change affects only the advisory economic screen (scanner wrapper, its single
+shared policy definition, and the pre-AI review screen that consults it) and the
 reference profile defaults/validation/editor. Shared economic gate constants,
-execution-compatible callers, position limits, max stop-risk, read-only
-comparison, F11 independent refusal and evidence/canonical history remain
-unchanged. Production retains existing authority until separately released.
+their keyword defaults, execution-compatible callers, position limits, max
+stop-risk, read-only comparison, F11 independent refusal and evidence/canonical
+history remain unchanged. Production retains existing authority until separately
+released.
 
 ACCEPTANCE TEST TRACEABILITY:
 AC-001 -> tests/test_advisory_policy_v2.py::test_advisory_has_no_dollar_cutoff_while_execution_defaults_unchanged
@@ -68,6 +90,12 @@ AC-002 -> tests/test_advisory_policy_v2.py::test_negative_after_costs_is_not_qua
 AC-003 -> tests/test_advisory_policy_v2.py::test_optional_move_and_reward_risk_filters_default_off_but_can_be_enabled
 AC-004 -> tests/test_advisory_policy_v2.py::test_versioned_reference_policy_disables_only_advisory_filters
 AC-005 -> tests/test_advisory_policy_v2.py::test_private_editor_supports_disabled_advisory_reward_risk_filter
+AC-006 -> tests/test_advisory_policy_v2.py::test_ac_006_projection_is_computable_and_never_fabricated
+AC-006 -> tests/test_advisory_policy_v2.py::test_ac_006_short_geometry_is_mirrored_and_not_confused_with_long
+AC-007 -> tests/test_advisory_policy_v2.py::test_ac_007_no_discontinuity_at_seventy_five_dollars
+AC-007 -> tests/test_advisory_policy_v2.py::test_ac_007_execution_gate_keeps_its_seventy_five_dollar_bar
+AC-008 -> tests/test_advisory_policy_v2.py::test_ac_008_chief_advisory_prefilter_cannot_reintroduce_a_fixed_floor
+AC-009 -> tests/test_advisory_policy_v2.py::test_ac_009_execution_side_paths_keep_the_execution_bar
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/jobs/scan_opportunities.py
@@ -84,6 +112,18 @@ AC-005 -> OHM-Trade-Agent-v1/app/api/strategy_admin.html
 AC-005 -> OHM-Trade-Agent-v1/tests/test_advisory_policy_v2.py
 AC-005 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
 AC-005 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-ADVISORY-NO-FIXED-PROFIT-v1.md
+AC-006 -> OHM-Trade-Agent-v1/app/services/economic_quality_gate.py
+AC-006 -> OHM-Trade-Agent-v1/tests/test_advisory_policy_v2.py
+AC-007 -> OHM-Trade-Agent-v1/app/services/economic_quality_gate.py
+AC-007 -> OHM-Trade-Agent-v1/tests/test_advisory_policy_v2.py
+AC-008 -> OHM-Trade-Agent-v1/app/services/chief_analyst.py
+AC-008 -> OHM-Trade-Agent-v1/app/jobs/scan_opportunities.py
+AC-008 -> OHM-Trade-Agent-v1/tests/test_advisory_policy_v2.py
+AC-008 -> OHM-Trade-Agent-v1/tests/test_build6_choke_intelligence_v1.py
+AC-008 -> OHM-Trade-Agent-v1/tests/test_opip_scan_funnel_integration_v1.py
+AC-009 -> OHM-Trade-Agent-v1/app/services/economic_quality_gate.py
+AC-009 -> OHM-Trade-Agent-v1/app/services/chief_analyst.py
+AC-009 -> OHM-Trade-Agent-v1/tests/test_advisory_policy_v2.py
 
 DEFERRED DISCOVERIES:
 The scanner's distinct target-quality vetoes and postqualification alert/rank
@@ -91,6 +131,16 @@ policy remain unchanged and require evidence-backed analysis before changes.
 Production effective profile state is not verified by this PR. The broader
 configurability of fees, slippage, liquidity and F11 requires preserving
 non-bypassable safety controls, validation, owner authorization and receipts.
+
+The advisory screen's single definition now lives in
+economic_quality_gate.advisory_economic_policy, and the pre-AI review screen in
+chief_analyst consumes it so a fixed floor cannot be reintroduced through the
+review stage. Two paths deliberately still apply the execution-compatible bar and
+were NOT changed here: the Tradevisor evaluation path
+(app/services/tradevisor_evaluation.py) and the tradeability/decision gates
+(app/services/trade_action_gate.py, app/opip/decision/gates.py). Reclassifying
+those is an execution-policy change and requires its own bounded, validated
+increment; this PR does not claim a system-wide removal of the $75 bar.
 
 UNAPPROVED SCOPE CHANGES:
 NONE

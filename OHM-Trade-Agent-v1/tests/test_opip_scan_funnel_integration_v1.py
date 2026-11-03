@@ -654,12 +654,14 @@ def test_nearest_miss_quotes_the_binding_metric_not_a_passing_one(
     )
     assert terminal["metadata"]["target_qualified_any"] is True
     assert terminal["metadata"]["economic_qualified_any"] is False
-    # The economic gate rejects this fixture on Target 2 move before it
-    # reaches the net-profit check, so telemetry must name the actual first
-    # binding policy constraint rather than a later failing metric.
-    assert terminal["metadata"]["binding_metric"] == "ECONOMIC_TARGET_2_MOVE_PCT"
-    assert terminal["threshold"] == 4.0
-    assert terminal["measured_value"] < 4.0
+    # The advisory screen carries no fixed movement floor, so this fixture is no
+    # longer rejected on Target 2 move: the only constraint that can bind is the
+    # after-cost net profit, and telemetry must name that actual constraint - and
+    # the threshold that was really applied - rather than a floor this profile
+    # does not use.
+    assert terminal["metadata"]["binding_metric"] == "ECONOMIC_NET_PROFIT_AT_TARGET_2"
+    assert terminal["threshold"] == 0.0
+    assert terminal["measured_value"] < 0.0
 
 
 

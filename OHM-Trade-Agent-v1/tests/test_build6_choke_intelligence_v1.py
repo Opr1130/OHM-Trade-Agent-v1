@@ -842,7 +842,13 @@ def test_build6_producer_deterministic_policy_reject_through_observer_persistenc
     assert set(det_gate["metadata"]["risk_levels"]) == set(
         prefilter_row["risk_levels"]
     )
-    assert det_gate["threshold_distance"] is not None
+    # The nearest-miss distance is a RELATIVE gap, so it is undefined when the
+    # applying threshold is zero. Since the advisory screen deliberately carries
+    # no fixed dollar floor, a net-profit rejection now names the floor that was
+    # actually applied ($0.00) and reports no relative distance rather than
+    # dividing by zero or quoting a $75 floor the screen never used.
+    assert det_gate["threshold"] == 0.0
+    assert det_gate["threshold_distance"] is None
 
     report = build_recent_qualification_funnel(
         funnel_events_path=funnel,
@@ -866,9 +872,19 @@ def test_build6_producer_deterministic_policy_reject_through_observer_persistenc
     assert set(sample["risk_levels_evaluated"]) == {
         str(level).upper() for level in prefilter_row["risk_levels"]
     }
-    expected_gap_pct = round(abs(float(det_gate["threshold_distance"])) * 100.0, 4)
-    assert deterministic["nearest_threshold_gap_pct"] == expected_gap_pct
-    assert deterministic["median_threshold_gap_pct"] == expected_gap_pct
+    if det_gate["threshold_distance"] is None:
+        # A zero applying threshold has no relative gap, so the funnel must report
+        # an ABSENT gap rather than fabricating one (and must still count the
+        # reject it did observe).
+        assert deterministic["threshold_distance_samples"] == 0
+        assert deterministic["nearest_threshold_gap_pct"] is None
+        assert deterministic["median_threshold_gap_pct"] is None
+    else:
+        expected_gap_pct = round(
+            abs(float(det_gate["threshold_distance"])) * 100.0, 4
+        )
+        assert deterministic["nearest_threshold_gap_pct"] == expected_gap_pct
+        assert deterministic["median_threshold_gap_pct"] == expected_gap_pct
     assert "DETERMINISTIC_POLICY_REJECT_COUNT=1" in rendered
     assert "DETERMINISTIC_OPERATIONAL_ERROR_COUNT=0" in rendered
     assert sample["binding_metric"] in rendered
