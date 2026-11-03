@@ -45,32 +45,55 @@ Guarantees of that path:
 - It never names `ohm-trade-agent`, `opip-canonical-writer`, the scanner, F11,
   paper/Freqtrade, learning or analytics; it never passes `--remove-orphans` and
   never runs a bare `docker compose -f ...v2.yml up`.
-- The Nginx base config and the V2 snippet are mounted from the
-  manifest-verified candidate tree staged at
-  `/var/lib/ohm-deploy/staging/<sha>/tree/OHM-Trade-Agent-v1`, so the
-  `/dashboard/v2` include arrives **without** deploying the older-running core.
-- Preflight (fail closed, no mutation): candidate files + include, Compose
-  graph (image pin, exact mounts, `read_only`, ports 443/8443 only), `nginx -t`
-  with the real certificate mount, disk/RAM budget, and a captured rollback
-  vehicle.
+- The Nginx base config and the V2 snippet are mounted from an **immutable,
+  digest-verified per-release copy** at
+  `/var/lib/ohm-deploy/ui-releases/<sha>/tree/OHM-Trade-Agent-v1`, promoted from
+  the manifest-verified candidate tree staged at
+  `/var/lib/ohm-deploy/staging/<sha>/tree/OHM-Trade-Agent-v1`. The staging
+  directory is build input only: the staging provider deletes and re-extracts it,
+  so it is never what the live container mounts. `/dashboard/v2` therefore
+  arrives **without** deploying the older-running core, and a repeat deploy of
+  the same SHA reuses the retained copy untouched.
+- Preflight (fail closed, no mutation): candidate files + include, the frozen
+  artifact's digest, Compose graph (image pin, exact mounts, `read_only`, ports
+  443/8443 only), `nginx -t` with the real certificate mount, disk/RAM budget,
+  and a **provable** rollback vehicle — the actual running edge's kind, immutable
+  image identity and, for a V2 edge, the retained release tree it mounts. A
+  missing or digest-inconsistent artifact refuses the cutover here.
 - Post-cutover gates: `/dashboard` (200 + legacy marker + 308 redirect),
   `/dashboard/v2/` (200 + bundle), one hashed asset, unauthenticated
   `/api/opip/*` refusals for the exact allowlisted methods, a denied
-  out-of-allowlist method, the 443 vhost (GET only, never a webhook POST), and
-  unchanged cgroup/port isolation. Any failure restores the previous edge and
-  re-verifies the legacy dashboard.
-- Receipts: `/var/lib/ohm-deploy/ui/receipts/<sha>.<utc>.env` (immutable per
-  attempt) plus an append-only `history.log`.
+  out-of-allowlist method, and unchanged cgroup/port isolation.
+- Two **independent** ingress checks on their own ports: the dashboard on 8443
+  and the Tradevisor webhook vhost on 443. The 443 answer is captured as a
+  baseline before cutover, and a listener that answered before and answers
+  nothing afterwards fails the release even when 8443 is perfect. Both probes are
+  GET only — no synthetic webhook POST is ever sent, and a method-restricted 403
+  is accepted as a healthy listener+SNI+route proof.
+- Any failure restores the ACTUAL previous edge: the V2 overlay plus the previous
+  V2 image and tree for a V2→V2 restore, the tracked base file for a legacy edge,
+  with the recreated container's image identity verified against the captured
+  one. Both ingress paths are re-verified after the restore.
+- Receipts: `/var/lib/ohm-deploy/ui/receipts/<sha>.<attempt>.env` (one immutable,
+  atomically written file per attempt, with a nanosecond+PID attempt identity so
+  two attempts cannot collide) plus an append-only `history.log`.
 
 One-time owner prerequisite after merge: the host still runs the pre-merge
-controller, so install the merged controller pair once from the droplet console
-(no deployment is performed by that step):
+controller **set**, so install all four components once from the droplet console
+(no deployment, no container mutation, no scheduler/cron/credential change):
 
 ```bash
-sudo -n bash /opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1/deploy/remote/bootstrap-release-tree-controller.sh --apply --sha <merged 40-hex>
+sudo -n bash /opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1/deploy/remote/bootstrap-ui-release-controller.sh --check
+sudo -n bash /opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1/deploy/remote/bootstrap-ui-release-controller.sh --apply --sha <merged 40-hex>
 ```
 
-That installs `ohm-deploy` and `ohm-deploy-ssh`; `reconcile-scheduler.sh` then
-keeps `opip_ui_release.sh` installed beside the controller on every later core
-release. After it, the single approval comment above is the whole release.
+That installs, atomically and with a bounded backup of the previous set:
+`/usr/local/sbin/ohm-deploy`, `/usr/local/sbin/ohm-deploy-ssh`,
+`/usr/local/lib/opip/opip_release_tree.sh` and
+`/usr/local/lib/opip/opip_ui_release.sh`. It verifies each asset's bytes, mode,
+ownership and required behaviour, refuses a SHA that is not current `origin/main`,
+refuses a deploy key not wired to `/usr/local/sbin/ohm-deploy-ssh`, is idempotent
+(`NOT_NEEDED`), and reports `RESTORE=VERIFIED` or `RESTORE=UNPROVEN` on failure.
+It does **not** rewrite `authorized_keys` and does **not** rely on a later core
+release, because the UI-only path never performs one.
 

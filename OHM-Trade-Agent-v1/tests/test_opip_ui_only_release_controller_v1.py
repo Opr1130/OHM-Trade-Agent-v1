@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -133,22 +134,45 @@ DOCKER_SHIM = """#!/usr/bin/env bash
 log="${FAKE_DOCKER_LOG:?}"
 printf '%s\\n' "$*" >> "$log"
 cmd="${1:-}"; shift || true
+last_positional() {
+  ref=""
+  skip=0
+  for arg in "$@"; do
+    if [[ "$skip" == "1" ]]; then skip=0; continue; fi
+    if [[ "$arg" == "--format" || "$arg" == "-f" ]]; then skip=1; continue; fi
+    if [[ "$arg" == -?* ]]; then continue; fi
+    ref="$arg"
+  done
+  printf '%s' "$ref"
+}
 case "$cmd" in
   build) exit "${FAKE_BUILD_RC:-0}" ;;
   image)
     [[ "${1:-}" == "inspect" ]] || exit 0
-    if [[ "$*" == *"--format {{.Id}}"* ]]; then printf 'sha256:fakeimage\\n'; fi
+    ref="$(last_positional "$@")"
+    if [[ "$ref" == "${FAKE_IMAGE_REPO}:${FAKE_SHA}" ]]; then
+      printf 'sha256:buildimage\\n'
+    elif [[ "$ref" == "$FAKE_BASE_IMAGE" ]]; then
+      printf '%s\\n' "$FAKE_BASE_IMAGE_ID"
+    elif [[ -n "${FAKE_PREV_IMAGE:-}" && "$ref" == "$FAKE_PREV_IMAGE" ]]; then
+      printf '%s\\n' "$FAKE_PREV_IMAGE_ID"
+    else
+      exit 1
+    fi
     exit 0 ;;
   run)
     if [[ "$*" == *"nginx -t"* ]]; then printf 'configuration file test is successful\\n'; exit "${FAKE_NGINX_RC:-0}"; fi
-    if [[ "$*" == *"ls /usr/share"* ]]; then printf 'index-abc123.js\\n'; exit 0; fi
+    if [[ "$*" == *"/usr/share/nginx/html"* ]]; then printf 'index-abc123.js\\n'; exit 0; fi
     exit 0 ;;
   inspect)
-    if [[ "$*" == *"HostConfig.Memory"* ]]; then
-      printf '67108864|67108864|128|true\\n'
-    else
-      printf 'nginx:1.27-alpine\\n'
-    fi
+    case "$*" in
+      *'{{json .Config.Image}}'*) printf '"%s"' "$FAKE_PREV_CONFIG_IMAGE" ;;
+      *'{{json .Image}}'*) printf '"%s"' "$FAKE_PREV_IMAGE_ID" ;;
+      *'{{json .Mounts}}'*) printf '%s' "$FAKE_PREV_MOUNTS" ;;
+      *'{{.Image}}'*) printf '%s\\n' "${FAKE_RUNNING_IMAGE_ID:-$FAKE_PREV_IMAGE_ID}" ;;
+      *'HostConfig.Memory'*) printf '67108864|67108864|128|true\\n' ;;
+      *) printf '%s\\n' "$FAKE_PREV_CONFIG_IMAGE" ;;
+    esac
     exit 0 ;;
   port) printf '443/tcp -> 0.0.0.0:443\\n8443/tcp -> 0.0.0.0:8443\\n'; exit 0 ;;
   compose)
@@ -192,10 +216,29 @@ for arg in "$@"; do
   prev="$arg"
 done
 rest="${url#*://}"
+hostport="${rest%%/*}"
 if [[ "$rest" == */* ]]; then path="/${rest#*/}"; else path="/"; fi
+port="${hostport##*:}"
 status=404
 body=""
-if [[ "$path" == "/dashboard/v2" ]]; then
+if [[ "$port" == "443" ]]; then
+  # The Tradevisor webhook vhost on :443, deliberately INDEPENDENT of 8443.
+  if [[ "$path" == "/" ]]; then
+    count=0
+    if [[ -f "${FAKE_443_COUNTER:-/nonexistent}" ]]; then count="$(cat "$FAKE_443_COUNTER")"; fi
+    count=$((count + 1))
+    printf '%s' "$count" > "${FAKE_443_COUNTER:-/dev/null}"
+    if [[ -n "${FAKE_443_ROOT_AFTER:-}" && "$count" -gt 1 ]]; then
+      status="$FAKE_443_ROOT_AFTER"
+    else
+      status="${FAKE_443_ROOT:-404}"
+    fi
+  elif [[ "$path" == "/webhooks/tradevisor/v1" ]]; then
+    status="${FAKE_443_WEBHOOK:-403}"
+  else
+    status=404
+  fi
+elif [[ "$path" == "/dashboard/v2" ]]; then
   status=308
 elif [[ "$path" == "/dashboard/v2/" ]]; then
   if [[ "${FAKE_POST_FAIL:-0}" == "1" ]]; then status=500; else status=200; body='<div id="root"></div>'; fi
@@ -207,8 +250,8 @@ elif [[ "$path" == "/dashboard" ]]; then
   status=200; body="O'Pip Intelligence Cockpit"
 elif [[ "$path" == /api/opip/* ]]; then
   if [[ "$method" == "DELETE" ]]; then status=403; else status=401; fi
-elif [[ "$path" == "/" || "$path" == "/webhooks/tradevisor/v1" ]]; then
-  status="${FAKE_TRADEVISOR_STATUS:-000}"
+else
+  status=404
 fi
 if [[ "$wants_code" == "1" ]]; then printf '%s' "$status"; else printf '%s' "$body"; fi
 exit 0
@@ -272,6 +315,13 @@ def _harness(tmp_path: Path, **overrides: object) -> dict[str, object]:
     _write_exec(bin_dir / "curl", CURL_SHIM)
     _write_exec(bin_dir / "df", DF_SHIM)
     state = tmp_path / "ui"
+    releases = tmp_path / "state" / "ui-releases"
+    frozen = releases / SHA / "tree" / "OHM-Trade-Agent-v1"
+    legacy_mounts = (
+        '[{"Destination":"/etc/nginx/nginx.conf","Source":"'
+        + str(app / "deploy/nginx/dashboard-sidecar.conf")
+        + '"},{"Destination":"/etc/letsencrypt","Source":"/etc/letsencrypt"}]'
+    )
     log = tmp_path / "docker.log"
     python = __import__("sys").executable
     env = {
@@ -292,12 +342,33 @@ def _harness(tmp_path: Path, **overrides: object) -> dict[str, object]:
         "OPIP_UI_ATTEMPT": "t0001",
         "FAKE_DOCKER_LOG": str(log),
         "FAKE_PYTHON": python,
-        "FAKE_TREE": str(candidate),
+        "FAKE_APP": str(app),
+        "FAKE_RELEASES": str(releases),
+        "FAKE_TREE": str(frozen),
         "FAKE_SHA": SHA,
+        "FAKE_IMAGE_REPO": "opip-dashboard-edge-v2",
+        "FAKE_BASE_IMAGE": "nginx:1.27-alpine",
+        "FAKE_BASE_IMAGE_ID": "sha256:legacyedge",
+        "FAKE_PREV_CONFIG_IMAGE": "nginx:1.27-alpine",
+        "FAKE_PREV_IMAGE_ID": "sha256:legacyedge",
+        "FAKE_PREV_MOUNTS": legacy_mounts,
+        "FAKE_443_COUNTER": str(tmp_path / "c443"),
+        "FAKE_443_ROOT": "404",
+        "FAKE_443_WEBHOOK": "403",
     }
     for key, value in overrides.items():
         env[key] = str(value)
-    return {"env": env, "log": log, "state": state, "candidate": candidate, "app": app}
+    return {
+        "env": env,
+        "log": log,
+        "state": state,
+        "candidate": candidate,
+        "app": app,
+        "frozen": frozen,
+        "releases": releases,
+        "staging": staging,
+        "tmp": tmp_path,
+    }
 
 
 def _run(harness: dict[str, object], mode: str) -> subprocess.CompletedProcess:
@@ -367,12 +438,17 @@ def test_successful_cutover_recreates_only_the_edge_and_records_a_receipt(tmp_pa
         for service in FORBIDDEN_SERVICES:
             assert service not in line
     build_lines = [line for line in _log_lines(harness) if line.startswith("build")]
-    assert build_lines and str(harness["candidate"]) in build_lines[0]
+    assert build_lines and str(harness["frozen"]) in build_lines[0]
     receipt = _receipts(harness)
     assert f"sha={SHA}" in receipt
     assert "result=DEPLOYED" in receipt
     assert "rollback=NONE" in receipt
-    assert (harness["state"] / "active.env").is_file()
+    assert "active_artifact_digest=" in receipt
+    active = (harness["state"] / "active.env").read_text(encoding="utf-8")
+    assert f"sha={SHA}" in active
+    assert "image_id=sha256:buildimage" in active
+    # The live mount graph must never reference the shared staging directory.
+    assert str(harness["candidate"]) not in harness["log"].read_text(encoding="utf-8")
     assert (harness["state"] / "previous-edge.env").is_file()
 
 
@@ -399,6 +475,7 @@ def test_post_cutover_failure_restores_the_previous_edge(tmp_path):
     assert "result=DEPLOY_FAILED" in receipt
     assert "rollback=SUCCESS" in receipt
     assert "V2_INDEX_STATUS:500" in receipt
+    assert "restored_release=LEGACY" in receipt
     assert not (harness["state"] / "active.env").exists()
 
 
@@ -443,4 +520,175 @@ def test_legacy_surface_isolation_and_receipts_are_preserved():
     code = [line for line in lib.splitlines() if line.strip() and not line.strip().startswith("#")]
     assert not [line for line in code if "--remove-orphans" in line]
     assert not [line for line in code if "docker compose -f deploy/control-center" in line]
+
+
+def _tree_snapshot(root: Path) -> dict[str, str]:
+    snap: dict[str, str] = {}
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            snap[str(path.relative_to(root))] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return snap
+
+
+def _promote_deployed_release_to_previous(harness: dict[str, object]) -> None:
+    """Record the release the library just deployed as the previous V2 edge.
+
+    The identity is taken from what the library itself recorded, so the test does
+    not invent a rollback artifact.
+    """
+    state = harness["state"]
+    active = (state / "active.env").read_text(encoding="utf-8")
+    image_id = next(
+        line.split("=", 1)[1] for line in active.splitlines() if line.startswith("image_id=")
+    )
+    (state / "previous-edge.env").write_text(
+        "schema=2\n"
+        "kind=v2\n"
+        f"sha={SHA}\n"
+        f"tree={harness['frozen']}\n"
+        f"image=opip-dashboard-edge-v2:{SHA}\n"
+        f"image_id={image_id}\n",
+        encoding="utf-8",
+    )
+    harness["env"].update(
+        {
+            "FAKE_PREV_CONFIG_IMAGE": f"opip-dashboard-edge-v2:{SHA}",
+            "FAKE_PREV_IMAGE_ID": image_id,
+            "FAKE_RUNNING_IMAGE_ID": image_id,
+            "FAKE_PREV_MOUNTS": (
+                '[{"Destination":"/etc/nginx/nginx.conf","Source":"'
+                + str(harness["frozen"])
+                + '/deploy/nginx/dashboard-sidecar.conf"}]'
+            ),
+        }
+    )
+
+
+@pytest.mark.acceptance
+def test_ac_008_v2_to_v2_rollback_restores_the_previous_v2_release(tmp_path):
+    """ATDD-OPIP-UI-ONLY-RELEASE-CONTROLLER-v1/AC-008: a V2 rollback stays V2, never the legacy image."""
+    if not _bash_ready():
+        pytest.skip("a usable bash is not available in this environment")
+    harness = _harness(tmp_path)
+    first = _run(harness, "ui-deploy")
+    assert first.returncode == 0, first.stderr
+    _promote_deployed_release_to_previous(harness)
+    harness["log"].write_text("", encoding="utf-8")
+    result = _run(harness, "rollback-ui")
+    assert result.returncode == 0, result.stderr
+    up_lines = [line for line in _log_lines(harness) if " up " in f" {line} "]
+    assert len(up_lines) == 1, up_lines
+    # The recreated edge must come from the V2 overlay and the V2 image, not
+    # from the tracked base file with the legacy nginx image.
+    assert "docker-compose.v2.yml" in up_lines[0]
+    assert "opip-dashboard-edge-v2" in up_lines[0]
+    assert "nginx:1.27-alpine" not in up_lines[0]
+    assert "--no-deps" in up_lines[0]
+    receipt = _receipts(harness)
+    assert "result=ROLLED_BACK" in receipt
+    assert "rollback=SUCCESS" in receipt
+    assert f"restored_release={SHA}" in receipt
+    # The recorded active state agrees with the edge that is now running.
+    active = (harness["state"] / "active.env").read_text(encoding="utf-8")
+    assert f"sha={SHA}" in active
+    assert not (harness["state"] / "previous-edge.env").exists()
+
+
+@pytest.mark.acceptance
+def test_ac_008_corrupt_rollback_artifact_refuses_the_cutover(tmp_path):
+    """ATDD-OPIP-UI-ONLY-RELEASE-CONTROLLER-v1/AC-008: an unprovable restore refuses instead of cutting over."""
+    if not _bash_ready():
+        pytest.skip("a usable bash is not available in this environment")
+    harness = _harness(tmp_path)
+    first = _run(harness, "ui-deploy")
+    assert first.returncode == 0, first.stderr
+    _promote_deployed_release_to_previous(harness)
+    # Damage the retained artifact the rollback vehicle points at.
+    (harness["frozen"] / "deploy/nginx/dashboard-sidecar.conf").write_text(
+        "tampered\n", encoding="utf-8"
+    )
+    harness["log"].write_text("", encoding="utf-8")
+    result = _run(harness, "rollback-ui")
+    output = result.stdout + result.stderr
+    assert result.returncode == 65, output
+    assert "OPIP_UI_RESULT=ROLLBACK_REFUSED" in result.stdout
+    assert "ROLLBACK_ARTIFACT_UNVERIFIED" in output
+    assert not [line for line in _log_lines(harness) if " up " in f" {line} "]
+
+
+@pytest.mark.acceptance
+def test_ac_009_broken_443_cannot_be_hidden_by_a_healthy_8443(tmp_path):
+    """ATDD-OPIP-UI-ONLY-RELEASE-CONTROLLER-v1/AC-009: a 443 regression fails the release even when the dashboard is perfect."""
+    if not _bash_ready():
+        pytest.skip("a usable bash is not available in this environment")
+    harness = _harness(tmp_path, FAKE_443_ROOT="404", FAKE_443_ROOT_AFTER="000")
+    result = _run(harness, "ui-deploy")
+    assert result.returncode == 70, result.stderr
+    assert "OPIP_UI_RESULT=DEPLOY_FAILED" in result.stdout
+    assert "OPIP_UI_INGRESS_BASELINE_443_ROOT=404" in result.stdout
+    receipt = _receipts(harness)
+    assert "TRADEVISOR_443_REGRESSION" in receipt
+    # The dashboard itself was healthy throughout: only the 443 surface failed.
+    assert "LEGACY_DASHBOARD_STATUS" not in receipt
+    assert "V2_INDEX_STATUS" not in receipt
+
+
+@pytest.mark.acceptance
+def test_ac_009_a_443_that_is_dark_before_and_after_is_not_a_regression(tmp_path):
+    """ATDD-OPIP-UI-ONLY-RELEASE-CONTROLLER-v1/AC-009: pre-existing darkness is reported, not invented as failure."""
+    if not _bash_ready():
+        pytest.skip("a usable bash is not available in this environment")
+    harness = _harness(tmp_path, FAKE_443_ROOT="000")
+    result = _run(harness, "ui-deploy")
+    assert result.returncode == 0, result.stderr
+    assert "OPIP_UI_RESULT=DEPLOYED" in result.stdout
+    assert "OPIP_UI_TRADEVISOR_VHOST=DARK" in result.stdout
+    receipt = _receipts(harness)
+    assert "TRADEVISOR_443_REGRESSION" not in receipt
+
+
+@pytest.mark.acceptance
+def test_ac_010_repeated_deploy_never_disturbs_the_live_mount(tmp_path):
+    """ATDD-OPIP-UI-ONLY-RELEASE-CONTROLLER-v1/AC-010: the retained artifact is immutable and reused."""
+    if not _bash_ready():
+        pytest.skip("a usable bash is not available in this environment")
+    harness = _harness(tmp_path)
+    first = _run(harness, "ui-deploy")
+    assert first.returncode == 0, first.stderr
+    before = _tree_snapshot(harness["frozen"])
+    assert before
+    # The staging provider deletes and re-extracts this exact directory on a
+    # repeat deploy; the frozen copy must survive it byte for byte.
+    shutil.rmtree(harness["candidate"])
+    _install_tree(harness["staging"] / SHA / "tree")
+    second = _run(harness, "ui-deploy")
+    assert second.returncode == 0, second.stderr
+    assert "OPIP_UI_ACTIVE_ARTIFACT=REUSED" in second.stdout
+    assert _tree_snapshot(harness["frozen"]) == before
+    assert str(harness["candidate"]) not in harness["log"].read_text(encoding="utf-8")
+
+
+@pytest.mark.acceptance
+def test_ac_010_receipts_are_unique_and_never_partially_written(tmp_path):
+    """ATDD-OPIP-UI-ONLY-RELEASE-CONTROLLER-v1/AC-010: one distinguishable receipt per attempt."""
+    if not _bash_ready():
+        pytest.skip("a usable bash is not available in this environment")
+    harness = _harness(tmp_path)
+    assert _run(harness, "ui-deploy").returncode == 0
+    harness["env"].pop("OPIP_UI_ATTEMPT", None)
+    assert _run(harness, "ui-deploy").returncode == 0
+    directory = harness["state"] / "receipts"
+    receipts = sorted(directory.glob("*.env"))
+    assert len(receipts) == 2, [path.name for path in receipts]
+    assert not list(directory.glob("*partial*"))
+    attempts = set()
+    for path in receipts:
+        body = path.read_text(encoding="utf-8")
+        assert "result=DEPLOYED" in body
+        attempts.add(
+            next(line.split("=", 1)[1] for line in body.splitlines() if line.startswith("attempt="))
+        )
+    assert len(attempts) == 2
+    history = (harness["state"] / "history.log").read_text(encoding="utf-8")
+    assert history.count("result=DEPLOYED") == 2
 

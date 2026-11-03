@@ -818,13 +818,21 @@ jobs:
   # recreating `ohm-dashboard-edge`; it never names the core, writer, scanner,
   # F11, paper, learning or analytics services and never calls /deploy-learning.
   deploy_ui:
+    # AUTHORIZATION IS ONE CONJUNCTION.
+    # In a GitHub expression `&&` binds tighter than `||`, so an unparenthesized
+    #   a && b && c && d && startsWith(body,'/deploy-ui ') || startsWith(body,'/rollback-ui ')
+    # is evaluated as (a && b && c && d && deploy-ui) || rollback-ui, which lets
+    # `/rollback-ui` run on its own and bypass the owner, issue, association and
+    # repository predicates entirely. Rollback is a privileged action equal to
+    # deployment, so both bounded actions must satisfy EVERY predicate. The
+    # parentheses below are load-bearing, not cosmetic.
     if: >-
       github.event_name == 'issue_comment' &&
       github.event.issue.number == 64 &&
       github.event.comment.user.login == github.repository_owner &&
       github.event.comment.author_association == 'OWNER' &&
-      startsWith(github.event.comment.body, '/deploy-ui ') ||
-      startsWith(github.event.comment.body, '/rollback-ui ')
+      (startsWith(github.event.comment.body, '/deploy-ui ') ||
+      startsWith(github.event.comment.body, '/rollback-ui '))
     runs-on: ubuntu-latest
     environment: production
     steps:
@@ -955,6 +963,7 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
+          UI_ACTION: ${{ steps.target.outputs.action }}
           TARGET_SHA: ${{ steps.target.outputs.sha }}
           RESULT: ${{ steps.ui_deploy.outputs.result }}
           ROLLBACK: ${{ steps.ui_deploy.outputs.rollback }}
@@ -966,8 +975,8 @@ jobs:
           RUN_URL="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           BODY=$(cat <<EOF
           ## O'Pip UI-ONLY Edge Release Receipt
-          - **Action:** \`${{ steps.target.outputs.action }}\` (edge service only)
-          - **SHA:** \`${TARGET_SHA}\`
+          - **Action:** \`${UI_ACTION:-UNRESOLVED}\` (edge service only)
+          - **SHA:** \`${TARGET_SHA:-UNRESOLVED}\`
           - **Result:** ${RESULT:-UNKNOWN}
           - **Rollback:** ${ROLLBACK:-NONE}
           - **Blockers:** ${BLOCKERS:-NONE}
@@ -984,16 +993,33 @@ jobs:
             "repos/$GITHUB_REPOSITORY/issues/64/comments" \
             -f body="$BODY" >/dev/null
 
+      # The verdict is a shell `case`, not a boolean expression: `&&`/`||`
+      # grouping is exactly what made the previous authorization gate unsafe, so
+      # the pass/fail decision does not depend on expression precedence at all.
       - name: Fail unless the UI-only release gate passed
-        if: >-
-          (steps.ui_deploy.outputs.result != 'DEPLOYED' &&
-           steps.target.outputs.action == 'deploy-ui') ||
-          (steps.ui_deploy.outputs.result != 'ROLLED_BACK' &&
-           steps.target.outputs.action == 'rollback-ui')
+        if: always()
+        env:
+          UI_ACTION: ${{ steps.target.outputs.action }}
+          UI_RESULT: ${{ steps.ui_deploy.outputs.result }}
+          UI_ROLLBACK: ${{ steps.ui_deploy.outputs.rollback }}
+          UI_BLOCKERS: ${{ steps.ui_deploy.outputs.blockers }}
         run: |
-          echo "UI-only release gate: ${{ steps.ui_deploy.outputs.result }}" >&2
-          echo "Blockers: ${{ steps.ui_deploy.outputs.blockers }}" >&2
-          echo "Rollback: ${{ steps.ui_deploy.outputs.rollback }}" >&2
-          echo "Core release, writer, scanner, F11, paper and learning: NOT TOUCHED" >&2
-          exit 1
+          set -euo pipefail
+          case "${UI_ACTION:-}" in
+            deploy-ui) EXPECTED=DEPLOYED ;;
+            rollback-ui) EXPECTED=ROLLED_BACK ;;
+            *)
+              echo "UI-only release refused: unrecognised or unresolved action '${UI_ACTION:-}'" >&2
+              echo "Core release, writer, scanner, F11, paper and learning: NOT TOUCHED" >&2
+              exit 1
+              ;;
+          esac
+          if [[ "${UI_RESULT:-UNKNOWN}" != "$EXPECTED" ]]; then
+            echo "UI-only release gate: ${UI_RESULT:-UNKNOWN} (expected $EXPECTED)" >&2
+            echo "Blockers: ${UI_BLOCKERS:-NONE}" >&2
+            echo "Rollback: ${UI_ROLLBACK:-NONE}" >&2
+            echo "Core release, writer, scanner, F11, paper and learning: NOT TOUCHED" >&2
+            exit 1
+          fi
+          echo "UI-only release gate passed: $EXPECTED"
 
