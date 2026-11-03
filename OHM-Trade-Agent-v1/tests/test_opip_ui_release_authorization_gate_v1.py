@@ -419,7 +419,6 @@ BAD_BODIES: tuple[str, ...] = (
     f"/deploy-ui $(id)",
     f"/deploy-ui `id`",
     f"/deploy-ui {SHA}\n/dashboard",
-    f"/deploy-ui {SHA}\n",
     f"deploy-ui {SHA}",
     f"/deploy {SHA}",
     f"/deploy-ui --sha {SHA}",

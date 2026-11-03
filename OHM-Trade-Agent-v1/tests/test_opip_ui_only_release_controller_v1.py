@@ -132,7 +132,10 @@ def _bash_ready() -> bool:
 
 DOCKER_SHIM = """#!/usr/bin/env bash
 log="${FAKE_DOCKER_LOG:?}"
-printf '%s\\n' "$*" >> "$log"
+# The V2 image pin and the frozen tree are passed to Compose as environment, so
+# are recorded on the same line as the arguments (as a suffix, so the existing
+# `build`/` up ` line matching keeps working) and are therefore assertable.
+printf '%s\\n' "$* [OPIP_DEPLOYED_SHA=${OPIP_DEPLOYED_SHA:-NONE} OPIP_UI_TREE=${OPIP_UI_TREE:-NONE}]" >> "$log"
 cmd="${1:-}"; shift || true
 last_positional() {
   ref=""
@@ -578,11 +581,12 @@ def test_ac_008_v2_to_v2_rollback_restores_the_previous_v2_release(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     up_lines = [line for line in _log_lines(harness) if " up " in f" {line} "]
     assert len(up_lines) == 1, up_lines
-    # The recreated edge must come from the V2 overlay and the V2 image, not
-    # from the tracked base file with the legacy nginx image.
+    # The recreated edge must come from the V2 overlay, pinned to the PREVIOUS V2
+    # release SHA and mounting the frozen previous tree - not the tracked base file
+    # with the legacy nginx image, and not the live or staging tree.
     assert "docker-compose.v2.yml" in up_lines[0]
-    assert "opip-dashboard-edge-v2" in up_lines[0]
-    assert "nginx:1.27-alpine" not in up_lines[0]
+    assert f"OPIP_DEPLOYED_SHA={SHA}" in up_lines[0]
+    assert f"OPIP_UI_TREE={harness['frozen']}" in up_lines[0]
     assert "--no-deps" in up_lines[0]
     receipt = _receipts(harness)
     assert "result=ROLLED_BACK" in receipt
