@@ -1170,10 +1170,15 @@ def _economic_quality(plan, snapshot, account_equity, advisory_policy: dict | No
 
     This is an advisory opportunity screen, not an execution permission.
     Require nonnegative projected net P&L after modeled costs by default;
-    callers may select a stricter versioned advisory policy explicitly.
+    avoid fixed-dollar, percentage-move, and reward/risk rejection floors.\n    Callers may select stricter versioned advisory filters explicitly.
     The shared execution-compatible economic gate keeps its own $75 default.
     """
-    effective_policy = {"min_net_profit": 0.0, **(advisory_policy or {})}
+    effective_policy = {
+        "min_net_profit": 0.0,
+        "min_target_2_move_pct": 0.0,
+        "min_reward_to_risk": 0.0,
+        **(advisory_policy or {}),
+    }
     if snapshot.trade_direction == "SHORT":
         return evaluate_economic_quality(
             plan,
