@@ -115,7 +115,7 @@ def _sha256(path: Path) -> str:
 
 
 class Sandbox:
-    """A throwaway host layout: trusted checkout + bare origin + sbin/lib + state."""
+    """A throwaway release-tree host: bare origin/cache + installed root components."""
 
     def __init__(
         self,
@@ -128,6 +128,7 @@ class Sandbox:
         self.root = root
         self.repo = root / "repo"
         self.origin = root / "origin.git"
+        self.cache = root / "cache.git"
         self.state = root / "state"
         self.sbin = root / "sbin"
         self.lib = root / "lib"
@@ -149,6 +150,7 @@ class Sandbox:
         _git(["config", "user.name", "bootstrap"], self.repo)
         _git(["remote", "add", "origin", self.origin.as_posix()], self.repo)
         self.commit_components()
+        _git(["clone", "--bare", "-q", self.origin.as_posix(), self.cache.as_posix()], self.root)
         if self.install_previous:
             _write(self.sbin / "ohm-deploy", OLD_CONTROLLER, mode=0o755)
 
@@ -195,7 +197,7 @@ class Sandbox:
     def env(self, **overrides: str) -> dict[str, str]:
         env = dict(os.environ)
         env["OPIP_UI_BOOTSTRAP_TEST_SEAMS"] = "1"
-        env["OPIP_UI_BOOTSTRAP_REPO_ROOT"] = str(self.repo)
+        env["OPIP_UI_BOOTSTRAP_SOURCE_CACHE"] = str(self.cache)
         env["OPIP_UI_BOOTSTRAP_STATE_DIR"] = str(self.state)
         env["OPIP_UI_BOOTSTRAP_SBIN_DIR"] = str(self.sbin)
         env["OPIP_UI_BOOTSTRAP_LIB_DIR"] = str(self.lib)
@@ -203,7 +205,7 @@ class Sandbox:
         env["OPIP_UI_BOOTSTRAP_GATEWAY_WIRING_FILE"] = str(self.wiring)
         env["FAKE_SBIN_DIR"] = str(self.sbin)
         env["FAKE_LIB_DIR"] = str(self.lib)
-        env["FAKE_BACKUP_DIR"] = str(self.state / "controller-bootstrap-previous")
+        env["FAKE_BACKUP_DIR"] = str(self.state / "ui-controller-bootstrap-previous")
         env.update(overrides)
         return env
 
@@ -261,7 +263,7 @@ def _cp_shim(*, fail_install: bool = False, fail_restore: bool = False) -> str:
     The bootstrap copies in three distinguishable ways: the extracted commit
     object becomes the staged target (source is a private temp directory), the
     installed component is backed up (source is under sbin/lib) and a backup is
-    restored (source is under ``controller-bootstrap-previous``). Matching on the
+    restored (source is under ``ui-controller-bootstrap-previous``). Matching on the
     SOURCE lets a test fail the installation, the restore, or both, without
     guessing a random temporary directory.
     """
@@ -495,6 +497,29 @@ def test_ac_006_check_mode_reports_without_changing_anything(sandbox):
     assert "component_ohm-deploy-ssh=ABSENT" in proc.stdout
     assert not sandbox.dest(1).exists()
     assert not sandbox.state.joinpath("ui-controller-bootstrap-receipt.env").exists()
+
+
+def test_ac_006_old_release_tree_without_git_and_existing_backup_file_works(sandbox):
+    """ATDD-OPIP-UI-ONLY-RELEASE-CONTROLLER-v1/AC-006: genuine host layout."""
+    old_backup = sandbox.state / "controller-bootstrap-previous"
+    old_backup.write_bytes(b"legacy-controller-backup-retain-exactly")
+    shutil.rmtree(sandbox.repo / ".git")
+    proc = sandbox.run("--apply", "--sha", _git(["rev-parse", "refs/heads/main"], sandbox.origin).stdout.strip())
+    _skip_on_fork(proc)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert old_backup.read_bytes() == b"legacy-controller-backup-retain-exactly"
+    assert (sandbox.state / "ui-controller-bootstrap-previous").is_dir()
+    assert "OPIP_UI_BOOTSTRAP_STATUS=SUCCESS" in proc.stdout
+
+
+def test_ac_006_bootstrap_refuses_missing_bare_cache(sandbox):
+    """ATDD-OPIP-UI-ONLY-RELEASE-CONTROLLER-v1/AC-006: trusted cache required."""
+    shutil.rmtree(sandbox.cache)
+    proc = sandbox.run("--apply")
+    _skip_on_fork(proc)
+    assert proc.returncode == 69
+    assert "trusted release object cache missing" in proc.stderr
+    assert not sandbox.dest(1).exists()
 
 
 def test_ac_006_bootstrap_touches_no_forbidden_control_plane():
