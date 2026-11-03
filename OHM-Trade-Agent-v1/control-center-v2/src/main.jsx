@@ -1,7 +1,7 @@
 import React,{useEffect,useRef,useState} from 'react';
 import{createRoot}from'react-dom/client';
 import{Activity,ArrowDownToLine,BarChart3,BrainCircuit,ChartNoAxesCombined,Check,ChevronRight,CircleAlert,ClipboardList,Database,GitCompareArrows,LockKeyhole,RefreshCw,RotateCcw,Search,Settings2,ShieldCheck,SlidersHorizontal}from'lucide-react';
-import{apiRequest,modelAuthority,evidenceStatus,objectSummary,exportCsv,sanitizeJsonExport,statusLevel}from'./api.mjs';
+import{apiRequest,modelAuthority,evidenceStatus,objectSummary,exportCsv,sanitizeJsonExport,statusLevel,readState}from'./api.mjs';
 import './style.css';
 const NAV=[
  ['Overview',Activity],['V1 / V2 Evidence',GitCompareArrows],['Qualification',SlidersHorizontal],
@@ -37,18 +37,25 @@ function ConfigAdmin({secret}){
  const[ack,setAck]=useState('');
  const[reason,setReason]=useState('');
  const[message,setMessage]=useState('');
+ const[messageError,setMessageError]=useState(false);
  const[busy,setBusy]=useState(false);
  const[diff,setDiff]=useState([]);
+ // `ok` and `fail` are the only two ways a message may be produced, so a refused
+ // or failed operation can never be rendered in the confirmation style.
+ const ok=text=>{setMessage(text);setMessageError(false)};
+ const fail=text=>{setMessage(text);setMessageError(true)};
  const authGeneration=useRef(0);
  const baseHeaders={secret,adminSecret};
- useEffect(()=>{authGeneration.current+=1;setDraft(null);setActive(null);setDocument('');setMessage('');setDiff([]);setBusy(false)},[secret,adminSecret]);
+ // A different viewer must never inherit the previous viewer's admin authority.
+ useEffect(()=>{setAdminSecret('');setActivationSecret('');setAck('');setReason('')},[secret]);
+ useEffect(()=>{authGeneration.current+=1;setDraft(null);setActive(null);setDocument('');setMessage('');setMessageError(false);setDiff([]);setBusy(false)},[secret,adminSecret]);
  async function load(){const generation=++authGeneration.current;setBusy(true);setMessage('');try{
   const [d,a]=await Promise.all([
    apiRequest('/api/opip/strategy-admin/draft',baseHeaders),
    apiRequest('/api/opip/strategy-admin/active',baseHeaders)
   ]);if(generation!==authGeneration.current)return;
-  setDraft(d);setActive(a);setDocument(JSON.stringify(d.document,null,2));setMessage('Loaded server-side advisory configuration.');setDiff([]);
- }catch(e){if(generation===authGeneration.current)setMessage(e.message)}finally{if(generation===authGeneration.current)setBusy(false)}}
+  setDraft(d);setActive(a);setDocument(JSON.stringify(d.document,null,2));ok('Loaded server-side advisory configuration.');setDiff([]);
+ }catch(e){if(generation===authGeneration.current)fail(e.message)}finally{if(generation===authGeneration.current)setBusy(false)}}
  function changes(next){
   if(!draft?.document)return[];
   const old=draft.document,results=[];
@@ -66,33 +73,33 @@ function ConfigAdmin({secret}){
   }
   return results;
  }
- function validate(){try{const next=sanitizeJsonExport(document);const changeset=changes(next);if(!changeset.length)throw Error('No changed fields to stage');setDiff(changeset);setMessage('Review the changes below. The server enforces protected-field validation.');return next}catch(e){setMessage(e.message);setDiff([]);return null}}
- async function save(){const next=validate();if(!next||!reason.trim())return setMessage('A non-empty change reason is required before staging.');
+ function validate(){try{const next=sanitizeJsonExport(document);const changeset=changes(next);if(!changeset.length)throw Error('No changed fields to stage');setDiff(changeset);ok('Review the changes below. The server enforces protected-field validation.');return next}catch(e){fail(e.message);setDiff([]);return null}}
+ async function save(){const next=validate();if(!next||!reason.trim())return fail('A non-empty change reason is required before staging.');
   const generation=authGeneration.current;
   setBusy(true);
   try{
    const saved=await apiRequest('/api/opip/strategy-admin/draft',{...baseHeaders,method:'PUT',expectedDigest:draft.digest,json:next});
    if(generation!==authGeneration.current)return;
-   setMessage('Draft staged without runtime activation. Reason (local only): '+reason);
+   ok('Draft staged without runtime activation. Reason (local only): '+reason);
    setDraft({...draft,digest:saved.digest,document:next});setDiff([]);
-  }catch(e){if(generation===authGeneration.current)setMessage(e.message)}
+  }catch(e){if(generation===authGeneration.current)fail(e.message)}
   finally{if(generation===authGeneration.current)setBusy(false)}
  }
- async function activate(rollback=false){if(!draft||!active)return setMessage('Load configuration first');
+ async function activate(rollback=false){if(!draft||!active)return fail('Load configuration first');
   const exact=rollback?'ROLLBACK_ADVISORY_ONLY':'ACTIVATE_ADVISORY_ONLY';
-  if(ack!==exact)return setMessage('Type the exact advisory acknowledgment before proceeding.');
-  if(!activationSecret.trim())return setMessage('Separate activation credential required.');
+  if(ack!==exact)return fail('Type the exact advisory acknowledgment before proceeding.');
+  if(!activationSecret.trim())return fail('Separate activation credential required.');
   // Activation secret is not accepted by the legacy backend: the configured admin secret
   // is the server's second factor; this field is deliberately a local confirmation only.
-  if(activationSecret!==adminSecret)return setMessage('Activation confirmation must match the protected admin credential.');
+  if(activationSecret!==adminSecret)return fail('Activation confirmation must match the protected admin credential.');
   const generation=authGeneration.current;
   setBusy(true);
   try{
    const result=await apiRequest('/api/opip/strategy-admin/'+(rollback?'rollback':'activate'),{...baseHeaders,method:'POST',json:{expected_digest:rollback?active.digest:draft.digest,acknowledgment:exact}});
    if(generation!==authGeneration.current)return;
-   setMessage(result.status+' — funded trading not activated.');setAck('');setActivationSecret('');
+   ok(result.status+' — funded trading not activated.');setAck('');setActivationSecret('');
    await load();
-  }catch(e){if(generation===authGeneration.current)setMessage(e.message)}
+  }catch(e){if(generation===authGeneration.current)fail(e.message)}
   finally{if(generation===authGeneration.current)setBusy(false)}
  }
  return <div className="stack">
@@ -100,14 +107,14 @@ function ConfigAdmin({secret}){
  <div className="input-row"><label>Strategy Admin secret<input type="password" autoComplete="off" value={adminSecret} onChange={e=>setAdminSecret(e.target.value)} placeholder="Admin credential (memory only)"/></label><button onClick={load} disabled={busy||!secret||!adminSecret}>Load Active & Draft</button></div>
  {active&&<div className="inline-stats"><Status value={active.status||'UNVERIFIED'}/><span>Active digest: <code>{active.digest}</code></span></div>}
  </Card>
- {draft&&<Card title="Review and stage"><div className="split"><div><span className="muted">Current draft — server-validated JSON</span><textarea aria-label="Strategy JSON draft" rows={16} spellCheck="false" value={document} onChange={e=>{setDocument(e.target.value);setDiff([])}}/></div><div><span className="muted">Active reference</span><Inspection object={active?.document||{}}/></div></div>
- <div className="input-row"><label>Audit reason<input value={reason} onChange={e=>setReason(e.target.value)} placeholder="Why are you changing this?"/></label><button className="secondary" onClick={validate}>Preview changes</button><button onClick={save} disabled={!reason.trim()||busy}>Stage draft</button></div>
+ {draft&&<Card title="Review and stage"><div className="split"><div><span className="muted">Current draft — server-validated JSON</span><textarea aria-label="Strategy JSON draft" rows={16} spellCheck="false" disabled={busy} value={document} onChange={e=>{setDocument(e.target.value);setDiff([])}}/></div><div><span className="muted">Active reference</span><Inspection object={active?.document||{}}/></div></div>
+ <div className="input-row"><label>Audit reason<input value={reason} onChange={e=>setReason(e.target.value)} placeholder="Why are you changing this?"/></label><button className="secondary" disabled={busy} onClick={validate}>Preview changes</button><button onClick={save} disabled={!reason.trim()||busy}>Stage draft</button></div>
  {diff.length>0&&<div className="diff"><strong>Active draft diff ({diff.length} fields)</strong>{diff.map(change=><div key={change.path}><code>{change.path}</code><span>{JSON.stringify(change.before)} → {JSON.stringify(change.after)}</span></div>)}</div>}
  </Card>}
  {draft&&<Card title="Second-step advisory authorization"><p className="muted">Activation and rollback are disabled by the production backend unless separate server-side gates are enabled. These actions cannot authorize funded trading.</p>
  <div className="input-row"><label>Re-enter admin credential<input type="password" value={activationSecret} onChange={e=>setActivationSecret(e.target.value)} autoComplete="off"/></label><label>Exact acknowledgment<input value={ack} onChange={e=>setAck(e.target.value)} placeholder="ACTIVATE_ADVISORY_ONLY"/></label></div><div className="actions"><button disabled={busy||ack!=='ACTIVATE_ADVISORY_ONLY'} onClick={()=>activate(false)}><Check size={16}/> Authorize advisory profile</button><button disabled={busy||ack!=='ROLLBACK_ADVISORY_ONLY'} className="secondary" onClick={()=>activate(true)}><RotateCcw size={16}/> Roll back advisory profile</button></div>
  </Card>}
- {message&&<p className="notice" role="status">{message}</p>}
+ {message&&<p className={messageError?'error notice-error':'notice'} role={messageError?'alert':'status'}>{message}</p>}
  </div>
 }
 function App(){
@@ -129,7 +136,7 @@ function App(){
   const got={},errs={};results.forEach((result,i)=>{const key=Object.keys(endpoints)[i];if(result.status==='fulfilled')got[key]=result.value[1];else errs[key]=String(result.reason?.message||'Unavailable')});
   setRecords(got);setErrors(errs);setLoadedAt(new Date().toISOString());setBusy(false)}
  const comparisonStatus=evidenceStatus(records.comparisons);
- const cards=[['V1 / V2 comparison',comparisonStatus],['Qualification evidence',records.zero?'RECORDED':errors.zero?'UNAVAILABLE':'NOT LOADED'],['Analytics summary',records.summary?'RECORDED':errors.summary?'UNAVAILABLE':'NOT LOADED'],['F11 verification','NOT ATTESTED']];
+ const cards=[['V1 / V2 comparison',comparisonStatus],['Qualification evidence',readState(records.zero,errors.zero)],['Analytics summary',readState(records.summary,errors.summary)],['F11 verification','NOT ATTESTED']];
  const filtered=Array.isArray(records.comparisons?.rows)?records.comparisons.rows.filter(row=>JSON.stringify(row).toLowerCase().includes(search.toLowerCase())):[];
  return <div className="shell">
  <aside className="sidebar"><div className="brand"><div className="brand-icon">◈</div><div><strong>O’Pip</strong><span>Operational Control Center</span></div></div>
