@@ -192,9 +192,11 @@ def test_ac_003_section_performs_no_mutation_or_activation():
 def test_ac_003_forced_command_gateway_is_unchanged():
     """ATDD-R4-F8A-readiness-observability/AC-003: remote execution authority is not widened by this follow-up."""
     gateway = GATEWAY.read_text(encoding="utf-8")
-    assert gateway.count("exec sudo") == 2
+    # Issue #496 adds exactly two bounded, exact-SHA UI actions to the allowlist
+    # (deploy-ui, rollback-ui); no shell passthrough is introduced.
+    assert gateway.count("exec sudo") == 4
     assert gateway.count("SSH_ORIGINAL_COMMAND") == 1
-    assert gateway.count("$ORIGINAL") == 2
+    assert gateway.count("$ORIGINAL") == 4
     assert "refusing command" in gateway
     for forbidden in ("bash -c", "sh -c", "eval "):
         assert forbidden not in gateway

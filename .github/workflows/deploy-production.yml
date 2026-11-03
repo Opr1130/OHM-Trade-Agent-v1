@@ -811,3 +811,189 @@ jobs:
       - name: Fail if diagnostics command failed
         if: steps.diagnose.outputs.rc != '0'
         run: exit 1
+
+  # --- owner-gated UI-ONLY edge release (Control Center V2) -------------------
+  # Same workflow, SSH key, forced command, installed controller, deploy lock and
+  # approval issue as the core release. The only mutation this job can produce is
+  # recreating `ohm-dashboard-edge`; it never names the core, writer, scanner,
+  # F11, paper, learning or analytics services and never calls /deploy-learning.
+  deploy_ui:
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.issue.number == 64 &&
+      github.event.comment.user.login == github.repository_owner &&
+      github.event.comment.author_association == 'OWNER' &&
+      startsWith(github.event.comment.body, '/deploy-ui ') ||
+      startsWith(github.event.comment.body, '/rollback-ui ')
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Resolve the exact approved main SHA for the UI release
+        id: target
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          set -euo pipefail
+          if [[ "$COMMENT_BODY" =~ ^(/deploy-ui|/rollback-ui)[[:space:]]+([0-9a-f]{40})[[:space:]]*$ ]]; then
+            ACTION="${BASH_REMATCH[1]#/}"
+            TARGET_SHA="${BASH_REMATCH[2]}"
+          else
+            echo "Refusing: approval comment must be exactly '/deploy-ui <40-hex>' or '/rollback-ui <40-hex>'." >&2
+            exit 64
+          fi
+          echo "action=$ACTION" >> "$GITHUB_OUTPUT"
+          echo "sha=$TARGET_SHA" >> "$GITHUB_OUTPUT"
+          echo "Owner-approved UI-only action: $ACTION $TARGET_SHA"
+
+      - name: Require approved SHA to equal current main
+        if: steps.target.outputs.action == 'deploy-ui'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          MAIN_SHA="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq '.sha')"
+          test "$TARGET_SHA" = "$MAIN_SHA" || {
+            echo "Refusing UI release: approved SHA is not current main." >&2
+            echo "approved=$TARGET_SHA current_main=$MAIN_SHA" >&2
+            exit 65
+          }
+
+      - name: Require successful pytest CI for the exact SHA
+        if: steps.target.outputs.action == 'deploy-ui'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          RESULT="$(gh run list \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow pytest.yml \
+            --branch main \
+            --commit "$TARGET_SHA" \
+            --limit 1 \
+            --json status,conclusion \
+            --jq '.[0] | [.status,.conclusion] | @tsv')"
+          if [[ "$RESULT" != $'completed\tsuccess' ]]; then
+            echo "Refusing UI release: exact SHA has no successful completed pytest run." >&2
+            echo "CI result: ${RESULT:-not found}" >&2
+            exit 1
+          fi
+
+      - name: Validate deploy secrets
+        env:
+          OHM_DEPLOY_HOST: ${{ secrets.OHM_DEPLOY_HOST }}
+          OHM_DEPLOY_USER: ${{ secrets.OHM_DEPLOY_USER }}
+          OHM_DEPLOY_SSH_KEY_B64: ${{ secrets.OHM_DEPLOY_SSH_KEY_B64 }}
+          OHM_DEPLOY_KNOWN_HOSTS: ${{ secrets.OHM_DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          test -n "$OHM_DEPLOY_HOST"
+          test -n "$OHM_DEPLOY_USER"
+          test -n "$OHM_DEPLOY_SSH_KEY_B64"
+          test -n "$OHM_DEPLOY_KNOWN_HOSTS"
+
+      - name: Decode and validate SSH key
+        id: ssh_config
+        env:
+          OHM_DEPLOY_SSH_KEY_B64: ${{ secrets.OHM_DEPLOY_SSH_KEY_B64 }}
+          OHM_DEPLOY_KNOWN_HOSTS: ${{ secrets.OHM_DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set +e
+          install -m 700 -d ~/.ssh
+          printf '%s' "$OHM_DEPLOY_SSH_KEY_B64" | base64 --decode > ~/.ssh/ohm_deploy 2>/dev/null
+          DECODE_RC=$?
+          chmod 600 ~/.ssh/ohm_deploy 2>/dev/null
+          if [[ "$DECODE_RC" -ne 0 ]] || ! ssh-keygen -y -f ~/.ssh/ohm_deploy >/dev/null 2>&1; then
+            rm -f ~/.ssh/ohm_deploy
+            echo "UI release SSH key validation failed." >&2
+            echo "result=SSH KEY INVALID" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          printf '%s\n' "$OHM_DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          echo "result=READY" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Release the exact approved UI-only edge
+        id: ui_deploy
+        if: steps.ssh_config.outputs.result == 'READY'
+        continue-on-error: true
+        env:
+          OHM_DEPLOY_HOST: ${{ secrets.OHM_DEPLOY_HOST }}
+          OHM_DEPLOY_USER: ${{ secrets.OHM_DEPLOY_USER }}
+          OHM_DEPLOY_PORT: ${{ secrets.OHM_DEPLOY_PORT }}
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+          UI_ACTION: ${{ steps.target.outputs.action }}
+        run: |
+          set +e
+          PORT="${OHM_DEPLOY_PORT:-22}"
+          ssh \
+            -i ~/.ssh/ohm_deploy \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=20 \
+            -o TCPKeepAlive=yes \
+            -p "$PORT" \
+            "$OHM_DEPLOY_USER@$OHM_DEPLOY_HOST" \
+            "$UI_ACTION $TARGET_SHA" 2>&1 | tee ui-deploy.log
+          RC=${PIPESTATUS[0]}
+          RESULT="$(grep -oE 'OPIP_UI_RESULT=[^[:space:]]*' ui-deploy.log | tail -n 1 | cut -d= -f2)"
+          ROLLBACK="$(grep -oE 'OPIP_UI_ROLLBACK_STATE=[^[:space:]]*' ui-deploy.log | tail -n 1 | cut -d= -f2)"
+          BLOCKERS="$(grep -oE 'OPIP_UI_BLOCKER=[^[:space:]]*' ui-deploy.log | cut -d= -f2 | paste -sd, -)"
+          RECEIPT="$(grep -oE 'OPIP_UI_RECEIPT=[^[:space:]]*' ui-deploy.log | tail -n 1 | cut -d= -f2)"
+          echo "rc=$RC" >> "$GITHUB_OUTPUT"
+          echo "result=${RESULT:-UNKNOWN}" >> "$GITHUB_OUTPUT"
+          echo "rollback=${ROLLBACK:-NONE}" >> "$GITHUB_OUTPUT"
+          echo "blockers=${BLOCKERS:-NONE}" >> "$GITHUB_OUTPUT"
+          echo "receipt=${RECEIPT:-NONE}" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Publish UI-only release receipt
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+          RESULT: ${{ steps.ui_deploy.outputs.result }}
+          ROLLBACK: ${{ steps.ui_deploy.outputs.rollback }}
+          BLOCKERS: ${{ steps.ui_deploy.outputs.blockers }}
+          RECEIPT: ${{ steps.ui_deploy.outputs.receipt }}
+        run: |
+          set -euo pipefail
+          TAIL="$(tail -c 4000 ui-deploy.log 2>/dev/null || echo 'no host output')"
+          RUN_URL="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          BODY=$(cat <<EOF
+          ## O'Pip UI-ONLY Edge Release Receipt
+          - **Action:** \`${{ steps.target.outputs.action }}\` (edge service only)
+          - **SHA:** \`${TARGET_SHA}\`
+          - **Result:** ${RESULT:-UNKNOWN}
+          - **Rollback:** ${ROLLBACK:-NONE}
+          - **Blockers:** ${BLOCKERS:-NONE}
+          - **Host receipt:** ${RECEIPT:-NONE}
+          - **Workflow run:** $RUN_URL
+
+          \`\`\`text
+          $TAIL
+          \`\`\`
+          EOF
+          )
+          gh api \
+            --method POST \
+            "repos/$GITHUB_REPOSITORY/issues/64/comments" \
+            -f body="$BODY" >/dev/null
+
+      - name: Fail unless the UI-only release gate passed
+        if: >-
+          (steps.ui_deploy.outputs.result != 'DEPLOYED' &&
+           steps.target.outputs.action == 'deploy-ui') ||
+          (steps.ui_deploy.outputs.result != 'ROLLED_BACK' &&
+           steps.target.outputs.action == 'rollback-ui')
+        run: |
+          echo "UI-only release gate: ${{ steps.ui_deploy.outputs.result }}" >&2
+          echo "Blockers: ${{ steps.ui_deploy.outputs.blockers }}" >&2
+          echo "Rollback: ${{ steps.ui_deploy.outputs.rollback }}" >&2
+          echo "Core release, writer, scanner, F11, paper and learning: NOT TOUCHED" >&2
+          exit 1
+

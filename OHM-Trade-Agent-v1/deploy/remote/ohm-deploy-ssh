@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# O'Pip forced-command SSH gateway. The deploy key can request ONLY these
+# bounded operations, each forwarded to the installed root release script:
+#
+#   deploy <40-hex>        full core release (unchanged)
+#   deploy-ui <40-hex>     owner-gated UI-ONLY edge release (Control Center V2)
+#   rollback-ui <40-hex>   restore the previous edge for the recorded active UI
+#                          release
+#   diagnose-learning      read-only learning diagnostics (unchanged)
+#
+# There is no interactive shell, no arbitrary command and no raw SSH path.
 ORIGINAL="${SSH_ORIGINAL_COMMAND:-}"
 
 if [[ "$ORIGINAL" =~ ^deploy[[:space:]]+([0-9a-f]{40})$ ]]; then
@@ -8,6 +18,15 @@ if [[ "$ORIGINAL" =~ ^deploy[[:space:]]+([0-9a-f]{40})$ ]]; then
   exec sudo /usr/local/sbin/ohm-deploy "$TARGET_SHA"
 fi
 
+if [[ "$ORIGINAL" =~ ^deploy-ui[[:space:]]+([0-9a-f]{40})$ ]]; then
+  TARGET_SHA="${BASH_REMATCH[1]}"
+  exec sudo /usr/local/sbin/ohm-deploy ui-deploy "$TARGET_SHA"
+fi
+
+if [[ "$ORIGINAL" =~ ^rollback-ui[[:space:]]+([0-9a-f]{40})$ ]]; then
+  TARGET_SHA="${BASH_REMATCH[1]}"
+  exec sudo /usr/local/sbin/ohm-deploy rollback-ui "$TARGET_SHA"
+fi
 if [[ "$ORIGINAL" == "diagnose-learning" ]]; then
   exec sudo /usr/local/sbin/ohm-deploy diagnose-learning
 fi

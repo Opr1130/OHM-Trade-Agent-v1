@@ -1,12 +1,21 @@
-# Opt-in overlay ONLY. Must be combined with tracked docker-compose.yml by
-# the exact-SHA, owner-gated release controller after CI/host preflight.
-# Never execute this compose file by itself.
+# Opt-in overlay ONLY. Applied by the existing owner-gated O'Pip release
+# controller (`deploy-ui <40-hex>`) together with the tracked docker-compose.yml,
+# after CI and host preflight pass. Never execute this compose file by itself.
+#
+# Every source path below is anchored to OPIP_UI_TREE: the manifest-verified
+# candidate tree the controller stages from the approved commit. A relative path
+# would resolve against the project directory - the LIVE release, which may be an
+# older commit that does not carry these files - so it is never used here.
 services:
   ohm-dashboard-edge:
     image: opip-dashboard-edge-v2:${OPIP_DEPLOYED_SHA:?exact release SHA required}
     build:
-      context: .
+      # Relative to this file: the application root of the candidate tree.
+      context: ../..
       dockerfile: deploy/control-center/Dockerfile.edge
     volumes:
-      - ./deploy/control-center/nginx:/etc/nginx/opip-control-center:ro
+      # The candidate base config carries the /dashboard/v2 include, so the V2
+      # snippet becomes reachable without deploying the whole trading stack.
+      - ${OPIP_UI_TREE:?exact release tree required}/deploy/nginx/dashboard-sidecar.conf:/etc/nginx/nginx.conf:ro
+      - ${OPIP_UI_TREE:?exact release tree required}/deploy/control-center/nginx:/etc/nginx/opip-control-center:ro
     # No new ports, credentials, networks, resource allowances, or trading services.

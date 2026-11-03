@@ -4,7 +4,11 @@ This directory contains the server-side pieces for audited GitHub-driven deploym
 
 ## Safety properties
 
-- GitHub Actions may request only `deploy <40-char-sha>` through the forced SSH key.
+- GitHub Actions may request only `deploy <40-char-sha>`, `deploy-ui
+  <40-char-sha>`, `rollback-ui <40-char-sha>` or `diagnose-learning` through the
+  forced SSH key. `deploy-ui`/`rollback-ui` are owner-gated and can only stage,
+  build and recreate the `ohm-dashboard-edge` service; they never name a trading,
+  writer, scanner, F11, paper, learning or analytics service.
 - The forced SSH key cannot open an interactive shell.
 - The server deploy command accepts only the exact commit currently at `origin/main`.
 - Deployments are serialized with a filesystem lock.

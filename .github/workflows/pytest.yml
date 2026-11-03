@@ -64,6 +64,7 @@ jobs:
           bash -n deploy/remote/ohm-deploy
           bash -n deploy/remote/ohm-deploy-ssh
           bash -n deploy/remote/lib/opip_release_tree.sh
+          bash -n deploy/remote/lib/opip_ui_release.sh
           bash -n deploy/remote/bootstrap-release-tree-controller.sh
           bash -n deploy/remote/reconcile-scheduler.sh
           bash -n deploy/remote/reconcile-stream-worker.sh

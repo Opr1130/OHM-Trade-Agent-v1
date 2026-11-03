@@ -27,3 +27,50 @@ Production acceptance gates:
 
 Rollback is the inverse, through the same owner-gated exact-SHA controller.
 Never manually modify or rewrite the tracked Nginx source on a live host.
+
+## Owner-gated UI-only release (existing controller, edge service only)
+
+The merged source does **not** need a full trading-stack deploy to become
+reachable. The existing controller gained one bounded mode:
+
+| Owner action (comment on the approval issue, owner only) | Host command | Effect |
+| --- | --- | --- |
+| `/deploy-ui <40-hex main SHA>` | `deploy-ui` → `ohm-deploy ui-deploy <sha>` | stage, build, recreate **only** `ohm-dashboard-edge` |
+| `/rollback-ui <40-hex active UI SHA>` | `rollback-ui` → `ohm-deploy rollback-ui <sha>` | restore the captured previous edge |
+
+Guarantees of that path:
+
+- Same forced-command SSH key, same `/var/lock/ohm-deploy.lock`, same
+  exact-`main`-SHA owner approval and green-CI requirement as `/deploy`.
+- It never names `ohm-trade-agent`, `opip-canonical-writer`, the scanner, F11,
+  paper/Freqtrade, learning or analytics; it never passes `--remove-orphans` and
+  never runs a bare `docker compose -f ...v2.yml up`.
+- The Nginx base config and the V2 snippet are mounted from the
+  manifest-verified candidate tree staged at
+  `/var/lib/ohm-deploy/staging/<sha>/tree/OHM-Trade-Agent-v1`, so the
+  `/dashboard/v2` include arrives **without** deploying the older-running core.
+- Preflight (fail closed, no mutation): candidate files + include, Compose
+  graph (image pin, exact mounts, `read_only`, ports 443/8443 only), `nginx -t`
+  with the real certificate mount, disk/RAM budget, and a captured rollback
+  vehicle.
+- Post-cutover gates: `/dashboard` (200 + legacy marker + 308 redirect),
+  `/dashboard/v2/` (200 + bundle), one hashed asset, unauthenticated
+  `/api/opip/*` refusals for the exact allowlisted methods, a denied
+  out-of-allowlist method, the 443 vhost (GET only, never a webhook POST), and
+  unchanged cgroup/port isolation. Any failure restores the previous edge and
+  re-verifies the legacy dashboard.
+- Receipts: `/var/lib/ohm-deploy/ui/receipts/<sha>.<utc>.env` (immutable per
+  attempt) plus an append-only `history.log`.
+
+One-time owner prerequisite after merge: the host still runs the pre-merge
+controller, so install the merged controller pair once from the droplet console
+(no deployment is performed by that step):
+
+```bash
+sudo -n bash /opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1/deploy/remote/bootstrap-release-tree-controller.sh --apply --sha <merged 40-hex>
+```
+
+That installs `ohm-deploy` and `ohm-deploy-ssh`; `reconcile-scheduler.sh` then
+keeps `opip_ui_release.sh` installed beside the controller on every later core
+release. After it, the single approval comment above is the whole release.
+
