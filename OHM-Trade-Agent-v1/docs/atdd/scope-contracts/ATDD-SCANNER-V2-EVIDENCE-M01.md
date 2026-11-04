@@ -101,6 +101,7 @@ AC-004 -> OHM-Trade-Agent-v1/tests/test_opip_scan_v2_evidence_v1.py
 AC-005 -> OHM-Trade-Agent-v1/control-center-v2/src/api.mjs
 AC-005 -> OHM-Trade-Agent-v1/control-center-v2/src/main.jsx
 AC-005 -> OHM-Trade-Agent-v1/control-center-v2/test/api.test.mjs
+AC-005 -> OHM-Trade-Agent-v1/control-center-v2/e2e/smoke.spec.mjs
 AC-005 -> OHM-Trade-Agent-v1/app/api/scoring_comparison.html
 AC-005 -> OHM-Trade-Agent-v1/tests/test_opip_control_center_v2_round2_v1.py
 AC-005 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
