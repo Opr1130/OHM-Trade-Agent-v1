@@ -1,0 +1,82 @@
+/* O'Pip Control Center V2 — semantic design tokens.
+ *
+ * Moondust: muted grey-blue supporting surfaces.
+ * Emerald:  verified success and analytical accent.
+ * Gold:     brand identity; used sparingly for premium emphasis.
+ * Ink:      primary text and structural contrast.
+ * Amber:    operational degradation (not failure).
+ * Red:      genuine risk, failed controls, dangerous state.
+ *
+ * Colour is never the only carrier of meaning: every state also renders a
+ * label and, where relevant, an icon and an accessible description.
+ */
+:root {
+  /* Moondust scale */
+  --op-bg: #0a0f14;
+  --op-surface-1: #111a22;
+  --op-surface-2: #16222c;
+  --op-surface-3: #1c2b37;
+  --op-border: #263a49;
+  --op-border-strong: #35505f;
+
+  /* Ink */
+  --op-ink: #eef4f8;
+  --op-ink-soft: #c2d2dd;
+  --op-ink-muted: #8ea4b4;
+
+  /* Emerald */
+  --op-emerald: #34d399;
+  --op-emerald-dim: #1d7a58;
+  --op-emerald-wash: rgba(52, 211, 153, 0.12);
+
+  /* Brushed gold */
+  --op-gold: #e6c478;
+  --op-gold-dim: #8a6f33;
+  --op-gold-wash: rgba(230, 196, 120, 0.12);
+
+  /* Warning amber / critical red */
+  --op-amber: #f2b544;
+  --op-amber-wash: rgba(242, 181, 68, 0.14);
+  --op-red: #f87171;
+  --op-red-wash: rgba(248, 113, 113, 0.14);
+
+  /* Typography and rhythm */
+  --op-font: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --op-mono: ui-monospace, "SF Mono", Consolas, "Liberation Mono", monospace;
+  --op-radius-sm: 8px;
+  --op-radius: 12px;
+  --op-radius-lg: 18px;
+  --op-space-1: 4px;
+  --op-space-2: 8px;
+  --op-space-3: 12px;
+  --op-space-4: 16px;
+  --op-space-5: 24px;
+  --op-space-6: 32px;
+  --op-shadow: 0 18px 40px rgba(0, 0, 0, 0.35);
+  --op-focus: 0 0 0 2px var(--op-bg), 0 0 0 4px var(--op-emerald);
+}
+
+*:focus-visible {
+  outline: none;
+  box-shadow: var(--op-focus);
+  border-radius: var(--op-radius-sm);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+.op-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}

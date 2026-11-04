@@ -1,32 +1,64 @@
-# O’Pip Control Center V2 — repository-native UI review candidate
+# O’Pip Operational Control Center V2
 
-This React/Vite console consumes **existing authenticated O’Pip endpoints**. It adds no production source writer, new database, scanner dependency, risk authority, funded-trading function or retention-deletion path. The old dashboard stays untouched.
+Evidence-led operator console for the O’Pip signal system. Every figure it shows
+is either read from canonical evidence (projected into a derived SQLite store) or
+rendered as an explicit `UNAVAILABLE`, `NO_EVIDENCE`, `STALE`, `INSUFFICIENT DATA`
+or `OUTCOME NOT MATURED` state.
 
-## Scope already wired
-- Operator-authenticated production summary, intelligence and zero-trade explanation
-- V1/V2 comparison from actual recorded evidence, with explicit NO_EVIDENCE and recorded model authority
-- Scanner/qualification exploration and JSON forensic detail
-- Advisory-only strategy draft read, optimistic-digest staging, activation and rollback through the existing two-header protected backend
-- Memory-only credentials, no stored secrets, CSV formula-injection hardening, JSON detail, responsive premium shell, and a CI build workflow.
+It has **no** trading authority: no funded order path, no F11 override, no scanner
+admission change, no learning or Committee activation, and no canonical-evidence
+write path.
 
-## Nonclaims and remaining gates
-- **Not yet mounted** at /dashboard/v2 on Nginx, and **not deployed**. The Vite base is a target output path, not a deployment.
-- The F10 eight-page parity contract remains unsatisfied: dashboard read availability is not equivalent to canonical count/PnL parity. Semantically unavailable metrics remain unavailable.
-- There is no self-service live risk/F11 authority. Production strategy admin only permits an allowlisted advisory-policy diff; a separate server-side flag controls activation.
-- The extra re-entry field in the UI is a local user confirmation; server-side authorization uses the existing X-Webhook-Secret and X-Strategy-Admin-Secret. Do not describe it as a third independent backend credential.
-- The existing learning-droplet PostgreSQL platform must be runtime-inventoried before any standalone SQLite ingestion is authorized.
-- Automated 30-day retention for a new data plane is **not installed** by this PR; the standalone ZIP candidate remains isolated pending data-plane arbitration.
-- Cross-plane edge routing, TLS/auth, CI, browser E2E, canonical reconciliation, latency budgets and private deployment must be certified before activation.
+## What the console does
 
-## Local development (a review environment, never production)
+| Workspace | Source | Notes |
+| --- | --- | --- |
+| Persistent header | `/api/opip/control-center/health` | Environment, F11, reconciliation, scanner heartbeat, learning CPU/RAM, analytics DB size, config digest, deployed revision, sync age, auth state. |
+| KPI ribbon | same | Live V2 signals, V1/V2 attribution, AI agreement, strategy performance, retention & storage. |
+| Overview | `/api/analytics/summary`, `/api/analytics/intelligence`, `/api/opip/zero-trade-explanation`, `/api/opip/scoring-comparison` | Existing recorded payloads, unchanged. |
+| V1 / V2 Evidence | `/api/opip/control-center/signals` | Per-symbol V1 vs V2 with divergence classification, filters, sorting, keyset pagination, CSV/JSON export, forensics drawer. |
+| Qualification | `/api/opip/control-center/scanner` | Attempt-by-attempt funnel; stages without an evidence source are named, not filled in. |
+| Intelligence | `/api/opip/control-center/ai` | Real inference rows or an informative empty state; no invented curves. |
+| Operations | header payload | F11, reconciliation, scanner heartbeat and revision as separate observable facts. |
+| Data & Retention | `/api/opip/control-center/data` | Source coverage, ingestion lag, quarantine, aging, retention policy and bounded maintenance actions. |
+| Config Admin | `/api/opip/control-center/config` | Schema-driven eight-domain registry, staging with audit note and optimistic concurrency, plus the existing protected advisory activation/rollback. |
+
+## Deliberate non-claims
+
+- **No matured attribution.** Avoided losses, missed winners, agreement rate,
+  win rate and expectancy stay `OUTCOME NOT MATURED` / `INSUFFICIENT DATA` until
+  matched outcome evidence is projected.
+- **No qualification inference.** Qualified and rejected candidate counts have no
+  registered source, so they render `UNAVAILABLE` rather than being derived from
+  score thresholds.
+- **No F11 claim.** There is no persisted protection artifact on the host, so the
+  header states `UNVERIFIED`. Only an artifact at `OPIP_F11_STATE_PATH` changes it.
+- **No learning-droplet telemetry.** There is no cross-host channel, so CPU/RAM
+  read `UNAVAILABLE` instead of an assumed value.
+- **No activation from this console.** Configuration staging is inert; activation
+  and rollback stay with the protected `/api/opip/strategy-admin/*` endpoints.
+- **No deletion.** Retention runs dry-run unless `OPIP_ENABLE_RETENTION_DELETE`
+  is separately authorized.
+- **Brand asset.** `src/format.mjs` declares the approved transparent logo path
+  `/assets/opip-control-center-logo-transparent.png`. If that file is absent the
+  header renders an explicit missing-asset mark — it never substitutes another
+  logo.
+
+## Local development (never production)
+
 ```bash
 cd OHM-Trade-Agent-v1/control-center-v2
 npm install
-npm test
-npm run build
-npm run dev
+npm test          # node unit tests for the pure presentation/API helpers
+npm run build     # production bundle
+npm run dev       # Vite dev server, /api proxied to 127.0.0.1:8000
 ```
-Vite dev proxies /api to the existing O'Pip backend on 127.0.0.1:8000; it is for development only.
 
-## Deployment restriction
-No automatic deployment is defined. Owner-approved exact-SHA release workflow remains the only production path. Do not merge or publish this UI until CI and parity-related security gates are complete.
+`npm run test:e2e` runs the Playwright smoke suite against the dev server.
+
+## Deployment
+
+Not deployed by this increment. The V2 edge overlay is opt-in and the only
+production path is the owner-gated UI-only release controller with an exact
+merged SHA; it deploys `ohm-dashboard-edge` only and leaves the trading core, the
+scanner, the canonical writer, F11, learning and the paper engines untouched.

@@ -453,6 +453,32 @@ class Settings(BaseSettings):
     opip_scan_dispatch_token_seconds: int = Field(default=120, ge=30, le=600)
     # Durable scan attempt/manifest root.
     opip_scan_state_dir: str = "/app/data/scan"
+    # --- O'Pip Control Center V2 analytical projection ---------------------
+    # Derived, reconstructable SQLite projection of already-written evidence.
+    # None of these settings grants trading, scoring, F11 or learning authority.
+    opip_analytics_db_path: str = "/app/data/opip/analytics/opip_analytics.db"
+    # Empty means "follow opip_scan_state_dir".
+    opip_analytics_scan_state_dir: str = ""
+    opip_analytics_scoring_comparison_path: str = (
+        "/app/data/opip/qualification/scoring_comparison.jsonl"
+    )
+    opip_analytics_retention_days: Literal[7, 15, 30, 60, 90] = 30
+    opip_analytics_ingest_batch_records: int = Field(default=500, ge=1, le=5000)
+    opip_analytics_ingest_max_bytes: int = Field(
+        default=2_097_152, ge=65_536, le=33_554_432
+    )
+    opip_analytics_busy_timeout_ms: int = Field(default=5_000, ge=100, le=60_000)
+    opip_analytics_query_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
+    opip_analytics_page_size_default: int = Field(default=50, ge=1, le=200)
+    opip_analytics_page_size_max: int = Field(default=200, ge=1, le=1_000)
+    opip_analytics_export_max_rows: int = Field(default=5_000, ge=1, le=50_000)
+    # Analytical retention deletion stays off until it is separately authorized.
+    opip_enable_retention_delete: bool = False
+    # Registered runtime-evidence artifacts. An absent artifact is reported as
+    # UNVERIFIED/UNAVAILABLE; it is never substituted with an assumed value.
+    opip_f11_state_path: str = "/app/data/opip/protection/protection_state.json"
+    opip_release_state_path: str = "/app/data/opip/release/runtime.json"
+    opip_learning_telemetry_path: str = "/app/data/opip/learning/telemetry.json"
     # A persistence chain survives a gap of up to interval * multiplier, so one
     # late scan does not reset it but a real outage does.
     signal_quality_continuity_multiplier: float = Field(default=2.5, ge=1.0, le=10.0)

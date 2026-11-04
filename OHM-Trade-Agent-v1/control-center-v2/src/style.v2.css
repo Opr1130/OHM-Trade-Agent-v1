@@ -1,0 +1,755 @@
+/* O'Pip Control Center V2 — surface restyle and new workspaces.
+ *
+ * Loaded after style.css so it can restyle the existing shell with tokens
+ * without renaming a single proven class or role.
+ */
+body {
+  background: var(--op-bg);
+  color: var(--op-ink);
+  font-family: var(--op-font);
+}
+
+.shell {
+  grid-template-columns: 244px minmax(0, 1fr);
+  background: var(--op-bg);
+}
+
+.sidebar {
+  background: linear-gradient(180deg, var(--op-surface-1), #0b1218);
+  border-right: 1px solid var(--op-border);
+  gap: var(--op-space-5);
+}
+
+.brand-icon {
+  border: 1px solid var(--op-gold-dim);
+  color: var(--op-gold);
+  background: radial-gradient(circle at 35% 20%, #23343f, #0c151b);
+  box-shadow: 0 0 22px rgba(230, 196, 120, 0.12);
+}
+
+.brand strong {
+  color: var(--op-gold);
+}
+
+.brand span,
+.sidebar-bottom span {
+  color: var(--op-ink-muted);
+}
+
+.nav {
+  color: var(--op-ink-muted);
+  border: 1px solid transparent;
+}
+
+.nav:hover {
+  background: var(--op-surface-2);
+  color: var(--op-ink);
+}
+
+.nav.selected {
+  color: var(--op-gold);
+  background: var(--op-surface-3);
+  border-color: var(--op-gold-dim);
+}
+
+.sidebar-bottom {
+  color: var(--op-emerald);
+  border-top: 1px solid var(--op-border);
+}
+
+.sidebar-bottom strong {
+  color: var(--op-gold);
+}
+
+main {
+  background: radial-gradient(ellipse at 85% 0%, #16222c 0%, #0a0f14 45%, #080c10 78%);
+  padding: var(--op-space-5) clamp(16px, 2.4vw, 40px);
+}
+
+.topbar h1 {
+  font-size: 26px;
+  letter-spacing: -0.01em;
+}
+
+.eyebrow {
+  color: var(--op-gold);
+  letter-spacing: 0.16em;
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+.muted {
+  color: var(--op-ink-muted);
+}
+
+.card {
+  background: var(--op-surface-1);
+  border: 1px solid var(--op-border);
+  border-radius: var(--op-radius);
+}
+
+.card-header h3 {
+  color: var(--op-ink);
+  font-size: 15px;
+}
+
+.status {
+  border-radius: 999px;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  padding: 3px 9px;
+  border: 1px solid var(--op-border-strong);
+  color: var(--op-ink-soft);
+  background: var(--op-surface-2);
+}
+
+.status.good {
+  color: #05130d;
+  background: var(--op-emerald);
+  border-color: var(--op-emerald);
+  font-weight: 700;
+}
+
+.status.bad {
+  color: #1a0505;
+  background: var(--op-red);
+  border-color: var(--op-red);
+  font-weight: 700;
+}
+
+.status.neutral {
+  color: var(--op-ink-soft);
+  background: var(--op-surface-2);
+}
+
+button {
+  background: var(--op-emerald);
+  color: #05130d;
+  border: 1px solid var(--op-emerald);
+  border-radius: var(--op-radius-sm);
+  padding: 9px 14px;
+  font-weight: 650;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+button.secondary {
+  background: var(--op-surface-2);
+  color: var(--op-ink);
+  border-color: var(--op-border-strong);
+}
+
+button.subtle {
+  background: transparent;
+  color: var(--op-gold);
+  border-color: var(--op-gold-dim);
+  padding: 5px 10px;
+  font-weight: 600;
+}
+
+button:disabled {
+  opacity: 0.42;
+}
+
+input,
+select,
+textarea {
+  background: var(--op-surface-2);
+  border: 1px solid var(--op-border-strong);
+  border-radius: var(--op-radius-sm);
+  color: var(--op-ink);
+  padding: 9px 11px;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+thead th {
+  text-align: left;
+  color: var(--op-ink-muted);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  border-bottom: 1px solid var(--op-border);
+  padding: 8px 10px;
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+}
+
+tbody td {
+  border-bottom: 1px solid rgba(38, 58, 73, 0.6);
+  padding: 9px 10px;
+  color: var(--op-ink-soft);
+  vertical-align: top;
+}
+
+tbody tr:hover {
+  background: var(--op-surface-2);
+}
+
+.numeric,
+code,
+.op-mono {
+  font-variant-numeric: tabular-nums;
+  font-family: var(--op-mono);
+}
+
+.notice {
+  background: var(--op-surface-2);
+  border: 1px solid var(--op-border-strong);
+  color: var(--op-ink-soft);
+  border-radius: var(--op-radius-sm);
+  padding: 10px 12px;
+}
+
+.notice-error,
+.error {
+  background: var(--op-red-wash);
+  border: 1px solid var(--op-red);
+  color: #ffd9d9;
+  border-radius: var(--op-radius-sm);
+  padding: 10px 12px;
+}
+
+.empty {
+  border: 1px dashed var(--op-border-strong);
+  border-radius: var(--op-radius);
+  color: var(--op-ink-muted);
+  background: rgba(255, 255, 255, 0.01);
+}
+
+/* --- Tier 0: persistent global command & safety header ------------------- */
+.op-header {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: grid;
+  grid-template-columns: minmax(180px, 0.9fr) 3fr;
+  gap: var(--op-space-4);
+  align-items: center;
+  padding: var(--op-space-3) var(--op-space-4);
+  margin-bottom: var(--op-space-4);
+  background: linear-gradient(180deg, rgba(17, 26, 34, 0.98), rgba(11, 18, 24, 0.96));
+  border: 1px solid var(--op-border);
+  border-radius: var(--op-radius-lg);
+  box-shadow: var(--op-shadow);
+  backdrop-filter: blur(6px);
+}
+
+.op-brand {
+  display: flex;
+  align-items: center;
+  gap: var(--op-space-3);
+  min-width: 0;
+}
+
+.op-logo {
+  height: 46px;
+  width: auto;
+  max-width: 104px;
+  object-fit: contain;
+  border-radius: 8px;
+  background: transparent;
+}
+
+.op-logo-fallback {
+  height: 46px;
+  min-width: 46px;
+  display: grid;
+  place-items: center;
+  padding: 0 10px;
+  border-radius: 10px;
+  border: 1px dashed var(--op-gold-dim);
+  color: var(--op-gold);
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  background: var(--op-gold-wash);
+}
+
+.op-brand-text {
+  min-width: 0;
+}
+
+.op-brand-text strong {
+  display: block;
+  color: var(--op-gold);
+  font-size: 16px;
+  letter-spacing: 0.04em;
+}
+
+.op-brand-text span {
+  display: block;
+  color: var(--op-ink-muted);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.op-header-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+  gap: var(--op-space-2);
+  min-width: 0;
+}
+
+.op-header-field {
+  background: var(--op-surface-2);
+  border: 1px solid var(--op-border);
+  border-radius: var(--op-radius-sm);
+  padding: 6px 9px;
+  min-width: 0;
+}
+
+.op-header-field span {
+  display: block;
+  color: var(--op-ink-muted);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.op-header-field strong {
+  display: block;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--op-ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.op-header-field.good strong {
+  color: var(--op-emerald);
+}
+
+.op-header-field.bad strong {
+  color: var(--op-red);
+}
+
+.op-header-field small {
+  display: block;
+  color: var(--op-ink-muted);
+  font-size: 9px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* --- Tier 1: KPI ribbon -------------------------------------------------- */
+.op-ribbon {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(232px, 1fr));
+  gap: var(--op-space-3);
+  margin-bottom: var(--op-space-4);
+}
+
+.op-kpi {
+  background: var(--op-surface-1);
+  border: 1px solid var(--op-border);
+  border-radius: var(--op-radius);
+  padding: var(--op-space-3) var(--op-space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--op-space-2);
+}
+
+.op-kpi header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--op-space-2);
+}
+
+.op-kpi header h3 {
+  margin: 0;
+  font-size: 13px;
+  color: var(--op-ink);
+}
+
+.op-kpi-rows {
+  display: grid;
+  gap: 3px;
+}
+
+.op-kpi-row {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--op-space-3);
+  font-size: 12px;
+}
+
+.op-kpi-row span {
+  color: var(--op-ink-muted);
+}
+
+.op-kpi-row strong {
+  font-variant-numeric: tabular-nums;
+  color: var(--op-ink);
+  text-align: right;
+}
+
+.op-kpi-row strong.bad {
+  color: var(--op-red);
+}
+
+.op-kpi-row strong.good {
+  color: var(--op-emerald);
+}
+
+.op-kpi footer {
+  border-top: 1px solid var(--op-border);
+  padding-top: var(--op-space-2);
+  color: var(--op-ink-muted);
+  font-size: 10px;
+  display: grid;
+  gap: 2px;
+}
+
+/* --- Toolbars, filters, chips ------------------------------------------- */
+.op-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--op-space-3);
+  margin-bottom: var(--op-space-3);
+}
+
+.op-field {
+  display: grid;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--op-ink-muted);
+  min-width: 120px;
+}
+
+.op-field input,
+.op-field select {
+  min-width: 0;
+}
+
+.op-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: var(--op-space-3);
+}
+
+.op-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--op-surface-2);
+  border: 1px solid var(--op-border-strong);
+  color: var(--op-ink-soft);
+  border-radius: 999px;
+  padding: 3px 6px 3px 10px;
+  font-size: 11px;
+}
+
+.op-chip button {
+  background: transparent;
+  border: 0;
+  color: var(--op-ink-muted);
+  padding: 0 4px;
+  font-size: 13px;
+  line-height: 1;
+}
+
+.op-chip button:hover {
+  color: var(--op-red);
+}
+
+.op-badge {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  border-radius: 999px;
+  padding: 2px 8px;
+  border: 1px solid var(--op-border-strong);
+  color: var(--op-ink-muted);
+  white-space: nowrap;
+}
+
+.op-badge.good {
+  color: var(--op-emerald);
+  border-color: var(--op-emerald-dim);
+  background: var(--op-emerald-wash);
+}
+
+.op-badge.bad {
+  color: var(--op-red);
+  border-color: var(--op-red);
+  background: var(--op-red-wash);
+}
+
+.op-badge.warn {
+  color: var(--op-amber);
+  border-color: var(--op-amber);
+  background: var(--op-amber-wash);
+}
+
+.op-banner {
+  display: flex;
+  align-items: center;
+  gap: var(--op-space-3);
+  border-radius: var(--op-radius);
+  padding: var(--op-space-3) var(--op-space-4);
+  font-size: 12px;
+  border: 1px solid var(--op-border-strong);
+  background: var(--op-surface-2);
+  color: var(--op-ink-soft);
+}
+
+.op-banner.bad {
+  border-color: var(--op-red);
+  background: var(--op-red-wash);
+  color: #ffe0e0;
+}
+
+.op-banner.warn {
+  border-color: var(--op-amber);
+  background: var(--op-amber-wash);
+  color: #ffeecb;
+}
+
+
+/* --- Workspaces, drawer, config console ---------------------------------- */
+.op-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: var(--op-space-3);
+}
+
+.op-tab {
+  background: transparent;
+  border: 1px solid var(--op-border-strong);
+  color: var(--op-ink-muted);
+  border-radius: 999px;
+  padding: 6px 14px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.op-tab[aria-selected='true'] {
+  color: var(--op-gold);
+  border-color: var(--op-gold-dim);
+  background: var(--op-gold-wash);
+}
+
+.op-stage-list {
+  display: grid;
+  gap: 6px;
+}
+
+.op-stage {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: var(--op-space-3);
+  align-items: center;
+  padding: 8px 10px;
+  border: 1px solid var(--op-border);
+  border-radius: var(--op-radius-sm);
+  background: var(--op-surface-2);
+  font-size: 12px;
+}
+
+.op-stage strong {
+  font-variant-numeric: tabular-nums;
+}
+
+.op-stage small {
+  color: var(--op-ink-muted);
+}
+
+.drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(3, 7, 10, 0.66);
+  display: flex;
+  justify-content: flex-end;
+  z-index: 40;
+}
+
+.drawer {
+  width: min(680px, 100vw);
+  height: 100%;
+  overflow-y: auto;
+  background: var(--op-surface-1);
+  border-left: 1px solid var(--op-gold-dim);
+  padding: var(--op-space-5);
+  box-shadow: var(--op-shadow);
+}
+
+.op-prov {
+  display: grid;
+  gap: 2px;
+  margin-top: var(--op-space-3);
+}
+
+.op-prov-row {
+  display: grid;
+  grid-template-columns: minmax(140px, 240px) 1fr;
+  gap: var(--op-space-3);
+  font-size: 12px;
+  padding: 5px 0;
+  border-bottom: 1px solid rgba(38, 58, 73, 0.5);
+}
+
+.op-prov-row span {
+  color: var(--op-ink-muted);
+}
+
+.op-prov-row strong {
+  font-family: var(--op-mono);
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+  color: var(--op-ink-soft);
+}
+
+.op-prov-row.missing strong {
+  color: var(--op-amber);
+}
+
+.op-config-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: var(--op-space-3);
+}
+
+.op-config-field {
+  border: 1px solid var(--op-border);
+  border-radius: var(--op-radius-sm);
+  background: var(--op-surface-2);
+  padding: var(--op-space-3);
+  display: grid;
+  gap: 6px;
+}
+
+.op-config-field label {
+  font-size: 12px;
+  color: var(--op-ink);
+  font-weight: 600;
+}
+
+.op-config-field p {
+  margin: 0;
+  font-size: 11px;
+  color: var(--op-ink-muted);
+}
+
+.op-config-field .op-config-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 10px;
+  color: var(--op-ink-muted);
+}
+
+.op-config-field input[type='range'] {
+  padding: 0;
+  accent-color: var(--op-emerald);
+}
+
+.op-config-field.op-invalid {
+  border-color: var(--op-red);
+}
+
+.op-config-error {
+  color: var(--op-red);
+  font-size: 11px;
+}
+
+.op-skeleton {
+  border-radius: var(--op-radius);
+  background: linear-gradient(90deg, var(--op-surface-2) 25%, var(--op-surface-3) 37%, var(--op-surface-2) 63%);
+  background-size: 400% 100%;
+  animation: op-shimmer 1.4s ease-in-out infinite;
+  min-height: 96px;
+}
+
+@keyframes op-shimmer {
+  0% {
+    background-position: 100% 0;
+  }
+  100% {
+    background-position: 0 0;
+  }
+}
+
+.op-footer {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: var(--op-space-3);
+  margin-top: var(--op-space-5);
+  padding-top: var(--op-space-3);
+  border-top: 1px solid var(--op-border);
+  color: var(--op-ink-muted);
+  font-size: 11px;
+}
+
+@media (max-width: 1080px) {
+  .shell {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    flex-direction: row;
+    align-items: center;
+    overflow-x: auto;
+    gap: var(--op-space-4);
+    padding: var(--op-space-3);
+    border-right: 0;
+    border-bottom: 1px solid var(--op-border);
+  }
+
+  .sidebar nav {
+    grid-auto-flow: column;
+    grid-auto-columns: max-content;
+    display: grid;
+    gap: 6px;
+  }
+
+  .sidebar-bottom {
+    display: none;
+  }
+
+  .op-header {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 720px) {
+  .op-prov-row {
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
+
+  .drawer {
+    width: 100vw;
+    padding: var(--op-space-4);
+  }
+
+  .op-stage {
+    grid-template-columns: 1fr auto;
+  }
+}
+
+@media print {
+  .sidebar,
+  .op-header,
+  .drawer-backdrop {
+    display: none;
+  }
+}
+
