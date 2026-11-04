@@ -4,9 +4,7 @@ Every assertion here exists because production ran for eleven comparison
 records with a shortlist of zero: the isolated worker serialised snapshots that
 carried no V2 evidence, the core ran with V2 production authority and selected
 nothing, and the result was indistinguishable from "the market produced no
-opportunities". They pin the two halves of the repair, and they are unit/contract regressions
-for a proven production defect rather than owner-approved ATDD criteria, so
-they deliberately claim no `acceptance` marker or increment binding:
+opportunities". They pin the two halves of the repair for ATDD-SCANNER-V2-EVIDENCE-M01:
 
 * a worker reports which of the two causes it hit (image too old, or attempt
   without the scoring authority), and
@@ -28,6 +26,7 @@ from app.services import scan_attempt as sa
 from app.services import scan_manifest as sm
 from app.services import scan_result_promotion as promo
 
+INCREMENT = "ATDD-SCANNER-V2-EVIDENCE-M01"
 APP_ROOT = Path(__file__).resolve().parents[1]
 NOW = datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc)
 
@@ -121,8 +120,9 @@ def _promote(settings, snapshots):
     return promo.load_promoted(settings=settings, attempt=attempt, now=_real_now())
 
 
+@pytest.mark.acceptance(f"{INCREMENT}/AC-002")
 def test_v2_authority_rejects_a_population_with_no_v2_evidence(tmp_path: Path):
-    """No silent V1 fall-back.
+    """ATDD-SCANNER-V2-EVIDENCE-M01/AC-002: No silent V1 fall-back.
 
     A population whose every row is ``NOT_COMPUTED`` is an acquisition pipeline
     defect, not a quiet market. It must be rejected with its own reason code so
@@ -145,8 +145,9 @@ def test_v2_authority_rejects_a_population_with_no_v2_evidence(tmp_path: Path):
     assert excinfo.value.reason == promo.REASON_V2_EVIDENCE_ABSENT
 
 
+@pytest.mark.acceptance(f"{INCREMENT}/AC-002")
 def test_v2_authority_rejects_a_population_that_errored_everywhere(tmp_path: Path):
-    """V2 was attempted and raised for every symbol: also a defect, not a market."""
+    """ATDD-SCANNER-V2-EVIDENCE-M01/AC-002: V2 was attempted and raised for every symbol: also a defect, not a market."""
     settings = _settings(tmp_path)
     blank = dict(
         v2_long_score=None,
@@ -166,8 +167,9 @@ def test_v2_authority_rejects_a_population_that_errored_everywhere(tmp_path: Pat
     assert excinfo.value.reason == promo.REASON_V2_EVIDENCE_ERROR
 
 
+@pytest.mark.acceptance(f"{INCREMENT}/AC-003")
 def test_v2_authority_accepts_attempted_but_insufficient_evidence(tmp_path: Path):
-    """Insufficient inputs are a real market outcome, not a pipeline defect.
+    """ATDD-SCANNER-V2-EVIDENCE-M01/AC-003: Insufficient inputs are a real market outcome, not a pipeline defect.
 
     The population is consumable, the selector still refuses every row, and no
     candidate is invented to hide it.
@@ -188,8 +190,9 @@ def test_v2_authority_accepts_attempted_but_insufficient_evidence(tmp_path: Path
     assert select_directional_candidates(list(promoted.snapshots), scoring_version="v2") == []
 
 
+@pytest.mark.acceptance(f"{INCREMENT}/AC-003")
 def test_v2_authority_promotes_a_genuine_v2_score(tmp_path: Path):
-    """A round-tripped V2 score reaches production selection unchanged."""
+    """ATDD-SCANNER-V2-EVIDENCE-M01/AC-003: A round-tripped V2 score reaches production selection unchanged."""
     from app.scanner.directional_candidates import select_directional_candidates
 
     settings = _settings(tmp_path)
@@ -203,8 +206,9 @@ def test_v2_authority_promotes_a_genuine_v2_score(tmp_path: Path):
     assert selected[0].technical_score == 88
 
 
+@pytest.mark.acceptance(f"{INCREMENT}/AC-002")
 def test_v1_authority_is_unchanged_by_the_v2_gate(tmp_path: Path):
-    """With V1 as production authority the V2 gate must not interfere."""
+    """ATDD-SCANNER-V2-EVIDENCE-M01/AC-002: With V1 as production authority the V2 gate must not interfere."""
     settings = _settings(tmp_path, opip_production_scoring_version="v1")
     snapshots = [
         _snapshot(symbol="BTCUSD", v2_feature_status="NOT_COMPUTED",
@@ -217,8 +221,9 @@ def test_v1_authority_is_unchanged_by_the_v2_gate(tmp_path: Path):
     assert len(promoted.snapshots) == 1
 
 
+@pytest.mark.acceptance(f"{INCREMENT}/AC-004")
 def test_worker_status_records_which_cause_it_hit():
-    """The image / configuration distinction is recorded with the evidence."""
+    """ATDD-SCANNER-V2-EVIDENCE-M01/AC-004: The image / configuration distinction is recorded with the evidence."""
     from app.jobs import scan_worker
 
     settings = SimpleNamespace(
@@ -243,8 +248,9 @@ def test_worker_status_records_which_cause_it_hit():
     }
 
 
+@pytest.mark.acceptance(f"{INCREMENT}/AC-004")
 def test_unconfigured_worker_reports_not_computed_for_every_row():
-    """The exact production signature: settings absent, nothing computed."""
+    """ATDD-SCANNER-V2-EVIDENCE-M01/AC-004: The exact production signature: settings absent, nothing computed."""
     from app.jobs import scan_worker
 
     settings = SimpleNamespace()
@@ -265,8 +271,9 @@ def test_unconfigured_worker_reports_not_computed_for_every_row():
     assert evidence["v2_evaluation_enabled"] is False
 
 
+@pytest.mark.acceptance(f"{INCREMENT}/AC-004")
 def test_scanner_service_carries_the_core_scoring_authority():
-    """The worker must be told the same scoring authority the core selects with.
+    """ATDD-SCANNER-V2-EVIDENCE-M01/AC-004: The worker must be told the same scoring authority the core selects with.
 
     Container environment is resolved at `docker compose run`, not baked into the
     image, so this is the half of the defect a rebuild alone cannot fix.
@@ -282,8 +289,9 @@ def test_scanner_service_carries_the_core_scoring_authority():
     assert "cap_drop:" in block
 
 
+@pytest.mark.acceptance(f"{INCREMENT}/AC-001")
 def test_release_controller_builds_proves_and_restores_the_scanner_image():
-    """The governed release owns the scanner image, not a manual build."""
+    """ATDD-SCANNER-V2-EVIDENCE-M01/AC-001: The governed release owns the scanner image, not a manual build."""
     controller = (APP_ROOT / "deploy/remote/ohm-deploy").read_text(encoding="utf-8")
 
     # Built from the same approved SHA as the core ...
@@ -300,8 +308,9 @@ def test_release_controller_builds_proves_and_restores_the_scanner_image():
     assert "OPIP_ROLLBACK_SCANNER=DECLARED_BY_RESTORED_RELEASE" in controller
 
 
+@pytest.mark.acceptance(f"{INCREMENT}/AC-001")
 def test_release_controller_refuses_an_incompatible_scanner_image():
-    """An image that is not this release, or cannot emit V2, blocks acceptance."""
+    """ATDD-SCANNER-V2-EVIDENCE-M01/AC-001: An image that is not this release, or cannot emit V2, blocks acceptance."""
     controller = (APP_ROOT / "deploy/remote/ohm-deploy").read_text(encoding="utf-8")
 
     assert 'SCANNER_IMAGE_PROBE="SCHEMA_V2_READY"' in controller
