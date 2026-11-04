@@ -20,7 +20,7 @@ test('dashboard shows real evidence classification and protects admin flow',asyn
  await page.getByPlaceholder('X-Webhook-Secret (session memory only)').fill('test-viewer');
  await page.getByRole('button',{name:'Refresh'}).click();
  await expect(page.getByText('SCAN:fixture')).toBeVisible();
- await expect(page.getByText('V2 production · V1 observation')).toBeVisible();
+ await expect(page.getByRole('table').getByText('V2 production · V1 observation')).toBeVisible();
  await page.getByRole('button',{name:'V1 / V2 Evidence'}).click();
  await expect(page.getByRole('heading',{name:'Recorded V2 production / V1 observation'})).toBeVisible();
  await page.getByRole('button',{name:'Config Admin'}).click();
@@ -47,7 +47,8 @@ test('late response from previous viewer credential never repopulates the consol
  const outgoing=page.waitForRequest(req=>req.url().includes('/api/analytics/summary'));
  await page.getByRole('button',{name:'Refresh'}).click();
  await outgoing;
- await viewer.fill('new-secret');
+ await page.getByRole('button',{name:'Change credential'}).click();
+ await page.getByPlaceholder('X-Webhook-Secret (session memory only)').fill('new-secret');
  await page.waitForTimeout(850);
  await expect(page.getByText('SCAN:old-secret')).toHaveCount(0);
  await expect(page.getByText('AWAITING EVIDENCE')).toBeVisible();

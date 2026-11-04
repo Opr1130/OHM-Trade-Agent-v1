@@ -33,3 +33,5 @@ docker-compose.override.yml
 # Control Center V2 build output (npm ci / vite build artifacts)
 control-center-v2/node_modules/
 control-center-v2/dist/
+control-center-v2/test-results/
+control-center-v2/playwright-report/
