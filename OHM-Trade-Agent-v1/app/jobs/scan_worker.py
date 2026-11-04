@@ -39,6 +39,43 @@ EXIT_REJECTED = 78
 STATUS_NAME = "worker_status.json"
 SNAPSHOTS_NAME = "snapshots.jsonl"
 
+V2_STATUS_NOT_COMPUTED = "NOT_COMPUTED"
+
+
+def _v2_evidence(settings: Any, snapshots: list[Any]) -> dict[str, Any]:
+    """Record the scoring provenance this worker actually produced.
+
+    "The image predates the V2 evidence fields" and "the image has them but the
+    attempt ran without the V2 scoring authority" have different remedies, and
+    both used to look identical downstream: N snapshots, no V2 status. The
+    answer is recorded here, beside the acquisition evidence, instead of being
+    inferred later from the absence of a field.
+    """
+    from dataclasses import fields as dataclass_fields
+
+    from app.scanner.models import MarketSnapshot
+
+    declared = {field.name for field in dataclass_fields(MarketSnapshot)}
+    counts: dict[str, int] = {}
+    for snapshot in snapshots:
+        status = str(getattr(snapshot, "v2_feature_status", "") or "")
+        key = status.split(":", 1)[0].strip() or V2_STATUS_NOT_COMPUTED
+        counts[key] = counts.get(key, 0) + 1
+    required = {"v2_long_score", "v2_short_score", "v2_feature_status", "v2_profile_digest"}
+    return {
+        "production_scoring_version": str(
+            getattr(settings, "opip_production_scoring_version", "") or ""
+        ),
+        "v2_evaluation_enabled": bool(
+            getattr(settings, "opip_score_v2_evaluation_enabled", False)
+        ),
+        # False means this IMAGE cannot emit V2 evidence at all, whatever the
+        # configuration says; True with all NOT_COMPUTED means the attempt ran
+        # without the scoring authority. Neither may stay silent.
+        "v2_fields_in_snapshot_schema": required.issubset(declared),
+        "v2_status_counts": dict(sorted(counts.items())),
+    }
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -111,6 +148,7 @@ def run(*, attempt_id: str, limit: int | None = None) -> int:
                 "attempt_id": attempt_id,
                 "state": "FAILED",
                 "reason_code": f"ACQUISITION_EXCEPTION_{type(exc).__name__.upper()}",
+                "scoring": _v2_evidence(settings, []),
                 "finished_at": _now().isoformat(),
             },
         )
@@ -130,6 +168,7 @@ def run(*, attempt_id: str, limit: int | None = None) -> int:
         os.fsync(handle.fileno())
 
     coverage = _coverage(result, requested_target)
+    scoring = _v2_evidence(settings, snapshots)
     complete = (
         coverage["requested"] > 0
         and coverage["analyzed"] == coverage["requested"]
@@ -160,6 +199,7 @@ def run(*, attempt_id: str, limit: int | None = None) -> int:
             "state": "COMPLETED" if complete else "PARTIAL",
             "reason_code": None if complete else "COVERAGE_INCOMPLETE",
             "coverage": coverage,
+            "scoring": scoring,
             "manifest_sha256": (manifest.get("snapshots") or {}).get("sha256"),
             "finished_at": _now().isoformat(),
         },

@@ -73,6 +73,80 @@ export function exportCsv(rows) {
   const headers=[...new Set(rows.flatMap(row=>Object.keys(row||{})))];
   return [headers.map(csvEscape).join(','),...rows.map(row=>headers.map(key=>csvEscape(row?.[key])).join(','))].join('\n');
 }
+// --- source-backed read shapes (Round 2) -----------------------------------
+// A recorded scan timestamp is UTC, and the reporting window is a UTC day
+// (`dashboard_read_model._scope_rows` compares `datetime.now(timezone.utc)`).
+// The local rendering is therefore shown BESIDE the UTC value, never instead of
+// it, so a 00:30Z scan cannot be read as "yesterday" by a local operator.
+export function utcWithLocal(iso){
+  if(!iso) return {utc:'Unknown',local:'—'};
+  const at=new Date(iso);
+  if(Number.isNaN(at.getTime())) return {utc:String(iso),local:'Unparsed'};
+  return {utc:at.toISOString().replace('.000Z','Z'),local:at.toLocaleString()};
+}
+function _count(value){
+  return typeof value==='number'&&Number.isFinite(value)?value:null;
+}
+// Ordered funnel over the fields the zero-trade explanation actually returns.
+// A field the server did not send is reported as unverified; it is never shown
+// as zero, because zero is a claim about the market and null is not.
+export function qualificationFunnel(explanation){
+  if(!explanation||typeof explanation!=='object') return [];
+  const stage=(label,key)=>({label,value:_count(explanation[key])});
+  return [
+    stage('Snapshot population analysed','candidates_analyzed'),
+    stage('Technical candidates','technical_candidates'),
+    stage('Long candidates','long_candidates'),
+    stage('Short candidates','short_candidates'),
+    stage('Shortlisted (directional)','directional_candidates'),
+    stage('Qualified','qualified'),
+    stage('Paper-admission eligible','paper_admission_eligible'),
+  ];
+}
+export function rejectionBreakdown(explanation){
+  if(!explanation||typeof explanation!=='object') return [];
+  const stage=(label,key)=>({label,value:_count(explanation[key])});
+  return [
+    stage('Rejected by policy','rejected_by_policy'),
+    stage('Rejected by budget','rejected_by_budget'),
+    stage('Rejected by model','rejected_by_model'),
+    stage('Rejected for other reasons','rejected_other'),
+    stage('Operational failures','operational_failures'),
+    stage('Incomplete evidence','incomplete'),
+  ];
+}
+// Five distinguishable advisory states. "Nothing reached the AI stage" must not
+// be displayed as a disabled provider, and an unreachable provider must not be
+// displayed as a pipeline failure.
+export function aiOperatingState(explanation){
+  if(!explanation||typeof explanation!=='object')
+    return {state:'NO_EVIDENCE',detail:'No zero-trade explanation was returned'};
+  const status=String(explanation.ai_invocation_status||'').toUpperCase();
+  if(explanation.ai_invoked===true){
+    if(status&&!['OK','SUCCESS','COMPLETED','INVOKED'].includes(status))
+      return {state:'FAILED_INVOCATION',
+        detail:status+(explanation.ai_failure_type?' · '+explanation.ai_failure_type:'')};
+    return {state:'INVOKED',
+      detail:'Advisory returned '+(_count(explanation.ai_candidates_returned)??0)+' candidate(s)'};
+  }
+  if(explanation.ai_budget_exhausted===true)
+    return {state:'BUDGET_EXHAUSTED',detail:'The advisory budget for this scan was exhausted'};
+  if(explanation.ai_unavailable===true)
+    return {state:'UNAVAILABLE',detail:'No advisory provider was reachable for this scan'};
+  if(explanation.ai_stage_reached===true)
+    return {state:'NO_INVOCATION',detail:'The advisory stage was reached and no request was made'};
+  return {state:'NOT_REACHED',detail:'No candidate reached the advisory stage'};
+}
+// The strategy-administration endpoints answer 404 when the capability is not
+// provisioned on the deployment. That is a deployment fact: it must never be
+// rendered as an empty form, a credential failure, or "not started yet".
+export function configAdminState(error){
+  const text=String(error?.message||error||'');
+  if(!text) return {state:'READY',detail:''};
+  if(/HTTP 404\b/.test(text)) return {state:'NOT_AVAILABLE',detail:text};
+  if(/HTTP 401\b|HTTP 403\b/.test(text)) return {state:'CREDENTIAL_REFUSED',detail:text};
+  return {state:'UNAVAILABLE',detail:text};
+}
 export async function apiRequest(path,{secret='',adminSecret='',method='GET',json,expectedDigest='',signal}={}) {
   if(!path.startsWith('/api/')) throw new Error('API path must be same-origin /api/');
   if (!secret.trim()) throw new Error('Viewer credential required');

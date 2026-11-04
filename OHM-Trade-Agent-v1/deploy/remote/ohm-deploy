@@ -43,6 +43,14 @@ SAFE_BASELINE_OVERRIDE="$STATE_DIR/safe-baseline-rollback.override.yml"
 PAPER_GENESIS_MARKER="$STATE_DIR/paper-registry-initialized-v1"
 SCHEDULER_RECONCILE="$APP_ROOT/deploy/remote/reconcile-scheduler.sh"
 PAPER_COMPOSE="$APP_ROOT/docker-compose.paper.yml"
+#: Isolated acquisition worker. A separate Compose service with its own
+#: image, so it must ship with the release instead of drifting behind it.
+SCANNER_SERVICE="opip-scan-worker"
+SCANNER_IMAGE_STATE="$STATE_DIR/scanner-image.env"
+SCANNER_IMAGE_ID=""
+SCANNER_IMAGE_REVISION=""
+SCANNER_IMAGE_PROBE="NOT_RUN"
+SCANNER_IMAGE_PREVIOUS=""
 # Export root and proof bounds, mirroring the exporter and the verification
 # helper. Kept explicit here so the deploy gate cannot drift from them.
 EXPORT_ROOT="/var/lib/opip-learning-export"
@@ -417,6 +425,113 @@ cleanup_snapshot() {
     rm -rf "$SCHEDULER_SNAPSHOT"
   fi
   rm -f "$SAFE_BASELINE_OVERRIDE"
+}
+
+# --- isolated acquisition worker (scanner) image ---------------------------
+#
+# `opip-scan-worker` is a SEPARATE Compose service with its own image, built from
+# the same Dockerfile but tagged per service. This controller rebuilt only the
+# core-side images, so the scanner image froze at whatever revision last built
+# it. The core then consumed snapshots serialised by an older worker that
+# carried no V2 evidence fields, reconstructed every one of them as
+# NOT_COMPUTED, and shortlisted nothing - a state indistinguishable from "the
+# market produced no opportunities" for eleven consecutive comparison records.
+#
+# The scanner image is therefore built from the SAME approved release as the
+# core, its immutable identity and source revision are recorded in the receipt,
+# the previous image is left on the host, and an incompatible or unprovable
+# scanner image blocks release acceptance instead of being activated.
+
+scanner_declared() {
+  docker compose -f docker-compose.yml config --services 2>/dev/null \
+    | grep -qx "$SCANNER_SERVICE"
+}
+
+# The image the host is currently on, read BEFORE the build replaces the tag.
+# Attempt containers are ephemeral, so this is often unresolvable; the previous
+# image is never deleted here, and rollback rebuilds the scanner from
+# `$PREVIOUS_SHA`, exactly as it already does for the core and the writer.
+current_scanner_image() {
+  local cid
+  cid="$(docker compose ps -q "$SCANNER_SERVICE" 2>/dev/null | head -n1)"
+  [[ -n "$cid" ]] || return 0
+  docker inspect --format '{{.Image}}' "$cid" 2>/dev/null || true
+}
+
+# A rebuild never interrupts an attempt: a running container keeps the image ID
+# it was created with. Recorded so the receipt states the truth rather than
+# implying the cutover was idle.
+scanner_attempt_active() {
+  local cid label
+  for cid in $(docker ps -q --filter 'label=opip.attempt_id' 2>/dev/null || true); do
+    label="$(docker inspect --format '{{ index .Config.Labels "opip.attempt_id" }}' "$cid" 2>/dev/null || true)"
+    if [[ -n "$label" && "$label" != "UNSET" ]]; then
+      printf 'YES'
+      return 0
+    fi
+  done
+  printf 'NO'
+}
+
+# Prove the built scanner image BEFORE anything is recreated: it must come from
+# the approved revision and must carry the V2 evidence schema the core's scoring
+# authority depends on. The probe container is never an attempt - its
+# `opip.attempt_id` label is UNSET, which the dispatcher's overlap fence can
+# never match - and it acquires nothing.
+verify_scanner_image() {
+  local name="opip-scan-probe-$$" rc=""
+  SCANNER_IMAGE_ID=""
+  SCANNER_IMAGE_REVISION=""
+  SCANNER_IMAGE_PROBE="NOT_RUN"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  if docker compose run -d --no-deps --name "$name" "$SCANNER_SERVICE" \
+    python -c 'import sys
+from dataclasses import fields
+from app.scanner.models import MarketSnapshot
+required = {"v2_long_score", "v2_short_score", "v2_feature_status", "v2_profile_digest"}
+missing = sorted(required - {field.name for field in fields(MarketSnapshot)})
+sys.exit("V2_EVIDENCE_FIELDS_ABSENT:" + ",".join(missing) if missing else 0)' \
+    >/dev/null 2>&1; then
+    timeout 120 docker wait "$name" >/dev/null 2>&1 || true
+    rc="$(docker inspect --format '{{.State.ExitCode}}' "$name" 2>/dev/null || echo unknown)"
+    SCANNER_IMAGE_ID="$(docker inspect --format '{{.Image}}' "$name" 2>/dev/null || true)"
+    if [[ "$rc" == "0" ]]; then
+      SCANNER_IMAGE_PROBE="SCHEMA_V2_READY"
+    else
+      SCANNER_IMAGE_PROBE="SCHEMA_INCOMPATIBLE_EXIT_${rc}"
+    fi
+    docker rm -f "$name" >/dev/null 2>&1 || true
+  else
+    SCANNER_IMAGE_PROBE="PROBE_LAUNCH_FAILED"
+  fi
+  if [[ -n "$SCANNER_IMAGE_ID" ]]; then
+    SCANNER_IMAGE_REVISION="$(docker image inspect \
+      --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
+      "$SCANNER_IMAGE_ID" 2>/dev/null || true)"
+  fi
+  mkdir -p "$STATE_DIR"
+  (
+    umask 077
+    printf '%s\n' \
+      "OPIP_SCANNER_IMAGE_ID=${SCANNER_IMAGE_ID:-UNPROVEN}" \
+      "OPIP_SCANNER_IMAGE_REVISION=${SCANNER_IMAGE_REVISION:-UNPROVEN}" \
+      "OPIP_SCANNER_IMAGE_SCHEMA=$SCANNER_IMAGE_PROBE" \
+      "OPIP_SCANNER_IMAGE_PREVIOUS=${SCANNER_IMAGE_PREVIOUS:-UNTRACKED}" \
+      > "$SCANNER_IMAGE_STATE"
+  )
+  echo "OPIP_SCANNER_IMAGE_ID=${SCANNER_IMAGE_ID:-UNPROVEN}"
+  echo "OPIP_SCANNER_IMAGE_REVISION=${SCANNER_IMAGE_REVISION:-UNPROVEN}"
+  echo "OPIP_SCANNER_IMAGE_SCHEMA=$SCANNER_IMAGE_PROBE"
+  echo "OPIP_SCANNER_IMAGE_PREVIOUS=${SCANNER_IMAGE_PREVIOUS:-UNTRACKED}"
+  if [[ "$SCANNER_IMAGE_PROBE" != "SCHEMA_V2_READY" ]]; then
+    echo "refusing release: isolated scanner image is not proven V2-capable ($SCANNER_IMAGE_PROBE)" >&2
+    return 1
+  fi
+  if [[ "$SCANNER_IMAGE_REVISION" != "$TARGET_SHA" ]]; then
+    echo "refusing release: scanner image revision ${SCANNER_IMAGE_REVISION:-UNPROVEN} is not the approved SHA $TARGET_SHA" >&2
+    return 1
+  fi
+  return 0
 }
 
 #: Fail-closed abort disposal: PRESERVE the pre-deploy scheduler transaction
@@ -1461,6 +1576,18 @@ rollback() {
     echo "OPIP_ROLLBACK_IRR_WORKER=ABSENT_FROM_RESTORED_RELEASE"
   fi
   # <<< opip-irr-rollback-detection
+  # The scanner image belongs to the restored release for the same reason the
+  # core does: it produces the snapshots the core scores, and an image from a
+  # later revision may emit evidence the restored core cannot consume. A
+  # restored release that predates the service simply has no scanner to build.
+  scanner_rollback_targets=()
+  if docker compose -f docker-compose.yml -f "$SAFE_BASELINE_OVERRIDE" \
+    config --services 2>/dev/null | grep -qx "$SCANNER_SERVICE"; then
+    scanner_rollback_targets=("$SCANNER_SERVICE")
+    echo "OPIP_ROLLBACK_SCANNER=DECLARED_BY_RESTORED_RELEASE"
+  else
+    echo "OPIP_ROLLBACK_SCANNER=ABSENT_FROM_RESTORED_RELEASE"
+  fi
   if [[ "${#irr_rollback_build_targets[@]}" -eq 0 ]]; then
     # The restored release cannot run the worker, so its activation state goes
     # with it: an entry, runner and pin that belong to the abandoned candidate
@@ -1476,7 +1603,8 @@ rollback() {
     config --services 2>/dev/null | grep -qx 'opip-canonical-writer'; then
     docker compose -f docker-compose.yml -f "$SAFE_BASELINE_OVERRIDE" \
       build --build-arg "OPIP_RELEASE_SHA=$PREVIOUS_SHA" \
-      opip-canonical-writer ohm-trade-agent "${irr_rollback_build_targets[@]}"
+      opip-canonical-writer ohm-trade-agent "${irr_rollback_build_targets[@]}" \
+      "${scanner_rollback_targets[@]}"
     docker compose -f docker-compose.yml -f "$SAFE_BASELINE_OVERRIDE" \
       up -d --remove-orphans opip-canonical-writer
     docker compose -f docker-compose.yml -f "$SAFE_BASELINE_OVERRIDE" \
@@ -1497,7 +1625,7 @@ rollback() {
   else
     docker compose -f docker-compose.yml -f "$SAFE_BASELINE_OVERRIDE" \
       build --build-arg "OPIP_RELEASE_SHA=$PREVIOUS_SHA" ohm-trade-agent \
-      "${irr_rollback_build_targets[@]}"
+      "${irr_rollback_build_targets[@]}" "${scanner_rollback_targets[@]}"
     # --remove-orphans drops a writer left from the failed PR 2 attempt.
     docker compose -f docker-compose.yml -f "$SAFE_BASELINE_OVERRIDE" \
       up -d --remove-orphans ohm-trade-agent
@@ -2151,8 +2279,26 @@ opip_write_core_env || {
 # This is the first production-runtime mutation on the success path.
 stop_paper_stack
 
+# The isolated acquisition worker is a separate service with its own image.
+# Include it whenever this release declares it, then prove it BEFORE anything is
+# recreated: an image that is not this release, or that cannot emit V2 evidence,
+# blocks acceptance rather than being activated.
+SCANNER_IMAGE_PREVIOUS="$(current_scanner_image)"
+scanner_build_targets=()
+if scanner_declared; then
+  scanner_build_targets=("$SCANNER_SERVICE")
+else
+  echo "OPIP_SCANNER_IMAGE=NOT_DECLARED_BY_CANDIDATE_RELEASE"
+fi
+echo "OPIP_SCANNER_ATTEMPT_ACTIVE_AT_BUILD=$(scanner_attempt_active)"
 docker compose build --build-arg "OPIP_RELEASE_SHA=$TARGET_SHA" \
-  opip-canonical-writer ohm-trade-agent opip-irr-shadow
+  opip-canonical-writer ohm-trade-agent opip-irr-shadow "${scanner_build_targets[@]}"
+if [[ "${#scanner_build_targets[@]}" -gt 0 ]]; then
+  verify_scanner_image || {
+    echo "OPIP_SCANNER_IMAGE_ACCEPTANCE=BLOCKED" >&2
+    false
+  }
+fi
 # Writer and core are independent services. Build/start both; validate each
 # separately. Never introduce Compose depends_on: condition=service_healthy
 # from ohm-trade-agent onto opip-canonical-writer.
