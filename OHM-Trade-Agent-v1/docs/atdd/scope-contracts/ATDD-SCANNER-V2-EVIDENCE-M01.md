@@ -78,6 +78,9 @@ FROZEN BOUNDARIES:
 ACCEPTANCE TEST TRACEABILITY:
 AC-001 -> tests/test_opip_scan_v2_evidence_v1.py::test_release_controller_builds_proves_and_restores_the_scanner_image
 AC-001 -> tests/test_opip_scan_v2_evidence_v1.py::test_release_controller_refuses_an_incompatible_scanner_image
+AC-001 -> tests/test_opip_scan_v2_evidence_v1.py::test_scanner_detection_activates_the_scanner_profile
+AC-001 -> tests/test_opip_scan_v2_evidence_v1.py::test_a_v2_release_without_a_declared_scanner_fails_closed
+AC-001 -> tests/test_opip_scan_v2_evidence_v1.py::test_rollback_still_tolerates_a_release_without_the_scanner_service
 AC-002 -> tests/test_opip_scan_v2_evidence_v1.py::test_v2_authority_rejects_a_population_with_no_v2_evidence
 AC-002 -> tests/test_opip_scan_v2_evidence_v1.py::test_v2_authority_rejects_a_population_that_errored_everywhere
 AC-002 -> tests/test_opip_scan_v2_evidence_v1.py::test_v1_authority_is_unchanged_by_the_v2_gate

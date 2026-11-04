@@ -442,9 +442,27 @@ cleanup_snapshot() {
 # the previous image is left on the host, and an incompatible or unprovable
 # scanner image blocks release acceptance instead of being activated.
 
+# `opip-scan-worker` is PROFILE-GATED (`profiles: [scanner]`), and
+# `docker compose config --services` lists only services whose profiles are
+# active. Without the explicit profile the service was invisible here while
+# `docker compose build opip-scan-worker` - which activates the profile
+# implicitly when the service is named - would have built it. Detection
+# therefore answered NOT_DECLARED for every release, the build target list
+# stayed empty, and the scanner image was never rebuilt.
 scanner_declared() {
-  docker compose -f docker-compose.yml config --services 2>/dev/null \
+  docker compose --profile scanner -f docker-compose.yml config --services 2>/dev/null \
     | grep -qx "$SCANNER_SERVICE"
+}
+
+# A release whose core selects with V2 production authority cannot function
+# without the isolated worker: that worker is the only process holding the
+# completed candles the V2 evidence is computed from. Such a release must
+# declare the scanner, or it is not releasable. A V1 release keeps the previous
+# behaviour, and a release restored by rollback is never blocked by this.
+release_requires_scanner() {
+  docker compose -f docker-compose.yml config 2>/dev/null \
+    | awk '/^  ohm-trade-agent:/ {inside=1; next} inside && /^  [^ ]/ {inside=0} inside' \
+    | grep -qE 'OPIP_PRODUCTION_SCORING_VERSION:[[:space:]]*"?v2"?'
 }
 
 # The image the host is currently on, read BEFORE the build replaces the tag.
@@ -1581,7 +1599,10 @@ rollback() {
   # later revision may emit evidence the restored core cannot consume. A
   # restored release that predates the service simply has no scanner to build.
   scanner_rollback_targets=()
-  if docker compose -f docker-compose.yml -f "$SAFE_BASELINE_OVERRIDE" \
+  # Same profile gate as forward detection. A restored release that predates
+  # the service simply has no scanner to build - that stays a safe, recorded
+  # no-op rather than a rollback failure.
+  if docker compose --profile scanner -f docker-compose.yml -f "$SAFE_BASELINE_OVERRIDE" \
     config --services 2>/dev/null | grep -qx "$SCANNER_SERVICE"; then
     scanner_rollback_targets=("$SCANNER_SERVICE")
     echo "OPIP_ROLLBACK_SCANNER=DECLARED_BY_RESTORED_RELEASE"
@@ -2287,6 +2308,15 @@ SCANNER_IMAGE_PREVIOUS="$(current_scanner_image)"
 scanner_build_targets=()
 if scanner_declared; then
   scanner_build_targets=("$SCANNER_SERVICE")
+elif release_requires_scanner; then
+  # Fail closed: a V2 release that cannot prove its scanner was declared would
+  # activate a core that selects from V2 evidence nothing can produce. Refuse
+  # before any service is recreated; the rollback trap restores the previous
+  # release.
+  echo "OPIP_SCANNER_IMAGE=UNDECLARED_FOR_V2_RELEASE"
+  echo "OPIP_SCANNER_IMAGE_ACCEPTANCE=BLOCKED"
+  echo "refusing release: the core selects with V2 production authority but this release declares no $SCANNER_SERVICE" >&2
+  false
 else
   echo "OPIP_SCANNER_IMAGE=NOT_DECLARED_BY_CANDIDATE_RELEASE"
 fi
