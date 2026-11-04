@@ -317,3 +317,104 @@ def test_release_controller_refuses_an_incompatible_scanner_image():
     assert "V2_EVIDENCE_FIELDS_ABSENT" in controller
     assert "is not the approved SHA $TARGET_SHA" in controller
     assert "isolated scanner image is not proven V2-capable" in controller
+
+
+
+# --- Round 3: profile-aware scanner discovery + fail-closed V2 releases ------
+
+
+def _compose_service_block(service: str) -> str:
+    """The named service block exactly as `docker compose config` renders it.
+
+    Compose normalises service keys to two-space indent, which is the shape the
+    controller's predicate parses, so the checked-in file is representative.
+    """
+    lines = (APP_ROOT / "docker-compose.yml").read_text(encoding="utf-8").splitlines()
+    block: list[str] = []
+    inside = False
+    for line in lines:
+        if line.rstrip() == f"  {service}:":
+            inside = True
+            continue
+        if inside and line.strip() and not line.startswith("   "):
+            break
+        if inside:
+            block.append(line)
+    return "\n".join(block)
+
+
+V2_PREDICATE_ERE = r'OPIP_PRODUCTION_SCORING_VERSION:[[:space:]]*"?v2"?'
+#: Same rule as the shell/grep ERE above, expressed for Python's `re`.
+V2_PREDICATE = r'OPIP_PRODUCTION_SCORING_VERSION:\s*"?v2"?'
+
+
+@pytest.mark.acceptance(f"{INCREMENT}/AC-001")
+def test_scanner_detection_activates_the_scanner_profile():
+    """ATDD-SCANNER-V2-EVIDENCE-M01/AC-001: discovery must see a profile-gated service.
+
+    `docker compose config --services` lists only services whose profiles are
+    active, so a scanner gated behind `profiles: [scanner]` was invisible and
+    every release reported NOT_DECLARED - which is exactly what production
+    printed at 03:17:59 despite the service being declared.
+    """
+    controller = (APP_ROOT / "deploy/remote/ohm-deploy").read_text(encoding="utf-8")
+    scanner_block = _compose_service_block("opip-scan-worker")
+
+    # The service really is profile-gated, which is why the flag is required.
+    assert "profiles:" in scanner_block and "- scanner" in scanner_block
+    # Forward discovery and rollback discovery both activate the profile.
+    assert (
+        "docker compose --profile scanner -f docker-compose.yml config --services"
+        in controller
+    )
+    assert (
+        'docker compose --profile scanner -f docker-compose.yml -f "$SAFE_BASELINE_OVERRIDE"'
+        in controller
+    )
+    # No un-profiled forward discovery survives.
+    assert "docker compose -f docker-compose.yml config --services" not in controller
+
+
+@pytest.mark.acceptance(f"{INCREMENT}/AC-001")
+def test_a_v2_release_without_a_declared_scanner_fails_closed():
+    """ATDD-SCANNER-V2-EVIDENCE-M01/AC-001: an unprovable scanner blocks a V2 release."""
+    import re
+
+    controller = (APP_ROOT / "deploy/remote/ohm-deploy").read_text(encoding="utf-8")
+    core_block = _compose_service_block("ohm-trade-agent")
+    v1_block = core_block.replace(
+        'OPIP_PRODUCTION_SCORING_VERSION: "v2"', 'OPIP_PRODUCTION_SCORING_VERSION: "v1"'
+    )
+
+    # The predicate reads the core service's scoring authority, not a guess.
+    assert "release_requires_scanner()" in controller
+    assert V2_PREDICATE_ERE in controller
+    # The dependency is real: this release's core selects with V2.
+    assert re.search(V2_PREDICATE, core_block), "core must select V2"
+    # A V1 core does not trip it.
+    assert not re.search(V2_PREDICATE, v1_block), "a V1 copy must not require the scanner"
+
+    # An undeclared scanner on a V2 release refuses release acceptance.
+    assert "elif release_requires_scanner; then" in controller
+    assert "OPIP_SCANNER_IMAGE=UNDECLARED_FOR_V2_RELEASE" in controller
+    assert "OPIP_SCANNER_IMAGE_ACCEPTANCE=BLOCKED" in controller
+    assert (
+        "the core selects with V2 production authority but this release declares no"
+        in controller
+    )
+
+
+@pytest.mark.acceptance(f"{INCREMENT}/AC-001")
+def test_rollback_still_tolerates_a_release_without_the_scanner_service():
+    """ATDD-SCANNER-V2-EVIDENCE-M01/AC-001: older releases keep a safe rollback."""
+    controller = (APP_ROOT / "deploy/remote/ohm-deploy").read_text(encoding="utf-8")
+    rollback = controller.split("  if docker compose --profile scanner", 1)[1]
+    body = rollback.split("  else\n", 1)[0]
+
+    # A restored release that predates the service is recorded, never fatal.
+    assert "scanner_rollback_targets=()" in controller
+    assert "OPIP_ROLLBACK_SCANNER=ABSENT_FROM_RESTORED_RELEASE" in controller
+    assert "OPIP_ROLLBACK_SCANNER=DECLARED_BY_RESTORED_RELEASE" in controller
+    # The tolerated branch performs no refusal.
+    assert "UNDECLARED_FOR_V2_RELEASE" not in body
+    assert "false" not in body
