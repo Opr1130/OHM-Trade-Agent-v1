@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import math
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 import uuid
 
 from app.scanner.models import MarketSnapshot
@@ -32,6 +32,49 @@ from app.services.scan_supervisor import attempt_evidence_dir, attempt_staging_d
 
 SNAPSHOTS_NAME = "snapshots.jsonl"
 PROMOTION_NAME = "promotion.json"
+
+V2_STATUS_NOT_COMPUTED = "NOT_COMPUTED"
+V2_STATUS_ERROR = "ERROR"
+REASON_V2_EVIDENCE_ABSENT = "V2_EVIDENCE_ABSENT"
+REASON_V2_EVIDENCE_ERROR = "V2_EVIDENCE_ERROR"
+
+
+def _v2_status(snapshot: Any) -> str:
+    """Normalise one snapshot's V2 readiness label (``ERROR:<Type>`` -> ``ERROR``)."""
+    raw = str(getattr(snapshot, "v2_feature_status", "") or "")
+    return raw.split(":", 1)[0].strip() or V2_STATUS_NOT_COMPUTED
+
+
+def _require_v2_evidence(settings: Any, snapshots: Sequence[MarketSnapshot]) -> None:
+    """Fail closed, with an explicit reason, when V2 authority got no V2 evidence.
+
+    Under V2 production authority the selector already refuses every snapshot
+    that is not ``READY``, which is the correct fail-closed behaviour. On its
+    own, though, that is indistinguishable from "the market produced nothing": a
+    worker that computes no V2 at all serialises its snapshots, the selector
+    yields an empty shortlist and the run looks legitimate. That is exactly the
+    state an acquisition image predating the V2 evidence fields produces.
+
+    So the systemic cases are separated here, once, before qualification:
+
+    * every snapshot ``NOT_COMPUTED`` - V2 was never attempted. Either the worker
+      image predates the V2 evidence fields or the worker ran without the V2
+      scoring authority. Both are pipeline defects, never market conditions.
+    * every snapshot ``ERROR`` - V2 was attempted and raised for every symbol.
+
+    A population that WAS attempted and is merely short of inputs
+    (``INSUFFICIENT_FEATURES``) is a real market-data outcome and stays with the
+    selector and the recorded comparison evidence.
+    """
+    if str(getattr(settings, "opip_production_scoring_version", "v1")) != "v2":
+        return
+    if not snapshots:
+        return
+    statuses = {_v2_status(snapshot) for snapshot in snapshots}
+    if statuses == {V2_STATUS_NOT_COMPUTED}:
+        raise PromotionRejected(REASON_V2_EVIDENCE_ABSENT)
+    if statuses == {V2_STATUS_ERROR}:
+        raise PromotionRejected(REASON_V2_EVIDENCE_ERROR)
 
 
 class PromotionRejected(RuntimeError):
@@ -220,6 +263,10 @@ def load_promoted(
         raise PromotionRejected("MANIFEST_COVERAGE_MISSING")
     if int(coverage.get("analyzed") or 0) != len(snapshots):
         raise PromotionRejected("COVERAGE_SNAPSHOT_DISAGREEMENT")
+
+    # V2 production authority may only consume acquisition evidence that
+    # actually carries V2 scoring. Never a silent fall-back to V1.
+    _require_v2_evidence(settings, snapshots)
 
     return PromotedScan(
         attempt_id=attempt.attempt_id,

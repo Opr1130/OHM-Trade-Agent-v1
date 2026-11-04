@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {modelAuthority,evidenceStatus,objectSummary,exportCsv,sanitizeJsonExport,apiRequest,statusLevel,readState} from '../src/api.mjs';
+import {modelAuthority,evidenceStatus,objectSummary,exportCsv,sanitizeJsonExport,apiRequest,statusLevel,readState,utcWithLocal,qualificationFunnel,rejectionBreakdown,aiOperatingState,configAdminState} from '../src/api.mjs';
 test('V2 authority derives only from recorded evidence',()=>{
  assert.equal(modelAuthority({model_authority:'V2_PRODUCTION_V1_OBSERVATION'}),'V2 production · V1 observation');
  assert.equal(modelAuthority({}), 'UNVERIFIED');
@@ -61,4 +61,46 @@ test('CSV export keeps real numbers as numbers and still neutralises formulas',(
  assert.equal(exportCsv([{symbol:'BTC/USD'}]),'symbol\nBTC/USD');
  assert.equal(exportCsv([{note:'profit fell -3.2%'}]),'note\nprofit fell -3.2%');
 });
+
+// --- Round 2: source-backed Control Center reads -----------------------------
+test('a scan timestamp is shown in UTC with the local rendering beside it',()=>{
+ const stamp=utcWithLocal('2026-11-03T00:30:00Z');
+ assert.equal(stamp.utc,'2026-11-03T00:30:00Z');
+ assert.ok(stamp.local.length>0);
+ assert.deepEqual(utcWithLocal(null),{utc:'Unknown',local:'—'});
+});
+test('the qualification funnel keeps an unreturned field unverified, never zero',()=>{
+ const stages=qualificationFunnel({candidates_analyzed:200,qualified:0});
+ assert.deepEqual(stages.map(s=>s.label),[ 'Snapshot population analysed','Technical candidates',
+  'Long candidates','Short candidates','Shortlisted (directional)','Qualified',
+  'Paper-admission eligible']);
+ assert.equal(stages[0].value,200);
+ assert.equal(stages[1].value,null);
+ assert.equal(stages[5].value,0);
+ assert.deepEqual(qualificationFunnel(null),[]);
+});
+test('the rejection breakdown reports the recorded rejection classes only',()=>{
+ const rows=rejectionBreakdown({rejected_by_policy:0,rejected_by_model:3});
+ assert.equal(rows.find(r=>r.label==='Rejected by model').value,3);
+ assert.equal(rows.find(r=>r.label==='Rejected by policy').value,0);
+ assert.equal(rows.find(r=>r.label==='Rejected by budget').value,null);
+});
+test('AI operating states stay distinct: never reached, no invocation, unavailable, budget, failed, invoked',()=>{
+ assert.equal(aiOperatingState(null).state,'NO_EVIDENCE');
+ assert.equal(aiOperatingState({ai_stage_reached:false}).state,'NOT_REACHED');
+ assert.equal(aiOperatingState({ai_stage_reached:true}).state,'NO_INVOCATION');
+ assert.equal(aiOperatingState({ai_stage_reached:true,ai_unavailable:true}).state,'UNAVAILABLE');
+ assert.equal(aiOperatingState({ai_stage_reached:true,ai_budget_exhausted:true}).state,'BUDGET_EXHAUSTED');
+ assert.equal(aiOperatingState({ai_invoked:true,ai_invocation_status:'TIMEOUT'}).state,'FAILED_INVOCATION');
+ const invoked=aiOperatingState({ai_invoked:true,ai_invocation_status:'OK',ai_candidates_returned:2});
+ assert.equal(invoked.state,'INVOKED');
+ assert.match(invoked.detail,/2 candidate/);
+});
+test('an unavailable strategy-admin capability is not a credential or an empty form',()=>{
+ assert.equal(configAdminState(null).state,'READY');
+ assert.equal(configAdminState(new Error('HTTP 404: Strategy administration not enabled')).state,'NOT_AVAILABLE');
+ assert.equal(configAdminState(new Error('HTTP 401: Invalid dashboard secret')).state,'CREDENTIAL_REFUSED');
+ assert.equal(configAdminState(new Error('HTTP 503: unavailable')).state,'UNAVAILABLE');
+});
+
 

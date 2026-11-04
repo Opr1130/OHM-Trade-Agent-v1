@@ -1,7 +1,7 @@
 import React,{useEffect,useRef,useState} from 'react';
 import{createRoot}from'react-dom/client';
 import{Activity,ArrowDownToLine,BarChart3,BrainCircuit,ChartNoAxesCombined,Check,ChevronRight,CircleAlert,ClipboardList,Database,GitCompareArrows,LockKeyhole,RefreshCw,RotateCcw,Search,Settings2,ShieldCheck,SlidersHorizontal}from'lucide-react';
-import{apiRequest,modelAuthority,evidenceStatus,objectSummary,exportCsv,sanitizeJsonExport,statusLevel,readState}from'./api.mjs';
+import{apiRequest,modelAuthority,evidenceStatus,objectSummary,exportCsv,sanitizeJsonExport,statusLevel,readState,utcWithLocal,qualificationFunnel,rejectionBreakdown,aiOperatingState,configAdminState}from'./api.mjs';
 import './style.css';
 const NAV=[
  ['Overview',Activity],['V1 / V2 Evidence',GitCompareArrows],['Qualification',SlidersHorizontal],
@@ -28,6 +28,9 @@ function EvidenceTable({response,onSelect}) {
 }
 function Empty({title,detail}){return <div className="empty"><CircleAlert size={21}/><strong>{title}</strong><p>{detail}</p></div>}
 function Card({title,children,action}){return <section className="card"><div className="card-header"><h3>{title}</h3>{action}</div>{children}</section>}
+// Ordered, source-backed funnel. A field the server did not send renders as
+// 'Not verified' rather than 0: zero is a claim about the market.
+function Funnel({stages,empty}){if(!stages.length)return <p className="muted">{empty}</p>;return <div className="pairs">{stages.map(stage=><div className="pair" key={stage.label}><span>{stage.label}</span><strong>{stage.value===null?'Not verified':String(stage.value)}</strong></div>)}</div>}
 function ConfigAdmin({secret}){
  const[adminSecret,setAdminSecret]=useState('');
  const[activationSecret,setActivationSecret]=useState('');
@@ -40,6 +43,10 @@ function ConfigAdmin({secret}){
  const[messageError,setMessageError]=useState(false);
  const[busy,setBusy]=useState(false);
  const[diff,setDiff]=useState([]);
+ // Round 2: the strategy-administration endpoints answer 404 when the
+ // capability is not provisioned. That is classified once, here, so the
+ // console cannot present an unusable form as if it were ready.
+ const[availability,setAvailability]=useState('READY');
  // `ok` and `fail` are the only two ways a message may be produced, so a refused
  // or failed operation can never be rendered in the confirmation style.
  const ok=text=>{setMessage(text);setMessageError(false)};
@@ -54,8 +61,8 @@ function ConfigAdmin({secret}){
    apiRequest('/api/opip/strategy-admin/draft',baseHeaders),
    apiRequest('/api/opip/strategy-admin/active',baseHeaders)
   ]);if(generation!==authGeneration.current)return;
-  setDraft(d);setActive(a);setDocument(JSON.stringify(d.document,null,2));ok('Loaded server-side advisory configuration.');setDiff([]);
- }catch(e){if(generation===authGeneration.current)fail(e.message)}finally{if(generation===authGeneration.current)setBusy(false)}}
+  setDraft(d);setActive(a);setDocument(JSON.stringify(d.document,null,2));setAvailability('READY');ok('Loaded server-side advisory configuration.');setDiff([]);
+ }catch(e){if(generation===authGeneration.current){const state=configAdminState(e);setAvailability(state.state);fail(state.detail)}}finally{if(generation===authGeneration.current)setBusy(false)}}
  function changes(next){
   if(!draft?.document)return[];
   const old=draft.document,results=[];
@@ -102,6 +109,16 @@ function ConfigAdmin({secret}){
   }catch(e){if(generation===authGeneration.current)fail(e.message)}
   finally{if(generation===authGeneration.current)setBusy(false)}
  }
+ if(availability!=='READY')return <div className="stack">
+ <Card title="Configuration administration unavailable">
+ <Empty title="Strategy administration is not enabled on this deployment"
+ detail={availability==='NOT_AVAILABLE'
+ ?'The backend answered HTTP 404 for /api/opip/strategy-admin/*, so this release has no draft, activation or rollback capability to offer.'
+ :'The backend refused the configuration read ('+availability+'): '+(message||'no detail')}/>
+ <p className="muted">Nothing here is hidden by the console: the capability is absent server-side. No credential is requested, no write is attempted, and no protected functionality is activated.</p>
+ </Card>
+ {message&&<p className="error notice-error" role="alert">{message}</p>}
+ </div>;
  return <div className="stack">
  <Card title="Protected advisory configuration"><p className="muted">Existing O’Pip backend controls runtime validation and authorized advisory-only activation. This console cannot alter funded trading, F11, or hard-coded provider secrets.</p>
  <div className="input-row"><label>Strategy Admin secret<input type="password" autoComplete="off" value={adminSecret} onChange={e=>setAdminSecret(e.target.value)} placeholder="Admin credential (memory only)"/></label><button onClick={load} disabled={busy||!secret||!adminSecret}>Load Active & Draft</button></div>
@@ -127,28 +144,52 @@ function App(){
  const[busy,setBusy]=useState(false);
  const[selected,setSelected]=useState(null);
  const[search,setSearch]=useState('');
+ // Collapse the credential entry once a read has been accepted, and offer an
+ // explicit re-entry. The value never reaches storage of any kind.
+ const[credentialLocked,setCredentialLocked]=useState(false);
  const requestGeneration=useRef(0);
+ useEffect(()=>{setCredentialLocked(false)},[secret]);
  useEffect(()=>{requestGeneration.current+=1;setRecords({});setErrors({});setLoadedAt('');setSelected(null);setBusy(false)},[secret,scope]);
  async function refresh(){if(!secret.trim())return;const generation=++requestGeneration.current;setBusy(true);const endpoints={...READS,summary:'/api/analytics/summary?scope='+scope,intelligence:'/api/analytics/intelligence?scope='+scope};
   const requestedSecret=secret;
   const results=await Promise.allSettled(Object.entries(endpoints).map(async([key,path])=>[key,await apiRequest(path,{secret:requestedSecret})]));
   if(generation!==requestGeneration.current)return;
   const got={},errs={};results.forEach((result,i)=>{const key=Object.keys(endpoints)[i];if(result.status==='fulfilled')got[key]=result.value[1];else errs[key]=String(result.reason?.message||'Unavailable')});
-  setRecords(got);setErrors(errs);setLoadedAt(new Date().toISOString());setBusy(false)}
+  setRecords(got);setErrors(errs);setLoadedAt(new Date().toISOString());setBusy(false)
+  if(Object.keys(got).length)setCredentialLocked(true)}
  const comparisonStatus=evidenceStatus(records.comparisons);
- const cards=[['V1 / V2 comparison',comparisonStatus],['Qualification evidence',readState(records.zero,errors.zero)],['Analytics summary',readState(records.summary,errors.summary)],['F11 verification','NOT ATTESTED']];
+ const latestComparison=Array.isArray(records.comparisons?.rows)?records.comparisons.rows[0]:null;
+ const ai=aiOperatingState(records.zero);
+ // Every figure below is read from a recorded payload. A value the server did
+ // not return is 'Not verified', never 0 and never a hard-coded green.
+ const count=(value,of)=>typeof value==='number'?(of===undefined?String(value):value+' / '+of):'Not verified';
+ const aiEvidence=records.zero?{invoked:records.zero.ai_invoked,invocation_status:records.zero.ai_invocation_status,failure_type:records.zero.ai_failure_type,eligible_before_ai:records.zero.ai_eligible_candidates_before_ai,returned_by_ai:records.zero.ai_candidates_returned,confidence:records.zero.ai_confidence_distribution,budget_exhausted:records.zero.ai_budget_exhausted,unavailable:records.zero.ai_unavailable}:null;
+ const cards=[
+  ['Model authority',modelAuthority(latestComparison)],
+  ['V1 / V2 comparison',comparisonStatus],
+  ['Scanned (latest comparison)',latestComparison?count(latestComparison.scanned):'Not verified'],
+  ['V2 features ready',latestComparison?count(latestComparison.v2_ready,latestComparison.scanned):'Not verified'],
+  ['V1 shortlist',Array.isArray(latestComparison?.v1_top)?String(latestComparison.v1_top.length):'Not verified'],
+  ['V2 shortlist (production)',Array.isArray(latestComparison?.v2_top)?String(latestComparison.v2_top.length):'Not verified'],
+  ['Qualified (last scan)',records.zero?count(records.zero.qualified):'Not verified'],
+  ['Paper-admission eligible',records.zero?count(records.zero.paper_admission_eligible):'Not verified'],
+  ['AI advisory',ai.state],
+  ['Qualification evidence',readState(records.zero,errors.zero)],
+  ['Analytics summary',readState(records.summary,errors.summary)],
+  ['F11 verification','NOT ATTESTED'],
+ ];
  const filtered=Array.isArray(records.comparisons?.rows)?records.comparisons.rows.filter(row=>JSON.stringify(row).toLowerCase().includes(search.toLowerCase())):[];
  return <div className="shell">
  <aside className="sidebar"><div className="brand"><div className="brand-icon">◈</div><div><strong>O’Pip</strong><span>Operational Control Center</span></div></div>
  <nav aria-label="Main navigation">{NAV.map(([name,Icon])=><button className={'nav '+(section===name?'selected':'')} key={name} onClick={()=>{setSection(name);setSelected(null)}}><Icon size={18}/>{name}</button>)}</nav>
  <div className="sidebar-bottom"><ShieldCheck size={19}/><div>TRADING AUTHORITY<strong>UNCHANGED</strong><span>Read-only operational surface</span></div></div></aside>
  <main><header className="topbar"><div><span className="eyebrow">O'PIP / OPERATIONS</span><h1>{section}</h1><p>Evidence-led visibility · no inferred profits · safety-first configuration</p></div><div className="top-actions"><Status value={loadedAt?'SNAPSHOT LOADED':'AWAITING EVIDENCE'}/><button className="secondary" disabled={busy||!secret.trim()} onClick={refresh}><RefreshCw size={16}/>{busy?'Loading':'Refresh'}</button></div></header>
- <div className="auth-bar"><label>Operator API credential<input type="password" value={secret} onChange={e=>setSecret(e.target.value)} autoComplete="off" placeholder="X-Webhook-Secret (session memory only)" /></label><label>Window<select value={scope} onChange={e=>setScope(e.target.value)}><option value="all">All recorded</option><option value="today">Today</option></select></label><span className="muted">Last fetched: {loadedAt?new Date(loadedAt).toLocaleString():'Never'}</span></div>
+ <div className="auth-bar">{credentialLocked?<><span className="muted">Credential held in this tab's memory only · never written to browser storage</span><button className="secondary" onClick={()=>{setCredentialLocked(false);setSecret('')}}>Change credential</button></>:<label>Operator API credential<input type="password" value={secret} onChange={e=>setSecret(e.target.value)} autoComplete="off" placeholder="X-Webhook-Secret (memory only)" /></label>}<label>Window<select value={scope} onChange={e=>setScope(e.target.value)}><option value="all">All recorded</option><option value="today">Today (UTC day)</option></select></label><span className="muted">Last fetched: {loadedAt?utcWithLocal(loadedAt).utc+' (local '+utcWithLocal(loadedAt).local+')':'Never'} · window boundaries are UTC</span></div>
  {!secret&&<div className="notice" role="status"><LockKeyhole size={17}/> Enter the existing O’Pip operator credential and select Refresh. No credentials are persisted.</div>}
  {section==='Overview'&&<div className="stack"><div className="metric-grid">{cards.map(([name,value])=><div className="metric" key={name}><span>{name}</span><Status value={value}/></div>)}</div><div className="cols"><Card title="Production analytics"><Pairs data={records.summary}/>{errors.summary&&<p className="error">{errors.summary}</p>}</Card><Card title="Why zero trades?"><Pairs data={records.zero}/>{errors.zero&&<p className="error">{errors.zero}</p>}</Card></div><Card title="Comparison evidence"><EvidenceTable response={records.comparisons} onSelect={setSelected}/>{errors.comparisons&&<p className="error">{errors.comparisons}</p>}</Card></div>}
  {section==='V1 / V2 Evidence'&&<div className="stack"><Card title="Recorded V2 production / V1 observation"><p className="muted">Authority is read from each recorded comparison. Missing records are displayed as missing evidence, not as zero signals.</p><div className="input-row"><label>Filter recorded scans<input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Scan ID or symbol"/></label><button className="secondary" disabled={!filtered.length} onClick={()=>download(exportCsv(filtered),'opip-v1-v2-evidence.csv','text/csv')}><ArrowDownToLine size={16}/> Export visible rows</button></div><EvidenceTable response={{status:records.comparisons?.status,rows:filtered}} onSelect={setSelected}/></Card></div>}
- {section==='Qualification'&&<Card title="Qualification funnel and decision trace">{records.zero?<Inspection object={records.zero}/>:<Empty title="Qualification evidence unavailable" detail={errors.zero||'Refresh to request the server-side zero-trade explanation'}/>}</Card>}
- {section==='Intelligence'&&<Card title="AI, outcomes and performance"><p className="muted">The intelligence read model is authoritative only for its observed and qualified fields. It does not create a live AI recommendation.</p>{records.intelligence?<Inspection object={records.intelligence}/>:<Empty title="Intelligence evidence unavailable" detail={errors.intelligence||'Refresh to query the intelligence read model'}/>}</Card>}
+ {section==='Qualification'&&<div className="stack"><Card title="Where candidates stopped">{records.zero?<div className="stack"><p className="muted">{String(records.zero.explanation||'No explanation sentence was recorded')}</p><Funnel stages={qualificationFunnel(records.zero)} empty="No funnel fields were returned"/><span className="muted">Dominant terminal gate: {String(records.zero.dominant_terminal_gate||'Not verified')} · deepest stage reached: {String(records.zero.deepest_stage_reached||'Not verified')} · scan: {String(records.zero.scan_id||'Not verified')} · observed: {utcWithLocal(records.zero.last_scan_at_utc).utc}</span></div>:<Empty title="Qualification evidence unavailable" detail={errors.zero||'Refresh to request the server-side zero-trade explanation'}/>}</Card><Card title="Rejection breakdown">{records.zero?<Funnel stages={rejectionBreakdown(records.zero)} empty="No rejection fields were returned"/>:<Empty title="No rejection evidence" detail={errors.zero||'No zero-trade explanation was returned'}/>}</Card><Card title="Nearest misses" action={<span className="muted">Recorded evidence only, never a recommendation</span>}>{Array.isArray(records.zero?.nearest_misses)&&records.zero.nearest_misses.length?<Inspection object={records.zero.nearest_misses}/>:<p className="muted">No nearest-miss records were returned for this scan.</p>}</Card></div>}
+ {section==='Intelligence'&&<div className="stack"><Card title="AI advisory operating state"><div className="inline-stats"><Status value={ai.state}/><span>{ai.detail}</span></div><Pairs data={aiEvidence}/><p className="muted">A stage that was never reached is not a disabled provider, and an unreachable provider is not a pipeline failure: each state is shown as recorded.</p></Card><Card title="Intelligence read model">{records.intelligence?<><Pairs data={records.intelligence}/><details><summary>Advanced JSON evidence</summary><Inspection object={records.intelligence}/></details></>:<Empty title="Intelligence evidence unavailable" detail={errors.intelligence||'Refresh to query the intelligence read model'}/>}</Card></div>}
  {section==='Operations'&&<div className="cols"><Card title="Analytical diagnostics"><Pairs data={records.intelligence?.data_platform||records.intelligence}/><p className="muted">CPU, memory, reconciliation and learning readiness require authoritative host telemetry; unknown is not healthy.</p></Card><Card title="Data freshness"><Pairs data={records.intelligence?.freshness||records.summary}/><Status value="LIVE HOST ATTESTATION UNVERIFIED"/></Card></div>}
  {section==='Config Admin'&&<ConfigAdmin secret={secret}/>}
  <footer><span>O’Pip · Review candidate — not an execution system</span><span>No funded trading controls · No F11 override · No automated retention deletion</span></footer>

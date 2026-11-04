@@ -11,56 +11,85 @@ strong{font-size:25px}table{border-collapse:collapse;width:100%;overflow:auto}th
 button,input{padding:9px;border:1px solid #6385a5;border-radius:8px;background:#162f49;color:#fff}
 button{cursor:pointer}input{min-width:220px}.status{color:#e6c789}.controls{display:flex;gap:10px;flex-wrap:wrap}
 </style></head><body>
-<header><div><h1>O'Pip — V1 / V2 Scoring</h1><div class="sub">Observational comparison • Not a trade recommendation • V2 not production active</div></div><a href="/dashboard">Back to Intelligence Cockpit</a></header>
-<div class="panel"><div class="controls"><input type="password" id="secret" placeholder="Existing OHM operator secret" autocomplete="off"><button id="unlock">Unlock / refresh</button><button id="refresh">Refresh</button></div><p id="status" class="status" role="status">No data loaded</p><small>Uses the same restricted, read-only dashboard API. Updates every 30 seconds; market scans run on their own schedule.</small></div>
+<header><div><h1>O'Pip — V1 / V2 Scoring</h1><div class="sub">Paired V1 / V2 evidence • Not a trade recommendation • Model authority is read from each record, never assumed</div></div><a href="/dashboard">Back to Intelligence Cockpit</a></header>
+<div class="panel"><div class="controls"><span id="entry"><input type="password" id="secret" placeholder="Existing operator credential (memory only)" autocomplete="off"><button id="unlock">Unlock / refresh</button></span><span id="locked" hidden><span class="sub">Credential held in this tab memory only · never persisted</span><button id="change">Change credential</button></span><button id="refresh">Refresh</button></div><p id="status" class="status" role="status">No data loaded</p><small>Uses the same restricted, read-only dashboard API. Updates every 30 seconds; market scans run on their own schedule. Every timestamp is UTC.</small></div>
 <div class="cards" id="cards"></div>
 <div class="panel"><h2>Paired candidate selection</h2><div id="compare">No recorded comparison yet.</div></div>
-<div class="panel"><h2>Indicator-level scores</h2><div style="overflow:auto"><table><thead><tr><th>Coin</th><th>V1 LONG</th><th>V1 SHORT</th><th>V2 LONG</th><th>V2 SHORT</th><th>V2 evidence</th></tr></thead><tbody id="scores"></tbody></table></div></div>
+<div class="panel"><h2>Indicator-level scores</h2><div style="overflow:auto"><table><thead><tr><th>Coin</th><th>V1 LONG</th><th>V1 SHORT</th><th>V2 LONG</th><th>V2 SHORT</th><th>V2 status</th><th>Selection reason</th></tr></thead><tbody id="scores"></tbody></table></div></div>
 <div class="panel"><h2>Recent scan timestamps</h2><ul id="history"></ul><small>Forward-outcome and profitability results are not available in this view until independently matured and joined.</small></div>
 <script>
 "use strict";
 const $=id=>document.getElementById(id);
 const build=(tag,text)=>{const el=document.createElement(tag);el.textContent=String(text);return el;};
 function cell(row,tag,value){row.appendChild(build(tag,value===null||value===undefined?"—":value));}
+// The credential is held in this tab's memory only. It is never written to
+// sessionStorage, localStorage or a cookie, and is dropped when the tab closes
+// or when the operator explicitly changes it.
+let credential="";
+function authority(row){
+ if(!row||typeof row!=="object")return "UNVERIFIED";
+ const value=String(row.model_authority||"");
+ if(value==="V2_PRODUCTION_V1_OBSERVATION")return "V2 production · V1 observation";
+ if(value==="V1_PRODUCTION_V2_OBSERVATION")return "V1 production · V2 observation";
+ return "UNVERIFIED";
+}
+function v2Label(row){return authority(row)==="V2 production · V1 observation"
+ ?"V2 shortlist (production authority)":"V2 shortlist (observation only)";}
+function v1Label(row){return authority(row)==="V2 production · V1 observation"
+ ?"V1 shortlist (observation only)":"V1 shortlist (production authority)";}
+function lock(on){$("entry").hidden=on;$("locked").hidden=!on;$("secret").value="";}
 function render(row,all){
  $('cards').replaceChildren();
  for(const [name,value] of [
-  ["Scan",row.scan_id],["Time (UTC)",row.observed_at_utc],["Scanned",row.scanned],
-  ["V2 features ready",row.v2_ready+" / "+row.scanned],
-  ["V1 shortlisted",(row.v1_top||[]).length],["V2 hypothetical shortlist",(row.v2_top||[]).length],
+  ["Model authority",authority(row)],
+  ["Scan",row.scan_id],["Observed (UTC)",row.observed_at_utc],["Scanned",row.scanned],
+  ["V2 features ready",(row.v2_ready===undefined?"Not verified":row.v2_ready)+" / "+row.scanned],
+  [v1Label(row),(row.v1_top||[]).length],[v2Label(row),(row.v2_top||[]).length],
+  ["V1 threshold",row.v1_threshold],["V2 threshold",row.v2_threshold],
   ["V1-only",(row.v1_only||[]).length],["V2-only",(row.v2_only||[]).length],
  ]){
   const box=build("div","");box.append(build("small",name),document.createElement("br"),build("strong",value));
   $('cards').appendChild(box);
  }
  const p=$('compare');p.replaceChildren();
- for(const [name,items] of [["V1 production",row.v1_top||[]],["V2 hypothetical (not active)",row.v2_top||[]]]){
+ for(const [name,items] of [[v1Label(row),row.v1_top||[]],[v2Label(row),row.v2_top||[]]]){
   const div=document.createElement("div");div.append(build("h3",name));
   div.append(build("p",items.map(i=>i.symbol+" "+i.direction+" ("+i.score+")").join(" • ")||"No candidates"));
   p.appendChild(div);
  }
+ // Selection reason is derived from the recorded status, not inferred: a row
+ // that was never computed is not the same as one that lacks inputs.
  const tbody=$('scores');tbody.replaceChildren();
  for(const c of row.candidates||[]){
   const tr=document.createElement("tr");
   for(const field of ["symbol","v1_long","v1_short","v2_long","v2_short","v2_status"])cell(tr,"td",c[field]);
+  const status=String(c.v2_status||"");
+  cell(tr,"td",status==="READY"?"V2 evidence ready"
+   :status==="NOT_COMPUTED"?"V2 never computed for this snapshot"
+   :status==="INSUFFICIENT_FEATURES"?"Inputs insufficient at this point in time"
+   :status.indexOf("ERROR")===0?"V2 scoring raised "+status.slice(6):"No recorded reason");
   tbody.appendChild(tr);
  }
  const history=$('history');history.replaceChildren();
- for(const item of all){const li=build("li",item.observed_at_utc+" — scan "+item.scan_id);history.appendChild(li);}
+ for(const item of all){const li=build("li",item.observed_at_utc+" (UTC) — scan "+item.scan_id);history.appendChild(li);}
 }
 async function load(){
- const secret=sessionStorage.getItem("ohmDashboardSecret");
- if(!secret){$('status').textContent="Enter the existing operator secret.";return;}
+ if(!credential){$('status').textContent="Enter the existing operator credential.";return;}
  try{
-  const result=await fetch("/api/opip/scoring-comparison",{headers:{"X-Webhook-Secret":secret},cache:"no-store"});
+  const result=await fetch("/api/opip/scoring-comparison",{headers:{"X-Webhook-Secret":credential},cache:"no-store"});
+  if(result.status===401){credential="";lock(false);$('status').textContent="Credential refused (HTTP 401). Re-enter it.";return;}
   if(!result.ok)throw Error("Dashboard API returned "+result.status);
   const payload=await result.json();
-  if(!Array.isArray(payload.rows)||!payload.rows.length){$('status').textContent="No comparison evidence yet. V2 evaluation may still be disabled.";return;}
-  $('status').textContent="Read-only comparison loaded. Outcome labels pending.";
+  const status=String(payload.status||"");
+  if(status==="UNAVAILABLE"){$('status').textContent="Comparison evidence is unavailable (the read failed). This is not an empty result.";return;}
+  if(!Array.isArray(payload.rows)||!payload.rows.length){$('status').textContent="No comparison evidence recorded yet. That is not evidence of a disabled model or of zero opportunity.";return;}
+  lock(true);
+  $('status').textContent="Read-only comparison loaded · "+authority(payload.rows[0]);
   render(payload.rows[0],payload.rows);
  }catch(e){$('status').textContent="Unable to load: "+e.message;}
 }
-$('unlock').onclick=()=>{const value=$('secret').value.trim();if(value){sessionStorage.setItem("ohmDashboardSecret",value);$('secret').value="";}load();};
+$('unlock').onclick=()=>{const value=$('secret').value.trim();if(value)credential=value;load();};
+$('change').onclick=()=>{credential="";lock(false);$('status').textContent="Re-enter the operator credential.";};
 $('refresh').onclick=load;
 setInterval(load,30000);
 load();

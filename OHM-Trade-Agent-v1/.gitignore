@@ -29,3 +29,7 @@ Thumbs.db
 
 # Docker
 docker-compose.override.yml
+
+# Control Center V2 build output (npm ci / vite build artifacts)
+control-center-v2/node_modules/
+control-center-v2/dist/
