@@ -1,3 +1,5 @@
+import {bytes, isNumber, metric, payloadState} from './format.mjs';
+
 const REQUEST_LIMIT_MS=12000;
 // Only explicitly verified positive states receive a positive visual treatment.
 // Substring matching would misclassify INACTIVE, UNHEALTHY and NOT_READY.
@@ -165,3 +167,336 @@ export async function apiRequest(path,{secret='',adminSecret='',method='GET',jso
     return data;
   }finally{clearTimeout(timeout);signal?.removeEventListener('abort',abort)}
 }
+
+// --- Round 3: Control Center V2 operational surfaces ------------------------
+// Every path below is one of the explicit same-origin routes the V2 edge
+// allowlists. Nothing here can reach an unlisted endpoint.
+export const ENDPOINTS = Object.freeze({
+  summary: '/api/analytics/summary',
+  intelligence: '/api/analytics/intelligence',
+  zero: '/api/opip/zero-trade-explanation',
+  comparisons: '/api/opip/scoring-comparison',
+  health: '/api/opip/control-center/health',
+  signals: '/api/opip/control-center/signals',
+  forensics: '/api/opip/control-center/forensics',
+  scanner: '/api/opip/control-center/scanner',
+  ai: '/api/opip/control-center/ai',
+  data: '/api/opip/control-center/data',
+  config: '/api/opip/control-center/config',
+  configPreview: '/api/opip/control-center/config/preview',
+  configStage: '/api/opip/control-center/config/stage',
+  ingest: '/api/opip/control-center/maintenance/ingest',
+  reconcile: '/api/opip/control-center/maintenance/reconcile',
+  retention: '/api/opip/control-center/maintenance/retention',
+});
+
+const F11_STATES = ['ARMED', 'TRIGGERED_HALT', 'OVERRIDE_SHADOW'];
+
+/** F11 never renders as healthy unless a recorded state proves it. */
+export function f11Display(protection) {
+  if (!protection || typeof protection !== 'object')
+    return {label: 'UNVERIFIED', level: 'bad', detail: 'No protection evidence was returned'};
+  const state = String(protection.state || '').toUpperCase();
+  if (protection.status === 'MEASURED' && state === 'ARMED')
+    return {label: 'ARMED', level: 'good', detail: protection.source || null};
+  if (protection.status === 'MEASURED' && F11_STATES.includes(state))
+    return {label: state, level: 'bad', detail: protection.reason_code || protection.source || null};
+  if (protection.status === 'MEASURED' && state)
+    return {label: `UNKNOWN (${state})`, level: 'bad', detail: 'Unrecognised protection state'};
+  return {
+    label: 'UNVERIFIED',
+    level: 'bad',
+    detail: protection.reason_code || 'No persisted protection state artifact',
+  };
+}
+
+export function scannerHealth(scanner) {
+  if (!scanner || typeof scanner !== 'object')
+    return {label: 'UNAVAILABLE', level: 'bad', detail: 'No scanner evidence'};
+  if (scanner.status !== 'MEASURED')
+    return {label: 'UNAVAILABLE', level: 'bad', detail: scanner.reason_code || null};
+  const outcome = String(scanner.acquisition_outcome || scanner.state || 'RECORDED').toUpperCase();
+  const good = outcome === 'COMPLETED';
+  return {
+    label: outcome,
+    level: good ? 'good' : 'bad',
+    detail: scanner.attempt_id
+      ? `${scanner.attempt_id} · ${scanner.age_seconds ? Math.round(scanner.age_seconds) + 's ago' : 'age unknown'}`
+      : null,
+  };
+}
+
+export function reconciliationDisplay(reconciliation) {
+  if (!reconciliation || typeof reconciliation !== 'object')
+    return {label: 'UNVERIFIED', level: 'bad', detail: 'No reconciliation run recorded'};
+  const state = String(reconciliation.state || 'UNVERIFIED').toUpperCase();
+  if (state === 'RECONCILED')
+    return {label: 'RECONCILED', level: 'good', detail: reconciliation.run_id || null};
+  if (state === 'DRIFT_DETECTED')
+    return {label: 'DRIFT DETECTED', level: 'bad', detail: reconciliation.detail || null};
+  return {
+    label: state.replaceAll('_', ' '),
+    level: 'bad',
+    detail: reconciliation.reason_code || reconciliation.detail || null,
+  };
+}
+
+
+/** The persistent global header, as data. Order is deliberate. */
+export function headerFields(health, {authenticated = false} = {}) {
+  const runtime = health?.runtime || {};
+  const projection = health?.projection || {};
+  const f11 = f11Display(runtime.protection);
+  const scanner = scannerHealth(runtime.scanner);
+  const reconciliation = reconciliationDisplay(projection.reconciliation || {});
+  const learning = runtime.learning || {};
+  const environment = runtime.environment || {};
+  const release = runtime.release || {};
+  const configVersion = runtime.config_version || {};
+  const learningMeasured = learning.status === 'MEASURED';
+  const dbMeasured = typeof projection.db_bytes === 'number';
+  const synced = health?.generated_at_utc ? utcWithLocal(health.generated_at_utc) : null;
+  return [
+    {
+      id: 'environment',
+      label: 'Environment',
+      value: environment.label || 'UNVERIFIED',
+      level: 'neutral',
+      detail: environment.release_profile || environment.raw || null,
+    },
+    {id: 'f11', label: 'F11 safety', value: f11.label, level: f11.level, detail: f11.detail},
+    {
+      id: 'reconciliation',
+      label: 'Reconciliation',
+      value: reconciliation.label,
+      level: reconciliation.level,
+      detail: reconciliation.detail,
+    },
+    {id: 'scanner', label: 'Scanner heartbeat', value: scanner.label, level: scanner.level, detail: scanner.detail},
+    {
+      id: 'learning_cpu',
+      label: 'Learning CPU',
+      value: learningMeasured ? `${learning.cpu_pct}%` : 'UNAVAILABLE',
+      level: learningMeasured ? 'neutral' : 'bad',
+      detail: learningMeasured ? null : learning.reason_code || null,
+    },
+    {
+      id: 'learning_ram',
+      label: 'Learning RAM',
+      value:
+        learningMeasured && typeof learning.memory_used_mib === 'number'
+          ? `${learning.memory_used_mib} / ${learning.memory_total_mib ?? '?'} MiB`
+          : 'UNAVAILABLE',
+      level: learningMeasured ? 'neutral' : 'bad',
+      detail: learningMeasured ? null : learning.reason_code || null,
+    },
+    {
+      id: 'db',
+      label: 'Analytics DB',
+      value: dbMeasured ? bytes(projection.db_bytes) : 'UNAVAILABLE',
+      level: dbMeasured ? 'neutral' : 'bad',
+      detail: projection.wal_bytes ? `WAL ${bytes(projection.wal_bytes)}` : null,
+    },
+    {
+      id: 'config',
+      label: 'Config version',
+      value: configVersion.digest ? String(configVersion.digest).slice(0, 12) : 'UNVERIFIED',
+      level: configVersion.status === 'MEASURED' ? 'neutral' : 'bad',
+      detail: configVersion.authority || configVersion.reason_code || null,
+    },
+    {
+      id: 'release',
+      label: 'Deployed revision',
+      value: release.deployed_sha ? String(release.deployed_sha).slice(0, 12) : 'UNAVAILABLE',
+      level: release.status === 'MEASURED' ? 'neutral' : 'bad',
+      detail: release.source || release.reason_code || null,
+    },
+    {
+      id: 'sync',
+      label: 'Last synchronized',
+      value: synced ? synced.utc : 'UNVERIFIED',
+      level: synced ? 'neutral' : 'bad',
+      detail: synced ? `local ${synced.local}` : null,
+    },
+    {
+      id: 'auth',
+      label: 'Authentication',
+      value: authenticated ? 'AUTHENTICATED' : 'NOT AUTHENTICATED',
+      level: authenticated ? 'good' : 'bad',
+      detail: authenticated ? 'credential held in this tab only' : null,
+    },
+  ];
+}
+
+
+function _cardRow(label, value, level = 'neutral') {
+  return {label, value, level};
+}
+
+/** Tier 1 KPI ribbon, as data. Absence is always explicit. */
+export function kpiCards(health) {
+  const projection = health?.projection || {};
+  const kpi = projection.kpi || {};
+  const comparison = projection.comparison || null;
+  const ai = projection.ai || {};
+  const retention = projection.retention || {};
+  const preview = projection.retention_preview || {};
+  const reconciliation = reconciliationDisplay(projection.reconciliation || {});
+  const v2Status = projection.v2_status || {};
+  const measured = projection.status === 'MEASURED' && kpi.status === 'MEASURED';
+  const projectionState = measured ? 'MEASURED' : payloadState(projection, []);
+  const cards = [];
+
+  cards.push({
+    id: 'signals',
+    title: 'Live V2 signals',
+    status: projectionState,
+    rows: [
+      _cardRow('Symbols scanned', metric(kpi.symbols_scanned)),
+      _cardRow('V2 features ready', metric(kpi.v2_ready), isNumber(kpi.v2_ready) ? 'neutral' : 'bad'),
+      _cardRow('V2 directional candidates', metric(kpi.v2_directional), isNumber(kpi.v2_directional) ? 'neutral' : 'bad'),
+      _cardRow('Qualified signals', 'UNAVAILABLE', 'bad'),
+      _cardRow('Rejected candidates', 'UNAVAILABLE', 'bad'),
+      _cardRow('V2 not computed', metric(v2Status.NOT_COMPUTED), isNumber(v2Status.NOT_COMPUTED) && v2Status.NOT_COMPUTED > 0 ? 'bad' : 'neutral'),
+      _cardRow('Last successful scan', kpi.last_observed_at_utc ? utcWithLocal(kpi.last_observed_at_utc).utc : 'UNVERIFIED'),
+    ],
+    note: kpi.qualification_reason
+      ? `Qualification: ${String(kpi.qualification_reason).replaceAll('_', ' ').toLowerCase()}`
+      : null,
+    source: 'scanner_snapshots (derived projection)',
+    observedAt: kpi.last_observed_at_utc || null,
+  });
+
+  const v1Count = Array.isArray(comparison?.v1_top) ? comparison.v1_top.length : null;
+  const v2Count = Array.isArray(comparison?.v2_top) ? comparison.v2_top.length : null;
+  cards.push({
+    id: 'attribution',
+    title: 'V1 vs V2 alpha attribution',
+    status: comparison ? 'MEASURED' : 'NO_EVIDENCE',
+    rows: [
+      _cardRow('V1 shortlist', metric(v1Count)),
+      _cardRow('V2 shortlist', metric(v2Count)),
+      _cardRow('Verified avoided losses', 'OUTCOME NOT MATURED', 'bad'),
+      _cardRow('Verified missed opportunities', 'OUTCOME NOT MATURED', 'bad'),
+      _cardRow('Agreement rate', 'OUTCOME NOT MATURED', 'bad'),
+    ],
+    note: 'Directional disagreement alone is not an avoided loss or a missed winner.',
+    source: 'scoring_comparisons (derived projection)',
+    observedAt: comparison?.observed_at_utc || null,
+  });
+
+  const aiMeasured = ai.status === 'MEASURED';
+  cards.push({
+    id: 'ai',
+    title: 'AI agreement rate',
+    status: aiMeasured ? 'MEASURED' : 'NO_EVIDENCE',
+    rows: [
+      _cardRow('Eligible AI reviews', aiMeasured ? metric(ai.inferences) : 'NO EVIDENCE', aiMeasured ? 'neutral' : 'bad'),
+      _cardRow('Matured outcomes', aiMeasured ? metric(ai.matured_outcomes) : 'NO EVIDENCE', 'bad'),
+      _cardRow('Agreement rate', 'INSUFFICIENT DATA', 'bad'),
+      _cardRow(
+        'Model',
+        aiMeasured && ai.models?.length
+          ? `${ai.models[0].model} ${ai.models[0].model_version || ''}`.trim()
+          : 'UNVERIFIED',
+        aiMeasured && ai.models?.length ? 'neutral' : 'bad',
+      ),
+    ],
+    note: ai.reason_code
+      ? String(ai.reason_code).replaceAll('_', ' ').toLowerCase()
+      : ai.metrics_reason
+        ? String(ai.metrics_reason).replaceAll('_', ' ').toLowerCase()
+        : null,
+    source: 'ai_inferences (derived projection)',
+    observedAt: ai.last_observed_at_utc || null,
+  });
+
+  cards.push({
+    id: 'performance',
+    title: 'Strategy performance',
+    status: 'INSUFFICIENT DATA',
+    rows: [
+      _cardRow('Win rate', 'INSUFFICIENT DATA', 'bad'),
+      _cardRow('Average win / loss', 'INSUFFICIENT DATA', 'bad'),
+      _cardRow('Expectancy', 'INSUFFICIENT DATA', 'bad'),
+      _cardRow('Sample size', 'NO MATURED OUTCOMES', 'bad'),
+    ],
+    note: 'Realized fills, paper fills and theoretical outcomes are different populations.',
+    source: 'outcome evidence not yet projected',
+    observedAt: null,
+  });
+
+  cards.push({
+    id: 'retention',
+    title: 'Retention & storage health',
+    status: projectionState,
+    rows: [
+      _cardRow(
+        'Analytics DB size',
+        typeof projection.db_bytes === 'number' ? bytes(projection.db_bytes) : 'UNAVAILABLE',
+        typeof projection.db_bytes === 'number' ? 'neutral' : 'bad',
+      ),
+      _cardRow('Retention policy', retention.retention_days ? `${retention.retention_days} days` : 'DEFAULT 30 DAYS'),
+      _cardRow('Eligible for cleanup', isNumber(preview.eligible_total) ? metric(preview.eligible_total) : 'UNVERIFIED'),
+      _cardRow(
+        'Protected records',
+        isNumber(preview.protected_unverified) || isNumber(preview.protected_locked)
+          ? metric((preview.protected_unverified || 0) + (preview.protected_locked || 0))
+          : 'UNVERIFIED',
+      ),
+      _cardRow('Reconciliation', reconciliation.label, reconciliation.level),
+    ],
+    note: 'Retention deletion is disabled until separately authorized.',
+    source: 'retention_policies / retention_cleanup_logs',
+    observedAt: projection.generated_at_utc || null,
+  });
+  return cards;
+}
+
+
+/** Provenance rows for the forensics drawer, naming every unproven field. */
+export function provenanceRows(forensics) {
+  if (!forensics || typeof forensics !== 'object') return [];
+  const signal = forensics.signal || {};
+  const comparison = forensics.comparison || {};
+  const missing = new Set(forensics.missing_fields || []);
+  const row = (label, value, key) => ({
+    label,
+    value: value === null || value === undefined || value === '' ? 'NOT RECORDED' : String(value),
+    missing: key ? missing.has(key) : false,
+  });
+  return [
+    row('Scanner attempt', signal.attempt_id),
+    row('Symbol', signal.symbol),
+    row('Direction', signal.trade_direction),
+    row('Timeframe', signal.timeframe, 'timeframe'),
+    row('Technical score version', signal.technical_score_version),
+    row('V2 profile version', signal.v2_profile_version, 'v2_profile_version'),
+    row('V2 profile digest', signal.v2_profile_digest, 'v2_profile_digest'),
+    row('Rejection / exclusion', signal.rejection_reason, 'rejection_reason'),
+    row('Canonical source', signal.source_id),
+    row('Byte offset', signal.byte_offset, 'byte_offset'),
+    row('Line number', signal.line_number, 'line_number'),
+    row('Source record hash', signal.record_sha256),
+    row('Comparison evidence', comparison.comparison_key || null),
+    row('Reconciliation', comparison.record_sha256 ? 'PROVENANCE RECORDED' : 'UNVERIFIED'),
+    row('Observed (UTC)', signal.observed_at_utc),
+  ];
+}
+
+/** Stage outcome classification, so a refusal never looks like a success. */
+export function stageOutcome(response) {
+  if (!response || typeof response !== 'object')
+    return {state: 'UNAVAILABLE', message: 'No staging response'};
+  const status = String(response.status || '').toUpperCase();
+  if (status === 'STAGED')
+    return {
+      state: 'STAGED',
+      message:
+        'Staged without runtime effect. Activation stays with the protected strategy-admin endpoint.',
+    };
+  if (status === 'STAGE_REFUSED' || status === 'CONFLICT')
+    return {state: status, message: 'Refused: the stored draft changed. Reload and review again.'};
+  return {state: status || 'UNVERIFIED', message: 'No staging outcome was recorded'};
+}
+

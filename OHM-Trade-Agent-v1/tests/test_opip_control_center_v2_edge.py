@@ -31,10 +31,24 @@ def test_side_by_side_route_and_exact_api_allowlist():
         "/api/opip/strategy-admin/active",
         "/api/opip/strategy-admin/activate",
         "/api/opip/strategy-admin/rollback",
+        # Control Center V2 round 3: exact-match analytical routes.
+        "/api/opip/control-center/health",
+        "/api/opip/control-center/signals",
+        "/api/opip/control-center/forensics",
+        "/api/opip/control-center/scanner",
+        "/api/opip/control-center/ai",
+        "/api/opip/control-center/data",
+        "/api/opip/control-center/config",
+        "/api/opip/control-center/config/preview",
+        "/api/opip/control-center/config/stage",
+        "/api/opip/control-center/maintenance/ingest",
+        "/api/opip/control-center/maintenance/reconcile",
+        "/api/opip/control-center/maintenance/retention",
     ):
         assert f"location = {route} {{" in routes
     assert "limit_except GET PUT { deny all; }" in routes
-    assert routes.count("limit_except POST { deny all; }") == 2
+    # Two advisory-admin endpoints plus five bounded control-center actions.
+    assert routes.count("limit_except POST { deny all; }") == 7
     assert "location /api/" not in routes
     assert "location = /webhooks" not in routes
 

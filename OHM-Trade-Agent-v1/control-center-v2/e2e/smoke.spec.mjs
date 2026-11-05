@@ -176,3 +176,68 @@ test('protected advisory stage, activation and rollback enforce request contract
  expect(writes[2].body).toEqual({expected_digest:staged,acknowledgment:'ACTIVATE_ADVISORY_ONLY'});
  expect(writes[3].body).toEqual({expected_digest:staged,acknowledgment:'ROLLBACK_ADVISORY_ONLY'});
 });
+
+// --- Round 3: operational surfaces ----------------------------------------
+test('the global header, KPI ribbon and retention workspace stay source-backed',async({page})=>{
+ await page.route('**/api/**',async route=>{
+  const path=new URL(route.request().url()).pathname;
+  if(path==='/api/opip/control-center/health')return route.fulfill({json:{
+   status:'MEASURED',
+   generated_at_utc:'2026-11-03T12:00:00Z',
+   runtime:{
+    environment:{status:'MEASURED',label:'PRODUCTION',source:'ENV:APP_ENV'},
+    protection:{status:'UNVERIFIED',reason_code:'NO_F11_STATE_ARTIFACT',state:null},
+    scanner:{status:'MEASURED',attempt_id:'SCAN:fixture',acquisition_outcome:'COMPLETED',age_seconds:120},
+    learning:{status:'UNAVAILABLE',reason_code:'NO_LEARNING_DROPLET_TELEMETRY_CHANNEL'},
+    release:{status:'UNAVAILABLE',reason_code:'NO_RELEASE_STATE_ARTIFACT'},
+    config_version:{status:'MEASURED',digest:'a'.repeat(64),authority:'BUNDLED_DEFAULT'},
+   },
+   projection:{
+    status:'MEASURED',db_bytes:1048576,wal_bytes:4096,schema_version:1,
+    kpi:{status:'MEASURED',symbols_scanned:200,v2_ready:12,v2_directional:3,last_observed_at_utc:'2026-11-03T11:00:00Z',qualification_reason:'NO_QUALIFICATION_EVENT_SOURCE'},
+    v2_status:{NOT_COMPUTED:0,READY:12},
+    reconciliation:{state:'UNVERIFIED',reason_code:'NO_RECONCILIATION_RUN'},
+    ai:{status:'NO_EVIDENCE',reason_code:'NO_AI_INFERENCE_SOURCE'},
+    retention:{retention_days:30,dry_run:1},
+    retention_preview:{eligible_total:5,protected_unverified:2,protected_locked:1},
+   },
+  }});
+  if(path==='/api/opip/control-center/data')return route.fulfill({json:{
+   status:'MEASURED',schema_version:1,db_bytes:1048576,wal_bytes:4096,
+   sources:[{source_id:'scan_snapshots:SCAN-fixture',record_kind:'SCAN_SNAPSHOT',last_offset:4096,records_committed:2,quarantined:0,last_ingest_at_utc:'2026-11-03T11:59:00Z',ingestion_lag_seconds:60}],
+   quarantine_backlog:0,aging:{LAST_24H:2},
+   retention:{retention_days:30,dry_run:1},
+   retention_preview:{eligible_total:5,protected_unverified:2,protected_locked:1},
+   retention_runs:[{run_id:'retention:fixture',policy_version:'policy:30d',started_at_utc:'2026-11-03T11:00:00Z',dry_run:1,rows_considered:5,rows_deleted:0,rows_protected_unverified:2,rows_protected_locked:1,status:'DRY_RUN_COMPLETE'}],
+   reconciliation:{state:'UNVERIFIED',reason_code:'NO_RECONCILIATION_RUN'},
+  }});
+  if(path==='/api/opip/control-center/signals')return route.fulfill({json:{status:'NO_EVIDENCE',rows:[],next_cursor:null}});
+  if(path==='/api/opip/control-center/scanner')return route.fulfill({json:{status:'NO_EVIDENCE',attempts:[]}});
+  if(path==='/api/opip/control-center/ai')return route.fulfill({json:{status:'MEASURED',summary:{status:'NO_EVIDENCE',reason_code:'NO_AI_INFERENCE_SOURCE'},page:{status:'NO_EVIDENCE',rows:[]}}});
+  if(path==='/api/opip/control-center/config')return route.fulfill({json:{
+   status:'READY',registry_version:1,
+   domains:[{domain:'DASHBOARD',definitions:[{key:'dashboard.refresh_seconds',domain:'DASHBOARD',display_name:'Refresh interval',description:'How often the console re-reads evidence.',data_type:'INTEGER',minimum:15,maximum:3600,step:15,unit:'seconds',editability:'STAGE_ONLY',activation_authority:'ADVISORY_PROFILE',allowed:[]}],staged:null,activation_authority:['ADVISORY_PROFILE']}],
+   effective:{status:'LIVE_READBACK',values:{'dashboard.refresh_seconds':{value:60,source:'ENV'}}},
+   activation:{console_can_activate:false,reason:'Activation stays with the protected strategy-admin endpoints.'},
+  }});
+  return route.fulfill({status:404,json:{detail:'Unavailable in fixture'}});
+ });
+ await page.goto('/dashboard/v2/');
+ await page.getByPlaceholder('X-Webhook-Secret (session memory only)').fill('test-viewer');
+ await page.getByRole('button',{name:'Refresh'}).click();
+ await expect(page.getByRole('region',{name:'Global operational status'})).toBeVisible();
+ await expect(page.getByText('F11 safety')).toBeVisible();
+ await expect(page.getByText('UNVERIFIED',{exact:true}).first()).toBeVisible();
+ await expect(page.getByText('Live V2 signals')).toBeVisible();
+ await expect(page.getByText('OUTCOME NOT MATURED').first()).toBeVisible();
+ // The approved asset is referenced; when it is absent the console says so.
+ await expect(page.locator('.op-logo, .op-logo-fallback').first()).toBeVisible();
+ await page.getByRole('button',{name:'Data & Retention'}).click();
+ await expect(page.getByRole('heading',{name:'Canonical source coverage'})).toBeVisible();
+ await expect(page.getByText('DRY RUN ONLY')).toBeVisible();
+ await page.getByRole('button',{name:'Config Admin'}).click();
+ await expect(page.getByRole('heading',{name:'Schema-driven configuration registry'})).toBeVisible();
+ const persisted=await page.evaluate(()=>({local:localStorage.length,session:sessionStorage.length}));
+ expect(persisted).toEqual({local:0,session:0});
+});
+
