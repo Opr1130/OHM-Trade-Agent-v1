@@ -25,9 +25,11 @@ import {
   f11Display,
   headerFields,
   kpiCards,
+  provenanceLabel,
   provenanceRows,
   reconciliationDisplay,
   stageOutcome,
+  zeroBuySummary,
 } from '../src/api.mjs';
 
 test('a missing value never renders as zero', () => {
@@ -263,5 +265,44 @@ test('a refusal is never rendered as a successful staging', () => {
 
 test('the approved logo asset path is one declared constant', () => {
   assert.equal(LOGO_ASSET, '/assets/opip-control-center-logo-transparent.png');
+});
+
+
+test('a direct read is labelled and never presented as a projection value', () => {
+  assert.equal(provenanceLabel({source: 'CANONICAL_DIRECT', detail: 'read direct'}).label, 'CANONICAL (DIRECT)');
+  assert.equal(provenanceLabel({source: 'CANONICAL_DIRECT'}).level, 'warn');
+  assert.equal(provenanceLabel({projection_fallback: true}).label, 'PROJECTION FALLBACK');
+  assert.equal(provenanceLabel({status: 'MEASURED'}), null);
+  assert.equal(provenanceLabel(null), null);
+});
+
+test('zero-BUY explanation is structured from recorded fields only', () => {
+  const summary = zeroBuySummary({
+    status: 'NO_QUALIFIED_SIGNAL',
+    dominant_terminal_gate: 'SCORE_BELOW_ENTRY',
+    deepest_stage_reached: 'DIRECTIONAL',
+    scan_id: 'SCAN:1',
+    last_scan_at_utc: '2026-11-04T12:00:00Z',
+    candidates_analyzed: 200,
+    technical_candidates: 40,
+    qualified: 0,
+    paper_admission_eligible: 0,
+    rejected_by_policy: 3,
+    rejected_by_budget: 0,
+  });
+  assert.equal(summary.dominantGate, 'SCORE_BELOW_ENTRY');
+  assert.equal(summary.deepestStage, 'DIRECTIONAL');
+  assert.equal(summary.qualified, 0);
+  assert.equal(summary.measuredStages.length, 4);
+  assert.deepEqual(summary.unverifiedStages, [
+    'Long candidates',
+    'Short candidates',
+    'Shortlisted (directional)',
+  ]);
+  assert.deepEqual(summary.rejections.map(row => row.label), ['Rejected by policy']);
+  assert.equal(zeroBuySummary(null), null);
+  // Nothing is invented: an absent field stays null, never 0.
+  assert.equal(summary.paperAdmissionEligible, 0);
+  assert.equal(zeroBuySummary({status: 'X'}).qualified, null);
 });
 

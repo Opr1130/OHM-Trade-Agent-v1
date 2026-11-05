@@ -193,3 +193,70 @@ source entry, a reconciliation rule and tests. Until then the corresponding widg
 keeps stating the limitation, and the derived KPIs stay unverified.
 
 
+
+## 10. Production acceptance repair (release `08af8546`)
+
+Two defects were reported against the deployed release. Both root causes and their
+minimal fixes are recorded here.
+
+### 10.1 Logo did not load — edge packaging
+
+`deploy/control-center/Dockerfile.edge` copies `index.html`, `vite.config.js` and
+`src` into the Vite build stage. It never copied `control-center-v2/public`, so the
+approved PNG was absent from the build context and Vite emitted no
+`dist/assets/opip-control-center-logo-transparent.png`. The container therefore
+served a 404 for the logo URL, and the header correctly degraded to its
+missing-asset mark.
+
+Fix: one line, `COPY control-center-v2/public ./public`, before `RUN npm run build`.
+
+| Evidence | Value |
+| --- | --- |
+| Asset in the release commit | present (blob in `08af8546`) |
+| Asset in the built bundle (local) | `dist/assets/opip-control-center-logo-transparent.png`, 2,206,180 bytes |
+| Served URL | `/dashboard/v2/assets/opip-control-center-logo-transparent.png` |
+| Local preview response | `200`, `image/png`, 2,206,180 bytes, PNG signature `89 50 4E 47 0D 0A 1A 0A` |
+
+### 10.2 Little or no data — the projection is unpopulated
+
+`opip_analytics.db` is created only by the maintenance worker
+(`app/jobs/opip_analytics_maintenance.py`), and no scheduler entry invokes it.
+On a fresh host the projection therefore does not exist, so every
+projection-backed surface returned `UNAVAILABLE` even though the canonical evidence
+was on disk. That is indistinguishable from "no signals" to an operator.
+
+Fix: a bounded read-through, `app/opip/analytics/direct.py`, wired into the
+authenticated API. When the projection is absent, empty or unreadable, the route
+answers from the **same registered sources** and labels the payload:
+
+| Field | Value | Meaning |
+| --- | --- | --- |
+| `source` | `CANONICAL_DIRECT` | read straight from canonical evidence |
+| `verification` | `UNPROJECTED` | not reconciled through the projection |
+| `projection` | `{"status": ..., "reason_code": ...}` | why the projection could not answer |
+| `projection_fallback` | `true` | the fallback was used |
+
+Bounds and honesty rules: tail reads only (newest batches, ≤400 snapshot rows,
+≤400 ledger lines, ≤24 comparisons), `truncated` reported when a bound was hit,
+`is_verified = 0` on every direct row, uncomputed scores stay `null`, and
+`byte_offset` / `line_number` are `null` because a direct read has no committed
+offset. The layer contains no `conn.execute`, no writer import, and no file
+mutation, which the acceptance test asserts along with byte- and mtime-identical
+canonical evidence afterwards.
+
+### 10.3 Why zero BUY signals
+
+The overview now renders a "Why zero BUY signals" panel built only from the
+recorded zero-trade explanation: status, dominant terminal gate, deepest stage
+reached, per-stage counts, qualified and paper-admission counts, and recorded
+rejection classes. Stages the explanation did not return are listed as *not
+recorded*. No recommendation, alert or score is generated to explain an absence.
+
+### 10.4 Still genuinely missing
+
+The projection stays unpopulated until an approved Compose change schedules the
+maintenance worker; until then retention, quarantine and reconciliation panels
+report unavailable. AI inference, qualification-decision, promotion and
+outcome-maturation sources remain unregistered (see §9), so those KPIs stay
+`NO_EVIDENCE` / `INSUFFICIENT DATA` / `OUTCOME NOT MATURED`.
+

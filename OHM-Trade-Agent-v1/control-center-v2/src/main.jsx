@@ -1,7 +1,7 @@
 import React,{useEffect,useRef,useState} from 'react';
 import{createRoot}from'react-dom/client';
 import{Activity,ArrowDownToLine,BarChart3,BrainCircuit,ChartNoAxesCombined,Check,ChevronRight,CircleAlert,ClipboardList,Database,GitCompareArrows,LockKeyhole,RefreshCw,RotateCcw,Search,Settings2,ShieldCheck,SlidersHorizontal}from'lucide-react';
-import{apiRequest,modelAuthority,evidenceStatus,objectSummary,exportCsv,sanitizeJsonExport,statusLevel,readState,utcWithLocal,qualificationFunnel,rejectionBreakdown,aiOperatingState,configAdminState,ENDPOINTS,headerFields,kpiCards,provenanceRows,stageOutcome}from'./api.mjs';
+import{apiRequest,modelAuthority,evidenceStatus,objectSummary,exportCsv,sanitizeJsonExport,statusLevel,readState,utcWithLocal,qualificationFunnel,rejectionBreakdown,aiOperatingState,configAdminState,ENDPOINTS,headerFields,kpiCards,provenanceRows,stageOutcome,provenanceLabel,zeroBuySummary}from'./api.mjs';
 import{LOGO_ASSET,LOGO_FALLBACK_MARK,activeFilters,bytes,clampPresets,freshness,metric,payloadState,percent,removeFilter,configDiff,configFieldKind,divergenceLabel,divergenceLevel,precheckStagedValue,rubricTotal,signalQuery,sortRows,windowStartIso}from'./format.mjs';
 import './theme.css';
 import './style.css';
@@ -584,6 +584,89 @@ function RegistryConsole({config,secret,adminSecret,initialDomain,onReload}){
  </div>;
 }
 
+function ProvenanceNote({payload}) {
+  const note = provenanceLabel(payload);
+  if (!note) return null;
+  return (
+    <div className={'op-banner ' + (note.level === 'warn' ? 'warn' : '')} role="status">
+      <ClipboardList size={15} />
+      <span>
+        <strong>{note.label}</strong> · {note.detail}
+      </span>
+    </div>
+  );
+}
+function AuthPanel() {
+  return (
+    <div className="op-banner" role="status">
+      <LockKeyhole size={16} />
+      <span>
+        <strong>Evidence not loaded.</strong> Enter the operator credential above and select
+        Refresh. The console shows nothing until a read succeeds; an unauthenticated view is not
+        evidence of zero signals.
+      </span>
+    </div>
+  );
+}
+function ZeroBuyCard({zero}) {
+  const summary = zeroBuySummary(zero);
+  if (!summary) {
+    return (
+      <Empty
+        title="Zero-BUY explanation unavailable"
+        detail="The recorded zero-trade explanation was not returned. No BUY explanation is guessed."
+      />
+    );
+  }
+  return (
+    <div className="stack">
+      <div className="op-kpi-rows">
+        <div className="op-kpi-row"><span>Recorded status</span><strong>{summary.status}</strong></div>
+        <div className="op-kpi-row"><span>Dominant terminal gate</span>
+          <strong className={summary.dominantGate ? '' : 'bad'}>{summary.dominantGate || 'NOT RECORDED'}</strong></div>
+        <div className="op-kpi-row"><span>Deepest stage reached</span>
+          <strong>{summary.deepestStage || 'NOT RECORDED'}</strong></div>
+        <div className="op-kpi-row"><span>Qualified</span>
+          <strong className={summary.qualified === 0 ? 'bad' : ''}>
+            {summary.qualified === null ? 'NOT RECORDED' : String(summary.qualified)}
+          </strong></div>
+        <div className="op-kpi-row"><span>Paper-admission eligible</span>
+          <strong>{summary.paperAdmissionEligible === null ? 'NOT RECORDED' : String(summary.paperAdmissionEligible)}</strong></div>
+        <div className="op-kpi-row"><span>Scan</span><strong>{summary.scanId || 'NOT RECORDED'}</strong></div>
+        <div className="op-kpi-row"><span>Observed (UTC)</span>
+          <strong>{summary.observedAtUtc ? utcWithLocal(summary.observedAtUtc).utc : 'NOT RECORDED'}</strong></div>
+      </div>
+      {summary.explanation && <p className="muted">{String(summary.explanation)}</p>}
+      {summary.measuredStages.length > 0 && (
+        <div className="op-stage-list">
+          {summary.measuredStages.map(stage => (
+            <div className="op-stage" key={stage.label}>
+              <span>{stage.label}</span>
+              <small>{stage.value === 0 ? 'stopped here' : ''}</small>
+              <strong>{String(stage.value)}</strong>
+            </div>
+          ))}
+        </div>
+      )}
+      {summary.unverifiedStages.length > 0 && (
+        <p className="muted">Not returned by the recorded explanation: {summary.unverifiedStages.join(', ')}.</p>
+      )}
+      {summary.rejections.length > 0 && (
+        <div className="op-chips">
+          {summary.rejections.map(row => (
+            <span className="op-chip" key={row.label}>{row.label}: {row.value}</span>
+          ))}
+        </div>
+      )}
+      <p className="muted">
+        This is recorded evidence from the qualification stage, not an inference. A zero here means the
+        deterministic gate refused every candidate on the recorded scan.
+      </p>
+    </div>
+  );
+}
+
+
 
 function ConfigAdmin({secret, config, configDomain, onReload}){
 
@@ -746,8 +829,8 @@ function App(){
 <div><span className="eyebrow">O'PIP / OPERATIONS</span><h1>{section}</h1><p>Evidence-led visibility · no inferred profits · safety-first configuration</p></div><div className="top-actions"><Status value={loadedAt?'SNAPSHOT LOADED':'AWAITING EVIDENCE'}/><button className="secondary" disabled={busy||!secret.trim()} onClick={refresh}><RefreshCw size={16}/>{busy?'Loading':'Refresh'}</button></div></header>
  <div className="auth-bar">{credentialLocked?<><span className="muted">Credential held in this tab's memory only · never written to browser storage</span><button className="secondary" onClick={()=>{setCredentialLocked(false);setSecret('')}}>Change credential</button><button className="subtle" onClick={()=>{setCredentialLocked(false);setSecret('');setRecords({});setErrors({});setLoadedAt('');setSelected(null)}}>Sign out</button></>:<label>Operator API credential<input type="password" value={secret} onChange={e=>setSecret(e.target.value)} autoComplete="off" placeholder="X-Webhook-Secret (session memory only)" /></label>}<label>Window<select value={scope} onChange={e=>setScope(e.target.value)}><option value="all">All recorded</option><option value="today">Today (UTC day)</option></select></label><span className="muted">Last fetched: {loadedAt?utcWithLocal(loadedAt).utc+' (local '+utcWithLocal(loadedAt).local+')':'Never'} · window boundaries are UTC</span></div>
  {!secret&&<div className="notice" role="status"><LockKeyhole size={17}/> Enter the existing O’Pip operator credential and select Refresh. No credentials are persisted.</div>}
- {section==='Overview'&&<div className="stack"><WidgetBoundary><KpiRibbon health={records.health}/></WidgetBoundary><div className="metric-grid">
-{cards.map(([name,value])=><div className="metric" key={name}><span>{name}</span><Status value={value}/></div>)}</div><div className="cols"><Card title="Production analytics"><Pairs data={records.summary}/>{errors.summary&&<p className="error">{errors.summary}</p>}</Card><Card title="Why zero trades?"><Pairs data={records.zero}/>{errors.zero&&<p className="error">{errors.zero}</p>}</Card></div><Card title="Comparison evidence"><EvidenceTable response={records.comparisons} onSelect={setSelected}/>{errors.comparisons&&<p className="error">{errors.comparisons}</p>}</Card></div>}
+ {section==='Overview'&&<div className="stack">{!credentialLocked&&<AuthPanel/>}<WidgetBoundary><ProvenanceNote payload={records.health?.projection}/><KpiRibbon health={records.health}/></WidgetBoundary><div className="metric-grid">
+{cards.map(([name,value])=><div className="metric" key={name}><span>{name}</span><Status value={value}/></div>)}</div><div className="cols"><Card title="Production analytics"><Pairs data={records.summary}/>{errors.summary&&<p className="error">{errors.summary}</p>}</Card><Card title="Why zero BUY signals"><ZeroBuyCard zero={records.zero}/></Card></div><Card title="Comparison evidence"><EvidenceTable response={records.comparisons} onSelect={setSelected}/>{errors.comparisons&&<p className="error">{errors.comparisons}</p>}</Card></div>}
  {section==='V1 / V2 Evidence'&&<div className="stack"><WidgetBoundary><SignalsWorkspace secret={secret} onTune={domain=>{setConfigDomain(domain||'V2_SCORING');setSection('Config Admin')}}/></WidgetBoundary><Card title="Recorded V2 production / V1 observation">
 <p className="muted">Authority is read from each recorded comparison. Missing records are displayed as missing evidence, not as zero signals.</p><div className="input-row"><label>Filter recorded scans<input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Scan ID or symbol"/></label><button className="secondary" disabled={!filtered.length} onClick={()=>download(exportCsv(filtered),'opip-v1-v2-evidence.csv','text/csv')}><ArrowDownToLine size={16}/> Export visible rows</button></div><EvidenceTable response={{status:records.comparisons?.status,rows:filtered}} onSelect={setSelected}/></Card></div>}
  {section==='Qualification'&&<div className="stack"><WidgetBoundary><ScannerFunnelWorkspace scanner={records.scanner}/></WidgetBoundary><Card title="Where candidates stopped">

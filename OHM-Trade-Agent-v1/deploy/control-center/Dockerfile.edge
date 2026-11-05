@@ -5,6 +5,10 @@ COPY control-center-v2/package.json control-center-v2/package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY control-center-v2/index.html control-center-v2/vite.config.js ./
 COPY control-center-v2/src ./src
+# The approved brand asset lives in public/ and is copied verbatim into the build
+# output. Omitting this line makes /dashboard/v2/assets/* 404 in production, so the
+# header falls back to its missing-asset mark and the approved logo never renders.
+COPY control-center-v2/public ./public
 RUN npm run build
 
 FROM nginx:1.27-alpine

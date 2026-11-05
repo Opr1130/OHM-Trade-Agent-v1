@@ -10,6 +10,7 @@ evidence store must not make page 20 progressively more expensive.
 
 from __future__ import annotations
 
+import base64
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -90,19 +91,37 @@ def divergence_clause(kind: str, v1: float, v2: float) -> tuple[str, tuple[Any, 
 
 
 def encode_cursor(row: dict[str, Any]) -> str:
-    return "|".join(
+    """Opaque, URL-safe keyset cursor.
+
+    The key contains an ISO timestamp with ``+00:00``; embedded raw in a query
+    string the ``+`` decodes to a space and the comparison silently matches
+    nothing. Base64url keeps the cursor safe for any client and any proxy.
+    """
+    raw = "|".join(
         [
             str(row.get("observed_at_utc") or ""),
             str(row.get("attempt_id") or ""),
             str(row.get("symbol") or ""),
         ]
     )
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
 
 
 def decode_cursor(cursor: str | None) -> tuple[str, str, str] | None:
     if not cursor:
         return None
-    parts = str(cursor).split("|")
+    text = str(cursor).strip()
+    padded = text + "=" * (-len(text) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        decoded = None
+    if decoded is not None:
+        parts = decoded.split("|")
+        if len(parts) == 3:
+            return parts[0], parts[1], parts[2]
+    # Legacy plain cursors remain readable so an open console is not broken.
+    parts = text.split("|")
     if len(parts) != 3:
         raise ValueError("INVALID_CURSOR")
     return parts[0], parts[1], parts[2]
@@ -248,10 +267,24 @@ def signals_page(
         params.append(str(observed_to))
     decoded = decode_cursor(cursor)
     if decoded is not None:
+        # ORDER BY is (observed_at DESC, attempt_id DESC, symbol ASC), so the
+        # keyset predicate must mirror each direction. A single same-direction
+        # tuple comparison would repeat or skip rows whose sort keys tie.
         clauses.append(
-            "(COALESCE(observed_at_utc, ''), attempt_id, symbol) < (?, ?, ?)"
+            "(COALESCE(observed_at_utc, '') < ?"
+            " OR (COALESCE(observed_at_utc, '') = ? AND attempt_id < ?)"
+            " OR (COALESCE(observed_at_utc, '') = ? AND attempt_id = ? AND symbol > ?))"
         )
-        params.extend(decoded)
+        params.extend(
+            [
+                decoded[0],
+                decoded[0],
+                decoded[1],
+                decoded[0],
+                decoded[1],
+                decoded[2],
+            ]
+        )
     where = " AND ".join(clauses) if clauses else "1 = 1"
     page_size = _clamp_page(limit)
     rows = _rows(
