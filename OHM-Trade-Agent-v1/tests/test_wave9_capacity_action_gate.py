@@ -87,7 +87,7 @@ def test_capacity_ceiling_caps_recommended_capital(monkeypatch):
     assert candidate["capacity_adjusted_validation_net_t2"] == 100.0
 
 
-def test_capacity_cap_rejects_when_economic_minimum_no_longer_holds(monkeypatch):
+def test_capacity_cap_allows_positive_net_below_old_seventy_five_floor(monkeypatch):
     monkeypatch.setattr(
         trade_action_gate,
         "evaluate_trade_decision",
@@ -120,10 +120,50 @@ def test_capacity_cap_rejects_when_economic_minimum_no_longer_holds(monkeypatch)
         active_trades=[],
     )
 
-    assert decision.allowed is False
+    # A capacity-capped $48 net is positive expectation and must not be rejected
+    # merely for being below the old $75 floor.
+    assert decision.allowed is True
     assert candidate["recommended_capital"] == 120.0
     assert candidate["capacity_adjusted_validation_net_t2"] == 48.0
-    assert "below economic minimum" in decision.reason
+
+
+def test_capacity_cap_rejects_negative_net(monkeypatch):
+    monkeypatch.setattr(
+        trade_action_gate,
+        "evaluate_trade_decision",
+        lambda **kwargs: _intelligence(400.0),
+    )
+    monkeypatch.setattr(
+        trade_action_gate,
+        "evaluate_portfolio_risk",
+        lambda **kwargs: PortfolioRiskDecision(
+            allowed=True,
+            reason="portfolio risk limits satisfied",
+            open_positions=0,
+            gross_exposure=0.0,
+            proposed_exposure=kwargs["proposed_capital"],
+            proposed_total_exposure=kwargs["proposed_capital"],
+        ),
+    )
+    candidate = {
+        "economic_qualified": True,
+        "direction": "LONG",
+        "liquidity_capacity_ceiling_usd": 120.0,
+        "economic_validation_capital": 400.0,
+        "economic_validation_net_t2": -160.0,
+    }
+
+    decision = trade_action_gate.apply_action_gate(
+        candidate=candidate,
+        plan=_plan(),
+        account_capital=2_000.0,
+        active_trades=[],
+    )
+
+    assert decision.allowed is False
+    assert candidate["recommended_capital"] == 120.0
+    assert candidate["capacity_adjusted_validation_net_t2"] == -48.0
+    assert "below break-even" in decision.reason
 
 
 def test_capacity_above_allocation_does_not_change_recommendation(monkeypatch):

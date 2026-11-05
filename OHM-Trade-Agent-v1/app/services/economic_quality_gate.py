@@ -10,11 +10,15 @@ PRODUCTION_MAX_CAPITAL_FRACTION = 0.20
 
 # The economic gate's policy numbers, named so that telemetry can report how
 # far a candidate was from the bar without restating the value. These are the
-# keyword defaults below; production never overrides them.
-MIN_TARGET_2_MOVE_PCT = 4.0
+# keyword defaults below. The owner's contract disables arbitrary dollar/move/
+# reward-risk floors by default: an actionable opportunity requires positive
+# projected net economics after costs (enforced by ``min_net_profit`` at zero),
+# never a fixed $75 / 4% / 2.5R bar. A versioned policy can still raise any of
+# them explicitly through ``advisory_economic_policy`` or the policy file.
+MIN_TARGET_2_MOVE_PCT = 0.0
 PREFERRED_TARGET_2_MOVE_PCT = 7.0
-MIN_NET_PROFIT = 75.0
-MIN_REWARD_TO_RISK = 2.5
+MIN_NET_PROFIT = 0.0
+MIN_REWARD_TO_RISK = 0.0
 ESTIMATED_ROUND_TRIP_COST_PCT = 0.60
 
 # --- advisory screen policy ---------------------------------------------------

@@ -113,6 +113,8 @@ def evaluate_trade_decision(
     plan: EntryExitPlan,
     account_capital: float,
     active_trades: list[Any],
+    risk_per_trade_pct: float = 0.75,
+    max_positions: int = 3,
 ) -> TradeDecisionIntelligence:
     direction = str(candidate.get("direction") or plan.direction or "LONG").upper()
     leverage = float(candidate.get("margin_leverage") or (2.0 if direction == "SHORT" else 1.0))
@@ -144,6 +146,7 @@ def evaluate_trade_decision(
         net_edge_pct=net_edge_pct,
         calibration_multiplier=multiplier,
         leverage=leverage,
+        risk_per_trade_pct=risk_per_trade_pct,
     )
     portfolio = evaluate_portfolio_risk(
         active_trades=active_trades,
@@ -152,6 +155,7 @@ def evaluate_trade_decision(
         proposed_capital=allocation.recommended_capital,
         proposed_leverage=leverage,
         account_capital=account_capital,
+        max_positions=max_positions,
     )
 
     return TradeDecisionIntelligence(

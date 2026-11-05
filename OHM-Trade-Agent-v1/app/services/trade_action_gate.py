@@ -28,11 +28,17 @@ def apply_action_gate(
     plan: EntryExitPlan,
     account_capital: float,
     active_trades: list[Any] | None = None,
+    risk_per_trade_pct: float = 0.75,
+    max_positions: int = 3,
 ) -> ActionGateDecision:
     """Evaluate capital/portfolio eligibility before notification.
 
     This is intentionally upstream of Telegram. The notifier consumes the
     resulting decision; it does not decide portfolio eligibility itself.
+
+    ``risk_per_trade_pct`` and ``max_positions`` are the effective risk-sizing
+    policy forwarded from ``Settings``. They default to the library values but
+    the live scan always passes the configured values so the two cannot drift.
     """
     if candidate.get("economic_qualified") is not True:
         reason = "economic qualification is required for an actionable trade"
@@ -61,6 +67,8 @@ def apply_action_gate(
             plan=plan,
             account_capital=account_capital,
             active_trades=trades,
+            risk_per_trade_pct=risk_per_trade_pct,
+            max_positions=max_positions,
         )
     except Exception as exc:
         candidate["action_gate_evaluated"] = True
@@ -130,6 +138,7 @@ def apply_action_gate(
                 proposed_capital=capped_allocation.recommended_capital,
                 proposed_leverage=leverage,
                 account_capital=account_capital,
+                max_positions=max_positions,
             )
             intelligence = replace(
                 intelligence,
@@ -165,8 +174,8 @@ def apply_action_gate(
                 if adjusted_net < MIN_NET_PROFIT:
                     capacity_reason = (
                         f"capacity-capped validation net profit "
-                        f"USD {adjusted_net:.2f} is below economic minimum "
-                        f"USD {MIN_NET_PROFIT:.2f}"
+                        f"USD {adjusted_net:.2f} is below break-even "
+                        f"(minimum USD {MIN_NET_PROFIT:.2f})"
                     )
         else:
             candidate["liquidity_capacity_capped"] = False

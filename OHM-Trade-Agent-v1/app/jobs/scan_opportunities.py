@@ -1322,6 +1322,12 @@ def _apply_ranked_action_gates(ranked_opportunities, *, settings, opip=None, aut
                 plan=plan,
                 account_capital=float(settings.account_equity),
                 active_trades=projected_trades,
+                risk_per_trade_pct=float(
+                    getattr(settings, "risk_per_trade_pct", 0.35)
+                ),
+                max_positions=int(
+                    getattr(settings, "max_open_trades", 2)
+                ),
             )
         except Exception as exc:
             reason = f"{type(exc).__name__}: {exc}"

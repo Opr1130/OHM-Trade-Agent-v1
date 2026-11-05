@@ -24,8 +24,8 @@ def plan():
 
 
 @pytest.mark.acceptance
-def test_fixed_profit_floor_remains_in_execution_default_but_not_advisory_override():
-    """ATDD-OPIP-CONFIGURABLE-SCORING-v1/AC-007: advisor is not execution policy."""
+def test_fixed_profit_floor_is_disabled_in_shared_default():
+    """Phase 2A: the shared economic default has no fixed dollar floor."""
     execution_default = evaluate_economic_quality(
         plan(), available_capital=500,
         max_capital_fraction=PRODUCTION_MAX_CAPITAL_FRACTION,
@@ -42,22 +42,22 @@ def test_fixed_profit_floor_remains_in_execution_default_but_not_advisory_overri
             "estimated_round_trip_cost_pct": 0.6,
         },
     )
-    assert MIN_NET_PROFIT == 75.0
-    assert execution_default.qualified is False
+    assert MIN_NET_PROFIT == 0.0
+    assert execution_default.qualified is True
     assert advisory_default.qualified is True
     assert advisory_configured.qualified is True
     assert 0 < advisory_default.target_2_net_profit < 75
 
 
 @pytest.mark.acceptance
-def test_advisory_has_no_dollar_cutoff_while_execution_defaults_unchanged():
-    """ATDD-OPIP-ADVISORY-NO-FIXED-PROFIT-v1/AC-001: advisory dollar veto absent."""
+def test_no_dollar_cutoff_in_shared_default():
+    """Phase 2A: no arbitrary dollar floor in the shared economic default."""
     advice = _economic_quality(
         plan(), SimpleNamespace(trade_direction="LONG"), 500,
     )
     assert advice.qualified is True
     assert 0 < advice.target_2_net_profit < 75
-    assert MIN_NET_PROFIT == 75.0
+    assert MIN_NET_PROFIT == 0.0
 
 
 @pytest.mark.acceptance
@@ -272,8 +272,8 @@ def test_ac_007_no_discontinuity_at_seventy_five_dollars():
 
 
 @pytest.mark.acceptance
-def test_ac_007_execution_gate_keeps_its_seventy_five_dollar_bar():
-    """ATDD-OPIP-ADVISORY-NO-FIXED-PROFIT-v1/AC-007: advisory removal is not execution removal."""
+def test_execution_gate_has_no_fixed_dollar_bar():
+    """Phase 2A: the shared economic gate default has no fixed dollar bar."""
     from app.opip.decision.gates import evaluate_economic_quality_gate
     from app.opip.decision.models import GateStatus
 
@@ -281,20 +281,18 @@ def test_ac_007_execution_gate_keeps_its_seventy_five_dollar_bar():
     advice = _economic_quality(plan(), snapshot, 500)
     assert advice.qualified is True
 
-    # The same candidate is still refused by the execution-side gate.
+    # The same candidate is now admitted by the shared economic gate because
+    # positive projected net (not a $75 floor) is the only default requirement.
     execution = evaluate_economic_quality_gate(plan(), snapshot, account_equity=500)
-    assert execution.status is GateStatus.FAIL
-    assert "75.00" in " ".join(
-        str(part) for part in (execution.reason, execution.metadata)
-    )
+    assert execution.status is GateStatus.PASS
 
-    # The shared gate's own default is unchanged.
+    # The shared gate's own default is now disabled (zero), not $75.
     shared = evaluate_economic_quality(
         plan(), available_capital=500,
         max_capital_fraction=PRODUCTION_MAX_CAPITAL_FRACTION,
     )
-    assert shared.qualified is False
-    assert "$75.00" in (shared.rejection_reason or "")
+    assert shared.qualified is True
+    assert "$75.00" not in (shared.rejection_reason or "")
 
 
 @pytest.mark.acceptance
@@ -365,8 +363,8 @@ def test_ac_008_chief_advisory_prefilter_cannot_reintroduce_a_fixed_floor(monkey
 
 
 @pytest.mark.acceptance
-def test_ac_009_execution_side_paths_keep_the_execution_bar():
-    """ATDD-OPIP-ADVISORY-NO-FIXED-PROFIT-v1/AC-009: advisory removal is not execution removal."""
+def test_execution_side_paths_share_disabled_defaults():
+    """Phase 2A: execution-side defaults are disabled (zero), not $75/4%/2.5."""
     import inspect
 
     from app.services import trade_action_gate, tradevisor_evaluation
@@ -376,23 +374,22 @@ def test_ac_009_execution_side_paths_keep_the_execution_bar():
         MIN_TARGET_2_MOVE_PCT,
     )
 
-    # The named execution constants are untouched by the advisory change.
-    assert MIN_NET_PROFIT == 75.0
-    assert MIN_TARGET_2_MOVE_PCT == 4.0
-    assert MIN_REWARD_TO_RISK == 2.5
+    # The named economic constants are disabled by default.
+    assert MIN_NET_PROFIT == 0.0
+    assert MIN_TARGET_2_MOVE_PCT == 0.0
+    assert MIN_REWARD_TO_RISK == 0.0
 
-    # The shared gate still defaults to the execution-compatible bar.
+    # The shared gate still defaults to these (now disabled) constants.
     signature = inspect.signature(evaluate_economic_quality).parameters
     assert signature["min_net_profit"].default == MIN_NET_PROFIT
     assert signature["min_target_2_move_pct"].default == MIN_TARGET_2_MOVE_PCT
     assert signature["min_reward_to_risk"].default == MIN_REWARD_TO_RISK
 
-    # Tradeability enforces the dollar bar independently of the advisory screen.
+    # The action gate enforces break-even (positive net), not a fixed $75 bar.
     assert "MIN_NET_PROFIT" in inspect.getsource(trade_action_gate)
 
-    # The Tradevisor evaluation path is NOT reclassified by this change, and that
-    # limitation is recorded rather than presented as a system-wide removal.
+    # The Tradevisor evaluation path consumes the shared defaults; the floor is
+    # removed system-wide through the shared constant, not re-implemented locally.
     tradevisor = inspect.getsource(tradevisor_evaluation)
-    assert "advisory_economic_policy" not in tradevisor
     assert "min_net_profit" not in tradevisor
 
