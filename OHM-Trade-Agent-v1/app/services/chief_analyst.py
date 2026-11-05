@@ -219,6 +219,7 @@ def _quality_by_risk_level(candidate: MarketSnapshot, account_equity: float, eco
 CHIEF_SKIPPED_NO_ELIGIBLE = "SKIPPED_NO_ELIGIBLE_CANDIDATES"
 CHIEF_BUDGET_BLOCKED = "BUDGET_BLOCKED"
 CHIEF_CACHE_REUSED = "CACHE_REUSED"
+CHIEF_NOT_CONFIGURED = "NOT_CONFIGURED"
 CHIEF_FAILED = "FAILED"
 CHIEF_SUCCEEDED = "SUCCEEDED"
 
@@ -743,6 +744,32 @@ def review_candidates(
         stage_evidence["provider"] = route_plan.targets[0].provider
         stage_evidence["model"] = route_plan.targets[0].model
         stage_evidence["reasoning_effort"] = route_plan.targets[0].reasoning_effort
+
+    if not route_plan.targets:
+        # No provider is configured (no API key for any allowed provider). This is
+        # a configuration state, not a provider outage: record it distinctly so a
+        # zero-trade scan is attributable to "AI not configured" rather than to an
+        # unavailable service.
+        _trace_chief_failure(
+            chief_eligible_candidates,
+            reason_code="CHIEF_NOT_CONFIGURED",
+            detail="no O'Pip AI provider is configured (no API key)",
+        )
+        print(
+            "CHIEF SUPPRESSED Reason=CHIEF_NOT_CONFIGURED "
+            "(no O'Pip AI provider configured)"
+        )
+        stage_evidence["invocation_status"] = CHIEF_NOT_CONFIGURED
+        stage_evidence["failure_type"] = "NO_AI_PROVIDER_CONFIGURED"
+        stage_evidence["completed_at"] = datetime.now(
+            timezone.utc
+        ).isoformat()
+        return _no_trade_review(
+            "Chief API skipped: no O'Pip AI provider is configured.",
+            failure_code="CHIEF_NOT_CONFIGURED",
+            eligible_candidates=len(payload),
+            stage_evidence=stage_evidence,
+        )
 
     fingerprint = build_chief_fingerprint(
         request_payload,

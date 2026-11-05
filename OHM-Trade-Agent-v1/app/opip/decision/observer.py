@@ -34,6 +34,7 @@ from app.opip.decision.funnel import (
     AI_BUDGET_BLOCKED,
     AI_CACHE_REUSED,
     AI_FAILED,
+    AI_NOT_CONFIGURED,
     AI_NOT_REACHED,
     AI_SKIPPED_NO_ELIGIBLE,
     AI_SUCCEEDED,
@@ -79,6 +80,7 @@ _AI_STATUS_MAP = {
     "SKIPPED_NO_ELIGIBLE_CANDIDATES": AI_SKIPPED_NO_ELIGIBLE,
     "BUDGET_BLOCKED": AI_BUDGET_BLOCKED,
     "CACHE_REUSED": AI_CACHE_REUSED,
+    "NOT_CONFIGURED": AI_NOT_CONFIGURED,
     "FAILED": AI_FAILED,
     "SUCCEEDED": AI_SUCCEEDED,
 }
@@ -438,6 +440,15 @@ class OPipScanObserver:
                 GateStatus.FAIL,
                 ReasonCode.AI_SERVICE_UNAVAILABLE,
                 reason=f"Chief unavailable: {stage.failure_type or 'unknown'}",
+                evaluated_at=evaluated_at,
+                metadata=metadata,
+            )
+        if stage.invocation_status == AI_NOT_CONFIGURED:
+            return GateResult.build(
+                GateName.AI_INVOCATION,
+                GateStatus.FAIL,
+                ReasonCode.AI_NOT_CONFIGURED,
+                reason="Chief skipped: no O'Pip AI provider is configured",
                 evaluated_at=evaluated_at,
                 metadata=metadata,
             )
