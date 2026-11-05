@@ -671,24 +671,37 @@ def api(tmp_path, monkeypatch):
 
 @pytest.mark.acceptance(f"{INCREMENT}/AC-005")
 def test_api_reports_absence_instead_of_inventing_data(api):
-    """ATDD-OPIP-CONTROL-CENTER-V2-M02/AC-005: a missing projection is UNAVAILABLE with a reason, never a 500."""
+    """ATDD-OPIP-CONTROL-CENTER-V2-M02/AC-005: absence is explicit, never a 500 or a fabricated row.
+
+    Contract note (acceptance repair AC-002): with no projection the
+    route now answers from canonical evidence instead of refusing, so the payload is
+    labelled CANONICAL_DIRECT and carries the projection state that caused the
+    fallback. With no canonical evidence either, the status stays NO_EVIDENCE. The
+    original intent - absence is never invented data - is unchanged.
+    """
     client, _settings_ = api
     health = client.get("/api/opip/control-center/health")
     assert health.status_code == 200
     body = health.json()
     assert body["status"] == "MEASURED"
-    assert body["projection"]["status"] == "UNAVAILABLE"
-    assert body["projection"]["reason_code"] == "ANALYTICS_DB_UNAVAILABLE"
+    projection = body["projection"]
+    assert projection["source"] == "CANONICAL_DIRECT"
+    assert projection["projection_fallback"] is True
+    assert projection["projection"]["status"] == "UNAVAILABLE"
+    assert projection["projection"]["reason_code"] == "ANALYTICS_DB_UNAVAILABLE"
+    # Nothing was measured, so the KPI block must say so rather than show zeros.
+    assert projection["kpi"]["status"] == "NO_EVIDENCE"
     # Runtime evidence is still reported, and an absent artifact is not healthy.
     assert body["runtime"]["protection"]["status"] in {"UNVERIFIED", "MEASURED"}
     assert body["runtime"]["trading_authority"]["funded_orders"] is False
 
     signals = client.get("/api/opip/control-center/signals")
     assert signals.status_code == 200
-    assert signals.json()["status"] == "UNAVAILABLE"
+    assert signals.json()["status"] == "NO_EVIDENCE"
+    assert signals.json()["source"] == "CANONICAL_DIRECT"
 
     scanner = client.get("/api/opip/control-center/scanner")
-    assert scanner.json()["status"] == "UNAVAILABLE"
+    assert scanner.json()["status"] == "NO_EVIDENCE"
 
     config = client.get("/api/opip/control-center/config")
     assert config.status_code == 200

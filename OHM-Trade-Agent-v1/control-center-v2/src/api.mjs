@@ -500,3 +500,56 @@ export function stageOutcome(response) {
   return {state: status || 'UNVERIFIED', message: 'No staging outcome was recorded'};
 }
 
+
+/** How a payload was obtained, so a direct read is never read as reconciled. */
+export function provenanceLabel(payload) {
+  if (!payload || typeof payload !== 'object') return null;
+  if (payload.source === 'CANONICAL_DIRECT') {
+    return {
+      label: 'CANONICAL (DIRECT)',
+      level: 'warn',
+      detail:
+        payload.detail ||
+        'Read directly from canonical evidence. Not yet reconciled through the analytical projection.',
+    };
+  }
+  if (payload.projection_fallback) {
+    return {
+      label: 'PROJECTION FALLBACK',
+      level: 'warn',
+      detail: 'The projection had no rows for this surface, so canonical evidence answered instead.',
+    };
+  }
+  return null;
+}
+
+/**
+ * Why zero BUY signals: the recorded qualification explanation, structured.
+ * Nothing is inferred - every field comes from the recorded payload.
+ */
+export function zeroBuySummary(explanation) {
+  if (!explanation || typeof explanation !== 'object') return null;
+  const stages = qualificationFunnel(explanation);
+  const rejections = rejectionBreakdown(explanation).filter(
+    row => typeof row.value === 'number' && row.value > 0
+  );
+  return {
+    status: explanation.status || 'UNRECORDED',
+    reason: explanation.reason || null,
+    explanation: explanation.explanation || null,
+    dominantGate: explanation.dominant_terminal_gate || null,
+    deepestStage: explanation.deepest_stage_reached || null,
+    scanId: explanation.scan_id || null,
+    observedAtUtc: explanation.last_scan_at_utc || null,
+    stages,
+    measuredStages: stages.filter(row => typeof row.value === 'number'),
+    unverifiedStages: stages.filter(row => row.value === null).map(row => row.label),
+    rejections,
+    qualified: typeof explanation.qualified === 'number' ? explanation.qualified : null,
+    paperAdmissionEligible:
+      typeof explanation.paper_admission_eligible === 'number'
+        ? explanation.paper_admission_eligible
+        : null,
+  };
+}
+

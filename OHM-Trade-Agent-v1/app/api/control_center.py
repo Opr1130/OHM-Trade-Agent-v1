@@ -26,6 +26,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query
 
 from app.core.config import get_settings
 from app.opip.analytics import queries, reconcile, retention, runtime
+from app.opip.analytics import direct
 from app.opip.analytics import sources as source_registry
 from app.opip.analytics.ingest import ingest_all
 from app.opip.analytics.store import (
@@ -105,19 +106,55 @@ def _unavailable(reason: str = REASON_DB_UNAVAILABLE) -> dict[str, Any]:
     }
 
 
-def _guarded(payload_builder, *, reason: str = REASON_DB_UNAVAILABLE) -> dict[str, Any]:
-    """Run a read, converting an absent projection or a timeout into a reason."""
+def _note_fallback(
+    payload: dict[str, Any], projection_status: str, reason_code: str | None
+) -> dict[str, Any]:
+    """Stamp a read-through payload with the projection state that caused it."""
+    payload["projection"] = {"status": projection_status, "reason_code": reason_code}
+    payload["projection_fallback"] = True
+    return payload
+
+
+def _guarded(
+    payload_builder,
+    *,
+    fallback=None,
+    reason: str = REASON_DB_UNAVAILABLE,
+) -> dict[str, Any]:
+    """Run a projection read, converting absence or a timeout into a reason.
+
+    When ``fallback`` is supplied and the projection cannot answer (absent, timed
+    out, or holding no rows for this surface), the read-through to canonical
+    evidence answers instead - labelled ``CANONICAL_DIRECT`` / ``UNPROJECTED`` so it
+    is never presented as a reconciled projection value.
+    """
     with reader() as conn:
         if conn is None:
-            return _unavailable(reason)
+            if fallback is None:
+                return _unavailable(reason)
+            return _note_fallback(fallback(), "UNAVAILABLE", reason)
         try:
-            return payload_builder(conn)
+            payload = payload_builder(conn)
         except sqlite3.OperationalError as exc:
+            if fallback is not None:
+                return _note_fallback(fallback(), "UNAVAILABLE", REASON_QUERY_TIMEOUT)
             if "interrupted" in str(exc).lower():
                 return _unavailable(REASON_QUERY_TIMEOUT)
             return _unavailable(f"ANALYTICS_QUERY_FAILED_{type(exc).__name__.upper()}")
         except AnalyticsStoreError:
+            if fallback is not None:
+                return _note_fallback(fallback(), "UNAVAILABLE", reason)
             return _unavailable()
+    if fallback is not None and payload.get("status") in {
+        "UNAVAILABLE",
+        "NO_EVIDENCE",
+    }:
+        direct_payload = fallback()
+        if direct_payload.get("status") == "MEASURED":
+            return _note_fallback(
+                direct_payload, str(payload.get("status")), payload.get("reason_code")
+            )
+    return payload
 
 
 @router.get("/api/opip/control-center/health")
@@ -134,10 +171,10 @@ def control_center_health(
         observed_from = (runtime._utc() - timedelta(days=int(window_days))).isoformat()
     with reader() as conn:
         if conn is None:
-            projection: dict[str, Any] = {
-                "status": "UNAVAILABLE",
-                "reason_code": REASON_DB_UNAVAILABLE,
-            }
+            projection: dict[str, Any] = direct.health_block(
+                settings, window_days=window_days
+            )
+            projection["projection_fallback"] = True
         else:
             try:
                 projection = {
@@ -153,6 +190,19 @@ def control_center_health(
                 main_bytes, wal_bytes = database_size_bytes(_db_path())
                 projection["db_bytes"] = main_bytes
                 projection["wal_bytes"] = wal_bytes
+                if projection["kpi"].get("status") != "MEASURED":
+                    # The projection exists but holds no rows for the window: read
+                    # through to canonical evidence instead of showing nothing.
+                    fallback = direct.health_block(settings, window_days=window_days)
+                    if fallback["kpi"].get("status") == "MEASURED":
+                        fallback["projection"] = {
+                            "status": projection["kpi"].get("status"),
+                            "reason_code": projection["kpi"].get("reason_code"),
+                        }
+                        fallback["projection_fallback"] = True
+                        fallback["db_bytes"] = main_bytes
+                        fallback["wal_bytes"] = wal_bytes
+                        projection = fallback
             except sqlite3.OperationalError as exc:
                 projection = {
                     "status": "UNAVAILABLE",
@@ -169,6 +219,43 @@ def control_center_health(
         "window_days": window_days or None,
         "generated_at_utc": runtime._utc().isoformat(),
     }
+
+
+def _direct_signals(settings, *, symbols, direction, v2_status, divergence,
+                    min_score, max_score, limit) -> dict[str, Any]:
+    """Apply the same filters to a direct read as the projection query would."""
+    payload = direct.signals(settings, limit=200)
+    rows = payload.get("rows") or []
+    if symbols:
+        wanted = {str(item).upper() for item in symbols}
+        rows = [row for row in rows if str(row.get("symbol", "")).upper() in wanted]
+    if direction in {"LONG", "SHORT"}:
+        rows = [row for row in rows if str(row.get("trade_direction", "")).upper() == direction]
+    if v2_status:
+        rows = [row for row in rows if str(row.get("v2_feature_status")) == v2_status]
+    if divergence:
+        rows = [row for row in rows if str(row.get("divergence")) == divergence]
+    if min_score is not None:
+        rows = [
+            row
+            for row in rows
+            if isinstance(row.get("technical_score"), (int, float))
+            and row["technical_score"] >= float(min_score)
+        ]
+    if max_score is not None:
+        rows = [
+            row
+            for row in rows
+            if isinstance(row.get("technical_score"), (int, float))
+            and row["technical_score"] <= float(max_score)
+        ]
+    page = rows[: max(1, min(int(limit), 200))]
+    payload["rows"] = page
+    payload["rows_available"] = len(rows)
+    if not page:
+        payload["status"] = "NO_EVIDENCE"
+        payload["reason_code"] = "NO_ROWS_MATCH_FILTERS"
+    return payload
 
 
 @router.get("/api/opip/control-center/signals")
@@ -209,7 +296,19 @@ def control_center_signals(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    return _guarded(build)
+    def fallback() -> dict[str, Any]:
+        return _direct_signals(
+            get_settings(),
+            symbols=symbol_list,
+            direction=direction,
+            v2_status=v2_status,
+            divergence=divergence,
+            min_score=min_score,
+            max_score=max_score,
+            limit=limit,
+        )
+
+    return _guarded(build, fallback=fallback)
 
 
 @router.get("/api/opip/control-center/forensics")
@@ -221,7 +320,10 @@ def control_center_forensics(
     """Full provenance for one row, naming every field it could not prove."""
     _require_secret(x_webhook_secret)
     return _guarded(
-        lambda conn: queries.forensics(conn, attempt_id=attempt_id, symbol=symbol)
+        lambda conn: queries.forensics(conn, attempt_id=attempt_id, symbol=symbol),
+        fallback=lambda: direct.forensics(
+            get_settings(), attempt_id=attempt_id, symbol=symbol
+        ),
     )
 
 
@@ -232,7 +334,10 @@ def control_center_scanner(
 ) -> dict[str, Any]:
     """Attempt-by-attempt operational funnel."""
     _require_secret(x_webhook_secret)
-    return _guarded(lambda conn: queries.scanner_funnel(conn, limit=limit))
+    return _guarded(
+        lambda conn: queries.scanner_funnel(conn, limit=limit),
+        fallback=lambda: direct.funnel(get_settings(), limit=limit),
+    )
 
 
 @router.get("/api/opip/control-center/ai")
@@ -251,7 +356,7 @@ def control_center_ai(
             "generated_at_utc": runtime._utc().isoformat(),
         }
 
-    return _guarded(build)
+    return _guarded(build, fallback=lambda: direct.ai(get_settings()))
 
 
 
@@ -260,7 +365,10 @@ def control_center_data(x_webhook_secret: str | None = Header(default=None)) -> 
     """Source coverage, ingestion lag, quarantine, aging and retention state."""
     _require_secret(x_webhook_secret)
     path = _db_path()
-    return _guarded(lambda conn: queries.data_health(conn, db_path=path))
+    return _guarded(
+        lambda conn: queries.data_health(conn, db_path=path),
+        fallback=lambda: direct.data_coverage(get_settings()),
+    )
 
 
 @router.get("/api/opip/control-center/config")
