@@ -38,7 +38,10 @@ from app.services.chief_analyst import (
     SHORT_MAX_ACCOUNT_RISK_AT_STOP_PCT,
     SHORT_VALIDATION_LEVERAGE,
 )
-from app.services.economic_quality_gate import evaluate_economic_quality
+from app.services.economic_quality_gate import (
+    effective_economic_policy,
+    evaluate_economic_quality,
+)
 from app.services.recommendation_gate import candidate_alert_authorized, parse_confidence
 from app.services.short_target_attainability import evaluate_short_target_attainability
 from app.services.target_attainability import evaluate_target_attainability
@@ -522,11 +525,13 @@ def evaluate_economic_quality_gate(
             leverage=SHORT_VALIDATION_LEVERAGE,
             estimated_margin_cost_pct=SHORT_MARGIN_COST_RESERVE_PCT,
             max_account_risk_at_stop_pct=SHORT_MAX_ACCOUNT_RISK_AT_STOP_PCT,
+            **effective_economic_policy(),
         )
     else:
         result = evaluate_economic_quality(
             plan,
             available_capital=account_equity,
             max_capital_fraction=PRODUCTION_MAX_CAPITAL_FRACTION,
+            **effective_economic_policy(),
         )
     return economic_quality_gate_from_result(result, evaluated_at=evaluated_at)

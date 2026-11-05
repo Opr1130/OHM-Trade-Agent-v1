@@ -74,6 +74,26 @@ def advisory_economic_policy(
     return policy
 
 
+def effective_economic_policy() -> dict[str, float]:
+    """Return the versioned economic-floor policy from the active strategy profile.
+
+    This is the single source of truth for the economic floors consumed by the
+    scanner, the Chief prefilter, Tradevisor, the action gate and the shadow
+    decision engine. The bundled reference profile disables all three floors
+    (zero); an owner-activated profile can raise any of them. A malformed or
+    unauthorized active profile raises (it must never be silently substituted).
+    """
+    from app.core.strategy_policy import load_active_strategy_policy
+
+    economics = load_active_strategy_policy().advisory_economics
+    return advisory_economic_policy({
+        "min_net_profit": economics["min_net_profit_usd"],
+        "min_target_2_move_pct": economics["min_target_2_move_pct"],
+        "min_reward_to_risk": economics["min_reward_to_risk"],
+        "estimated_round_trip_cost_pct": economics["estimated_round_trip_cost_pct"],
+    })
+
+
 @dataclass
 class EconomicGateResult:
     qualified: bool
@@ -225,6 +245,12 @@ def evaluate_economic_quality(
         rejection_reason = (
             f"Projected Target 2 move {target_2_move_pct:.2f}% is below minimum "
             f"{min_target_2_move_pct:.2f}%"
+        )
+    elif target_2_net_profit <= 0:
+        rejection_reason = (
+            f"Projected net profit ${target_2_net_profit:.2f} at the "
+            f"{max_capital_fraction * 100:.0f}% capital envelope is not "
+            f"strictly positive after costs"
         )
     elif target_2_net_profit < min_net_profit:
         rejection_reason = (

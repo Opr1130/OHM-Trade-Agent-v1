@@ -116,6 +116,18 @@ def test_ai_status_map_distinguishes_not_configured():
     assert AI_NOT_CONFIGURED != AI_FAILED
 
 
+def test_effective_economic_policy_reads_versioned_profile():
+    """The centralized economic policy resolves from the versioned profile."""
+    from app.services.economic_quality_gate import effective_economic_policy
+
+    policy = effective_economic_policy()
+    # The bundled reference profile disables all three floors.
+    assert policy["min_net_profit"] == 0.0
+    assert policy["min_target_2_move_pct"] == 0.0
+    assert policy["min_reward_to_risk"] == 0.0
+    assert policy["estimated_round_trip_cost_pct"] > 0
+
+
 def test_trade_decision_forwards_configured_risk_sizing(monkeypatch):
     """Configured risk-per-trade and max-positions reach the allocator."""
     captured = {}
