@@ -348,17 +348,18 @@ def test_ac_020_instrument_coverage_distinguishes_supported_unsupported_unknown(
 # ---------------------------------------------------------------------------
 
 
-def test_ac_021_final_economics_rejects_when_f7_allocation_falls_below_minimum():
-    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-021: the final allocation decides."""
+def test_ac_021_final_economics_passes_positive_net_below_old_seventy_five_floor():
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-021: the final allocation decides on positive net."""
     decision = evaluate(equity=8_000.0)
 
     assert decision.decision == te.DECISION_WATCH
-    assert decision.rejection_code == "ECONOMIC_REJECT_AT_FINAL_ALLOCATION"
+    # A positive net at the F7 allocation is no longer vetoed by the old $75
+    # floor; the candidate proceeds to the (unchanged) shadow-only F6 blocker.
+    assert decision.rejection_code == "ADVISORY_EVIDENCE_INCOMPLETE"
     assert decision.actionable is False
-    # No economic PASS may be reported for an allocation below the bar.
     assert decision.economics is not None
-    assert decision.economics.qualified is False
-    assert decision.economics.target_2_net_profit < 75.0
+    assert decision.economics.qualified is True
+    assert 0 < decision.economics.target_2_net_profit < 75.0
 
     envelope = decision.evidence["economics_at_envelope"]
     assert envelope["qualified"] is True
@@ -855,7 +856,7 @@ def test_ac_028_non_finite_or_negative_allocation_fails_closed_without_raising(
 
 
 def test_ac_028_unusable_allocation_never_reports_an_economic_pass(monkeypatch):
-    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-028: no PASS without a usable allocation."""
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-028: no actionable PASS without a usable allocation."""
     monkeypatch.setattr(
         te, "recommend_capital", lambda **_kwargs: _FakeAllocation(10.0)
     )
@@ -863,8 +864,10 @@ def test_ac_028_unusable_allocation_never_reports_an_economic_pass(monkeypatch):
 
     assert decision.rejection_code == "CAPITAL_BELOW_EXECUTABLE_MINIMUM"
     assert decision.economics is not None
-    assert decision.economics.qualified is False
-    assert decision.evidence["f5_final"]["qualified"] is False
+    # The economics (positive net after costs) pass, but the decision is still
+    # rejected at the capital gate because $10 is below the executable minimum.
+    assert decision.economics.qualified is True
+    assert decision.evidence["f5_final"]["qualified"] is True
 
 
 # ---------------------------------------------------------------------------

@@ -45,6 +45,7 @@ from app.services.capital_efficiency_ranking import MIN_EXECUTABLE_NOTIONAL_USD
 from app.services.economic_quality_gate import (
     PRODUCTION_MAX_CAPITAL_FRACTION,
     EconomicGateResult,
+    effective_economic_policy,
     evaluate_economic_quality,
 )
 from app.services.entry_exit_advisor import EntryExitPlan, build_entry_exit_plan
@@ -236,6 +237,7 @@ def _evaluate_buy_plans(
             plan,
             equity,
             max_capital_fraction=PRODUCTION_MAX_CAPITAL_FRACTION,
+            **effective_economic_policy(),
         )
         attempt.update(
             attainability_qualified=bool(attainability.qualified),
@@ -855,6 +857,7 @@ def _finalize_qualified_buy(
             equity_value,
             max_capital_fraction=allocation_fraction,
             max_account_risk_at_stop_pct=None,
+            **effective_economic_policy(),
         )
         evidence["economics_at_envelope"] = {
             "recommended_capital": economics.recommended_capital,

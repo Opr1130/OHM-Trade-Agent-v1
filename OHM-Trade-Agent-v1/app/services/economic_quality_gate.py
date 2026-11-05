@@ -10,11 +10,15 @@ PRODUCTION_MAX_CAPITAL_FRACTION = 0.20
 
 # The economic gate's policy numbers, named so that telemetry can report how
 # far a candidate was from the bar without restating the value. These are the
-# keyword defaults below; production never overrides them.
-MIN_TARGET_2_MOVE_PCT = 4.0
+# keyword defaults below. The owner's contract disables arbitrary dollar/move/
+# reward-risk floors by default: an actionable opportunity requires positive
+# projected net economics after costs (enforced by ``min_net_profit`` at zero),
+# never a fixed $75 / 4% / 2.5R bar. A versioned policy can still raise any of
+# them explicitly through ``advisory_economic_policy`` or the policy file.
+MIN_TARGET_2_MOVE_PCT = 0.0
 PREFERRED_TARGET_2_MOVE_PCT = 7.0
-MIN_NET_PROFIT = 75.0
-MIN_REWARD_TO_RISK = 2.5
+MIN_NET_PROFIT = 0.0
+MIN_REWARD_TO_RISK = 0.0
 ESTIMATED_ROUND_TRIP_COST_PCT = 0.60
 
 # --- advisory screen policy ---------------------------------------------------
@@ -68,6 +72,26 @@ def advisory_economic_policy(
             raise ValueError(f"Invalid advisory economic bound for {key}")
         policy[key] = numeric
     return policy
+
+
+def effective_economic_policy() -> dict[str, float]:
+    """Return the versioned economic-floor policy from the active strategy profile.
+
+    This is the single source of truth for the economic floors consumed by the
+    scanner, the Chief prefilter, Tradevisor, the action gate and the shadow
+    decision engine. The bundled reference profile disables all three floors
+    (zero); an owner-activated profile can raise any of them. A malformed or
+    unauthorized active profile raises (it must never be silently substituted).
+    """
+    from app.core.strategy_policy import load_active_strategy_policy
+
+    economics = load_active_strategy_policy().advisory_economics
+    return advisory_economic_policy({
+        "min_net_profit": economics["min_net_profit_usd"],
+        "min_target_2_move_pct": economics["min_target_2_move_pct"],
+        "min_reward_to_risk": economics["min_reward_to_risk"],
+        "estimated_round_trip_cost_pct": economics["estimated_round_trip_cost_pct"],
+    })
 
 
 @dataclass
@@ -221,6 +245,12 @@ def evaluate_economic_quality(
         rejection_reason = (
             f"Projected Target 2 move {target_2_move_pct:.2f}% is below minimum "
             f"{min_target_2_move_pct:.2f}%"
+        )
+    elif target_2_net_profit <= 0:
+        rejection_reason = (
+            f"Projected net profit ${target_2_net_profit:.2f} at the "
+            f"{max_capital_fraction * 100:.0f}% capital envelope is not "
+            f"strictly positive after costs"
         )
     elif target_2_net_profit < min_net_profit:
         rejection_reason = (

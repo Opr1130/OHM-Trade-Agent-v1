@@ -61,6 +61,7 @@ from app.services.chief_analyst import (
 from app.services.economic_quality_gate import (
     PRODUCTION_MAX_CAPITAL_FRACTION,
     advisory_economic_policy,
+    effective_economic_policy,
     evaluate_economic_quality,
 )
 from app.services.entry_exit_advisor import build_entry_exit_plan
@@ -1322,6 +1323,12 @@ def _apply_ranked_action_gates(ranked_opportunities, *, settings, opip=None, aut
                 plan=plan,
                 account_capital=float(settings.account_equity),
                 active_trades=projected_trades,
+                risk_per_trade_pct=float(
+                    getattr(settings, "risk_per_trade_pct", 0.35)
+                ),
+                max_positions=int(
+                    getattr(settings, "max_open_trades", 2)
+                ),
             )
         except Exception as exc:
             reason = f"{type(exc).__name__}: {exc}"
@@ -1409,13 +1416,7 @@ def main(scan_override=None):
     if bool(getattr(settings, "opip_advisory_profile_enabled", False)):
         from app.core.strategy_policy import load_active_strategy_policy
         active_strategy = load_active_strategy_policy()
-        economics = active_strategy.advisory_economics
-        advisory_policy = {
-            "min_net_profit": economics["min_net_profit_usd"],
-            "min_target_2_move_pct": economics["min_target_2_move_pct"],
-            "min_reward_to_risk": economics["min_reward_to_risk"],
-            "estimated_round_trip_cost_pct": economics["estimated_round_trip_cost_pct"],
-        }
+        advisory_policy = effective_economic_policy()
     scoring_version = getattr(settings, "opip_production_scoring_version", "v1")
     if scoring_version not in {"v1", "v2"}:
         raise ValueError("INVALID_PRODUCTION_SCORING_VERSION")

@@ -876,12 +876,12 @@ def test_binding_constraint_names_the_gate_that_actually_stopped_the_candidate()
                 "target_quality_qualified": True,
                 "target_quality_score": 96,
                 "economic_qualified": False,
-                "hypothetical_target_2_net_profit_at_assumed_capital": 12.5,
+                "hypothetical_target_2_net_profit_at_assumed_capital": -12.5,
             }
         }
     )
     assert economics_failed["binding_metric"] == "ECONOMIC_NET_PROFIT_AT_TARGET_2"
-    assert economics_failed["binding_measured"] == 12.5
+    assert economics_failed["binding_measured"] == -12.5
     assert economics_failed["binding_threshold"] == float(MIN_NET_PROFIT)
 
 
@@ -924,6 +924,6 @@ def test_economic_gate_defaults_are_the_named_policy_constants():
         signature.parameters["min_reward_to_risk"].default == gate.MIN_REWARD_TO_RISK
     )
     # Pin the live values so this build cannot move a production threshold.
-    assert gate.MIN_NET_PROFIT == 75.0
-    assert gate.MIN_TARGET_2_MOVE_PCT == 4.0
-    assert gate.MIN_REWARD_TO_RISK == 2.5
+    assert gate.MIN_NET_PROFIT == 0.0
+    assert gate.MIN_TARGET_2_MOVE_PCT == 0.0
+    assert gate.MIN_REWARD_TO_RISK == 0.0

@@ -27,6 +27,7 @@ from typing import Any, Mapping
 from app.opip.decision.funnel import (
     AI_BUDGET_BLOCKED,
     AI_FAILED,
+    AI_NOT_CONFIGURED,
     AI_NOT_REACHED,
     AI_SKIPPED_NO_ELIGIBLE,
     AIStageEvidence,
@@ -143,6 +144,15 @@ class OPipDecisionEngine:
                     if self.ai_stage.failure_type
                     else "Chief unavailable"
                 ),
+                evaluated_at=self.decision_at,
+                metadata=metadata,
+            )
+        if status == AI_NOT_CONFIGURED:
+            return GateResult.build(
+                GateName.AI_INVOCATION,
+                GateStatus.FAIL,
+                ReasonCode.AI_NOT_CONFIGURED,
+                reason="Chief skipped: no O'Pip AI provider is configured",
                 evaluated_at=self.decision_at,
                 metadata=metadata,
             )

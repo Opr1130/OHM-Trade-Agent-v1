@@ -124,7 +124,7 @@ AC-006 -> tests/test_v2_production_selection_contract.py::test_missing_v2_featur
 AC-006 -> tests/test_v2_production_selection_contract.py::test_v2_margin_fallback_requires_independent_v2_long_qualification
 AC-006 -> tests/test_v2_production_selection_contract.py::test_selector_and_screening_rows_share_v2_threshold
 AC-006 -> tests/test_v2_production_selection_contract.py::test_comparison_relabels_authority_correctly_on_v2_cutover
-AC-007 -> tests/test_advisory_policy_v2.py::test_fixed_profit_floor_remains_in_execution_default_but_not_advisory_override
+AC-007 -> tests/test_advisory_policy_v2.py::test_fixed_profit_floor_is_disabled_in_shared_default
 AC-007 -> tests/test_advisory_policy_v2.py::test_invalid_ai_return_potential_cannot_become_trade_claim
 AC-007 -> tests/test_advisory_policy_v2.py::test_conditional_ai_move_is_visible_but_not_claimed_as_guaranteed_return
 AC-008 -> tests/test_strategy_admin_drafts.py::test_advisory_activation_and_rollback_are_atomic_and_versioned

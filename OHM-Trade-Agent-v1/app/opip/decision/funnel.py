@@ -54,6 +54,7 @@ AI_NOT_REACHED = "NOT_REACHED"
 AI_SKIPPED_NO_ELIGIBLE = "SKIPPED_NO_ELIGIBLE_CANDIDATES"
 AI_BUDGET_BLOCKED = "BUDGET_BLOCKED"
 AI_CACHE_REUSED = "CACHE_REUSED"
+AI_NOT_CONFIGURED = "NOT_CONFIGURED"
 AI_FAILED = "FAILED"
 AI_SUCCEEDED = "SUCCEEDED"
 
@@ -86,6 +87,10 @@ class AIStageEvidence:
     @property
     def budget_exhausted(self) -> bool:
         return self.invocation_status == AI_BUDGET_BLOCKED
+
+    @property
+    def not_configured(self) -> bool:
+        return self.invocation_status == AI_NOT_CONFIGURED
 
     def confidence_summary(self) -> dict[str, Any]:
         """Return distribution statistics for the observed AI confidences.
@@ -132,6 +137,7 @@ class AIStageEvidence:
             "invoked": self.invoked,
             "unavailable": self.unavailable,
             "budget_exhausted": self.budget_exhausted,
+            "not_configured": self.not_configured,
             "confidence_summary": self.confidence_summary(),
         }
 
