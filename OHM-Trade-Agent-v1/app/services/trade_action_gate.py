@@ -7,7 +7,7 @@ from typing import Any
 from app.services.active_trade_registry import get_active_trades
 from app.services.capital_efficiency_ranking import MIN_EXECUTABLE_NOTIONAL_USD
 from app.services.entry_exit_advisor import EntryExitPlan
-from app.services.economic_quality_gate import MIN_NET_PROFIT
+from app.services.economic_quality_gate import effective_economic_policy
 from app.services.portfolio_risk import evaluate_portfolio_risk
 from app.services.trade_decision_intelligence import (
     TradeDecisionIntelligence,
@@ -171,11 +171,18 @@ def apply_action_gate(
                     adjusted_net,
                     2,
                 )
-                if adjusted_net < MIN_NET_PROFIT:
+                min_net_profit = effective_economic_policy()["min_net_profit"]
+                if adjusted_net <= 0:
                     capacity_reason = (
                         f"capacity-capped validation net profit "
-                        f"USD {adjusted_net:.2f} is below break-even "
-                        f"(minimum USD {MIN_NET_PROFIT:.2f})"
+                        f"USD {adjusted_net:.2f} is at or below break-even "
+                        f"after costs"
+                    )
+                elif adjusted_net < min_net_profit:
+                    capacity_reason = (
+                        f"capacity-capped validation net profit "
+                        f"USD {adjusted_net:.2f} is below the configured "
+                        f"economic minimum USD {min_net_profit:.2f}"
                     )
         else:
             candidate["liquidity_capacity_capped"] = False
