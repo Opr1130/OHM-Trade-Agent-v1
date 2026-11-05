@@ -372,6 +372,7 @@ def test_execution_side_paths_share_disabled_defaults():
         MIN_NET_PROFIT,
         MIN_REWARD_TO_RISK,
         MIN_TARGET_2_MOVE_PCT,
+        effective_economic_policy,
     )
 
     # The named economic constants are disabled by default.
@@ -385,11 +386,11 @@ def test_execution_side_paths_share_disabled_defaults():
     assert signature["min_target_2_move_pct"].default == MIN_TARGET_2_MOVE_PCT
     assert signature["min_reward_to_risk"].default == MIN_REWARD_TO_RISK
 
-    # The action gate enforces break-even (positive net), not a fixed $75 bar.
-    assert "MIN_NET_PROFIT" in inspect.getsource(trade_action_gate)
+    # The action gate uses the versioned shared policy, not a local fixed floor.
+    assert effective_economic_policy()["min_net_profit"] == MIN_NET_PROFIT
+    assert "effective_economic_policy" in inspect.getsource(trade_action_gate)
 
     # The Tradevisor evaluation path consumes the shared defaults; the floor is
     # removed system-wide through the shared constant, not re-implemented locally.
     tradevisor = inspect.getsource(tradevisor_evaluation)
     assert "min_net_profit" not in tradevisor
-

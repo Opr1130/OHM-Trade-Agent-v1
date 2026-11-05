@@ -276,20 +276,24 @@ def test_atdd28_target_attainability_rejection_abstains():
     assert decision.rejection_code == "TARGET_ATTAINABILITY_REJECT"
 
 
-def test_atdd32_after_cost_economics_reject_a_thin_account():
-    # A small account cannot clear the fixed net-profit floor after costs.
+def test_atdd32_thin_account_remains_non_actionable_without_complete_evidence():
     decision = evaluate(account_equity=1_000.0)
     assert decision.decision == te.DECISION_WATCH
-    assert decision.rejection_code == "ECONOMIC_REJECT"
+    assert decision.rejection_code == "ADVISORY_EVIDENCE_INCOMPLETE"
+    assert decision.evidence["advisory_qualification"]["missing"] == [
+        "F6_TRUSTED_FORECAST",
+        "SWING_4H_CLOSED_CONTEXT",
+    ]
 
 
-def test_atdd30_undersized_capital_is_rejected():
+def test_atdd30_undersized_capital_does_not_bypass_missing_evidence():
     decision = evaluate(account_equity=2_500.0)
     assert decision.decision == te.DECISION_WATCH
-    assert decision.rejection_code in {
-        "CAPITAL_BELOW_EXECUTABLE_MINIMUM",
-        "ECONOMIC_REJECT",
-    }
+    assert decision.rejection_code == "ADVISORY_EVIDENCE_INCOMPLETE"
+    assert decision.evidence["advisory_qualification"]["missing"] == [
+        "F6_TRUSTED_FORECAST",
+        "SWING_4H_CLOSED_CONTEXT",
+    ]
 
 
 def test_atdd30_exposure_capacity_rejects_a_full_book():
@@ -381,5 +385,4 @@ def test_decision_record_declares_no_authority():
     assert record["admission_authority"] is False
     assert record["measurement_only"] is True
     assert record["evidence"]["native_admission"] == "NOT_PERFORMED"
-
 

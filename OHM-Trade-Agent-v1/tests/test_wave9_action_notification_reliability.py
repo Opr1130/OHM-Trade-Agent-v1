@@ -306,7 +306,15 @@ def test_rank_one_veto_does_not_block_rank_two(monkeypatch):
         lambda *args: entry_watch_cleanup_calls.append(args),
     )
 
-    def gate(*, candidate, plan, account_capital, active_trades):
+    def gate(
+        *,
+        candidate,
+        plan,
+        account_capital,
+        active_trades,
+        risk_per_trade_pct,
+        max_positions,
+    ):
         if plan.symbol == "AAAUSD":
             candidate["action_gate_evaluated"] = True
             candidate["action_gate_allowed"] = False
