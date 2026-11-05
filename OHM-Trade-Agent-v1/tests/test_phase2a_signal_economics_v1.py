@@ -63,8 +63,9 @@ def test_negative_net_after_costs_is_still_rejected():
     assert result.target_2_net_profit < 0
 
 
+@pytest.mark.acceptance
 def test_chief_not_configured_is_recorded_distinctly(monkeypatch):
-    """No provider configured is a config state, not a provider outage."""
+    """ATDD-OPIP-PHASE2A-SIGNAL-ECONOMICS-v1/AC-002: no provider configured is a config state, not a provider outage."""
     from app.scanner.models import MarketSnapshot
 
     monkeypatch.setattr(
@@ -106,8 +107,9 @@ def test_chief_not_configured_is_recorded_distinctly(monkeypatch):
     assert review["opip_stage_evidence"]["failure_type"] == "NO_AI_PROVIDER_CONFIGURED"
 
 
+@pytest.mark.acceptance
 def test_ai_status_map_distinguishes_not_configured():
-    """The funnel map keeps NOT_CONFIGURED separate from FAILED."""
+    """ATDD-OPIP-PHASE2A-SIGNAL-ECONOMICS-v1/AC-002: the funnel map keeps NOT_CONFIGURED separate from FAILED."""
     from app.opip.decision.funnel import AI_FAILED, AI_NOT_CONFIGURED
     from app.opip.decision.observer import _AI_STATUS_MAP
 
@@ -128,8 +130,9 @@ def test_effective_economic_policy_reads_versioned_profile():
     assert policy["estimated_round_trip_cost_pct"] > 0
 
 
+@pytest.mark.acceptance
 def test_trade_decision_forwards_configured_risk_sizing(monkeypatch):
-    """Configured risk-per-trade and max-positions reach the allocator."""
+    """ATDD-OPIP-PHASE2A-SIGNAL-ECONOMICS-v1/AC-003: configured risk-per-trade and max-positions reach the allocator."""
     captured = {}
 
     def fake_recommend(**kwargs):

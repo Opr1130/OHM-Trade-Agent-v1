@@ -85,7 +85,7 @@ history remain unchanged. Production retains existing authority until separately
 released.
 
 ACCEPTANCE TEST TRACEABILITY:
-AC-001 -> tests/test_advisory_policy_v2.py::test_advisory_has_no_dollar_cutoff_while_execution_defaults_unchanged
+AC-001 -> tests/test_advisory_policy_v2.py::test_no_dollar_cutoff_in_shared_default
 AC-002 -> tests/test_advisory_policy_v2.py::test_negative_after_costs_is_not_qualified_and_explicit_stricter_policy_is_preserved
 AC-003 -> tests/test_advisory_policy_v2.py::test_optional_move_and_reward_risk_filters_default_off_but_can_be_enabled
 AC-004 -> tests/test_advisory_policy_v2.py::test_versioned_reference_policy_disables_only_advisory_filters
@@ -93,9 +93,9 @@ AC-005 -> tests/test_advisory_policy_v2.py::test_private_editor_supports_disable
 AC-006 -> tests/test_advisory_policy_v2.py::test_ac_006_projection_is_computable_and_never_fabricated
 AC-006 -> tests/test_advisory_policy_v2.py::test_ac_006_short_geometry_is_mirrored_and_not_confused_with_long
 AC-007 -> tests/test_advisory_policy_v2.py::test_ac_007_no_discontinuity_at_seventy_five_dollars
-AC-007 -> tests/test_advisory_policy_v2.py::test_ac_007_execution_gate_keeps_its_seventy_five_dollar_bar
+AC-007 -> tests/test_advisory_policy_v2.py::test_execution_gate_has_no_fixed_dollar_bar
 AC-008 -> tests/test_advisory_policy_v2.py::test_ac_008_chief_advisory_prefilter_cannot_reintroduce_a_fixed_floor
-AC-009 -> tests/test_advisory_policy_v2.py::test_ac_009_execution_side_paths_keep_the_execution_bar
+AC-009 -> tests/test_advisory_policy_v2.py::test_execution_side_paths_share_disabled_defaults
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/jobs/scan_opportunities.py

@@ -25,7 +25,7 @@ def plan():
 
 @pytest.mark.acceptance
 def test_fixed_profit_floor_is_disabled_in_shared_default():
-    """Phase 2A: the shared economic default has no fixed dollar floor."""
+    """ATDD-OPIP-CONFIGURABLE-SCORING-v1/AC-007 ATDD-OPIP-PHASE2A-SIGNAL-ECONOMICS-v1/AC-001: the shared economic default has no fixed dollar floor."""
     execution_default = evaluate_economic_quality(
         plan(), available_capital=500,
         max_capital_fraction=PRODUCTION_MAX_CAPITAL_FRACTION,
@@ -51,7 +51,7 @@ def test_fixed_profit_floor_is_disabled_in_shared_default():
 
 @pytest.mark.acceptance
 def test_no_dollar_cutoff_in_shared_default():
-    """Phase 2A: no arbitrary dollar floor in the shared economic default."""
+    """ATDD-OPIP-ADVISORY-NO-FIXED-PROFIT-v1/AC-001 ATDD-OPIP-PHASE2A-SIGNAL-ECONOMICS-v1/AC-001: no arbitrary dollar floor in the shared economic default."""
     advice = _economic_quality(
         plan(), SimpleNamespace(trade_direction="LONG"), 500,
     )
@@ -273,7 +273,7 @@ def test_ac_007_no_discontinuity_at_seventy_five_dollars():
 
 @pytest.mark.acceptance
 def test_execution_gate_has_no_fixed_dollar_bar():
-    """Phase 2A: the shared economic gate default has no fixed dollar bar."""
+    """ATDD-OPIP-ADVISORY-NO-FIXED-PROFIT-v1/AC-007 ATDD-OPIP-PHASE2A-SIGNAL-ECONOMICS-v1/AC-001: the shared economic gate default has no fixed dollar bar."""
     from app.opip.decision.gates import evaluate_economic_quality_gate
     from app.opip.decision.models import GateStatus
 
@@ -364,7 +364,7 @@ def test_ac_008_chief_advisory_prefilter_cannot_reintroduce_a_fixed_floor(monkey
 
 @pytest.mark.acceptance
 def test_execution_side_paths_share_disabled_defaults():
-    """Phase 2A: execution-side defaults are disabled (zero), not $75/4%/2.5."""
+    """ATDD-OPIP-ADVISORY-NO-FIXED-PROFIT-v1/AC-009 ATDD-OPIP-PHASE2A-SIGNAL-ECONOMICS-v1/AC-001: execution-side defaults are disabled (zero), not $75/4%/2.5."""
     import inspect
 
     from app.services import trade_action_gate, tradevisor_evaluation
