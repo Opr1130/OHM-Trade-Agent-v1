@@ -22,6 +22,7 @@ import uuid
 from app.scanner.models import MarketSnapshot
 from app.services.registry_io import registry_lock
 from app.services.scan_manifest import (
+    COVERAGE_SCHEMA_VERSION,
     ManifestError,
     is_complete,
     read_manifest,
@@ -464,20 +465,44 @@ def to_scan_result(promoted: PromotedScan) -> Any:
     ``universe`` is intentionally None: universe descriptors are acquisition
     metadata, and the qualification path already treats a missing universe as
     "not available" rather than as an empty one.
+
+    Coverage version 2 counts *every* candidate observation, including an
+    exclusion that a deterministic replacement recovered. Consumers of this
+    adapter (``derive_scan_outcome`` and the scan log line) read the counters as
+    coverage *gaps*: a recovered exclusion left no gap, so it must not be
+    reported as a partial acquisition downstream. The complete observation
+    history stays in the attempt's own evidence (manifest + worker_status), so
+    nothing is lost by describing the gap view here.
     """
     from app.scanner.market_scanner import ScanResult
 
     coverage = promoted.coverage
+    try:
+        version = int(coverage.get("schema_version") or 1)
+    except (TypeError, ValueError):
+        version = 1
+    requested = int(coverage.get("requested") or 0)
+    analyzed = int(coverage.get("analyzed") or 0)
+    if version >= COVERAGE_SCHEMA_VERSION:
+        skipped = max(0, requested - analyzed)
+        failed = 0
+        data_quality_rejected = 0
+    else:
+        skipped = int(coverage.get("skipped") or 0)
+        failed = int(coverage.get("failed") or 0)
+        data_quality_rejected = int(coverage.get("data_quality_rejected") or 0)
     return ScanResult(
         snapshots=list(promoted.snapshots),
-        requested=int(coverage.get("requested") or 0),
-        analyzed=int(coverage.get("analyzed") or 0),
-        skipped=int(coverage.get("skipped") or 0),
-        failed=int(coverage.get("failed") or 0),
+        requested=requested,
+        analyzed=analyzed,
+        skipped=skipped,
+        failed=failed,
         skips=[],
         failures=[],
         universe=None,
+        data_quality_rejected=data_quality_rejected,
     )
+
 
 
 def already_promoted(settings: Any, attempt_id: str) -> bool:

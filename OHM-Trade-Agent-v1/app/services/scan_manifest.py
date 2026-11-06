@@ -21,6 +21,26 @@ SCHEMA_VERSION = 1
 MANIFEST_NAME = "manifest.json"
 SENTINEL_NAME = "COMPLETE"
 
+#: Coverage contract version written by the acquisition worker.
+#:
+#: ``1`` (implicit, historical) counted only the initial selection and treated any
+#: skip/failure as an unresolved gap. ``2`` additionally counts every attempt and
+#: reports how many distinct underlying assets the snapshots represent, which lets
+#: a scan that legitimately replaced an ineligible candidate still prove it reached
+#: its target. Historical manifests keep the version-1 interpretation exactly.
+COVERAGE_SCHEMA_VERSION = 2
+
+#: Counters that must reconcile in a version-2 coverage block.
+_COVERAGE_V2_COUNTERS = (
+    "requested",
+    "analyzed",
+    "failed",
+    "skipped",
+    "data_quality_rejected",
+    "attempted",
+    "unique_assets",
+)
+
 
 class ManifestError(RuntimeError):
     """Manifest could not be trusted."""
@@ -135,18 +155,58 @@ def read_manifest(directory: Path | str) -> dict[str, Any]:
     return manifest
 
 
+def coverage_is_complete(coverage: Mapping[str, Any] | None) -> bool:
+    """Return whether a coverage block describes a genuinely complete acquisition.
+
+    Two contracts are recognised, and neither is a relaxation of the other:
+
+    * ``schema_version`` absent or ``< 2`` — historical evidence. Interpreted
+      exactly as it always was, so an old incomplete manifest can never become
+      complete and an old complete one keeps its verdict.
+    * ``schema_version >= 2`` — the target must be fully met by distinct
+      underlying assets, and the counters must reconcile, so a shortfall or a
+      miscount fails closed rather than passing on a plausible-looking number.
+    """
+    if not isinstance(coverage, Mapping):
+        return False
+    try:
+        version = int(coverage.get("schema_version") or 1)
+    except (TypeError, ValueError):
+        return False
+    if version < COVERAGE_SCHEMA_VERSION:
+        try:
+            requested = int(coverage.get("requested"))
+            analyzed = int(coverage.get("analyzed"))
+            failed = int(coverage.get("failed"))
+            skipped = int(coverage.get("skipped"))
+        except (TypeError, ValueError):
+            return False
+        return requested > 0 and analyzed == requested and failed == 0 and skipped == 0
+
+    counters: dict[str, int] = {}
+    for key in _COVERAGE_V2_COUNTERS:
+        value = coverage.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return False
+        counters[key] = value
+    if counters["requested"] <= 0:
+        return False
+    if counters["analyzed"] != counters["requested"]:
+        return False
+    if counters["unique_assets"] != counters["analyzed"]:
+        return False
+    accounted = (
+        counters["analyzed"]
+        + counters["skipped"]
+        + counters["data_quality_rejected"]
+        + counters["failed"]
+    )
+    return counters["attempted"] == accounted
+
+
 def is_complete(manifest: Mapping[str, Any]) -> bool:
     """Return whether the manifest describes a genuinely complete scan."""
     if not bool(manifest.get("complete")):
         return False
-    coverage = manifest.get("coverage")
-    if not isinstance(coverage, Mapping):
-        return False
-    try:
-        requested = int(coverage.get("requested"))
-        analyzed = int(coverage.get("analyzed"))
-        failed = int(coverage.get("failed"))
-        skipped = int(coverage.get("skipped"))
-    except (TypeError, ValueError):
-        return False
-    return requested > 0 and analyzed == requested and failed == 0 and skipped == 0
+    return coverage_is_complete(manifest.get("coverage"))
+

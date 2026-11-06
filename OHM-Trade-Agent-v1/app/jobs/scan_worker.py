@@ -22,7 +22,12 @@ from typing import Any
 
 from app.core.config import get_settings
 from app.services.scan_attempt import ScanAttemptStore
-from app.services.scan_manifest import sha256_path, write_manifest
+from app.services.scan_manifest import (
+    COVERAGE_SCHEMA_VERSION,
+    coverage_is_complete,
+    sha256_path,
+    write_manifest,
+)
 from app.services.scan_supervisor import (
     MODE_ISOLATED,
     attempt_staging_dir,
@@ -40,6 +45,14 @@ STATUS_NAME = "worker_status.json"
 SNAPSHOTS_NAME = "snapshots.jsonl"
 
 V2_STATUS_NOT_COMPUTED = "NOT_COMPUTED"
+
+#: Bounded exclusion evidence. The whole document is projected into analytics, so
+#: it must not grow with the candidate pool: the true total is always reported and
+#: truncation is explicit, never silent.
+EXCLUSIONS_RECORDED_LIMIT = 25
+EXCLUSION_REASON_MAX_CHARS = 200
+_EXCLUSION_FIELDS = ("pair", "base_asset", "liquidity_rank", "status", "reason", "stage")
+
 
 
 def _v2_evidence(settings: Any, snapshots: list[Any]) -> dict[str, Any]:
@@ -105,12 +118,90 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     os.replace(temp, path)
 
 
-def _coverage(result: Any, requested: int) -> dict[str, int]:
+def _coverage(result: Any, requested: int) -> dict[str, Any]:
+    """Return the coverage block that proves (or denies) the scan target.
+
+    ``requested`` stays the target and ``analyzed`` stays the number of valid
+    snapshots. ``skipped``/``failed``/``data_quality_rejected`` keep their
+    established meaning (every observation in this scan), so a recovered scan
+    reports its exclusions truthfully; completeness is then decided by comparing
+    the achieved target with the attempt accounting, not by hiding the exclusion.
+    """
+    snapshots = list(getattr(result, "snapshots", []) or [])
+    analyzed = int(getattr(result, "analyzed", len(snapshots)) or 0)
+    skipped = int(getattr(result, "skipped", 0) or 0)
+    failed = int(getattr(result, "failed", 0) or 0)
+    data_rejected = int(getattr(result, "data_quality_rejected", 0) or 0)
+    attempted = int(getattr(result, "attempted", 0) or 0)
+    if attempted <= 0:
+        # A producer that predates the counter still classifies every candidate
+        # into exactly one bucket, so their sum is the truthful attempt count.
+        attempted = analyzed + skipped + failed + data_rejected
     return {
+        "schema_version": COVERAGE_SCHEMA_VERSION,
         "requested": int(getattr(result, "requested", requested) or 0),
-        "analyzed": int(getattr(result, "analyzed", 0) or 0),
-        "failed": int(getattr(result, "failed", 0) or 0),
-        "skipped": int(getattr(result, "skipped", 0) or 0),
+        "analyzed": analyzed,
+        "failed": failed,
+        "skipped": skipped,
+        "data_quality_rejected": data_rejected,
+        "attempted": attempted,
+        "unique_assets": len({_asset_key(item) for item in snapshots}),
+        "replacement_attempts": int(getattr(result, "replacement_attempts", 0) or 0),
+        "remaining_candidate_capacity": int(
+            getattr(result, "remaining_candidate_capacity", 0) or 0
+        ),
+    }
+
+
+def _asset_key(snapshot: Any) -> str:
+    for attribute in ("underlying_asset", "primary_pair", "symbol"):
+        value = str(getattr(snapshot, attribute, "") or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _exclusions(result: Any) -> dict[str, Any]:
+    """Return bounded, explicit exclusion evidence for this attempt."""
+    raw = list(getattr(result, "exclusions", []) or [])
+    records: list[dict[str, Any]] = []
+    for item in raw[:EXCLUSIONS_RECORDED_LIMIT]:
+        if not isinstance(item, dict):
+            continue
+        record: dict[str, Any] = {}
+        for key in _EXCLUSION_FIELDS:
+            value = item.get(key)
+            if isinstance(value, str):
+                record[key] = value[:EXCLUSION_REASON_MAX_CHARS]
+            elif isinstance(value, int) and not isinstance(value, bool):
+                record[key] = value
+        if record.get("pair"):
+            records.append(record)
+    return {
+        "recorded": len(records),
+        "total": len(raw),
+        "truncated": len(raw) > len(records),
+        "records": records,
+    }
+
+
+def _universe_evidence(result: Any) -> dict[str, Any]:
+    """Record how large the ranked pool was, so replacement capacity is auditable."""
+    universe = getattr(result, "universe", None)
+    if universe is None:
+        return {"status": "UNAVAILABLE"}
+    return {
+        "status": "RECORDED",
+        "unique_underlying_assets": int(
+            getattr(universe, "unique_underlying_assets", 0) or 0
+        ),
+        "selected_liquid_assets": int(
+            getattr(universe, "selected_liquid_assets", 0) or 0
+        ),
+        "eligible_usd_markets": int(getattr(universe, "eligible_usd_markets", 0) or 0),
+        "eligible_usdt_markets": int(getattr(universe, "eligible_usdt_markets", 0) or 0),
+        "ticker_batch_requests": int(getattr(universe, "ticker_batch_requests", 0) or 0),
+        "warnings": [str(item)[:EXCLUSION_REASON_MAX_CHARS] for item in list(getattr(universe, "warnings", []) or [])[:5]],
     }
 
 
@@ -169,12 +260,12 @@ def run(*, attempt_id: str, limit: int | None = None) -> int:
 
     coverage = _coverage(result, requested_target)
     scoring = _v2_evidence(settings, snapshots)
-    complete = (
-        coverage["requested"] > 0
-        and coverage["analyzed"] == coverage["requested"]
-        and coverage["failed"] == 0
-        and coverage["skipped"] == 0
-    )
+    exclusions = _exclusions(result)
+    # Completeness is earned from valid data: the target must be met by distinct
+    # underlying assets whose attempts all reconcile. A scan that replaced a
+    # legitimately ineligible candidate is complete *and* still reports the
+    # exclusion, so nothing is hidden to manufacture a pass.
+    complete = coverage_is_complete(coverage)
     manifest = write_manifest(
         staging,
         {
@@ -182,6 +273,7 @@ def run(*, attempt_id: str, limit: int | None = None) -> int:
             "fence": attempt.fence,
             "started_at": started.isoformat(),
             "coverage": coverage,
+            "exclusions": exclusions,
             "snapshots": {
                 "file": SNAPSHOTS_NAME,
                 "rows": len(snapshots),
@@ -199,6 +291,8 @@ def run(*, attempt_id: str, limit: int | None = None) -> int:
             "state": "COMPLETED" if complete else "PARTIAL",
             "reason_code": None if complete else "COVERAGE_INCOMPLETE",
             "coverage": coverage,
+            "exclusions": exclusions,
+            "universe": _universe_evidence(result),
             "scoring": scoring,
             "manifest_sha256": (manifest.get("snapshots") or {}).get("sha256"),
             "finished_at": _now().isoformat(),
@@ -209,6 +303,22 @@ def run(*, attempt_id: str, limit: int | None = None) -> int:
         f"analyzed={coverage['analyzed']}/{coverage['requested']} "
         f"failed={coverage['failed']} skipped={coverage['skipped']}"
     )
+    if exclusions["total"] or not complete:
+        # An attempt that lost a candidate must be diagnosable from its own log,
+        # not only from a persisted document nobody may be able to read.
+        print(
+            f"scan_worker: attempted={coverage['attempted']} "
+            f"replaced={coverage['replacement_attempts']} "
+            f"excluded={exclusions['total']} recorded={exclusions['recorded']} "
+            f"truncated={exclusions['truncated']} "
+            f"remaining_candidates={coverage['remaining_candidate_capacity']}"
+        )
+        for record in exclusions["records"][:5]:
+            print(
+                f"scan_worker: excluded pair={record.get('pair')} "
+                f"rank={record.get('liquidity_rank')} status={record.get('status')} "
+                f"stage={record.get('stage')} reason={record.get('reason')}"
+            )
     return EXIT_OK
 
 

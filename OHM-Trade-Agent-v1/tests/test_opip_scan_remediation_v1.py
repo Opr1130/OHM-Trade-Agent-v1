@@ -589,7 +589,12 @@ def test_batching_is_bounded_and_ordered(monkeypatch):
 
     from app.scanner import market_scanner
 
-    assets = [SimpleNamespace(primary_pair=f"SYM{index}USD") for index in range(120)]
+    assets = [
+        # A candidate always carries its canonical underlying asset: duplicate
+        # protection during deterministic replacement keys on it.
+        SimpleNamespace(primary_pair=f"SYM{index}USD", base_asset=f"SYM{index}")
+        for index in range(120)
+    ]
     monkeypatch.setattr(
         market_scanner,
         "build_kraken_asset_universe",

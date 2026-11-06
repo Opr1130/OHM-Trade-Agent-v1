@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {modelAuthority,evidenceStatus,objectSummary,exportCsv,sanitizeJsonExport,apiRequest,statusLevel,readState,utcWithLocal,qualificationFunnel,rejectionBreakdown,aiOperatingState,configAdminState} from '../src/api.mjs';
+import {modelAuthority,evidenceStatus,objectSummary,exportCsv,sanitizeJsonExport,apiRequest,statusLevel,readState,utcWithLocal,qualificationFunnel,rejectionBreakdown,aiOperatingState,configAdminState,scannerCoverage,scannerExclusions} from '../src/api.mjs';
 test('V2 authority derives only from recorded evidence',()=>{
  assert.equal(modelAuthority({model_authority:'V2_PRODUCTION_V1_OBSERVATION'}),'V2 production · V1 observation');
  assert.equal(modelAuthority({}), 'UNVERIFIED');
@@ -101,6 +101,48 @@ test('an unavailable strategy-admin capability is not a credential or an empty f
  assert.equal(configAdminState(new Error('HTTP 404: Strategy administration not enabled')).state,'NOT_AVAILABLE');
  assert.equal(configAdminState(new Error('HTTP 401: Invalid dashboard secret')).state,'CREDENTIAL_REFUSED');
  assert.equal(configAdminState(new Error('HTTP 503: unavailable')).state,'UNAVAILABLE');
+});
+// A scan that replaced an ineligible candidate is COMPLETE *and* still shows the
+// exclusion: recovered completeness never hides what was excluded.
+const RECOVERED={coverage:{schema_version:2,requested:200,analyzed:200,attempted:201,skipped:1,
+ data_quality_rejected:0,failed:0,unique_assets:200,replacement_attempts:1,remaining_candidate_capacity:0},
+ exclusions:{recorded:1,total:1,truncated:false,records:[{pair:'KORUSD',base_asset:'KOR',liquidity_rank:49,
+  status:'skip',reason:'KORUSD: insufficient history (39 candles)',stage:'initial'}]}};
+test('recovered coverage is complete and the exclusion stays visible',()=>{
+ const coverage=scannerCoverage(RECOVERED);
+ assert.equal(coverage.state,'COMPLETE');
+ assert.equal(coverage.level,'good');
+ assert.deepEqual([coverage.target,coverage.valid],[200,200]);
+ const excluded=coverage.fields.find(field=>field.key==='Excluded candidates');
+ assert.equal(excluded.value,1,'the recorded exclusion is counted, not erased');
+ const exclusions=scannerExclusions(RECOVERED);
+ assert.equal(exclusions.total,1);
+ assert.equal(exclusions.rows[0].pair,'KORUSD');
+ assert.match(exclusions.rows[0].reason,/insufficient history/);
+ assert.equal(exclusions.rows[0].level,'bad');
+});
+test('a shortfall is partial, never healthy',()=>{
+ const partial={...RECOVERED,coverage:{...RECOVERED.coverage,analyzed:199}};
+ const coverage=scannerCoverage(partial);
+ assert.equal(coverage.state,'PARTIAL');
+ assert.equal(coverage.level,'bad');
+ assert.deepEqual([coverage.target,coverage.valid],[200,199]);
+ assert.equal(scannerCoverage({}).state,'UNAVAILABLE');
+ assert.equal(scannerCoverage(undefined).level,'bad');
+ assert.equal(scannerCoverage({coverage:{requested:200,analyzed:200}}).state,'COMPLETE');
+ assert.equal(scannerCoverage({coverage:{requested:0,analyzed:0}}).state,'PARTIAL','an empty target is not complete');
+ assert.equal(statusLevel('COMPLETE'),'good');
+ assert.equal(statusLevel('PARTIAL'),'bad');
+});
+test('bounded exclusion evidence reports truncation instead of dropping silently',()=>{
+ const truncated={exclusions:{recorded:25,total:40,truncated:true,
+  records:Array.from({length:25},(_,index)=>({pair:`S${index}USD`,liquidity_rank:index,status:'skip',reason:'insufficient history'}))}};
+ const exclusions=scannerExclusions(truncated);
+ assert.equal(exclusions.total,40);
+ assert.equal(exclusions.recorded,25);
+ assert.equal(exclusions.truncated,true);
+ const empty=scannerExclusions({});
+ assert.deepEqual([empty.total,empty.recorded,empty.truncated,empty.rows.length],[0,0,false,0]);
 });
 
 

@@ -430,6 +430,13 @@ class Settings(BaseSettings):
     # many per-symbol working sets can coexist; it never changes the candidate
     # population, because selection runs over the complete snapshot set.
     opip_scan_batch_assets: int = Field(default=50, ge=1, le=200)
+    # Bounded deterministic replacement. A candidate can be legitimately
+    # ineligible (a newly listed pair cannot yet supply the required 200 hourly
+    # candles), and one such candidate must not cap the scan below its target:
+    # the next liquidity-ranked candidates are evaluated instead. ``0`` restores
+    # the previous behaviour exactly, and the ceiling bounds provider load and
+    # runtime inside the existing attempt deadline.
+    opip_scan_replacement_candidates: int = Field(default=25, ge=0, le=100)
     # Hard wall-clock budget for one acquisition attempt.
     opip_scan_deadline_seconds: int = Field(default=300, ge=60, le=1800)
     # Memory ceiling the isolated scanner container is configured with. Used by

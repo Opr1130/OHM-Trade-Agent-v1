@@ -299,6 +299,16 @@ services:
       OPIP_SCAN_EXECUTION_MODE: "isolated"
       # Must match core scoring authority: no .env.core or funded secrets here.
       OPIP_PRODUCTION_SCORING_VERSION: "v2"
+      # Bounded deterministic replacement budget for this attempt. Non-secret
+      # acquisition control only, interpolated from the owner `.env` (the single
+      # source of truth) exactly like the other isolated workers' OPIP_* controls:
+      # this container declares its environment and inherits no shared environment
+      # document. `${VAR:-25}` substitutes the documented default only when the
+      # variable is unset or empty, so an explicit `0` (replacement disabled)
+      # survives and this never depends on shell or Python truthiness. The 0-100
+      # range is validated by app.core.config.Settings, which fails closed before
+      # acquisition starts on an invalid value.
+      OPIP_SCAN_REPLACEMENT_CANDIDATES: "${OPIP_SCAN_REPLACEMENT_CANDIDATES:-25}"
       WEBHOOK_SECRET: "unused-acquisition-worker-only"
     command:
       - python
