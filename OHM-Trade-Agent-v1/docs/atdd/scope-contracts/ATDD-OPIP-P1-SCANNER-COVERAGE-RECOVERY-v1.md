@@ -273,8 +273,9 @@ DEFERRED DISCOVERIES:
   change.
 - The Compose-resolution assertions in
   `tests/test_opip_scan_replacement_budget_propagation_v1.py` skip on a host with
-  no Compose CLI; the declaration assertion runs everywhere, and CI (Linux, with
-  Compose) executes the resolved-environment cases for 0, 1, 25, 100 and unset.
+  no Compose CLI, and are bounded (one probe per session, two resolved
+  invocations: an explicit `0` and unset). The declaration assertion runs
+  everywhere, and CI (Linux, with Compose) executes the resolved cases.
 
 UNAPPROVED SCOPE CHANGES:
 NONE
