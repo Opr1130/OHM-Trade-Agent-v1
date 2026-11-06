@@ -240,9 +240,8 @@ def test_worker_service_declares_the_bounded_replacement_budget():
 def test_resolved_worker_environment_carries_the_configured_value(tmp_path, value):
     """ATDD-OPIP-P1-SCANNER-COVERAGE-RECOVERY-v1/AC-013 Compose resolves the configured budget for the worker.
 
-    One resolved invocation proves the mapping (using ``0``, the value most at
-    risk of being swallowed by a default). Resolve each documented boundary in the production-equivalent Compose
-    service, not only in Python settings tests.
+    Resolve every documented boundary value through the production-equivalent
+    Compose service, including explicit ``0``. The default case is separate.
     """
     docker = _docker_compose()
     if docker is None:
