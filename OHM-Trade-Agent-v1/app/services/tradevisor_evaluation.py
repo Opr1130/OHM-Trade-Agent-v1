@@ -45,6 +45,8 @@ from app.services.capital_efficiency_ranking import MIN_EXECUTABLE_NOTIONAL_USD
 from app.services.economic_quality_gate import (
     PRODUCTION_MAX_CAPITAL_FRACTION,
     EconomicGateResult,
+    advisory_economic_policy,
+    describe_advisory_economic_policy,
     evaluate_economic_quality,
 )
 from app.services.entry_exit_advisor import EntryExitPlan, build_entry_exit_plan
@@ -68,6 +70,19 @@ DECISION_EXPIRED = "EXPIRED"
 
 #: Only these two are actionable entry recommendations.
 ACTIONABLE_DECISIONS = frozenset({DECISION_ENTER_NOW, DECISION_SET_LIMIT_ENTRY})
+
+#: Tradevisor proposes; O'Pip decides. This module produces advisory evidence
+#: and never an order, so its economic qualification uses the advisory policy
+#: (optional fixed dollar/move/reward-risk floors OFF by default) instead of the
+#: execution-compatible bar. A disabled filter never removes the independent
+#: requirement that modelled net profit after costs be strictly positive, and it
+#: never widens exchange, funded-trading or execution authority.
+#:
+#: The owner-configured override is not read here: this service holds no profile
+#: access and must stay free of surprise I/O, so the applied regime is recorded
+#: explicitly in evidence rather than guessed.
+ADVISORY_ECONOMIC_POLICY = advisory_economic_policy()
+ADVISORY_ECONOMIC_POLICY_EVIDENCE = describe_advisory_economic_policy()
 
 HORIZON_TACTICAL = "TACTICAL"
 HORIZON_SWING = "SWING"
@@ -236,12 +251,14 @@ def _evaluate_buy_plans(
             plan,
             equity,
             max_capital_fraction=PRODUCTION_MAX_CAPITAL_FRACTION,
+            **ADVISORY_ECONOMIC_POLICY,
         )
         attempt.update(
             attainability_qualified=bool(attainability.qualified),
             attainability_score=int(attainability.attainability_score),
             economic_qualified=bool(economics.qualified),
             economic_reason=economics.rejection_reason,
+            economic_policy_id=economics.policy_id,
             stop_pct=economics.stop_pct,
             target_2_move_pct=economics.target_2_move_pct,
             reward_to_risk_2=plan.reward_to_risk_2,
@@ -855,6 +872,12 @@ def _finalize_qualified_buy(
             equity_value,
             max_capital_fraction=allocation_fraction,
             max_account_risk_at_stop_pct=None,
+            **ADVISORY_ECONOMIC_POLICY,
+        )
+        # The displayed recommendation is the one at the capital the operator may
+        # actually deploy, and the policy that produced it is recorded with it.
+        evidence["advisory_economic_policy"] = dict(
+            ADVISORY_ECONOMIC_POLICY_EVIDENCE
         )
         evidence["economics_at_envelope"] = {
             "recommended_capital": economics.recommended_capital,
@@ -862,6 +885,8 @@ def _finalize_qualified_buy(
             "target_1_net_profit": economics.target_1_net_profit,
             "target_2_net_profit": economics.target_2_net_profit,
             "qualified": economics.qualified,
+            "policy_id": economics.policy_id,
+            "policy_regime": "ADVISORY_VALIDATION_ENVELOPE",
         }
         evidence["final_allocation_basis"] = {
             "allocation": allocation_capital,
@@ -896,6 +921,27 @@ def _finalize_qualified_buy(
                 f"({capital_status})"
             ),
         )
+
+    if capital_status == "CAPITAL_BELOW_EXECUTABLE_MINIMUM":
+        # A size below the executable minimum cannot be reported as an advisory
+        # pass either. This is an executable-notional stop, not an economic
+        # floor, so the rebased projection and its policy attribution are kept.
+        final_economics = replace(
+            final_economics,
+            qualified=False,
+            rejection_reason=(
+                f"F7 recommended capital USD {allocation_capital:.2f} is below "
+                f"the minimum executable notional USD "
+                f"{MIN_EXECUTABLE_NOTIONAL_USD:.2f}"
+            ),
+        )
+        if "f5_final" in evidence:
+            # The recorded evidence must state the same verdict as the decision.
+            evidence["f5_final"] = {
+                **evidence["f5_final"],
+                "qualified": False,
+                "rejection_reason": final_economics.rejection_reason,
+            }
 
     rejection: tuple[str, str] | None = None
     if capital_status == "CAPITAL_INCONSISTENT":

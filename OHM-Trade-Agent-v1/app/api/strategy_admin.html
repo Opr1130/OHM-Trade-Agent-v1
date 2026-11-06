@@ -21,13 +21,15 @@ button:disabled{opacity:.5;cursor:not-allowed}small{color:#a3b4c6}
 </section>
 <section class="panel" id="editor" hidden>
 <h2>Adjust advisory strategy draft</h2>
+<p class="info">These settings change <b>advisory eligibility only</b>: whether O'Pip may tell you about an opportunity worth reviewing. They never grant funded execution, exchange order authority, F11 protection changes, position limits or risk ceilings. A value of <b>0 means OFF</b> and the filter is disabled - an empty field is treated as OFF.</p>
 <div class="grid">
 <div><label for="threshold">V2 minimum technical score (50–95)</label><input id="threshold" type="number" min="50" max="95" step="1"></div>
-<div><label for="profit">Minimum projected net profit ($0–$10,000)</label><input id="profit" type="number" min="0" max="10000" step="0.01"></div>
-<div><label for="move">Minimum Target 2 movement (0–25%)</label><input id="move" type="number" min="0" max="25" step="0.1"></div>
-<div><label for="rr">Minimum reward / risk (0 = no advisory filter; max 10)</label><input id="rr" type="number" min="0" max="10" step="0.1"></div>
+<div><label for="profit">Minimum projected net profit (USD, 0 = OFF, max 10000)</label><input id="profit" type="number" min="0" max="10000" step="0.01"><small id="profitState">OFF</small></div>
+<div><label for="move">Minimum Target 2 movement (%, 0 = OFF, max 25)</label><input id="move" type="number" min="0" max="25" step="0.1"><small id="moveState">OFF</small></div>
+<div><label for="rr">Minimum reward / risk (0 = OFF, max 10)</label><input id="rr" type="number" min="0" max="10" step="0.1"><small id="rrState">OFF</small></div>
 <div><label for="cost">Estimated round-trip costs (0–5%)</label><input id="cost" type="number" min="0" max="5" step="0.01"></div>
 </div>
+<p><small>With a filter OFF, a candidate still needs strictly positive modelled net profit after fees, slippage and margin costs to be recommended. Disabling a filter never bypasses liquidity capacity, executable notional, spread, price freshness, entry/stop geometry, portfolio exposure or F11 protection.</small></p>
 <p><small id="version"></small></p>
 <button id="save">Save validated draft</button><button id="reload">Discard local changes</button><button id="activate">Activate advisory settings</button><button id="rollback">Rollback active settings</button><p><small id="activeVersion">Active profile not loaded.</small></p>
 <p class="warn">Protected: model authority, position limits, funded execution, risk ceilings and strategy activation cannot be changed here. Active production behavior is unchanged.</p>
@@ -41,12 +43,23 @@ function auth(){
  const headers={"X-Webhook-Secret":operator,"X-Strategy-Admin-Secret":adminKey};
  return headers;
 }
+function showFilterState(){
+ // 0 (or an empty field) is the approved OFF representation: the filter is disabled.
+ for(const id of ["profit","move","rr"]){
+  const input=el(id), badge=el(id+"State");
+  const raw=input.value.trim();
+  const value=raw===""?0:Number(raw);
+  const off=!Number.isFinite(value)||value<=0;
+  badge.textContent=off?"OFF (advisory unaffected)":"ON: rejects below "+raw;
+ }
+}
 function setFields(d){
  el("threshold").value=d.scoring.v2_threshold;
  el("profit").value=d.advisory_economics.min_net_profit_usd;
  el("move").value=d.advisory_economics.min_target_2_move_pct;
  el("rr").value=d.advisory_economics.min_reward_to_risk;
  el("cost").value=d.advisory_economics.estimated_round_trip_cost_pct;
+ showFilterState();
 }
 function status(t){el("status").textContent=t;}
 async function load(){
@@ -94,14 +107,16 @@ async function performActivation(action){
  }catch(e){status(e.message);}
 }
 function number(id){const input=el(id);if(!input.reportValidity())throw Error("Invalid "+id);const value=Number(input.value);if(!Number.isFinite(value))throw Error("Invalid "+id);return value;}
+// An empty optional filter field is the approved OFF representation, serialized as 0.
+function optionalNumber(id){const input=el(id);if(input.value.trim()===""){if(!input.reportValidity())throw Error("Invalid "+id);return 0;}return number(id);}
 async function save(){
  if(!original||!digest){status("Load a draft first.");return;}
  try{
   const proposed=JSON.parse(JSON.stringify(original));
   proposed.scoring.v2_threshold=number("threshold");
-  proposed.advisory_economics.min_net_profit_usd=number("profit");
-  proposed.advisory_economics.min_target_2_move_pct=number("move");
-  proposed.advisory_economics.min_reward_to_risk=number("rr");
+  proposed.advisory_economics.min_net_profit_usd=optionalNumber("profit");
+  proposed.advisory_economics.min_target_2_move_pct=optionalNumber("move");
+  proposed.advisory_economics.min_reward_to_risk=optionalNumber("rr");
   proposed.advisory_economics.estimated_round_trip_cost_pct=number("cost");
   const headers={...auth(),"X-Expected-Profile-Sha256":digest,"Content-Type":"application/json"};
   const response=await fetch("/api/opip/strategy-admin/draft",{
@@ -112,6 +127,7 @@ async function save(){
  }catch(e){status(e.message);}
 }
 el("load").onclick=load;el("save").onclick=save;el("reload").onclick=load;
+["profit","move","rr"].forEach(id=>el(id).addEventListener("input",showFilterState));
 el("activate").onclick=()=>performActivation("activate");
 el("rollback").onclick=()=>performActivation("rollback");
 </script></body></html>

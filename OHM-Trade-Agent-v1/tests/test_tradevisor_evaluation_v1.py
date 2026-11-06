@@ -277,18 +277,30 @@ def test_atdd28_target_attainability_rejection_abstains():
 
 
 def test_atdd32_after_cost_economics_reject_a_thin_account():
-    # A small account cannot clear the fixed net-profit floor after costs.
+    # A small account is no longer refused by a fixed net-profit floor; the
+    # advisory policy requires strict after-cost positivity instead, and the
+    # G-02 advisory blocker still keeps the decision non-actionable.
+    # Superseded premise: ATDD-OPIP-ADVISORY-ECONOMIC-POLICY-CORRECTION-v1.
     decision = evaluate(account_equity=1_000.0)
     assert decision.decision == te.DECISION_WATCH
-    assert decision.rejection_code == "ECONOMIC_REJECT"
+    assert decision.actionable is False
+    assert decision.rejection_code == "ADVISORY_EVIDENCE_INCOMPLETE"
+    assert decision.economics is not None
+    assert decision.economics.qualified is True
+    assert decision.economics.target_2_net_profit > 0
 
 
 def test_atdd30_undersized_capital_is_rejected():
+    # An allocation below the executable notional is still refused, and a size
+    # that is merely thin is no longer refused by the retired $75 floor.
+    # Superseded premise: ATDD-OPIP-ADVISORY-ECONOMIC-POLICY-CORRECTION-v1.
     decision = evaluate(account_equity=2_500.0)
     assert decision.decision == te.DECISION_WATCH
+    assert decision.actionable is False
     assert decision.rejection_code in {
         "CAPITAL_BELOW_EXECUTABLE_MINIMUM",
         "ECONOMIC_REJECT",
+        "ADVISORY_EVIDENCE_INCOMPLETE",
     }
 
 

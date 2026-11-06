@@ -135,12 +135,23 @@ non-bypassable safety controls, validation, owner authorization and receipts.
 The advisory screen's single definition now lives in
 economic_quality_gate.advisory_economic_policy, and the pre-AI review screen in
 chief_analyst consumes it so a fixed floor cannot be reintroduced through the
-review stage. Two paths deliberately still apply the execution-compatible bar and
-were NOT changed here: the Tradevisor evaluation path
+review stage. Two paths deliberately still applied the execution-compatible bar
+and were NOT changed here: the Tradevisor evaluation path
 (app/services/tradevisor_evaluation.py) and the tradeability/decision gates
 (app/services/trade_action_gate.py, app/opip/decision/gates.py). Reclassifying
 those is an execution-policy change and requires its own bounded, validated
 increment; this PR does not claim a system-wide removal of the $75 bar.
+
+SUPERSESSION (provenance preserved): the bounded, validated increment named in
+the paragraph above is ATDD-OPIP-ADVISORY-ECONOMIC-POLICY-CORRECTION-v1, which
+reclassifies exactly the three deferred advisory call sites - the capital action
+gate's capacity-adjusted re-verification, the Tradevisor advisory evaluation, and
+the shadow decision engine's economic gate - as advisory-policy consumers. The
+acceptance criteria of this contract are unchanged and remain the historical
+record of what was approved here; tests/test_advisory_policy_v2.py still cites
+this increment for AC-007 and AC-009 and now asserts the post-supersession
+guarantee, namely that the named execution constants and the shared gate's own
+defaults were not relaxed.
 
 UNAPPROVED SCOPE CHANGES:
 NONE

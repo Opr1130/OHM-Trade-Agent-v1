@@ -349,21 +349,31 @@ def test_ac_020_instrument_coverage_distinguishes_supported_unsupported_unknown(
 
 
 def test_ac_021_final_economics_rejects_when_f7_allocation_falls_below_minimum():
-    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-021: the final allocation decides."""
+    """ATDD-TRADEVISOR-V2-ADVISORY-v1/AC-021: the final allocation decides.
+
+    Superseded premise, recorded by
+    ATDD-OPIP-ADVISORY-ECONOMIC-POLICY-CORRECTION-v1: the final allocation is
+    still the deciding basis, but a positive after-cost projection at that
+    allocation is no longer vetoed by the retired $75 advisory floor. The
+    displayed economics remain the deployable ones, and the recommendation stays
+    advisory-only (WATCH) because the F6 blocker is independent.
+    """
     decision = evaluate(equity=8_000.0)
 
     assert decision.decision == te.DECISION_WATCH
-    assert decision.rejection_code == "ECONOMIC_REJECT_AT_FINAL_ALLOCATION"
     assert decision.actionable is False
-    # No economic PASS may be reported for an allocation below the bar.
+    assert decision.rejection_code == "ADVISORY_EVIDENCE_INCOMPLETE"
     assert decision.economics is not None
-    assert decision.economics.qualified is False
-    assert decision.economics.target_2_net_profit < 75.0
-
+    assert decision.economics.policy_id == "OPIP-ADVISORY-ECONOMIC-POLICY-V2"
+    assert decision.economics.min_net_profit_applied == 0.0
+    assert decision.economics.qualified is True
+    # The displayed figure is the smaller, deployable one, not the envelope.
     envelope = decision.evidence["economics_at_envelope"]
-    assert envelope["qualified"] is True
-    assert envelope["target_2_net_profit"] >= 75.0
+    assert decision.economics.target_2_net_profit <= envelope["target_2_net_profit"]
     assert decision.evidence["final_allocation_basis"]["parity"] is True
+    assert decision.economics.target_2_net_profit == pytest.approx(
+        decision.evidence["f5_final"]["target_2_net_profit"]
+    )
 
 
 def test_ac_021_final_economics_pass_uses_the_same_basis_for_display():
