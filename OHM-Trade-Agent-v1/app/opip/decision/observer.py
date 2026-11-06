@@ -110,9 +110,15 @@ class OPipScanObserver:
         decision_at: datetime,
         account_equity: float | None,
         telemetry_enabled: bool | None = None,
+        advisory_policy: Mapping[str, Any] | None = None,
     ) -> None:
         self.decision_at = decision_at
         self.account_equity = account_equity
+        #: The effective advisory economic policy resolved by the scan's
+        #: orchestration layer. The observer only carries it; it never reads a
+        #: profile itself, and the shadow engine applies exactly these values so
+        #: an owner-enabled threshold is reproduced rather than approximated.
+        self.advisory_policy = advisory_policy
         self.telemetry_enabled = (
             opip_funnel_telemetry_enabled()
             if telemetry_enabled is None
@@ -846,6 +852,7 @@ class OPipScanObserver:
             account_equity=self.account_equity,
             decision_at=self.decision_at,
             ai_stage=self.funnel.ai_stage,
+            advisory_policy=self.advisory_policy,
         )
         legacy_decisions = {
             state.key: state.to_decision(decided_at=self.funnel.decision_at_iso)
@@ -1037,13 +1044,21 @@ def build_scan_observer(
     snapshots: Sequence[Any],
     decision_at: datetime,
     account_equity: float | None,
+    advisory_policy: Mapping[str, Any] | None = None,
 ) -> "OPipScanObserver | NullScanObserver":
-    """Return a scan observer, degrading to a no-op rather than raising."""
+    """Return a scan observer, degrading to a no-op rather than raising.
+
+    ``advisory_policy`` is the effective advisory economic policy the scan's
+    orchestration layer resolved from the versioned profile. Passing it here is
+    what lets the shadow comparison reproduce an enabled owner threshold instead
+    of recomputing the default.
+    """
     try:
         return OPipScanObserver(
             snapshots=snapshots,
             decision_at=decision_at,
             account_equity=account_equity,
+            advisory_policy=advisory_policy,
         )
     except Exception as exc:
         logger.warning(

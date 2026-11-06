@@ -87,6 +87,11 @@ GIVEN: a rejection is recorded under the advisory policy
 WHEN: its threshold metadata, policy identity and reason string are read
 THEN: they match the rule actually applied, the execution-compatible constants are retained on execution-only paths, historical records are not rewritten, and a source-wide audit finds no advisory call site still referencing a historical fixed floor.
 
+AC-013:
+GIVEN: the owner has explicitly enabled a minimum net profit of $25, a minimum Target 2 movement of 4 percent, or a minimum reward/risk of 2.5:1 in the versioned advisory profile
+WHEN: the scanner, the pre-AI screen, the shadow decision engine and the Tradevisor advisory evaluation qualify a candidate
+THEN: each advisory path consumes that same effective, validated, versioned policy from its owning orchestration layer, each configured threshold is enforced independently and named with its configured value, a pure evaluator never reads the profile itself, and only a malformed or unreadable profile fails closed without any path substituting the all-OFF default.
+
 EXPLICITLY OUT OF SCOPE:
 - Deployment, merge, release-profile change or strategy-profile activation.
 - Funded trading, live exchange execution, learning activation, paper admission or IRR activation.
@@ -122,6 +127,15 @@ AC-010 -> tests/test_advisory_economic_policy_correction_v1.py::test_ac_010_noti
 AC-011 -> tests/test_advisory_economic_policy_correction_v1.py::test_ac_011_configuration_lifecycle_is_versioned_and_not_activated
 AC-012 -> tests/test_advisory_economic_policy_correction_v1.py::test_ac_012_recorded_threshold_and_policy_match_the_applied_rule
 AC-012 -> tests/test_advisory_economic_policy_correction_v1.py::test_ac_012_source_wide_old_floor_call_site_audit
+AC-013 -> tests/test_advisory_economic_policy_correction_v1.py::test_ac_013_configured_minimum_profit_is_enforced_by_tradevisor
+AC-013 -> tests/test_advisory_economic_policy_correction_v1.py::test_ac_013_configured_target_move_is_enforced_by_tradevisor
+AC-013 -> tests/test_advisory_economic_policy_correction_v1.py::test_ac_013_configured_reward_risk_is_enforced_by_tradevisor
+AC-013 -> tests/test_advisory_economic_policy_correction_v1.py::test_ac_013_configured_thresholds_reach_both_tradevisor_economic_bases
+AC-013 -> tests/test_advisory_economic_policy_correction_v1.py::test_ac_013_configured_thresholds_are_enforced_by_the_shadow_engine
+AC-013 -> tests/test_advisory_economic_policy_correction_v1.py::test_ac_013_shadow_policy_reaches_the_engine_from_orchestration
+AC-013 -> tests/test_advisory_economic_policy_correction_v1.py::test_ac_013_configured_threshold_governs_the_native_scan
+AC-013 -> tests/test_advisory_economic_policy_correction_v1.py::test_ac_013_admin_ui_serializes_empty_optional_field_as_zero
+AC-013 -> tests/test_advisory_economic_policy_correction_v1.py::test_ac_013_malformed_stored_configuration_fails_closed
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/services/economic_quality_gate.py
@@ -161,6 +175,14 @@ AC-012 -> OHM-Trade-Agent-v1/tests/test_wave9_action_notification_reliability.py
 AC-012 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-ADVISORY-ECONOMIC-POLICY-CORRECTION-v1.md
 AC-012 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-ADVISORY-NO-FIXED-PROFIT-v1.md
 AC-012 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
+AC-013 -> OHM-Trade-Agent-v1/app/services/tradevisor_evaluation.py
+AC-013 -> OHM-Trade-Agent-v1/app/services/tradevisor_pipeline.py
+AC-013 -> OHM-Trade-Agent-v1/app/opip/decision/engine.py
+AC-013 -> OHM-Trade-Agent-v1/app/opip/decision/observer.py
+AC-013 -> OHM-Trade-Agent-v1/app/opip/decision/gates.py
+AC-013 -> OHM-Trade-Agent-v1/app/jobs/scan_opportunities.py
+AC-013 -> OHM-Trade-Agent-v1/app/api/strategy_admin.html
+AC-013 -> OHM-Trade-Agent-v1/tests/test_advisory_economic_policy_correction_v1.py
 
 DEFERRED DISCOVERIES:
 The shadow decision engine cannot read the active advisory profile without

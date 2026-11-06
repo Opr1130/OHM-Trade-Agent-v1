@@ -11,21 +11,27 @@ liquidity, capital, exposure, F11 or execution protection.
 """
 
 import json
+import inspect
 import math
 import pathlib
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
 
+from app.core.config import Settings
 from app.core.strategy_policy import parse_strategy_policy
 from app.jobs import scan_opportunities
 from app.opip.decision import store as opip_store
+from app.opip.decision.models import GateStatus
 from app.services import chief_analyst
+from app.services import economic_quality_gate
 from app.scanner.execution_validation import ExecutionValidation
 from app.scanner.market_scanner import ScanResult
 from app.scanner.models import MarketSnapshot
 from app.scanner.reference_market_validation import ReferenceMarketValidation
-from app.services import trade_action_gate
+from app.services import trade_action_gate, tradevisor_evaluation
+from app.services.tradevisor_ingress import TradevisorSignal
 from app.services.capital_allocation import CapitalAllocation
 from app.services.economic_quality_gate import (
     ADVISORY_POLICY_ID,
@@ -607,7 +613,7 @@ class _FakeChief:
         return SimpleNamespace(output_text=json.dumps(self._payload), usage=None)
 
 
-def _install_scan(monkeypatch, tmp_path, snapshots, *, chief_top=None):
+def _install_scan(monkeypatch, tmp_path, snapshots, *, chief_top=None, extra_settings=None):
     """Stub only I/O boundaries; keep every deterministic gate real."""
     settings = SimpleNamespace(
         openai_model="model", openai_api_key="key", account_equity=10_000.0,
@@ -619,6 +625,8 @@ def _install_scan(monkeypatch, tmp_path, snapshots, *, chief_top=None):
         paper_trade_pending_ttl_hours=24, paper_trade_starting_equity=10_000.0,
         paper_trade_max_positions=3, tradingview_v2_enabled=False,
     )
+    for key, value in (extra_settings or {}).items():
+        setattr(settings, key, value)
     sent: list = []
     monkeypatch.setattr(scan_opportunities, "get_settings", lambda: settings)
     monkeypatch.setattr(
@@ -1120,4 +1128,420 @@ def test_ac_012_source_wide_old_floor_call_site_audit():
         text = (APP_ROOT / "app" / rel).read_text(encoding="utf-8")
         assert "advisory_economic_policy" in text, rel
         assert "MIN_NET_PROFIT" not in text, rel
+
+
+
+# --------------------------------------------------------------- AC-013 ---
+#
+# Configured-threshold propagation. AC-001..AC-012 prove that the *default OFF*
+# state is safe; these tests prove that an owner-ENABLED threshold is enforced
+# consistently by every advisory path, from the versioned profile through the
+# orchestration layer to the pure evaluator, with no path recomputing a default.
+
+_TV_NOW = datetime(2026, 10, 23, 13, 0, 5, tzinfo=timezone.utc)
+#: The Tradevisor fixture below models a 9.05% Target 2 move at 3.0:1 reward/risk.
+_TV_MOVE_PCT = 9.05
+_TV_REWARD_TO_RISK = 3.0
+
+
+def _tv_snapshot():
+    return MarketSnapshot(
+        symbol="BTCUSD", last_price=100.0, ema20=99.0, ema50=95.0, ema200=90.0,
+        rsi=58.0, macd_line=1.0, macd_signal=0.5, macd_histogram=0.5, atr=2.0,
+        atr_pct=2.0, volume_ratio=1.5, technical_score=90, trend="bullish",
+        recent_24h_high=112.0, recent_24h_low=94.0, recent_72h_high=120.0,
+        recent_72h_low=88.0, momentum_6h_pct=1.0, momentum_24h_pct=3.0,
+        momentum_72h_pct=7.0, rolling_24h_range_median_pct=8.0,
+        rolling_24h_range_p75_pct=10.0, rolling_24h_range_p90_pct=12.0,
+        rolling_72h_range_median_pct=12.0, rolling_72h_range_p75_pct=16.0,
+        rolling_72h_range_p90_pct=20.0, rolling_24h_upside_median_pct=8.0,
+        rolling_24h_upside_p75_pct=10.0, rolling_24h_upside_p90_pct=12.0,
+        rolling_72h_upside_median_pct=12.0, rolling_72h_upside_p75_pct=16.0,
+        rolling_72h_upside_p90_pct=20.0, rolling_24h_downside_median_pct=8.0,
+        rolling_24h_downside_p75_pct=10.0, rolling_24h_downside_p90_pct=12.0,
+        rolling_72h_downside_median_pct=12.0, rolling_72h_downside_p75_pct=16.0,
+        rolling_72h_downside_p90_pct=20.0, ticker_last=100.0,
+        execution_validation=ExecutionValidation(
+            status="VALID", book_coverage_status="COMPLETE", warnings=[],
+            best_bid=99.95, best_ask=100.05, mid_price=100.0, spread_pct=0.1,
+            spread_bps=5.0, validation_notional_usd=250.0, buy_vwap=100.02,
+            sell_vwap=99.98, buy_fully_covered=True, sell_fully_covered=True,
+            estimated_visible_round_trip_market_drag_pct=0.10,
+            recent_trade_status="FRESH", latest_trade_price=100.0,
+            latest_trade_age_seconds=10.0, recent_trade_count=20,
+        ),
+    )
+
+
+def _tv_signal() -> TradevisorSignal:
+    return TradevisorSignal(
+        dedup_id="advisory-policy-correction", signal="BUY", instrument="BTC/USD",
+        market="BTCUSD", source_exchange="COINBASE", source_symbol="BTCUSD",
+        timeframe_minutes=60,
+        bar_opened_at=_TV_NOW - timedelta(minutes=65),
+        bar_closed_at=_TV_NOW - timedelta(minutes=5),
+        triggered_at=_TV_NOW - timedelta(seconds=5),
+        received_at=_TV_NOW, signal_price=100.0,
+        alert_config_version="tradevisor-1h-buy",
+    )
+
+
+def _tv_evaluate(*, equity: float, advisory_policy: dict | None = None):
+    """Run the real Tradevisor evaluation with a deterministic market fixture.
+
+    Only the market fetch is a fixture; every gate is the production owner.
+    """
+    return tradevisor_evaluation.evaluate_signal(
+        _tv_signal(),
+        now=_TV_NOW,
+        settings=Settings(_env_file=None, webhook_secret="x" * 12),
+        snapshot_provider=lambda _market: ("ok", _tv_snapshot(), None),
+        account_equity=equity,
+        active_trades=[],
+        advisory_policy=advisory_policy,
+    )
+
+
+
+@pytest.mark.acceptance
+def test_ac_013_configured_minimum_profit_is_enforced_by_tradevisor():
+    """ATDD-OPIP-ADVISORY-ECONOMIC-POLICY-CORRECTION-v1/AC-013: $25 floor, Tradevisor."""
+    # OFF: a $9.00 after-cost projection at the deployable allocation qualifies.
+    off = _tv_evaluate(equity=1_000.0)
+    assert off.rejection_code == "ADVISORY_EVIDENCE_INCOMPLETE"
+    assert off.actionable is False
+    assert off.economics.qualified is True
+    assert off.economics.target_2_net_profit == pytest.approx(9.0, abs=0.05)
+
+    # Configured $25: the same opportunity is refused by the owner's floor, and
+    # the refusal names that exact number rather than a historical default.
+    configured = _tv_evaluate(equity=1_000.0, advisory_policy={"min_net_profit": 25})
+    assert configured.rejection_code == "ECONOMIC_REJECT"
+    assert configured.actionable is False
+    assert "below minimum $25.00" in configured.reason
+    assert "75" not in configured.reason
+    applied = configured.evidence["advisory_economic_policy"]
+    assert applied["filters"]["min_net_profit"] == {"enabled": True, "value": 25.0}
+    assert applied["policy_version"] == ADVISORY_POLICY_VERSION
+
+    # The same floor does not over-reach: at $90.05 of profit it still passes.
+    roomy = _tv_evaluate(equity=10_000.0, advisory_policy={"min_net_profit": 25})
+    assert roomy.rejection_code == "ADVISORY_EVIDENCE_INCOMPLETE"
+    assert roomy.economics.target_2_net_profit == pytest.approx(90.05, abs=0.05)
+    assert roomy.economics.min_net_profit_applied == 25.0
+
+
+@pytest.mark.acceptance
+def test_ac_013_configured_target_move_is_enforced_by_tradevisor():
+    """ATDD-OPIP-ADVISORY-ECONOMIC-POLICY-CORRECTION-v1/AC-013: 4% move, Tradevisor."""
+    # The fixture projects a 9.05% deterministic Target 2 move.
+    configured_4 = _tv_evaluate(
+        equity=10_000.0, advisory_policy={"min_target_2_move_pct": 4}
+    )
+    assert configured_4.rejection_code == "ADVISORY_EVIDENCE_INCOMPLETE"
+    assert configured_4.economics.target_2_move_pct == pytest.approx(
+        _TV_MOVE_PCT, abs=0.01
+    )
+    assert configured_4.economics.min_target_2_move_pct_applied == 4.0
+    assert configured_4.evidence["advisory_economic_policy"]["filters"][
+        "min_target_2_move_pct"
+    ] == {"enabled": True, "value": 4.0}
+
+    # A configured movement filter above the projection binds and is enforced.
+    configured_12 = _tv_evaluate(
+        equity=10_000.0, advisory_policy={"min_target_2_move_pct": 12}
+    )
+    assert configured_12.rejection_code == "ECONOMIC_REJECT"
+    assert "below minimum 12.00%" in configured_12.reason
+
+
+@pytest.mark.acceptance
+def test_ac_013_configured_reward_risk_is_enforced_by_tradevisor():
+    """ATDD-OPIP-ADVISORY-ECONOMIC-POLICY-CORRECTION-v1/AC-013: 2.5:1, Tradevisor."""
+    # The fixture plan is 3.0:1, so a configured 2.5:1 must admit it.
+    configured_25 = _tv_evaluate(
+        equity=10_000.0, advisory_policy={"min_reward_to_risk": 2.5}
+    )
+    assert configured_25.plan.reward_to_risk_2 == pytest.approx(_TV_REWARD_TO_RISK)
+    assert configured_25.rejection_code == "ADVISORY_EVIDENCE_INCOMPLETE"
+    assert configured_25.economics.min_reward_to_risk_applied == 2.5
+    assert configured_25.evidence["advisory_economic_policy"]["filters"][
+        "min_reward_to_risk"
+    ] == {"enabled": True, "value": 2.5}
+
+    # A configured ratio above the plan binds and is enforced.
+    configured_4 = _tv_evaluate(
+        equity=10_000.0, advisory_policy={"min_reward_to_risk": 4}
+    )
+    assert configured_4.rejection_code == "ECONOMIC_REJECT"
+    assert "below minimum 4.00:1" in configured_4.reason
+
+
+
+@pytest.mark.acceptance
+def test_ac_013_configured_thresholds_reach_both_tradevisor_economic_bases(monkeypatch):
+    """ATDD-OPIP-ADVISORY-ECONOMIC-POLICY-CORRECTION-v1/AC-013: one policy, two bases."""
+    configured = {
+        "min_net_profit": 25,
+        "min_target_2_move_pct": 4,
+        "min_reward_to_risk": 2.5,
+    }
+    captured: list[dict] = []
+    real = economic_quality_gate.evaluate_economic_quality
+
+    def _recording(*args, **kwargs):
+        captured.append(dict(kwargs))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(tradevisor_evaluation, "evaluate_economic_quality", _recording)
+    decision = _tv_evaluate(equity=10_000.0, advisory_policy=configured)
+
+    # Both the validation-envelope qualification and the F7 final-allocation
+    # re-evaluation receive the identical configured values: no regime mixing.
+    assert len(captured) >= 2, captured
+    for kwargs in captured:
+        assert kwargs["min_net_profit"] == 25.0
+        assert kwargs["min_target_2_move_pct"] == 4.0
+        assert kwargs["min_reward_to_risk"] == 2.5
+        assert kwargs["policy_id"] == ADVISORY_POLICY_ID
+    fractions = {round(kwargs["max_capital_fraction"], 6) for kwargs in captured}
+    assert PRODUCTION_MAX_CAPITAL_FRACTION in fractions
+    assert len(fractions) >= 2, "the final allocation must use its own basis"
+
+    # The pure evaluator stayed pure: the policy arrived as an argument.
+    assert "advisory_policy" in inspect.signature(
+        tradevisor_evaluation.evaluate_signal
+    ).parameters
+    source = pathlib.Path("app/services/tradevisor_evaluation.py").read_text(
+        encoding="utf-8"
+    )
+    assert "load_active_strategy_policy" not in source
+    assert "open(" not in source
+    assert decision.economics.min_net_profit_applied == 25.0
+
+
+@pytest.mark.acceptance
+def test_ac_013_configured_thresholds_are_enforced_by_the_shadow_engine():
+    """ATDD-OPIP-ADVISORY-ECONOMIC-POLICY-CORRECTION-v1/AC-013: shadow engine honours the owner."""
+    from app.opip.decision.gates import evaluate_economic_quality_gate
+
+    # Each plan clears every OTHER optional filter, so exactly one configured
+    # threshold can bind.
+    candidates = {
+        "min_net_profit": (
+            plan(target_1=101.0, target_2=102.0, reward_to_risk_2=3.0),
+            25,
+            "below minimum $25.00",
+        ),
+        "min_target_2_move_pct": (
+            plan(target_1=101.5, target_2=103.99, reward_to_risk_2=3.0),
+            4,
+            "below minimum 4.00%",
+        ),
+        "min_reward_to_risk": (plan(reward_to_risk_2=2.0), 2.5, "below minimum 2.50:1"),
+    }
+    snapshot = SimpleNamespace(trade_direction="LONG")
+
+    for knob, (candidate_plan, value, expect_fragment) in candidates.items():
+        policy = {knob: value}
+        off = evaluate_economic_quality_gate(
+            candidate_plan, snapshot, account_equity=500
+        )
+        assert off.status is GateStatus.PASS, (knob, off.reason)
+
+        configured = evaluate_economic_quality_gate(
+            candidate_plan, snapshot, account_equity=500, advisory_policy=policy
+        )
+        assert configured.status is GateStatus.FAIL, knob
+        assert expect_fragment in configured.reason, (knob, configured.reason)
+        assert configured.metadata["policy_id"] == ADVISORY_POLICY_ID
+        assert configured.metadata["policy_regime"] == "ADVISORY"
+        assert configured.metadata["advisory_overrides_visible"] is True
+        assert configured.metadata[f"{knob}_applied"] == float(value)
+        # The gate's ``threshold`` field always measures the net-profit rule it
+        # reports; the binding configured floor for this knob is named in
+        # metadata and in the reason, so both stay truthful for every knob.
+        assert configured.threshold == float(
+            configured.metadata["min_net_profit_applied"]
+        )
+
+
+@pytest.mark.acceptance
+def test_ac_013_shadow_policy_reaches_the_engine_from_orchestration(monkeypatch):
+    """ATDD-OPIP-ADVISORY-ECONOMIC-POLICY-CORRECTION-v1/AC-013: orchestration seam."""
+    import app.opip.decision.observer as observer_module
+    from app.opip.decision.observer import build_scan_observer
+
+    configured = {"min_net_profit": 25, "min_target_2_move_pct": 4}
+    observer = build_scan_observer(
+        snapshots=[],
+        decision_at=_TV_NOW,
+        account_equity=1_000.0,
+        advisory_policy=configured,
+    )
+    assert observer.advisory_policy == configured
+
+    captured: dict = {}
+
+    class _FakeEngine:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def evaluate(self, evidence):  # pragma: no cover - no candidates here
+            raise AssertionError("no candidate should be evaluated")
+
+    monkeypatch.setattr(observer_module, "OPipDecisionEngine", _FakeEngine)
+    observer.run_shadow_engine()
+    assert captured["advisory_policy"] == configured
+    # The engine performs no I/O of its own: the policy is an argument.
+    engine_source = pathlib.Path("app/opip/decision/engine.py").read_text(
+        encoding="utf-8"
+    )
+    assert "load_active_strategy_policy" not in engine_source
+    assert "open(" not in engine_source
+    gates_source = pathlib.Path("app/opip/decision/gates.py").read_text(
+        encoding="utf-8"
+    )
+    assert "load_active_strategy_policy" not in gates_source
+
+
+
+@pytest.mark.acceptance
+def test_ac_013_configured_threshold_governs_the_native_scan(monkeypatch, tmp_path, capsys):
+    """ATDD-OPIP-ADVISORY-ECONOMIC-POLICY-CORRECTION-v1/AC-013: configured end-to-end."""
+    import app.core.strategy_policy as strategy_policy_module
+
+    def _profile(**economics):
+        values = {
+            "min_net_profit_usd": 0,
+            "min_target_2_move_pct": 0,
+            "min_reward_to_risk": 0,
+            "estimated_round_trip_cost_pct": 0.6,
+        }
+        values.update(economics)
+        return SimpleNamespace(advisory_economics=values, digest="d" * 64)
+
+    # The same candidate, through the real scan, under three policies.
+    for economics, expect_pass, fragment in (
+        ({}, True, None),
+        ({"min_target_2_move_pct": 25}, False, "below minimum 25.00%"),
+        ({"min_net_profit_usd": 10_000}, False, "below minimum $10000.00"),
+    ):
+        monkeypatch.setattr(
+            strategy_policy_module,
+            "load_active_strategy_policy",
+            lambda _e=economics: _profile(**_e),
+        )
+        sent = _install_scan(
+            monkeypatch, tmp_path, [_journey_snapshot("AKTUSD")],
+            chief_top=_chief_alert("AKTUSD"),
+            extra_settings={"opip_advisory_profile_enabled": True},
+        )
+        # Capture the live pre-AI screen's own evidence instead of its stub.
+        prefiltered: list[dict] = []
+        monkeypatch.setattr(
+            chief_analyst,
+            "capture_prefilter_rejection",
+            lambda candidate, *, quality_by_risk_level, market_regime_context: (
+                prefiltered.append(dict(quality_by_risk_level)) or True
+            ),
+        )
+        scan_opportunities.main()
+        output = capsys.readouterr().out
+        summary = _journey_summary(tmp_path)
+
+        if expect_pass:
+            assert "ECONOMIC PASS LONG AKTUSD" in output
+            assert "ACTION GATE PASS rank=1 LONG AKTUSD" in output
+            assert summary["funnel"]["qualified"] == 1
+            assert len(sent) == 1
+        else:
+            # The owner's enabled threshold stops the recommendation inside the
+            # journey, before any notification, and the recorded rejection names
+            # the configured value rather than a historical default.
+            assert "ACTION GATE PASS" not in output
+            assert summary["funnel"]["qualified"] == 0
+            assert summary["funnel"]["rejected_by_policy"] == 1
+            assert sent == []
+            assert prefiltered, "the pre-AI screen must have recorded a verdict"
+            reasons = " ".join(
+                str(level.get("economic_rejection") or "")
+                for levels in prefiltered
+                for level in levels.values()
+            )
+            assert fragment in reasons, reasons
+
+        # Reset the persisted telemetry between scenarios.
+        for name in ("funnel_events.jsonl", "scan_summaries.jsonl"):
+            path = tmp_path / name
+            if path.exists():
+                path.unlink()
+
+
+@pytest.mark.acceptance
+def test_ac_013_admin_ui_serializes_empty_optional_field_as_zero():
+    """ATDD-OPIP-ADVISORY-ECONOMIC-POLICY-CORRECTION-v1/AC-013: empty means OFF."""
+    editor = (APP_ROOT / "app/api/strategy_admin.html").read_text(encoding="utf-8")
+
+    # All three optional filters go through the OFF-aware serializer ...
+    for field in ("profit", "move", "rr"):
+        assert f'optionalNumber("{field}")' in editor, field
+        assert f'id="{field}State"' in editor, field
+    # ... which maps an empty field to the approved disabled value 0.
+    assert 'input.value.trim()===""' in editor
+    assert "return 0;" in editor
+    # The cost assumption is NOT optional: it still uses the strict parser.
+    assert 'number("cost")' in editor
+    # Advisory eligibility is distinguished from execution authority in the UI.
+    assert "advisory eligibility only" in editor
+    assert "0 means OFF" in editor
+    # The editor still cannot reach execution or protection settings.
+    assert "allow_funded_orders" not in editor
+
+
+@pytest.mark.acceptance
+def test_ac_013_malformed_stored_configuration_fails_closed(monkeypatch):
+    """ATDD-OPIP-ADVISORY-ECONOMIC-POLICY-CORRECTION-v1/AC-013: never guess a policy."""
+    from app.core import strategy_policy as strategy_policy_module
+    from app.services import tradevisor_pipeline
+
+    # A configured profile is translated and handed to the evaluator.
+    monkeypatch.setattr(
+        strategy_policy_module,
+        "load_active_strategy_policy",
+        lambda: SimpleNamespace(
+            advisory_economics={
+                "min_net_profit_usd": 25,
+                "min_target_2_move_pct": 4,
+                "min_reward_to_risk": 2.5,
+                "estimated_round_trip_cost_pct": 0.6,
+            }
+        ),
+    )
+    assert tradevisor_pipeline._advisory_policy() == {
+        "min_net_profit": 25,
+        "min_target_2_move_pct": 4,
+        "min_reward_to_risk": 2.5,
+        "estimated_round_trip_cost_pct": 0.6,
+    }
+
+    # A malformed active profile must never be replaced by the all-OFF default:
+    # that would silently disable a filter the owner enabled.
+    def _malformed():
+        raise ValueError("INVALID_ECONOMIC_BOUND")
+
+    monkeypatch.setattr(
+        strategy_policy_module, "load_active_strategy_policy", _malformed
+    )
+    with pytest.raises(tradevisor_pipeline.AdvisoryPolicyUnavailable):
+        tradevisor_pipeline._advisory_policy()
+    # The composition root refuses the evaluation, so nothing is delivered.
+    with pytest.raises(tradevisor_pipeline.AdvisoryPolicyUnavailable):
+        tradevisor_pipeline.evaluate_and_notify(
+            _tv_signal(),
+            settings=Settings(_env_file=None, webhook_secret="x" * 12),
+            snapshot_provider=lambda _market: ("ok", _tv_snapshot(), None),
+            account_equity=10_000.0,
+            active_trades=[],
+        )
 

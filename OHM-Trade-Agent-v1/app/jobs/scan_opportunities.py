@@ -1410,17 +1410,13 @@ def main(scan_override=None):
         str(signal.get("stage") or "UNKNOWN")
         for signal in local_movement_signals
     )
-    # Construct the observer before selection so the screening rows and funnel
-    # share one scan identity.  No callback is installed while telemetry is
-    # dark, preserving the historical selector call exactly.
-    opip = build_scan_observer(
-        snapshots=scan.snapshots,
-        decision_at=decision_at,
-        account_equity=getattr(settings, "account_equity", None),
-    )
-    screening_rows: list[dict] = []
-    screening_scan_id = _screening_scan_id(opip)
+    # The effective advisory economic policy is resolved once, before anything
+    # that qualifies a candidate. Every advisory consumer - scanner economics,
+    # the pre-AI screen, the capital action gate and the shadow comparison -
+    # applies this one resolved policy, so an owner-enabled threshold can never
+    # be enforced by one stage and ignored by another.
     advisory_policy = None
+    active_strategy = None
     if bool(getattr(settings, "opip_advisory_profile_enabled", False)):
         from app.core.strategy_policy import load_active_strategy_policy
 
@@ -1430,6 +1426,17 @@ def main(scan_override=None):
         advisory_policy = advisory_policy_from_profile(
             active_strategy.advisory_economics
         )
+    # Construct the observer before selection so the screening rows and funnel
+    # share one scan identity.  No callback is installed while telemetry is
+    # dark, preserving the historical selector call exactly.
+    opip = build_scan_observer(
+        snapshots=scan.snapshots,
+        decision_at=decision_at,
+        account_equity=getattr(settings, "account_equity", None),
+        advisory_policy=advisory_policy,
+    )
+    screening_rows: list[dict] = []
+    screening_scan_id = _screening_scan_id(opip)
     scoring_version = getattr(settings, "opip_production_scoring_version", "v1")
     if scoring_version not in {"v1", "v2"}:
         raise ValueError("INVALID_PRODUCTION_SCORING_VERSION")
