@@ -7,7 +7,8 @@ import pytest
 from app.jobs.scan_opportunities import _economic_quality
 from app.services.chief_analyst import _normalize_chief_potential
 from app.services.economic_quality_gate import (
-    MIN_NET_PROFIT, PRODUCTION_MAX_CAPITAL_FRACTION, evaluate_economic_quality,
+    ADVISORY_POLICY_ID, EXECUTION_GATE_POLICY_ID, MIN_NET_PROFIT,
+    PRODUCTION_MAX_CAPITAL_FRACTION, evaluate_economic_quality,
 )
 from app.core.strategy_policy import load_strategy_policy, parse_strategy_policy
 from app.services.chief_alert_notifier import format_trade_plan
@@ -273,7 +274,16 @@ def test_ac_007_no_discontinuity_at_seventy_five_dollars():
 
 @pytest.mark.acceptance
 def test_ac_007_execution_gate_keeps_its_seventy_five_dollar_bar():
-    """ATDD-OPIP-ADVISORY-NO-FIXED-PROFIT-v1/AC-007: advisory removal is not execution removal."""
+    """ATDD-OPIP-ADVISORY-NO-FIXED-PROFIT-v1/AC-007: advisory removal is not execution removal.
+
+    Superseded scope, recorded by
+    ATDD-OPIP-ADVISORY-ECONOMIC-POLICY-CORRECTION-v1: the shadow decision engine
+    reproduces the live advisory decision, so its economic gate now applies the
+    advisory policy (OFF by default) instead of the historical execution bar.
+    What AC-007 still guarantees is unchanged: the *execution-compatible* default
+    of the shared gate remains $75, and the advisory reclassification did not
+    relax it.
+    """
     from app.opip.decision.gates import evaluate_economic_quality_gate
     from app.opip.decision.models import GateStatus
 
@@ -281,20 +291,22 @@ def test_ac_007_execution_gate_keeps_its_seventy_five_dollar_bar():
     advice = _economic_quality(plan(), snapshot, 500)
     assert advice.qualified is True
 
-    # The same candidate is still refused by the execution-side gate.
-    execution = evaluate_economic_quality_gate(plan(), snapshot, account_equity=500)
-    assert execution.status is GateStatus.FAIL
-    assert "75.00" in " ".join(
-        str(part) for part in (execution.reason, execution.metadata)
-    )
+    # The shadow engine applies the same advisory policy production applies and
+    # says so, rather than silently applying a bar production does not use.
+    shadow = evaluate_economic_quality_gate(plan(), snapshot, account_equity=500)
+    assert shadow.status is GateStatus.PASS
+    assert shadow.metadata["policy_id"] == ADVISORY_POLICY_ID
+    assert shadow.metadata["min_net_profit_applied"] == 0.0
+    assert shadow.metadata["policy_regime"] == "ADVISORY"
 
-    # The shared gate's own default is unchanged.
+    # The shared gate's own execution-compatible default is unchanged.
     shared = evaluate_economic_quality(
         plan(), available_capital=500,
         max_capital_fraction=PRODUCTION_MAX_CAPITAL_FRACTION,
     )
     assert shared.qualified is False
     assert "$75.00" in (shared.rejection_reason or "")
+    assert shared.policy_id == EXECUTION_GATE_POLICY_ID
 
 
 @pytest.mark.acceptance
@@ -366,10 +378,19 @@ def test_ac_008_chief_advisory_prefilter_cannot_reintroduce_a_fixed_floor(monkey
 
 @pytest.mark.acceptance
 def test_ac_009_execution_side_paths_keep_the_execution_bar():
-    """ATDD-OPIP-ADVISORY-NO-FIXED-PROFIT-v1/AC-009: advisory removal is not execution removal."""
+    """ATDD-OPIP-ADVISORY-NO-FIXED-PROFIT-v1/AC-009: advisory removal is not execution removal.
+
+    Superseded scope, recorded by
+    ATDD-OPIP-ADVISORY-ECONOMIC-POLICY-CORRECTION-v1: the two advisory call sites
+    this increment deferred - the capital action gate and the Tradevisor advisory
+    evaluation - now apply the advisory policy. AC-009's guarantee is unchanged:
+    the execution-compatible constants and the shared gate's own defaults were
+    not relaxed by that reclassification.
+    """
     import inspect
 
     from app.services import trade_action_gate, tradevisor_evaluation
+    from app.services.economic_quality_gate import advisory_economic_policy
     from app.services.economic_quality_gate import (
         MIN_NET_PROFIT,
         MIN_REWARD_TO_RISK,
@@ -387,12 +408,11 @@ def test_ac_009_execution_side_paths_keep_the_execution_bar():
     assert signature["min_target_2_move_pct"].default == MIN_TARGET_2_MOVE_PCT
     assert signature["min_reward_to_risk"].default == MIN_REWARD_TO_RISK
 
-    # Tradeability enforces the dollar bar independently of the advisory screen.
-    assert "MIN_NET_PROFIT" in inspect.getsource(trade_action_gate)
-
-    # The Tradevisor evaluation path is NOT reclassified by this change, and that
-    # limitation is recorded rather than presented as a system-wide removal.
+    # The advisory call sites resolve the advisory policy rather than a floor.
+    assert "advisory_economic_policy" in inspect.getsource(trade_action_gate)
+    assert "MIN_NET_PROFIT" not in inspect.getsource(trade_action_gate)
     tradevisor = inspect.getsource(tradevisor_evaluation)
-    assert "advisory_economic_policy" not in tradevisor
-    assert "min_net_profit" not in tradevisor
+    assert "ADVISORY_ECONOMIC_POLICY" in tradevisor
+    assert "describe_advisory_economic_policy" in tradevisor
+    assert float(advisory_economic_policy()["min_net_profit"]) == 0.0
 

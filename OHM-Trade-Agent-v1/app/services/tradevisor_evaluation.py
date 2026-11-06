@@ -45,6 +45,8 @@ from app.services.capital_efficiency_ranking import MIN_EXECUTABLE_NOTIONAL_USD
 from app.services.economic_quality_gate import (
     PRODUCTION_MAX_CAPITAL_FRACTION,
     EconomicGateResult,
+    advisory_economic_policy,
+    describe_advisory_economic_policy,
     evaluate_economic_quality,
 )
 from app.services.entry_exit_advisor import EntryExitPlan, build_entry_exit_plan
@@ -68,6 +70,23 @@ DECISION_EXPIRED = "EXPIRED"
 
 #: Only these two are actionable entry recommendations.
 ACTIONABLE_DECISIONS = frozenset({DECISION_ENTER_NOW, DECISION_SET_LIMIT_ENTRY})
+
+#: Tradevisor proposes; O'Pip decides. This module produces advisory evidence
+#: and never an order, so its economic qualification uses the advisory policy
+#: (optional fixed dollar/move/reward-risk floors OFF by default) instead of the
+#: execution-compatible bar. A disabled filter never removes the independent
+#: requirement that modelled net profit after costs be strictly positive, and it
+#: never widens exchange, funded-trading or execution authority.
+#:
+#: The owner-configured override is not read here: this service holds no profile
+#: access and must stay free of surprise I/O, so the applied regime is recorded
+#: explicitly in evidence rather than guessed.
+#: The bounded advisory policy the module assumes when no orchestration layer
+#: supplies one, plus its evidence form. Both are *derived* from
+#: ``advisory_economic_policy`` so there is no second definition; a configured
+#: owner profile is passed in explicitly by ``tradevisor_pipeline`` instead.
+ADVISORY_ECONOMIC_POLICY = advisory_economic_policy()
+ADVISORY_ECONOMIC_POLICY_EVIDENCE = describe_advisory_economic_policy()
 
 HORIZON_TACTICAL = "TACTICAL"
 HORIZON_SWING = "SWING"
@@ -189,8 +208,17 @@ def _evaluate_buy_plans(
     risk_per_trade_pct: float,
     expiry_minutes: int,
     active_trades: list[Any] | None,
+    advisory_policy: dict | None = None,
 ) -> TradevisorDecision:
-    """Run the existing F5/F7/R4 sequence over the source BUY evidence."""
+    """Run the existing F5/F7/R4 sequence over the source BUY evidence.
+
+    ``advisory_policy`` is the effective, validated, versioned advisory filter
+    policy handed down by the composition root. ``None`` means the bounded
+    default (all optional filters OFF); it is never substituted for an
+    owner-configured value here, because this function performs no I/O of its
+    own and must not guess.
+    """
+    effective_policy = advisory_economic_policy(advisory_policy)
     attempts: list[dict[str, Any]] = []
     accepted: dict[str, Any] | None = None
     last_code = "NO_VALID_ENTRY_GEOMETRY"
@@ -236,12 +264,14 @@ def _evaluate_buy_plans(
             plan,
             equity,
             max_capital_fraction=PRODUCTION_MAX_CAPITAL_FRACTION,
+            **effective_policy,
         )
         attempt.update(
             attainability_qualified=bool(attainability.qualified),
             attainability_score=int(attainability.attainability_score),
             economic_qualified=bool(economics.qualified),
             economic_reason=economics.rejection_reason,
+            economic_policy_id=economics.policy_id,
             stop_pct=economics.stop_pct,
             target_2_move_pct=economics.target_2_move_pct,
             reward_to_risk_2=plan.reward_to_risk_2,
@@ -308,6 +338,7 @@ def _evaluate_buy_plans(
         risk_per_trade_pct=risk_per_trade_pct,
         expiry_minutes=expiry_minutes,
         active_trades=active_trades,
+        advisory_policy=advisory_policy,
     )
 
 
@@ -549,6 +580,7 @@ def evaluate_signal(
     account_equity: float | None = None,
     active_trades: list[Any] | None = None,
     btc_context_provider: Callable[[str], Any] | None = None,
+    advisory_policy: dict | None = None,
 ) -> TradevisorDecision:
     """Evaluate one validated Tradevisor signal against native O'Pip evidence.
 
@@ -577,6 +609,12 @@ def evaluate_signal(
     snapshot, snapshot_error = _resolve_snapshot(provider, signal.market)
     evidence = _base_evidence(
         signal, equity=equity, snapshot=snapshot, snapshot_error=snapshot_error
+    )
+    # Record the effective advisory filter policy on EVERY decision, qualified or
+    # rejected, so a stored refusal can always be attributed to the thresholds
+    # that were actually in force - including which of them were enabled.
+    evidence["advisory_economic_policy"] = describe_advisory_economic_policy(
+        advisory_policy
     )
     regime = (
         (str(getattr(snapshot, "trend", "") or "").upper() or None)
@@ -710,6 +748,7 @@ def evaluate_signal(
         risk_per_trade_pct=risk_per_trade_pct,
         expiry_minutes=expiry_minutes,
         active_trades=active_trades,
+        advisory_policy=advisory_policy,
     )
 
 
@@ -728,8 +767,15 @@ def _finalize_qualified_buy(
     risk_per_trade_pct: float,
     expiry_minutes: int,
     active_trades: list[Any] | None,
+    advisory_policy: dict | None = None,
 ) -> TradevisorDecision:
-    """F7 capital planning and exposure capacity for an already-qualified plan."""
+    """F7 capital planning and exposure capacity for an already-qualified plan.
+
+    The same effective advisory policy that qualified the plan is applied to the
+    final-allocation re-evaluation, so the qualifying rule and the displayed
+    figure can never come from two different policy regimes.
+    """
+    effective_policy = advisory_economic_policy(advisory_policy)
     plan: EntryExitPlan = accepted["plan"]
     attainability: TargetAttainabilityResult = accepted["attainability"]
     economics: EconomicGateResult = accepted["economics"]
@@ -855,13 +901,19 @@ def _finalize_qualified_buy(
             equity_value,
             max_capital_fraction=allocation_fraction,
             max_account_risk_at_stop_pct=None,
+            **effective_policy,
         )
+        # The displayed recommendation is the one at the capital the operator may
+        # actually deploy. The effective filter policy it was qualified under is
+        # already recorded in evidence by ``evaluate_signal``.
         evidence["economics_at_envelope"] = {
             "recommended_capital": economics.recommended_capital,
             "position_notional": economics.position_notional,
             "target_1_net_profit": economics.target_1_net_profit,
             "target_2_net_profit": economics.target_2_net_profit,
             "qualified": economics.qualified,
+            "policy_id": economics.policy_id,
+            "policy_regime": "ADVISORY_VALIDATION_ENVELOPE",
         }
         evidence["final_allocation_basis"] = {
             "allocation": allocation_capital,
@@ -896,6 +948,27 @@ def _finalize_qualified_buy(
                 f"({capital_status})"
             ),
         )
+
+    if capital_status == "CAPITAL_BELOW_EXECUTABLE_MINIMUM":
+        # A size below the executable minimum cannot be reported as an advisory
+        # pass either. This is an executable-notional stop, not an economic
+        # floor, so the rebased projection and its policy attribution are kept.
+        final_economics = replace(
+            final_economics,
+            qualified=False,
+            rejection_reason=(
+                f"F7 recommended capital USD {allocation_capital:.2f} is below "
+                f"the minimum executable notional USD "
+                f"{MIN_EXECUTABLE_NOTIONAL_USD:.2f}"
+            ),
+        )
+        if "f5_final" in evidence:
+            # The recorded evidence must state the same verdict as the decision.
+            evidence["f5_final"] = {
+                **evidence["f5_final"],
+                "qualified": False,
+                "rejection_reason": final_economics.rejection_reason,
+            }
 
     rejection: tuple[str, str] | None = None
     if capital_status == "CAPITAL_INCONSISTENT":

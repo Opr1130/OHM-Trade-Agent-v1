@@ -23,10 +23,13 @@ from app.services.chief_analyst import (
     SHORT_VALIDATION_LEVERAGE,
 )
 from app.services.economic_quality_gate import (
+    ADVISORY_POLICY_ID,
+    ADVISORY_POLICY_VERSION,
     MIN_NET_PROFIT,
     MIN_REWARD_TO_RISK,
     MIN_TARGET_2_MOVE_PCT,
     PRODUCTION_MAX_CAPITAL_FRACTION,
+    advisory_economic_policy,
 )
 from app.services.recommendation_gate import (
     ALLOWED_DIRECTIONS,
@@ -63,7 +66,14 @@ def gate_policy_constants() -> dict[str, Any]:
 
     Values are read at call time rather than snapshotted at import so a test
     that legitimately monkeypatches a threshold sees a different fingerprint.
+
+    The ``economic_*`` keys are the EXECUTION-compatible bar and are unchanged.
+    The ``advisory_economic_*`` keys are the policy the live advisory screen
+    actually applies, which is a different regime; recording both means a
+    stored rejection can be attributed to the rule that produced it instead of
+    to a bar that was never in force.
     """
+    advisory = advisory_economic_policy()
     return {
         "ai_min_confidence": int(MIN_CONFIDENCE),
         "allowed_directions": sorted(ALLOWED_DIRECTIONS),
@@ -75,6 +85,15 @@ def gate_policy_constants() -> dict[str, Any]:
         "economic_min_target_2_move_pct": float(MIN_TARGET_2_MOVE_PCT),
         "economic_min_net_profit": float(MIN_NET_PROFIT),
         "economic_min_reward_to_risk": float(MIN_REWARD_TO_RISK),
+        "advisory_policy_id": str(ADVISORY_POLICY_ID),
+        "advisory_policy_version": int(ADVISORY_POLICY_VERSION),
+        "advisory_economic_min_net_profit": float(advisory["min_net_profit"]),
+        "advisory_economic_min_target_2_move_pct": float(
+            advisory["min_target_2_move_pct"]
+        ),
+        "advisory_economic_min_reward_to_risk": float(
+            advisory["min_reward_to_risk"]
+        ),
         "target_min_qualifying_score": int(MIN_QUALIFYING_SCORE),
         "max_long_spread_bps": float(MAX_LONG_SPREAD_BPS),
         "max_long_round_trip_drag_pct": float(MAX_LONG_ROUND_TRIP_DRAG_PCT),

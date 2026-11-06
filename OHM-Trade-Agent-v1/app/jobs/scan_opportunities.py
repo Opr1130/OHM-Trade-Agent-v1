@@ -61,6 +61,7 @@ from app.services.chief_analyst import (
 from app.services.economic_quality_gate import (
     PRODUCTION_MAX_CAPITAL_FRACTION,
     advisory_economic_policy,
+    advisory_policy_from_profile,
     evaluate_economic_quality,
 )
 from app.services.entry_exit_advisor import build_entry_exit_plan
@@ -1275,12 +1276,24 @@ def _assess_price_movement(snapshot, settings, market_intelligence=None):
 
 
 
-def _apply_ranked_action_gates(ranked_opportunities, *, settings, opip=None, authority=None, client=None):
+def _apply_ranked_action_gates(
+    ranked_opportunities,
+    *,
+    settings,
+    opip=None,
+    authority=None,
+    client=None,
+    advisory_policy=None,
+):
     """Apply scarce-capital/portfolio eligibility in global rank order.
 
     Approved candidates are added to a projected exposure list so lower-ranked
     signals cannot independently allocate the same capital/position slots.
     A vetoed higher-ranked candidate does not block the next-best candidate.
+
+    ``advisory_policy`` is the owner's resolved advisory economic policy. The
+    capital/portfolio gate asks the advisory question, so a disabled optional
+    filter must not resurface here as a fixed dollar floor.
 
     The existing-position source is authority-aware: under the legacy authority it
     remains the legacy registry, and under a granted Paper-v2 authority it is
@@ -1322,6 +1335,7 @@ def _apply_ranked_action_gates(ranked_opportunities, *, settings, opip=None, aut
                 plan=plan,
                 account_capital=float(settings.account_equity),
                 active_trades=projected_trades,
+                advisory_policy=advisory_policy,
             )
         except Exception as exc:
             reason = f"{type(exc).__name__}: {exc}"
@@ -1337,6 +1351,7 @@ def _apply_ranked_action_gates(ranked_opportunities, *, settings, opip=None, aut
                 ranked,
                 allowed=bool(gate.allowed),
                 reason=str(gate.reason or ""),
+                reason_code=getattr(gate, "reason_code", None),
             )
         if not gate.allowed:
             print(
@@ -1395,6 +1410,22 @@ def main(scan_override=None):
         str(signal.get("stage") or "UNKNOWN")
         for signal in local_movement_signals
     )
+    # The effective advisory economic policy is resolved once, before anything
+    # that qualifies a candidate. Every advisory consumer - scanner economics,
+    # the pre-AI screen, the capital action gate and the shadow comparison -
+    # applies this one resolved policy, so an owner-enabled threshold can never
+    # be enforced by one stage and ignored by another.
+    advisory_policy = None
+    active_strategy = None
+    if bool(getattr(settings, "opip_advisory_profile_enabled", False)):
+        from app.core.strategy_policy import load_active_strategy_policy
+
+        active_strategy = load_active_strategy_policy()
+        # One translation lives in the economic-policy owner, so the editor,
+        # the validator and every advisory gate cannot drift apart.
+        advisory_policy = advisory_policy_from_profile(
+            active_strategy.advisory_economics
+        )
     # Construct the observer before selection so the screening rows and funnel
     # share one scan identity.  No callback is installed while telemetry is
     # dark, preserving the historical selector call exactly.
@@ -1402,20 +1433,10 @@ def main(scan_override=None):
         snapshots=scan.snapshots,
         decision_at=decision_at,
         account_equity=getattr(settings, "account_equity", None),
+        advisory_policy=advisory_policy,
     )
     screening_rows: list[dict] = []
     screening_scan_id = _screening_scan_id(opip)
-    advisory_policy = None
-    if bool(getattr(settings, "opip_advisory_profile_enabled", False)):
-        from app.core.strategy_policy import load_active_strategy_policy
-        active_strategy = load_active_strategy_policy()
-        economics = active_strategy.advisory_economics
-        advisory_policy = {
-            "min_net_profit": economics["min_net_profit_usd"],
-            "min_target_2_move_pct": economics["min_target_2_move_pct"],
-            "min_reward_to_risk": economics["min_reward_to_risk"],
-            "estimated_round_trip_cost_pct": economics["estimated_round_trip_cost_pct"],
-        }
     scoring_version = getattr(settings, "opip_production_scoring_version", "v1")
     if scoring_version not in {"v1", "v2"}:
         raise ValueError("INVALID_PRODUCTION_SCORING_VERSION")
@@ -2230,6 +2251,8 @@ def main(scan_override=None):
         action_gate_kwargs["authority"] = authority
     if "client" in inspect.signature(_apply_ranked_action_gates).parameters:
         action_gate_kwargs["client"] = _paper_v2_writer_client()
+    if "advisory_policy" in inspect.signature(_apply_ranked_action_gates).parameters:
+        action_gate_kwargs["advisory_policy"] = advisory_policy
     actionable_ranked_opportunities = _apply_ranked_action_gates(
         ranked_opportunities,
         **action_gate_kwargs,

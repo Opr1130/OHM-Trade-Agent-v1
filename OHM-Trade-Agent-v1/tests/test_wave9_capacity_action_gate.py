@@ -87,7 +87,15 @@ def test_capacity_ceiling_caps_recommended_capital(monkeypatch):
     assert candidate["capacity_adjusted_validation_net_t2"] == 100.0
 
 
-def test_capacity_cap_rejects_when_economic_minimum_no_longer_holds(monkeypatch):
+def test_capacity_cap_admits_positive_net_whilst_the_profit_filter_is_off(monkeypatch):
+    """A capacity-capped positive projection is advisory-eligible by default.
+
+    Superseded behaviour: this case used to fail with "below economic minimum"
+    because the capacity re-check compared against the historical $75 execution
+    floor. Advisory eligibility now applies the advisory policy (OFF by default)
+    plus the independent strict-positivity requirement, so $48 of after-cost
+    profit is not vetoed by a fixed dollar amount.
+    """
     monkeypatch.setattr(
         trade_action_gate,
         "evaluate_trade_decision",
@@ -120,10 +128,60 @@ def test_capacity_cap_rejects_when_economic_minimum_no_longer_holds(monkeypatch)
         active_trades=[],
     )
 
+    assert decision.allowed is True
+    assert candidate["recommended_capital"] == 120.0
+    assert candidate["capacity_adjusted_validation_net_t2"] == 48.0
+    assert decision.rejection_class is None
+    assert "action_gate_rejection_class" not in candidate
+
+
+def test_capacity_cap_rejects_below_a_configured_advisory_profit_floor(monkeypatch):
+    """A configured advisory floor still applies at the deployable capital.
+
+    The stop is classified as an economic-policy stop, not as missing capital.
+    """
+    monkeypatch.setattr(
+        trade_action_gate,
+        "evaluate_trade_decision",
+        lambda **kwargs: _intelligence(400.0),
+    )
+    monkeypatch.setattr(
+        trade_action_gate,
+        "evaluate_portfolio_risk",
+        lambda **kwargs: PortfolioRiskDecision(
+            allowed=True,
+            reason="portfolio risk limits satisfied",
+            open_positions=0,
+            gross_exposure=0.0,
+            proposed_exposure=kwargs["proposed_capital"],
+            proposed_total_exposure=kwargs["proposed_capital"],
+        ),
+    )
+    candidate = {
+        "economic_qualified": True,
+        "direction": "LONG",
+        "liquidity_capacity_ceiling_usd": 120.0,
+        "economic_validation_capital": 400.0,
+        "economic_validation_net_t2": 160.0,
+    }
+
+    decision = trade_action_gate.apply_action_gate(
+        candidate=candidate,
+        plan=_plan(),
+        account_capital=2_000.0,
+        active_trades=[],
+        advisory_policy={"min_net_profit": 75.0},
+    )
+
     assert decision.allowed is False
     assert candidate["recommended_capital"] == 120.0
     assert candidate["capacity_adjusted_validation_net_t2"] == 48.0
-    assert "below economic minimum" in decision.reason
+    assert "below the configured advisory minimum USD 75.00" in decision.reason
+    assert decision.rejection_class == trade_action_gate.REJECTION_ECONOMIC_FLOOR
+    assert decision.reason_code == "ECONOMIC_GATE_FAILED"
+    assert candidate["action_gate_rejection_class"] == (
+        trade_action_gate.REJECTION_ECONOMIC_FLOOR
+    )
 
 
 def test_capacity_above_allocation_does_not_change_recommendation(monkeypatch):

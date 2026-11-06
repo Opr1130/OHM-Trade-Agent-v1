@@ -15,6 +15,7 @@ exchange requests, which it must never do.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
@@ -38,7 +39,10 @@ from app.services.chief_analyst import (
     SHORT_MAX_ACCOUNT_RISK_AT_STOP_PCT,
     SHORT_VALIDATION_LEVERAGE,
 )
-from app.services.economic_quality_gate import evaluate_economic_quality
+from app.services.economic_quality_gate import (
+    advisory_economic_policy,
+    evaluate_economic_quality,
+)
 from app.services.recommendation_gate import candidate_alert_authorized, parse_confidence
 from app.services.short_target_attainability import evaluate_short_target_attainability
 from app.services.target_attainability import evaluate_target_attainability
@@ -458,6 +462,9 @@ def economic_quality_gate_from_result(
     evaluated_at: datetime | None = None,
 ) -> GateResult:
     """Convert an already-computed economic gate result to a GateResult."""
+    applied_net_profit = float(
+        getattr(result, "min_net_profit_applied", 0.0) or 0.0
+    )
     metadata = {
         "target_1_move_pct": result.target_1_move_pct,
         "target_2_move_pct": result.target_2_move_pct,
@@ -465,6 +472,16 @@ def economic_quality_gate_from_result(
         "estimated_costs": result.estimated_costs,
         "leverage": getattr(result, "leverage", 1.0),
         "account_risk_at_stop_pct": getattr(result, "account_risk_at_stop_pct", 0.0),
+        # Exact rule attribution: which policy produced this verdict and which
+        # numeric floors were applied.
+        "policy_id": getattr(result, "policy_id", None),
+        "min_net_profit_applied": applied_net_profit,
+        "min_target_2_move_pct_applied": getattr(
+            result, "min_target_2_move_pct_applied", None
+        ),
+        "min_reward_to_risk_applied": getattr(
+            result, "min_reward_to_risk_applied", None
+        ),
     }
     if result.qualified:
         return GateResult.build(
@@ -473,7 +490,7 @@ def economic_quality_gate_from_result(
             ReasonCode.GATE_PASSED,
             reason=f"net profit at target 2 is {result.target_2_net_profit:.2f}",
             measured_value=result.target_2_net_profit,
-            threshold=0.0,
+            threshold=applied_net_profit,
             evaluated_at=evaluated_at,
             metadata=metadata,
         )
@@ -483,7 +500,7 @@ def economic_quality_gate_from_result(
         ReasonCode.ECONOMIC_GATE_FAILED,
         reason=str(result.rejection_reason or "economic gate rejected"),
         measured_value=result.target_2_net_profit,
-        threshold=0.0,
+        threshold=applied_net_profit,
         evaluated_at=evaluated_at,
         metadata=metadata,
     )
@@ -511,13 +528,29 @@ def evaluate_economic_quality_gate(
     *,
     account_equity: float,
     evaluated_at: datetime | None = None,
+    advisory_policy: dict | None = None,
 ) -> GateResult:
-    """Independently recompute the final economic quality gate."""
+    """Independently recompute the final economic quality gate.
+
+    The live advisory path qualifies a candidate with the owner's advisory
+    economic policy, whose optional fixed dollar/move/reward-risk floors are OFF
+    by default, and which is production's own admission rule. Reproducing that
+    rule here is what keeps the shadow engine a reproduction rather than a
+    second opinion, so the advisory policy is applied and labelled.
+
+    This adapter must stay free of filesystem access, so it cannot read the
+    active profile. When no explicit policy is supplied it therefore applies the
+    bounded default (all filters OFF) and records that owner overrides are not
+    visible to the shadow engine. It never silently substitutes the historical
+    execution bar.
+    """
+    policy = advisory_economic_policy(advisory_policy)
     if _direction(snapshot) == "SHORT":
         result = evaluate_economic_quality(
             plan,
             available_capital=account_equity,
             max_capital_fraction=PRODUCTION_MAX_CAPITAL_FRACTION,
+            **policy,
             direction="SHORT",
             leverage=SHORT_VALIDATION_LEVERAGE,
             estimated_margin_cost_pct=SHORT_MARGIN_COST_RESERVE_PCT,
@@ -528,5 +561,14 @@ def evaluate_economic_quality_gate(
             plan,
             available_capital=account_equity,
             max_capital_fraction=PRODUCTION_MAX_CAPITAL_FRACTION,
+            **policy,
         )
-    return economic_quality_gate_from_result(result, evaluated_at=evaluated_at)
+    gate = economic_quality_gate_from_result(result, evaluated_at=evaluated_at)
+    return replace(
+        gate,
+        metadata={
+            **dict(gate.metadata),
+            "policy_regime": "ADVISORY",
+            "advisory_overrides_visible": advisory_policy is not None,
+        },
+    )

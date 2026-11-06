@@ -75,6 +75,22 @@ from app.services.canonical_episode_capture import (
 logger = logging.getLogger(__name__)
 
 
+def _action_gate_reason_code(reason_code: str | None) -> ReasonCode:
+    """Map the action gate's own classification onto the reason vocabulary.
+
+    Legacy callers that supply no classification keep ``NO_CAPITAL`` so existing
+    evidence streams stay interpretable. An unrecognised classification is
+    recorded as an operational error rather than being dressed up as a policy
+    stop the system can claim it made.
+    """
+    if reason_code is None:
+        return ReasonCode.NO_CAPITAL
+    try:
+        return ReasonCode(str(reason_code))
+    except ValueError:
+        return ReasonCode.GATE_EVALUATION_ERROR
+
+
 _AI_STATUS_MAP = {
     "SKIPPED_NO_ELIGIBLE_CANDIDATES": AI_SKIPPED_NO_ELIGIBLE,
     "BUDGET_BLOCKED": AI_BUDGET_BLOCKED,
@@ -94,9 +110,15 @@ class OPipScanObserver:
         decision_at: datetime,
         account_equity: float | None,
         telemetry_enabled: bool | None = None,
+        advisory_policy: Mapping[str, Any] | None = None,
     ) -> None:
         self.decision_at = decision_at
         self.account_equity = account_equity
+        #: The effective advisory economic policy resolved by the scan's
+        #: orchestration layer. The observer only carries it; it never reads a
+        #: profile itself, and the shadow engine applies exactly these values so
+        #: an owner-enabled threshold is reproduced rather than approximated.
+        self.advisory_policy = advisory_policy
         self.telemetry_enabled = (
             opip_funnel_telemetry_enabled()
             if telemetry_enabled is None
@@ -664,12 +686,19 @@ class OPipScanObserver:
         *,
         allowed: bool | None,
         reason: str,
+        reason_code: str | None = None,
     ) -> None:
         """Capture the production capital/portfolio authority verbatim.
 
         ``None`` means the authority could not be evaluated and is operational,
         never a policy rejection.  This hook remains fail-soft like every other
         observer method and cannot change the gate's production verdict.
+
+        ``reason_code`` is the classification the gate actually applied. Every
+        stop used to be recorded as ``NO_CAPITAL``, so an economic-policy stop
+        was indistinguishable from a missing-capital stop. A caller that does
+        not supply a classification keeps the historical default; a supplied one
+        is used as-is.
         """
         try:
             snapshot = ranked.opportunity.snapshot
@@ -681,14 +710,17 @@ class OPipScanObserver:
                 code = ReasonCode.GATE_PASSED
             else:
                 status = GateStatus.FAIL
-                code = ReasonCode.NO_CAPITAL
+                code = _action_gate_reason_code(reason_code)
             result = GateResult.build(
                 GateName.CAPITAL_PORTFOLIO_GATE,
                 status,
                 code,
                 reason=reason,
                 evaluated_at=self._evaluated_at(),
-                metadata={"profit_rank": getattr(ranked, "rank", None)},
+                metadata={
+                    "profit_rank": getattr(ranked, "rank", None),
+                    "action_gate_reason_code": code.value,
+                },
             )
             self._record(snapshot, result)
             if result.is_terminal:
@@ -820,6 +852,7 @@ class OPipScanObserver:
             account_equity=self.account_equity,
             decision_at=self.decision_at,
             ai_stage=self.funnel.ai_stage,
+            advisory_policy=self.advisory_policy,
         )
         legacy_decisions = {
             state.key: state.to_decision(decided_at=self.funnel.decision_at_iso)
@@ -977,6 +1010,7 @@ class NullScanObserver:
         *,
         allowed: bool | None,
         reason: str,
+        reason_code: str | None = None,
     ) -> None:
         return None
 
@@ -1010,13 +1044,21 @@ def build_scan_observer(
     snapshots: Sequence[Any],
     decision_at: datetime,
     account_equity: float | None,
+    advisory_policy: Mapping[str, Any] | None = None,
 ) -> "OPipScanObserver | NullScanObserver":
-    """Return a scan observer, degrading to a no-op rather than raising."""
+    """Return a scan observer, degrading to a no-op rather than raising.
+
+    ``advisory_policy`` is the effective advisory economic policy the scan's
+    orchestration layer resolved from the versioned profile. Passing it here is
+    what lets the shadow comparison reproduce an enabled owner threshold instead
+    of recomputing the default.
+    """
     try:
         return OPipScanObserver(
             snapshots=snapshots,
             decision_at=decision_at,
             account_equity=account_equity,
+            advisory_policy=advisory_policy,
         )
     except Exception as exc:
         logger.warning(

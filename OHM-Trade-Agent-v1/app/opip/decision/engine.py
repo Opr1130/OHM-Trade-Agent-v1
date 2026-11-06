@@ -101,10 +101,16 @@ class OPipDecisionEngine:
         account_equity: float | None,
         decision_at: datetime,
         ai_stage: AIStageEvidence | None = None,
+        advisory_policy: Mapping[str, Any] | None = None,
     ) -> None:
         self.account_equity = account_equity
         self.decision_at = decision_at
         self.ai_stage = ai_stage or AIStageEvidence()
+        #: The effective advisory economic policy, supplied by the orchestration
+        #: layer. ``None`` means "no profile selected", so the gate applies the
+        #: bounded default and records that owner overrides were not visible.
+        #: The engine performs no I/O of its own: it never reads a profile.
+        self.advisory_policy = advisory_policy
 
     # -- gate sequence --------------------------------------------------
 
@@ -385,6 +391,7 @@ class OPipDecisionEngine:
                     snapshot,
                     account_equity=float(self.account_equity or 0.0),
                     evaluated_at=self.decision_at,
+                    advisory_policy=self.advisory_policy,
                 )
             ):
                 return _finish()

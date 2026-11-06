@@ -43,6 +43,39 @@ def _active_trades():
     return list(trades) if isinstance(trades, (list, tuple, dict)) else None
 
 
+class AdvisoryPolicyUnavailable(RuntimeError):
+    """The effective advisory policy could not be resolved or validated.
+
+    Failing closed here means "produce no recommendation under a guessed
+    policy", never "fall back to permissive defaults": silently substituting the
+    all-OFF default for a malformed owner profile would disable a filter the
+    owner enabled.
+    """
+
+
+def _advisory_policy() -> dict | None:
+    """Resolve the effective advisory policy for this evaluation.
+
+    This is the composition root, so reading the versioned profile is its job:
+    ``tradevisor_evaluation`` stays a pure evaluator and receives the resolved
+    values as an argument. ``None`` means no profile is selected - the caller
+    keeps the bounded default (all optional filters OFF).
+
+    A malformed or unreadable active profile raises, so the caller leaves the
+    row retryable and nothing is delivered under a guessed policy.
+    """
+    try:
+        from app.core.strategy_policy import load_active_strategy_policy
+        from app.services.economic_quality_gate import advisory_policy_from_profile
+
+        profile = load_active_strategy_policy()
+        return advisory_policy_from_profile(profile.advisory_economics)
+    except Exception as exc:  # noqa: BLE001 - fail closed, never guess a policy
+        raise AdvisoryPolicyUnavailable(
+            f"advisory policy unavailable: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
 def evaluate_and_notify(
     signal: TradevisorSignal,
     *,
@@ -55,9 +88,15 @@ def evaluate_and_notify(
     active_trades=None,
     deliver: bool = True,
 ) -> dict:
-    """Evaluate one validated signal and (optionally) deliver its alert."""
+    """Evaluate one validated signal and (optionally) deliver its alert.
+
+    The effective advisory policy is resolved here, once, and handed to the
+    evaluator so a configured owner threshold is enforced consistently at every
+    economic decision inside this evaluation.
+    """
     evaluated_at = now or datetime.now(timezone.utc)
     trades = _active_trades() if active_trades is None else list(active_trades)
+    advisory_policy = _advisory_policy()
 
     decision = evaluate_signal(
         signal,
@@ -67,6 +106,7 @@ def evaluate_and_notify(
         execution_provider=execution_provider,
         account_equity=account_equity,
         active_trades=trades,
+        advisory_policy=advisory_policy,
     )
 
     notification = None
