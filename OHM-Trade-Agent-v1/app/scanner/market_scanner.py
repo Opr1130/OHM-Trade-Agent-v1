@@ -106,9 +106,14 @@ def configured_batch_assets() -> int:
 def configured_replacement_candidates() -> int:
     """Return the bounded number of replacement candidates this process may evaluate.
 
-    Resolved lazily for the same reasons as the worker/batch settings: this module
-    stays importable without settings, and a malformed or over-wide configured
-    value degrades to the previous behaviour instead of raising mid-scan.
+    Resolved lazily so this module stays importable and usable without a complete
+    settings environment. An *invalid* configured value is rejected earlier, by
+    ``app.core.config.Settings`` itself: the acquisition worker reads settings on
+    entry, so an out-of-range or unparseable ``OPIP_SCAN_REPLACEMENT_CANDIDATES``
+    fails the attempt closed before any candidate is evaluated and is never
+    silently replaced with the default here. This helper therefore only has to
+    handle "settings are unavailable" (import-only/test context), where the
+    documented default is the truthful answer.
     """
     try:
         from app.core.config import get_settings

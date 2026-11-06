@@ -137,6 +137,21 @@ every replacement candidate is ineligible
 THEN:
 no more candidates are attempted than the configured budget permits
 
+AC-013:
+GIVEN:
+an operator-configured replacement budget in the owner `.env`, and an isolated
+`opip-scan-worker` that declares its environment explicitly and inherits no
+environment file
+WHEN:
+the production Compose configuration is resolved and the worker starts
+THEN:
+the configured non-secret budget reaches the worker unchanged (an explicit `0`
+disables replacement and is never replaced by the default), the documented
+default of 25 applies only when the variable is unset or empty, an out-of-range
+or unparseable value is rejected by the existing settings validation rather than
+silently defaulted, and no exchange, AI or notification credential is introduced
+into the acquisition container
+
 EXPLICITLY OUT OF SCOPE:
 
 - Any change to V2 scoring, thresholds, risk sizing, minimum reward-to-risk,
@@ -183,6 +198,15 @@ AC-009 -> tests/test_opip_scan_coverage_recovery_v1.py::test_control_center_scan
 AC-010 -> tests/test_opip_scan_coverage_recovery_v1.py::test_missing_scanner_evidence_is_never_reported_as_healthy
 AC-011 -> tests/test_opip_scan_coverage_recovery_v1.py::test_scanner_acquisition_keeps_no_notification_ai_or_execution_authority
 AC-012 -> tests/test_opip_scan_coverage_recovery_v1.py::test_replacement_attempts_are_bounded
+AC-013 -> tests/test_opip_scan_replacement_budget_propagation_v1.py::test_worker_service_declares_the_bounded_replacement_budget
+AC-013 -> tests/test_opip_scan_replacement_budget_propagation_v1.py::test_resolved_worker_environment_carries_the_configured_value
+AC-013 -> tests/test_opip_scan_replacement_budget_propagation_v1.py::test_resolved_worker_environment_defaults_when_the_budget_is_unset
+AC-013 -> tests/test_opip_scan_replacement_budget_propagation_v1.py::test_scanner_enforces_the_configured_budget
+AC-013 -> tests/test_opip_scan_replacement_budget_propagation_v1.py::test_explicit_zero_disables_replacement
+AC-013 -> tests/test_opip_scan_replacement_budget_propagation_v1.py::test_invalid_budget_is_rejected_by_validation
+AC-013 -> tests/test_opip_scan_replacement_budget_propagation_v1.py::test_invalid_budget_prevents_settings_from_resolving
+AC-013 -> tests/test_opip_scan_replacement_budget_propagation_v1.py::test_worker_never_starts_acquisition_with_an_invalid_budget
+AC-013 -> tests/test_opip_scan_replacement_budget_propagation_v1.py::test_missing_setting_uses_the_documented_default
 
 IMPLEMENTATION MAP:
 
@@ -194,6 +218,10 @@ AC-004 -> OHM-Trade-Agent-v1/app/scanner/market_scanner.py
 AC-005 -> OHM-Trade-Agent-v1/app/scanner/market_scanner.py
 AC-012 -> OHM-Trade-Agent-v1/app/scanner/market_scanner.py
 AC-012 -> OHM-Trade-Agent-v1/app/core/config.py
+AC-013 -> OHM-Trade-Agent-v1/app/core/config.py
+AC-013 -> OHM-Trade-Agent-v1/app/scanner/market_scanner.py
+AC-013 -> OHM-Trade-Agent-v1/docker-compose.yml
+AC-013 -> OHM-Trade-Agent-v1/tests/test_opip_scan_replacement_budget_propagation_v1.py
 AC-006 -> OHM-Trade-Agent-v1/app/jobs/scan_worker.py
 AC-010 -> OHM-Trade-Agent-v1/app/jobs/scan_worker.py
 AC-007 -> OHM-Trade-Agent-v1/app/services/scan_manifest.py
@@ -236,6 +264,17 @@ DEFERRED DISCOVERIES:
   blockage would also self-clear; the structural defect (one ineligible candidate
   blocking every scan for up to ~8.3 days, and recurring on every new listing) is
   what this increment fixes.
+
+- Adjacent observation, deliberately NOT changed here: the same container also
+  declares no `OPIP_SCAN_MAX_WORKERS` or `OPIP_SCAN_BATCH_ASSETS`, so the isolated
+  worker runs those tightening-only ceilings at their application defaults (4 and
+  50). That predates this increment, cannot widen concurrency or memory above the
+  documented ceilings, and propagating them is a separate, separately approved
+  change.
+- The Compose-resolution assertions in
+  `tests/test_opip_scan_replacement_budget_propagation_v1.py` skip on a host with
+  no Compose CLI; the declaration assertion runs everywhere, and CI (Linux, with
+  Compose) executes the resolved-environment cases for 0, 1, 25, 100 and unset.
 
 UNAPPROVED SCOPE CHANGES:
 NONE
