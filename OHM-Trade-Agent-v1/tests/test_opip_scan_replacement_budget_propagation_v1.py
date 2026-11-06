@@ -236,25 +236,25 @@ def test_worker_service_declares_the_bounded_replacement_budget():
 
 
 @pytest.mark.acceptance(f"{INCREMENT}/AC-013")
-def test_resolved_worker_environment_carries_the_configured_value(tmp_path):
+@pytest.mark.parametrize("value", ["0", "1", "25", "100"])
+def test_resolved_worker_environment_carries_the_configured_value(tmp_path, value):
     """ATDD-OPIP-P1-SCANNER-COVERAGE-RECOVERY-v1/AC-013 Compose resolves the configured budget for the worker.
 
     One resolved invocation proves the mapping (using ``0``, the value most at
-    risk of being swallowed by a default). The remaining values are covered by
-    the declaration test and by the scanner-level budget test, so the suite never
-    pays for a Compose start-up per value.
+    risk of being swallowed by a default). Resolve each documented boundary in the production-equivalent Compose
+    service, not only in Python settings tests.
     """
     docker = _docker_compose()
     if docker is None:
         pytest.skip("no Compose CLI on this host; the declaration test still runs everywhere")
 
     resolved = _resolved_worker_env(
-        docker, _compose_project(tmp_path), _compose_env({KEY: "0"})
+        docker, _compose_project(tmp_path), _compose_env({KEY: value})
     )
     if resolved is None:
         pytest.skip("Compose did not resolve within the bounded timeout")
 
-    assert resolved[KEY] == "0"
+    assert resolved[KEY] == value
     assert not set(resolved) & FORBIDDEN_WORKER_ENV
 
 
