@@ -414,17 +414,13 @@ def test_invalid_budget_is_rejected_by_validation(invalid):
 @pytest.mark.acceptance(f"{INCREMENT}/AC-013")
 def test_invalid_budget_prevents_settings_from_resolving(monkeypatch):
     """ATDD-OPIP-P1-SCANNER-COVERAGE-RECOVERY-v1/AC-013 an invalid budget stops the process before acquisition."""
-    # The same resolution path the worker runs on entry, with a real (temporary)
-    # process environment and no mock: an invalid value makes settings unreadable
-    # instead of being silently coerced to the default.
-    monkeypatch.setenv("WEBHOOK_SECRET", "test-operator-credential")
+    # The same resolution the worker performs on entry (environment source ->
+    # Settings validation), asserted without touching the process-wide settings
+    # cache: an invalid value is rejected, never silently coerced to the default.
     monkeypatch.setenv(KEY, "101")
-    app_config.get_settings.cache_clear()
-    try:
-        with pytest.raises(ValidationError):
-            app_config.get_settings()
-    finally:
-        app_config.get_settings.cache_clear()
+
+    with pytest.raises(ValidationError):
+        _settings()
 
 
 @pytest.mark.acceptance(f"{INCREMENT}/AC-013")
