@@ -1,7 +1,7 @@
 import React,{useEffect,useRef,useState} from 'react';
 import{createRoot}from'react-dom/client';
 import{Activity,ArrowDownToLine,BarChart3,BrainCircuit,ChartNoAxesCombined,Check,ChevronRight,CircleAlert,ClipboardList,Database,GitCompareArrows,LockKeyhole,RefreshCw,RotateCcw,Search,Settings2,ShieldCheck,SlidersHorizontal}from'lucide-react';
-import{apiRequest,modelAuthority,evidenceStatus,objectSummary,exportCsv,sanitizeJsonExport,statusLevel,readState,utcWithLocal,qualificationFunnel,rejectionBreakdown,aiOperatingState,configAdminState,ENDPOINTS,headerFields,kpiCards,provenanceRows,stageOutcome,provenanceLabel,zeroBuySummary}from'./api.mjs';
+import{apiRequest,modelAuthority,evidenceStatus,objectSummary,exportCsv,sanitizeJsonExport,statusLevel,readState,utcWithLocal,qualificationFunnel,rejectionBreakdown,aiOperatingState,configAdminState,scannerCoverage,scannerExclusions,ENDPOINTS,headerFields,kpiCards,provenanceRows,stageOutcome,provenanceLabel,zeroBuySummary}from'./api.mjs';
 import{LOGO_ASSET,LOGO_FALLBACK_MARK,activeFilters,bytes,clampPresets,freshness,metric,payloadState,percent,removeFilter,configDiff,configFieldKind,divergenceLabel,divergenceLevel,precheckStagedValue,rubricTotal,signalQuery,sortRows,windowStartIso}from'./format.mjs';
 import './theme.css';
 import './style.css';
@@ -290,6 +290,26 @@ function StageRow({label,value,state,detail}){
   <Status value={state||'UNVERIFIED'}/>
  </div>;
 }
+// Acquisition coverage is its own dimension: what the attempt achieved against
+// its target, and which candidates it excluded and why. A recorded exclusion is
+// never hidden, and an attempt with no coverage document says so.
+function CoveragePanel({worker}){
+ const coverage=scannerCoverage(worker);
+ const exclusions=scannerExclusions(worker);
+ if(coverage.state==='UNAVAILABLE')
+  return <StageRow label="Acquisition coverage" value={null} state="UNAVAILABLE" detail={coverage.detail}/>;
+ // A flat fragment: these rows belong to the attempt card's own stage grid, so
+ // the panel must not nest a second grid inside it.
+ return <>
+  <StageRow label="Acquisition coverage" value={`${coverage.valid}/${coverage.target}`} state={coverage.state} detail={coverage.detail}/>
+  {coverage.fields.map(field=><StageRow key={field.key} label={field.key} value={field.value} state={coverage.state}/>)}
+  {exclusions.total>0&&<StageRow label="Recorded exclusions" value={exclusions.total}
+   state={exclusions.truncated?'DEGRADED':'RECORDED'}
+   detail={exclusions.truncated?`${exclusions.recorded} shown (bounded evidence)`:'each exclusion carries its reason'}/>}
+  {exclusions.rows.map(row=><StageRow key={`${row.pair}-${row.rank??'?'}`} label={`Excluded ${row.pair}`}
+   value={row.rank===null?row.status:`rank ${row.rank} · ${row.status}`} state="DEGRADED" detail={row.reason}/>)}
+ </>;
+}
 function ScannerFunnelWorkspace({scanner}){
  const attempts=Array.isArray(scanner?.attempts)?scanner.attempts:[];
  if(!attempts.length)return <Empty title="No scanner attempt evidence" detail={scanner?.reason_code||'No scan attempt has been projected yet. An empty funnel is not proof that discovery ran.'}/>;
@@ -300,6 +320,7 @@ function ScannerFunnelWorkspace({scanner}){
     detail={`last event ${attempt.last_event_at_utc?utcWithLocal(attempt.last_event_at_utc).utc:'unknown'}`}/>
    <StageRow label="Acquisition outcome" value={attempt.acquisition_outcome||'—'} state={attempt.acquisition_outcome||'UNVERIFIED'}
     detail={attempt.reason_code||''}/>
+   <CoveragePanel worker={attempt.worker_status}/>
    <StageRow label="Snapshots acquired" value={attempt.snapshots} state={attempt.snapshots>0?'RECORDED':'NO_EVIDENCE'}
     detail={attempt.snapshot_first_at_utc?`first ${utcWithLocal(attempt.snapshot_first_at_utc).utc}`:''}/>
    <StageRow label="Manifest / worker status" value={attempt.worker_status?'RECORDED':'NOT PROJECTED'}

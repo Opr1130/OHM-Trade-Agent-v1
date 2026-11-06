@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 
 from app.exchanges.kraken import KrakenClient
@@ -65,6 +65,12 @@ class UniverseBuildResult:
     usdt_usd_rate: float | None
     warnings: list[str]
     ticker_batch_requests: int
+    #: The complete liquidity-ranked candidate pool. ``assets`` is exactly its
+    #: first ``limit`` entries (the selected universe), so a caller that needs a
+    #: deterministic replacement after a legitimate exclusion can walk the rest
+    #: in rank order. The pool is already materialised before selection, so
+    #: exposing it costs no additional Kraken request.
+    ranked_assets: list[UniverseAsset] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -308,10 +314,14 @@ def build_kraken_asset_universe(
 
     assets.sort(key=lambda asset: (-asset.combined_24h_notional_usd, asset.base_asset))
     unique_count = len(assets)
-    selected = [
+    # One ranking, two views: the pool keeps every eligible candidate (in rank
+    # order) and the selection is its prefix. Assigning the rank once here means
+    # a replacement carries the same rank it would have had in an all-valid scan.
+    ranked = [
         replace(asset, liquidity_rank=rank)
-        for rank, asset in enumerate(assets[:limit], start=1)
+        for rank, asset in enumerate(assets, start=1)
     ]
+    selected = ranked[:limit]
     return UniverseBuildResult(
         assets=selected,
         eligible_usd_markets=sum(m.quote_currency == "USD" for m in markets),
@@ -321,6 +331,7 @@ def build_kraken_asset_universe(
         usdt_usd_rate=usdt_usd_rate,
         warnings=warnings,
         ticker_batch_requests=ticker_batch_requests,
+        ranked_assets=ranked,
     )
 
 

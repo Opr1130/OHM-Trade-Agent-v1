@@ -5,8 +5,8 @@ const REQUEST_LIMIT_MS=12000;
 // Substring matching would misclassify INACTIVE, UNHEALTHY and NOT_READY.
 export function statusLevel(value) {
   const status=String(value??'').trim().toUpperCase().replace(/[^A-Z0-9]+/g,'_');
-  if (new Set(['UNVERIFIED','UNAVAILABLE','ERROR','BLOCKED','STALE','NO_EVIDENCE','UNKNOWN','FAILED','FAILURE','UNHEALTHY','INACTIVE','NOT_READY','NOT_ACTIVE','NOT_ATTESTED','DEGRADED','DISABLED']).has(status)) return 'bad';
-  if (new Set(['PASS','HEALTHY','RECORDED','SUCCESS','READY','ACTIVE','ACTIVE_VERIFIED']).has(status)) return 'good';
+  if (new Set(['UNVERIFIED','UNAVAILABLE','ERROR','BLOCKED','STALE','NO_EVIDENCE','UNKNOWN','FAILED','FAILURE','UNHEALTHY','INACTIVE','NOT_READY','NOT_ACTIVE','NOT_ATTESTED','DEGRADED','DISABLED','PARTIAL']).has(status)) return 'bad';
+  if (new Set(['PASS','HEALTHY','RECORDED','SUCCESS','READY','ACTIVE','ACTIVE_VERIFIED','COMPLETE']).has(status)) return 'good';
   return 'neutral';
 }
 export function modelAuthority(row) {
@@ -223,6 +223,79 @@ export function scannerHealth(scanner) {
     detail: scanner.attempt_id
       ? `${scanner.attempt_id} · ${scanner.age_seconds ? Math.round(scanner.age_seconds) + 's ago' : 'age unknown'}`
       : null,
+  };
+}
+
+// --- Scanner acquisition coverage -------------------------------------------
+// Coverage version 2 counts every attempted candidate, including an exclusion a
+// deterministic replacement recovered. The operator therefore sees the achieved
+// target, the recorded exclusions and their reasons side by side: a scan that
+// replaced an ineligible candidate is COMPLETE, and one that could not reach the
+// target stays PARTIAL. Nothing here turns a recorded exclusion into a healthy
+// label, and a missing coverage document is UNAVAILABLE rather than complete.
+const _scannerCount = (value) => (typeof value === 'number' && Number.isFinite(value) ? value : null);
+const _scannerSum = (...values) => (values.every((value) => value === null) ? null : values.reduce((total, value) => total + (value || 0), 0));
+
+export function scannerCoverage(worker) {
+  const coverage = worker && typeof worker === 'object' ? worker.coverage : null;
+  if (!coverage || typeof coverage !== 'object') {
+    return {
+      state: 'UNAVAILABLE',
+      level: 'bad',
+      detail: 'worker_status carries no coverage document',
+      target: null,
+      valid: null,
+      fields: [],
+    };
+  }
+  const target = _scannerCount(coverage.requested);
+  const valid = _scannerCount(coverage.analyzed);
+  const excluded = _scannerSum(
+    _scannerCount(coverage.skipped),
+    _scannerCount(coverage.data_quality_rejected),
+    _scannerCount(coverage.failed),
+  );
+  // A target is only met when it is positive and fully achieved. The schema
+  // version is not accepted as a proxy for completeness.
+  const complete = target !== null && valid !== null && target > 0 && valid === target;
+  return {
+    state: complete ? 'COMPLETE' : 'PARTIAL',
+    level: complete ? 'good' : 'bad',
+    detail: complete
+      ? 'target met by distinct eligible assets'
+      : 'target not met; inspect the recorded exclusions',
+    target,
+    valid,
+    fields: [
+      {key: 'Target valid snapshots', value: target},
+      {key: 'Valid snapshots', value: valid},
+      {key: 'Candidates attempted', value: _scannerCount(coverage.attempted)},
+      {key: 'Excluded candidates', value: excluded},
+      {key: 'Replacement attempts', value: _scannerCount(coverage.replacement_attempts)},
+      {key: 'Distinct underlying assets', value: _scannerCount(coverage.unique_assets)},
+      {key: 'Unused replacement capacity', value: _scannerCount(coverage.remaining_candidate_capacity)},
+    ],
+  };
+}
+
+export function scannerExclusions(worker) {
+  const document = worker && typeof worker === 'object' ? worker.exclusions : null;
+  const raw = document && typeof document === 'object' && Array.isArray(document.records) ? document.records : [];
+  const rows = raw.slice(0, 25).map((record) => ({
+    pair: String(record?.pair || 'unidentified pair'),
+    rank: _scannerCount(record?.liquidity_rank),
+    status: String(record?.status || 'EXCLUDED').toUpperCase(),
+    stage: record?.stage ? String(record.stage) : null,
+    // The reason is the whole point of the evidence: never replaced by a label.
+    reason: String(record?.reason || 'no reason recorded'),
+    level: record?.status === 'ok' ? 'good' : 'bad',
+  }));
+  const total = _scannerCount(document?.total);
+  return {
+    total: total === null ? rows.length : total,
+    recorded: rows.length,
+    truncated: document?.truncated === true || (total !== null && total > rows.length),
+    rows,
   };
 }
 

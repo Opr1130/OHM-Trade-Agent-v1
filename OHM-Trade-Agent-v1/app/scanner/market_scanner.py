@@ -1,5 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from typing import Any
 
@@ -38,6 +38,15 @@ MIN_CANDLES_REQUIRED = 200
 #: Historical hard-coded concurrency. Retained as the absolute ceiling: the
 #: operator-facing setting may only tighten it, never widen it.
 MAX_WORKERS = 8
+
+#: Bounded deterministic replacement. A candidate can be legitimately ineligible
+#: (a newly listed pair cannot yet supply MIN_CANDLES_REQUIRED hourly candles), and
+#: one such candidate must not cap the whole scan below its target. The next
+#: liquidity-ranked candidates are evaluated instead, up to a bounded budget so
+#: provider load and runtime stay inside the existing attempt deadline. ``0``
+#: reproduces the previous behaviour exactly.
+DEFAULT_REPLACEMENT_CANDIDATES = 25
+MAX_REPLACEMENT_CANDIDATES = 100
 
 
 @lru_cache(maxsize=1)
@@ -93,6 +102,28 @@ def configured_batch_assets() -> int:
         return 50
     return max(1, min(DEFAULT_UNIQUE_ASSET_LIMIT, configured))
 
+
+def configured_replacement_candidates() -> int:
+    """Return the bounded number of replacement candidates this process may evaluate.
+
+    Resolved lazily for the same reasons as the worker/batch settings: this module
+    stays importable without settings, and a malformed or over-wide configured
+    value degrades to the previous behaviour instead of raising mid-scan.
+    """
+    try:
+        from app.core.config import get_settings
+
+        configured = int(
+            getattr(
+                get_settings(),
+                "opip_scan_replacement_candidates",
+                DEFAULT_REPLACEMENT_CANDIDATES,
+            )
+        )
+    except Exception:  # noqa: BLE001 - configuration must never break acquisition
+        return DEFAULT_REPLACEMENT_CANDIDATES
+    return max(0, min(MAX_REPLACEMENT_CANDIDATES, configured))
+
 EXECUTION_VALIDATION_MAX_POSITION_FRACTION = 0.20
 MOVEMENT_COMPRESSION_PREFILTER_PERCENTILE = 40.0
 MOVEMENT_MIN_CANDLES = 120
@@ -111,6 +142,65 @@ class ScanResult:
     data_quality_rejected: int = 0
     data_quality_warnings: int = 0
     data_quality_rejections: list[str] | None = None
+    #: Every attempt made during this scan, including replacements. ``requested``
+    #: stays the target and ``analyzed`` stays the count of valid snapshots, so a
+    #: complete scan has ``attempted == analyzed`` plus any recorded exclusions.
+    attempted: int = 0
+    #: Candidates evaluated beyond the initial selection because an earlier
+    #: candidate was legitimately excluded.
+    replacement_attempts: int = 0
+    #: Ranked candidates that were never evaluated (pool or budget exhaustion).
+    remaining_candidate_capacity: int = 0
+    #: Terminal classification of each excluded candidate, in attempt order.
+    #: Persisted (bounded) by the isolated worker so an exclusion is never silent.
+    exclusions: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class _AcquisitionTally:
+    """Classify every attempted candidate exactly once.
+
+    ``snapshots``/``skips``/``failures``/``data_quality_rejections`` keep the
+    established counter meanings (total observations in this scan), while
+    ``exclusions`` preserves identity and reason for each of them.
+    """
+
+    snapshots: list[MarketSnapshot] = field(default_factory=list)
+    skips: list[str] = field(default_factory=list)
+    failures: list[str] = field(default_factory=list)
+    data_rejections: list[str] = field(default_factory=list)
+    exclusions: list[dict[str, Any]] = field(default_factory=list)
+    attempted: int = 0
+
+    def record(
+        self,
+        asset: UniverseAsset,
+        status: str,
+        snapshot: MarketSnapshot | None,
+        message: str | None,
+        stage: str,
+    ) -> None:
+        self.attempted += 1
+        if status == "ok" and snapshot is not None:
+            self.snapshots.append(snapshot)
+            return
+        reason = str(message or "")
+        if status == "skip":
+            self.skips.append(reason)
+        elif status == "data_reject":
+            self.data_rejections.append(reason)
+        else:
+            self.failures.append(reason)
+        self.exclusions.append(
+            {
+                "pair": str(getattr(asset, "primary_pair", "") or ""),
+                "base_asset": str(getattr(asset, "base_asset", "") or ""),
+                "liquidity_rank": int(getattr(asset, "liquidity_rank", 0) or 0),
+                "status": status,
+                "reason": reason,
+                "stage": stage,
+            }
+        )
 
 
 @dataclass
@@ -412,50 +502,97 @@ def analyze_symbol(symbol: str, universe_asset: UniverseAsset | None = None) -> 
         return "fail", None, f"{symbol}: {exc}"
 
 
-def scan_market(limit: int = DEFAULT_UNIQUE_ASSET_LIMIT) -> ScanResult:
-    universe_client = KrakenClient()
-    universe = build_kraken_asset_universe(client=universe_client, limit=limit)
-    snapshots: list[MarketSnapshot] = []
-    skips: list[str] = []
-    failures: list[str] = []
-    data_rejections: list[str] = []
+def _evaluate_candidates(
+    candidates: list[UniverseAsset], tally: _AcquisitionTally, *, stage: str
+) -> None:
+    """Evaluate candidates with the existing validation, recording every outcome.
 
-    # Real batching: assets are submitted in bounded batches so the number of
-    # simultaneously-live per-symbol working sets is capped by the batch size as
-    # well as by worker count. Selection still runs later over the complete
-    # snapshot set, so batching cannot change coverage or ranking.
+    Batching is unchanged: assets are submitted in bounded batches so the number of
+    simultaneously-live per-symbol working sets is capped by the batch size as well
+    as by worker count. A candidate that raises unexpectedly is classified rather
+    than allowed to void the whole attempt.
+    """
+    if not candidates:
+        return
     batch_size = configured_batch_assets()
-    for start in range(0, len(universe.assets), batch_size):
-        batch = universe.assets[start : start + batch_size]
+    for start in range(0, len(candidates), batch_size):
+        batch = candidates[start : start + batch_size]
         with ThreadPoolExecutor(max_workers=configured_max_workers()) as executor:
             futures = {
-                executor.submit(analyze_symbol, asset.primary_pair, asset): asset.primary_pair
+                executor.submit(analyze_symbol, asset.primary_pair, asset): asset
                 for asset in batch
             }
             for future in as_completed(futures):
-                status, snapshot, message = future.result()
-                if status == "ok" and snapshot is not None:
-                    snapshots.append(snapshot)
-                elif status == "skip" and message:
-                    skips.append(message)
-                elif status == "data_reject" and message:
-                    data_rejections.append(message)
-                elif status == "fail" and message:
-                    failures.append(message)
+                asset = futures[future]
+                try:
+                    status, snapshot, message = future.result()
+                except Exception as exc:  # noqa: BLE001 - classified, never hidden
+                    status, snapshot, message = (
+                        "fail",
+                        None,
+                        f"{asset.primary_pair}: {exc}",
+                    )
+                tally.record(asset, status, snapshot, message, stage)
 
-    snapshots.sort(key=lambda item: item.technical_score, reverse=True)
+
+def scan_market(limit: int = DEFAULT_UNIQUE_ASSET_LIMIT) -> ScanResult:
+    universe_client = KrakenClient()
+    universe = build_kraken_asset_universe(client=universe_client, limit=limit)
+    target = max(0, int(limit))
+    tally = _AcquisitionTally()
+
+    selected = list(getattr(universe, "assets", []) or [])
+    _evaluate_candidates(selected, tally, stage="initial")
+
+    # Deterministic replacement. The universe builder already ranked every eligible
+    # candidate, so the replacement pool is its suffix after the selection: no extra
+    # AssetPairs or Ticker request is issued, only the OHLC read that an evaluation
+    # always costs. Candidates are taken strictly in rank order and each underlying
+    # asset is attempted at most once, so a replacement can never duplicate an
+    # already-counted asset. Nothing is fabricated: a replacement must pass exactly
+    # the same validation as an original candidate.
+    attempted_bases = {asset.base_asset for asset in selected}
+    ranked = list(getattr(universe, "ranked_assets", []) or [])
+    pool = [
+        asset
+        for asset in ranked[len(selected):]
+        if asset.base_asset not in attempted_bases
+    ]
+    budget = configured_replacement_candidates()
+    replacements = 0
+    for candidate in pool:
+        if target <= 0 or len(tally.snapshots) >= target:
+            break
+        if replacements >= budget:
+            break
+        replacements += 1
+        attempted_bases.add(candidate.base_asset)
+        _evaluate_candidates([candidate], tally, stage="replacement")
+
+    snapshots = sorted(
+        tally.snapshots, key=lambda item: item.technical_score, reverse=True
+    )
+    coverage_exclusions = list(tally.exclusions)
     return ScanResult(
         snapshots=snapshots,
-        requested=len(universe.assets),
+        requested=len(selected),
         analyzed=len(snapshots),
-        skipped=len(skips),
-        failed=len(failures),
-        skips=sorted(skips),
-        failures=sorted(failures),
+        skipped=len(tally.skips),
+        failed=len(tally.failures),
+        skips=sorted(tally.skips),
+        failures=sorted(tally.failures),
         universe=universe,
-        data_quality_rejected=len(data_rejections),
-        data_quality_warnings=sum(snapshot.market_data_validation.status == "WARN" for snapshot in snapshots if snapshot.market_data_validation is not None),
-        data_quality_rejections=sorted(data_rejections),
+        data_quality_rejected=len(tally.data_rejections),
+        data_quality_warnings=sum(
+            snapshot.market_data_validation.status == "WARN"
+            for snapshot in snapshots
+            if snapshot.market_data_validation is not None
+        ),
+        data_quality_rejections=sorted(tally.data_rejections),
+        attempted=tally.attempted,
+        replacement_attempts=replacements,
+        remaining_candidate_capacity=max(0, len(pool) - replacements),
+        exclusions=coverage_exclusions,
     )
 
 
