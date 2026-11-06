@@ -50,7 +50,8 @@ TARGET = 200
 #: unavailable or unresponsive Docker client may cost seconds, never minutes.
 DOCKER_PROBE_TIMEOUT_SECONDS = 20
 COMPOSE_CONFIG_TIMEOUT_SECONDS = 45
-_DOCKER_CLI: str | None | bool = None
+_DOCKER_CLI: str | None = None
+_DOCKER_PROBED = False
 
 #: Credentials and provider secrets the acquisition container must never receive.
 FORBIDDEN_WORKER_ENV = {
@@ -84,27 +85,25 @@ def _docker_compose() -> str | None:
     test suite: an unavailable or unresponsive Docker client must cost seconds,
     not minutes.
     """
-    global _DOCKER_CLI
-    if _DOCKER_CLI is not False:
-        return _DOCKER_CLI or None
+    global _DOCKER_CLI, _DOCKER_PROBED
+    if _DOCKER_PROBED:
+        return _DOCKER_CLI
+    _DOCKER_PROBED = True
     docker = shutil.which("docker")
-    _DOCKER_CLI = None
-    if docker is not None:
-        try:
-            probe = subprocess.run(
-                [docker, "compose", "version"],
-                capture_output=True,
-                text=True,
-                timeout=DOCKER_PROBE_TIMEOUT_SECONDS,
-                check=False,
-            )
-            if probe.returncode == 0:
-                _DOCKER_CLI = docker
-        except (OSError, subprocess.SubprocessError):
-            _DOCKER_CLI = None
-    if _DOCKER_CLI is None:
-        _DOCKER_CLI = False  # remembered as "unavailable"
+    if docker is None:
         return None
+    try:
+        probe = subprocess.run(
+            [docker, "compose", "version"],
+            capture_output=True,
+            text=True,
+            timeout=DOCKER_PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        _DOCKER_CLI = None
+        return None
+    _DOCKER_CLI = docker if probe.returncode == 0 else None
     return _DOCKER_CLI
 
 
