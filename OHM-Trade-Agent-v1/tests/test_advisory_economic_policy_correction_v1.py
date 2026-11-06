@@ -30,6 +30,7 @@ from app.scanner.execution_validation import ExecutionValidation
 from app.scanner.market_scanner import ScanResult
 from app.scanner.models import MarketSnapshot
 from app.scanner.reference_market_validation import ReferenceMarketValidation
+from app.services import active_trade_registry
 from app.services import trade_action_gate, tradevisor_evaluation
 from app.services.tradevisor_ingress import TradevisorSignal
 from app.services.capital_allocation import CapitalAllocation
@@ -700,8 +701,17 @@ def _install_scan(monkeypatch, tmp_path, snapshots, *, chief_top=None, extra_set
         scan_opportunities, "send_trade_plan",
         lambda **kwargs: sent.append(kwargs) or True,
     )
-    # I/O boundary 2: the live position registry.
+    # I/O boundary 2: the on-disk active-trade registry. The action gate reads it
+    # through ``paper_v2_portfolio_source.projected_positions``, which imports
+    # ``active_trade_registry.get_active_trades`` at call time, so that module
+    # attribute is the boundary that actually runs - not the scanner's local
+    # alias. Both bindings are stubbed so the portfolio input is deterministic on
+    # any platform (the real registry lives under an absolute /app path that a CI
+    # runner cannot create).
     monkeypatch.setattr(scan_opportunities, "get_active_trades", lambda: [])
+    monkeypatch.setattr(
+        active_trade_registry, "get_active_trades", lambda: []
+    )
     monkeypatch.setattr(
         scan_opportunities, "_prepare_qualified_lineage",
         lambda ranked, **kwargs: (len(list(ranked)), 0),
@@ -778,7 +788,11 @@ def test_ac_008_advisory_journey_admits_positive_opportunity(
     # The candidate survived selection, the pre-AI prefilter, the Chief review,
     # target quality, economics, ranking and the capital/portfolio gate.
     assert "ECONOMIC PASS LONG AKTUSD" in output
-    assert "ACTION GATE PASS rank=1 LONG AKTUSD" in output
+    if "ACTION GATE PASS rank=1 LONG AKTUSD" not in output:
+        pytest.fail(
+            "the capital/portfolio gate did not pass the qualified candidate: "
+            f"{[line for line in output.splitlines() if 'ACTION GATE' in line]}"
+        )
     assert "ACTION GATE REJECT" not in output
     assert summary["funnel"]["entered"] == 1
     assert summary["funnel"]["qualified"] == 1
@@ -794,6 +808,36 @@ def test_ac_008_advisory_journey_admits_positive_opportunity(
     comparison = summary.get("shadow_comparison") or {}
     if comparison:
         assert comparison.get("divergences", 0) == 0, comparison
+
+
+@pytest.mark.acceptance
+def test_ac_008_seeded_exposure_still_blocks_the_advisory(monkeypatch, tmp_path, capsys):
+    """ATDD-OPIP-ADVISORY-ECONOMIC-POLICY-CORRECTION-v1/AC-008: portfolio protection stays live."""
+    sent = _install_scan(
+        monkeypatch, tmp_path, [_journey_snapshot("AKTUSD")],
+        chief_top=_chief_alert("AKTUSD"),
+    )
+    # Seed a real open exposure through the same registry boundary the action
+    # gate reads. A duplicate symbol must still be refused: stubbing the I/O
+    # boundary must never stub out portfolio protection.
+    monkeypatch.setattr(
+        active_trade_registry,
+        "get_active_trades",
+        lambda: [
+            SimpleNamespace(
+                symbol="AKTUSD", status="active", direction="LONG",
+                capital=500.0, margin_leverage=1.0,
+            )
+        ],
+    )
+    scan_opportunities.main()
+
+    output = capsys.readouterr().out
+    assert "ECONOMIC PASS LONG AKTUSD" in output
+    assert "ACTION GATE PASS" not in output
+    assert "ACTION GATE REJECT rank=1 LONG AKTUSD" in output
+    # Nothing reached the notification boundary, and the stop is classified.
+    assert sent == []
 
 
 @pytest.mark.acceptance
@@ -1023,11 +1067,27 @@ def test_ac_011_configuration_lifecycle_is_versioned_and_not_activated(tmp_path)
     # Restart-safe persistence: the state is on disk, not in memory.
     assert read_active_policy_status(tmp_path)["digest"] == rolled_back["digest"]
 
-    # 5. Rollback with no previous version is refused rather than guessed.
+    # 5. The guard refuses a rollback that has no safe target instead of
+    #    guessing a version to restore. ``previous.json`` is deliberately not
+    #    consumed by a rollback, so the guard must be exercised where the
+    #    rollback state is genuinely absent (a fresh directory), not by
+    #    repeating a rollback that already succeeded.
+    empty = tmp_path / "fresh-admin-root"
     with pytest.raises(ValueError, match="NO_SAFE_ROLLBACK"):
         rollback_active_policy(
-            expected_digest=rolled_back["digest"], directory=tmp_path
+            expected_digest=rolled_back["digest"], directory=empty
         )
+    assert not (empty / "active.json").exists()
+
+    # 6. Repeating a rollback re-applies the same single previous version and is
+    #    idempotent: it cannot invent a different policy and still never grants
+    #    funded-trading authority.
+    repeated = rollback_active_policy(
+        expected_digest=rolled_back["digest"], directory=tmp_path
+    )
+    assert repeated["status"] == "ROLLED_BACK_ADVISORY_PROFILE"
+    assert repeated["funded_trading_activated"] is False
+    assert read_active_policy_status(tmp_path)["digest"] == rolled_back["digest"]
 
     # The bundled production reference policy was never modified by any of this.
     assert (
