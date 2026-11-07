@@ -280,6 +280,7 @@ def check_contracts(
             "ATDD-RUFF-IMPORT-CLEANUP-M01",
             "ATDD-BANDIT-CAPTURE-LOCK-M01",
             "ATDD-SQLITE-LINEAGE-IDENTIFIER-M01",
+            "ATDD-CI-OPTIMIZATION-M01",
         })
         # The entire change set must match ONE fully traced maintenance scope.
         # A mixed application/CI patch or path from different scopes fails closed.

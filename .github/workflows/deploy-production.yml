@@ -100,7 +100,7 @@ jobs:
             exit 65
           }
 
-      - name: Require successful pytest CI for exact SHA
+      - name: Require successful focused release CI and mandatory safety evidence for exact SHA
         id: exact_ci
         env:
           GH_TOKEN: ${{ github.token }}
@@ -108,6 +108,11 @@ jobs:
         run: |
           set -euo pipefail
           echo "status=UNPROVEN" >> "$GITHUB_OUTPUT"
+          # The exact-SHA gate is the focused release CI in pytest.yml: the
+          # changed-module selection plus the mandatory safety suite. The
+          # historical complete-suite run is manual-only evidence and never
+          # certifies a release. Absent, failed or skipped evidence is refused,
+          # never treated as success.
           RESULT="$(gh run list \
             --repo "$GITHUB_REPOSITORY" \
             --workflow pytest.yml \
@@ -116,14 +121,47 @@ jobs:
             --limit 1 \
             --json status,conclusion \
             --jq '.[0] | [.status,.conclusion] | @tsv')"
-          if [[ "$RESULT" == $'completed\tsuccess' ]]; then
-            echo "status=PASS" >> "$GITHUB_OUTPUT"
-          else
+          if [[ -z "$RESULT" || "$RESULT" != $'completed\tsuccess' ]]; then
             echo "status=FAIL" >> "$GITHUB_OUTPUT"
-            echo "Refusing production deploy: exact SHA does not have a successful completed pytest run." >&2
+            echo "Refusing production deploy: exact SHA has no completed focused release CI run." >&2
             echo "CI result: ${RESULT:-not found}" >&2
             exit 1
           fi
+          RUN_ID="$(gh run list \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow pytest.yml \
+            --branch main \
+            --commit "$TARGET_SHA" \
+            --limit 1 \
+            --json databaseId \
+            --jq '.[0].databaseId')"
+          if [[ -z "$RUN_ID" ]]; then
+            echo "status=FAIL" >> "$GITHUB_OUTPUT"
+            echo "Refusing production deploy: exact SHA has no focused release CI run id." >&2
+            exit 1
+          fi
+          gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs?per_page=100" \
+            --paginate \
+            --jq '.jobs[] | . as $job | ($job.name + "|" + ($job.conclusion // "unknown")), ($job.steps[]? | ($job.name + "|" + .name + "|" + (.conclusion // "unknown")))' \
+            > "$RUNNER_TEMP/exact-ci-evidence.txt"
+          test -s "$RUNNER_TEMP/exact-ci-evidence.txt"
+          require_evidence() {
+            grep -Fxq "$1" "$RUNNER_TEMP/exact-ci-evidence.txt" || {
+              echo "status=FAIL" >> "$GITHUB_OUTPUT"
+              echo "Refusing production deploy: missing exact-SHA CI evidence: $1" >&2
+              exit 1
+            }
+          }
+          require_evidence "test|success"
+          require_evidence "atdd scope|success"
+          require_evidence "release architecture gate|success"
+          require_evidence "release security gate (Bandit)|success"
+          require_evidence "test|Focused release selection (changed modules only)|success"
+          require_evidence "test|Run focused release selection|success"
+          require_evidence "test|Run mandatory safety suite|success"
+          require_evidence "test|Verify mandatory safety receipt (fail closed)|success"
+          echo "status=PASS" >> "$GITHUB_OUTPUT"
 
       - name: Checkout and validate the exact-SHA release profile
         uses: actions/checkout@v4
@@ -867,13 +905,17 @@ jobs:
             exit 65
           }
 
-      - name: Require successful pytest CI for the exact SHA
+      - name: Require successful focused release CI and mandatory safety evidence for exact SHA
         if: steps.target.outputs.action == 'deploy-ui'
         env:
           GH_TOKEN: ${{ github.token }}
           TARGET_SHA: ${{ steps.target.outputs.sha }}
         run: |
           set -euo pipefail
+          # Same exact-SHA evidence contract as the core /deploy gate: focused
+          # release CI plus the mandatory safety suite, and never the
+          # manual-only complete suite. Absent, failed or skipped evidence is
+          # refused.
           RESULT="$(gh run list \
             --repo "$GITHUB_REPOSITORY" \
             --workflow pytest.yml \
@@ -882,11 +924,43 @@ jobs:
             --limit 1 \
             --json status,conclusion \
             --jq '.[0] | [.status,.conclusion] | @tsv')"
-          if [[ "$RESULT" != $'completed\tsuccess' ]]; then
-            echo "Refusing UI release: exact SHA has no successful completed pytest run." >&2
+          if [[ -z "$RESULT" || "$RESULT" != $'completed\tsuccess' ]]; then
+            echo "Refusing UI release: exact SHA has no completed focused release CI run." >&2
             echo "CI result: ${RESULT:-not found}" >&2
             exit 1
           fi
+          RUN_ID="$(gh run list \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow pytest.yml \
+            --branch main \
+            --commit "$TARGET_SHA" \
+            --limit 1 \
+            --json databaseId \
+            --jq '.[0].databaseId')"
+          if [[ -z "$RUN_ID" ]]; then
+            echo "Refusing UI release: exact SHA has no focused release CI run id." >&2
+            exit 1
+          fi
+          gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs?per_page=100" \
+            --paginate \
+            --jq '.jobs[] | . as $job | ($job.name + "|" + ($job.conclusion // "unknown")), ($job.steps[]? | ($job.name + "|" + .name + "|" + (.conclusion // "unknown")))' \
+            > "$RUNNER_TEMP/exact-ci-evidence.txt"
+          test -s "$RUNNER_TEMP/exact-ci-evidence.txt"
+          require_evidence() {
+            grep -Fxq "$1" "$RUNNER_TEMP/exact-ci-evidence.txt" || {
+              echo "Refusing UI release: missing exact-SHA CI evidence: $1" >&2
+              exit 1
+            }
+          }
+          require_evidence "test|success"
+          require_evidence "atdd scope|success"
+          require_evidence "release architecture gate|success"
+          require_evidence "release security gate (Bandit)|success"
+          require_evidence "test|Focused release selection (changed modules only)|success"
+          require_evidence "test|Run focused release selection|success"
+          require_evidence "test|Run mandatory safety suite|success"
+          require_evidence "test|Verify mandatory safety receipt (fail closed)|success"
 
       - name: Validate deploy secrets
         env:
