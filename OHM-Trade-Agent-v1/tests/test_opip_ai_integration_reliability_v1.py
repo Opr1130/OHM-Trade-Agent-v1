@@ -793,13 +793,26 @@ def test_ac_012_scope_contract_declares_the_active_increment():
     pointer = (app_root / "docs" / "atdd" / "ACTIVE_INCREMENT").read_text(
         encoding="utf-8"
     ).strip()
-    assert pointer == "ATDD-OPIP-AI-INTEGRATION-RELIABILITY-v1"
+    # `docs/atdd/ACTIVE_INCREMENT` is deliberately movable orchestration state
+    # (ATDD-SCOPE-MOVABLE-ACTIVE-POINTER-v1): it must resolve to a declared
+    # scope contract. This increment proves its own identity from its own frozen
+    # contract instead of pinning the global pointer to itself, because only one
+    # increment can be active and such a pin would block every later approved
+    # increment.
     contract_path = (
         app_root / "docs" / "atdd" / "scope-contracts" / f"{pointer}.md"
     )
-    assert contract_path.is_file()
-    contract = contract_path.read_text(encoding="utf-8")
-    assert contract.startswith(f"INCREMENT:\n{pointer}")
+    assert contract_path.is_file(), pointer
+    contract = (
+        app_root
+        / "docs"
+        / "atdd"
+        / "scope-contracts"
+        / "ATDD-OPIP-AI-INTEGRATION-RELIABILITY-v1.md"
+    ).read_text(encoding="utf-8")
+    assert contract.startswith(
+        "INCREMENT:\nATDD-OPIP-AI-INTEGRATION-RELIABILITY-v1"
+    )
     for section in (
         "OWNER-APPROVED INTENT:",
         "ARCHITECTURE REFERENCES:",
