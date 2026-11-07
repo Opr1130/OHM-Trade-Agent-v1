@@ -22,3 +22,16 @@ test('legacy unavailable state describes separate registry staging without imply
   assert.match(failedLegacy, /staging is inert/);
   assert.match(failedLegacy, /no activation, rollback, funded order, F11 override or learning control/);
 });
+
+test('asynchronously loaded domains initialize a valid tab without discarding operator selection', () => {
+  assert.match(jsx, /setDomain\(current=>domains\.some\(item=>item\.domain===current\)\?current:/);
+  assert.match(jsx, /\},\[initialDomain,config\?\.domains\]\)/);
+  assert.match(jsx, /setDomain\(item\.domain\);setValues\(\{\}\);setErrors\(\{\}\);setPreview\(null\)/);
+});
+
+test('refused stage preserves unsaved operator changes and only successful stage clears them', () => {
+  const registry = jsx.split('function RegistryConsole(')[1]?.split('function ProvenanceNote(')[0];
+  assert.ok(registry);
+  assert.match(registry, /if\(outcome\.state==='STAGED'\)\{\s*setValues\(\{\}\)/);
+  assert.match(registry, /if\(typeof onReload==='function'\)onReload\(\)/);
+});
