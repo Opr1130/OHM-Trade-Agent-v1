@@ -531,7 +531,14 @@ function RegistryConsole({config,secret,adminSecret,initialDomain,onReload}){
  const[failed,setFailed]=useState(false);
  const[busy,setBusy]=useState(false);
  const[preview,setPreview]=useState(null);
- useEffect(()=>{if(initialDomain)setDomain(initialDomain)},[initialDomain]);
+ // The config arrives asynchronously. Select its first declared domain only
+ // after it exists, while preserving an operator-selected valid domain.
+ useEffect(()=>{
+  if(initialDomain&&domains.some(item=>item.domain===initialDomain)){
+   setDomain(initialDomain);return;
+  }
+  setDomain(current=>domains.some(item=>item.domain===current)?current:(domains[0]?.domain||''));
+ },[initialDomain,config?.domains]);
  const current=domains.find(item=>item.domain===domain);
  const definitions=Array.isArray(current?.definitions)?current.definitions:[];
  const effective=config?.effective?.values||{};
@@ -554,8 +561,10 @@ function RegistryConsole({config,secret,adminSecret,initialDomain,onReload}){
    const outcome=stageOutcome(payload);
    setFailed(outcome.state!=='STAGED');
    setMessage(outcome.message);
-   setValues({});setPreview(null);
-   if(typeof onReload==='function')onReload();
+   if(outcome.state==='STAGED'){
+    setValues({});setErrors({});setPreview(null);
+    if(typeof onReload==='function')onReload();
+   }
   }catch(err){setFailed(true);setMessage(String(err?.message||err))}
   finally{setBusy(false)}
  }
@@ -574,7 +583,7 @@ function RegistryConsole({config,secret,adminSecret,initialDomain,onReload}){
   <Card title="Schema-driven configuration registry" action={<Status value={config?.status||'UNREADY'}/>}>
    <div className="op-tabs" role="tablist">{domains.map(item=><button className="op-tab" key={item.domain}
     role="tab" aria-selected={item.domain===domain}
-    onClick={()=>{setDomain(item.domain);setValues({});setPreview(null)}}>
+    onClick={()=>{setDomain(item.domain);setValues({});setErrors({});setPreview(null)}}>
     {String(item.domain).replaceAll('_',' ')}</button>)}</div>
    <p className="muted">{config?.activation?.reason||''}</p>
    {domain==='V2_SCORING'&&<p className={weights.complete&&!weights.balanced?'error':'muted'}>
@@ -768,13 +777,23 @@ function ConfigAdmin({secret, config, configDomain, onReload}){
   }catch(e){if(generation===authGeneration.current)fail(e.message)}
   finally{if(generation===authGeneration.current)setBusy(false)}
  }
+ // Registry staging and the legacy advisory editor are separate server-side capabilities.
+ // A 404/401 on /strategy-admin must not hide the independent /control-center/config
+ // registry. Keep legacy activation/rollback unavailable and allow a credential retry.
  if(availability!=='READY')return <div className="stack">
- <Card title="Configuration administration unavailable">
- <Empty title="Strategy administration is not enabled on this deployment"
+ <WidgetBoundary>
+  <RegistryConsole config={config} secret={secret} adminSecret={adminSecret} initialDomain={configDomain} onReload={onReload}/>
+ </WidgetBoundary>
+ <Card title="Protected advisory configuration unavailable">
+ <Empty title="Legacy strategy administration is unavailable"
  detail={availability==='NOT_AVAILABLE'
- ?'The backend answered HTTP 404 for /api/opip/strategy-admin/*, so this release has no draft, activation or rollback capability to offer.'
- :'The backend refused the configuration read ('+availability+'): '+(message||'no detail')}/>
- <p className="muted">Nothing here is hidden by the console: the capability is absent server-side. No credential is requested, no write is attempted, and no protected functionality is activated.</p>
+ ?'The backend answered HTTP 404 for /api/opip/strategy-admin/*; draft, activation and rollback are not available through that legacy API.'
+ :'The legacy strategy-admin read failed ('+availability+'): '+(message||'no detail')}/>
+ <div className="input-row">
+  <label>Strategy Admin secret<input type="password" autoComplete="off" value={adminSecret} onChange={e=>setAdminSecret(e.target.value)} placeholder="Admin credential (memory only)"/></label>
+  <button className="secondary" onClick={load} disabled={busy||!secret||!adminSecret}>Retry legacy administration</button>
+ </div>
+ <p className="muted">The configuration registry above is independent. Its staging is inert; no activation, rollback, funded order, F11 override or learning control is granted by this screen.</p>
  </Card>
  {message&&<p className="error notice-error" role="alert">{message}</p>}
  </div>;
