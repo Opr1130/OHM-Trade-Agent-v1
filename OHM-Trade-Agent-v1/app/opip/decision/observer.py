@@ -327,6 +327,8 @@ class OPipScanObserver:
                 AI_NOT_REACHED,
             )
             stage.failure_type = evidence.get("failure_type")
+            stage.failure_code = evidence.get("failure_code")
+            stage.failure_message = evidence.get("failure_message")
             stage.invoked_at = evidence.get("invoked_at")
             stage.model = evidence.get("model")
             stage.prompt_version = evidence.get("prompt_version")
@@ -440,6 +442,7 @@ class OPipScanObserver:
         metadata = {
             "invocation_status": stage.invocation_status,
             "failure_type": stage.failure_type,
+            "failure_code": stage.failure_code,
             "model": stage.model,
             "prompt_version": stage.prompt_version,
             "eligible_candidates_before_ai": stage.eligible_candidates_before_ai,

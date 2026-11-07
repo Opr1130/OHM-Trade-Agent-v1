@@ -34,6 +34,10 @@ from app.services.economic_quality_gate import (
 from app.services.entry_exit_advisor import build_entry_exit_plan
 from app.services.openai_usage_telemetry import append_usage_record
 from app.services.opip_ai_router import (
+    AI_FAILURE_JSON_NOT_OBJECT,
+    AI_FAILURE_SCHEMA_INVALID,
+    classified_error,
+    failure_evidence,
     invoke_chief_review,
     plan_chief_route,
 )
@@ -246,6 +250,13 @@ def _new_stage_evidence() -> dict:
         "prompt_version": SYSTEM_PROMPT_VERSION,
         "eligible_candidate_count": 0,
         "returned_candidate_count": 0,
+        # Additive, privacy-safe failure attribution. ``failure_type`` keeps the
+        # historical exception-class vocabulary; ``failure_code`` is the
+        # classification that makes a ``CHIEF_UNAVAILABLE`` countable by cause.
+        "failure_code": None,
+        "failure_message": None,
+        "provider_status": None,
+        "incomplete_reason": None,
     }
 
 
@@ -486,6 +497,47 @@ def _trace_chief_failure(candidates: list[MarketSnapshot], *, reason_code: str, 
             )
         except Exception:
             pass
+
+
+#: The only actions the Chief prompt contract permits. Anything else means the
+#: provider answered in a shape this system does not understand.
+ALLOWED_CHIEF_ACTIONS = frozenset({"alert", "watch", "no_trade"})
+
+
+def _validate_chief_review_contract(review: dict) -> None:
+    """Reject a JSON object that violates the advisory response contract.
+
+    The router proves only that the provider returned *a* JSON object. A
+    structurally wrong object used to be accepted and then read downstream as
+    "the model returned no candidates": a ``top_candidates: null`` body reached
+    ``for candidate in review.get("top_candidates", [])`` and raised
+    ``TypeError`` mid-scan, while a non-list body was silently iterated into
+    nothing. Both hid a provider/format defect behind an ordinary-looking
+    MODEL outcome.
+
+    Rejection is fail-closed and fabricates nothing: no candidate, score,
+    target, direction or recommendation is ever inferred from a malformed
+    body.
+    """
+    action = review.get("recommended_action")
+    if not isinstance(action, str) or action.strip().lower() not in ALLOWED_CHIEF_ACTIONS:
+        raise classified_error(
+            AI_FAILURE_SCHEMA_INVALID,
+            f"Chief response recommended_action is invalid: {action!r}",
+        )
+
+    entries = review.get("top_candidates")
+    if not isinstance(entries, list):
+        raise classified_error(
+            AI_FAILURE_SCHEMA_INVALID,
+            "Chief response top_candidates is not a list",
+        )
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise classified_error(
+                AI_FAILURE_SCHEMA_INVALID,
+                "Chief response top_candidates contains a non-object entry",
+            )
 
 
 def _request_payload(payload: list[dict], *, market_regime_context: object | None, coingecko_global_context: object | None) -> dict:
@@ -843,19 +895,31 @@ def review_candidates(
 
         usage = routed.usage
         if usage is not None and routed.provider == "openai":
-            record = append_usage_record(
-                model=routed.model,
-                reasoning_effort=routed.reasoning_effort or "none",
-                candidate_count=len(payload),
-                usage=usage,
-            )
-            print(
-                "OPENAI USAGE "
-                f"Model={record['model']} Candidates={record['candidate_count']} "
-                f"Input={record['input_tokens']} Cached={record['cached_input_tokens']} "
-                f"Output={record['output_tokens']} Reasoning={record['reasoning_tokens']} "
-                f"Total={record['total_tokens']}"
-            )
+            # The daily OpenAI ledger is telemetry, not adjudication. A lock
+            # timeout or a full volume there used to propagate and turn a
+            # completed, billable Chief review into CHIEF_UNAVAILABLE - a
+            # fabricated operational failure for a call that actually
+            # succeeded. Recording is therefore fail-open, exactly like the
+            # router's own usage log.
+            try:
+                record = append_usage_record(
+                    model=routed.model,
+                    reasoning_effort=routed.reasoning_effort or "none",
+                    candidate_count=len(payload),
+                    usage=usage,
+                )
+                print(
+                    "OPENAI USAGE "
+                    f"Model={record['model']} Candidates={record['candidate_count']} "
+                    f"Input={record['input_tokens']} Cached={record['cached_input_tokens']} "
+                    f"Output={record['output_tokens']} Reasoning={record['reasoning_tokens']} "
+                    f"Total={record['total_tokens']}"
+                )
+            except Exception as exc:
+                print(
+                    "OPENAI USAGE UNRECORDED "
+                    f"Model={routed.model} Error={type(exc).__name__}"
+                )
         elif usage is not None:
             print(
                 "OPIP AI USAGE "
@@ -865,7 +929,15 @@ def review_candidates(
 
         review = json.loads(routed.output_text)
         if not isinstance(review, dict):
-            raise ValueError("Chief response JSON was not an object")
+            raise classified_error(
+                AI_FAILURE_JSON_NOT_OBJECT,
+                "Chief response JSON was not an object",
+            )
+        # The router proves only that the body is a JSON object. Reject a body
+        # that violates the advisory response contract before anything reads
+        # ``top_candidates``, so a malformed shape is attributed instead of
+        # being read as "the model returned no candidates".
+        _validate_chief_review_contract(review)
         # AI upside is descriptive and must never alter deterministic gates.
         _normalize_chief_potential(review)
         review["opip_ai_route"] = routed.route_evidence()
@@ -878,15 +950,41 @@ def review_candidates(
             route_key=_actual_route_cache_key(routed),
         )
     except Exception as exc:
-        detail = f"{type(exc).__name__}: {exc}"
+        failure = failure_evidence(exc)
+        # The trace keeps the sanitized, bounded message: a provider error body
+        # must never become a credential or prompt leak in durable evidence.
+        detail = failure["error_message"]
         _trace_chief_failure(
             chief_eligible_candidates,
             reason_code="CHIEF_UNAVAILABLE",
             detail=detail,
         )
-        print(f"CHIEF SUPPRESSED Reason=CHIEF_UNAVAILABLE Error={type(exc).__name__}")
+        # The operator line keeps its stable prefix and now names the cause.
+        # Without the code, "Error=ValueError" is true for six unrelated
+        # conditions and the reason for a suppressed scan is unrecoverable
+        # from the logs.
+        cause = f"Code={failure['error_code']}"
+        if failure["provider_status"]:
+            cause += f" ProviderStatus={failure['provider_status']}"
+        if failure["incomplete_reason"]:
+            cause += f" Incomplete={failure['incomplete_reason']}"
+        print(
+            "CHIEF SUPPRESSED Reason=CHIEF_UNAVAILABLE "
+            f"Error={type(exc).__name__} {cause}"
+        )
         stage_evidence["invocation_status"] = CHIEF_FAILED
         stage_evidence["failure_type"] = type(exc).__name__
+        stage_evidence["failure_code"] = failure["error_code"]
+        stage_evidence["failure_message"] = failure["error_message"]
+        stage_evidence["provider_status"] = failure["provider_status"]
+        stage_evidence["incomplete_reason"] = failure["incomplete_reason"]
+        recorded_attempts = getattr(exc, "opip_ai_attempts", None)
+        if recorded_attempts:
+            # A failed provider chain is still evidence: which provider was
+            # tried, in what order, and how each one failed.
+            stage_evidence["router_attempts"] = [
+                dict(item) for item in recorded_attempts
+            ]
         stage_evidence["completed_at"] = datetime.now(timezone.utc).isoformat()
         return _no_trade_review(
             f"Chief unavailable; fail-closed: {type(exc).__name__}.",

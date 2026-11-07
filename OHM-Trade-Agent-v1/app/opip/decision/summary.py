@@ -205,6 +205,8 @@ def render_scan_summary_text(summary: Mapping[str, Any]) -> str:
     lines.append(f"AI invocation status: {ai_stage.get('invocation_status', 'UNKNOWN')}")
     if ai_stage.get("failure_type"):
         lines.append(f"AI failure type: {ai_stage['failure_type']}")
+    if ai_stage.get("failure_code"):
+        lines.append(f"AI failure code: {ai_stage['failure_code']}")
     lines.append(
         "AI eligible candidates before review: "
         f"{ai_stage.get('eligible_candidates_before_ai', 0)}"

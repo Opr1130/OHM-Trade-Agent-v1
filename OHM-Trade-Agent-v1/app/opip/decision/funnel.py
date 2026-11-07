@@ -68,6 +68,12 @@ class AIStageEvidence:
 
     invocation_status: str = AI_NOT_REACHED
     failure_type: str | None = None
+    #: Machine-countable cause of the failure. ``failure_type`` names the
+    #: exception class; this names *what happened* (empty output, malformed
+    #: JSON, truncated output, provider rejection, ...). Without it every
+    #: suppression reads as the same ``ValueError``.
+    failure_code: str | None = None
+    failure_message: str | None = None
     invoked_at: str | None = None
     model: str | None = None
     prompt_version: str | None = None
@@ -124,6 +130,8 @@ class AIStageEvidence:
         return {
             "invocation_status": self.invocation_status,
             "failure_type": self.failure_type,
+            "failure_code": self.failure_code,
+            "failure_message": self.failure_message,
             "invoked_at": self.invoked_at,
             "model": self.model,
             "prompt_version": self.prompt_version,
