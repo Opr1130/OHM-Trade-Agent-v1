@@ -139,6 +139,42 @@ Fields include:
 - success/failure
 - token usage when returned by the provider
 
+### Provider outcome classification
+
+`error_type` keeps the historical exception-class vocabulary. Beside it, every
+attempt now records a privacy-safe `error_code`, a bounded and redacted
+`error_message`, the provider `provider_status` where one exists, the
+`incomplete_reason` when the provider declared the response incomplete, and
+`reasoning_tokens`.
+
+The codes exist because a bare `ValueError` was true for every one of the
+following conditions at once, so `CHIEF_UNAVAILABLE` could not be counted by
+cause. They are diagnostic only: none of them changes a verdict, and no
+candidate, score, target or recommendation is ever inferred from a failed
+response.
+
+| `error_code` | Meaning | Operator action |
+| --- | --- | --- |
+| `EMPTY_RESPONSE` | Provider returned a completed response with no text. | Inspect route/model compatibility. |
+| `TRUNCATED_OUTPUT` | Provider declared `incomplete` / `max_output_tokens`; reasoning tokens are billed inside the same output budget. | Compare `reasoning_tokens` with the configured `OPENAI_MAX_OUTPUT_TOKENS`. |
+| `MALFORMED_JSON` | Body is not valid JSON. | Inspect the model; consider prompt/output-cap review. |
+| `JSON_NOT_OBJECT` | Valid JSON that is not an object. | Same as above. |
+| `SCHEMA_INVALID` | Object violates the Chief response contract (`recommended_action`, `top_candidates`). | Same as above; the review is rejected fail-closed. |
+| `PROVIDER_AUTH` | 401/403. | Rotate/inspect the provider credential. |
+| `PROVIDER_RATE_LIMIT` | 429. | Inspect call volume and `OPENAI_DAILY_CALL_BUDGET`. |
+| `PROVIDER_REJECTED` | 4xx other than 401/403/429, or a `failed`/`cancelled` response. | Inspect model and request parameters. |
+| `PROVIDER_TIMEOUT` | Timeout / 408. | Inspect provider health and latency. |
+| `PROVIDER_TRANSPORT` | Connection-level failure. | Inspect network/DNS. |
+| `PROVIDER_UNAVAILABLE` | 5xx. | Provider-side outage. |
+| `UNKNOWN` | No classification was derivable. | Report as an unclassified defect. |
+
+No retry is performed. Retries are added only once the distribution of these
+codes in a released build justifies the extra paid calls; `retryable` is
+recorded per failed attempt so that decision can be made from evidence rather
+than assumption. The same classification is carried into the qualification
+funnel (`AI failure code`), the decision-engine `AI_INVOCATION` gate metadata
+and the `zero-trade` explanation path.
+
 Chief learning evidence also records the successful provider/model route.
 That allows later outcome analysis to compare signal quality and realized
 paper-trade performance by provider/model without letting historical learning

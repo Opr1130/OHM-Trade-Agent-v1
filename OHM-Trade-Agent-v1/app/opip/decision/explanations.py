@@ -194,6 +194,9 @@ def build_zero_trade_explanation(
         "ai_budget_exhausted": bool(ai_stage.get("budget_exhausted")),
         "ai_invocation_status": ai_stage.get("invocation_status"),
         "ai_failure_type": ai_stage.get("failure_type"),
+        # Machine-countable cause of an unavailable Chief review. Additive: the
+        # exception-class field above is unchanged.
+        "ai_failure_code": ai_stage.get("failure_code"),
         "ai_eligible_candidates_before_ai": ai_stage.get(
             "eligible_candidates_before_ai", 0
         ),

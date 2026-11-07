@@ -126,6 +126,7 @@ class OPipDecisionEngine:
         metadata = {
             "invocation_status": status,
             "failure_type": self.ai_stage.failure_type,
+            "failure_code": self.ai_stage.failure_code,
             "eligible_candidates_before_ai": self.ai_stage.eligible_candidates_before_ai,
             "candidates_returned_by_ai": self.ai_stage.candidates_returned_by_ai,
             "model": self.ai_stage.model,
