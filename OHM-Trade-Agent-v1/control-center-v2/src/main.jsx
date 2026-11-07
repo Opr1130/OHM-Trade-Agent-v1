@@ -531,7 +531,14 @@ function RegistryConsole({config,secret,adminSecret,initialDomain,onReload}){
  const[failed,setFailed]=useState(false);
  const[busy,setBusy]=useState(false);
  const[preview,setPreview]=useState(null);
- useEffect(()=>{if(initialDomain)setDomain(initialDomain)},[initialDomain]);
+ // The config arrives asynchronously. Select its first declared domain only
+ // after it exists, while preserving an operator-selected valid domain.
+ useEffect(()=>{
+  if(initialDomain&&domains.some(item=>item.domain===initialDomain)){
+   setDomain(initialDomain);return;
+  }
+  setDomain(current=>domains.some(item=>item.domain===current)?current:(domains[0]?.domain||''));
+ },[initialDomain,config?.domains]);
  const current=domains.find(item=>item.domain===domain);
  const definitions=Array.isArray(current?.definitions)?current.definitions:[];
  const effective=config?.effective?.values||{};
@@ -554,8 +561,10 @@ function RegistryConsole({config,secret,adminSecret,initialDomain,onReload}){
    const outcome=stageOutcome(payload);
    setFailed(outcome.state!=='STAGED');
    setMessage(outcome.message);
-   setValues({});setPreview(null);
-   if(typeof onReload==='function')onReload();
+   if(outcome.state==='STAGED'){
+    setValues({});setErrors({});setPreview(null);
+    if(typeof onReload==='function')onReload();
+   }
   }catch(err){setFailed(true);setMessage(String(err?.message||err))}
   finally{setBusy(false)}
  }
@@ -574,7 +583,7 @@ function RegistryConsole({config,secret,adminSecret,initialDomain,onReload}){
   <Card title="Schema-driven configuration registry" action={<Status value={config?.status||'UNREADY'}/>}>
    <div className="op-tabs" role="tablist">{domains.map(item=><button className="op-tab" key={item.domain}
     role="tab" aria-selected={item.domain===domain}
-    onClick={()=>{setDomain(item.domain);setValues({});setPreview(null)}}>
+    onClick={()=>{setDomain(item.domain);setValues({});setErrors({});setPreview(null)}}>
     {String(item.domain).replaceAll('_',' ')}</button>)}</div>
    <p className="muted">{config?.activation?.reason||''}</p>
    {domain==='V2_SCORING'&&<p className={weights.complete&&!weights.balanced?'error':'muted'}>
