@@ -418,3 +418,88 @@ def test_rollback_still_tolerates_a_release_without_the_scanner_service():
     # The tolerated branch performs no refusal.
     assert "UNDECLARED_FOR_V2_RELEASE" not in body
     assert "false" not in body
+
+
+# --- Round 4: the declaration probe publishes the evidence for its verdict ---
+#
+# ATDD-SCANNER-DECLARATION-PROBE-M01. The approved release f4378e49 declares
+# `opip-scan-worker` in its Compose file and was still refused with
+# OPIP_SCANNER_IMAGE=UNDECLARED_FOR_V2_RELEASE, because the probe discarded its
+# exit status and stderr: "the render did not complete" and "this release
+# declares no scanner" reached the receipt as the same single line, and the
+# refusal then asserted something the release did not say.
+
+PROBE_INCREMENT = "ATDD-SCANNER-DECLARATION-PROBE-M01"
+
+
+def _declaration_probe_source() -> str:
+    controller = (APP_ROOT / "deploy/remote/ohm-deploy").read_text(encoding="utf-8")
+    return controller.split("scanner_declared() {", 1)[1].split("\n}", 1)[0]
+
+
+@pytest.mark.acceptance(f"{PROBE_INCREMENT}/AC-001")
+def test_declaration_probe_never_presents_a_failed_render_as_an_absent_service():
+    """ATDD-SCANNER-DECLARATION-PROBE-M01/AC-001: a failed probe is its own fact."""
+    controller = (APP_ROOT / "deploy/remote/ohm-deploy").read_text(encoding="utf-8")
+    probe = _declaration_probe_source()
+
+    # The diagnostic is no longer discarded ...
+    assert "2>/dev/null" not in probe, "the probe must not discard its own diagnostic"
+    # ... the outcome is classified, not collapsed into one boolean ...
+    assert 'SCANNER_DECLARATION="PROBE_FAILED"' in probe
+    assert 'SCANNER_DECLARATION="SERVICE_NOT_IN_RESOLVED_MODEL"' in probe
+    assert 'SCANNER_DECLARATION="DECLARED"' in probe
+    assert "SCANNER_DECLARATION_EXIT=" in controller
+    # ... and the refusal publishes that evidence before it refuses, so a release
+    # that does declare the service can never again be refused with only a verdict.
+    refusal = controller.split("elif release_requires_scanner; then", 1)[1]
+    refusal = refusal.split("  false\n", 1)[0]
+    for marker in (
+        "OPIP_SCANNER_DECLARATION=$SCANNER_DECLARATION",
+        "OPIP_SCANNER_DECLARATION_EXIT=$SCANNER_DECLARATION_EXIT",
+        "OPIP_SCANNER_DECLARATION_SERVICES=$SCANNER_DECLARATION_SERVICES",
+        "OPIP_SCANNER_DECLARATION_DIAGNOSTIC=$SCANNER_DECLARATION_DIAGNOSTIC",
+    ):
+        assert marker in refusal, marker
+    assert "OPIP_SCANNER_IMAGE=UNDECLARED_FOR_V2_RELEASE" in refusal
+
+
+@pytest.mark.acceptance(f"{PROBE_INCREMENT}/AC-002")
+def test_declaration_probe_activation_is_hermetic_and_its_evidence_secret_free():
+    """ATDD-SCANNER-DECLARATION-PROBE-M01/AC-002: activation and evidence are controlled."""
+    controller = (APP_ROOT / "deploy/remote/ohm-deploy").read_text(encoding="utf-8")
+    probe = _declaration_probe_source()
+
+    # The profile is stated in the command's own environment as well as by the
+    # flag, so a host environment document cannot decide the model on its own.
+    assert 'COMPOSE_PROFILES="scanner${COMPOSE_PROFILES:+,$COMPOSE_PROFILES}"' in probe
+    assert "COMPOSE_DISABLE_ENV_FILE=1" in probe
+    # Compose's own diagnostic is redacted before it is bounded and published.
+    assert "opip_scanner_diagnostic_text" in probe
+    helper = controller.split("opip_scanner_diagnostic_text() {", 1)[1].split("\n}", 1)[0]
+    assert "<redacted-assignment>" in helper
+    assert 'cut -c "1-$SCANNER_DIAGNOSTIC_BYTES"' in helper
+    # Only a bounded rendering is ever emitted, and it defaults to "no diagnostic".
+    assert "SCANNER_DIAGNOSTIC_BYTES=240" in controller
+    assert 'SCANNER_DECLARATION_DIAGNOSTIC="NONE"' in controller
+
+
+@pytest.mark.acceptance(f"{PROBE_INCREMENT}/AC-003")
+def test_declaration_probe_changes_no_gate_provenance_or_rollback():
+    """ATDD-SCANNER-DECLARATION-PROBE-M01/AC-003: only the evidence is new."""
+    controller = (APP_ROOT / "deploy/remote/ohm-deploy").read_text(encoding="utf-8")
+    probe = _declaration_probe_source()
+
+    # The probe still answers with its exit status and never refuses by itself.
+    assert 'grep -qx "$SCANNER_SERVICE"' in probe
+    assert "return 1" in probe and "return 0" in probe
+    assert "exit " not in probe and "false" not in probe
+    # Provenance, acceptance, build targets and both rollback dispositions are
+    # exactly what they were.
+    assert "verify_scanner_image" in controller
+    assert 'opip-irr-shadow "${scanner_build_targets[@]}"' in controller
+    assert "OPIP_SCANNER_IMAGE_ACCEPTANCE=BLOCKED" in controller
+    assert 'scanner_build_targets=("$SCANNER_SERVICE")' in controller
+    assert "OPIP_ROLLBACK_SCANNER=DECLARED_BY_RESTORED_RELEASE" in controller
+    assert "OPIP_ROLLBACK_SCANNER=ABSENT_FROM_RESTORED_RELEASE" in controller
+

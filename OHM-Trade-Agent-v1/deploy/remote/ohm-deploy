@@ -449,9 +449,76 @@ cleanup_snapshot() {
 # implicitly when the service is named - would have built it. Detection
 # therefore answered NOT_DECLARED for every release, the build target list
 # stayed empty, and the scanner image was never rebuilt.
+#
+# Discovery is therefore PROVEN and RECORDED, because the two facts a single
+# discarded exit status conflated are not the same fact:
+#
+#   * Activation is stated redundantly - the explicit flag AND the command's own
+#     environment - because profile activation is the one input to this render
+#     that comes from the host's effective environment rather than from the
+#     candidate release. `COMPOSE_DISABLE_ENV_FILE` stops the owner's `.env`
+#     from seeding Compose's own `COMPOSE_*` controls into this one render, so a
+#     host environment document can never silently decide which services the
+#     candidate model contains.
+#   * The probe's outcome is published instead of discarded. An approved release
+#     that DECLARES `opip-scan-worker` was refused on the production host, and
+#     the receipt carried only the verdict: with `2>/dev/null` a render that
+#     failed and a release that declares no scanner are the same single line.
+#     They are distinct markers now, and the render's bounded, redacted
+#     diagnostic is published with them.
+SCANNER_DECLARATION="NOT_PROBED"
+SCANNER_DECLARATION_EXIT="NA"
+SCANNER_DECLARATION_SERVICES="NONE"
+SCANNER_DECLARATION_DIAGNOSTIC="NONE"
+SCANNER_DIAGNOSTIC_BYTES=240
+
+# Bounded, secret-free rendering of Compose's own diagnostic. Compose names
+# variables rather than values, but a parse error can echo a raw environment
+# line, so `KEY=value` fields are redacted FIRST; the text is then reduced to an
+# allowlist, flattened to one line and truncated. Only this form is ever
+# published, so no value can reach a receipt or a log through this path.
+opip_scanner_diagnostic_text() {
+  sed -E 's/[A-Za-z0-9_.-]+=[^[:space:]]+/<redacted-assignment>/g' 2>/dev/null \
+    | tr '\n' ' ' \
+    | tr -cd 'A-Za-z0-9 .,:;/()<>_|+-' \
+    | tr -s ' ' \
+    | cut -c "1-$SCANNER_DIAGNOSTIC_BYTES" \
+    | sed -e 's/^ *//' -e 's/ *$//' || true
+}
+
 scanner_declared() {
-  docker compose --profile scanner -f docker-compose.yml config --services 2>/dev/null \
-    | grep -qx "$SCANNER_SERVICE"
+  local rendered="" rc=0 services=""
+  rendered="$(
+    COMPOSE_PROFILES="scanner${COMPOSE_PROFILES:+,$COMPOSE_PROFILES}" \
+      COMPOSE_DISABLE_ENV_FILE=1 \
+      docker compose --profile scanner -f docker-compose.yml config --services 2>&1
+  )" || rc=$?
+  SCANNER_DECLARATION_EXIT="$rc"
+  # A service name is the only rendered line that is a bare name; Compose
+  # warnings and errors are `level=...` records or prose, so this list is the
+  # resolved model itself and never a diagnostic.
+  services="$(printf '%s\n' "$rendered" \
+    | grep -oE '^[A-Za-z0-9][A-Za-z0-9_.-]*$' \
+    | tr '\n' ',' \
+    | cut -c "1-$SCANNER_DIAGNOSTIC_BYTES")" || true
+  SCANNER_DECLARATION_SERVICES="${services:-NONE}"
+  if [[ "$rc" -ne 0 ]]; then
+    # Fail closed exactly as before; only the evidence is new.
+    SCANNER_DECLARATION="PROBE_FAILED"
+    SCANNER_DECLARATION_DIAGNOSTIC="$(printf '%s\n' "$rendered" \
+      | opip_scanner_diagnostic_text)" || true
+    SCANNER_DECLARATION_DIAGNOSTIC="${SCANNER_DECLARATION_DIAGNOSTIC:-NONE}"
+    return 1
+  fi
+  if printf '%s\n' "$rendered" | grep -qx "$SCANNER_SERVICE"; then
+    SCANNER_DECLARATION="DECLARED"
+    return 0
+  fi
+  SCANNER_DECLARATION="SERVICE_NOT_IN_RESOLVED_MODEL"
+  SCANNER_DECLARATION_DIAGNOSTIC="$(printf '%s\n' "$rendered" \
+    | opip_scanner_diagnostic_text)" || true
+  SCANNER_DECLARATION_DIAGNOSTIC="${SCANNER_DECLARATION_DIAGNOSTIC:-NONE}"
+  return 1
 }
 
 # A release whose core selects with V2 production authority cannot function
@@ -2307,17 +2374,36 @@ stop_paper_stack
 SCANNER_IMAGE_PREVIOUS="$(current_scanner_image)"
 scanner_build_targets=()
 if scanner_declared; then
+  echo "OPIP_SCANNER_DECLARATION=$SCANNER_DECLARATION"
+  echo "OPIP_SCANNER_DECLARATION_SERVICES=$SCANNER_DECLARATION_SERVICES"
   scanner_build_targets=("$SCANNER_SERVICE")
 elif release_requires_scanner; then
   # Fail closed: a V2 release that cannot prove its scanner was declared would
   # activate a core that selects from V2 evidence nothing can produce. Refuse
   # before any service is recreated; the rollback trap restores the previous
   # release.
+  #
+  # The refusal states the evidence it was derived from, so a release that DOES
+  # declare the service can never again be refused with only a verdict: the
+  # resolved model, the render's exit status and its bounded diagnostic are
+  # published BEFORE the refusal, and the reason on stderr distinguishes "the
+  # render did not complete" from "the model does not contain the service".
+  echo "OPIP_SCANNER_DECLARATION=$SCANNER_DECLARATION"
+  echo "OPIP_SCANNER_DECLARATION_EXIT=$SCANNER_DECLARATION_EXIT"
+  echo "OPIP_SCANNER_DECLARATION_SERVICES=$SCANNER_DECLARATION_SERVICES"
+  echo "OPIP_SCANNER_DECLARATION_DIAGNOSTIC=$SCANNER_DECLARATION_DIAGNOSTIC"
   echo "OPIP_SCANNER_IMAGE=UNDECLARED_FOR_V2_RELEASE"
   echo "OPIP_SCANNER_IMAGE_ACCEPTANCE=BLOCKED"
   echo "refusing release: the core selects with V2 production authority but this release declares no $SCANNER_SERVICE" >&2
+  if [[ "$SCANNER_DECLARATION" == "PROBE_FAILED" ]]; then
+    echo "the scanner declaration probe did not complete (exit $SCANNER_DECLARATION_EXIT): $SCANNER_DECLARATION_DIAGNOSTIC" >&2
+  else
+    echo "the scanner declaration probe resolved a model without $SCANNER_SERVICE (services=$SCANNER_DECLARATION_SERVICES): $SCANNER_DECLARATION_DIAGNOSTIC" >&2
+  fi
   false
 else
+  echo "OPIP_SCANNER_DECLARATION=$SCANNER_DECLARATION"
+  echo "OPIP_SCANNER_DECLARATION_SERVICES=$SCANNER_DECLARATION_SERVICES"
   echo "OPIP_SCANNER_IMAGE=NOT_DECLARED_BY_CANDIDATE_RELEASE"
 fi
 echo "OPIP_SCANNER_ATTEMPT_ACTIVE_AT_BUILD=$(scanner_attempt_active)"
