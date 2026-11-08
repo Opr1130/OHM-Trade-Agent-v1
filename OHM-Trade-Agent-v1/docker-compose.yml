@@ -302,8 +302,8 @@ services:
       OPIP_SCAN_EXECUTION_MODE: "isolated"
       # Must match core scoring authority: no .env.core or funded secrets here.
       OPIP_PRODUCTION_SCORING_VERSION: "v2"
-      # Resolve the same non-secret opt-in selector as the core. No env_file,
-      # exchange credentials, AI keys or administrator credential are inherited.
+      # Resolve the same non-secret opt-in selector as the core; never
+      # inherit exchange credentials, AI keys or administrator credentials.
       OPIP_ADVISORY_PROFILE_ENABLED: "${OPIP_ADVISORY_PROFILE_ENABLED:-false}"
       # Bounded deterministic replacement budget for this attempt. Non-secret
       # acquisition control only, interpolated from the owner `.env` (the single
