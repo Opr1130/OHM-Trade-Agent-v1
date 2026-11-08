@@ -53,7 +53,7 @@ def _write_jsonl(path: Path, rows: list[dict], *, trailing: bytes = b"") -> None
 
 @pytest.mark.acceptance(f"{INCREMENT}/AC-001")
 def test_chief_evidence_is_read_from_the_router_ledger(tmp_path):
-    """AC-001: recorded provider invocations are evidence, not a missing source."""
+    """ATDD-OPIP-CONTROL-CENTER-EVIDENCE-WIRING-v1/AC-001: recorded provider invocations are evidence, not a missing source."""
     path = tmp_path / "opip_ai_router_usage.jsonl"
     _write_jsonl(
         path,
@@ -86,7 +86,7 @@ def test_chief_evidence_is_read_from_the_router_ledger(tmp_path):
 
 @pytest.mark.acceptance(f"{INCREMENT}/AC-001")
 def test_ai_absence_states_are_distinguished_and_never_claim_success(tmp_path):
-    """AC-001: absent ledger, empty ledger and recorded invocations are three states."""
+    """ATDD-OPIP-CONTROL-CENTER-EVIDENCE-WIRING-v1/AC-001: absent ledger, empty ledger and recorded invocations are three states."""
     absent = direct.ai(_ledger_settings(tmp_path / "missing.jsonl"))
     assert absent["status"] == "NO_EVIDENCE"
     assert absent["reason_code"] == "NO_AI_USAGE_LEDGER"
@@ -112,7 +112,7 @@ def test_ai_absence_states_are_distinguished_and_never_claim_success(tmp_path):
 
 @pytest.mark.acceptance(f"{INCREMENT}/AC-001")
 def test_a_truncated_ledger_tail_does_not_hide_the_readable_rows(tmp_path):
-    """AC-001: a partially written row is dropped, not fatal, and not silent."""
+    """ATDD-OPIP-CONTROL-CENTER-EVIDENCE-WIRING-v1/AC-001: a partially written row is dropped, not fatal, and not silent."""
     path = tmp_path / "opip_ai_router_usage.jsonl"
     _write_jsonl(path, [_usage("OK")], trailing=b'{"timestamp_utc":"2026-11-08T09:01:00')
 
@@ -124,7 +124,7 @@ def test_a_truncated_ledger_tail_does_not_hide_the_readable_rows(tmp_path):
 
 @pytest.mark.acceptance(f"{INCREMENT}/AC-003")
 def test_data_coverage_does_not_assert_a_zero_quarantine(tmp_path):
-    """AC-003: projection-only facts are unknown without the projection, not zero."""
+    """ATDD-OPIP-CONTROL-CENTER-EVIDENCE-WIRING-v1/AC-003: projection-only facts are unknown without the projection, not zero."""
     settings = SimpleNamespace(
         opip_analytics_scan_state_dir=str(tmp_path / "scan"),
         opip_analytics_scoring_comparison_path=str(tmp_path / "cmp.jsonl"),
@@ -141,7 +141,7 @@ def test_data_coverage_does_not_assert_a_zero_quarantine(tmp_path):
 
 @pytest.mark.acceptance(f"{INCREMENT}/AC-004")
 def test_scan_summary_read_is_bounded_and_still_returns_the_newest_row(tmp_path, monkeypatch):
-    """AC-004: the zero-trade read model reads a bounded tail, not the whole stream."""
+    """ATDD-OPIP-CONTROL-CENTER-EVIDENCE-WIRING-v1/AC-004: the zero-trade read model reads a bounded tail, not the whole stream."""
     path = tmp_path / "scan_summaries.jsonl"
     rows = [
         {"scan_id": f"SCAN:{index}", "decision_at_utc": "2026-11-08T09:00:00+00:00"}
@@ -165,7 +165,7 @@ def test_scan_summary_read_is_bounded_and_still_returns_the_newest_row(tmp_path,
 
 @pytest.mark.acceptance(f"{INCREMENT}/AC-004")
 def test_funnel_rows_are_read_from_a_bounded_tail_for_the_requested_scan(tmp_path, monkeypatch):
-    """AC-004: the explanation still returns the recorded rows of its own scan."""
+    """ATDD-OPIP-CONTROL-CENTER-EVIDENCE-WIRING-v1/AC-004: the explanation still returns the recorded rows of its own scan."""
     path = tmp_path / "funnel_events.jsonl"
     _write_jsonl(
         path,
@@ -194,7 +194,7 @@ def test_funnel_rows_are_read_from_a_bounded_tail_for_the_requested_scan(tmp_pat
 
 @pytest.mark.acceptance(f"{INCREMENT}/AC-004")
 def test_a_truncated_funnel_tail_row_is_skipped_rather_than_fatal(tmp_path):
-    """AC-004: fail-soft behaviour is preserved by the bounded reader."""
+    """ATDD-OPIP-CONTROL-CENTER-EVIDENCE-WIRING-v1/AC-004: fail-soft behaviour is preserved by the bounded reader."""
     path = tmp_path / "funnel_events.jsonl"
     _write_jsonl(
         path,
@@ -209,7 +209,7 @@ def test_a_truncated_funnel_tail_row_is_skipped_rather_than_fatal(tmp_path):
 
 @pytest.mark.acceptance(f"{INCREMENT}/AC-005")
 def test_scoring_authority_is_reconciled_without_activating_anything():
-    """AC-005: the reference document and the deployed selector are reported apart."""
+    """ATDD-OPIP-CONTROL-CENTER-EVIDENCE-WIRING-v1/AC-005: the reference document and the deployed selector are reported apart."""
     drift = config_staging.scoring_authority_reconciliation(
         {
             "scoring.production_declared": {
@@ -251,7 +251,7 @@ def test_scoring_authority_is_reconciled_without_activating_anything():
 def test_config_overview_reports_the_runtime_selector_and_keeps_activation_closed(
     tmp_path, monkeypatch
 ):
-    """AC-005: the console can see the drift, and still cannot act on it."""
+    """ATDD-OPIP-CONTROL-CENTER-EVIDENCE-WIRING-v1/AC-005: the console can see the drift, and still cannot act on it."""
     from app.core.config import Settings
 
     monkeypatch.setenv("OPIP_PRODUCTION_SCORING_VERSION", "v2")
@@ -276,7 +276,7 @@ def test_config_overview_reports_the_runtime_selector_and_keeps_activation_close
 
 @pytest.mark.acceptance(f"{INCREMENT}/AC-002")
 def test_the_console_classifies_a_timed_out_read_instead_of_leaking_an_abort():
-    """AC-002: the browser's abort text is never presented as a system state."""
+    """ATDD-OPIP-CONTROL-CENTER-EVIDENCE-WIRING-v1/AC-002: the browser's abort text is never presented as a system state."""
     api = (UI / "src" / "api.mjs").read_text(encoding="utf-8")
     view = (UI / "src" / "main.jsx").read_text(encoding="utf-8")
 
@@ -292,7 +292,7 @@ def test_the_console_classifies_a_timed_out_read_instead_of_leaking_an_abort():
 
 @pytest.mark.acceptance(f"{INCREMENT}/AC-006")
 def test_the_console_derives_f11_and_qualification_instead_of_hardcoding_them():
-    """AC-006: a displayed safety state comes from recorded evidence."""
+    """ATDD-OPIP-CONTROL-CENTER-EVIDENCE-WIRING-v1/AC-006: a displayed safety state comes from recorded evidence."""
     api = (UI / "src" / "api.mjs").read_text(encoding="utf-8")
     view = (UI / "src" / "main.jsx").read_text(encoding="utf-8")
 
