@@ -1,11 +1,32 @@
 import {bytes, isNumber, metric, payloadState} from './format.mjs';
 
-const REQUEST_LIMIT_MS=12000;
+const REQUEST_LIMIT_MS=20000;
+// A read that ran out of time is not an empty evidence set, a refusal, or a
+// cancelled (superseded) read. The browser reports every abort as the same
+// DOMException, whose message ("signal is aborted without reason") tells an
+// operator nothing, so the console classifies it itself.
+export const READ_TIMEOUT_CODE='READ_TIMEOUT';
+export function readErrorState(error){
+  const text=String(error?.message||error||'');
+  if(!text) return {state:'UNREAD',detail:''};
+  if(error?.code===READ_TIMEOUT_CODE||/^READ TIMEOUT\b/.test(text))
+    return {state:'TIMEOUT',detail:text};
+  const status=text.match(/^HTTP (\d{3})\b/);
+  if(status){
+    const code=status[1];
+    if(code==='401'||code==='403') return {state:'CREDENTIAL_REFUSED',detail:text};
+    if(code==='404') return {state:'NOT_AVAILABLE',detail:text};
+    return {state:'HTTP_'+code,detail:text};
+  }
+  return {state:'UNAVAILABLE',detail:text};
+}
 // Only explicitly verified positive states receive a positive visual treatment.
 // Substring matching would misclassify INACTIVE, UNHEALTHY and NOT_READY.
 export function statusLevel(value) {
   const status=String(value??'').trim().toUpperCase().replace(/[^A-Z0-9]+/g,'_');
-  if (new Set(['UNVERIFIED','UNAVAILABLE','ERROR','BLOCKED','STALE','NO_EVIDENCE','UNKNOWN','FAILED','FAILURE','UNHEALTHY','INACTIVE','NOT_READY','NOT_ACTIVE','NOT_ATTESTED','DEGRADED','DISABLED','PARTIAL']).has(status)) return 'bad';
+  if (new Set(['UNVERIFIED','UNAVAILABLE','ERROR','BLOCKED','STALE','NO_EVIDENCE','UNKNOWN','FAILED','FAILURE','UNHEALTHY','INACTIVE','NOT_READY','NOT_ACTIVE','NOT_ATTESTED','DEGRADED','DISABLED','PARTIAL','TIMEOUT','CREDENTIAL_REFUSED','NOT_AVAILABLE','UNREAD']).has(status)) return 'bad';
+  // A refused read is never neutral: HTTP_401/HTTP_502 and friends are failures.
+  if (/^HTTP_\d{3}$/.test(status)) return 'bad';
   if (new Set(['PASS','HEALTHY','RECORDED','SUCCESS','READY','ACTIVE','ACTIVE_VERIFIED','COMPLETE']).has(status)) return 'good';
   return 'neutral';
 }
@@ -149,11 +170,13 @@ export function configAdminState(error){
   if(/HTTP 401\b|HTTP 403\b/.test(text)) return {state:'CREDENTIAL_REFUSED',detail:text};
   return {state:'UNAVAILABLE',detail:text};
 }
-export async function apiRequest(path,{secret='',adminSecret='',method='GET',json,expectedDigest='',signal}={}) {
+export async function apiRequest(path,{secret='',adminSecret='',method='GET',json,expectedDigest='',signal,timeoutMs=REQUEST_LIMIT_MS}={}) {
   if(!path.startsWith('/api/')) throw new Error('API path must be same-origin /api/');
   if (!secret.trim()) throw new Error('Viewer credential required');
+  const budget=Number.isFinite(timeoutMs)&&timeoutMs>0?timeoutMs:REQUEST_LIMIT_MS;
   const controller=new AbortController();
-  const timeout=setTimeout(()=>controller.abort(),REQUEST_LIMIT_MS);
+  let timedOut=false;
+  const timeout=setTimeout(()=>{timedOut=true;controller.abort()},budget);
   const headers={'X-Webhook-Secret':secret,'Accept':'application/json'};
   if(adminSecret) headers['X-Strategy-Admin-Secret']=adminSecret;
   if(expectedDigest) headers['X-Expected-Profile-Sha256']=expectedDigest;
@@ -165,6 +188,18 @@ export async function apiRequest(path,{secret='',adminSecret='',method='GET',jso
     let data;try{data=await response.json()}catch{throw new Error('Invalid API response')}
     if(!response.ok) throw new Error(`HTTP ${response.status}: ${typeof data.detail==='string'?data.detail:'Request refused'}`);
     return data;
+  }catch(error){
+    // Only our own budget converts to a timeout; a caller-cancelled request stays
+    // an AbortError so a superseded read is never reported as a failure.
+    if(timedOut){
+      const failure=new Error(`READ TIMEOUT after ${budget} ms: ${path} did not answer inside the console read budget`);
+      failure.name='TimeoutError';
+      failure.code=READ_TIMEOUT_CODE;
+      failure.path=path;
+      failure.timeoutMs=budget;
+      throw failure;
+    }
+    throw error;
   }finally{clearTimeout(timeout);signal?.removeEventListener('abort',abort)}
 }
 
@@ -428,8 +463,8 @@ export function kpiCards(health) {
       _cardRow('Symbols scanned', metric(kpi.symbols_scanned)),
       _cardRow('V2 features ready', metric(kpi.v2_ready), isNumber(kpi.v2_ready) ? 'neutral' : 'bad'),
       _cardRow('V2 directional candidates', metric(kpi.v2_directional), isNumber(kpi.v2_directional) ? 'neutral' : 'bad'),
-      _cardRow('Qualified signals', 'UNAVAILABLE', 'bad'),
-      _cardRow('Rejected candidates', 'UNAVAILABLE', 'bad'),
+      _cardRow('Qualified signals', isNumber(kpi.qualified) ? metric(kpi.qualified) : 'UNAVAILABLE', isNumber(kpi.qualified) ? 'neutral' : 'bad'),
+      _cardRow('Rejected candidates', isNumber(kpi.rejected) ? metric(kpi.rejected) : 'UNAVAILABLE', isNumber(kpi.rejected) ? 'neutral' : 'bad'),
       _cardRow('V2 not computed', metric(v2Status.NOT_COMPUTED), isNumber(v2Status.NOT_COMPUTED) && v2Status.NOT_COMPUTED > 0 ? 'bad' : 'neutral'),
       _cardRow('Last successful scan', kpi.last_observed_at_utc ? utcWithLocal(kpi.last_observed_at_utc).utc : 'UNVERIFIED'),
     ],

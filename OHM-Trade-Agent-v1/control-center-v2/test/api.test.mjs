@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {modelAuthority,evidenceStatus,objectSummary,exportCsv,sanitizeJsonExport,apiRequest,statusLevel,readState,utcWithLocal,qualificationFunnel,rejectionBreakdown,aiOperatingState,configAdminState,scannerCoverage,scannerExclusions} from '../src/api.mjs';
+import {modelAuthority,evidenceStatus,objectSummary,exportCsv,sanitizeJsonExport,apiRequest,statusLevel,readState,utcWithLocal,qualificationFunnel,rejectionBreakdown,aiOperatingState,configAdminState,scannerCoverage,scannerExclusions,readErrorState,READ_TIMEOUT_CODE,f11Display} from '../src/api.mjs';
 test('V2 authority derives only from recorded evidence',()=>{
  assert.equal(modelAuthority({model_authority:'V2_PRODUCTION_V1_OBSERVATION'}),'V2 production · V1 observation');
  assert.equal(modelAuthority({}), 'UNVERIFIED');
@@ -143,6 +143,58 @@ test('bounded exclusion evidence reports truncation instead of dropping silently
  assert.equal(exclusions.truncated,true);
  const empty=scannerExclusions({});
  assert.deepEqual([empty.total,empty.recorded,empty.truncated,empty.rows.length],[0,0,false,0]);
+});
+// A read that ran out of budget, a refusal and an absent capability are three
+// different answers. The browser's own abort text must never be one of them.
+test('read failures are classified, never passed through as browser text',()=>{
+ assert.equal(readErrorState({code:READ_TIMEOUT_CODE,message:'READ TIMEOUT after 20000 ms: /api/x'}).state,'TIMEOUT');
+ assert.equal(readErrorState(new Error('READ TIMEOUT after 20 ms: /api/x')).state,'TIMEOUT');
+ assert.equal(readErrorState(new Error('HTTP 401: Invalid dashboard secret')).state,'CREDENTIAL_REFUSED');
+ assert.equal(readErrorState(new Error('HTTP 403: forbidden')).state,'CREDENTIAL_REFUSED');
+ assert.equal(readErrorState(new Error('HTTP 404: nope')).state,'NOT_AVAILABLE');
+ assert.equal(readErrorState(new Error('HTTP 502: bad gateway')).state,'HTTP_502');
+ assert.equal(readErrorState(new Error('Invalid API response')).state,'UNAVAILABLE');
+ assert.equal(readErrorState(undefined).state,'UNREAD');
+ // None of these states may render as healthy.
+ for(const state of ['TIMEOUT','CREDENTIAL_REFUSED','NOT_AVAILABLE','HTTP_502','UNAVAILABLE'])
+  assert.equal(statusLevel(state),'bad',state);
+});
+test('a read that exceeds its budget is a timeout, and a cancelled read stays cancelled',async()=>{
+ const original=globalThis.fetch;
+ const hang=(path,{signal})=>new Promise((_resolve,reject)=>{
+  signal.addEventListener('abort',()=>reject(Object.assign(new Error('signal is aborted without reason'),{name:'AbortError'})),{once:true});
+ });
+ try{
+  globalThis.fetch=hang;
+  await assert.rejects(apiRequest('/api/slow',{secret:'s',timeoutMs:20}),error=>{
+   assert.equal(error.code,READ_TIMEOUT_CODE);
+   assert.equal(error.name,'TimeoutError');
+   assert.match(error.message,/READ TIMEOUT after 20 ms/);
+   assert.equal(error.path,'/api/slow');
+   assert.equal(readErrorState(error).state,'TIMEOUT');
+   return true;
+  });
+  // A superseded read keeps its AbortError identity, so the console can cancel
+  // silently instead of reporting a failure that never happened.
+  const controller=new AbortController();
+  const pending=apiRequest('/api/slow',{secret:'s',signal:controller.signal,timeoutMs:5000});
+  controller.abort();
+  await assert.rejects(pending,error=>{
+   assert.equal(error.name,'AbortError');
+   assert.notEqual(error.code,READ_TIMEOUT_CODE);
+   return true;
+  });
+ } finally{globalThis.fetch=original}
+});
+test('F11 renders from recorded protection evidence, never from a default',()=>{
+ assert.equal(f11Display({status:'MEASURED',state:'ARMED',source:'/app/data/opip/f11.json'}).label,'ARMED');
+ assert.equal(f11Display({status:'MEASURED',state:'ARMED'}).level,'good');
+ assert.equal(f11Display({status:'MEASURED',state:'TRIGGERED_HALT'}).label,'TRIGGERED_HALT');
+ assert.equal(f11Display({status:'MEASURED',state:'TRIGGERED_HALT'}).level,'bad');
+ assert.equal(f11Display({status:'MEASURED',state:'SOMETHING_ELSE'}).level,'bad');
+ assert.equal(f11Display({status:'UNVERIFIED',reason_code:'NO_F11_STATE_ARTIFACT'}).label,'UNVERIFIED');
+ assert.equal(f11Display(null).label,'UNVERIFIED');
+ assert.notEqual(statusLevel(f11Display(null).label),'good');
 });
 
 

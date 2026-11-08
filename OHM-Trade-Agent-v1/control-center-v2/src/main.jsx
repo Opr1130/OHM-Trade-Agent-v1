@@ -1,7 +1,7 @@
 import React,{useEffect,useRef,useState} from 'react';
 import{createRoot}from'react-dom/client';
 import{Activity,ArrowDownToLine,BarChart3,BrainCircuit,ChartNoAxesCombined,Check,ChevronRight,CircleAlert,ClipboardList,Database,GitCompareArrows,LockKeyhole,RefreshCw,RotateCcw,Search,Settings2,ShieldCheck,SlidersHorizontal}from'lucide-react';
-import{apiRequest,modelAuthority,evidenceStatus,objectSummary,exportCsv,sanitizeJsonExport,statusLevel,readState,utcWithLocal,qualificationFunnel,rejectionBreakdown,aiOperatingState,configAdminState,scannerCoverage,scannerExclusions,ENDPOINTS,headerFields,kpiCards,provenanceRows,stageOutcome,provenanceLabel,zeroBuySummary}from'./api.mjs';
+import{apiRequest,modelAuthority,evidenceStatus,objectSummary,exportCsv,sanitizeJsonExport,statusLevel,readState,utcWithLocal,qualificationFunnel,rejectionBreakdown,aiOperatingState,configAdminState,scannerCoverage,scannerExclusions,ENDPOINTS,headerFields,kpiCards,provenanceRows,stageOutcome,provenanceLabel,zeroBuySummary,readErrorState,f11Display}from'./api.mjs';
 import{LOGO_ASSET,LOGO_FALLBACK_MARK,activeFilters,bytes,clampPresets,freshness,metric,payloadState,percent,removeFilter,configDiff,configFieldKind,divergenceLabel,divergenceLevel,precheckStagedValue,rubricTotal,signalQuery,sortRows,windowStartIso}from'./format.mjs';
 import './theme.css';
 import './style.css';
@@ -93,7 +93,7 @@ function ForensicsDrawer({secret,attemptId,symbol,onClose}){
   const controller=new AbortController();let live=true;
   apiRequest(`${ENDPOINTS.forensics}?attempt_id=${encodeURIComponent(attemptId)}&symbol=${encodeURIComponent(symbol)}`,{secret,signal:controller.signal})
    .then(payload=>{if(live)setData(payload)})
-   .catch(err=>{if(live)setError(String(err?.message||err))});
+   .catch(err=>{if(live)setError(readErrorState(err).detail)});
   return()=>{live=false;controller.abort()};
  },[secret,attemptId,symbol]);
  const rows=provenanceRows(data);
@@ -195,8 +195,13 @@ function SignalsWorkspace({secret,onTune}){
    setStatus(payload.status||'UNVERIFIED');
    if(remember)setStack(previous=>[...previous,cursor]);
   }catch(err){
-   if(mine!==generation.current||String(err?.name)==='AbortError')return;
-   setRows([]);setNextCursor(null);setError(String(err?.message||err));setStatus('UNAVAILABLE');
+   if(mine!==generation.current)return;
+   // A superseded read is cancelled on purpose; a read that ran out of budget is
+   // a real failure and must not be swallowed with it.
+   const failure=readErrorState(err);
+   if(failure.state==='UNREAD')return;
+   if(String(err?.name)==='AbortError'&&!err?.code)return;
+   setRows([]);setNextCursor(null);setError(failure.detail);setStatus(failure.state);
   }finally{if(mine===generation.current)setBusy(false)}
  }
  useEffect(()=>{
@@ -409,13 +414,15 @@ function AiWorkspace({aiPayload}){
 }
 
 // --- Workspace E: data and retention ---------------------------------------
-function DataRetentionWorkspace({data,secret,adminSecret,onRefresh}){
+function DataRetentionWorkspace({data,secret,adminSecret,onRefresh,error,readState:failedReadState}){
  const[busy,setBusy]=useState(false);
  const[message,setMessage]=useState('');
  const[failed,setFailed]=useState(false);
  const[days,setDays]=useState(30);
  if(!data||data.status==='UNAVAILABLE')return <Empty title="Data platform unavailable"
-  detail={data?.reason_code||'The derived projection is not readable yet.'}/>;
+  detail={error||data?.projection?.detail||data?.reason_code||'The derived projection is not readable yet.'}/>;
+ if(failedReadState==='TIMEOUT')return <Empty title="Data read timed out"
+  detail={error||'The canonical source read did not finish inside the console read budget.'}/>;
  const sources=Array.isArray(data.sources)?data.sources:[];
  const runs=Array.isArray(data.retention_runs)?data.retention_runs:[];
  const retention=data.retention||{};
@@ -821,6 +828,7 @@ function App(){
  const[scope,setScope]=useState('all');
  const[records,setRecords]=useState({});
  const[errors,setErrors]=useState({});
+ const[readStates,setReadStates]=useState({});
  const[configDomain,setConfigDomain]=useState('');
  const[loadedAt,setLoadedAt]=useState('');
  const[busy,setBusy]=useState(false);
@@ -831,13 +839,19 @@ function App(){
  const[credentialLocked,setCredentialLocked]=useState(false);
  const requestGeneration=useRef(0);
  useEffect(()=>{setCredentialLocked(false)},[secret]);
- useEffect(()=>{requestGeneration.current+=1;setRecords({});setErrors({});setLoadedAt('');setSelected(null);setBusy(false)},[secret,scope]);
+ useEffect(()=>{requestGeneration.current+=1;setRecords({});setErrors({});setReadStates({});setLoadedAt('');setSelected(null);setBusy(false)},[secret,scope]);
  async function refresh(){if(!secret.trim())return;const generation=++requestGeneration.current;setBusy(true);const endpoints={...READS,summary:'/api/analytics/summary?scope='+scope,intelligence:'/api/analytics/intelligence?scope='+scope};
   const requestedSecret=secret;
   const results=await Promise.allSettled(Object.entries(endpoints).map(async([key,path])=>[key,await apiRequest(path,{secret:requestedSecret})]));
   if(generation!==requestGeneration.current)return;
-  const got={},errs={};results.forEach((result,i)=>{const key=Object.keys(endpoints)[i];if(result.status==='fulfilled')got[key]=result.value[1];else errs[key]=String(result.reason?.message||'Unavailable')});
-  setRecords(got);setErrors(errs);setLoadedAt(new Date().toISOString());setBusy(false)
+  // One classification per failed read. A timeout, a refusal, a missing
+  // capability and an unavailable service are four different answers, and none
+  // of them is "no signals".
+  const got={},errs={},states={};results.forEach((result,i)=>{const key=Object.keys(endpoints)[i];
+   if(result.status==='fulfilled'){got[key]=result.value[1];return}
+   const failure=readErrorState(result.reason);
+   errs[key]=failure.detail||'Unavailable';states[key]=failure.state});
+  setRecords(got);setErrors(errs);setReadStates(states);setLoadedAt(new Date().toISOString());setBusy(false)
   if(Object.keys(got).length)setCredentialLocked(true)}
  const comparisonStatus=evidenceStatus(records.comparisons);
  const latestComparison=Array.isArray(records.comparisons?.rows)?records.comparisons.rows[0]:null;
@@ -846,6 +860,10 @@ function App(){
  // not return is 'Not verified', never 0 and never a hard-coded green.
  const count=(value,of)=>typeof value==='number'?(of===undefined?String(value):value+' / '+of):'Not verified';
  const aiEvidence=records.zero?{invoked:records.zero.ai_invoked,invocation_status:records.zero.ai_invocation_status,failure_type:records.zero.ai_failure_type,eligible_before_ai:records.zero.ai_eligible_candidates_before_ai,returned_by_ai:records.zero.ai_candidates_returned,confidence:records.zero.ai_confidence_distribution,budget_exhausted:records.zero.ai_budget_exhausted,unavailable:records.zero.ai_unavailable}:null;
+ // F11 is derived from the recorded protection artifact. A hard-coded label here
+ // made the console assert "NOT ATTESTED" even when the runtime reported ARMED,
+ // and would have asserted nothing trustworthy either way.
+ const f11=f11Display(records.health?.runtime?.protection);
  const cards=[
   ['Model authority',modelAuthority(latestComparison)],
   ['V1 / V2 comparison',comparisonStatus],
@@ -858,7 +876,7 @@ function App(){
   ['AI advisory',ai.state],
   ['Qualification evidence',readState(records.zero,errors.zero)],
   ['Analytics summary',readState(records.summary,errors.summary)],
-  ['F11 verification','NOT ATTESTED'],
+  ['F11 verification',f11.label],
  ];
  const filtered=Array.isArray(records.comparisons?.rows)?records.comparisons.rows.filter(row=>JSON.stringify(row).toLowerCase().includes(search.toLowerCase())):[];
  return <div className="shell">
@@ -870,17 +888,17 @@ function App(){
  <div className="auth-bar">{credentialLocked?<><span className="muted">Credential held in this tab's memory only · never written to browser storage</span><button className="secondary" onClick={()=>{setCredentialLocked(false);setSecret('')}}>Change credential</button><button className="subtle" onClick={()=>{setCredentialLocked(false);setSecret('');setRecords({});setErrors({});setLoadedAt('');setSelected(null)}}>Sign out</button></>:<label>Operator API credential<input type="password" value={secret} onChange={e=>setSecret(e.target.value)} autoComplete="off" placeholder="X-Webhook-Secret (session memory only)" /></label>}<label>Window<select value={scope} onChange={e=>setScope(e.target.value)}><option value="all">All recorded</option><option value="today">Today (UTC day)</option></select></label><span className="muted">Last fetched: {loadedAt?utcWithLocal(loadedAt).utc+' (local '+utcWithLocal(loadedAt).local+')':'Never'} · window boundaries are UTC</span></div>
  {!secret&&<div className="notice" role="status"><LockKeyhole size={17}/> Enter the existing O’Pip operator credential and select Refresh. No credentials are persisted.</div>}
  {section==='Overview'&&<div className="stack">{!credentialLocked&&<AuthPanel/>}<WidgetBoundary><ProvenanceNote payload={records.health?.projection}/><KpiRibbon health={records.health}/></WidgetBoundary><div className="metric-grid">
-{cards.map(([name,value])=><div className="metric" key={name}><span>{name}</span><Status value={value}/></div>)}</div><div className="cols"><Card title="Production analytics"><Pairs data={records.summary}/>{errors.summary&&<p className="error">{errors.summary}</p>}</Card><Card title="Why zero BUY signals"><ZeroBuyCard zero={records.zero}/></Card></div><Card title="Comparison evidence"><EvidenceTable response={records.comparisons} onSelect={setSelected}/>{errors.comparisons&&<p className="error">{errors.comparisons}</p>}</Card></div>}
+{cards.map(([name,value])=><div className="metric" key={name}><span>{name}</span><Status value={value}/></div>)}</div><div className="cols"><Card title="Production analytics" action={<Status value={readStates.summary||readState(records.summary)}/>}><Pairs data={records.summary}/>{errors.summary&&<p className="error">{errors.summary}</p>}</Card><Card title="Why zero BUY signals" action={<Status value={readStates.zero||readState(records.zero)}/>}><ZeroBuyCard zero={records.zero}/></Card></div><Card title="Comparison evidence"><EvidenceTable response={records.comparisons} onSelect={setSelected}/>{errors.comparisons&&<p className="error">{errors.comparisons}</p>}</Card></div>}
  {section==='V1 / V2 Evidence'&&<div className="stack"><WidgetBoundary><SignalsWorkspace secret={secret} onTune={domain=>{setConfigDomain(domain||'V2_SCORING');setSection('Config Admin')}}/></WidgetBoundary><Card title="Recorded V2 production / V1 observation">
 <p className="muted">Authority is read from each recorded comparison. Missing records are displayed as missing evidence, not as zero signals.</p><div className="input-row"><label>Filter recorded scans<input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Scan ID or symbol"/></label><button className="secondary" disabled={!filtered.length} onClick={()=>download(exportCsv(filtered),'opip-v1-v2-evidence.csv','text/csv')}><ArrowDownToLine size={16}/> Export visible rows</button></div><EvidenceTable response={{status:records.comparisons?.status,rows:filtered}} onSelect={setSelected}/></Card></div>}
  {section==='Qualification'&&<div className="stack"><WidgetBoundary><ScannerFunnelWorkspace scanner={records.scanner}/></WidgetBoundary><Card title="Where candidates stopped">
 {records.zero?<div className="stack"><p className="muted">{String(records.zero.explanation||'No explanation sentence was recorded')}</p><Funnel stages={qualificationFunnel(records.zero)} empty="No funnel fields were returned"/><span className="muted">Dominant terminal gate: {String(records.zero.dominant_terminal_gate||'Not verified')} · deepest stage reached: {String(records.zero.deepest_stage_reached||'Not verified')} · scan: {String(records.zero.scan_id||'Not verified')} · observed: {utcWithLocal(records.zero.last_scan_at_utc).utc}</span></div>:<Empty title="Qualification evidence unavailable" detail={errors.zero||'Refresh to request the server-side zero-trade explanation'}/>}</Card><Card title="Rejection breakdown">{records.zero?<Funnel stages={rejectionBreakdown(records.zero)} empty="No rejection fields were returned"/>:<Empty title="No rejection evidence" detail={errors.zero||'No zero-trade explanation was returned'}/>}</Card><Card title="Nearest misses" action={<span className="muted">Recorded evidence only, never a recommendation</span>}>{Array.isArray(records.zero?.nearest_misses)&&records.zero.nearest_misses.length?<Inspection object={records.zero.nearest_misses}/>:<p className="muted">No nearest-miss records were returned for this scan.</p>}</Card></div>}
  {section==='Intelligence'&&<div className="stack"><WidgetBoundary><AiWorkspace aiPayload={records.ai}/></WidgetBoundary><Card title="AI advisory operating state">
-<div className="inline-stats"><Status value={ai.state}/><span>{ai.detail}</span></div><Pairs data={aiEvidence}/><p className="muted">A stage that was never reached is not a disabled provider, and an unreachable provider is not a pipeline failure: each state is shown as recorded.</p></Card><Card title="Intelligence read model">{records.intelligence?<><Pairs data={records.intelligence}/><details><summary>Advanced JSON evidence</summary><Inspection object={records.intelligence}/></details></>:<Empty title="Intelligence evidence unavailable" detail={errors.intelligence||'Refresh to query the intelligence read model'}/>}</Card></div>}
+<div className="inline-stats"><Status value={ai.state}/><span>{ai.detail}</span></div><Pairs data={aiEvidence}/><p className="muted">A stage that was never reached is not a disabled provider, and an unreachable provider is not a pipeline failure: each state is shown as recorded.</p></Card><Card title="Intelligence read model" action={<Status value={readStates.intelligence||readState(records.intelligence)}/>}>{records.intelligence?<><Pairs data={records.intelligence}/><details><summary>Advanced JSON evidence</summary><Inspection object={records.intelligence}/></details></>:<Empty title="Intelligence evidence unavailable" detail={errors.intelligence||'Refresh to query the intelligence read model'}/>}</Card></div>}
  {section==='Operations'&&<div className="stack"><WidgetBoundary><div className="op-ribbon">{[['F11 protection',headerFields(records.health,{authenticated:credentialLocked}).find(f=>f.id==='f11')],['Reconciliation',headerFields(records.health,{}).find(f=>f.id==='reconciliation')],['Scanner heartbeat',headerFields(records.health,{}).find(f=>f.id==='scanner')],['Deployed revision',headerFields(records.health,{}).find(f=>f.id==='release')]].map(([label,field])=><section className="op-kpi" key={label}><header><h3>{label}</h3><Status value={field?field.level==='good'?'HEALTHY':field.level==='bad'?'DEGRADED':'UNVERIFIED':'UNVERIFIED'}/></header><div className="op-kpi-rows"><div className="op-kpi-row"><span>Observed</span><strong>{field?field.value:'UNAVAILABLE'}</strong></div><div className="op-kpi-row"><span>Source</span><strong>{field&&field.detail?field.detail:'not recorded'}</strong></div></div></section>)}</div></WidgetBoundary>
  <div className="cols"><Card title="Analytical diagnostics">
 <Pairs data={records.intelligence?.data_platform||records.intelligence}/><p className="muted">CPU, memory, reconciliation and learning readiness require authoritative host telemetry; unknown is not healthy.</p></Card><Card title="Data freshness"><Pairs data={records.intelligence?.freshness||records.summary}/><Status value="LIVE HOST ATTESTATION UNVERIFIED"/></Card></div></div>}
- {section==='Data & Retention'&&<WidgetBoundary><DataRetentionWorkspace data={records.data} secret={secret} adminSecret={secret} onRefresh={refresh}/></WidgetBoundary>}
+ {section==='Data & Retention'&&<WidgetBoundary><DataRetentionWorkspace data={records.data} secret={secret} adminSecret={secret} onRefresh={refresh} error={errors.data} readState={readStates.data}/></WidgetBoundary>}
  {section==='Config Admin'&&<ConfigAdmin secret={secret} config={records.config} configDomain={configDomain} onReload={refresh}/>}
  <footer><span>O’Pip · Review candidate — not an execution system</span><span>No funded trading controls · No F11 override · No automated retention deletion</span></footer>
  </main>

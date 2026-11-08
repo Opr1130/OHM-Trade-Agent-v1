@@ -40,6 +40,7 @@ from app.opip.storage.bounded_jsonl import (
     BoundedJsonlArchive,
     encode_row,
     parse_json_object_line,
+    read_tail_lines,
 )
 from app.services.jsonl_retention import compact_jsonl_recent
 from app.services.registry_io import registry_lock
@@ -550,12 +551,48 @@ def read_jsonl(path: Path, *, limit: int | None = None) -> list[dict[str, Any]]:
     return rows
 
 
+#: Bounded read-model windows. These two readers sit in an authenticated HTTP
+#: request path (the Control Center's "why zero trades?" explanation), so their
+#: cost must not be the size of the stream. ``funnel_events.jsonl`` is bounded by
+#: 64 MiB / 50,000 rows and a row is ~5.5 KB: parsing the whole file on every
+#: refresh is seconds of work for evidence the operator only ever inspects for
+#: the newest scan. The tail window below covers many scans of both streams.
+READ_TAIL_SUMMARY_LINES = 200
+READ_TAIL_FUNNEL_LINES = 5_000
+
+
+def _read_tail_rows(path: Path, max_lines: int) -> list[dict[str, Any]]:
+    """Parse at most ``max_lines`` trailing rows, skipping malformed lines.
+
+    Bounded by bytes read rather than by the file's size, and still fail-soft:
+    a truncated final row is dropped exactly as ``read_jsonl`` drops it.
+    """
+    try:
+        lines = read_tail_lines(path, max_lines)
+    except OSError as exc:
+        logger.warning("O'Pip qualification tail read failed open: %s", type(exc).__name__)
+        return []
+    rows: list[dict[str, Any]] = []
+    for raw in lines:
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if isinstance(parsed, dict):
+            rows.append(parsed)
+    return rows
+
+
 def read_latest_scan_summary(
     *,
     path: Path | None = None,
 ) -> dict[str, Any] | None:
-    """Return the most recent persisted scan summary, or None."""
-    rows = read_jsonl(path or SCAN_SUMMARIES_FILE)
+    """Return the most recent persisted scan summary, or None.
+
+    The summary stream is append-only, so the newest row is in the tail; the
+    whole-file parse it replaces was the dominant cost of the read model.
+    """
+    rows = _read_tail_rows(path or SCAN_SUMMARIES_FILE, READ_TAIL_SUMMARY_LINES)
     return rows[-1] if rows else None
 
 
@@ -564,13 +601,18 @@ def read_funnel_events_for_scan(
     *,
     path: Path | None = None,
 ) -> list[dict[str, Any]]:
-    """Return every funnel row belonging to one scan."""
+    """Return the funnel rows of one scan from a bounded tail of the stream.
+
+    The caller asks for the scan the summary just named, i.e. the newest one, so
+    a tail window is the correct and bounded source. Rows are returned oldest
+    first, exactly as a sequential scan returned them.
+    """
     target = str(scan_id or "")
     if not target:
         return []
     return [
         row
-        for row in read_jsonl(path or FUNNEL_EVENTS_FILE)
+        for row in _read_tail_rows(path or FUNNEL_EVENTS_FILE, READ_TAIL_FUNNEL_LINES)
         if str(row.get("scan_id") or "") == target
     ]
 
