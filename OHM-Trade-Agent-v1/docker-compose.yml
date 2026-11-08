@@ -111,6 +111,9 @@ services:
       # Explicit Compose override defeats stale .env.core V1 values.
       # V1 remains the read-only comparison scorer; no order authority is added.
       OPIP_PRODUCTION_SCORING_VERSION: "v2"
+      # Advisory profile selection is explicitly identical in core and worker.
+      # It is advisory-only and never enables funded orders or learning.
+      OPIP_ADVISORY_PROFILE_ENABLED: "${OPIP_ADVISORY_PROFILE_ENABLED:-false}"
       OPIP_COMMITTEE_MODE: "off"
       OPIP_CANONICAL_WRITER_MODE: "shadow"
       # Pin Paper-v2 off at the Compose service level so a stale .env cannot
@@ -299,6 +302,9 @@ services:
       OPIP_SCAN_EXECUTION_MODE: "isolated"
       # Must match core scoring authority: no .env.core or funded secrets here.
       OPIP_PRODUCTION_SCORING_VERSION: "v2"
+      # Resolve the same non-secret opt-in selector as the core. No env_file,
+      # exchange credentials, AI keys or administrator credential are inherited.
+      OPIP_ADVISORY_PROFILE_ENABLED: "${OPIP_ADVISORY_PROFILE_ENABLED:-false}"
       # Bounded deterministic replacement budget for this attempt. Non-secret
       # acquisition control only, interpolated from the owner `.env` (the single
       # source of truth) exactly like the other isolated workers' OPIP_* controls:
@@ -328,6 +334,9 @@ services:
     volumes:
       - ./data/scan:/app/data/scan:ro
       - ./data/scan/staging:/app/data/scan/staging
+      # Active, versioned advisory policy is read-only. Missing active.json
+      # uses the same bundled default as core; writes stay in the core.
+      - ./data/opip/strategy-admin:/app/data/opip/strategy-admin:ro
     read_only: true
     tmpfs:
       - /tmp
