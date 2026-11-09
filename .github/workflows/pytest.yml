@@ -104,6 +104,9 @@ jobs:
         run: |
           test ! -e .env.core
           cat > .env.core <<'EOF'
+          # A stale, weaker runtime identity. The Compose literal must win over
+          # this value; if it does not, the validation below fails closed.
+          APP_ENV=development
           OPIP_RELEASE_PROFILE=SAFE_BASELINE
           OPIP_FEATURE_BUS_MODE=active
           OPIP_CANONICAL_WRITER_MODE=active
@@ -112,8 +115,9 @@ jobs:
           OPIP_COMMITTEE_MODE=shadow
           EOF
           trap 'rm -f .env.core' EXIT
+          grep -q 'APP_ENV=development' .env.core
           docker compose config -q
-          docker compose config --format json | python -c 'import json,sys; e=json.load(sys.stdin)["services"]["ohm-trade-agent"]["environment"]; expected={"OPIP_RELEASE_PROFILE":"EVIDENCE_SHADOW","OPIP_FEATURE_BUS_MODE":"shadow","OPIP_CANONICAL_WRITER_MODE":"shadow","OPIP_TARGET_SPINE_MODE":"shadow","OPIP_PAPER_V2_MODE":"off","OPIP_COMMITTEE_MODE":"off"}; assert all(e.get(k)==v for k,v in expected.items()), e; funded=("KRAKEN_API_KEY","KRAKEN_API_SECRET","KRAKEN_PRIVATE_KEY","KRKN_API_KEY","LIVE_TRADING_KEY"); assert not any(k in e for k in funded), {k:v for k,v in e.items() if k in funded}'
+          docker compose config --format json | python -c 'import json,sys; e=json.load(sys.stdin)["services"]["ohm-trade-agent"]["environment"]; expected={"APP_ENV":"production","OPIP_RELEASE_PROFILE":"EVIDENCE_SHADOW","OPIP_FEATURE_BUS_MODE":"shadow","OPIP_CANONICAL_WRITER_MODE":"shadow","OPIP_TARGET_SPINE_MODE":"shadow","OPIP_PAPER_V2_MODE":"off","OPIP_COMMITTEE_MODE":"off"}; assert all(e.get(k)==v for k,v in expected.items()), e; funded=("KRAKEN_API_KEY","KRAKEN_API_SECRET","KRAKEN_PRIVATE_KEY","KRKN_API_KEY","LIVE_TRADING_KEY"); assert not any(k in e for k in funded), {k:v for k,v in e.items() if k in funded}'
       - name: Validate deployment shell
         run: |
           bash -n deploy/remote/ohm-deploy

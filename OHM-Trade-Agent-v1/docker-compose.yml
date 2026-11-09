@@ -89,6 +89,15 @@ services:
     env_file:
       - .env.core
     environment:
+      # Runtime identity. Pinned as a literal, in the same block that overrides
+      # `env_file: .env.core`, so a stale `.env` cannot downgrade the runtime.
+      # It matters because the canonical authority defaults an absent APP_ENV to
+      # "unknown" - deliberately conservative - and the LONG execution-evidence
+      # gate in `app/services/target_attainability.py` is fail-closed only when
+      # the runtime is conservative. Declaring the identity here makes the
+      # deployed posture explicit instead of depending on whether a host `.env`
+      # happened to set it (ATDD-OPIP-RUNTIME-AUTHORITY-FAILCLOSED-v1).
+      APP_ENV: "production"
       # O'Pip Sequence 2 production shadow activation.
       # Evidence collection only; the event store is not consumed by
       # qualification, ranking, alerts, paper admission, or exchange actions.

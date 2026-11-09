@@ -1,7 +1,7 @@
 import math
 from dataclasses import dataclass
 
-from app.core.config import get_settings
+from app.core.runtime_environment import conservative_runtime
 from app.scanner.models import MarketSnapshot
 from app.services.entry_exit_advisor import EntryExitPlan
 
@@ -92,11 +92,23 @@ def _valid_long_geometry(plan: EntryExitPlan, entry: float, atr_value: float) ->
 
 
 def _conservative_runtime() -> bool:
-    try:
-        app_env = (get_settings().app_env or "").strip().lower()
-    except Exception:
-        return True
-    return app_env not in {"development", "dev", "test", "testing"}
+    """Delegate the runtime-identity question to its single canonical authority.
+
+    This module previously reimplemented the question by reading
+    ``Settings.app_env``, whose model default is ``"development"``. The canonical
+    authority defaults an absent value to ``"unknown"`` and therefore answers
+    conservatively. The two implementations disagreed in the unsafe direction:
+    whenever ``APP_ENV`` was absent - the posture of any deployment that never set
+    it - the local copy answered "not conservative", so
+    ``_long_execution_rejections`` skipped every missing-execution-evidence
+    rejection and a LONG could qualify carrying no order-book, spread or drag
+    evidence at all.
+
+    Keeping one implementation makes unset, unknown and explicitly non-production
+    identities resolve identically everywhere, and removes the second source of
+    truth that made the divergence possible.
+    """
+    return conservative_runtime()
 
 
 def _long_execution_rejections(snapshot: MarketSnapshot) -> list[str]:

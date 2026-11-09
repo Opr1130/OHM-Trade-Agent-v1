@@ -111,7 +111,11 @@ def test_versioned_reference_policy_disables_only_advisory_filters():
     # Preserve the ability to explicitly select a bounded advisory filter.
     import json
     from pathlib import Path
-    source = json.loads((Path(__file__).parents[1] / "app/core/strategy_policy.json").read_text())
+    source = json.loads(
+        (
+            Path(__file__).parents[1] / "app/core/strategy_policy.json"
+        ).read_text(encoding="utf-8")
+    )
     source["advisory_economics"]["min_reward_to_risk"] = 2.5
     source["advisory_economics"]["min_target_2_move_pct"] = 4
     strict = parse_strategy_policy(json.dumps(source))
@@ -123,7 +127,13 @@ def test_versioned_reference_policy_disables_only_advisory_filters():
 def test_private_editor_supports_disabled_advisory_reward_risk_filter():
     """ATDD-OPIP-ADVISORY-NO-FIXED-PROFIT-v1/AC-005: zero is editable, protected fields stay protected."""
     from pathlib import Path
-    editor = (Path(__file__).parents[1] / "app/api/strategy_admin.html").read_text()
+    # Explicit UTF-8: this file contains non-ASCII characters (arrows, dashes,
+    # bullets). Reading it with the platform default codec raises
+    # UnicodeDecodeError on Windows (cp1252), which silently removed this test's
+    # coverage on that platform.
+    editor = (Path(__file__).parents[1] / "app/api/strategy_admin.html").read_text(
+        encoding="utf-8"
+    )
     assert 'id="rr" type="number" min="0"' in editor
     assert "Protected: model authority, position limits" in editor
     assert "strategy_admin" not in editor.lower() or "funded execution" in editor.lower()
