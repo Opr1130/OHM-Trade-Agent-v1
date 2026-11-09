@@ -494,12 +494,29 @@ export function kpiCards(health) {
   });
 
   const aiMeasured = ai.status === 'MEASURED';
+  // The projection path counts inferences; the canonical read-through counts
+  // provider invocation attempts from the router ledger. Both must be labelled
+  // for what they are, and neither is a qualified trade or a delivered alert.
+  const aiFromLedger = ai.metric_subject === 'PROVIDER_INVOCATION_ATTEMPTS';
   cards.push({
     id: 'ai',
     title: 'AI agreement rate',
     status: aiMeasured ? 'MEASURED' : 'NO_EVIDENCE',
     rows: [
-      _cardRow('Eligible AI reviews', aiMeasured ? metric(ai.inferences) : 'NO EVIDENCE', aiMeasured ? 'neutral' : 'bad'),
+      _cardRow(
+        aiFromLedger ? 'Provider invocations (bounded window)' : 'Eligible AI reviews',
+        aiMeasured ? metric(ai.inferences) : 'NO EVIDENCE',
+        aiMeasured ? 'neutral' : 'bad',
+      ),
+      aiFromLedger
+        ? _cardRow(
+            'Succeeded / failed',
+            typeof ai.succeeded === 'number' && typeof ai.failed === 'number'
+              ? `${ai.succeeded} / ${ai.failed}`
+              : 'NOT VERIFIED',
+            aiMeasured ? 'neutral' : 'bad',
+          )
+        : null,
       _cardRow('Matured outcomes', aiMeasured ? metric(ai.matured_outcomes) : 'NO EVIDENCE', 'bad'),
       _cardRow('Agreement rate', 'INSUFFICIENT DATA', 'bad'),
       _cardRow(
@@ -509,13 +526,15 @@ export function kpiCards(health) {
           : 'UNVERIFIED',
         aiMeasured && ai.models?.length ? 'neutral' : 'bad',
       ),
-    ],
+    ].filter(Boolean),
     note: ai.reason_code
       ? String(ai.reason_code).replaceAll('_', ' ').toLowerCase()
       : ai.metrics_reason
         ? String(ai.metrics_reason).replaceAll('_', ' ').toLowerCase()
         : null,
-    source: 'ai_inferences (derived projection)',
+    source: aiFromLedger
+      ? 'opip_ai_router_usage.jsonl (canonical, bounded window)'
+      : 'ai_inferences (derived projection)',
     observedAt: ai.last_observed_at_utc || null,
   });
 

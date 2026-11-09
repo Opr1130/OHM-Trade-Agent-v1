@@ -36,9 +36,9 @@ ARCHITECTURE REFERENCES:
 
 APPROVED ACCEPTANCE CRITERIA:
 AC-001:
-GIVEN: the Chief router usage ledger holds recorded invocations, including failures with error codes, and the projection holds no inference rows
+GIVEN: the Chief router usage ledger holds recorded invocations written with the router's own status vocabulary ("succeeded" for a completed response that satisfied the Chief contract, "failed" for a failed provider attempt), and the projection holds no inference rows
 WHEN: the Control Center asks for AI inference evidence
-THEN: the surface answers MEASURED from the ledger with inferences, succeeded, failed, the failure-code counts, the p50 latency and the models, keeps matured_outcomes, win_rate, false_signal_rate and missed_opportunity_rate unknown with reason NO_MATURED_OUTCOME_EVIDENCE, distinguishes an absent ledger (NO_AI_USAGE_LEDGER) from an empty one (NO_AI_INVOCATION_RECORDED), and tolerates a truncated final row without losing the readable rows.
+THEN: the surface answers MEASURED from the ledger with inferences, succeeded, failed, unclassified, the failure-code counts, the p50 latency and the models, reconciles those counts to the rows read, classifies success only as "succeeded" so a bare invocation is never a completed response, labels the counts as bounded-window provider invocation attempts that are not qualified trades or delivered alerts, reports whether the whole ledger fitted inside the window, keeps matured_outcomes, win_rate, false_signal_rate and missed_opportunity_rate unknown with reason NO_MATURED_OUTCOME_EVIDENCE, and distinguishes an absent ledger (NO_AI_USAGE_LEDGER) from an empty one (NO_AI_INVOCATION_RECORDED) while tolerating a truncated final row.
 
 AC-002:
 GIVEN: an authenticated read does not answer inside the console's read budget
@@ -84,6 +84,9 @@ FROZEN BOUNDARIES:
 
 ACCEPTANCE TEST TRACEABILITY:
 AC-001 -> tests/test_opip_control_center_v2_evidence_wiring_v1.py::test_chief_evidence_is_read_from_the_router_ledger
+AC-001 -> tests/test_opip_control_center_v2_evidence_wiring_v1.py::test_an_invocation_is_not_a_completed_response
+AC-001 -> tests/test_opip_control_center_v2_evidence_wiring_v1.py::test_the_bounded_window_is_not_presented_as_an_all_time_total
+AC-001 -> tests/test_opip_control_center_v2_evidence_wiring_v1.py::test_the_reader_vocabulary_matches_the_router_source
 AC-001 -> tests/test_opip_control_center_v2_evidence_wiring_v1.py::test_ai_absence_states_are_distinguished_and_never_claim_success
 AC-001 -> tests/test_opip_control_center_v2_evidence_wiring_v1.py::test_a_truncated_ledger_tail_does_not_hide_the_readable_rows
 AC-002 -> tests/test_opip_control_center_v2_evidence_wiring_v1.py::test_the_console_classifies_a_timed_out_read_instead_of_leaking_an_abort

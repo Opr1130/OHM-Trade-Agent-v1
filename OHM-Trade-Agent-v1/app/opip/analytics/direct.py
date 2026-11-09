@@ -53,9 +53,24 @@ REASON_NO_MATURED_AI_OUTCOME = "NO_MATURED_OUTCOME_EVIDENCE"
 #: The derived projection is the only artifact that can answer quarantine,
 #: aging, retention and schema questions; without it those are unknown.
 REASON_PROJECTION_NOT_READABLE = "ANALYTICS_PROJECTION_NOT_READABLE"
-#: Provider outcomes that mean the review actually completed. Everything else
-#: (including a recorded failure code) is a failed invocation, not evidence.
-AI_SUCCESS_STATUSES = frozenset({"OK", "SUCCESS", "COMPLETED", "INVOKED"})
+#: The router's authoritative status vocabulary. `app.services.opip_ai_router`
+#: calls `_append_router_usage` with exactly two values: ``"failed"`` in the
+#: per-provider failure branch and ``"succeeded"`` in the completed-response
+#: branch. A test pins this set against the router source so the two cannot drift.
+AI_STATUS_SUCCEEDED = "succeeded"
+AI_STATUS_FAILED = "failed"
+#: Only a completed response that satisfied the Chief contract counts. A bare
+#: invocation, a retry marker or a provider acknowledgement is not a success.
+AI_SUCCESS_STATUSES = frozenset({AI_STATUS_SUCCEEDED})
+AI_KNOWN_STATUSES = frozenset({AI_STATUS_SUCCEEDED, AI_STATUS_FAILED})
+
+#: What one ledger row is, and what it is not. One row is one *provider
+#: invocation attempt*: a single Chief review that falls through a failed provider
+#: writes one ``failed`` row per attempt and one ``succeeded`` row for the call
+#: that answered. A row is therefore not a qualified trade, not an approved
+#: candidate and not a delivered alert.
+METRIC_SUBJECT = "PROVIDER_INVOCATION_ATTEMPTS"
+METRIC_SCOPE_BOUNDED = "BOUNDED_WINDOW"
 
 
 def _num(value: Any) -> float | int | None:
@@ -538,7 +553,13 @@ def _median(values: list[float]) -> float | None:
 
 
 def _ai_summary(records: list[tuple[dict[str, Any], str]]) -> dict[str, Any]:
-    """Count what the ledger records, and claim nothing it does not."""
+    """Count what the ledger records, and claim nothing it does not.
+
+    Every row is classified by the router's own vocabulary. A status the router
+    does not emit is reported as ``unclassified`` instead of being folded into
+    either success or failure, so the three counts always reconcile to the rows
+    read.
+    """
     statuses: dict[str, int] = {}
     failure_codes: dict[str, int] = {}
     models: dict[tuple[str, str], int] = {}
@@ -546,9 +567,17 @@ def _ai_summary(records: list[tuple[dict[str, Any], str]]) -> dict[str, Any]:
     first_at: str | None = None
     last_at: str | None = None
     authority_unchanged = True
+    succeeded = 0
+    failed = 0
     for record, _sha in records:
-        status = _text(record.get("status"), 32) or "UNRECORDED"
+        raw_status = _text(record.get("status"), 32)
+        status = raw_status or "UNRECORDED"
         statuses[status] = statuses.get(status, 0) + 1
+        normalized = (raw_status or "").strip().lower()
+        if normalized in AI_SUCCESS_STATUSES:
+            succeeded += 1
+        elif normalized == AI_STATUS_FAILED:
+            failed += 1
         code = _text(record.get("error_code"), 64)
         if code:
             failure_codes[code] = failure_codes.get(code, 0) + 1
@@ -569,16 +598,24 @@ def _ai_summary(records: list[tuple[dict[str, Any], str]]) -> dict[str, Any]:
         if record.get("funded_trade_authority_changed") is not False:
             authority_unchanged = False
     total = len(records)
-    succeeded = sum(
-        count for status, count in statuses.items() if status.upper() in AI_SUCCESS_STATUSES
-    )
+    unclassified = total - succeeded - failed
     ordered_models = sorted(models.items(), key=lambda item: (-item[1], item[0]))
     return {
         "status": queries.STATUS_MEASURED if total else queries.STATUS_NO_EVIDENCE,
         "reason_code": None if total else REASON_NO_AI_INVOCATION,
+        # What is counted, and over what. A window of 500 rows is not an
+        # all-time total, and an invocation attempt is not a trade or an alert.
+        "metric_subject": METRIC_SUBJECT,
+        "metric_scope": METRIC_SCOPE_BOUNDED,
+        "window_limit": MAX_AI_USAGE_ROWS,
+        "counts_qualified_trades": False,
+        "counts_delivered_alerts": False,
+        "counts_successful_advisory_reviews_only": False,
         "inferences": total,
         "succeeded": succeeded,
-        "failed": total - succeeded,
+        "failed": failed,
+        "unclassified": unclassified,
+        "reconciles": total == succeeded + failed + unclassified,
         "statuses": statuses,
         "failure_codes": failure_codes,
         "models": [
@@ -618,18 +655,24 @@ def ai(settings: Any) -> dict[str, Any]:
             {
                 "inference_key": sha[:32],
                 "observed_at_utc": _iso(record.get("timestamp_utc")),
-                # The router records a batch review, not a per-symbol verdict, so
-                # these stay null rather than being filled from the request.
+                # The router records one batch review attempt, not a per-symbol
+                # verdict, so these stay null rather than being filled from the
+                # request.
                 "symbol": None,
                 "direction": None,
                 "provider": _text(record.get("provider"), 32),
                 "model": _text(record.get("model"), 64),
                 "model_version": None,
-                "verdict": _text(record.get("status"), 32) or "UNRECORDED",
+                # ``provider_status`` is the invocation outcome. ``verdict`` is a
+                # per-candidate advisory verdict, which this ledger does not hold.
+                "provider_status": _text(record.get("status"), 32) or "UNRECORDED",
+                "verdict": None,
                 "confidence": None,
                 "duration_ms": _num(record.get("latency_ms")),
                 "outcome_maturity": "NOT_MATURED",
+                "error_type": _text(record.get("error_type"), 64),
                 "error_code": _text(record.get("error_code"), 64),
+                "incomplete_reason": _text(record.get("incomplete_reason"), 64),
                 "candidate_count": _num(record.get("candidate_count")),
                 "route_tier": _text(record.get("route_tier"), 32),
                 "record_sha256": sha,
@@ -646,7 +689,13 @@ def ai(settings: Any) -> dict[str, Any]:
             "page_size": MAX_AI_USAGE_PAGE,
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         },
-        "path": str(path),
+        "ledger_path": str(path),
+        # The reader is bounded. ``window_complete`` states whether the whole
+        # ledger was inside the window, so a 500-row count is never presented as
+        # an all-time total.
+        "window_limit": MAX_AI_USAGE_ROWS,
+        "window_records": len(records),
+        "window_complete": len(records) < MAX_AI_USAGE_ROWS,
         "records_read": len(records),
         "truncated": len(records) >= MAX_AI_USAGE_ROWS,
         **provenance(),

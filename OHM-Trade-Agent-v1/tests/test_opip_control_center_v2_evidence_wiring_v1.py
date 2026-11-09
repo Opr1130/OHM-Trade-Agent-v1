@@ -11,6 +11,7 @@ the authenticated request path.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -30,16 +31,47 @@ def _ledger_settings(path: Path) -> SimpleNamespace:
     return SimpleNamespace(opip_ai_router_usage_path=str(path))
 
 
-def _usage(status: str, *, latency: int = 1_000, error_code: str | None = None) -> dict:
+def _router_record(
+    status: str,
+    *,
+    latency_ms: int = 1_000,
+    error_type: str | None = None,
+    error_code: str | None = None,
+    error_message: str | None = None,
+    provider_status: str | None = None,
+    incomplete_reason: str | None = None,
+    input_tokens: int = 700,
+    output_tokens: int = 400,
+    reasoning_tokens: int = 0,
+    total_tokens: int = 1_100,
+    candidate_count: int = 3,
+    timestamp_utc: str = "2026-11-08T09:00:00+00:00",
+) -> dict:
+    """One ledger row exactly as ``opip_ai_router._append_router_usage`` writes it.
+
+    The router emits ``status="succeeded"`` for a completed response that
+    satisfied the Chief contract and ``status="failed"`` for every failed
+    provider attempt; the remaining diagnostic fields are null on success.
+    """
     return {
-        "timestamp_utc": "2026-11-08T09:00:00+00:00",
+        "timestamp_utc": timestamp_utc,
         "provider": "openai",
         "model": "gpt-5",
         "route_tier": "premium",
-        "candidate_count": 3,
-        "latency_ms": latency,
+        "route_reason": "reasoning model for a Chief review",
+        "reasoning_effort": "medium",
+        "candidate_count": candidate_count,
+        "latency_ms": latency_ms,
         "status": status,
+        "error_type": error_type,
         "error_code": error_code,
+        "error_message": error_message,
+        "provider_status": provider_status,
+        "incomplete_reason": incomplete_reason,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "total_tokens": total_tokens,
         "advisory_only": True,
         "funded_trade_authority_changed": False,
     }
@@ -58,9 +90,23 @@ def test_chief_evidence_is_read_from_the_router_ledger(tmp_path):
     _write_jsonl(
         path,
         [
-            _usage("OK", latency=900),
-            _usage("FAILED", latency=1_500, error_code="EMPTY_RESPONSE"),
-            _usage("FAILED", latency=2_100, error_code="PROVIDER_TIMEOUT"),
+            _router_record("succeeded", latency_ms=900),
+            _router_record(
+                "failed",
+                latency_ms=1_500,
+                error_type="ChiefReviewError",
+                error_code="EMPTY_RESPONSE",
+                error_message="AI provider returned an empty response",
+                provider_status="incomplete",
+            ),
+            _router_record(
+                "failed",
+                latency_ms=2_100,
+                error_type="APITimeoutError",
+                error_code="PROVIDER_TIMEOUT",
+                error_message="AI provider timed out",
+            ),
+            _router_record("succeeded", latency_ms=3_000, reasoning_tokens=550),
         ],
     )
 
@@ -71,17 +117,119 @@ def test_chief_evidence_is_read_from_the_router_ledger(tmp_path):
     assert payload["source"] == "CANONICAL_DIRECT"
     assert payload["verification"] == "UNPROJECTED"
     summary = payload["summary"]
-    assert summary["inferences"] == 3
-    assert summary["succeeded"] == 1
+    # The router's real vocabulary, not a synthetic one.
+    assert summary["statuses"] == {"succeeded": 2, "failed": 2}
+    assert summary["succeeded"] == 2
     assert summary["failed"] == 2
+    assert summary["unclassified"] == 0
+    assert summary["inferences"] == 4
+    # The counts reconcile to the rows actually read.
+    assert summary["reconciles"] is True
+    assert (
+        summary["inferences"]
+        == summary["succeeded"] + summary["failed"] + summary["unclassified"]
+    )
     assert summary["failure_codes"] == {"EMPTY_RESPONSE": 1, "PROVIDER_TIMEOUT": 1}
-    assert summary["statuses"] == {"OK": 1, "FAILED": 2}
-    assert summary["latency_ms_p50"] == 1_500.0
-    assert summary["models"] == [{"provider": "openai", "model": "gpt-5", "total": 3}]
+    assert summary["latency_ms_p50"] == 1_800.0
+    assert summary["models"] == [{"provider": "openai", "model": "gpt-5", "total": 4}]
     assert summary["funded_trade_authority_changed"] is False
-    assert payload["records_read"] == 3
-    assert len(payload["page"]["rows"]) == 3
-    assert payload["page"]["rows"][0]["verdict"] == "FAILED"
+    assert payload["records_read"] == 4
+    assert len(payload["page"]["rows"]) == 4
+    # The newest row first; a failed row keeps its own diagnostics.
+    assert payload["page"]["rows"][0]["provider_status"] == "succeeded"
+    failed_rows = [row for row in payload["page"]["rows"] if row["provider_status"] == "failed"]
+    assert len(failed_rows) == 2
+    oldest = failed_rows[-1]
+    assert oldest["error_code"] == "EMPTY_RESPONSE"
+    assert oldest["error_type"] == "ChiefReviewError"
+    assert oldest["incomplete_reason"] is None
+    # A ledger row carries no per-candidate advisory verdict.
+    assert all(row["verdict"] is None for row in payload["page"]["rows"])
+
+
+@pytest.mark.acceptance(f"{INCREMENT}/AC-001")
+def test_an_invocation_is_not_a_completed_response(tmp_path):
+    """ATDD-OPIP-CONTROL-CENTER-EVIDENCE-WIRING-v1/AC-001: only a completed response counts as success."""
+    path = tmp_path / "opip_ai_router_usage.jsonl"
+    # Statuses the router never emits. Each is a recorded row, none is a success,
+    # and none may be silently folded into the failure count either.
+    _write_jsonl(
+        path,
+        [
+            _router_record("invoked"),
+            _router_record("OK"),
+            _router_record("completed"),
+            _router_record("SUCCESS"),
+            _router_record("succeeded"),
+            _router_record("failed", error_code="MALFORMED_JSON"),
+        ],
+    )
+
+    summary = direct.ai(_ledger_settings(path))["summary"]
+
+    assert direct.AI_SUCCESS_STATUSES == frozenset({"succeeded"})
+    assert summary["succeeded"] == 1
+    assert summary["failed"] == 1
+    assert summary["unclassified"] == 4
+    assert summary["inferences"] == 6
+    assert summary["reconciles"] is True
+    # The unrecognised statuses are still reported verbatim.
+    assert summary["statuses"]["invoked"] == 1
+    assert summary["statuses"]["OK"] == 1
+
+
+@pytest.mark.acceptance(f"{INCREMENT}/AC-001")
+def test_the_bounded_window_is_not_presented_as_an_all_time_total(tmp_path):
+    """ATDD-OPIP-CONTROL-CENTER-EVIDENCE-WIRING-v1/AC-001: a bounded window says so."""
+    path = tmp_path / "opip_ai_router_usage.jsonl"
+    rows = [
+        _router_record(
+            "succeeded",
+            timestamp_utc=f"2026-11-08T09:{index // 60:02d}:{index % 60:02d}+00:00",
+        )
+        for index in range(direct.MAX_AI_USAGE_ROWS + 100)
+    ]
+    _write_jsonl(path, rows)
+
+    payload = direct.ai(_ledger_settings(path))
+
+    assert payload["records_read"] == direct.MAX_AI_USAGE_ROWS
+    assert payload["window_records"] == direct.MAX_AI_USAGE_ROWS
+    assert payload["window_limit"] == direct.MAX_AI_USAGE_ROWS
+    assert payload["window_complete"] is False
+    assert payload["truncated"] is True
+    summary = payload["summary"]
+    assert summary["inferences"] == direct.MAX_AI_USAGE_ROWS
+    # What it counts, and over what: neither a trade nor an all-time total.
+    assert summary["metric_subject"] == "PROVIDER_INVOCATION_ATTEMPTS"
+    assert summary["metric_scope"] == "BOUNDED_WINDOW"
+    assert summary["window_limit"] == direct.MAX_AI_USAGE_ROWS
+    assert summary["counts_qualified_trades"] is False
+    assert summary["counts_delivered_alerts"] is False
+
+    # A ledger smaller than the window is reported as fully covered.
+    small_path = tmp_path / "small.jsonl"
+    _write_jsonl(small_path, [_router_record("succeeded")])
+    small = direct.ai(_ledger_settings(small_path))
+    assert small["window_complete"] is True
+    assert small["truncated"] is False
+
+
+@pytest.mark.acceptance(f"{INCREMENT}/AC-001")
+def test_the_reader_vocabulary_matches_the_router_source():
+    """ATDD-OPIP-CONTROL-CENTER-EVIDENCE-WIRING-v1/AC-001: one authority for the status vocabulary."""
+    router = (APP_ROOT / "app" / "services" / "opip_ai_router.py").read_text(encoding="utf-8")
+    emitted = set(
+        re.findall(r'_append_router_usage\((?:(?!status=).)*?status="([^"]+)"', router, re.S)
+    )
+    assert emitted, "the router source no longer declares a ledger status"
+    # Every status the router can write is classified by the reader.
+    assert emitted <= direct.AI_KNOWN_STATUSES
+    # Exactly one of them is a success, and it is the one the router uses for a
+    # completed response that satisfied the Chief contract.
+    assert direct.AI_SUCCESS_STATUSES == frozenset({"succeeded"})
+    assert "succeeded" in emitted
+    assert "failed" in emitted
 
 
 @pytest.mark.acceptance(f"{INCREMENT}/AC-001")
@@ -114,7 +262,7 @@ def test_ai_absence_states_are_distinguished_and_never_claim_success(tmp_path):
 def test_a_truncated_ledger_tail_does_not_hide_the_readable_rows(tmp_path):
     """ATDD-OPIP-CONTROL-CENTER-EVIDENCE-WIRING-v1/AC-001: a partially written row is dropped, not fatal, and not silent."""
     path = tmp_path / "opip_ai_router_usage.jsonl"
-    _write_jsonl(path, [_usage("OK")], trailing=b'{"timestamp_utc":"2026-11-08T09:01:00')
+    _write_jsonl(path, [_router_record("succeeded")], trailing=b'{"timestamp_utc":"2026-11-08T09:01:00')
 
     payload = direct.ai(_ledger_settings(path))
 

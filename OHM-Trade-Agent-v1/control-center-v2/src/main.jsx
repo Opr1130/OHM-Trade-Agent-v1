@@ -370,8 +370,15 @@ function AiWorkspace({aiPayload}){
  const summary=aiPayload?.summary||{};
  const rows=Array.isArray(aiPayload?.page?.rows)?aiPayload.page.rows:[];
  const measured=summary.status==='MEASURED';
+ // A ledger row is a provider invocation attempt. It is not a qualified trade,
+ // not an approved candidate and not a delivered alert, and the reader is
+ // bounded - so the count must never read as an all-time total.
+ const ledger=summary.metric_subject==='PROVIDER_INVOCATION_ATTEMPTS';
+ const windowNote=ledger
+  ?`Bounded window: the newest ${metric(summary.window_limit)}${aiPayload?.window_complete===false?' (window full - earlier records exist and are not counted here)':' (the whole ledger fit inside the window)'}`
+  :null;
  const latencySeries=rows.filter(row=>typeof row.duration_ms==='number').slice(0,12)
-  .map(row=>({label:row.symbol||'—',value:Math.round(row.duration_ms)}));
+  .map(row=>({label:row.provider_status||row.verdict||row.model||'—',value:Math.round(row.duration_ms)}));
  return <div className="stack">
   <div className="op-ribbon">
    {[['Verified win rate',summary.win_rate,'OUTCOMES NOT MATURED'],
@@ -389,19 +396,26 @@ function AiWorkspace({aiPayload}){
    {!measured&&<Empty title="No recorded AI inference" detail={String(summary.reason_code||'NO_AI_INFERENCE_SOURCE').replaceAll('_',' ').toLowerCase()}/>}
    {measured&&<div className="stack">
     <div className="op-kpi-rows">
-     <div className="op-kpi-row"><span>Inferences recorded</span><strong>{metric(summary.inferences)}</strong></div>
+     <div className="op-kpi-row"><span>{ledger?'Provider invocations (window)':'Inferences recorded'}</span><strong>{metric(summary.inferences)}</strong></div>
+     {ledger&&<div className="op-kpi-row"><span>Succeeded (completed response)</span><strong className={typeof summary.succeeded==='number'&&summary.succeeded>0?'good':''}>{metric(summary.succeeded)}</strong></div>}
+     {ledger&&<div className="op-kpi-row"><span>Failed invocations</span><strong className={typeof summary.failed==='number'&&summary.failed>0?'bad':''}>{metric(summary.failed)}</strong></div>}
+     {ledger&&<div className="op-kpi-row"><span>Unclassified status</span><strong className={typeof summary.unclassified==='number'&&summary.unclassified>0?'bad':''}>{metric(summary.unclassified)}</strong></div>}
      <div className="op-kpi-row"><span>Matured outcomes</span><strong className="bad">{metric(summary.matured_outcomes)}</strong></div>
      <div className="op-kpi-row"><span>Model identity</span><strong>{summary.models?.length?`${summary.models[0].model} ${summary.models[0].model_version||''}`.trim():'UNVERIFIED'}</strong></div>
      <div className="op-kpi-row"><span>Observed window</span><strong>{summary.first_observed_at_utc?utcWithLocal(summary.first_observed_at_utc).utc:'UNKNOWN'}</strong></div>
     </div>
-    <BarChart series={latencySeries} label="Inference latency by inference (ms)"/>
+    {ledger&&<p className="op-banner" role="status">
+     These are recorded provider invocation attempts from the Chief router's own usage ledger. They are not qualified trades, not approved candidates and not delivered alerts.
+     {windowNote?` ${windowNote}.`:''}
+    </p>}
+    <BarChart series={latencySeries} label="Provider invocation latency (ms)"/>
     <div className="table-scroll"><table>
-     <thead><tr><th>Observed (UTC)</th><th>Asset</th><th>Direction</th><th>Model</th><th>Verdict</th><th>Confidence</th><th>Duration</th><th>Maturity</th></tr></thead>
+     <thead><tr><th>Observed (UTC)</th><th>Asset</th><th>Direction</th><th>Model</th><th>{ledger?'Provider status':'Verdict'}</th><th>Confidence</th><th>Duration</th><th>Maturity</th></tr></thead>
      <tbody>{rows.map(row=><tr key={row.inference_key}>
       <td className="numeric">{row.observed_at_utc?utcWithLocal(row.observed_at_utc).utc:'Not recorded'}</td>
       <td>{row.symbol||'—'}</td><td>{row.direction||'—'}</td>
       <td>{row.model||'—'} {row.model_version||''}</td>
-      <td>{row.verdict||'—'}</td>
+      <td>{row.provider_status||row.verdict||'—'}{row.error_code?` · ${row.error_code}`:''}</td>
       <td className="numeric">{metric(row.confidence,{digits:2})}</td>
       <td className="numeric">{metric(row.duration_ms,{digits:0,unit:'ms'})}</td>
       <td>{row.outcome_maturity||'OUTCOME NOT MATURED'}</td>
