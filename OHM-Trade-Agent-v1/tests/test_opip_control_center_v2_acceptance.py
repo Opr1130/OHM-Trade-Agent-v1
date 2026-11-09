@@ -137,8 +137,16 @@ def test_edge_image_ships_the_approved_public_asset():
 
 
 @pytest.mark.acceptance(f"{INCREMENT}/AC-002")
-def test_read_through_answers_with_real_evidence_when_the_projection_is_absent(tmp_path):
+def test_read_through_answers_with_real_evidence_when_the_projection_is_absent(
+    tmp_path, monkeypatch
+):
     """ATDD-OPIP-CONTROL-CENTER-V2-AC01/AC-002: bounded canonical reads, clearly labelled."""
+    # The AI assertion below is about ABSENCE, so the ledger it reads must be a
+    # path that cannot exist here. Pointing at the container default made the test
+    # depend on whatever a previous run had left on the host.
+    monkeypatch.setattr(
+        direct, "DEFAULT_AI_USAGE_PATH", tmp_path / "absent_ai_router_usage.jsonl"
+    )
     settings = _settings(tmp_path)
     _tree(settings)
     assert not Path(settings.opip_analytics_db_path).exists()
@@ -197,6 +205,9 @@ def test_api_serves_canonical_evidence_when_the_projection_is_missing(tmp_path, 
 
     settings = _settings(tmp_path)
     _tree(settings)
+    monkeypatch.setattr(
+        direct, "DEFAULT_AI_USAGE_PATH", tmp_path / "absent_ai_router_usage.jsonl"
+    )
     monkeypatch.setattr(control_center_api, "get_settings", lambda: settings)
     monkeypatch.setattr(control_center_api, "_require_secret", lambda value: None)
     app = FastAPI()
@@ -239,8 +250,18 @@ def test_api_serves_canonical_evidence_when_the_projection_is_missing(tmp_path, 
     assert forensics["source"] == "CANONICAL_DIRECT"
 
     ai = client.get("/api/opip/control-center/ai").json()
+    # Contract change (ATDD-OPIP-CONTROL-CENTER-EVIDENCE-WIRING-v1/AC-002): the
+    # surface no longer asserts a single "NO_AI_INFERENCE_SOURCE" for every
+    # absence. It names the deployment fact it actually observed, so an absent
+    # router ledger ("the Chief was never called on this host") is distinguishable
+    # from an empty projection table. Both remain NO_EVIDENCE - no success is
+    # inferred either way - and this assertion is pinned to a path that cannot
+    # exist on a test host.
     assert ai["status"] == "NO_EVIDENCE"
-    assert ai["reason_code"] == "NO_AI_INFERENCE_SOURCE"
+    assert ai["reason_code"] in {"NO_AI_USAGE_LEDGER", "NO_AI_INVOCATION_RECORDED"}
+    assert ai["summary"]["inferences"] == 0
+    assert ai["summary"]["win_rate"] is None
+    assert ai["summary"]["matured_outcomes"] is None
 
 
 @pytest.mark.acceptance(f"{INCREMENT}/AC-003")

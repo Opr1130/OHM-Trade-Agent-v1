@@ -37,7 +37,40 @@ MAX_COMPARISON_ROWS = 24
 MAX_ATTEMPT_EVENTS = 400
 MAX_SNAPSHOT_ATTEMPTS = 3
 MAX_SNAPSHOT_ROWS = 400
+MAX_AI_USAGE_ROWS = 500
+MAX_AI_USAGE_PAGE = 50
 REASON_NO_AI_SOURCE = "NO_AI_INFERENCE_SOURCE"
+
+#: The Chief router writes one row per provider invocation, successful or not,
+#: to this ledger (``app.services.opip_ai_router.ROUTER_USAGE_FILE``). It is the
+#: only persisted artifact that proves an advisory review was *attempted*, so
+#: the AI surface reads it directly. Reporting "no AI source" while this ledger
+#: exists conflated a missing projection with a missing interaction.
+DEFAULT_AI_USAGE_PATH = Path("/app/data/opip_ai_router_usage.jsonl")
+REASON_NO_AI_USAGE_LEDGER = "NO_AI_USAGE_LEDGER"
+REASON_NO_AI_INVOCATION = "NO_AI_INVOCATION_RECORDED"
+REASON_NO_MATURED_AI_OUTCOME = "NO_MATURED_OUTCOME_EVIDENCE"
+#: The derived projection is the only artifact that can answer quarantine,
+#: aging, retention and schema questions; without it those are unknown.
+REASON_PROJECTION_NOT_READABLE = "ANALYTICS_PROJECTION_NOT_READABLE"
+#: The router's authoritative status vocabulary. `app.services.opip_ai_router`
+#: calls `_append_router_usage` with exactly two values: ``"failed"`` in the
+#: per-provider failure branch and ``"succeeded"`` in the completed-response
+#: branch. A test pins this set against the router source so the two cannot drift.
+AI_STATUS_SUCCEEDED = "succeeded"
+AI_STATUS_FAILED = "failed"
+#: Only a completed response that satisfied the Chief contract counts. A bare
+#: invocation, a retry marker or a provider acknowledgement is not a success.
+AI_SUCCESS_STATUSES = frozenset({AI_STATUS_SUCCEEDED})
+AI_KNOWN_STATUSES = frozenset({AI_STATUS_SUCCEEDED, AI_STATUS_FAILED})
+
+#: What one ledger row is, and what it is not. One row is one *provider
+#: invocation attempt*: a single Chief review that falls through a failed provider
+#: writes one ``failed`` row per attempt and one ``succeeded`` row for the call
+#: that answered. A row is therefore not a qualified trade, not an approved
+#: candidate and not a delivered alert.
+METRIC_SUBJECT = "PROVIDER_INVOCATION_ATTEMPTS"
+METRIC_SCOPE_BOUNDED = "BOUNDED_WINDOW"
 
 
 def _num(value: Any) -> float | int | None:
@@ -486,31 +519,185 @@ def data_coverage(settings: Any) -> dict[str, Any]:
         "retention": None,
         "retention_preview": None,
         "retention_runs": [],
-        "quarantine_backlog": 0,
-        "aging": {},
+        # A quarantine backlog, an aging histogram and a schema version are
+        # properties of the derived projection. Without it they are unknown, and
+        # ``0`` would be an assertion that nothing is quarantined.
+        "quarantine_backlog": None,
+        "aging": None,
         "schema_version": None,
+        "projection_reason_code": REASON_PROJECTION_NOT_READABLE,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         **provenance(),
     }
 
 
-def ai(_settings: Any) -> dict[str, Any]:
-    """No AI inference source is registered, so there is nothing to read."""
+def ai_usage_path(settings: Any) -> Path:
+    """Resolve the Chief router usage ledger without importing the router.
+
+    The router module constructs provider clients, so a read model must not
+    import it merely to learn a path. The configured override exists for tests
+    and alternate mounts; the default mirrors the router's own constant.
+    """
+    configured = str(getattr(settings, "opip_ai_router_usage_path", "") or "").strip()
+    return Path(configured) if configured else DEFAULT_AI_USAGE_PATH
+
+
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return float(ordered[middle])
+    return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
+def _ai_summary(records: list[tuple[dict[str, Any], str]]) -> dict[str, Any]:
+    """Count what the ledger records, and claim nothing it does not.
+
+    Every row is classified by the router's own vocabulary. A status the router
+    does not emit is reported as ``unclassified`` instead of being folded into
+    either success or failure, so the three counts always reconcile to the rows
+    read.
+    """
+    statuses: dict[str, int] = {}
+    failure_codes: dict[str, int] = {}
+    models: dict[tuple[str, str], int] = {}
+    latencies: list[float] = []
+    first_at: str | None = None
+    last_at: str | None = None
+    authority_unchanged = True
+    succeeded = 0
+    failed = 0
+    for record, _sha in records:
+        raw_status = _text(record.get("status"), 32)
+        status = raw_status or "UNRECORDED"
+        statuses[status] = statuses.get(status, 0) + 1
+        normalized = (raw_status or "").strip().lower()
+        if normalized in AI_SUCCESS_STATUSES:
+            succeeded += 1
+        elif normalized == AI_STATUS_FAILED:
+            failed += 1
+        code = _text(record.get("error_code"), 64)
+        if code:
+            failure_codes[code] = failure_codes.get(code, 0) + 1
+        key = (
+            _text(record.get("provider"), 32) or "unknown",
+            _text(record.get("model"), 64) or "unknown",
+        )
+        models[key] = models.get(key, 0) + 1
+        latency = _num(record.get("latency_ms"))
+        if isinstance(latency, (int, float)):
+            latencies.append(float(latency))
+        stamp = _iso(record.get("timestamp_utc"))
+        if stamp:
+            if first_at is None or stamp < first_at:
+                first_at = stamp
+            if last_at is None or stamp > last_at:
+                last_at = stamp
+        if record.get("funded_trade_authority_changed") is not False:
+            authority_unchanged = False
+    total = len(records)
+    unclassified = total - succeeded - failed
+    ordered_models = sorted(models.items(), key=lambda item: (-item[1], item[0]))
     return {
-        "status": queries.STATUS_NO_EVIDENCE,
-        "reason_code": REASON_NO_AI_SOURCE,
-        "summary": {
-            "status": queries.STATUS_NO_EVIDENCE,
-            "reason_code": REASON_NO_AI_SOURCE,
-            "inferences": 0,
-            "matured_outcomes": 0,
-            "win_rate": None,
-            "false_signal_rate": None,
-            "missed_opportunity_rate": None,
-            "latency_ms_p50": None,
-            "metrics_reason": REASON_NO_AI_SOURCE,
+        "status": queries.STATUS_MEASURED if total else queries.STATUS_NO_EVIDENCE,
+        "reason_code": None if total else REASON_NO_AI_INVOCATION,
+        # What is counted, and over what. A window of 500 rows is not an
+        # all-time total, and an invocation attempt is not a trade or an alert.
+        "metric_subject": METRIC_SUBJECT,
+        "metric_scope": METRIC_SCOPE_BOUNDED,
+        "window_limit": MAX_AI_USAGE_ROWS,
+        "counts_qualified_trades": False,
+        "counts_delivered_alerts": False,
+        "counts_successful_advisory_reviews_only": False,
+        "inferences": total,
+        "succeeded": succeeded,
+        "failed": failed,
+        "unclassified": unclassified,
+        "reconciles": total == succeeded + failed + unclassified,
+        "statuses": statuses,
+        "failure_codes": failure_codes,
+        "models": [
+            {"provider": provider, "model": model, "total": count}
+            for (provider, model), count in ordered_models[:5]
+        ],
+        "first_observed_at_utc": first_at,
+        "last_observed_at_utc": last_at,
+        # No maturity join exists for a raw invocation, so no rate is claimed.
+        "matured_outcomes": None,
+        "win_rate": None,
+        "false_signal_rate": None,
+        "missed_opportunity_rate": None,
+        "latency_ms_p50": _median(latencies),
+        "metrics_reason": REASON_NO_MATURED_AI_OUTCOME,
+        "funded_trade_authority_changed": False if authority_unchanged else None,
+    }
+
+
+def ai(settings: Any) -> dict[str, Any]:
+    """Recorded Chief invocation evidence, read from the router usage ledger.
+
+    Three states are distinguished, because an operator acts differently on
+    each: the ledger is absent (deployment fact), the ledger exists but holds no
+    invocation (the stage never ran), and the ledger holds invocations (with
+    their outcomes and failure codes). No success is inferred from absence.
+    """
+    path = ai_usage_path(settings)
+    records = _tail_records(path, MAX_AI_USAGE_ROWS)
+    summary = _ai_summary(records)
+    if not records:
+        reason = REASON_NO_AI_USAGE_LEDGER if not path.is_file() else REASON_NO_AI_INVOCATION
+        summary["reason_code"] = reason
+    page_rows = []
+    for record, sha in reversed(records[-MAX_AI_USAGE_PAGE:]):
+        page_rows.append(
+            {
+                "inference_key": sha[:32],
+                "observed_at_utc": _iso(record.get("timestamp_utc")),
+                # The router records one batch review attempt, not a per-symbol
+                # verdict, so these stay null rather than being filled from the
+                # request.
+                "symbol": None,
+                "direction": None,
+                "provider": _text(record.get("provider"), 32),
+                "model": _text(record.get("model"), 64),
+                "model_version": None,
+                # ``provider_status`` is the invocation outcome. ``verdict`` is a
+                # per-candidate advisory verdict, which this ledger does not hold.
+                "provider_status": _text(record.get("status"), 32) or "UNRECORDED",
+                "verdict": None,
+                "confidence": None,
+                "duration_ms": _num(record.get("latency_ms")),
+                "outcome_maturity": "NOT_MATURED",
+                "error_type": _text(record.get("error_type"), 64),
+                "error_code": _text(record.get("error_code"), 64),
+                "incomplete_reason": _text(record.get("incomplete_reason"), 64),
+                "candidate_count": _num(record.get("candidate_count")),
+                "route_tier": _text(record.get("route_tier"), 32),
+                "record_sha256": sha,
+            }
+        )
+    return {
+        "status": summary["status"],
+        "reason_code": summary["reason_code"],
+        "summary": summary,
+        "page": {
+            "status": queries.STATUS_MEASURED if page_rows else queries.STATUS_NO_EVIDENCE,
+            "reason_code": None if page_rows else summary["reason_code"],
+            "rows": page_rows,
+            "page_size": MAX_AI_USAGE_PAGE,
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         },
-        "page": {"status": queries.STATUS_NO_EVIDENCE, "rows": []},
+        "ledger_path": str(path),
+        # The reader is bounded. ``window_complete`` states whether the whole
+        # ledger was inside the window, so a 500-row count is never presented as
+        # an all-time total.
+        "window_limit": MAX_AI_USAGE_ROWS,
+        "window_records": len(records),
+        "window_complete": len(records) < MAX_AI_USAGE_ROWS,
+        "records_read": len(records),
+        "truncated": len(records) >= MAX_AI_USAGE_ROWS,
         **provenance(),
     }
 
@@ -601,6 +788,15 @@ def health_block(settings: Any, *, window_days: int = 0, limit: int = 200) -> di
         "db_bytes": None,
         "wal_bytes": None,
         "window_days": window_days or None,
-        "projection": {"status": "UNAVAILABLE", "reason_code": "ANALYTICS_DB_UNAVAILABLE"},
+        "projection": {
+            "status": "UNAVAILABLE",
+            "reason_code": "ANALYTICS_DB_UNAVAILABLE",
+            "detail": (
+                "the derived analytical projection is not readable; this release "
+                "does not schedule its maintenance entrypoint "
+                "(python -m app.jobs.opip_analytics_maintenance ingest), so every "
+                "figure here is an unprojected canonical read"
+            ),
+        },
         **provenance(),
     }

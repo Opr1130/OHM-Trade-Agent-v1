@@ -42,6 +42,15 @@ router = APIRouter()
 
 REASON_DB_UNAVAILABLE = "ANALYTICS_DB_UNAVAILABLE"
 REASON_QUERY_TIMEOUT = "ANALYTICS_QUERY_TIMEOUT"
+#: The projection is not a broken component: its maintenance entrypoint is
+#: deliberately unscheduled in this release, so a missing DB is a known
+#: deployment fact rather than an incident. Say which, so the operator knows the
+#: difference between "run ingestion" and "the projection is corrupt".
+PROJECTION_ABSENT_DETAIL = (
+    "the derived analytical projection is absent; this release does not schedule "
+    "python -m app.jobs.opip_analytics_maintenance ingest, so the projection stays "
+    "empty until an operator runs it with the dual credential"
+)
 
 
 def _require_secret(value: str | None) -> None:
@@ -111,6 +120,9 @@ def _note_fallback(
 ) -> dict[str, Any]:
     """Stamp a read-through payload with the projection state that caused it."""
     payload["projection"] = {"status": projection_status, "reason_code": reason_code}
+    if reason_code == REASON_DB_UNAVAILABLE:
+        # Name the actual blocker instead of leaving the operator to infer it.
+        payload["projection"]["detail"] = PROJECTION_ABSENT_DETAIL
     payload["projection_fallback"] = True
     return payload
 
@@ -349,10 +361,27 @@ def control_center_ai(
     _require_secret(x_webhook_secret)
 
     def build(conn: sqlite3.Connection) -> dict[str, Any]:
+        summary = queries.ai_summary(conn)
+        page = queries.ai_page(conn, limit=limit)
+        if summary.get("status") != "MEASURED" or page.get("status") != "MEASURED":
+            # An empty inference table means the projection never received
+            # inference evidence, not that the provider was never called. The
+            # router's own usage ledger answers that question, so read through
+            # instead of reporting a missing source.
+            direct_payload = direct.ai(get_settings())
+            if direct_payload["summary"].get("status") == "MEASURED":
+                direct_payload["projection"] = {
+                    "status": summary.get("status"),
+                    "reason_code": summary.get("reason_code") or page.get("reason_code"),
+                }
+                direct_payload["projection_fallback"] = True
+                direct_payload["status"] = "MEASURED"
+                direct_payload["generated_at_utc"] = runtime._utc().isoformat()
+                return direct_payload
         return {
             "status": "MEASURED",
-            "summary": queries.ai_summary(conn),
-            "page": queries.ai_page(conn, limit=limit),
+            "summary": summary,
+            "page": page,
             "generated_at_utc": runtime._utc().isoformat(),
         }
 

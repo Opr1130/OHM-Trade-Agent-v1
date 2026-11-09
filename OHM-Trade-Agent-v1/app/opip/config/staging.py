@@ -182,6 +182,21 @@ def effective_values(settings: Any) -> dict[str, Any]:
         )
         put("scanner.max_candidates", policy.scoring.get("max_candidates"), str(source_path))
         put("ai.mode", policy.ai_advisory.get("mode"), str(source_path))
+        # The bundled/reference profile *declares* a production scorer. It is
+        # validated reference metadata: only the deployment environment selects
+        # the scorer, so both are reported and reconciled rather than letting one
+        # silently stand in for the other.
+        put(
+            "scoring.production_declared",
+            policy.scoring.get("production"),
+            str(source_path),
+        )
+        put("scoring.shadow_declared", policy.scoring.get("shadow"), str(source_path))
+        put(
+            "scoring.target_production_declared",
+            policy.scoring.get("target_production"),
+            str(source_path),
+        )
         protection = document.get("protection") or {}
         put(
             "f11.allow_funded_orders",
@@ -481,6 +496,64 @@ def stage(
     }
 
 
+def scoring_authority_reconciliation(effective: Mapping[str, Any]) -> dict[str, Any]:
+    """Reconcile the declared production scorer with the deployed selector.
+
+    Two artifacts answer "which scorer is production?":
+
+    * the versioned reference profile (``app/core/strategy_policy.json``), whose
+      ``scoring.production`` is validated reference metadata, and
+    * ``OPIP_PRODUCTION_SCORING_VERSION``, which is what the scanner and the core
+      actually select on.
+
+    A controller reporting either one as the other is how an operator comes to
+    believe a scorer changed when it did not. The reconciliation is read-only and
+    never activates, stages or reverts a scorer.
+    """
+    declared = (effective.get("scoring.production_declared") or {}).get("value")
+    shadow = (effective.get("scoring.shadow_declared") or {}).get("value")
+    target = (effective.get("scoring.target_production_declared") or {}).get("value")
+    selector_entry = effective.get("v2.production_selector") or {}
+    selector = selector_entry.get("value")
+    base = {
+        "declared": declared,
+        "shadow": shadow,
+        "target": target,
+        "selector": selector,
+        "selector_source": selector_entry.get("source"),
+        "mutates_runtime": False,
+    }
+    if not selector:
+        return {
+            **base,
+            "state": "UNVERIFIED",
+            "detail": (
+                "OPIP_PRODUCTION_SCORING_VERSION is not present in this process, so the "
+                "effective production scorer cannot be proven from the console. The "
+                "declared value below is reference metadata, not an activation."
+            ),
+        }
+    if selector == declared:
+        return {
+            **base,
+            "state": "MATCH",
+            "detail": (
+                "The deployment selects the scorer the reference profile declares. No "
+                "authority transition is implied by this agreement."
+            ),
+        }
+    return {
+        **base,
+        "state": "REFERENCE_DRIFT",
+        "detail": (
+            f"The reference profile declares production={declared} while this process "
+            f"selects {selector}. Selection authority is the deployment environment "
+            "variable; the profile is validated reference metadata that cannot activate "
+            "or revert a scorer on its own. Nothing on this surface changes it."
+        ),
+    }
+
+
 def overview(conn: Any | None, settings: Any) -> dict[str, Any]:
     """Everything the Admin Console needs to render itself honestly."""
     effective = effective_values(settings)
@@ -515,6 +588,9 @@ def overview(conn: Any | None, settings: Any) -> dict[str, Any]:
         "registry_version": 1,
         "domains": domains,
         "effective": effective,
+        "authority_reconciliation": scoring_authority_reconciliation(
+            effective.get("values") or {}
+        ),
         "activation": {
             "console_can_activate": False,
             "authority": "EXISTING_PROTECTED_STRATEGY_ADMIN_ENDPOINTS",
