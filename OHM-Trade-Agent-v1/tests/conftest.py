@@ -1,6 +1,34 @@
+from __future__ import annotations
+
 import os
 
 import pytest
+
+# ---------------------------------------------------------------------------
+# Hermetic acceptance-suite bootstrap.
+#
+# `Settings` declares `webhook_secret: str = Field(min_length=12)` with no
+# default, so constructing settings raises unless the deployment's `.env`
+# supplies it. A workstation without a local `.env` therefore turned 16
+# unrelated tests red, and because `get_settings()` is cached the failures even
+# depended on collection order. CI supplies a runtime identity but not this
+# boot field, so the same latent trap existed there.
+#
+# These two defaults make the suite independent of the shell that launched it.
+# They are intentionally narrow:
+#
+# * WEBHOOK_SECRET is a required boot field that no test asserts on; the value
+#   is a placeholder, never a credential.
+# * APP_ENV mirrors `.github/workflows/pytest.yml` exactly, so a local run and a
+#   CI run agree. It is NOT a safety switch: the fail-closed behaviour of the
+#   runtime-identity authority is proven by tests that set or delete APP_ENV
+#   explicitly (tests/test_opip_runtime_authority_failclosed_v1.py), so this
+#   default cannot mask a fail-open regression.
+#
+# `setdefault` only fills a gap: an operator who exports either value keeps it.
+# ---------------------------------------------------------------------------
+os.environ.setdefault("WEBHOOK_SECRET", "test-only-placeholder-not-a-secret")
+os.environ.setdefault("APP_ENV", "test")
 
 from app.jobs import scan_opportunities
 from app.services import (
