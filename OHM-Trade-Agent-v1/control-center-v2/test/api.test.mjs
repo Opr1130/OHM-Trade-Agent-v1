@@ -198,19 +198,21 @@ test('F11 renders from recorded protection evidence, never from a default',()=>{
 });
 // A router-ledger count is provider invocation attempts in a bounded window. It
 // is not a qualified trade, not a delivered alert, and not an all-time total.
+// The figures below are an arbitrary fixture: they are not measured production
+// counts and must not be read as evidence of any real ledger total.
 test('ledger-derived AI counts are labelled as bounded invocation attempts',()=>{
  const ledgerHealth={projection:{status:'MEASURED',kpi:{status:'NO_EVIDENCE'},
   ai:{status:'MEASURED',metric_subject:'PROVIDER_INVOCATION_ATTEMPTS',metric_scope:'BOUNDED_WINDOW',
-      window_limit:500,inferences:458,succeeded:441,failed:17,unclassified:0,matured_outcomes:null,
-      models:[{provider:'openai',model:'gpt-5',total:458}],metrics_reason:'NO_MATURED_OUTCOME_EVIDENCE'}}};
+      window_limit:500,inferences:12,succeeded:9,failed:3,unclassified:0,matured_outcomes:null,
+      models:[{provider:'openai',model:'gpt-5',total:12}],metrics_reason:'NO_MATURED_OUTCOME_EVIDENCE'}}};
  const ledgerCard=kpiCards(ledgerHealth).find(card=>card.id==='ai');
  const labels=ledgerCard.rows.map(row=>row.label);
  assert.ok(labels.includes('Provider invocations (bounded window)'),labels.join(' | '));
  assert.ok(!labels.includes('Eligible AI reviews'));
  const count=ledgerCard.rows.find(row=>row.label==='Provider invocations (bounded window)');
- assert.equal(count.value,'458');
+ assert.equal(count.value,'12');
  const split=ledgerCard.rows.find(row=>row.label==='Succeeded / failed');
- assert.equal(split.value,'441 / 17');
+ assert.equal(split.value,'9 / 3');
  assert.match(ledgerCard.source,/opip_ai_router_usage\.jsonl/);
  assert.match(ledgerCard.source,/bounded window/);
  // The projection path keeps its own honest label and source.
