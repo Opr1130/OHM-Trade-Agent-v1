@@ -10,6 +10,7 @@ from app.services.actionable_admission import (
     evaluate_actionable_admission,
     evidence_from_trade_plan,
 )
+from app.services.actionable_card import missing_card_elements, render_actionable_block
 from app.services.entry_exit_advisor import EntryExitPlan
 from app.services.kraken_reconciliation import (
     reconciliation_enabled,
@@ -529,13 +530,14 @@ def send_trade_plan(
     # reservation or send, so a card with missing or stale evidence can never be delivered and
     # can never leave delivery side effects behind. The refusal is a *notification* outcome: the
     # trade itself is untouched.
+    evidence = evidence_from_trade_plan(
+        candidate,
+        plan,
+        execution=execution_evidence or candidate.get("execution_evidence"),
+        observed_at=observed_at,
+    )
     admission = evaluate_actionable_admission(
-        evidence=evidence_from_trade_plan(
-            candidate,
-            plan,
-            execution=execution_evidence or candidate.get("execution_evidence"),
-            observed_at=observed_at,
-        ),
+        evidence=evidence,
         policy=policy,
         now=observed_at,
     )
@@ -602,6 +604,21 @@ def send_trade_plan(
         action=action,
     )
     message = format_primary_new_trade_alert(candidate=candidate, plan=plan)
+    # OPIP-ALERT-ACTIONABLE-ONLY-001 card contract: the delivered card must carry the entry zone,
+    # stop-loss, targets, invalidation, expiry, net reward-to-risk, the setup identity and the
+    # manual-execution statement. If the rendered card is incomplete it is not sent at all.
+    message = (
+        f"{message}\n\n"
+        + render_actionable_block(
+            admission=admission,
+            plan=plan,
+            setup_id=f"QUALIFIED_OPPORTUNITY:{trade_id or plan.symbol}",
+            direction=direction,
+            venue=evidence.venue,
+            instrument=evidence.instrument,
+            observed_at=evidence.observed_at,
+        )
+    )
     candidate["alert_detail"] = format_trade_plan(
         candidate=candidate,
         plan=plan,
@@ -610,6 +627,23 @@ def send_trade_plan(
     key = _alert_state_key(candidate, plan)
     identity = f"QUALIFIED_OPPORTUNITY:{trade_id or plan.symbol}"
     already_queued = queued_alert_fingerprint(trade_id) == key
+
+    incomplete = missing_card_elements(message)
+    if incomplete:
+        # Fail closed: an actionable card that does not state every mandatory plan element is not
+        # a valid notification, so it is refused rather than delivered partially.
+        record_telegram_suppression(
+            identity=identity,
+            alert_family="QUALIFIED_OPPORTUNITY",
+            event_type=action,
+            fingerprint=key,
+            reason="ACTIONABLE_CARD_INCOMPLETE:" + ",".join(incomplete),
+            symbol=plan.symbol,
+            journey_id=candidate.get("journey_id"),
+            signal_id=candidate.get("signal_id"),
+            trade_id=trade_id,
+        )
+        return False
 
     def _queue_tracking_notification(queue_reason: str) -> None:
         if not notify or already_queued or not should_send_trade_plan(candidate, plan):

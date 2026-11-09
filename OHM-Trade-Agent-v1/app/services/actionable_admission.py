@@ -65,10 +65,13 @@ REASON_DIRECTION_MISSING = "DIRECTION_MISSING"
 REASON_NO_ENTRY_TRIGGER = "NO_ENTRY_TRIGGER"
 REASON_TOO_EXTENDED = "TOO_EXTENDED_NOT_ENTRY"
 REASON_ENTRY_ZONE_MISSING = "ENTRY_ZONE_MISSING"
+REASON_ENTRY_PRICE_EVIDENCE_MISSING = "ENTRY_PRICE_EVIDENCE_MISSING"
 REASON_ENTRY_NOT_FEASIBLE = "ENTRY_NOT_FEASIBLE"
+REASON_LIMIT_ENTRY_NOT_EXECUTABLE = "LIMIT_ENTRY_NOT_YET_EXECUTABLE"
 
 REASON_EXECUTION_EVIDENCE_MISSING = "EXECUTION_EVIDENCE_MISSING"
-REASON_LIQUIDITY_INSUFFICIENT = "LIQUIDITY_INSUFFICIENT"
+REASON_LIQUIDITY_INSUFFICIENT = "MARKET_LIQUIDITY_INSUFFICIENT"
+REASON_CAPACITY_INSUFFICIENT = "POSITION_CAPACITY_INSUFFICIENT"
 REASON_SPREAD_TOO_WIDE = "SPREAD_TOO_WIDE"
 REASON_DEPTH_INSUFFICIENT = "DEPTH_INSUFFICIENT"
 REASON_SIZE_SLIPPAGE_EXCESSIVE = "SIZE_SLIPPAGE_EXCESSIVE"
@@ -94,10 +97,20 @@ REASON_FUNDED_AUTHORITY = "FUNDED_AUTHORITY_MUST_REMAIN_DISABLED"
 
 REASON_DELIVERY_IN_FLIGHT = "DELIVERY_IN_FLIGHT"
 
-#: Entry styles that describe a limit entry waiting for a better price. They are admitted only
-#: when the plan also carries a complete, currently reachable entry zone; see the trigger rule.
+#: Entry styles that describe a limit entry at a planned zone. They are admitted only when the
+#: limit is *executable now* (see the trigger rule); a plan still waiting for its condition is a
+#: future setup, not an actionable card.
 LIMIT_ENTRY_STYLES = frozenset(
-    {"wait_for_pullback", "wait_for_rebound", "place_limit", "limit", "limit_entry"}
+    {
+        "wait_for_pullback",
+        "wait_for_rebound",
+        "pullback_or_retest",
+        "breakout_or_retest",
+        "retest",
+        "place_limit",
+        "limit",
+        "limit_entry",
+    }
 )
 
 _DIRECTIONS = frozenset({"LONG", "SHORT"})
@@ -124,12 +137,20 @@ class ActionableNotificationPolicy:
     #: economic gate, and this floor only refuses a card whose own levels are not net-positive
     #: after costs. Raising it is an owner decision made through configuration.
     min_net_reward_to_risk: float = 1.0
-    round_trip_cost_pct: float = 0.60
-    min_liquidity_usd: float = 100_000.0
+    #: Cost model. ``round_trip_fee_pct`` is fees/venue friction only; the measured, direction
+    #: specific market impact travels separately in the evidence and is added exactly once, so no
+    #: cost term is counted twice and the card states the same number the gate used.
+    round_trip_fee_pct: float = 0.52
+    #: Market 24h turnover floor. This is a *market* quality threshold and is never compared with
+    #: the position-capacity ceiling, which is a different fact with a different test.
+    min_market_liquidity_usd: float = 100_000.0
+    #: Share of the venue's visible position-capacity ceiling the contemplated order may consume.
+    max_capacity_utilization_pct: float = 100.0
     max_spread_bps: float = 50.0
     max_size_slippage_pct: float = 1.00
     require_fully_covered_depth: bool = True
-    admit_limit_entries: bool = True
+    #: An executable limit entry is actionable; an unconfirmed future setup never is.
+    admit_executable_limit_entries: bool = True
     require_target_2: bool = False
 
     @classmethod
@@ -162,11 +183,15 @@ class ActionableNotificationPolicy:
             min_net_reward_to_risk=_float(
                 "opip_actionable_min_net_reward_to_risk", base.min_net_reward_to_risk
             ),
-            round_trip_cost_pct=_float(
-                "opip_actionable_round_trip_cost_pct", base.round_trip_cost_pct
+            round_trip_fee_pct=_float(
+                "opip_actionable_round_trip_fee_pct", base.round_trip_fee_pct
             ),
-            min_liquidity_usd=_float(
-                "opip_actionable_min_liquidity_usd", base.min_liquidity_usd
+            min_market_liquidity_usd=_float(
+                "opip_actionable_min_market_liquidity_usd", base.min_market_liquidity_usd
+            ),
+            max_capacity_utilization_pct=_float(
+                "opip_actionable_max_capacity_utilization_pct",
+                base.max_capacity_utilization_pct,
             ),
             max_spread_bps=_float("opip_actionable_max_spread_bps", base.max_spread_bps),
             max_size_slippage_pct=_float(
@@ -176,8 +201,9 @@ class ActionableNotificationPolicy:
                 "opip_actionable_require_fully_covered_depth",
                 base.require_fully_covered_depth,
             ),
-            admit_limit_entries=_bool(
-                "opip_actionable_admit_limit_entries", base.admit_limit_entries
+            admit_executable_limit_entries=_bool(
+                "opip_actionable_admit_executable_limit_entries",
+                base.admit_executable_limit_entries,
             ),
             require_target_2=_bool(
                 "opip_actionable_require_target_2", base.require_target_2
@@ -209,16 +235,23 @@ class ActionableEvidence:
     valid_now: bool | None = None
     entry_trigger_confirmed: bool | None = None
     too_extended: bool | None = None
+    #: The price the decision was actually taken at. Without it the gate cannot judge whether a
+    #: limit is executable now, so it refuses instead of assuming one.
+    current_price: float | None = None
     entry_price: float | None = None
     entry_low: float | None = None
     entry_high: float | None = None
     chase_limit: float | None = None
 
-    # C3 -- market and execution quality
-    liquidity_usd: float | None = None
+    # C3 -- market and execution quality. Two different facts, two different tests:
+    #:   * ``market_liquidity_usd``  -- 24h market turnover: is this market deep enough at all?
+    #:   * ``position_capacity_usd`` -- largest order the visible book can absorb: does the
+    #:     contemplated size fit?
+    market_liquidity_usd: float | None = None
+    position_capacity_usd: float | None = None
+    order_size_usd: float | None = None
     spread_bps: float | None = None
     size_slippage_pct: float | None = None
-    order_size_usd: float | None = None
     depth_covered: bool | None = None
 
     # C4 -- trade geometry
@@ -230,7 +263,9 @@ class ActionableEvidence:
     # C5 -- net economics
     economics_available: bool | None = None
     reward_to_risk_1: float | None = None
-    round_trip_cost_pct: float | None = None
+    #: Assumed venue fees for a round trip. The measured market impact is ``size_slippage_pct``
+    #: above; the gate adds each term once and reports the total it used.
+    round_trip_fee_pct: float | None = None
 
     # C6 -- risk and authority
     deterministic_qualified: bool | None = None
@@ -253,9 +288,19 @@ class ActionableAdmission:
     reasons: tuple[str, ...] = ()
     net_reward_to_risk: float | None = None
     net_edge_pct: float | None = None
+    #: Total round-trip cost actually applied to ``net_reward_to_risk``: assumed fees plus the
+    #: measured, direction-specific market impact, each counted once.
+    effective_cost_pct: float | None = None
     expires_at: datetime | None = None
+    expiry_source: str | None = None
     entry_zone_low: float | None = None
     entry_zone_high: float | None = None
+    current_price: float | None = None
+    entry_trigger_kind: str | None = None
+
+    @property
+    def admitted_plan(self) -> bool:
+        return self.admitted
 
     @property
     def suppressed(self) -> bool:
@@ -277,7 +322,10 @@ class ActionableAdmission:
             "reasons": list(self.reasons),
             "net_reward_to_risk": self.net_reward_to_risk,
             "net_edge_pct": self.net_edge_pct,
+            "effective_cost_pct": self.effective_cost_pct,
             "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+            "expiry_source": self.expiry_source,
+            "entry_trigger_kind": self.entry_trigger_kind,
         }
 
 
@@ -390,70 +438,124 @@ def _check_identity(
     return None
 
 
-def _trigger_confirmed(
+ENTRY_TRIGGER_MARKET = "MARKET_ENTRY_CONFIRMED"
+ENTRY_TRIGGER_LIMIT = "EXECUTABLE_LIMIT_ENTRY"
+ENTRY_TRIGGER_UNCONFIRMED = "UNCONFIRMED_FUTURE_SETUP"
+
+
+def _entry_trigger_kind(
     evidence: ActionableEvidence, policy: ActionableNotificationPolicy
-) -> bool:
-    if evidence.entry_trigger_confirmed is not None:
-        return bool(evidence.entry_trigger_confirmed)
-    if evidence.valid_now is True:
-        return True
+) -> tuple[str, str | None]:
+    """Classify the trigger, separating an executable entry from a future setup.
+
+    A **future setup** is a plan whose condition has not happened yet: the platform is still
+    waiting for a pullback/rebound/retest, so there is nothing to execute. An **executable limit
+    entry** is a resting order the operator can place now at a zone the quote has not run away
+    from. The distinction is decided from authoritative upstream facts --
+    ``entry_trigger_confirmed``, ``valid_now``, the plan's entry style, the analysed
+    ``current_price`` and the chase boundary -- never from "a zone exists".
+    """
+    direction = str(evidence.direction or "").strip().upper()
+    confirmed = evidence.entry_trigger_confirmed
+    if confirmed is False:
+        return ENTRY_TRIGGER_UNCONFIRMED, REASON_NO_ENTRY_TRIGGER
+
+    current = _number(evidence.current_price)
+    low = _number(evidence.entry_low)
+    high = _number(evidence.entry_high)
+    if current is None:
+        # No analysed price: neither an ENTER NOW nor a placeable limit can be proven.
+        return ENTRY_TRIGGER_UNCONFIRMED, REASON_ENTRY_PRICE_EVIDENCE_MISSING
+    if low is None or high is None or low <= 0 or high <= 0 or low > high:
+        return ENTRY_TRIGGER_UNCONFIRMED, REASON_ENTRY_ZONE_MISSING
+
+    chase_limit = _number(evidence.chase_limit)
     style = str(evidence.entry_style or "").strip().lower()
-    if style and style in LIMIT_ENTRY_STYLES:
-        if not policy.admit_limit_entries:
-            return False
-        return _entry_reference(evidence) is not None
-    return False
+
+    if evidence.valid_now is True or (confirmed is True and style not in LIMIT_ENTRY_STYLES):
+        # Market entry: the quote must actually be inside the approved zone.
+        if low <= current <= high:
+            return ENTRY_TRIGGER_MARKET, None
+        if chase_limit is not None:
+            if direction == "LONG" and current > chase_limit:
+                return ENTRY_TRIGGER_UNCONFIRMED, REASON_TOO_EXTENDED
+            if direction == "SHORT" and current < chase_limit:
+                return ENTRY_TRIGGER_UNCONFIRMED, REASON_TOO_EXTENDED
+        return ENTRY_TRIGGER_UNCONFIRMED, REASON_ENTRY_NOT_FEASIBLE
+
+    if style in LIMIT_ENTRY_STYLES and policy.admit_executable_limit_entries:
+        # The limit is placeable now only while the quote has not left the executable window:
+        # beyond the chase boundary the setup is too extended, and past the zone the entry has
+        # already been traded through.
+        if direction == "LONG":
+            if chase_limit is not None and current > chase_limit:
+                return ENTRY_TRIGGER_UNCONFIRMED, REASON_TOO_EXTENDED
+            if current < low:
+                return ENTRY_TRIGGER_UNCONFIRMED, REASON_ENTRY_NOT_FEASIBLE
+        elif direction == "SHORT":
+            if chase_limit is not None and current < chase_limit:
+                return ENTRY_TRIGGER_UNCONFIRMED, REASON_TOO_EXTENDED
+            if current > high:
+                return ENTRY_TRIGGER_UNCONFIRMED, REASON_ENTRY_NOT_FEASIBLE
+        else:
+            return ENTRY_TRIGGER_UNCONFIRMED, REASON_DIRECTION_MISSING
+        return ENTRY_TRIGGER_LIMIT, None
+
+    if style in LIMIT_ENTRY_STYLES:
+        return ENTRY_TRIGGER_UNCONFIRMED, REASON_LIMIT_ENTRY_NOT_EXECUTABLE
+    return ENTRY_TRIGGER_UNCONFIRMED, REASON_NO_ENTRY_TRIGGER
 
 
-def _check_trigger(evidence: ActionableEvidence, *, policy: ActionableNotificationPolicy) -> str | None:
+def _check_trigger(
+    evidence: ActionableEvidence,
+    *,
+    policy: ActionableNotificationPolicy,
+) -> str | None:
     direction = str(evidence.direction or "").strip().upper()
     if direction not in _DIRECTIONS:
         return REASON_DIRECTION_MISSING
     if evidence.too_extended is True:
         return REASON_TOO_EXTENDED
-    if not _trigger_confirmed(evidence, policy):
-        return REASON_NO_ENTRY_TRIGGER
-    reference = _entry_reference(evidence)
-    if reference is None:
-        return REASON_ENTRY_ZONE_MISSING
-    low = _number(evidence.entry_low)
-    high = _number(evidence.entry_high)
-    if low is not None and high is not None and low > high:
-        return REASON_ENTRY_ZONE_MISSING
-    chase_limit = _number(evidence.chase_limit)
-    if chase_limit is not None and direction == "LONG" and reference > chase_limit:
-        return REASON_ENTRY_NOT_FEASIBLE
-    if chase_limit is not None and direction == "SHORT" and reference < chase_limit:
-        return REASON_ENTRY_NOT_FEASIBLE
-    return None
+    _, reason = _entry_trigger_kind(evidence, policy)
+    return reason
 
 
 def _check_execution(
     evidence: ActionableEvidence, *, policy: ActionableNotificationPolicy
 ) -> str | None:
-    """Market/execution quality. A missing mandatory fact blocks; it never passes by default."""
-    liquidity = _number(evidence.liquidity_usd)
-    if liquidity is None:
+    """Market quality and size feasibility, tested separately.
+
+    ``market_liquidity_usd`` answers "is this market deep enough at all" and is compared with the
+    configured market floor. ``position_capacity_usd`` answers "can the visible book absorb the
+    contemplated order" and is compared with the order size -- never with the market floor.
+    Missing evidence blocks; nothing passes by default.
+    """
+    market_liquidity = _number(evidence.market_liquidity_usd)
+    if market_liquidity is None:
         return REASON_EXECUTION_EVIDENCE_MISSING
-    if liquidity < policy.min_liquidity_usd:
+    if market_liquidity < policy.min_market_liquidity_usd:
         return REASON_LIQUIDITY_INSUFFICIENT
-    spread = _number(evidence.spread_bps)
-    if spread is None:
+
+    capacity = _number(evidence.position_capacity_usd)
+    if capacity is None:
         return REASON_EXECUTION_EVIDENCE_MISSING
-    if spread < 0:
+    order_size = _number(evidence.order_size_usd)
+    if order_size is None or order_size <= 0:
+        return REASON_ORDER_SIZE_UNUSABLE
+    allowed_notional = capacity * max(0.0, policy.max_capacity_utilization_pct) / 100.0
+    if capacity <= 0 or order_size > allowed_notional:
+        return REASON_CAPACITY_INSUFFICIENT
+
+    spread = _number(evidence.spread_bps)
+    if spread is None or spread < 0:
         return REASON_EXECUTION_EVIDENCE_MISSING
     if spread > policy.max_spread_bps:
         return REASON_SPREAD_TOO_WIDE
     slippage = _number(evidence.size_slippage_pct)
-    if slippage is None:
-        return REASON_EXECUTION_EVIDENCE_MISSING
-    if slippage < 0:
+    if slippage is None or slippage < 0:
         return REASON_EXECUTION_EVIDENCE_MISSING
     if slippage > policy.max_size_slippage_pct:
         return REASON_SIZE_SLIPPAGE_EXCESSIVE
-    order_size = _number(evidence.order_size_usd)
-    if order_size is None or order_size <= 0:
-        return REASON_ORDER_SIZE_UNUSABLE
     if policy.require_fully_covered_depth and evidence.depth_covered is not True:
         return REASON_DEPTH_INSUFFICIENT
     return None
@@ -501,6 +603,24 @@ def _check_geometry(
     return None
 
 
+def effective_round_trip_cost_pct(
+    evidence: ActionableEvidence, policy: ActionableNotificationPolicy
+) -> float | None:
+    """Total round-trip cost used by *both* the net R:R and the rendered card.
+
+    Assumed venue fees (``round_trip_fee_pct``) and the measured, direction-specific market
+    impact (``size_slippage_pct``) are added exactly once each. A measured impact that is absent
+    cannot be defaulted, so the result is ``None`` and the gate refuses.
+    """
+    fee = _number(evidence.round_trip_fee_pct)
+    if fee is None:
+        fee = policy.round_trip_fee_pct
+    drag = _number(evidence.size_slippage_pct)
+    if fee is None or drag is None or fee < 0 or drag < 0:
+        return None
+    return fee + drag
+
+
 def _check_economics(
     evidence: ActionableEvidence, *, policy: ActionableNotificationPolicy
 ) -> str | None:
@@ -508,9 +628,9 @@ def _check_economics(
     if evidence.economics_available is not True:
         return REASON_ECONOMICS_UNAVAILABLE
     reference = _entry_reference(evidence)
-    cost_pct = _number(evidence.round_trip_cost_pct)
+    cost_pct = effective_round_trip_cost_pct(evidence, policy)
     if cost_pct is None:
-        cost_pct = policy.round_trip_cost_pct
+        return REASON_NET_RR_NOT_COMPUTABLE
     net_rr = cost_adjusted_reward_to_risk(
         entry=reference,
         stop=_number(evidence.stop_price),
@@ -587,30 +707,40 @@ def evaluate_actionable_admission(
     )
     failures = [(condition, reason) for condition, reason in evaluated if reason]
     expiry = _resolved_expiry(evidence, applied, now=moment)
-    cost_pct = _number(evidence.round_trip_cost_pct)
-    if cost_pct is None:
-        cost_pct = applied.round_trip_cost_pct
+    expiry_source = (
+        "explicit"
+        if _utc(evidence.expires_at) is not None
+        else ("policy_validity_window" if expiry is not None else None)
+    )
+    cost_pct = effective_round_trip_cost_pct(evidence, applied)
     reference = _entry_reference(evidence)
     target = _number(evidence.target_1)
-    net_rr = cost_adjusted_reward_to_risk(
-        entry=reference,
-        stop=_number(evidence.stop_price),
-        target=target,
-        round_trip_cost_pct=cost_pct,
-    )
+    net_rr: float | None = None
     net_edge: float | None = None
-    if reference is not None and reference > 0 and target is not None:
-        net_edge = projected_net_edge_pct(
-            gross_target_move_pct=abs(target - reference) / reference * 100.0,
-            round_trip_fee_pct=cost_pct,
+    if cost_pct is not None:
+        net_rr = cost_adjusted_reward_to_risk(
+            entry=reference,
+            stop=_number(evidence.stop_price),
+            target=target,
+            round_trip_cost_pct=cost_pct,
         )
+        if reference is not None and reference > 0 and target is not None:
+            net_edge = projected_net_edge_pct(
+                gross_target_move_pct=abs(target - reference) / reference * 100.0,
+                round_trip_fee_pct=cost_pct,
+            )
+    trigger_kind, _ = _entry_trigger_kind(evidence, applied)
     common = {
         "policy_version": applied.version,
         "net_reward_to_risk": net_rr,
         "net_edge_pct": net_edge,
+        "effective_cost_pct": cost_pct,
         "expires_at": expiry,
+        "expiry_source": expiry_source,
         "entry_zone_low": _number(evidence.entry_low),
         "entry_zone_high": _number(evidence.entry_high),
+        "current_price": _number(evidence.current_price),
+        "entry_trigger_kind": trigger_kind,
     }
     if failures:
         condition, reason = failures[0]
@@ -632,30 +762,39 @@ def execution_evidence_from_snapshot(
 ) -> dict[str, Any]:
     """Extract the deterministic execution facts the scanner already validated.
 
-    Nothing is computed here: ``spread_bps``, the measured visible round-trip market drag and the
-    full-coverage flags come from
-    :class:`app.scanner.execution_validation.ExecutionValidation`. A missing
-    ``execution_validation`` yields an empty mapping so the admission gate refuses with
+    Nothing is computed here. Every value is the venue's own measurement from
+    :class:`app.scanner.execution_validation.ExecutionValidation`, and the two direction-specific
+    facts are read from the matching leg, because a LONG entry buys into the asks while a SHORT
+    entry sells into the bids:
+
+    * LONG  -> ``buy_fully_covered`` and the long round-trip drag;
+    * SHORT -> ``sell_fully_covered`` and the short round-trip drag.
+
+    A missing ``execution_validation`` yields an empty mapping so the gate refuses with
     ``EXECUTION_EVIDENCE_MISSING`` instead of a default pass.
     """
     execution = getattr(snapshot, "execution_validation", None)
     if execution is None:
         return {}
     trade_direction = str(direction or "").strip().upper()
-    drag = _number(getattr(execution, "estimated_visible_round_trip_market_drag_pct", None))
     if trade_direction == "SHORT":
-        short_drag = _number(
+        drag = _number(
             getattr(execution, "estimated_visible_short_round_trip_market_drag_pct", None)
         )
-        if drag is None:
-            drag = short_drag
         covered = getattr(execution, "sell_fully_covered", None)
     else:
+        drag = _number(getattr(execution, "estimated_visible_round_trip_market_drag_pct", None))
         covered = getattr(execution, "buy_fully_covered", None)
     return {
         "spread_bps": _number(getattr(execution, "spread_bps", None)),
         "size_slippage_pct": drag,
         "depth_covered": None if covered is None else bool(covered),
+        "current_price": _number(getattr(snapshot, "last_price", None)),
+        # Market 24h turnover is a different fact from the position-capacity ceiling; the producer
+        # supplies the turnover here and the ceiling through its own capacity evidence.
+        "market_liquidity_usd": _number(
+            getattr(snapshot, "combined_24h_liquidity_usd", None)
+        ),
         "order_size_usd": _number(order_notional_usd),
         "validation_notional_usd": _number(
             getattr(execution, "validation_notional_usd", None)
@@ -668,19 +807,19 @@ def evidence_from_trade_plan(
     plan: Any,
     *,
     execution: Any = None,
-    now: datetime | None = None,
     observed_at: Any = None,
 ) -> ActionableEvidence:
     """Map a qualified candidate and its existing plan onto :class:`ActionableEvidence`.
 
-    Every value is read from evidence another component produced. Keys that are absent stay
-    ``None`` so the gate fails closed with a specific reason rather than assuming a value.
-    ``observed_at`` lets the caller state the scan's own evidence time without mutating the
-    candidate artifact.
+    Every value is read from evidence another component produced. Nothing is defaulted here: the
+    venue and its identity verdict, the evidence timestamp, the analysed price, the market
+    liquidity, the position-capacity ceiling and the measured impact all stay ``None`` when the
+    upstream producer did not supply them, so the gate fails closed with a specific reason
+    instead of synthesising a pass. ``observed_at`` lets the caller state the scan's own evidence
+    time without mutating the candidate artifact.
     """
     mapping: dict[str, Any] = candidate if isinstance(candidate, dict) else {}
     execution_map: dict[str, Any] = execution if isinstance(execution, dict) else {}
-    moment = _utc(now) or datetime.now(timezone.utc)
 
     def _first(*names: str) -> Any:
         for name in names:
@@ -699,30 +838,29 @@ def evidence_from_trade_plan(
                 return value
         return None
 
+    def _flag(*names: str) -> bool | None:
+        value = _first(*names)
+        return None if value is None else bool(value)
+
+    def _exec_flag(*names: str) -> bool | None:
+        value = _exec_first(*names)
+        return None if value is None else bool(value)
+
     symbol = _text(getattr(plan, "symbol", None)) or _text(_first("symbol", "pair"))
     direction = (
         _text(getattr(plan, "direction", None))
         or _text(_first("direction", "trade_direction"))
         or "LONG"
     ).upper()
-    observed_at_value = _utc(observed_at) or _utc(
-        _first("evidence_observed_at", "observed_at", "generated_at", "alerted_at")
-    )
-    expires_at = _utc(_first("plan_expires_at", "expires_at", "entry_expires_at"))
-    venue = (_text(_first("venue", "exchange")) or "KRAKEN").upper()
-
-    def _flag(*names: str) -> bool | None:
-        value = _first(*names)
-        return None if value is None else bool(value)
-
     depth_covered = _exec_first("depth_covered")
-
     return ActionableEvidence(
         instrument=symbol,
-        venue=venue,
-        venue_identity_valid=bool(symbol) and venue == "KRAKEN",
-        observed_at=observed_at_value or moment,
-        expires_at=expires_at,
+        # Authoritative venue identity supplied by the producer that owns the book/snapshot.
+        venue=_text(_exec_first("venue", "execution_venue")),
+        venue_identity_valid=_exec_flag("venue_identity_valid"),
+        observed_at=_utc(observed_at)
+        or _utc(_first("evidence_observed_at", "observed_at", "generated_at", "alerted_at")),
+        expires_at=_utc(_first("plan_expires_at", "expires_at", "entry_expires_at")),
         episode_id=_text(
             _first("episode_id", "trade_id", "setup_id", "signal_id", "journey_id")
         ),
@@ -733,20 +871,25 @@ def evidence_from_trade_plan(
         valid_now=None if getattr(plan, "valid_now", None) is None else bool(plan.valid_now),
         entry_trigger_confirmed=_flag("entry_trigger_confirmed"),
         too_extended=_flag("too_extended"),
+        current_price=_number(
+            _exec_first("current_price", "reference_price", "price", "last_price")
+        ),
         entry_price=_number(getattr(plan, "entry_high", None)),
         entry_low=_number(getattr(plan, "entry_low", None)),
         entry_high=_number(getattr(plan, "entry_high", None)),
         chase_limit=_number(getattr(plan, "chase_limit", None)),
-        liquidity_usd=_number(
-            _first(
-                "liquidity_capacity_ceiling_usd",
-                "liquidity_usd",
-                "liquidity_24h_usd",
+        # Market turnover and position capacity are distinct facts and are never aliased.
+        market_liquidity_usd=_number(
+            _exec_first(
+                "market_liquidity_usd",
                 "combined_24h_liquidity_usd",
+                "liquidity_24h_usd",
+                "liquidity_usd",
             )
         ),
-        spread_bps=_number(_exec_first("spread_bps")),
-        size_slippage_pct=_number(_exec_first("size_slippage_pct")),
+        position_capacity_usd=_number(
+            _exec_first("position_capacity_usd", "liquidity_capacity_ceiling_usd")
+        ),
         order_size_usd=_number(
             _exec_first(
                 "order_size_usd",
@@ -754,16 +897,19 @@ def evidence_from_trade_plan(
                 "position_notional_usd",
             )
         ),
+        spread_bps=_number(_exec_first("spread_bps")),
+        size_slippage_pct=_number(_exec_first("size_slippage_pct")),
         depth_covered=None if depth_covered is None else bool(depth_covered),
         stop_price=_number(getattr(plan, "stop_price", None)),
         target_1=_number(getattr(plan, "target_1", None)),
         target_2=_number(getattr(plan, "target_2", None)),
         invalidation=_text(
-            _first("invalidation", "invalidation_reason") or getattr(plan, "reason", None)
+            _first("invalidation", "invalidation_reason")
+            or getattr(plan, "reason", None)
         ),
         economics_available=_flag("economic_qualified"),
         reward_to_risk_1=_number(getattr(plan, "reward_to_risk_1", None)),
-        round_trip_cost_pct=_number(_first("round_trip_cost_pct")),
+        round_trip_fee_pct=_number(_first("round_trip_fee_pct")),
         deterministic_qualified=_flag("economic_qualified"),
         risk_gate_passed=_flag("action_gate_allowed"),
         ai_override_attempted=_flag("ai_override_attempted"),
@@ -784,9 +930,15 @@ __all__ = [
     "CONDITION_IDENTITY",
     "CONDITION_RISK",
     "CONDITION_TRIGGER",
+    "ENTRY_TRIGGER_LIMIT",
+    "ENTRY_TRIGGER_MARKET",
+    "ENTRY_TRIGGER_UNCONFIRMED",
+    "LIMIT_ENTRY_STYLES",
     "POLICY_VERSION",
     "SUPPRESSED",
+    "SUPPORTED_VENUES",
     "cost_adjusted_reward_to_risk",
+    "effective_round_trip_cost_pct",
     "evaluate_actionable_admission",
     "evidence_from_trade_plan",
     "execution_evidence_from_snapshot",

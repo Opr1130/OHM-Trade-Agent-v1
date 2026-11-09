@@ -424,30 +424,11 @@ def _retry_one(
             )
             return "TRACKING_PENDING"
 
-    # OPIP-ALERT-ACTIONABLE-ONLY-001: send-time revalidation. A retry can run long after the
-    # queue attempt, so delivery eligibility is enforced again here: an entry plan that has since
-    # expired must never be delivered late. Rows queued before this policy carry no expiry and
-    # keep their previous behaviour.
-    plan_expires_at = _parse_utc(row.get("plan_expires_at"))
-    if plan_expires_at is not None and plan_expires_at <= datetime.now(timezone.utc):
-        _remove(trade_id, token=lease_token)
-        record_telegram_suppression(
-            identity=str(row.get("identity") or f"QUALIFIED_OPPORTUNITY:{trade_id}"),
-            alert_family="QUALIFIED_OPPORTUNITY",
-            event_type=str(row.get("action") or "ACTION"),
-            fingerprint=str(row.get("fingerprint") or ""),
-            reason="ACTIONABLE_GATE:EXPIRY_PASSED",
-            symbol=plan.symbol,
-            journey_id=row.get("journey_id"),
-            signal_id=row.get("signal_id"),
-            trade_id=trade_id,
-        )
-        return "SUPPRESSED"
-
+    # A message already accepted for this exact identity/fingerprint is retired first: nothing will
+    # be sent, so this stays safe for rows queued before the admission policy existed.
     identity = str(row.get("identity") or f"QUALIFIED_OPPORTUNITY:{trade_id}")
     fingerprint = str(row.get("fingerprint") or "")
     event_type = action or "ACTION"
-
     accepted = accepted_delivery_message_id(
         identity=identity,
         event_type=event_type,
@@ -456,6 +437,44 @@ def _retry_one(
     if accepted is not None:
         _remove(trade_id, token=lease_token)
         return "ALREADY_DELIVERED"
+
+    # OPIP-ALERT-ACTIONABLE-ONLY-001 send-time revalidation. A retry can run long after the queue
+    # attempt, so delivery eligibility is enforced again here:
+    #   * a row without an admitted-verdict record cannot be proven admissible -> fail closed;
+    #   * an entry plan that has since expired must never be delivered late.
+    stored_admission = row.get("admission")
+    if not isinstance(stored_admission, dict) or str(
+        stored_admission.get("admission") or ""
+    ).upper() != "ADMITTED":
+        _remove(trade_id, token=lease_token)
+        record_telegram_suppression(
+            identity=identity,
+            alert_family="QUALIFIED_OPPORTUNITY",
+            event_type=str(row.get("action") or "ACTION"),
+            fingerprint=fingerprint,
+            reason="ACTIONABLE_GATE:MISSING_ADMISSION_EVIDENCE",
+            symbol=plan.symbol,
+            journey_id=row.get("journey_id"),
+            signal_id=row.get("signal_id"),
+            trade_id=trade_id,
+        )
+        return "SUPPRESSED"
+
+    plan_expires_at = _parse_utc(row.get("plan_expires_at"))
+    if plan_expires_at is not None and plan_expires_at <= datetime.now(timezone.utc):
+        _remove(trade_id, token=lease_token)
+        record_telegram_suppression(
+            identity=identity,
+            alert_family="QUALIFIED_OPPORTUNITY",
+            event_type=str(row.get("action") or "ACTION"),
+            fingerprint=fingerprint,
+            reason="ACTIONABLE_GATE:EXPIRY_PASSED",
+            symbol=plan.symbol,
+            journey_id=row.get("journey_id"),
+            signal_id=row.get("signal_id"),
+            trade_id=trade_id,
+        )
+        return "SUPPRESSED"
 
     policy_identity = str(row.get("policy_identity") or f"{direction}:{plan.symbol}")
     reservation = reserve_emit(

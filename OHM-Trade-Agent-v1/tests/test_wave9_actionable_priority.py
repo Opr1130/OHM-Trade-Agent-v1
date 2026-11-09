@@ -86,6 +86,10 @@ def test_retry_outbox_uses_actionable_policy_class(monkeypatch):
     captured = {}
     row = {
         "trade_id": "Q-PRIORITY",
+        # OPIP-ALERT-ACTIONABLE-ONLY-001: a queued actionable row must carry the admitted verdict
+        # (and its resolved expiry) the producer obtained before it may be retried.
+        "admission": {"admission": "ADMITTED", "policy_version": "opip-actionable-only-v1"},
+        "plan_expires_at": "2999-01-01T00:00:00+00:00",
         "plan": {
             "symbol": "SOLUSD",
             "valid_now": True,

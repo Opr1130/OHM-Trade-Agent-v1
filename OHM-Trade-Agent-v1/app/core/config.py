@@ -108,12 +108,20 @@ class Settings(BaseSettings):
     opip_actionable_max_evidence_age_seconds: int = Field(default=900, ge=60, le=21600)
     opip_actionable_plan_validity_minutes: int = Field(default=720, ge=0, le=10080)
     opip_actionable_min_net_reward_to_risk: float = Field(default=1.0, ge=0.1, le=10.0)
-    opip_actionable_round_trip_cost_pct: float = Field(default=0.60, ge=0.0, le=5.0)
-    opip_actionable_min_liquidity_usd: float = Field(default=100_000.0, gt=0)
+    #: Fees/venue friction only. The measured, direction-specific market impact is added once from
+    #: the execution evidence, so the card's net R/R states the same total the gate used.
+    opip_actionable_round_trip_fee_pct: float = Field(default=0.52, ge=0.0, le=5.0)
+    #: Market 24h turnover floor (market quality). Never compared with the position-capacity
+    #: ceiling, which bounds order size instead.
+    opip_actionable_min_market_liquidity_usd: float = Field(default=100_000.0, gt=0)
+    #: Share of the venue's visible capacity ceiling the contemplated order may consume.
+    opip_actionable_max_capacity_utilization_pct: float = Field(
+        default=100.0, gt=0, le=100.0
+    )
     opip_actionable_max_spread_bps: float = Field(default=50.0, gt=0, le=1000.0)
     opip_actionable_max_size_slippage_pct: float = Field(default=1.0, gt=0, le=10.0)
     opip_actionable_require_fully_covered_depth: bool = True
-    opip_actionable_admit_limit_entries: bool = True
+    opip_actionable_admit_executable_limit_entries: bool = True
     opip_actionable_require_target_2: bool = False
     # PR 2 canonical writer capture. Default off. "shadow" records Early Watch
     # governor transitions into SQLite evidence only; it does not grant trading

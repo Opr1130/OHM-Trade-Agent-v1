@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from app.core.config import get_settings
-from app.exchanges.kraken_identity import canonicalize_asset, split_canonical_pair
+from app.exchanges.kraken_identity import canonicalize_asset, split_canonical_pair, VENUE_ID
 from app.opip.decision.store import append_screening_evaluations, append_qualification_dead_letter
 from app.opip.discovery.admission import (
     build_callback_evaluation,
@@ -2361,11 +2361,22 @@ def main(scan_override=None):
             max_per_window=delivery_cap,
         )
         # OPIP-ALERT-ACTIONABLE-ONLY-001: hand the actionable admission gate the execution facts
-        # this scan already validated, plus the scan's own evidence timestamp. Evidence only:
-        # the candidate artifact is not mutated, so ranking and approval stay byte-identical.
+        # this scan already validated, plus the scan's own evidence timestamp and the venue that
+        # produced the book. Evidence only: the candidate artifact is not mutated, so ranking and
+        # approval stay byte-identical.
         alert_direction = str(
             getattr(plan, "direction", None) or alert.get("trade_direction") or "LONG"
         ).upper()
+        execution_evidence = execution_evidence_from_snapshot(
+            opportunity.snapshot,
+            direction=alert_direction,
+            order_notional_usd=alert.get("economic_position_notional"),
+        )
+        # Authoritative venue and instrument identity from the exchange that produced the book.
+        execution_evidence["venue"] = VENUE_ID
+        execution_evidence["venue_identity_valid"] = (
+            split_canonical_pair(plan.symbol) is not None
+        )
         if send_trade_plan(
             candidate=alert,
             plan=plan,
@@ -2374,11 +2385,7 @@ def main(scan_override=None):
             chat_id=settings.telegram_chat_id,
             notify=notify,
             policy=ActionableNotificationPolicy.from_settings(settings),
-            execution_evidence=execution_evidence_from_snapshot(
-                opportunity.snapshot,
-                direction=alert_direction,
-                order_notional_usd=alert.get("economic_position_notional"),
-            ),
+            execution_evidence=execution_evidence,
             observed_at=decision_at,
         ):
             sent += 1

@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from app.jobs import run_cycle, scan_opportunities
@@ -21,15 +22,31 @@ from app.services.qualified_trade_tracking import (
 #: Execution facts the scan validates before an actionable card may be delivered.
 #: OPIP-ALERT-ACTIONABLE-ONLY-001 fails closed when the mandatory execution evidence is absent,
 #: so fixtures that exercise a successful delivery must carry the same facts production does.
-SCANNER_EVIDENCE = {
-    "liquidity_capacity_ceiling_usd": 2_500_000.0,
-    "economic_position_notional": 500.0,
-    "execution_evidence": {
-        "spread_bps": 6.0,
-        "size_slippage_pct": 0.2,
-        "depth_covered": True,
-    },
-}
+def scanner_evidence() -> dict:
+    """Execution, identity and timing facts the scan supplies for an actionable card.
+
+    Venue identity, the analysed price, the 24h market turnover and the position-capacity ceiling
+    are separate facts; OPIP-ALERT-ACTIONABLE-ONLY-001 refuses a card that omits any of them, and
+    the capacity ceiling is compared with the order size rather than with the turnover floor.
+    """
+    return {
+        "venue": "KRAKEN",
+        "venue_identity_valid": True,
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+        "current_price": 100.0,
+        "market_liquidity_usd": 2_500_000.0,
+        "position_capacity_usd": 2_500.0,
+        "economic_position_notional": 500.0,
+        "execution_evidence": {
+            "venue": "KRAKEN",
+            "venue_identity_valid": True,
+            "market_liquidity_usd": 2_500_000.0,
+            "spread_bps": 6.0,
+            "size_slippage_pct": 0.2,
+            "depth_covered": True,
+            "current_price": 100.0,
+        },
+    }
 
 
 def plan(symbol="SOLUSD"):
@@ -70,6 +87,25 @@ def _patch_pending(tmp_path, monkeypatch):
         chief_alert_notifier,
         "STATE_LOCK_FILE",
         tmp_path / ".alert_state.lock",
+    )
+
+
+def _admitted_verdict(expires_in_hours: float = 4.0):
+    """The verdict a producer always passes when it queues an actionable retry.
+
+    OPIP-ALERT-ACTIONABLE-ONLY-001 fails a retry closed unless the row carries an admitted verdict
+    with a resolved expiry, so the fixture states one explicitly.
+    """
+    from app.services.actionable_admission import POLICY_VERSION, ActionableAdmission
+
+    return ActionableAdmission(
+        admitted=True,
+        policy_version=POLICY_VERSION,
+        net_reward_to_risk=2.0,
+        effective_cost_pct=0.72,
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=expires_in_hours),
+        expiry_source="explicit",
+        entry_trigger_kind="MARKET_ENTRY_CONFIRMED",
     )
 
 
@@ -132,7 +168,7 @@ def test_tracking_failure_keeps_qualified_setup_live_and_queues_retry(tmp_path, 
         "action_gate_evaluated": True,
         "action_gate_allowed": True,
         "recommended_capital": 200.0,
-        **SCANNER_EVIDENCE,
+        **scanner_evidence(),
     }
 
     assert not chief_alert_notifier.send_trade_plan(
@@ -194,7 +230,7 @@ def test_reconciliation_identity_mismatch_is_terminal_not_retryable(
         "action_gate_evaluated": True,
         "action_gate_allowed": True,
         "recommended_capital": 200.0,
-        **SCANNER_EVIDENCE,
+        **scanner_evidence(),
     }
 
     assert not chief_alert_notifier.send_trade_plan(
@@ -228,7 +264,7 @@ def test_telegram_failure_keeps_qualified_setup_live_and_queues_retry(tmp_path, 
         "action_gate_evaluated": True,
         "action_gate_allowed": True,
         "recommended_capital": 200.0,
-        **SCANNER_EVIDENCE,
+        **scanner_evidence(),
     }
 
     assert not chief_alert_notifier.send_trade_plan(
@@ -271,6 +307,7 @@ def test_qualified_outbox_retry_delivers_without_rescan(tmp_path, monkeypatch):
         identity=f"QUALIFIED_OPPORTUNITY:{setup.trade_id}",
         fingerprint="fp",
         reason="DELIVERY_PENDING",
+        admission=_admitted_verdict(),
     )
     monkeypatch.setattr(qualified_alert_outbox, "accepted_delivery_message_id", lambda **kwargs: None)
     monkeypatch.setattr(qualified_alert_outbox, "reserve_emit", lambda **kwargs: "reserve")
@@ -367,7 +404,7 @@ def test_notifier_consumes_pre_evaluated_action_gate(tmp_path, monkeypatch):
         "action_gate_evaluated": True,
         "action_gate_allowed": True,
         "recommended_capital": 200.0,
-        **SCANNER_EVIDENCE,
+        **scanner_evidence(),
     }
 
     assert chief_alert_notifier.send_trade_plan(
@@ -537,7 +574,7 @@ def _reservation_candidate():
         "action_gate_evaluated": True,
         "action_gate_allowed": True,
         "recommended_capital": 200.0,
-        **SCANNER_EVIDENCE,
+        **scanner_evidence(),
     }
 
 
@@ -705,7 +742,7 @@ def test_send_trade_plan_retains_recovery_record_when_terminalization_unconfirme
         "action_gate_evaluated": True,
         "action_gate_allowed": True,
         "recommended_capital": 200.0,
-        **SCANNER_EVIDENCE,
+        **scanner_evidence(),
     }
 
     assert not chief_alert_notifier.send_trade_plan(

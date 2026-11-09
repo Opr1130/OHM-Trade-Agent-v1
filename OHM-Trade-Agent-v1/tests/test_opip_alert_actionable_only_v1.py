@@ -55,6 +55,8 @@ pytestmark = pytest.mark.acceptance
 NOW = datetime(2026, 11, 9, 12, 0, tzinfo=timezone.utc)
 
 #: A complete, validated, manual LONG trade plan. Each test removes exactly one thing from it.
+#: Facts stay distinct: ``market_liquidity_usd`` is 24h turnover, ``position_capacity_usd`` is the
+#: largest order the book can absorb, and ``size_slippage_pct`` is the measured impact.
 BASE_EVIDENCE = {
     "instrument": "SOLUSD",
     "venue": "KRAKEN",
@@ -65,6 +67,7 @@ BASE_EVIDENCE = {
     "direction": "LONG",
     "entry_style": "enter_now",
     "valid_now": True,
+    "current_price": 100.0,
     "entry_price": 100.0,
     "entry_low": 99.5,
     "entry_high": 100.5,
@@ -73,10 +76,11 @@ BASE_EVIDENCE = {
     "target_1": 108.0,
     "target_2": 112.0,
     "invalidation": "close below 97.00",
-    "liquidity_usd": 2_400_000.0,
+    "market_liquidity_usd": 2_400_000.0,
+    "position_capacity_usd": 5_000.0,
+    "order_size_usd": 750.0,
     "spread_bps": 8.0,
     "size_slippage_pct": 0.25,
-    "order_size_usd": 750.0,
     "depth_covered": True,
     "economics_available": True,
     "deterministic_qualified": True,
@@ -119,12 +123,17 @@ def _candidate(**overrides: object) -> dict:
         "action_gate_evaluated": True,
         "action_gate_allowed": True,
         "economic_position_notional": 750.0,
-        "liquidity_capacity_ceiling_usd": 2_400_000.0,
+        "liquidity_capacity_ceiling_usd": 5_000.0,
         "evidence_observed_at": (NOW - timedelta(minutes=2)).isoformat(),
         "execution_evidence": {
+            "venue": "KRAKEN",
+            "venue_identity_valid": True,
+            "market_liquidity_usd": 2_400_000.0,
+            "position_capacity_usd": 5_000.0,
             "spread_bps": 8.0,
             "size_slippage_pct": 0.25,
             "depth_covered": True,
+            "current_price": 100.0,
         },
     }
     candidate.update(overrides)
@@ -526,14 +535,19 @@ def test_ac_007_critical_protection_bypasses_informational_throttling(
         ({"observed_at": NOW - timedelta(hours=6)}, admission.REASON_EVIDENCE_STALE),
         ({"observed_at": None}, admission.REASON_EVIDENCE_TIMESTAMP_MISSING),
         ({"venue": "BINANCE"}, admission.REASON_VENUE_IDENTITY_INVALID),
+        ({"venue": None}, admission.REASON_VENUE_IDENTITY_INVALID),
+        ({"venue_identity_valid": None}, admission.REASON_VENUE_IDENTITY_INVALID),
         ({"instrument": ""}, admission.REASON_VENUE_IDENTITY_INVALID),
-        ({"liquidity_usd": None}, admission.REASON_EXECUTION_EVIDENCE_MISSING),
-        ({"liquidity_usd": 5_000.0}, admission.REASON_LIQUIDITY_INSUFFICIENT),
+        ({"market_liquidity_usd": None}, admission.REASON_EXECUTION_EVIDENCE_MISSING),
+        ({"market_liquidity_usd": 5_000.0}, admission.REASON_LIQUIDITY_INSUFFICIENT),
+        ({"position_capacity_usd": None}, admission.REASON_EXECUTION_EVIDENCE_MISSING),
+        ({"position_capacity_usd": 500.0}, admission.REASON_CAPACITY_INSUFFICIENT),
         ({"spread_bps": None}, admission.REASON_EXECUTION_EVIDENCE_MISSING),
         ({"spread_bps": 400.0}, admission.REASON_SPREAD_TOO_WIDE),
         ({"size_slippage_pct": 4.0}, admission.REASON_SIZE_SLIPPAGE_EXCESSIVE),
         ({"depth_covered": None}, admission.REASON_DEPTH_INSUFFICIENT),
         ({"order_size_usd": None}, admission.REASON_ORDER_SIZE_UNUSABLE),
+        ({"current_price": None}, admission.REASON_ENTRY_PRICE_EVIDENCE_MISSING),
         ({"invalidation": None}, admission.REASON_INVALIDATION_MISSING),
         ({"expires_at": NOW - timedelta(minutes=1)}, admission.REASON_EXPIRY_PASSED),
         ({"target_1": 96.0}, admission.REASON_GEOMETRY_INCOHERENT),
@@ -585,7 +599,10 @@ def test_ac_008_a_suppression_is_never_a_trade_rejection():
         "reasons",
         "net_reward_to_risk",
         "net_edge_pct",
+        "effective_cost_pct",
         "expires_at",
+        "expiry_source",
+        "entry_trigger_kind",
     }
     assert payload["admission"] == admission.SUPPRESSED
     assert not {"QUALIFIED", "REJECTED", "ADMITTED_FOR_TRADING"} & {
@@ -667,12 +684,13 @@ def test_ac_010_the_policy_is_versioned_configurable_and_never_a_profit_cutoff()
         "opip_actionable_max_evidence_age_seconds",
         "opip_actionable_plan_validity_minutes",
         "opip_actionable_min_net_reward_to_risk",
-        "opip_actionable_round_trip_cost_pct",
-        "opip_actionable_min_liquidity_usd",
+        "opip_actionable_round_trip_fee_pct",
+        "opip_actionable_min_market_liquidity_usd",
+        "opip_actionable_max_capacity_utilization_pct",
         "opip_actionable_max_spread_bps",
         "opip_actionable_max_size_slippage_pct",
         "opip_actionable_require_fully_covered_depth",
-        "opip_actionable_admit_limit_entries",
+        "opip_actionable_admit_executable_limit_entries",
         "opip_actionable_require_target_2",
     ):
         assert name in fields, name
@@ -682,12 +700,12 @@ def test_ac_010_the_policy_is_versioned_configurable_and_never_a_profit_cutoff()
         SimpleNamespace(
             opip_actionable_min_net_reward_to_risk=2.0,
             opip_actionable_max_spread_bps=12.0,
-            opip_actionable_min_liquidity_usd=500_000.0,
+            opip_actionable_min_market_liquidity_usd=500_000.0,
         )
     )
     assert configured.min_net_reward_to_risk == 2.0
     assert configured.max_spread_bps == 12.0
-    assert configured.min_liquidity_usd == 500_000.0
+    assert configured.min_market_liquidity_usd == 500_000.0
     stricter = admission.evaluate_actionable_admission(
         evidence=_evidence(spread_bps=20.0), policy=configured, now=NOW
     )

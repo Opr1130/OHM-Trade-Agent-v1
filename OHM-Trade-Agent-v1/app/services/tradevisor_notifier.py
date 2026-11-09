@@ -25,6 +25,7 @@ from app.services.actionable_admission import (
     evaluate_actionable_admission,
     evidence_from_trade_plan,
 )
+from app.services.actionable_card import missing_card_elements, render_actionable_block
 from app.services.notification_policy import (
     DEFAULT_COOLDOWN_SECONDS,
     confirm_emit,
@@ -244,7 +245,7 @@ def format_tradevisor_alert(decision: TradevisorDecision) -> str:
             f"Planned loss: {_usd(allocation.risk_dollars)}",
             f"Estimated net profit T1: {_usd(net_t1)}",
             f"Estimated net profit T2: {_usd(net_t2)}",
-            f"Reward/Risk: {float(plan.reward_to_risk_2):.2f}:1",
+            f"Gross Reward/Risk (T2, before costs): {float(plan.reward_to_risk_2):.2f}:1",
             f"Horizon: {decision.horizon or 'UNCLASSIFIED'} "
             f"(native ATR {_atr_label(decision)}; no holding duration is modelled)",
             "",
@@ -321,41 +322,44 @@ def native_alert_recently_emitted(
 def _tradevisor_admission_evidence(decision: TradevisorDecision) -> ActionableEvidence:
     """Map this decision's own evidence onto the shared admission contract.
 
-    Only facts the evaluation already produced are used. ``economic_qualified`` and
-    ``action_gate_allowed`` are set to True because this function is only ever reached for a
-    decision that passed the Tradevisor action/economic/allocation contract above; nothing here
-    can make a rejected decision deliverable.
+    Only facts the evaluation already recorded are used, and the direction-specific ones are read
+    from the matching leg: a BUY buys into the asks (``buy_fully_covered``, long round-trip
+    drag), a SELL sells into the bids (``sell_fully_covered``, short round-trip drag). The venue
+    is the one the evaluation recorded with the book; nothing is defaulted here.
+    ``economic_qualified``/``action_gate_allowed`` are True because this function is only reached
+    for a decision that already passed the Tradevisor action/economic/allocation contract.
     """
     facts = decision.evidence if isinstance(decision.evidence, dict) else {}
     raw_execution = facts.get("execution_evidence")
     execution = raw_execution if isinstance(raw_execution, dict) else {}
     raw_capital = facts.get("f7_capital")
     capital = raw_capital if isinstance(raw_capital, dict) else {}
-    coverage = str(execution.get("book_coverage_status") or "").upper()
-    fully_covered = execution.get("fully_covered")
+    signal = str(decision.signal or "").strip().upper()
+    direction = "SHORT" if signal == "SELL" else "LONG"
+    if direction == "SHORT":
+        depth_covered = execution.get("sell_fully_covered")
+        measured_impact = execution.get("short_round_trip_market_drag_pct")
+    else:
+        depth_covered = execution.get("buy_fully_covered")
+        measured_impact = execution.get("round_trip_market_drag_pct")
     candidate = {
         "symbol": decision.market,
-        # The Tradevisor plane executes on Kraken by construction (`decision.market` is the Kraken
-        # pair). `source_exchange` is the *signal* source and is deliberately not used here.
-        "venue": "KRAKEN",
-        "direction": "LONG",
+        "venue": execution.get("venue"),
+        "venue_identity_valid": execution.get("venue_identity_valid"),
+        "direction": direction,
         "economic_qualified": True,
         "action_gate_allowed": True,
         "evidence_observed_at": decision.evaluated_at,
         "plan_expires_at": decision.expires_at,
-        "liquidity_usd": execution.get("visible_liquidity_usd"),
+        "current_price": execution.get("current_price"),
+        "market_liquidity_usd": execution.get("visible_liquidity_usd"),
+        "position_capacity_usd": execution.get("position_capacity_usd"),
         "spread_bps": execution.get("spread_bps"),
-        "size_slippage_pct": execution.get("round_trip_market_drag_pct"),
-        "depth_covered": (
-            bool(fully_covered) if fully_covered is not None else coverage == "COMPLETE"
-        ),
+        "size_slippage_pct": measured_impact,
+        "depth_covered": depth_covered,
         "economic_position_notional": capital.get("recommended_capital"),
     }
-    return evidence_from_trade_plan(
-        candidate,
-        decision.plan,
-        now=decision.evaluated_at,
-    )
+    return evidence_from_trade_plan(candidate, decision.plan)
 
 
 def notify_tradevisor_decision(
@@ -401,8 +405,9 @@ def notify_tradevisor_decision(
     # already refuses anything that is not an actionable decision with a complete plan, capital
     # and economic evidence, so those verdicts feed C6 unchanged; what the gate adds is the
     # mandatory market/execution evidence, geometry, cost-adjusted economics and expiry.
+    evidence = _tradevisor_admission_evidence(decision)
     admission = evaluate_actionable_admission(
-        evidence=_tradevisor_admission_evidence(decision),
+        evidence=evidence,
         policy=ActionableNotificationPolicy.from_settings(settings),
         now=now,
     )
@@ -412,8 +417,30 @@ def notify_tradevisor_decision(
             reason=admission.suppression_reason() or "ACTIONABLE_GATE",
         )
 
-    message = format_tradevisor_alert(decision)
     plan = decision.plan
+    message = format_tradevisor_alert(decision)
+    # OPIP-ALERT-ACTIONABLE-ONLY-001 card contract: one shared block so the Tradevisor card states
+    # the entry zone, stop, targets, invalidation, expiry, net R/R, setup identity and the
+    # manual-execution statement exactly like the native path.
+    message = (
+        f"{message}\n\n"
+        + render_actionable_block(
+            admission=admission,
+            plan=plan,
+            setup_id=str(decision.dedup_id),
+            direction="SHORT" if str(decision.signal).upper() == "SELL" else "LONG",
+            venue=evidence.venue,
+            instrument=decision.instrument,
+            observed_at=evidence.observed_at,
+        )
+    )
+    incomplete = missing_card_elements(message)
+    if incomplete:
+        return TradevisorNotificationOutcome(
+            status=STATUS_SUPPRESSED_POLICY,
+            reason="ACTIONABLE_CARD_INCOMPLETE:" + ",".join(incomplete),
+            message=message,
+        )
     identity = f"TRADEVISOR:LONG:{decision.market}"
     fingerprint = ":".join(
         (

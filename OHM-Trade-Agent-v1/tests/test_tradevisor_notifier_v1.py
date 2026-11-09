@@ -193,7 +193,9 @@ def test_atdd08_actionable_message_contains_every_required_field():
         "Planned loss:",
         "Estimated net profit T1:",
         "Estimated net profit T2:",
-        "Reward/Risk:",
+        # Gross reward/risk is labelled as gross; the mandatory net figure and the remaining plan
+        # elements are appended by the shared actionable block on delivery.
+        "Gross Reward/Risk (T2, before costs):",
         "Do not chase above:",
         "Expires:",
         "Why now:",

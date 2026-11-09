@@ -105,6 +105,11 @@ GIVEN: this scope contract and the movable active-increment pointer
 WHEN: both are inspected
 THEN: this contract declares exactly this increment with every required section, its implementation map authorizes the changed paths including the sequenced pointer, every acceptance criterion is traced to a test, and the pointer resolves to an existing contract without being owned or pinned by this increment
 
+AC-013:
+GIVEN: an architectural review of the released gate found six adapter and notification-contract defects
+WHEN: the corrected policy, producers, retry outbox and card renderer are exercised
+THEN: 24h market turnover and the position-capacity ceiling are separate facts with separate tests (turnover against the market floor, ceiling against the contemplated order size and configured utilization), no synthetic freshness or venue identity can be produced inside the gate (a missing timestamp or upstream identity verdict fails closed), an executable limit entry is distinguished from an unconfirmed future setup by the authoritative trigger flag, plan style, analysed price and chase boundary, a retry row without an admitted verdict fails closed with its reason instead of being delivered blind, every emitted actionable card states the entry zone, stop-loss, targets, invalidation, expiry, setup identity and the net reward-to-risk the gate admitted (an incomplete card is refused, and both actionable planes share the block), and execution depth plus the measured impact are read from the direction-specific leg while the cost model adds assumed fees and the measured impact exactly once
+
 EXPLICITLY OUT OF SCOPE:
 - Any change to deterministic qualification, ranking, scoring, capital allocation, risk sizing, execution geometry or the economic execution gate's protected thresholds
 - Any new trading, order-placement, order-modification, order-cancellation or confirmation authority; funded and automated execution remain disabled
@@ -142,6 +147,28 @@ AC-009 -> tests/test_wave9_actionable_only_alerts.py::test_production_compose_ke
 AC-010 -> tests/test_opip_alert_actionable_only_v1.py::test_ac_010_the_policy_is_versioned_configurable_and_never_a_profit_cutoff
 AC-011 -> tests/test_opip_alert_actionable_only_v1.py::test_ac_011_every_actionable_producer_routes_through_one_gate
 AC-012 -> tests/test_opip_alert_actionable_only_v1.py::test_ac_012_governance_contract_traceability_and_movable_pointer
+AC-013 -> tests/test_opip_alert_actionable_only_regressions_v1.py::test_a_deep_market_with_a_small_capacity_ceiling_is_refused_by_capacity_only
+AC-013 -> tests/test_opip_alert_actionable_only_regressions_v1.py::test_a_large_capacity_ceiling_cannot_excuse_a_thin_market
+AC-013 -> tests/test_opip_alert_actionable_only_regressions_v1.py::test_capacity_is_compared_with_the_order_size_and_the_configured_utilization
+AC-013 -> tests/test_opip_alert_actionable_only_regressions_v1.py::test_the_gate_no_longer_exposes_an_aliased_liquidity_field
+AC-013 -> tests/test_opip_alert_actionable_only_regressions_v1.py::test_absent_evidence_timestamp_fails_closed_instead_of_using_the_clock
+AC-013 -> tests/test_opip_alert_actionable_only_regressions_v1.py::test_venue_identity_is_never_synthesised_by_the_adapter
+AC-013 -> tests/test_opip_alert_actionable_only_regressions_v1.py::test_producers_supply_venue_and_identity_from_the_exchange_that_own_them
+AC-013 -> tests/test_opip_alert_actionable_only_regressions_v1.py::test_a_placeable_limit_entry_is_admitted_and_classified_as_executable
+AC-013 -> tests/test_opip_alert_actionable_only_regressions_v1.py::test_a_limit_beyond_the_chase_boundary_is_an_unconfirmed_future_setup
+AC-013 -> tests/test_opip_alert_actionable_only_regressions_v1.py::test_an_authoritative_unconfirmed_trigger_refuses_even_with_a_valid_zone
+AC-013 -> tests/test_opip_alert_actionable_only_regressions_v1.py::test_a_market_entry_outside_its_zone_is_not_confirmed
+AC-013 -> tests/test_opip_alert_actionable_only_regressions_v1.py::test_short_limit_entries_use_the_mirrored_executable_window
+AC-013 -> tests/test_opip_alert_actionable_only_regressions_v1.py::test_legacy_outbox_row_without_an_admitted_verdict_fails_closed
+AC-013 -> tests/test_opip_alert_actionable_only_regressions_v1.py::test_outbox_row_with_a_suppressed_verdict_is_not_delivered
+AC-013 -> tests/test_opip_alert_actionable_only_regressions_v1.py::test_outbox_row_admitted_then_expired_is_retired_with_the_expiry_reason
+AC-013 -> tests/test_opip_alert_actionable_only_regressions_v1.py::test_the_emitted_actionable_card_states_every_mandatory_plan_element
+AC-013 -> tests/test_opip_alert_actionable_only_regressions_v1.py::test_an_incomplete_card_is_refused_rather_than_delivered
+AC-013 -> tests/test_opip_alert_actionable_only_regressions_v1.py::test_the_tradevisor_delivery_appends_the_same_mandatory_block
+AC-013 -> tests/test_opip_alert_actionable_only_regressions_v1.py::test_long_and_short_read_their_own_depth_leg_and_measured_impact
+AC-013 -> tests/test_opip_alert_actionable_only_regressions_v1.py::test_a_short_plan_is_refused_when_only_the_ask_side_is_covered
+AC-013 -> tests/test_opip_alert_actionable_only_regressions_v1.py::test_the_cost_model_counts_fees_and_measured_impact_exactly_once
+AC-013 -> tests/test_opip_alert_actionable_only_regressions_v1.py::test_an_absent_measured_impact_makes_the_net_economics_uncomputable
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/services/actionable_admission.py
@@ -189,6 +216,23 @@ AC-011 -> OHM-Trade-Agent-v1/tests/test_tradevisor_notifier_v1.py
 AC-012 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-ALERT-ACTIONABLE-ONLY-001.md
 AC-012 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
 AC-012 -> OHM-Trade-Agent-v1/tests/test_opip_alert_actionable_only_v1.py
+AC-013 -> OHM-Trade-Agent-v1/app/services/actionable_admission.py
+AC-013 -> OHM-Trade-Agent-v1/app/services/actionable_card.py
+AC-013 -> OHM-Trade-Agent-v1/app/services/capital_efficiency_ranking.py
+AC-013 -> OHM-Trade-Agent-v1/app/exchanges/kraken_identity.py
+AC-013 -> OHM-Trade-Agent-v1/app/services/tradevisor_market.py
+AC-013 -> OHM-Trade-Agent-v1/app/services/tradevisor_evaluation.py
+AC-013 -> OHM-Trade-Agent-v1/app/services/tradevisor_notifier.py
+AC-013 -> OHM-Trade-Agent-v1/app/services/chief_alert_notifier.py
+AC-013 -> OHM-Trade-Agent-v1/app/services/qualified_alert_outbox.py
+AC-013 -> OHM-Trade-Agent-v1/app/jobs/scan_opportunities.py
+AC-013 -> OHM-Trade-Agent-v1/app/core/config.py
+AC-013 -> OHM-Trade-Agent-v1/tests/test_opip_alert_actionable_only_regressions_v1.py
+AC-013 -> OHM-Trade-Agent-v1/tests/test_opip_alert_actionable_only_v1.py
+AC-013 -> OHM-Trade-Agent-v1/tests/test_tradevisor_notifier_v1.py
+AC-013 -> OHM-Trade-Agent-v1/tests/test_trade_lifecycle.py
+AC-013 -> OHM-Trade-Agent-v1/tests/test_wave9_action_notification_reliability.py
+AC-013 -> OHM-Trade-Agent-v1/tests/test_opip_r4_alert_notification_quality.py
 
 DEFERRED DISCOVERIES:
 - Whether an already-qualified limit entry waiting for a better price should be admitted at all is
