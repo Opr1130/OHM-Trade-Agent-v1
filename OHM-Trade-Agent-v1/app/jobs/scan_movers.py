@@ -461,19 +461,54 @@ def _watch_telegram_enabled(settings) -> bool:
 
 
 def _early_watch_telegram_enabled(settings) -> bool:
-    """Allow only explicit, advisory Early Watch Telegram under Wave 9.
+    """Resolve the single automatic Early Watch Telegram policy.
 
-    This is intentionally independent from the legacy broad-watch transport.
-    OPIP_ACTIONABLE_ONLY_ALERTS may stay enabled while an operator opts into
-    deep-qualified EARLY_MOVER cards. These cards remain WATCH ONLY and never
-    grant entry, paper, or exchange authority.
+    OPIP-ALERT-ACTIONABLE-ONLY-001 makes the automatic Early Watch channel **evidence-only**:
+    observations, movement learning and canonical capture continue, but no automatic watch card
+    is delivered while the actionable-only policy is active. Early Watch therefore requires the
+    explicit opt-in *and* the legacy non-actionable-only policy, so there is exactly one
+    unambiguous effective policy and no partial bypass of the actionable gate. A user-requested
+    ``/watch`` command response is a different plane and is unaffected.
     """
     return bool(
         bool(getattr(settings, "opip_early_watch_alerts_enabled", False))
+        and not bool(getattr(settings, "opip_actionable_only_alerts", False))
         and settings.telegram_enabled
         and settings.telegram_bot_token
         and settings.telegram_chat_id
     )
+
+
+def _record_suppressed_early_watch(
+    signals,
+    *,
+    observed_at,
+    reason: str,
+    limit: int = 10,
+) -> int:
+    """Record why Early Watch candidates stayed silent while the channel is evidence-only.
+
+    Bounded to the same slice the governed channel would have carded, so a full-market sweep can
+    never grow the delivery ledger without bound. A ledger failure stops the loop and never
+    fails the scan.
+    """
+    recorded = 0
+    eligible = [item for item in signals if getattr(item, "alert_eligible", False)]
+    for signal in eligible[: max(0, int(limit))]:
+        try:
+            record_telegram_suppression(
+                identity=f"EARLY_MOVER:{signal.symbol}",
+                alert_family="EARLY_MOVER",
+                event_type=signal.stage,
+                fingerprint=_transition_key(signal),
+                reason=reason,
+                symbol=signal.symbol,
+                generated_at=observed_at,
+            )
+        except Exception:
+            break
+        recorded += 1
+    return recorded
 
 
 def main() -> None:
@@ -634,6 +669,20 @@ def main() -> None:
     broad_watch_delivery: dict[str, tuple[str, bool]] = {}
     early_watch_transport_enabled = _early_watch_telegram_enabled(settings)
     broad_watch_transport_enabled = _watch_telegram_enabled(settings)
+    if not early_watch_transport_enabled:
+        # OPIP-ALERT-ACTIONABLE-ONLY-001: the automatic Early Watch channel is evidence-only.
+        # The candidates that would have been carded keep their suppression reason in the
+        # delivery ledger, bounded to the same slice that would have been sent, so silence stays
+        # attributable without growing the ledger with a full-market sweep.
+        early_watch_suppressed_recorded = _record_suppressed_early_watch(
+            signals,
+            observed_at=decision_at,
+            reason="ACTIONABLE_ONLY_POLICY",
+        )
+        print(
+            "Early Watch Telegram: evidence-only (actionable-only policy);"
+            f" suppression reason recorded for {early_watch_suppressed_recorded} candidate(s)"
+        )
     if early_watch_transport_enabled or broad_watch_transport_enabled:
         repeat_cooldown = max(
             int(getattr(settings, "price_movement_alert_cooldown_seconds", 21600)),
