@@ -287,6 +287,14 @@ def _isolate_lifecycle(tmp_path, monkeypatch):
 
 
 def _candidate(symbol: str, score: float) -> dict:
+    """A candidate shaped as the scanner produces it.
+
+    OPIP-ALERT-ACTIONABLE-ONLY-001 requires execution evidence to exist before an actionable card
+    may be delivered, so the fixture carries the same facts the scan already validates
+    (liquidity ceiling, spread, measured round-trip drag, full depth coverage). The plan geometry
+    above is unchanged, so these tests keep proving the notification lifecycle they were written
+    for.
+    """
     return {
         "symbol": symbol,
         "confidence": 88,
@@ -299,6 +307,13 @@ def _candidate(symbol: str, score: float) -> dict:
         "underlying_asset": symbol,
         "primary_pair": symbol,
         "reference_price": 100.0,
+        "liquidity_capacity_ceiling_usd": 2_500_000.0,
+        "economic_position_notional": 500.0,
+        "execution_evidence": {
+            "spread_bps": 6.0,
+            "size_slippage_pct": 0.2,
+            "depth_covered": True,
+        },
     }
 
 

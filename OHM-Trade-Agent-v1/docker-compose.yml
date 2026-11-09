@@ -99,9 +99,12 @@ services:
       # P1 JSONL outbox is retired. This explicit override wins over any stale
       # .env value so the legacy multi-hundred-MB file cannot be recreated.
       P1_SHADOW_OUTBOX_ENABLED: "false"
-      # Explicit advisory Early Watch channel. Deep-qualified watch cards only;
-      # does not re-enable legacy broad-watch/movement alerts or trade authority.
-      OPIP_EARLY_WATCH_ALERTS_ENABLED: "true"
+      # OPIP-ALERT-ACTIONABLE-ONLY-001: the automatic Early Watch channel is evidence-only.
+      # Observations, movement learning and canonical capture continue unchanged; no automatic
+      # watch card is delivered. The flag is deliberately pinned false here and the channel also
+      # requires the legacy non-actionable-only policy, so a stale `.env` cannot re-enable
+      # informational Telegram while OPIP_ACTIONABLE_ONLY_ALERTS governs alerts.
+      OPIP_EARLY_WATCH_ALERTS_ENABLED: "false"
       # Canonical shadow evidence capture activated.
       # Evidence-only: does not grant ranking, trading, sizing, alert
       # qualification, or funded execution authority.

@@ -18,6 +18,20 @@ from app.services.qualified_trade_tracking import (
 )
 
 
+#: Execution facts the scan validates before an actionable card may be delivered.
+#: OPIP-ALERT-ACTIONABLE-ONLY-001 fails closed when the mandatory execution evidence is absent,
+#: so fixtures that exercise a successful delivery must carry the same facts production does.
+SCANNER_EVIDENCE = {
+    "liquidity_capacity_ceiling_usd": 2_500_000.0,
+    "economic_position_notional": 500.0,
+    "execution_evidence": {
+        "spread_bps": 6.0,
+        "size_slippage_pct": 0.2,
+        "depth_covered": True,
+    },
+}
+
+
 def plan(symbol="SOLUSD"):
     return EntryExitPlan(
         symbol=symbol,
@@ -118,6 +132,7 @@ def test_tracking_failure_keeps_qualified_setup_live_and_queues_retry(tmp_path, 
         "action_gate_evaluated": True,
         "action_gate_allowed": True,
         "recommended_capital": 200.0,
+        **SCANNER_EVIDENCE,
     }
 
     assert not chief_alert_notifier.send_trade_plan(
@@ -179,6 +194,7 @@ def test_reconciliation_identity_mismatch_is_terminal_not_retryable(
         "action_gate_evaluated": True,
         "action_gate_allowed": True,
         "recommended_capital": 200.0,
+        **SCANNER_EVIDENCE,
     }
 
     assert not chief_alert_notifier.send_trade_plan(
@@ -212,6 +228,7 @@ def test_telegram_failure_keeps_qualified_setup_live_and_queues_retry(tmp_path, 
         "action_gate_evaluated": True,
         "action_gate_allowed": True,
         "recommended_capital": 200.0,
+        **SCANNER_EVIDENCE,
     }
 
     assert not chief_alert_notifier.send_trade_plan(
@@ -350,6 +367,7 @@ def test_notifier_consumes_pre_evaluated_action_gate(tmp_path, monkeypatch):
         "action_gate_evaluated": True,
         "action_gate_allowed": True,
         "recommended_capital": 200.0,
+        **SCANNER_EVIDENCE,
     }
 
     assert chief_alert_notifier.send_trade_plan(
@@ -491,8 +509,10 @@ def test_qualified_retry_is_after_active_protection(monkeypatch):
 def _reservation_test_setup(tmp_path, monkeypatch):
     """Wire send_trade_plan up to a real, tmp-isolated notification_policy.
 
-    economic_qualified is False so the flow reaches the atomic reservation
-    directly, and only the network-facing pieces are mocked.
+    The candidate carries the economic verdict and execution evidence the scan supplies
+    (OPIP-ALERT-ACTIONABLE-ONLY-001 refuses a card without them); downstream trade tracking is
+    stubbed to a no-op so the flow reaches the atomic reservation directly, and only the
+    network-facing pieces are mocked.
     """
     _patch_pending(tmp_path, monkeypatch)
     monkeypatch.setattr(notification_policy, "STATE_FILE", tmp_path / "notification.json")
@@ -500,16 +520,24 @@ def _reservation_test_setup(tmp_path, monkeypatch):
     monkeypatch.setattr(chief_alert_notifier, "should_send_trade_plan", lambda *args: True)
     monkeypatch.setattr(chief_alert_notifier, "record_recommendation", lambda **kwargs: None)
     monkeypatch.setattr(chief_alert_notifier, "accepted_delivery_message_id", lambda **kwargs: None)
+    monkeypatch.setattr(
+        chief_alert_notifier, "_register_reconciliation_intent", lambda **kwargs: None
+    )
 
 
 def _reservation_candidate():
     return {
         "confidence": 88,
         "decision": "alert",
-        "economic_qualified": False,
+        # OPIP-ALERT-ACTIONABLE-ONLY-001: an actionable card must carry the deterministic economic
+        # verdict and a trade identity, exactly as the scan supplies them. Tracking itself is
+        # stubbed below so these tests keep proving reservation behaviour.
+        "economic_qualified": True,
+        "trade_id": "TRADE-RES-1",
         "action_gate_evaluated": True,
         "action_gate_allowed": True,
         "recommended_capital": 200.0,
+        **SCANNER_EVIDENCE,
     }
 
 
@@ -677,6 +705,7 @@ def test_send_trade_plan_retains_recovery_record_when_terminalization_unconfirme
         "action_gate_evaluated": True,
         "action_gate_allowed": True,
         "recommended_capital": 200.0,
+        **SCANNER_EVIDENCE,
     }
 
     assert not chief_alert_notifier.send_trade_plan(

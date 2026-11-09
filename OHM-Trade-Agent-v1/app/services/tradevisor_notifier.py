@@ -19,6 +19,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from app.services.actionable_admission import (
+    ActionableEvidence,
+    ActionableNotificationPolicy,
+    evaluate_actionable_admission,
+    evidence_from_trade_plan,
+)
 from app.services.notification_policy import (
     DEFAULT_COOLDOWN_SECONDS,
     confirm_emit,
@@ -312,6 +318,46 @@ def native_alert_recently_emitted(
     return False
 
 
+def _tradevisor_admission_evidence(decision: TradevisorDecision) -> ActionableEvidence:
+    """Map this decision's own evidence onto the shared admission contract.
+
+    Only facts the evaluation already produced are used. ``economic_qualified`` and
+    ``action_gate_allowed`` are set to True because this function is only ever reached for a
+    decision that passed the Tradevisor action/economic/allocation contract above; nothing here
+    can make a rejected decision deliverable.
+    """
+    facts = decision.evidence if isinstance(decision.evidence, dict) else {}
+    raw_execution = facts.get("execution_evidence")
+    execution = raw_execution if isinstance(raw_execution, dict) else {}
+    raw_capital = facts.get("f7_capital")
+    capital = raw_capital if isinstance(raw_capital, dict) else {}
+    coverage = str(execution.get("book_coverage_status") or "").upper()
+    fully_covered = execution.get("fully_covered")
+    candidate = {
+        "symbol": decision.market,
+        # The Tradevisor plane executes on Kraken by construction (`decision.market` is the Kraken
+        # pair). `source_exchange` is the *signal* source and is deliberately not used here.
+        "venue": "KRAKEN",
+        "direction": "LONG",
+        "economic_qualified": True,
+        "action_gate_allowed": True,
+        "evidence_observed_at": decision.evaluated_at,
+        "plan_expires_at": decision.expires_at,
+        "liquidity_usd": execution.get("visible_liquidity_usd"),
+        "spread_bps": execution.get("spread_bps"),
+        "size_slippage_pct": execution.get("round_trip_market_drag_pct"),
+        "depth_covered": (
+            bool(fully_covered) if fully_covered is not None else coverage == "COMPLETE"
+        ),
+        "economic_position_notional": capital.get("recommended_capital"),
+    }
+    return evidence_from_trade_plan(
+        candidate,
+        decision.plan,
+        now=decision.evaluated_at,
+    )
+
+
 def notify_tradevisor_decision(
     decision: TradevisorDecision,
     *,
@@ -349,6 +395,21 @@ def notify_tradevisor_decision(
         return TradevisorNotificationOutcome(
             status=STATUS_SUPPRESSED_NATIVE_DUPLICATE,
             reason="the native path already alerted this market's actionable trade",
+        )
+
+    # OPIP-ALERT-ACTIONABLE-ONLY-001: the shared actionable admission gate. The Tradevisor plane
+    # already refuses anything that is not an actionable decision with a complete plan, capital
+    # and economic evidence, so those verdicts feed C6 unchanged; what the gate adds is the
+    # mandatory market/execution evidence, geometry, cost-adjusted economics and expiry.
+    admission = evaluate_actionable_admission(
+        evidence=_tradevisor_admission_evidence(decision),
+        policy=ActionableNotificationPolicy.from_settings(settings),
+        now=now,
+    )
+    if admission.suppressed:
+        return TradevisorNotificationOutcome(
+            status=STATUS_SUPPRESSED_POLICY,
+            reason=admission.suppression_reason() or "ACTIONABLE_GATE",
         )
 
     message = format_tradevisor_alert(decision)

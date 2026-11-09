@@ -24,6 +24,20 @@ from app.services.order_intent_registry import OrderIntent
 from app.services.pending_setup_monitor import PendingSetupMonitorResult
 
 
+#: Execution facts the scan validates before an actionable card may be delivered. Fixtures that
+#: exercise a successful delivery must carry them: OPIP-ALERT-ACTIONABLE-ONLY-001 fails closed
+#: when the mandatory execution evidence is absent.
+SCANNER_EVIDENCE = {
+    "liquidity_capacity_ceiling_usd": 2_500_000.0,
+    "economic_position_notional": 500.0,
+    "execution_evidence": {
+        "spread_bps": 6.0,
+        "size_slippage_pct": 0.2,
+        "depth_covered": True,
+    },
+}
+
+
 @pytest.fixture
 def registry_files(tmp_path, monkeypatch):
     monkeypatch.setattr(
@@ -185,6 +199,7 @@ def test_actionable_setup_is_persisted_without_confirmation_buttons(
     )
     assert chief_alert_notifier.send_trade_plan(
         {
+            **SCANNER_EVIDENCE,
             "confidence": 90,
             "decision": "alert",
             "economic_qualified": True,
@@ -212,6 +227,7 @@ def test_movement_plan_becomes_actionable_only_after_final_intelligence_gate(
         "subtype": "VOLATILITY_EXPANSION",
     }
     candidate = {
+        **SCANNER_EVIDENCE,
         "confidence": 90,
         "decision": "alert",
         "economic_qualified": True,
@@ -269,6 +285,7 @@ def test_production_alert_registers_buttonless_kraken_reconciliation_intent(
         lambda *args, **kwargs: sent.update(kwargs) or SimpleNamespace(delivered=True, message_id=103),
     )
     candidate = {
+        **SCANNER_EVIDENCE,
         "confidence": 90,
         "decision": "alert",
         "economic_qualified": True,
@@ -315,6 +332,7 @@ def test_place_limit_reuses_pending_trade_id_for_reconciliation(
         lambda *args, **kwargs: SimpleNamespace(delivered=True, message_id=104),
     )
     candidate = {
+        **SCANNER_EVIDENCE,
         "confidence": 90,
         "decision": "alert",
         "economic_qualified": True,

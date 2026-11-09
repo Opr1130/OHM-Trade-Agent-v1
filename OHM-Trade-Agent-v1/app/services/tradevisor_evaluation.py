@@ -723,6 +723,13 @@ def evaluate_signal(
             execution, "estimated_visible_round_trip_market_drag_pct", None
         ),
         "warnings": list(getattr(execution, "warnings", []) or []),
+        # OPIP-ALERT-ACTIONABLE-ONLY-001: record the liquidity and full-coverage facts the
+        # admission gate needs. Additive evidence only; the decision above is unchanged.
+        "visible_liquidity_usd": getattr(snapshot, "combined_24h_liquidity_usd", None),
+        "fully_covered": bool(
+            getattr(execution, "buy_fully_covered", False)
+            or getattr(execution, "sell_fully_covered", False)
+        ),
     }
     # Independent native context (BTC regime, chase risk, breadth, ranking).
     # Read-only: it informs the operator and never grants authority.

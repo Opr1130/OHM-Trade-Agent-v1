@@ -76,6 +76,9 @@ def market(**over) -> MarketSnapshot:
         rolling_72h_downside_p75_pct=16.0,
         rolling_72h_downside_p90_pct=20.0,
         ticker_last=100.0,
+        # OPIP-ALERT-ACTIONABLE-ONLY-001: the admission gate needs the liquidity the execution
+        # venue actually shows, so the fixture carries the combined 24h figure the scanner reads.
+        combined_24h_liquidity_usd=2_500_000.0,
         execution_validation=ExecutionValidation(
             status="VALID",
             book_coverage_status="COMPLETE",

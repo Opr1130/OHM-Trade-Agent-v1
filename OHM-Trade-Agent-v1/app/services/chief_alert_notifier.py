@@ -2,7 +2,14 @@ from pathlib import Path
 from typing import Any
 import math
 
+from datetime import datetime
+
 from app.services.asset_display_identity import display_asset_text, display_market_label
+from app.services.actionable_admission import (
+    ActionableNotificationPolicy,
+    evaluate_actionable_admission,
+    evidence_from_trade_plan,
+)
 from app.services.entry_exit_advisor import EntryExitPlan
 from app.services.kraken_reconciliation import (
     reconciliation_enabled,
@@ -467,6 +474,9 @@ def send_trade_plan(
     chat_id: str,
     *,
     notify: bool = True,
+    policy: ActionableNotificationPolicy | None = None,
+    execution_evidence: dict[str, Any] | None = None,
+    observed_at: datetime | None = None,
 ) -> bool:
     action = _action_type(plan)
     direction = str(candidate.get("direction") or plan.direction or "LONG").upper()
@@ -512,6 +522,37 @@ def send_trade_plan(
             signal_id=candidate.get("signal_id"),
             trade_id=candidate.get("trade_id"),
         )
+        return False
+
+    # OPIP-ALERT-ACTIONABLE-ONLY-001: the single actionable-notification admission gate. It runs
+    # after the existing action/economic/risk verdicts and before any pending-setup registration,
+    # reservation or send, so a card with missing or stale evidence can never be delivered and
+    # can never leave delivery side effects behind. The refusal is a *notification* outcome: the
+    # trade itself is untouched.
+    admission = evaluate_actionable_admission(
+        evidence=evidence_from_trade_plan(
+            candidate,
+            plan,
+            execution=execution_evidence or candidate.get("execution_evidence"),
+            observed_at=observed_at,
+        ),
+        policy=policy,
+        now=observed_at,
+    )
+    if admission.suppressed:
+        reason = admission.suppression_reason() or "ACTIONABLE_GATE"
+        if notify:
+            record_telegram_suppression(
+                identity=identity,
+                alert_family="QUALIFIED_OPPORTUNITY",
+                event_type=action,
+                fingerprint=initial_fingerprint,
+                reason=reason,
+                symbol=plan.symbol,
+                journey_id=candidate.get("journey_id"),
+                signal_id=candidate.get("signal_id"),
+                trade_id=candidate.get("trade_id"),
+            )
         return False
 
     movement = attach_actionable_plan(
@@ -583,6 +624,7 @@ def send_trade_plan(
             identity=identity,
             fingerprint=key,
             reason=queue_reason,
+            admission=admission,
         )
         candidate["notification_attempted"] = True
 
@@ -758,6 +800,7 @@ def send_trade_plan(
                     identity=identity,
                     fingerprint=key,
                     reason=delivery_reason,
+                    admission=admission,
                 )
             except Exception as queue_exc:
                 print(

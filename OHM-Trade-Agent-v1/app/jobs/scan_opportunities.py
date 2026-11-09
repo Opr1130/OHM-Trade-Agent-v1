@@ -64,6 +64,10 @@ from app.services.economic_quality_gate import (
     advisory_policy_from_profile,
     evaluate_economic_quality,
 )
+from app.services.actionable_admission import (
+    ActionableNotificationPolicy,
+    execution_evidence_from_snapshot,
+)
 from app.services.entry_exit_advisor import build_entry_exit_plan
 from app.services.entry_watch_queue import enqueue_entry_watch, remove_entry_watch
 from app.services.freqtrade_signal_bridge import build_signal_id, to_freqtrade_pair
@@ -2356,6 +2360,12 @@ def main(scan_override=None):
             delivery_attempts=delivery_attempts,
             max_per_window=delivery_cap,
         )
+        # OPIP-ALERT-ACTIONABLE-ONLY-001: hand the actionable admission gate the execution facts
+        # this scan already validated, plus the scan's own evidence timestamp. Evidence only:
+        # the candidate artifact is not mutated, so ranking and approval stay byte-identical.
+        alert_direction = str(
+            getattr(plan, "direction", None) or alert.get("trade_direction") or "LONG"
+        ).upper()
         if send_trade_plan(
             candidate=alert,
             plan=plan,
@@ -2363,6 +2373,13 @@ def main(scan_override=None):
             bot_token=settings.telegram_bot_token,
             chat_id=settings.telegram_chat_id,
             notify=notify,
+            policy=ActionableNotificationPolicy.from_settings(settings),
+            execution_evidence=execution_evidence_from_snapshot(
+                opportunity.snapshot,
+                direction=alert_direction,
+                order_notional_usd=alert.get("economic_position_notional"),
+            ),
+            observed_at=decision_at,
         ):
             sent += 1
             if not plan.valid_now:
