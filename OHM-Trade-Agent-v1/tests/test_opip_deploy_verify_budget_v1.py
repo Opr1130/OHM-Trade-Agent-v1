@@ -362,17 +362,27 @@ def test_ac_013_scheduler_bound_is_derived_and_fails_closed() -> None:
         good = Path(d) / "good.cron"
         good.write_text(
             "* * * * * root flock -n /var/run/ohm-unified-cycle.lock -c "
-            "'... timeout --signal=TERM --kill-after=30s 3600 docker compose exec ...'\n",
+            "'... timeout --signal=TERM --kill-after=30s 3600 docker compose exec "
+            "-T ohm-trade-agent python -m app.jobs.run_cycle'\n",
             encoding="utf-8",
         )
         bad = Path(d) / "bad.cron"
         bad.write_text("no bound here\n", encoding="utf-8")
+        # A bound that exists only in a comment is not an installed bound.
+        prose = Path(d) / "prose.cron"
+        prose.write_text(
+            "# the cycle used to run: timeout --signal=TERM --kill-after=30s 3600\n"
+            "* * * * * root docker compose exec -T ohm-trade-agent "
+            "python -m app.jobs.run_cycle\n",
+            encoding="utf-8",
+        )
         script = (
             "set -Eeuo pipefail\n"
             "export OPIP_DEPLOY_TEST_SEAMS=1\n"
             f"{fn}\n"
             f"echo \"$(OPIP_RELEASE_SCHEDULER_ENTRY='{good.as_posix()}' scheduler_hard_bound_seconds)\"\n"
             f"if OPIP_RELEASE_SCHEDULER_ENTRY='{bad.as_posix()}' scheduler_hard_bound_seconds; then echo UNEXPECTED; exit 9; else echo CLOSED; fi\n"
+            f"if OPIP_RELEASE_SCHEDULER_ENTRY='{prose.as_posix()}' scheduler_hard_bound_seconds; then echo UNEXPECTED; exit 9; else echo PROSE_CLOSED; fi\n"
         )
         proc = subprocess.run([bash, "-c", script], capture_output=True, text=True, timeout=60)
     if _is_fork_failure(proc):
@@ -380,6 +390,7 @@ def test_ac_013_scheduler_bound_is_derived_and_fails_closed() -> None:
     assert proc.returncode == 0, proc.stderr
     assert "3600" in proc.stdout
     assert "CLOSED" in proc.stdout
+    assert "PROSE_CLOSED" in proc.stdout
 
 
 # ---------------------------------------------------------------------------

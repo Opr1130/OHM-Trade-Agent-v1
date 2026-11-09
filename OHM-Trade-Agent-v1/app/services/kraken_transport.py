@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from collections import OrderedDict
 import json
 import logging
 import os
@@ -35,6 +36,27 @@ KRAKEN_ATTEMPT_PHASE_BOUND = 2.0
 #: Floor for a deadline-derived attempt timeout: below this the request cannot
 #: realistically complete, so the caller stops instead of starting doomed work.
 KRAKEN_MIN_DEADLINE_ATTEMPT_SECONDS = 0.2
+
+#: Cache footprint caps.
+#:
+#: A TTL is a *freshness* contract, never a footprint bound: an entry is only
+#: dropped when that exact key is read again after it expires, and a key is
+#: ``endpoint + full params``. A long-lived process (the core API, or a cycle
+#: process during a long discovery pass) therefore retains one entry for every
+#: distinct pair/ticker/OHLC-interval it has *ever* asked for, so retained memory
+#: grows with the width of the market universe and the length of the process -
+#: not with the workload in flight. These caps make the retained footprint a
+#: function of the caps alone, independent of history.
+#:
+#: Eviction is least-recently-used (a hit refreshes recency), which preserves the
+#: repeated-read locality the cache exists for while bounding everything else.
+DEFAULT_CACHE_MAX_ENTRIES = 512
+DEFAULT_CACHE_MAX_BYTES = 32 * 1024 * 1024
+
+#: Eviction reasons, kept as explicit telemetry dimensions so a bounded cache can
+#: be told apart from a cache that is simply too small for the working set.
+EVICTION_TTL_SWEEP = "ttl_sweep"
+EVICTION_SIZE = "size"
 
 
 class KrakenTransportError(RuntimeError):
@@ -76,6 +98,24 @@ def retry_backoff_worst_case_seconds(max_retries: int) -> float:
 class _CacheEntry:
     expires_at: float
     value: dict[str, Any]
+    size_bytes: int = 0
+
+
+def _value_size_bytes(value: Any) -> int:
+    """Approximate retained size of one cached result.
+
+    The cache is a bounded heapless store, so the bound needs a cheap, stable and
+    deterministic size proxy rather than a heap walk. The length of the canonical
+    JSON encoding is that proxy: it is computed once per *stored network
+    response* (never per read) and it tracks the payload's dominant cost - the
+    encoded text and the Python objects it was parsed into.
+    """
+    try:
+        return len(
+            json.dumps(value, separators=(",", ":"), default=str).encode("utf-8")
+        )
+    except (TypeError, ValueError):
+        return 0
 
 
 class KrakenPublicTransport:
@@ -99,6 +139,8 @@ class KrakenPublicTransport:
         requests_per_second: float | None = None,
         burst: int | None = None,
         max_retries: int | None = None,
+        max_cache_entries: int | None = None,
+        max_cache_bytes: int | None = None,
     ) -> None:
         self.requests_per_second = max(
             0.25,
@@ -109,17 +151,39 @@ class KrakenPublicTransport:
             0,
             int(max_retries if max_retries is not None else os.getenv("KRAKEN_PUBLIC_MAX_RETRIES", "2")),
         )
+        self.max_cache_entries = max(
+            1,
+            int(
+                max_cache_entries
+                if max_cache_entries is not None
+                else os.getenv("KRAKEN_CACHE_MAX_ENTRIES", str(DEFAULT_CACHE_MAX_ENTRIES))
+            ),
+        )
+        self.max_cache_bytes = max(
+            1024,
+            int(
+                max_cache_bytes
+                if max_cache_bytes is not None
+                else os.getenv("KRAKEN_CACHE_MAX_BYTES", str(DEFAULT_CACHE_MAX_BYTES))
+            ),
+        )
         self._client = httpx.Client()
         self._lock = threading.RLock()
         self._tokens = float(self.burst)
         self._last_refill = time.monotonic()
-        self._cache: dict[str, _CacheEntry] = {}
+        # Ordered by recency: the left edge is the least recently used entry and
+        # therefore the eviction victim when a cap is reached.
+        self._cache: OrderedDict[str, _CacheEntry] = OrderedDict()
+        self._cache_bytes = 0
         self._metrics = {
             "network_calls": 0,
             "cache_hits": 0,
             "retries": 0,
             "failures": 0,
             "rate_wait_seconds": 0.0,
+            "cache_evictions": 0,
+            f"cache_evictions_{EVICTION_TTL_SWEEP}": 0,
+            f"cache_evictions_{EVICTION_SIZE}": 0,
         }
 
     def _cache_ttl(self, endpoint: str) -> float:
@@ -133,6 +197,36 @@ class KrakenPublicTransport:
     def _cache_key(endpoint: str, params: dict[str, Any]) -> str:
         return f"{endpoint}:{json.dumps(params, sort_keys=True, separators=(',', ':'), default=str)}"
 
+    def _pop_locked(self, key: str, reason: str) -> None:
+        """Drop one entry and account for it. Caller must hold ``self._lock``."""
+        entry = self._cache.pop(key, None)
+        if entry is None:
+            return
+        self._cache_bytes = max(0, self._cache_bytes - int(entry.size_bytes))
+        self._metrics["cache_evictions"] += 1
+        self._metrics[f"cache_evictions_{reason}"] += 1
+
+    def _enforce_cache_bounds_locked(self) -> None:
+        """Restore both caps. Caller must hold ``self._lock``.
+
+        Expired entries go first because they can never be served again, so a
+        TTL sweep is always preferable to evicting a still-fresh entry. Only then
+        is least-recently-used eviction applied until BOTH the entry cap and the
+        byte cap hold.
+        """
+        now = time.monotonic()
+        for key in [k for k, entry in self._cache.items() if entry.expires_at <= now]:
+            self._pop_locked(key, EVICTION_TTL_SWEEP)
+        while self._cache and (
+            len(self._cache) > self.max_cache_entries
+            or self._cache_bytes > self.max_cache_bytes
+        ):
+            oldest = next(iter(self._cache))
+            # A single entry larger than the whole budget is evicted too: the cap
+            # is a hard bound, and degrading to "no caching for huge payloads" is
+            # correct -- retaining one unbounded response would defeat it.
+            self._pop_locked(oldest, EVICTION_SIZE)
+
     def _cached(self, key: str) -> dict[str, Any] | None:
         now = time.monotonic()
         with self._lock:
@@ -140,19 +234,32 @@ class KrakenPublicTransport:
             if entry is None:
                 return None
             if entry.expires_at <= now:
-                self._cache.pop(key, None)
+                self._pop_locked(key, EVICTION_TTL_SWEEP)
                 return None
+            self._cache.move_to_end(key)
             self._metrics["cache_hits"] += 1
             return copy.deepcopy(entry.value)
 
     def _store(self, key: str, value: dict[str, Any], ttl: float) -> None:
         if ttl <= 0:
             return
+        size_bytes = _value_size_bytes(value)
+        entry = _CacheEntry(
+            expires_at=time.monotonic() + ttl,
+            value=copy.deepcopy(value),
+            size_bytes=size_bytes,
+        )
         with self._lock:
-            self._cache[key] = _CacheEntry(
-                expires_at=time.monotonic() + ttl,
-                value=copy.deepcopy(value),
-            )
+            if key in self._cache:
+                # Replacing an existing key must not double-count its footprint.
+                self._cache_bytes = max(
+                    0, self._cache_bytes - int(self._cache[key].size_bytes)
+                )
+                del self._cache[key]
+            self._cache[key] = entry
+            self._cache.move_to_end(key)
+            self._cache_bytes += size_bytes
+            self._enforce_cache_bounds_locked()
 
     def _acquire_budget(self, deadline_monotonic: float | None = None) -> bool:
         """Take one rate-budget token, optionally bounded by an absolute deadline.
@@ -311,14 +418,18 @@ class KrakenPublicTransport:
             return {
                 **self._metrics,
                 "cache_entries": len(self._cache),
+                "cache_bytes": self._cache_bytes,
                 "configured_rps": self.requests_per_second,
                 "configured_burst": self.burst,
                 "configured_max_retries": self.max_retries,
+                "configured_cache_max_entries": self.max_cache_entries,
+                "configured_cache_max_bytes": self.max_cache_bytes,
             }
 
     def clear_cache(self) -> None:
         with self._lock:
             self._cache.clear()
+            self._cache_bytes = 0
 
     def reset_connection(self) -> bool:
         """Recreate the pooled HTTP client after a genuine low-level failure.

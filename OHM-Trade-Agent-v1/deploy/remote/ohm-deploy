@@ -1013,15 +1013,37 @@ report_unified_cycle_wait_failure() {
 #: scheduler entry (``timeout --signal=TERM --kill-after=Ns <BOUND> ...'').
 #: Returns the bound on stdout, or non-zero when it cannot be determined.
 scheduler_hard_bound_seconds() {
-  local entry="/etc/cron.d/ohm-unified-cycle" value
+  local entry="/etc/cron.d/ohm-unified-cycle" program matches value
   # The path override is honored ONLY under an explicit test marker, so a
   # production deploy cannot be pointed at an arbitrary entry to extend the wait.
   if [[ "${OPIP_DEPLOY_TEST_SEAMS:-0}" == "1" && -n "${OPIP_RELEASE_SCHEDULER_ENTRY:-}" ]]; then
     entry="$OPIP_RELEASE_SCHEDULER_ENTRY"
   fi
   [[ -s "$entry" ]] || return 1
-  value="$(grep -m1 -oE 'timeout --signal=TERM --kill-after=[0-9]+s [0-9]+' "$entry" 2>/dev/null \
-    | grep -oE '[0-9]+$' || true)"
+  # ONLY EXECUTABLE LINES MAY SUPPLY THE BOUND. cron.d entries carry comments and
+  # `NAME=value` assignments, and the deployment itself writes an explanatory
+  # comment above the job. Matching the file verbatim therefore let a comment
+  # become the derived authority: quoting the long-form flags in documentation
+  # either replaced the real bound or produced two matches and failed the deploy.
+  # Comments and assignments are stripped first, so the derivation reads the
+  # scheduled command and nothing else.
+  program="$(awk '
+      /^[[:space:]]*#/ {next}
+      /^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=/ {next}
+      NF {print}
+    ' "$entry" 2>/dev/null || true)"
+  [[ -n "$program" ]] || return 1
+  # The bound has to come from the command that actually runs the cycle. A
+  # timeout belonging to some other scheduled program is not this cycle's bound.
+  if ! printf '%s\n' "$program" | grep -q 'python -m app\.jobs\.run_cycle'; then
+    return 1
+  fi
+  matches="$(printf '%s\n' "$program" \
+    | grep -oE 'timeout --signal=TERM --kill-after=[0-9]+s [0-9]+' || true)"
+  # Exactly one. Zero means there is no bound to enforce; two mean the authority
+  # is ambiguous. Both fail closed rather than silently picking one.
+  [[ "$(printf '%s\n' "$matches" | grep -c . || true)" == "1" ]] || return 1
+  value="$(printf '%s\n' "$matches" | grep -oE '[0-9]+$' || true)"
   [[ "$value" =~ ^[0-9]+$ && "$value" -ge 1 ]] || return 1
   printf '%s' "$value"
 }

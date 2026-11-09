@@ -10,4 +10,45 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # never delay the next protection cycle. The dispatcher is not a second
 # scheduler: it holds no cadence authority and acts only on a token the cycle
 # already authorised. Both stages are served by this one cron entry.
-* * * * * root flock -n /var/run/ohm-unified-cycle.lock -c 'cd /opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1 && timeout --signal=TERM --kill-after=30s 3600 /usr/bin/docker compose exec -T ohm-trade-agent python -m app.jobs.run_cycle >> /var/log/ohm-unified-cycle.log 2>&1' ; /usr/local/bin/opip-scan-dispatch >> /var/log/ohm-scan-dispatch.log 2>&1
+#
+# TWO BOUNDS, DELIBERATELY NESTED (containment, not cadence):
+#
+#   outer (host)      3600s hard bound on the LAUNCHER. It is the authorized
+#                     release bound, and the release controller plus the
+#                     diagnostics script derive it from THIS FILE with a
+#                     single-match grep for the long-form timeout flags.
+#                     Exactly ONE executable occurrence of that literal form may
+#                     appear here. Both readers ignore comment and
+#                     environment-assignment lines, so a comment can no longer
+#                     become the derived authority; no comment here reproduces
+#                     the form either - belt and braces.
+#
+#   inner (container)  3540s bound on the ACTUAL process, with a 5s SIGKILL
+#                     escalation, expressed with the short flags so it can never
+#                     be mistaken for the derivation match above.
+#
+# The outer bound alone is NOT containment. It signals the `docker compose`
+# CLIENT; the exec'd Python process lives in the container and is not signalled
+# by the client's death, so a cycle that outlived the bound kept running as an
+# orphan inside the container, holding `/app/data/.unified_cycle.lock`. Every
+# subsequent minute then logged LOCK_CONTENTION_SKIPPED and no cycle completed -
+# protection and discovery both stall while the host lock looks free.
+#
+# The inner bound is enforced where the process actually lives, so exceeding it
+# sends SIGTERM to Python (handled: see app/jobs/run_cycle.py) and, after 5s,
+# SIGKILL, which the kernel converts into lock release. It is set strictly inside
+# the outer bound so the container resolves the deadline before the launcher is
+# reaped. `3540 = 3600 - 60` is the containment margin; a test asserts the
+# ordering so the two numbers cannot silently invert.
+#
+# FAIL CLOSED WHEN THE BOUND TOOLING IS ABSENT. An unbound cycle is the defect
+# this entry exists to prevent, so a missing `timeout` binary must not silently
+# degrade into one. Both the host launcher and the in-container wrapper therefore
+# refuse to start the workload and emit a terminal marker instead:
+# `OPIP_UNIFIED_CYCLE_STATUS=CONTAINMENT_UNAVAILABLE` claims neither SUCCESS nor
+# DEGRADED and emits no COMPLETED_AT, so the release controller cannot mistake it
+# for a completion, while the log, the diagnostics tail counter and the exit code
+# (98 host / 97 container) name the exact cause. The next minute retries, so the
+# exposure is bounded by operator repair of the image rather than by an
+# unsupervised run that could hold the cycle lock indefinitely.
+* * * * * root flock -n /var/run/ohm-unified-cycle.lock -c 'set -e; command -v timeout >/dev/null 2>&1 || { echo "OPIP_UNIFIED_CYCLE_PHASE=CONTAINMENT_UNAVAILABLE"; echo "OPIP_UNIFIED_CYCLE_STATUS=CONTAINMENT_UNAVAILABLE"; exit 98; }; cd /opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1 && timeout --signal=TERM --kill-after=30s 3600 /usr/bin/docker compose exec -T ohm-trade-agent sh -c "command -v timeout >/dev/null 2>&1 || { echo OPIP_UNIFIED_CYCLE_PHASE=CONTAINMENT_UNAVAILABLE; echo OPIP_UNIFIED_CYCLE_STATUS=CONTAINMENT_UNAVAILABLE; exit 97; }; exec timeout -s TERM -k 5s 3540 python -m app.jobs.run_cycle"' >> /var/log/ohm-unified-cycle.log 2>&1 ; /usr/local/bin/opip-scan-dispatch >> /var/log/ohm-scan-dispatch.log 2>&1
