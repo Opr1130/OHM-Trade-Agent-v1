@@ -54,6 +54,10 @@ CONDITION_GEOMETRY = "C4_TRADE_GEOMETRY"
 CONDITION_ECONOMICS = "C5_NET_ECONOMICS"
 CONDITION_RISK = "C6_RISK_AND_AUTHORITY"
 CONDITION_DELIVERY = "C7_DELIVERY_ELIGIBILITY"
+CONDITION_DEPTH = "C3B_VERIFIED_DEPTH"
+CONDITION_PROBABILITY = "C5B_CALIBRATED_PROBABILITY"
+CONDITION_PROTECTION = "C6B_PROTECTION_ADMISSION"
+CONDITION_ROLLING_CAP = "C7B_ROLLING_24H_CAP"
 
 #: Reason codes. Each names what is missing rather than how a card could have been made to look.
 REASON_VENUE_IDENTITY_INVALID = "VENUE_IDENTITY_INVALID"
@@ -96,6 +100,17 @@ REASON_AI_CANNOT_OVERRIDE = "AI_ADVISORY_CANNOT_OVERRIDE_DETERMINISTIC"
 REASON_FUNDED_AUTHORITY = "FUNDED_AUTHORITY_MUST_REMAIN_DISABLED"
 
 REASON_DELIVERY_IN_FLIGHT = "DELIVERY_IN_FLIGHT"
+
+REASON_DEPTH_INSUFFICIENT = "MARKET_DEPTH_INSUFFICIENT"
+REASON_DEPTH_UNKNOWN = "MARKET_DEPTH_EVIDENCE_UNKNOWN"
+REASON_CONFIDENCE_NOT_CALIBRATED = "CONFIDENCE_NOT_CALIBRATED"
+REASON_CONFIDENCE_INVALID = "CALIBRATED_PROBABILITY_INVALID"
+REASON_CONFIDENCE_BELOW = "CALIBRATED_PROBABILITY_BELOW_THRESHOLD"
+REASON_CALIBRATION_UNTRUSTED = "CALIBRATION_ARTIFACT_UNTRUSTED"
+REASON_PROTECTION_SUSPENDED = "PROTECTION_ADMISSIONS_SUSPENDED"
+REASON_PROTECTION_UNKNOWN = "PROTECTION_ADMISSIONS_SUSPENDED_UNKNOWN"
+REASON_ROLLING_CAP = "ROLLING_24H_NOTIFICATION_CAP"
+REASON_ROLLING_CAP_UNKNOWN = "ROLLING_24H_COUNT_UNKNOWN"
 
 #: Entry styles that describe a limit entry at a planned zone. They are admitted only when the
 #: limit is *executable now* (see the trigger rule); a plan still waiting for its condition is a
@@ -152,6 +167,17 @@ class ActionableNotificationPolicy:
     #: An executable limit entry is actionable; an unconfirmed future setup never is.
     admit_executable_limit_entries: bool = True
     require_target_2: bool = False
+    # -- ATDD-OPIP-ACTIONABLE-LIQUIDITY-v1 guards (all default OFF) --
+    # An OFF guard adds no refusal, so the shipped notification policy is
+    # unchanged until an owner activates a condition deliberately. No guard can
+    # widen authority: each either refuses or does nothing.
+    require_verified_depth: bool = False
+    min_weaker_side_depth_usd: float = 600_000.0
+    depth_band_pct: float = 0.50
+    require_calibrated_probability: bool = False
+    min_calibrated_probability: float = 0.90
+    require_protection_admission: bool = False
+    rolling_24h_max_new_entries: int = 0
 
     @classmethod
     def from_settings(cls, settings: Any) -> "ActionableNotificationPolicy":
@@ -207,6 +233,33 @@ class ActionableNotificationPolicy:
             ),
             require_target_2=_bool(
                 "opip_actionable_require_target_2", base.require_target_2
+            ),
+            require_verified_depth=_bool(
+                "opip_actionable_require_verified_depth",
+                base.require_verified_depth,
+            ),
+            min_weaker_side_depth_usd=_float(
+                "opip_actionable_min_weaker_side_depth_usd",
+                base.min_weaker_side_depth_usd,
+            ),
+            depth_band_pct=_float(
+                "opip_actionable_depth_band_pct", base.depth_band_pct
+            ),
+            require_calibrated_probability=_bool(
+                "opip_actionable_require_calibrated_probability",
+                base.require_calibrated_probability,
+            ),
+            min_calibrated_probability=_float(
+                "opip_actionable_min_calibrated_probability",
+                base.min_calibrated_probability,
+            ),
+            require_protection_admission=_bool(
+                "opip_actionable_require_protection_admission",
+                base.require_protection_admission,
+            ),
+            rolling_24h_max_new_entries=_int(
+                "opip_actionable_rolling_24h_max_new_entries",
+                base.rolling_24h_max_new_entries,
             ),
         )
 
@@ -275,6 +328,20 @@ class ActionableEvidence:
 
     # C7 -- delivery eligibility
     delivery_in_flight: bool | None = None
+
+    # -- ATDD-OPIP-ACTIONABLE-LIQUIDITY-v1 optional evidence --
+    # None means the producer did not supply the fact; that refuses only when the
+    # matching policy guard is enabled, so an off guard changes nothing.
+    depth_status: str | None = None
+    weaker_side_depth_usd: float | None = None
+    depth_band_pct: float | None = None
+    depth_evidence_reason: str | None = None
+    calibrated_probability: float | None = None
+    calibration_status: str | None = None
+    calibration_model_version: str | None = None
+    protection_admissions_suspended: bool | None = None
+    protection_stamp_fresh: bool | None = None
+    new_entry_admissions_last_24h: int | None = None
 
 
 @dataclass(frozen=True)
@@ -671,6 +738,61 @@ def _check_delivery(evidence: ActionableEvidence) -> str | None:
     return None
 
 
+def _check_depth(evidence: ActionableEvidence, *, policy) -> str | None:
+    """Verified weaker-side band depth. Adds no refusal unless enabled."""
+    if not policy.require_verified_depth:
+        return None
+    status = str(evidence.depth_status or "").strip().upper()
+    if status == "PASS":
+        return None
+    if status == "FAIL":
+        return REASON_DEPTH_INSUFFICIENT
+    return REASON_DEPTH_UNKNOWN
+
+
+def _check_probability(evidence: ActionableEvidence, *, policy) -> str | None:
+    """Calibrated probability. A heuristic score can never satisfy this."""
+    if not policy.require_calibrated_probability:
+        return None
+    if str(evidence.calibration_status or "").strip().upper() != "CALIBRATED":
+        return REASON_CONFIDENCE_NOT_CALIBRATED
+    probability = _number(evidence.calibrated_probability)
+    if probability is None or probability < 0.0 or probability > 1.0:
+        return REASON_CONFIDENCE_INVALID
+    if not _text(evidence.calibration_model_version):
+        return REASON_CALIBRATION_UNTRUSTED
+    if probability < policy.min_calibrated_probability:
+        return REASON_CONFIDENCE_BELOW
+    return None
+
+
+def _check_protection(evidence: ActionableEvidence, *, policy) -> str | None:
+    """F11 admission state. Read-only: this can only ever refuse."""
+    if not policy.require_protection_admission:
+        return None
+    if evidence.protection_stamp_fresh is not True:
+        return REASON_PROTECTION_UNKNOWN
+    suspended = evidence.protection_admissions_suspended
+    if suspended is None:
+        return REASON_PROTECTION_UNKNOWN
+    if suspended is True:
+        return REASON_PROTECTION_SUSPENDED
+    return None
+
+
+def _check_rolling_cap(evidence: ActionableEvidence, *, policy) -> str | None:
+    """Rolling 24h new-entry cap. 0 disables; an unknown count refuses."""
+    cap = int(policy.rolling_24h_max_new_entries or 0)
+    if cap <= 0:
+        return None
+    count = evidence.new_entry_admissions_last_24h
+    if count is None:
+        return REASON_ROLLING_CAP_UNKNOWN
+    if int(count) >= cap:
+        return REASON_ROLLING_CAP
+    return None
+
+
 def _dedupe(reasons: list[str]) -> tuple[str, ...]:
     ordered: list[str] = []
     for reason in reasons:
@@ -700,10 +822,14 @@ def evaluate_actionable_admission(
         (CONDITION_IDENTITY, _check_identity(evidence, policy=applied, now=moment)),
         (CONDITION_TRIGGER, _check_trigger(evidence, policy=applied)),
         (CONDITION_EXECUTION, _check_execution(evidence, policy=applied)),
+        (CONDITION_DEPTH, _check_depth(evidence, policy=applied)),
         (CONDITION_GEOMETRY, _check_geometry(evidence, policy=applied, now=moment)),
         (CONDITION_ECONOMICS, _check_economics(evidence, policy=applied)),
+        (CONDITION_PROBABILITY, _check_probability(evidence, policy=applied)),
         (CONDITION_RISK, _check_risk(evidence)),
+        (CONDITION_PROTECTION, _check_protection(evidence, policy=applied)),
         (CONDITION_DELIVERY, _check_delivery(evidence)),
+        (CONDITION_ROLLING_CAP, _check_rolling_cap(evidence, policy=applied)),
     )
     failures = [(condition, reason) for condition, reason in evaluated if reason]
     expiry = _resolved_expiry(evidence, applied, now=moment)
@@ -915,6 +1041,20 @@ def evidence_from_trade_plan(
         ai_override_attempted=_flag("ai_override_attempted"),
         funded_execution_authorized=_flag("funded_execution_authorized"),
         delivery_in_flight=_flag("delivery_in_flight", "notification_in_flight"),
+        depth_status=_text(_exec_first("depth_status")),
+        weaker_side_depth_usd=_number(_exec_first("weaker_side_depth_usd")),
+        depth_band_pct=_number(_exec_first("depth_band_pct")),
+        depth_evidence_reason=_text(_exec_first("depth_evidence_reason")),
+        calibrated_probability=_number(_exec_first("calibrated_probability")),
+        calibration_status=_text(_exec_first("calibration_status")),
+        calibration_model_version=_text(_exec_first("calibration_model_version")),
+        protection_admissions_suspended=_exec_flag("protection_admissions_suspended"),
+        protection_stamp_fresh=_exec_flag("protection_stamp_fresh"),
+        new_entry_admissions_last_24h=(
+            None
+            if _exec_first("new_entry_admissions_last_24h") is None
+            else int(_exec_first("new_entry_admissions_last_24h"))
+        ),
     )
 
 

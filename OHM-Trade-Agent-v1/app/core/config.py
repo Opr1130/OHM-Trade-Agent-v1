@@ -123,6 +123,20 @@ class Settings(BaseSettings):
     opip_actionable_require_fully_covered_depth: bool = True
     opip_actionable_admit_executable_limit_entries: bool = True
     opip_actionable_require_target_2: bool = False
+    # ATDD-OPIP-ACTIONABLE-LIQUIDITY-v1 notification-admission guards. All
+    # default OFF so the shipped notification policy is unchanged. Enabling any
+    # of them can only ADD refusals; none can widen notification authority.
+    opip_actionable_require_verified_depth: bool = False
+    opip_actionable_min_weaker_side_depth_usd: float = Field(
+        default=600_000.0, gt=0
+    )
+    opip_actionable_depth_band_pct: float = Field(default=0.50, gt=0, le=5.0)
+    opip_actionable_require_calibrated_probability: bool = False
+    opip_actionable_min_calibrated_probability: float = Field(
+        default=0.90, gt=0.0, le=1.0
+    )
+    opip_actionable_require_protection_admission: bool = False
+    opip_actionable_rolling_24h_max_new_entries: int = Field(default=0, ge=0, le=20)
     # PR 2 canonical writer capture. Default off. "shadow" records Early Watch
     # governor transitions into SQLite evidence only; it does not grant trading
     # authority, ranking influence, or production activation.
