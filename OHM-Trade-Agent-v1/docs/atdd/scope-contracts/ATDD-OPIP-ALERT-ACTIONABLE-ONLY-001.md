@@ -169,6 +169,9 @@ AC-013 -> tests/test_opip_alert_actionable_only_regressions_v1.py::test_long_and
 AC-013 -> tests/test_opip_alert_actionable_only_regressions_v1.py::test_a_short_plan_is_refused_when_only_the_ask_side_is_covered
 AC-013 -> tests/test_opip_alert_actionable_only_regressions_v1.py::test_the_cost_model_counts_fees_and_measured_impact_exactly_once
 AC-013 -> tests/test_opip_alert_actionable_only_regressions_v1.py::test_an_absent_measured_impact_makes_the_net_economics_uncomputable
+AC-013 -> tests/test_opip_alert_actionable_only_regressions_v1.py::test_the_admission_clock_is_the_attempt_time_and_the_evidence_time_is_preserved
+AC-013 -> tests/test_opip_alert_actionable_only_regressions_v1.py::test_a_delayed_notification_is_refused_when_the_market_evidence_is_stale
+AC-013 -> tests/test_opip_alert_actionable_only_regressions_v1.py::test_a_plan_that_expired_before_the_attempt_is_never_delivered_late
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/services/actionable_admission.py

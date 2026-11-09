@@ -9,7 +9,9 @@ Each test pins one defect found in architectural review of the actionable-only g
 3. an executable limit entry is distinct from an unconfirmed future setup;
 4. a legacy outbox row without an admitted verdict fails closed instead of being delivered blind;
 5. every emitted actionable card states entry, stop, targets, invalidation, expiry and *net* R/R;
-6. execution depth and the cost model are direction-specific and counted once.
+6. execution depth and the cost model are direction-specific and counted once;
+7. the native producer admits delivery against the real UTC attempt time, never against the
+   evidence timestamp it was handed (which made C1 freshness and C4 expiry tautological).
 
 No production endpoint is contacted; transports and registries are stubbed.
 """
@@ -554,9 +556,19 @@ def _run_send_trade_plan(
     monkeypatch: pytest.MonkeyPatch,
     *,
     candidate: dict | None = None,
+    observed_at: datetime | None = None,
+    plan_expires_at: datetime | None = None,
 ) -> dict:
-    """Drive the real native producer with only the transport/registry edges stubbed."""
+    """Drive the real native producer with only the transport/registry edges stubbed.
+
+    ``observed_at`` is the independently captured evidence timestamp the scan supplies and
+    ``plan_expires_at`` an explicit plan expiry. Both default to values that are valid *relative
+    to the wall clock*, because the producer's admission clock is the real UTC time of the
+    attempt -- a frozen constant would either age out or drift into the future as time passes.
+    """
     captured: dict = {}
+    attempt_at = datetime.now(timezone.utc)
+    evidence_at = observed_at if observed_at is not None else attempt_at - timedelta(minutes=2)
     monkeypatch.setattr(chief, "get_pending_setup_by_trade_id", lambda trade_id: None)
     monkeypatch.setattr(
         chief, "add_pending_setup", lambda setup: SimpleNamespace(trade_id="TRADE-1")
@@ -581,7 +593,7 @@ def _run_send_trade_plan(
         return SimpleNamespace(delivered=True, message_id=7)
 
     monkeypatch.setattr(chief, "send_tracked_telegram", _send)
-    payload = candidate if candidate is not None else {
+    payload = {
         "symbol": "SOLUSD",
         "direction": "LONG",
         "trade_id": "TRADE-1",
@@ -589,7 +601,7 @@ def _run_send_trade_plan(
         "action_gate_evaluated": True,
         "action_gate_allowed": True,
         "economic_position_notional": 750.0,
-        "evidence_observed_at": (NOW - timedelta(minutes=2)).isoformat(),
+        "evidence_observed_at": evidence_at.isoformat(),
         "execution_evidence": {
             "venue": "KRAKEN",
             "venue_identity_valid": True,
@@ -601,16 +613,21 @@ def _run_send_trade_plan(
             "current_price": 100.0,
         },
     }
+    if plan_expires_at is not None:
+        payload["plan_expires_at"] = plan_expires_at.isoformat()
+    if candidate is not None:
+        payload.update(candidate)
     captured["delivered"] = chief.send_trade_plan(
         candidate=payload,
         plan=_plan(),
         summary="summary",
         bot_token="token",
         chat_id="chat",
-        observed_at=NOW,
+        observed_at=evidence_at,
     )
     captured["candidate"] = payload
     captured["plan"] = _plan()
+    captured["evidence_at"] = evidence_at
     return captured
 
 
@@ -869,3 +886,95 @@ def test_an_absent_measured_impact_makes_the_net_economics_uncomputable():
     )
     assert verdict.admitted is False
     assert verdict.reason == admission.REASON_EXECUTION_EVIDENCE_MISSING
+
+
+# --------------------------------------------------------------------------- #
+# 7. The admission clock is the delivery attempt, not the evidence timestamp
+# --------------------------------------------------------------------------- #
+
+
+def test_the_admission_clock_is_the_attempt_time_and_the_evidence_time_is_preserved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ATDD-OPIP-ALERT-ACTIONABLE-ONLY-001/AC-013.
+
+    A gate handed the evidence timestamp as "now" can never refuse a stale or expired card.
+
+    GIVEN a fresh qualified BUY whose evidence timestamp is captured by the scan
+    WHEN the native producer admits it
+    THEN the gate receives the real UTC time of the attempt while the evidence keeps the
+    independently captured producer timestamp, and the two are distinct
+    """
+
+    captured: dict = {}
+    real_gate = chief.evaluate_actionable_admission
+
+    def _spy(**kwargs):
+        captured["now"] = kwargs.get("now")
+        captured["evidence_observed_at"] = kwargs["evidence"].observed_at
+        return real_gate(**kwargs)
+
+    monkeypatch.setattr(chief, "evaluate_actionable_admission", _spy)
+    evidence_at = datetime.now(timezone.utc) - timedelta(minutes=3)
+    result = _run_send_trade_plan(monkeypatch, observed_at=evidence_at)
+
+    assert result["delivered"] is True
+    attempt_at = captured["now"]
+    assert isinstance(attempt_at, datetime)
+    assert attempt_at.utcoffset() == timedelta(0)
+    assert captured["evidence_observed_at"] == evidence_at
+    assert attempt_at > evidence_at
+    assert attempt_at - evidence_at >= timedelta(minutes=3)
+    assert abs((datetime.now(timezone.utc) - attempt_at).total_seconds()) < 30
+
+
+def test_a_delayed_notification_is_refused_when_the_market_evidence_is_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ATDD-OPIP-ALERT-ACTIONABLE-ONLY-001/AC-013.
+
+    Evidence that aged out while the delivery was delayed can never be presented as fresh.
+
+    GIVEN a complete qualified BUY whose evidence timestamp is far outside the freshness window
+          and whose plan expiry has not passed
+    WHEN the producer attempts the delivery late
+    THEN nothing is sent and the stale evidence is recorded as the refusal reason
+    """
+
+    result = _run_send_trade_plan(
+        monkeypatch,
+        observed_at=datetime.now(timezone.utc) - timedelta(minutes=45),
+        plan_expires_at=datetime.now(timezone.utc) + timedelta(hours=6),
+    )
+
+    assert result["delivered"] is False
+    assert "message" not in result
+    assert result["suppression"]["reason"] == "ACTIONABLE_GATE:EVIDENCE_STALE"
+    assert result["suppression"]["symbol"] == "SOLUSD"
+
+
+def test_a_plan_that_expired_before_the_attempt_is_never_delivered_late(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ATDD-OPIP-ALERT-ACTIONABLE-ONLY-001/AC-013.
+
+    Fresh evidence does not rescue an entry whose own window closed before the attempt.
+
+    GIVEN market evidence that is still inside the freshness window and a plan whose expiry
+          passed between the evidence capture and this attempt
+    WHEN the producer attempts the delivery
+    THEN nothing is sent and the expired plan is recorded as the refusal reason
+    """
+
+    attempt_at = datetime.now(timezone.utc)
+    result = _run_send_trade_plan(
+        monkeypatch,
+        observed_at=attempt_at - timedelta(minutes=10),
+        plan_expires_at=attempt_at - timedelta(minutes=5),
+    )
+
+    assert result["delivered"] is False
+    assert "message" not in result
+    assert result["suppression"]["reason"] == "ACTIONABLE_GATE:EXPIRY_PASSED"
+    assert result["suppression"]["symbol"] == "SOLUSD"
+

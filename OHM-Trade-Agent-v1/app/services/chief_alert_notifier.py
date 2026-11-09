@@ -2,7 +2,7 @@ from pathlib import Path
 from typing import Any
 import math
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from app.services.asset_display_identity import display_asset_text, display_market_label
 from app.services.actionable_admission import (
@@ -536,10 +536,14 @@ def send_trade_plan(
         execution=execution_evidence or candidate.get("execution_evidence"),
         observed_at=observed_at,
     )
+    # The admission clock is the real UTC time of this delivery attempt, never the evidence
+    # timestamp: C1 freshness and C4 expiry exist precisely to refuse a *delayed* card, so
+    # handing the gate the evidence time would compare it with itself and always pass. The
+    # evidence keeps the independently captured producer timestamp above.
     admission = evaluate_actionable_admission(
         evidence=evidence,
         policy=policy,
-        now=observed_at,
+        now=datetime.now(timezone.utc),
     )
     if admission.suppressed:
         reason = admission.suppression_reason() or "ACTIONABLE_GATE"
