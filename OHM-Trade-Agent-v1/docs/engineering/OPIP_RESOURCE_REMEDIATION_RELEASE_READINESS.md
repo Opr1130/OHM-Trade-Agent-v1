@@ -129,4 +129,45 @@ measurement-dependent tuning of Early Watch remains open and is listed, not
 guessed. The release is at the authorization gate — nothing has been merged,
 deployed or activated.**
 
+
+## 7. Blocking CI condition — `atdd scope` (owner-sequenced, not bypassed)
+
+CI reports `atdd scope=FAILURE` on all three PRs. This is a **governance
+prerequisite, not a code defect**, and it was deliberately not bypassed:
+
+```
+SCOPE_CHANGE_REQUIRED
+changed file not mapped to an approved AC: .../app/jobs/run_cycle.py
+... (one line per changed file) ...
+```
+
+`.github/workflows/pytest.yml` reads the single global pointer
+`OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT` (currently
+`ATDD-OPIP-V2-ADVISORY-PARITY-M01`) and requires every changed file to be mapped
+to an approved AC of that increment. To go green, each PR needs:
+
+1. a scope contract at `docs/atdd/scope-contracts/ATDD-<INCREMENT>.md` following
+   the existing format (INCREMENT / OWNER-APPROVED INTENT / ARCHITECTURE
+   REFERENCES / APPROVED ACCEPTANCE CRITERIA / EXPLICITLY OUT OF SCOPE / FROZEN
+   BOUNDARIES / ACCEPTANCE TEST TRACEABILITY / IMPLEMENTATION MAP / DEFERRED
+   DISCOVERIES / UNAPPROVED SCOPE CHANGES), mapping each changed file to an AC;
+2. `docs/atdd/ACTIVE_INCREMENT` moved to that increment.
+
+**Why it was not simply done here.** `ACTIVE_INCREMENT` is a *single repository-wide
+pointer*. With #513, #514, #515, #516 and #517 all open, three of them cannot each
+own it without conflicting, and moving it displaces the increment that the other
+in-flight PRs are currently validated against. That is a sequencing decision for
+the owner (merge order across the open PR set), and `AGENTS.md` principle 20 makes
+it a high-impact governance change rather than a routine edit.
+
+**Remedy:** add the contract and move the pointer in whichever PR the owner merges
+first, then rebase the others onto it (contracts are additive per-PR files; only
+the pointer line conflicts).
+
+The other non-green checks are explicitly **advisory**
+(`ruff (advisory)`, `bandit (advisory)`, `gitleaks (advisory)`) and do not gate
+the merge; `test` is green on #516 (the other two were still running when this
+report was written). The substantive suites that matter for these changes are
+green locally (§3).
+
 | C-2 | P1 | Automatic `EARLY_MOVER` alerting had no explicit, auditable release switch separate from subscribed `COMMAND_WATCH` and critical safety alerts. | **Delivered** — `OPIP_EARLY_WATCH_MODE=active\|evidence_only`, fail-closed, single boundary, distinct suppression reason | #517 · `test_ac_004/005/006_*` |
