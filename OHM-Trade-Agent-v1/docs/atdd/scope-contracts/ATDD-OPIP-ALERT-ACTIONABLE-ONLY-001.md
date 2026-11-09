@@ -232,6 +232,8 @@ AC-013 -> OHM-Trade-Agent-v1/tests/test_opip_alert_actionable_only_v1.py
 AC-013 -> OHM-Trade-Agent-v1/tests/test_tradevisor_notifier_v1.py
 AC-013 -> OHM-Trade-Agent-v1/tests/test_trade_lifecycle.py
 AC-013 -> OHM-Trade-Agent-v1/tests/test_wave9_action_notification_reliability.py
+AC-013 -> OHM-Trade-Agent-v1/tests/test_wave9_actionable_priority.py
+AC-013 -> OHM-Trade-Agent-v1/tests/test_wave9_review_fixes.py
 AC-013 -> OHM-Trade-Agent-v1/tests/test_opip_r4_alert_notification_quality.py
 
 DEFERRED DISCOVERIES:
