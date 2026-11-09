@@ -103,7 +103,7 @@ THEN: all actionable producers call the one shared gate, retry delivery is reval
 AC-012:
 GIVEN: this scope contract and the movable active-increment pointer
 WHEN: both are inspected
-THEN: this contract declares exactly this increment with every required section, its implementation map authorizes the changed paths, every acceptance criterion is traced to a test, and the pointer resolves to an existing contract without being owned or pinned by this increment
+THEN: this contract declares exactly this increment with every required section, its implementation map authorizes the changed paths including the sequenced pointer, every acceptance criterion is traced to a test, and the pointer resolves to an existing contract without being owned or pinned by this increment
 
 EXPLICITLY OUT OF SCOPE:
 - Any change to deterministic qualification, ranking, scoring, capital allocation, risk sizing, execution geometry or the economic execution gate's protected thresholds
@@ -146,35 +146,35 @@ AC-012 -> tests/test_opip_alert_actionable_only_v1.py::test_ac_012_governance_co
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/services/actionable_admission.py
 AC-001 -> OHM-Trade-Agent-v1/app/jobs/scan_movers.py
-AC-001 -> tests/test_opip_alert_actionable_only_v1.py
+AC-001 -> OHM-Trade-Agent-v1/tests/test_opip_alert_actionable_only_v1.py
 AC-002 -> OHM-Trade-Agent-v1/app/services/actionable_admission.py
-AC-002 -> tests/test_opip_alert_actionable_only_v1.py
+AC-002 -> OHM-Trade-Agent-v1/tests/test_opip_alert_actionable_only_v1.py
 AC-003 -> OHM-Trade-Agent-v1/app/services/actionable_admission.py
 AC-003 -> OHM-Trade-Agent-v1/app/services/chief_alert_notifier.py
-AC-003 -> tests/test_opip_alert_actionable_only_v1.py
+AC-003 -> OHM-Trade-Agent-v1/tests/test_opip_alert_actionable_only_v1.py
 AC-004 -> OHM-Trade-Agent-v1/app/services/actionable_admission.py
 AC-004 -> OHM-Trade-Agent-v1/app/services/chief_alert_notifier.py
-AC-004 -> tests/test_opip_alert_actionable_only_v1.py
+AC-004 -> OHM-Trade-Agent-v1/tests/test_opip_alert_actionable_only_v1.py
 AC-005 -> OHM-Trade-Agent-v1/app/services/actionable_admission.py
 AC-005 -> OHM-Trade-Agent-v1/app/services/chief_alert_notifier.py
-AC-005 -> tests/test_opip_alert_actionable_only_v1.py
+AC-005 -> OHM-Trade-Agent-v1/tests/test_opip_alert_actionable_only_v1.py
 AC-006 -> OHM-Trade-Agent-v1/app/services/qualified_alert_outbox.py
 AC-006 -> OHM-Trade-Agent-v1/app/services/telegram_delivery.py
-AC-006 -> tests/test_opip_alert_actionable_only_v1.py
+AC-006 -> OHM-Trade-Agent-v1/tests/test_opip_alert_actionable_only_v1.py
 AC-007 -> OHM-Trade-Agent-v1/app/services/telegram_delivery.py
-AC-007 -> tests/test_opip_alert_actionable_only_v1.py
+AC-007 -> OHM-Trade-Agent-v1/tests/test_opip_alert_actionable_only_v1.py
 AC-008 -> OHM-Trade-Agent-v1/app/services/actionable_admission.py
-AC-008 -> tests/test_opip_alert_actionable_only_v1.py
+AC-008 -> OHM-Trade-Agent-v1/tests/test_opip_alert_actionable_only_v1.py
 AC-009 -> OHM-Trade-Agent-v1/docker-compose.yml
 AC-009 -> OHM-Trade-Agent-v1/app/jobs/scan_movers.py
 AC-009 -> OHM-Trade-Agent-v1/app/core/config.py
 AC-009 -> OHM-Trade-Agent-v1/app/services/movement_discovery_v2.py
-AC-009 -> tests/test_wave9_actionable_only_alerts.py
-AC-009 -> tests/test_opip_alert_actionable_only_v1.py
-AC-009 -> tests/test_wave9_action_notification_reliability.py
+AC-009 -> OHM-Trade-Agent-v1/tests/test_wave9_actionable_only_alerts.py
+AC-009 -> OHM-Trade-Agent-v1/tests/test_opip_alert_actionable_only_v1.py
+AC-009 -> OHM-Trade-Agent-v1/tests/test_wave9_action_notification_reliability.py
 AC-010 -> OHM-Trade-Agent-v1/app/core/config.py
 AC-010 -> OHM-Trade-Agent-v1/app/services/actionable_admission.py
-AC-010 -> tests/test_opip_alert_actionable_only_v1.py
+AC-010 -> OHM-Trade-Agent-v1/tests/test_opip_alert_actionable_only_v1.py
 AC-011 -> OHM-Trade-Agent-v1/app/services/chief_alert_notifier.py
 AC-011 -> OHM-Trade-Agent-v1/app/services/qualified_alert_outbox.py
 AC-011 -> OHM-Trade-Agent-v1/app/services/tradevisor_notifier.py
@@ -182,12 +182,13 @@ AC-011 -> OHM-Trade-Agent-v1/app/services/tradevisor_evaluation.py
 AC-011 -> OHM-Trade-Agent-v1/app/services/movement_discovery_v2.py
 AC-011 -> OHM-Trade-Agent-v1/app/jobs/scan_opportunities.py
 AC-011 -> OHM-Trade-Agent-v1/app/services/telegram_delivery.py
-AC-011 -> tests/test_opip_alert_actionable_only_v1.py
-AC-011 -> tests/test_trade_lifecycle.py
-AC-011 -> tests/test_opip_r4_alert_notification_quality.py
-AC-011 -> tests/test_tradevisor_notifier_v1.py
+AC-011 -> OHM-Trade-Agent-v1/tests/test_opip_alert_actionable_only_v1.py
+AC-011 -> OHM-Trade-Agent-v1/tests/test_trade_lifecycle.py
+AC-011 -> OHM-Trade-Agent-v1/tests/test_opip_r4_alert_notification_quality.py
+AC-011 -> OHM-Trade-Agent-v1/tests/test_tradevisor_notifier_v1.py
 AC-012 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-ALERT-ACTIONABLE-ONLY-001.md
-AC-012 -> tests/test_opip_alert_actionable_only_v1.py
+AC-012 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
+AC-012 -> OHM-Trade-Agent-v1/tests/test_opip_alert_actionable_only_v1.py
 
 DEFERRED DISCOVERIES:
 - Whether an already-qualified limit entry waiting for a better price should be admitted at all is
