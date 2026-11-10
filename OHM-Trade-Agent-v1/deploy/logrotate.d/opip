@@ -8,7 +8,7 @@
 # and empty logs are safe.
 #
 # Logs may contain operational details; rotated files must remain root-only.
-/var/log/ohm-unified-cycle.log /var/log/ohm-scan-dispatch.log /var/log/ohm-scan-worker-*.log {
+/var/log/ohm-unified-cycle.log /var/log/ohm-scan-dispatch.log {
     su root root
     daily
     maxsize 10M
