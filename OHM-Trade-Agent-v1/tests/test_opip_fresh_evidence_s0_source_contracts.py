@@ -39,9 +39,9 @@ def _exported_json_state_paths_with_locks() -> dict[str, str]:
     """
     script = EXPORTER.read_text(encoding="utf-8")
     pattern = (
-        r'^\\s*copy_locked_json_state\\s+"\\$DATA_ROOT/([^"]+\\.json)"'
-        r'\\s+"state_snapshots/[^"]+\\.json"'
-        r'\\s+"\\$DATA_ROOT/(\\.[^"]+\\.lock)"'
+        r'^\s*copy_locked_json_state\s+"\$DATA_ROOT/([^"]+\.json)"'
+        r'\s+"state_snapshots/[^"]+\.json"'
+        r'\s+"\$DATA_ROOT/(\.[^"]+\.lock)"'
     )
     return dict(re.findall(pattern, script, flags=re.MULTILINE))
 
