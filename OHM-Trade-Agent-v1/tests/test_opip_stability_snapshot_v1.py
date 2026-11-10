@@ -91,3 +91,36 @@ def test_cycle_liveness_only_counts_timestamped_completions(tmp_path: Path):
     assert out["degraded"] is None
     assert out["skipped_lock"] is None
     assert out["measurement"] == "TIMESTAMPED_LOG_WINDOW"
+
+
+@pytest.mark.acceptance
+def test_docker_probe_is_opt_in_bounded_and_redacted(monkeypatch, tmp_path: Path):
+    """ATDD-OPIP-STABILITY-EVIDENCE-v1/AC-205: optional resource reads disclose no secrets."""
+    import subprocess
+
+    calls = []
+
+    def fake_run(argv, *, capture_output, text, timeout, check):
+        calls.append((argv, timeout))
+        if "stats" in argv:
+            output = json.dumps({
+                "Name": "opip-stream-worker", "MemUsage": "46MiB / 192MiB",
+                "MemPerc": "24%", "CPUPerc": "0.1%", "PIDs": "2",
+                "Env": "SECRET=DO_NOT_PRINT",
+            })
+        else:
+            output = json.dumps({
+                "Names": "opip-stream-worker", "State": "running",
+                "Status": "Up 1 hour", "Command": "secret",
+            })
+        return subprocess.CompletedProcess(argv, 0, output, "")
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    now = datetime(2026, 11, 10, tzinfo=timezone.utc)
+    assert module.snapshot(tmp_path, now=now)["docker"]["status"] == "NOT_REQUESTED"
+    assert calls == []
+    output = module.snapshot(tmp_path, now=now, inspect_docker=True)
+    assert output["docker"]["status"] == "OK"
+    assert len(calls) == 2 and all(timeout == 8 for _, timeout in calls)
+    assert "DO_NOT_PRINT" not in json.dumps(output)
+    assert "Command" not in json.dumps(output)
