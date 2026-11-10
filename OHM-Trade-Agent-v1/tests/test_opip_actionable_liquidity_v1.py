@@ -7,6 +7,8 @@ Telegram, no AI, no registry writes.
 
 from __future__ import annotations
 
+import pytest
+
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -73,8 +75,11 @@ def _depth(book, **overrides):
     return ev.depth_evidence(book, **kwargs)
 
 # ---------------------------------------------------------------- A - boundaries
+@pytest.mark.acceptance
 def test_ac_a2_exactly_six_hundred_thousand_passes_inclusive():
-    """AC-A2: exactly 600,000.00 on the weaker side passes (inclusive)."""
+    """ATDD-OPIP-ACTIONABLE-LIQUIDITY-v1/AC-101.
+
+    AC-A2: exactly 600,000.00 on the weaker side passes (inclusive)."""
     result = _depth(_book(700_000.0, ACTIONABLE))
     assert result.status == ev.DEPTH_PASS
     assert result.weaker_side_usd == Decimal("600000")
@@ -188,8 +193,11 @@ def test_ac_c1_depth_uses_the_price_boundary_not_the_average_price():
     assert result.marginal_ask_price is not None
 
 
+@pytest.mark.acceptance
 def test_ac_c5_depth_and_execution_feasibility_are_independent_contracts():
-    """AC-C5: depth and execution feasibility are separate verdicts."""
+    """ATDD-OPIP-ACTIONABLE-LIQUIDITY-v1/AC-112.
+
+    AC-C5: depth and execution feasibility are separate verdicts."""
     book = _book(900_000.0, 900_000.0)
     depth = _depth(book)
     execution = ev.evaluate_execution(
@@ -209,15 +217,21 @@ def test_ac_d1_no_book_is_unknown_and_never_zero():
     assert result.weaker_side_usd is None
 
 
+@pytest.mark.acceptance
 def test_ac_d2_partial_evidence_below_threshold_is_unknown_not_fail():
-    """AC-D2: an uncovered shortfall cannot be asserted as FAIL."""
+    """ATDD-OPIP-ACTIONABLE-LIQUIDITY-v1/AC-102.
+
+    AC-D2: an uncovered shortfall cannot be asserted as FAIL."""
     result = _depth(_book(700_000.0, 300_000.0, requested=8))
     assert result.status == ev.DEPTH_UNKNOWN
     assert result.covered_ask is False
 
 
+@pytest.mark.acceptance
 def test_ac_d3_partial_evidence_at_or_above_threshold_is_pass():
-    """AC-D3: observed depth is a subset of truth, so >= threshold proves PASS."""
+    """ATDD-OPIP-ACTIONABLE-LIQUIDITY-v1/AC-103.
+
+    AC-D3: observed depth is a subset of truth, so >= threshold proves PASS."""
     result = _depth(_book(700_000.0, 700_000.0, requested=8))
     assert result.status == ev.DEPTH_PASS
     assert result.covered_ask is False
@@ -239,8 +253,11 @@ def test_ec09_a_backwards_clock_is_untrustworthy_not_fresh():
     assert result.reason == ev.REASON_CLOCK_UNTRUSTED
 
 
+@pytest.mark.acceptance
 def test_ec01_exact_decimal_arithmetic_at_the_boundary():
-    """EC-01: accumulation is exact-decimal; float summation would fail this.
+    """ATDD-OPIP-ACTIONABLE-LIQUIDITY-v1/AC-104.
+
+    EC-01: accumulation is exact-decimal; float summation would fail this.
 
     331 x (0.1 * 0.1) is exactly 3.31 in decimal, but binary floats sum to
     3.3099999999999734 - which would refuse a plan that genuinely passes.
@@ -265,8 +282,11 @@ def test_ec01_exact_decimal_arithmetic_at_the_boundary():
     assert result.weaker_side_usd == Decimal("3.31")
 
 # ---------------------------------------------------------------- adapter
+@pytest.mark.acceptance
 def test_ac_b1_depth_request_is_clamped_and_returns_parsed_book():
-    """AC-B1: the count is clamped to the venue ceiling and rows are parsed."""
+    """ATDD-OPIP-ACTIONABLE-LIQUIDITY-v1/AC-111.
+
+    AC-B1: the count is clamped to the venue ceiling and rows are parsed."""
     from app.exchanges.kraken import KrakenClient
 
     seen = {}
@@ -306,6 +326,7 @@ def test_ec02_duplicate_price_levels_are_summed_not_overwritten():
 # F/G/H/I - guarded admission conditions
 # ---------------------------------------------------------------------------
 from app.services import actionable_admission as admission  # noqa: E402
+
 
 WINDOW = datetime(2026, 11, 9, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -358,8 +379,11 @@ def _passing(evidence=None, policy=None):
     return _admit(_base_evidence(**fields), policy)
 
 
+@pytest.mark.acceptance
 def test_ac_h1_a_fully_eligible_plan_is_admitted_exactly_once():
-    """AC-H1 / L1: the gate is not vacuously closed."""
+    """ATDD-OPIP-ACTIONABLE-LIQUIDITY-v1/AC-106.
+
+    AC-H1 / L1: the gate is not vacuously closed."""
     verdict = _passing({})
     assert verdict.admitted is True
     assert verdict.condition is None
@@ -381,8 +405,11 @@ def test_ac_h2_a_single_missing_mandatory_element_is_refused():
         assert reason in verdict.reasons, (field, verdict.reasons)
 
 
+@pytest.mark.acceptance
 def test_feature_disabled_guards_change_nothing():
-    """Owner requirement: disabled feature state matches deployed policy."""
+    """ATDD-OPIP-ACTIONABLE-LIQUIDITY-v1/AC-105.
+
+    Owner requirement: disabled feature state matches deployed policy."""
     off = admission.ActionableNotificationPolicy()
     assert off.require_verified_depth is False
     assert off.require_calibrated_probability is False
@@ -393,8 +420,11 @@ def test_feature_disabled_guards_change_nothing():
     assert verdict.admitted is True
 
 
+@pytest.mark.acceptance
 def test_ac_g1_below_ninety_percent_is_refused():
-    """AC-G1: 0.8999 fails; AC-G2: 0.9000 passes the comparison."""
+    """ATDD-OPIP-ACTIONABLE-LIQUIDITY-v1/AC-107.
+
+    AC-G1: 0.8999 fails; AC-G2: 0.9000 passes the comparison."""
     assert _passing({"calibrated_probability": 0.8999}).reason == \
         admission.REASON_CONFIDENCE_BELOW
     assert _passing({"calibrated_probability": 0.9000}).admitted is True
@@ -422,8 +452,11 @@ def test_ac_g7_an_unversioned_artifact_is_untrusted():
     assert verdict.reason == admission.REASON_CALIBRATION_UNTRUSTED
 
 
+@pytest.mark.acceptance
 def test_ac_f1_suspended_protection_refuses():
-    """AC-F1: a fresh stamp reporting suspension refuses new entries."""
+    """ATDD-OPIP-ACTIONABLE-LIQUIDITY-v1/AC-108.
+
+    AC-F1: a fresh stamp reporting suspension refuses new entries."""
     verdict = _passing({"protection_admissions_suspended": True})
     assert verdict.reason == admission.REASON_PROTECTION_SUSPENDED
     assert verdict.condition == admission.CONDITION_PROTECTION
@@ -445,8 +478,11 @@ def test_ac_f8_the_stamp_can_never_grant_authority():
     assert verdict.admitted is False
 
 
+@pytest.mark.acceptance
 def test_ac_i1_rolling_cap_refuses_a_third_entry():
-    """AC-I1: two admissions in the window exhaust the cap."""
+    """ATDD-OPIP-ACTIONABLE-LIQUIDITY-v1/AC-109.
+
+    AC-I1: two admissions in the window exhaust the cap."""
     assert _passing({"new_entry_admissions_last_24h": 2}).reason == \
         admission.REASON_ROLLING_CAP
     assert _passing({"new_entry_admissions_last_24h": 1}).admitted is True

@@ -5,6 +5,7 @@ real sleeps, no Telegram, no AI, no registry writes outside tmp_path.
 """
 
 from __future__ import annotations
+import pytest
 
 import json
 from datetime import datetime, timedelta, timezone
@@ -29,8 +30,11 @@ def test_p5_persisting_depth_is_stable():
     assert verdict.minimum_weaker_side_usd == 880_000
 
 
+@pytest.mark.acceptance
 def test_p5_vanishing_liquidity_cannot_qualify():
-    """The proof obligation: apparent liquidity that vanishes must be refused."""
+    """ATDD-OPIP-ACTIONABLE-LIQUIDITY-v1/AC-113.
+
+    The proof obligation: apparent liquidity that vanishes must be refused."""
     verdict = lv.assess_depth_stability([_obs(900_000), _obs(150_000), _obs(890_000)])
     assert verdict.status == lv.VANISHING
     assert verdict.reason == lv.REASON_LIQUIDITY_VANISHING
@@ -113,7 +117,11 @@ def _evidence(**overrides):
     return oe.OpportunityEvidence(**fields)
 
 
+@pytest.mark.acceptance
 def test_p1_a_finalist_evaluation_produces_a_valid_record(tmp_path):
+    """ATDD-OPIP-ACTIONABLE-LIQUIDITY-v1/AC-114.
+
+    A finalist evaluation yields a complete, valid evidence record."""
     path = tmp_path / "evidence.jsonl"
     assert oe.append_record(path, _evidence()) is True
     rows = oe.read_records(path)
@@ -149,6 +157,7 @@ def test_p1_record_contains_only_decision_time_fields():
 from app.services import ai_advisory_isolation as ai  # noqa: E402
 
 
+
 def _publish(tmp_path, observed_at, **overrides):
     args = dict(
         stamp_path=tmp_path / "stamp.json",
@@ -169,7 +178,11 @@ def test_p2_publisher_bootstraps_and_reader_fails_closed(tmp_path):
     assert stamp.usable is False
 
 
+@pytest.mark.acceptance
 def test_p2_derived_bound_tightens_but_never_widens(tmp_path):
+    """ATDD-OPIP-ACTIONABLE-LIQUIDITY-v1/AC-115.
+
+    The configured maximum stays authoritative; the derived p99 only tightens it."""
     last = None
     for index in range(25):
         last = _publish(tmp_path, NOW + timedelta(seconds=30 * index))
@@ -197,7 +210,11 @@ def test_p2_only_successful_observations_enter_the_history(tmp_path):
 
 
 # --------------------------------------------------------------------- P6 AI
+@pytest.mark.acceptance
 def test_p6_ai_failure_preserves_every_deterministic_candidate():
+    """ATDD-OPIP-ACTIONABLE-LIQUIDITY-v1/AC-116.
+
+    An AI outage removes no deterministic candidate."""
     annotated = ai.attach_advisory(
         ["c1", "c2", "c3"], ai.annotation_for_status(ai.AI_STATUS_UNAVAILABLE)
     )

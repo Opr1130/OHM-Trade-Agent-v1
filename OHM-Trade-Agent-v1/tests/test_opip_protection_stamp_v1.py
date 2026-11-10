@@ -5,9 +5,12 @@ Pure contract tests: no filesystem, no clock of their own, no authority.
 
 from __future__ import annotations
 
+import pytest
+
 from datetime import datetime, timedelta, timezone
 
 from app.services import protection_health as ph
+
 
 NOW = datetime(2026, 11, 9, 12, 0, 0, tzinfo=timezone.utc)
 SHA = "a" * 40
@@ -40,8 +43,11 @@ def test_f11_bound_is_derived_not_hardcoded():
     assert ph.derive_freshness_bound(wider) == 600.0
 
 
+@pytest.mark.acceptance
 def test_f11_below_min_samples_is_unproven():
-    """Twenty samples are a preliminary baseline, not a reliable p99."""
+    """ATDD-OPIP-ACTIONABLE-LIQUIDITY-v1/AC-110.
+
+    Twenty samples are a preliminary baseline, not a reliable p99."""
     times = [NOW + timedelta(seconds=60 * i) for i in range(ph.STAMP_MIN_SAMPLES - 1)]
     assert ph.derive_freshness_bound(times) is None
     stamp = _read(_payload(sample_count=ph.STAMP_MIN_SAMPLES - 1))
