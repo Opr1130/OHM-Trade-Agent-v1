@@ -10,6 +10,9 @@ refuse, and all of them ship disabled so the deployed policy is unchanged. The e
 this increment is validated by passing its name explicitly to the scope checker.
 
 ARCHITECTURE REFERENCES:
+- OHM-Trade-Agent-v1/app/services/liquidity_verification.py: bounded multi-observation stability.
+- OHM-Trade-Agent-v1/app/services/opportunity_evidence.py: prospective decision-time evidence.
+- OHM-Trade-Agent-v1/app/services/ai_advisory_isolation.py: AI advisory separated from evidence.
 - OHM-Trade-Agent-v1/app/scanner/execution_validation.py: tri-state verified band depth.
 - OHM-Trade-Agent-v1/app/exchanges/kraken.py: clamped deep-book read for finalists only.
 - OHM-Trade-Agent-v1/app/services/kraken_transport.py: Depth TTL entry.
@@ -18,6 +21,29 @@ ARCHITECTURE REFERENCES:
 - OHM-Trade-Agent-v1/app/core/config.py: versioned guard settings, all default off.
 
 APPROVED ACCEPTANCE CRITERIA:
+
+AC-113:
+GIVEN three independent depth observations for the same verified venue and instrument
+WHEN qualifying weaker-side depth does not persist across every observation
+THEN the candidate is refused as VANISHING and cannot become actionable
+
+AC-114:
+GIVEN a completed finalist evaluation
+WHEN a prospective evidence record is written
+THEN it carries only decision-time fields, is idempotent on its key, and is rejected if it
+     carries any future-derived outcome field
+
+AC-115:
+GIVEN the authoritative protection observation
+WHEN the F11 admission stamp is published
+THEN publication is atomic, replay-protected, and its freshness bound is the configured maximum
+     tightened by the derived p99 - never widened by a small sample
+
+AC-116:
+GIVEN an AI timeout, budget exhaustion or provider failure
+WHEN deterministic candidates exist
+THEN every deterministic candidate is preserved with an explicit advisory reason code, and the
+     AI opinion cannot admit anything
 
 AC-101:
 GIVEN verified weaker-side depth of exactly 600,000.00 inside a 0.5% band
@@ -99,6 +125,10 @@ FROZEN BOUNDARIES:
 - No merge, deployment, activation, Telegram send or AI call in this increment.
 
 ACCEPTANCE TEST TRACEABILITY:
+AC-113 -> OHM-Trade-Agent-v1/tests/test_opip_liquidity_pipeline_v1.py
+AC-114 -> OHM-Trade-Agent-v1/tests/test_opip_liquidity_pipeline_v1.py
+AC-115 -> OHM-Trade-Agent-v1/tests/test_opip_liquidity_pipeline_v1.py
+AC-116 -> OHM-Trade-Agent-v1/tests/test_opip_liquidity_pipeline_v1.py
 AC-101 -> OHM-Trade-Agent-v1/tests/test_opip_actionable_liquidity_v1.py
 AC-102 -> OHM-Trade-Agent-v1/tests/test_opip_actionable_liquidity_v1.py
 AC-103 -> OHM-Trade-Agent-v1/tests/test_opip_actionable_liquidity_v1.py
@@ -145,6 +175,14 @@ AC-112 -> OHM-Trade-Agent-v1/tests/test_opip_actionable_liquidity_v1.py
 AC-101 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-ACTIONABLE-LIQUIDITY-v1.md
 AC-112 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-ACTIONABLE-LIQUIDITY-v1.md
 
+AC-113 -> OHM-Trade-Agent-v1/app/services/liquidity_verification.py
+AC-113 -> OHM-Trade-Agent-v1/tests/test_opip_liquidity_pipeline_v1.py
+AC-114 -> OHM-Trade-Agent-v1/app/services/opportunity_evidence.py
+AC-114 -> OHM-Trade-Agent-v1/tests/test_opip_liquidity_pipeline_v1.py
+AC-115 -> OHM-Trade-Agent-v1/app/services/protection_health.py
+AC-115 -> OHM-Trade-Agent-v1/tests/test_opip_liquidity_pipeline_v1.py
+AC-116 -> OHM-Trade-Agent-v1/app/services/ai_advisory_isolation.py
+AC-116 -> OHM-Trade-Agent-v1/tests/test_opip_liquidity_pipeline_v1.py
 DEFERRED DISCOVERIES:
 - The AI-dependency correction (P6) and the depth-based monitoring classification remain designed
   but unwired; they are explicitly inactive and require their own authorisation.
