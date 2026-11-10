@@ -81,6 +81,22 @@ def test_p5_deadline_prevents_unbounded_waiting():
     assert verdict.reason == lv.REASON_DEADLINE_EXCEEDED
 
 
+def test_p5_slow_final_measurement_cannot_pass_after_deadline():
+    clock = {"t": 0.0}
+
+    def measure():
+        clock["t"] += 20.0
+        return _obs(900_000)
+
+    verdict = lv.collect_depth_observations(
+        measure, required=3, spacing_seconds=0.0,
+        deadline_seconds=45.0, sleep=lambda seconds: None,
+        monotonic=lambda: clock["t"],
+    )
+    assert verdict.status == lv.UNKNOWN
+    assert verdict.reason == lv.REASON_DEADLINE_EXCEEDED
+
+
 def test_p5_full_sequence_without_waiting_succeeds():
     clock = {"t": 0.0}
     verdict = lv.collect_depth_observations(
