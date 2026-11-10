@@ -101,7 +101,7 @@ This is a **static tests-first contract only** and stays RED until a separately 
 
 ### Remaining owner gate
 
-1. **Production scorer evidence:** read effective V2 settings from the active process and inspect a recent completed isolated attempt's `scoring.v2_status_counts`; distinguish V2 evaluation from selection and require authoritative per-row release/config/scorer attribution.
+1. **Production scorer evidence:** read effective V2 settings from the active process and inspect a recent completed isolated attempt's **`worker_status.json`** (`app/jobs/scan_worker.py`, `STATUS_NAME`), specifically `scoring.production_scoring_version`, `scoring.v2_evaluation_enabled`, and `scoring.v2_status_counts`. Do **not** assume an unrelated `status.json` contains this block. The existing Control Center analytical projection also documents `operational_telemetry` records with `section='worker_status'`, but actual population/freshness still needs runtime proof. Distinguish V2 evaluation from V2 production selection and require authoritative per-row release/config/scorer attribution.
 2. **Coverage:** prove the latest ten completed scans and a multi-release seven-day window with explicit scan IDs, archive segments, dead letters, rejected/omitted observations, Chief candidates, downstream decisions and record-level reconciliation.
 3. **Copy-only registry coverage:** approve the snapshot source contract and targeted fail-closed tests before implementing it; no mainline code or production file changes in S0/S0B.
 4. **Export capacity:** bound the 4.9-GiB full-copy cost, scheduling/locking behavior and resource headroom independently from lineage correctness.
