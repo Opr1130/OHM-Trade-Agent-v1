@@ -148,6 +148,11 @@ def collect_depth_observations(
             # A failed observation is never treated as a passing one.
             return StabilityVerdict(UNKNOWN, REASON_OBSERVATION_FAILED,
                                     len(observations), wanted, None, None)
+        # The final measurement can itself exceed the deadline; pre-call checks
+        # alone do not prove that all observations finished inside the budget.
+        if monotonic() - started > budget:
+            return StabilityVerdict(UNKNOWN, REASON_DEADLINE_EXCEEDED,
+                                    len(observations), wanted, None, None)
 
     return assess_depth_stability(observations, required=wanted)
 
