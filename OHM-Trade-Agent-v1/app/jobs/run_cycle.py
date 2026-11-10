@@ -59,7 +59,7 @@ def _cycle_phase(name: str) -> None:
     """Record the phase the canonical cycle has entered, durably."""
     print(f"{_CYCLE_PHASE_PREFIX}{name}", flush=True)
 
-def _publish_protection_admission_stamp_fail_open(settings) -> None:
+def _publish_protection_admission_stamp_fail_open(settings=None) -> None:
     """Publish F11's admission verdict for other containers. Default OFF.
 
     The observation is taken exactly once, here, from the same authoritative
@@ -73,6 +73,8 @@ def _publish_protection_admission_stamp_fail_open(settings) -> None:
     publishing none. Failure is reported and never aborts the cycle.
     """
     try:
+        if settings is None:
+            settings = get_settings()
         from app.services import opportunity_pipeline_wiring as wiring
 
         if not wiring.protectin_stamp_publish_enabled(settings):
@@ -773,7 +775,7 @@ def _run_cycle_once() -> bool:
     # observation is ever created and F11 keeps sole computation authority.
     # Publication cannot grant authority: consumers fail closed on a missing,
     # stale, corrupt or unproven stamp.
-    _publish_protection_admission_stamp_fail_open(settings)
+    _publish_protection_admission_stamp_fail_open()
 
     # Qualification (AI review, market validation, notification delivery) runs
     # in its own detached job. It must never execute under this cycle's lock: a
