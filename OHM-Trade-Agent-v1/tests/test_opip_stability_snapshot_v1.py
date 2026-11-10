@@ -6,6 +6,8 @@ import importlib.util
 import json
 from pathlib import Path
 
+import pytest
+
 SCRIPT = Path(__file__).parents[1] / "tools" / "opip_stability_snapshot.py"
 _spec = importlib.util.spec_from_file_location("opip_stability_snapshot", SCRIPT)
 assert _spec is not None and _spec.loader is not None
@@ -17,7 +19,9 @@ def _put(root: Path, filename: str, rows: list[dict]) -> None:
     (root / filename).write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
 
 
+@pytest.mark.acceptance
 def test_counts_are_aggregates_not_raw_records(tmp_path: Path):
+    """ATDD-OPIP-STABILITY-EVIDENCE-v1/AC-201: read-only scanner, Chief/router and Telegram aggregates."""
     now = datetime(2026, 11, 10, 12, tzinfo=timezone.utc)
     stamp = (now - timedelta(hours=1)).isoformat()
     old = (now - timedelta(hours=25)).isoformat()
@@ -43,14 +47,18 @@ def test_counts_are_aggregates_not_raw_records(tmp_path: Path):
     assert "PRIVATE" not in json.dumps(output)
 
 
+@pytest.mark.acceptance
 def test_missing_ledgers_are_unknown_not_zero_coverage(tmp_path: Path):
+    """ATDD-OPIP-STABILITY-EVIDENCE-v1/AC-202: incomplete evidence is never represented as complete."""
     output = module.snapshot(tmp_path, now=datetime(2026, 11, 10, tzinfo=timezone.utc))
     assert output["coverage"] == "INCOMPLETE"
     assert all(not m["present"] for m in output["ledgers"].values())
     assert output["metrics"]["scans"]["count"] == 0
 
 
+@pytest.mark.acceptance
 def test_large_ledger_tail_is_bounded_and_declares_truncation(tmp_path: Path):
+    """ATDD-OPIP-STABILITY-EVIDENCE-v1/AC-203: tail-bounded reads surface truncation."""
     path = tmp_path / "events.jsonl"
     path.write_text("x" * 6000 + "\n" + json.dumps({
         "attempted_at": "2026-11-10T00:00:00+00:00",
@@ -64,12 +72,13 @@ def test_large_ledger_tail_is_bounded_and_declares_truncation(tmp_path: Path):
 
 
 def test_invalid_window_is_rejected(tmp_path: Path):
-    import pytest
     with pytest.raises(ValueError):
         module.snapshot(tmp_path, hours=0)
 
 
+@pytest.mark.acceptance
 def test_cycle_liveness_only_counts_timestamped_completions(tmp_path: Path):
+    """ATDD-OPIP-STABILITY-EVIDENCE-v1/AC-204: cycle completions require observation timestamps."""
     log = tmp_path / "cycle.log"
     log.write_text(
         "OPIP_UNIFIED_CYCLE_COMPLETED_AT=2026-11-10T12:00:00+00:00\\n"
