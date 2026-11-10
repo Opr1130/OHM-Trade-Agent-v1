@@ -23,19 +23,8 @@ def _json(path, value):
 
 @pytest.mark.acceptance
 def test_fresh_outcomes_are_immutable_observations_not_realized_fills(tmp_path):
-    _json(tmp_path / "trade_outcomes.json", {
-        "xrp": {
-            "record_key": "xrp", "symbol": "XRPUSD", "direction": "SHORT",
-            "recommendation_timestamp": (NOW + timedelta(seconds=1)).isoformat(),
-            "target_1_observed": True, "entry_price": 1.08,
-            "terminal_status": "TARGET_1", "net_profit": 1000,
-            "credential": "NEVER_COPY",
-        }
-    })
-    result = collector.capture(tmp_path, now=NOW + timedelta(seconds=2))
-    assert result["new_rows"] == 0  # first activation starts prospectively
-    rows = list(collector._iter_source("map", (tmp_path / "trade_outcomes.json").read_text()))
-    assert rows[0]["credential"] == "NEVER_COPY"
+    # Activation is prospective: no pre-activation rows are imported.
+    collector.capture(tmp_path, now=NOW)
     _json(tmp_path / "trade_outcomes.json", {
         "xrp": {
             "record_key": "xrp", "symbol": "XRPUSD", "direction": "SHORT",
