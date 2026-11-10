@@ -165,7 +165,8 @@ def _publish(tmp_path, observed_at, **overrides):
         history_path=tmp_path / "history.json",
         release_sha=SHA, policy_version="f11-v1", observed_at=observed_at,
         admissions_suspended=False, coverage_complete=True,
-        incidents_healthy=True, reasons=[],
+        incidents_healthy=True, reasons=["PROTECTION_PROVEN"],
+        state="HEALTHY",
     )
     args.update(overrides)
     return stamp_io.publish_admission_stamp(**args)
@@ -244,3 +245,4 @@ def test_p6_an_ai_opinion_can_never_admit():
     assert annotation.available is True
     assert not hasattr(annotation, "calibrated_probability")
     assert annotation.reason_code is None
+

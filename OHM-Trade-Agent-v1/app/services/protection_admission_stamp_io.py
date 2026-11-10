@@ -32,8 +32,10 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from app.services.protection_health import (
+    REASON_HEALTHY,
     STAMP_ABSOLUTE_CEILING_SECONDS,
     STAMP_HISTORY_LIMIT,
+    STATE_HEALTHY,
     build_admission_stamp_payload,
     derive_freshness_bound,
 )
@@ -84,6 +86,7 @@ def publish_admission_stamp(
     incidents_healthy: bool | None,
     reasons: Sequence[str],
     max_freshness_seconds: float | None = None,
+    state: str | None = None,
 ) -> dict[str, Any]:
     """Publish F11's verdict. The configured maximum is the safety authority.
 
@@ -103,8 +106,15 @@ def publish_admission_stamp(
     limit = min(limit, STAMP_ABSOLUTE_CEILING_SECONDS)
 
     history = load_stamp_history(history_path)
+    # "Successful" is decided by explicit F11 status semantics, not by the
+    # absence of reason codes: a healthy observation legitimately carries the
+    # informational PROTECTION_PROVEN code.
+    state_norm = str(state or "").strip().upper()
     successful = (
-        coverage_complete is True and incidents_healthy is True and not reasons
+        state_norm == STATE_HEALTHY
+        and coverage_complete is True
+        and incidents_healthy is True
+        and all(str(reason) == REASON_HEALTHY for reason in reasons)
     )
     if successful:
         history.append(observed_at.astimezone(timezone.utc))
@@ -124,6 +134,7 @@ def publish_admission_stamp(
         reasons=reasons,
         freshness_bound_s=bound,
         sample_count=len(history),
+        state=state,
     )
     atomic_write_json(stamp_path, payload)
     atomic_write_json(

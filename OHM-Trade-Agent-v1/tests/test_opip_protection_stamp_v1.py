@@ -21,7 +21,8 @@ def _payload(**overrides):
         release_sha=SHA, policy_version="f11-v1",
         observed_at=NOW - timedelta(seconds=10), sequence=5,
         admissions_suspended=False, coverage_complete=True,
-        incidents_healthy=True, reasons=[], freshness_bound_s=300.0,
+        incidents_healthy=True, reasons=["PROTECTION_PROVEN"],
+        state="HEALTHY", freshness_bound_s=300.0,
         sample_count=25,
     )
     base.update(overrides)
@@ -95,7 +96,8 @@ def test_f6_a_naive_timestamp_is_refused_at_serialization():
             release_sha=SHA, policy_version="f11-v1",
             observed_at=datetime(2026, 11, 9, 12, 0, 0),  # naive on purpose
             sequence=1, admissions_suspended=False, coverage_complete=True,
-            incidents_healthy=True, reasons=[], freshness_bound_s=300.0,
+            incidents_healthy=True, reasons=["PROTECTION_PROVEN"],
+        state="HEALTHY", freshness_bound_s=300.0,
             sample_count=25,
         )
 
@@ -124,7 +126,9 @@ def test_f11_unhealthy_observation_refuses_even_when_unsuspended():
 
 
 def test_f1_suspension_is_reported_as_suspended():
-    stamp = _read(_payload(admissions_suspended=True))
+    stamp = _read(_payload(admissions_suspended=True, state="UNSAFE"))
     assert stamp.fresh is True
     assert stamp.admissions_suspended is True
     assert stamp.reason == ph.REASON_STAMP_SUSPENDED
+
+

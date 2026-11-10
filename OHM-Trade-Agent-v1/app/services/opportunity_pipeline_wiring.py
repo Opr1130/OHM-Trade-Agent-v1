@@ -102,6 +102,7 @@ def publish_stamp_if_enabled(
     reasons: Sequence[str],
     stamp_path: Path | None = None,
     history_path: Path | None = None,
+    state: str | None = None,
 ) -> dict[str, Any] | None:
     """Publish F11's verdict from the authoritative protection phase only."""
     if not protectin_stamp_publish_enabled(settings):
@@ -130,6 +131,7 @@ def publish_stamp_if_enabled(
             max_freshness_seconds=getattr(
                 settings, "opip_protection_stamp_max_freshness_seconds", None
             ),
+            state=state,
         )
     except Exception as exc:
         print(
@@ -175,6 +177,7 @@ def publish_stamp_from_observation(
     if observation is None:
         return None
     report = getattr(observation, "report", None)
+    state = _lookup(report, "state")
     suspended = _lookup(report, "admissions_suspended")
     coverage = _lookup(report, "coverage_complete")
     reasons = _lookup(report, "reason_codes") or _lookup(report, "reasons") or []
@@ -193,6 +196,7 @@ def publish_stamp_from_observation(
         coverage_complete=None if coverage is None else bool(coverage),
         incidents_healthy=incidents_healthy,
         reasons=[str(reason) for reason in reasons],
+        state=None if state is None else str(state),
     )
 
 

@@ -413,8 +413,38 @@ def read_admission_stamp(
     coverage = payload.get("coverage_complete")
     healthy = payload.get("incidents_healthy")
     reasons = payload.get("reasons") or []
-    unhealthy = coverage is not True or healthy is not True or bool(reasons)
-    suspended = bool(payload.get("admissions_suspended")) or unhealthy
+    # Explicit F11 status semantics. A healthy result legitimately carries the
+    # informational code PROTECTION_PROVEN, so a non-empty reason list is not by
+    # itself evidence of ill health - but the state must say HEALTHY and every
+    # other input must agree, or the payload is contradictory and refused.
+    state = str(payload.get("state") or "").strip().upper()
+    if state not in {STATE_HEALTHY, STATE_UNSAFE, STATE_UNAVAILABLE}:
+        return ProtectionAdmissionStamp(
+            admissions_suspended=True, fresh=False, reason=REASON_STAMP_UNKNOWN,
+            observed_at=observed, freshness_bound_s=bound, sample_count=samples,
+        )
+
+    if state == STATE_HEALTHY:
+        unexpected = [
+            str(reason) for reason in reasons if str(reason) != REASON_HEALTHY
+        ]
+        healthy_consistent = (
+            payload.get("admissions_suspended") is False
+            and coverage is True
+            and healthy is True
+            and not unexpected
+        )
+        if not healthy_consistent:
+            # HEALTHY contradicts its own evidence: refuse rather than trust it.
+            return ProtectionAdmissionStamp(
+                admissions_suspended=True, fresh=False,
+                reason=REASON_STAMP_UNKNOWN, observed_at=observed,
+                freshness_bound_s=bound, sample_count=samples,
+            )
+        suspended = False
+    else:
+        suspended = True
+
     return ProtectionAdmissionStamp(
         admissions_suspended=bool(suspended),
         fresh=True,
@@ -441,6 +471,7 @@ def build_admission_stamp_payload(
     reasons: Sequence[str],
     freshness_bound_s: float,
     sample_count: int,
+    state: str | None = None,
     contract_version: str = STAMP_CONTRACT_VERSION,
 ) -> dict[str, Any]:
     """Serialise the verdict the protection phase already computed.
@@ -457,6 +488,7 @@ def build_admission_stamp_payload(
         "release_sha": release_sha,
         "observed_at_utc": observed_at.astimezone(timezone.utc).isoformat(),
         "sequence": int(sequence),
+        "state": state,
         "admissions_suspended": bool(admissions_suspended),
         "coverage_complete": coverage_complete,
         "incidents_healthy": incidents_healthy,
