@@ -6,6 +6,7 @@ a source record is NOT evidence of a manual exchange fill. No network imports.
 from __future__ import annotations
 
 import argparse
+import fcntl
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -17,6 +18,7 @@ from typing import Any
 DEFAULT_ROOT = Path("/app/data")
 MAX_SOURCE_BYTES = 8 * 1024 * 1024
 MAX_IDENTITIES = 10000
+MAX_LEDGER_BYTES = 32 * 1024 * 1024
 SCHEMA = "opip-fresh-evidence-v1"
 SOURCES = {
     "TRADE_OUTCOME": ("trade_outcomes.json", "map"),
@@ -180,6 +182,13 @@ def capture(root: Path, *, now: datetime | None = None, max_bytes: int = MAX_SOU
             if len(hashes) > MAX_IDENTITIES:
                 raise ValueError("identity capacity exceeded")
     ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    # Never silently fill the production volume. An over-limit file is a
+    # visible hard stop, not an excuse to erase or rotate canonical evidence.
+    expected_bytes = sum(len(json.dumps(item, sort_keys=True, default=str,
+        allow_nan=False).encode("utf-8")) + 1 for item in staged)
+    existing_bytes = ledger_path.stat().st_size if ledger_path.exists() else 0
+    if existing_bytes + expected_bytes > MAX_LEDGER_BYTES:
+        raise ValueError("prospective evidence ledger capacity exceeded")
     if staged:
         with ledger_path.open("a", encoding="utf-8") as file:
             for item in staged:
@@ -200,7 +209,16 @@ def main() -> None:
     if os.getenv("OPIP_FRESH_EVIDENCE_ENABLED", "false").lower() not in ("true", "1"):
         print(json.dumps({"status": "DISABLED", "training": "OFF", "execution": "OFF"}))
         return
-    print(json.dumps(capture(args.root), sort_keys=True))
+    # Independent process lock: if host docker exec exits unexpectedly, a
+    # surviving container process still owns the lock. No core-cycle lock used.
+    lock = Path("/tmp/opip-fresh-evidence-v1.lock")
+    with lock.open("a+") as guard:
+        try:
+            fcntl.flock(guard.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(json.dumps({"status": "SKIPPED_LOCK_HELD"}))
+            return
+        print(json.dumps(capture(args.root), sort_keys=True))
 
 
 if __name__ == "__main__":
