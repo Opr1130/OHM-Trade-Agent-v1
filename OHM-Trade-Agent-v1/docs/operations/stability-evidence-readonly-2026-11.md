@@ -9,8 +9,13 @@ cd /opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1
 python3 tools/opip_stability_snapshot.py \
   --root ./data \
   --cycle-log /var/log/ohm-unified-cycle.log \
-  --hours 24
+  --hours 24 \\
+  --docker
 ```
+
+With `--docker`, the command also uses two bounded read-only Docker CLI
+queries (container CPU/RAM usage and states). Omitting it makes **no** Docker
+calls. Docker errors produce `UNAVAILABLE`, never guessed resource values.
 
 Output is JSON containing aggregate outcomes, AI call/token counts, router
 provider/error counters, Telegram status/family/suppression counts, current
@@ -28,8 +33,9 @@ Important limitations:
   timestamped `OPIP_UNIFIED_CYCLE_COMPLETED_AT` markers count completions only.
 - The machine metrics describe the command's Linux namespace, **not** necessarily
   the full host when called from inside a container.
-- No Docker per-container RSS/restart/OOM measurements or database table sizes
-  are inferred by this command. Those need separate authorized host probes.
+- Docker CLI stats show a point-in-time snapshot, not a verified post-scan
+  memory baseline. Docker OOM history and PostgreSQL table sizes are not
+  inferred. Those require separate authorized host probes.
 - AI token counts are not billing amounts; USD cost remains unknown.
 - Missing or disabled delivery capture must never be reported as zero messages.
 
