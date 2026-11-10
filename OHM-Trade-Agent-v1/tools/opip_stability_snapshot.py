@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-DEFAULT_MAX_BYTES = 32 * 1024 * 1024
+DEFAULT_MAX_BYTES = 8 * 1024 * 1024
 LEDGERS = {
     "scan_activity": "scan_activity.jsonl",
     "openai_usage": "openai_usage.jsonl",
@@ -210,7 +210,7 @@ def main() -> None:
     parser.add_argument("--root", type=Path, default=Path("/app/data"))
     parser.add_argument("--hours", type=int, default=24)
     parser.add_argument("--cycle-log", type=Path, default=Path("/var/log/ohm-unified-cycle.log"))
-    parser.add_argument("--max-ledger-mib", type=int, default=32)
+    parser.add_argument("--max-ledger-mib", type=int, default=8)
     args = parser.parse_args()
     print(json.dumps(snapshot(args.root, hours=args.hours, max_bytes=max(1, args.max_ledger_mib) * 1024 * 1024, cycle_log=args.cycle_log), sort_keys=True, indent=2))
 
