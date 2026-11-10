@@ -13,6 +13,7 @@ from pathlib import Path
 
 from app.services import liquidity_verification as lv
 from app.services import opportunity_evidence as oe
+from app.services import protection_admission_stamp_io as stamp_io
 from app.services import protection_health as ph
 
 NOW = datetime(2026, 11, 9, 12, 0, 0, tzinfo=timezone.utc)
@@ -167,7 +168,7 @@ def _publish(tmp_path, observed_at, **overrides):
         incidents_healthy=True, reasons=[],
     )
     args.update(overrides)
-    return ph.publish_admission_stamp(**args)
+    return stamp_io.publish_admission_stamp(**args)
 
 
 def test_p2_publisher_bootstraps_and_reader_fails_closed(tmp_path):

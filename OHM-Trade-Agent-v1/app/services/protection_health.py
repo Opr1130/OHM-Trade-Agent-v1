@@ -44,13 +44,9 @@ Ownership boundaries (what F11 is NOT)
 
 from __future__ import annotations
 
-import json
 import math
-import os
-import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Sequence
 
 #: Protection-health states. ``HEALTHY`` is the only state that permits new
@@ -447,7 +443,14 @@ def build_admission_stamp_payload(
     sample_count: int,
     contract_version: str = STAMP_CONTRACT_VERSION,
 ) -> dict[str, Any]:
-    """Serialise the verdict the protection phase already computed."""
+    """Serialise the verdict the protection phase already computed.
+
+    A naive or non-UTC timestamp is refused here rather than being silently
+    coerced through the host's local timezone: a stamp whose age cannot be
+    reasoned about must never reach a consumer.
+    """
+    if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+        raise ValueError("observed_at must be timezone-aware UTC")
     return {
         "contract_version": contract_version,
         "policy_version": policy_version,
@@ -463,100 +466,9 @@ def build_admission_stamp_payload(
     }
 
 
-#: Independently bounded policy for the published stamp. This configured
-#: maximum is the safety authority; the derived p99 may only TIGHTEN it.
-STAMP_MAX_FRESHNESS_ENV = "OPIP_PROTECTION_STAMP_MAX_FRESHNESS_SECONDS"
-STAMP_DEFAULT_MAX_FRESHNESS_SECONDS = 300.0
+
+#: Bounded ring of successful observations used to derive the freshness
+#: bound. Kept here as a pure constant; the reading/writing lives in
+#: ``app.services.protection_admission_stamp_io`` so this module stays
+#: read-only.
 STAMP_HISTORY_LIMIT = 200
-
-
-def publish_admission_stamp(
-    *,
-    stamp_path: Path,
-    history_path: Path,
-    release_sha: str,
-    policy_version: str,
-    observed_at: datetime,
-    admissions_suspended: bool,
-    coverage_complete: bool | None,
-    incidents_healthy: bool | None,
-    reasons: Sequence[str],
-    max_freshness_seconds: float | None = None,
-) -> dict[str, Any]:
-    """Publish the F11 verdict the protection phase already computed.
-
-    The freshness bound is ``min(configured_max, 2 x p99(observed gaps))``.
-    The configured maximum is the safety authority: a small sample can never
-    widen it, and while fewer than ``STAMP_MIN_SAMPLES`` successful
-    observations exist the stamp advertises an insufficient sample count so
-    every consumer fails closed.
-
-    Publication is atomic (temp file + ``os.replace``). Only successful
-    observations enter the history ring that drives the derived bound.
-    """
-    limit = float(
-        max_freshness_seconds
-        if max_freshness_seconds is not None
-        else STAMP_DEFAULT_MAX_FRESHNESS_SECONDS
-    )
-    if not math.isfinite(limit) or limit <= 0:
-        limit = STAMP_DEFAULT_MAX_FRESHNESS_SECONDS
-    limit = min(limit, STAMP_ABSOLUTE_CEILING_SECONDS)
-
-    history = _load_stamp_history(history_path)
-    successful = coverage_complete is True and incidents_healthy is True and not reasons
-    if successful:
-        history.append(observed_at)
-    history = sorted(history)[-STAMP_HISTORY_LIMIT:]
-
-    derived = derive_freshness_bound(history)
-    bound = limit if derived is None else min(limit, derived)
-    sequence = int(time.time() * 1000)
-
-    payload = build_admission_stamp_payload(
-        release_sha=release_sha,
-        policy_version=policy_version,
-        observed_at=observed_at,
-        sequence=sequence,
-        admissions_suspended=admissions_suspended,
-        coverage_complete=coverage_complete,
-        incidents_healthy=incidents_healthy,
-        reasons=reasons,
-        freshness_bound_s=bound,
-        sample_count=len(history),
-    )
-    _atomic_write_json(stamp_path, payload)
-    _atomic_write_json(
-        history_path,
-        {"observations": [moment.isoformat() for moment in history]},
-    )
-    return payload
-
-
-def _load_stamp_history(path: Path) -> list[datetime]:
-    if not path.exists():
-        return []
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
-    moments: list[datetime] = []
-    for value in (raw.get("observations") or [])[-STAMP_HISTORY_LIMIT:]:
-        try:
-            moment = datetime.fromisoformat(str(value))
-        except (TypeError, ValueError):
-            continue
-        if moment.tzinfo is None:
-            moment = moment.replace(tzinfo=timezone.utc)
-        moments.append(moment.astimezone(timezone.utc))
-    return moments
-
-
-def _atomic_write_json(path: Path, payload: Any) -> None:
-    """Publish atomically so a reader never sees a partial document."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, sort_keys=True, default=str), encoding="utf-8"
-    )
-    os.replace(temporary, path)

@@ -82,9 +82,29 @@ def test_ec09_a_future_observation_fails_closed():
 def test_f4_f5_corrupt_or_mismatched_stamps_fail_closed():
     assert _read(_payload(contract_version="other-v9")).usable is False
     assert _read(_payload(), running_release_sha="b" * 40).usable is False
-    assert _read(_payload(observed_at=NOW.replace(tzinfo=None))).usable is False
     assert _read(_payload(freshness_bound_s=0)).usable is False
     assert _read(_payload(freshness_bound_s=ph.STAMP_ABSOLUTE_CEILING_SECONDS + 1)).usable is False
+
+
+def test_f6_a_naive_timestamp_is_refused_at_serialization():
+    """AC-F6: serialisation refuses a naive timestamp instead of coercing it."""
+    import pytest
+
+    with pytest.raises(ValueError):
+        ph.build_admission_stamp_payload(
+            release_sha=SHA, policy_version="f11-v1",
+            observed_at=datetime(2026, 11, 9, 12, 0, 0),  # naive on purpose
+            sequence=1, admissions_suspended=False, coverage_complete=True,
+            incidents_healthy=True, reasons=[], freshness_bound_s=300.0,
+            sample_count=25,
+        )
+
+
+def test_f6_a_malformed_wire_payload_fails_closed():
+    """AC-F6: a consumer must reject a naive timestamp arriving on the wire."""
+    wire = dict(_payload())
+    wire["observed_at_utc"] = "2026-11-09T12:00:00"  # no offset
+    assert _read(wire).usable is False
 
 
 def test_ec11_sequence_regression_fails_closed():
