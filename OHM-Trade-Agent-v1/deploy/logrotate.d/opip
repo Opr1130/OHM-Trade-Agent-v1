@@ -1,0 +1,22 @@
+# O'Pip host logs: install as /etc/logrotate.d/opip only through the
+# separately approved host release workflow. This repository file alone
+# changes no running host configuration.
+#
+# Use copytruncate because the existing cron/dispatcher append directly to
+# host files. Preserve the live inode and never delete the active log.
+# Maximum historical retention: seven rotations, compressed. Missing files
+# and empty logs are safe.
+#
+# Logs may contain operational details; rotated files must remain root-only.
+/var/log/ohm-unified-cycle.log /var/log/ohm-scan-dispatch.log {
+    su root root
+    daily
+    maxsize 10M
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    create 0600 root root
+}
