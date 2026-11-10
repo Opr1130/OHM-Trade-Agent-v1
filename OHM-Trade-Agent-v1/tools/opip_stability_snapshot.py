@@ -78,6 +78,47 @@ def _total(rows: list[dict[str, Any]], field: str) -> int:
     return sum(int(value) for row in rows if isinstance((value := row.get(field)), (int, float)) and not isinstance(value, bool))
 
 
+def cycle_liveness(path: Path, *, cutoff: datetime, max_bytes: int = DEFAULT_MAX_BYTES) -> dict[str, Any]:
+    """Count explicitly terminal cycle statuses in a bounded host log tail.
+
+    Log lines must carry an ISO timestamp to be assigned to the window.
+    Without stamps, report the fact as unmeasured instead of assuming health.
+    """
+    result: dict[str, Any] = {"present": False, "truncated": False, "completed": 0, "degraded": 0, "skipped_lock": 0, "timestamped_events": 0}
+    try:
+        with path.open("rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            result["present"] = True
+            result["size_bytes"] = size
+            start = max(0, size - max(1024, max_bytes))
+            result["truncated"] = start > 0
+            handle.seek(start)
+            if start:
+                handle.readline()
+            for raw in handle:
+                line = raw.decode("utf-8", "replace").strip()
+                # The host's cron log can be un-stamped. A status without a
+                # timestamp cannot be attributed to the last N hours.
+                try:
+                    head = line.split(" ", 1)[0]
+                    stamp = datetime.fromisoformat(head.replace("Z", "+00:00"))
+                    if stamp.tzinfo is None or stamp.utcoffset() is None or stamp < cutoff:
+                        continue
+                except (ValueError, TypeError):
+                    continue
+                result["timestamped_events"] += 1
+                if "OPIP_UNIFIED_CYCLE_STATUS=SUCCESS" in line:
+                    result["completed"] += 1
+                elif "OPIP_UNIFIED_CYCLE_STATUS=DEGRADED" in line:
+                    result["degraded"] += 1
+                elif "LOCK_CONTENTION_SKIPPED" in line:
+                    result["skipped_lock"] += 1
+    except OSError as exc:
+        result["error"] = type(exc).__name__
+    result["measurement"] = "INCOMPLETE" if not result["present"] or result["truncated"] or not result["timestamped_events"] else "TIMESTAMPED_LOG_WINDOW"
+    return result
+
+
 def _runtime() -> dict[str, Any]:
     # /proc is host-specific: absent inside containers and never represented as
     # host-wide truth if mounted inside a different namespace.
@@ -120,6 +161,20 @@ def snapshot(root: Path, *, now: datetime | None = None, hours: int = 24, max_by
     router = rows_by_source["ai_router_usage"]
     delivery = [row for row in rows_by_source["telegram_delivery"] if row.get("record_type") == "TELEGRAM_DELIVERY_EVENT"]
     result["metrics"]["scans"] = {"count": len(scans), "by_outcome": _counts(scans, "outcome")}
+    # Hosts without an explicitly timestamped cycle log cannot establish
+    # cycle-health rates, regardless of whether the release probe passed.
+    result["metrics"]["cycles"] = cycle_liveness(
+        root.parent / "log" / "ohm-unified-cycle.log", cutoff=cutoff, max_bytes=max_bytes
+    )
+    try:
+        disk = os.statvfs(root)
+        result["filesystem"] = {
+            "scope": "DATA_PATH_FILESYSTEM",
+            "total_bytes": disk.f_blocks * disk.f_frsize,
+            "available_bytes": disk.f_bavail * disk.f_frsize,
+        }
+    except OSError:
+        result["filesystem"] = {"scope": "UNAVAILABLE"}
     result["metrics"]["chief_openai"] = {
         "calls_recorded": len(usage),
         "by_model": _counts(usage, "model"),
