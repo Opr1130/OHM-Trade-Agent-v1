@@ -47,7 +47,9 @@ Important limitations:
 ## Log rotation policy
 
 `deploy/logrotate.d/opip` specifies daily/max-10M rotation for host cycle,
-dispatcher and per-attempt scan logs, retaining seven compressed generations.
+and dispatcher logs, retaining seven compressed generations.
+Unique per-attempt scan logs are **not** controlled by this policy; their age-
+based removal needs a separate owner-approved, evidence-preserving retention task.
 It is deliberately **not installed** by this PR. Host release ownership,
 logrotate presence, and running writer behavior must be checked before a
 separately authorized installation.
