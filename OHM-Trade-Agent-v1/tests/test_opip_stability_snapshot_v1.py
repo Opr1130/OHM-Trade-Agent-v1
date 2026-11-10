@@ -67,3 +67,18 @@ def test_invalid_window_is_rejected(tmp_path: Path):
     import pytest
     with pytest.raises(ValueError):
         module.snapshot(tmp_path, hours=0)
+
+
+def test_cycle_liveness_only_counts_timestamped_completions(tmp_path: Path):
+    log = tmp_path / "cycle.log"
+    log.write_text(
+        "OPIP_UNIFIED_CYCLE_COMPLETED_AT=2026-11-10T12:00:00+00:00\\n"
+        "OPIP_UNIFIED_CYCLE_COMPLETED_AT=2026-11-08T12:00:00+00:00\\n"
+        "OHM Unified Cycle skipped: previous cycle still running.\\n",
+        encoding="utf-8",
+    )
+    out = module.cycle_liveness(log, cutoff=datetime(2026, 11, 9, tzinfo=timezone.utc))
+    assert out["completed"] == 1
+    assert out["degraded"] is None
+    assert out["skipped_lock"] is None
+    assert out["measurement"] == "TIMESTAMPED_LOG_WINDOW"
