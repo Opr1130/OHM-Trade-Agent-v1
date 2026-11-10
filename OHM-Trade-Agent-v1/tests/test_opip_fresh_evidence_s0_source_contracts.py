@@ -108,7 +108,7 @@ def test_s0_003_funnel_and_summary_preserve_rejections_and_ai_stage():
     assert summary["record_type"] == "OPIP_SCAN_SUMMARY"
     assert summary["ai_stage"]["invocation_status"] == "BUDGET_BLOCKED"
     assert summary["ai_stage"]["model"] == "read-only-source-model"
-    assert summary["funnel"]["total"] >= 1
+    assert summary["funnel"]["entered"] >= 1
 
 
 @pytest.mark.acceptance
