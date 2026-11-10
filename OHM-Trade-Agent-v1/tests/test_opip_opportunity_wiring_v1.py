@@ -104,6 +104,13 @@ def test_evidence_capture_failure_never_propagates(tmp_path):
     ) is False  # missing required fields -> refused, never raised
 
 
+def _on_with_stamp_paths(tmp_path):
+    return _on(
+        opip_protection_stamp_path=str(tmp_path / "stamp.json"),
+        opip_protection_stamp_history_path=str(tmp_path / "history.json"),
+    )
+
+
 def test_stamp_from_observation_maps_a_nested_report(tmp_path):
     """AC-115: the publisher serialises the verdict the observation already holds."""
     observation = SimpleNamespace(
@@ -113,21 +120,25 @@ def test_stamp_from_observation_maps_a_nested_report(tmp_path):
         incidents_healthy=True,
     )
     payload = wiring.publish_stamp_from_observation(
-        _on(), observation, release_sha=SHA, policy_version="v1", observed_at=NOW,
+        _on_with_stamp_paths(tmp_path), observation, release_sha=SHA, policy_version="v1", observed_at=NOW,
     )
     assert payload is not None
+    assert (tmp_path / "stamp.json").is_file()
+    assert (tmp_path / "history.json").is_file()
     assert payload["admissions_suspended"] is True
     assert payload["coverage_complete"] is False
     assert payload["reasons"] == ["UNMANAGED_EXPOSURE"]
 
 
-def test_stamp_from_observation_is_fail_closed_without_a_verdict():
+def test_stamp_from_observation_is_fail_closed_without_a_verdict(tmp_path):
     """A missing verdict must never publish an admission-safe stamp."""
     observation = SimpleNamespace(report={}, incidents_healthy=None)
     payload = wiring.publish_stamp_from_observation(
-        _on(), observation, release_sha=SHA, policy_version="v1", observed_at=NOW,
+        _on_with_stamp_paths(tmp_path), observation, release_sha=SHA, policy_version="v1", observed_at=NOW,
     )
     assert payload is not None
+    assert (tmp_path / "stamp.json").is_file()
+    assert (tmp_path / "history.json").is_file()
     assert payload["admissions_suspended"] is True
 
 
