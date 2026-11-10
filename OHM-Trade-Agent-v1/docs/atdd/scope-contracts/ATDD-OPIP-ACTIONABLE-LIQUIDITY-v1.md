@@ -187,6 +187,8 @@ AC-115 -> OHM-Trade-Agent-v1/app/services/protection_admission_stamp_io.py
 AC-116 -> OHM-Trade-Agent-v1/app/services/opportunity_pipeline_wiring.py
 AC-116 -> OHM-Trade-Agent-v1/tests/test_opip_opportunity_wiring_v1.py
 AC-101 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
+AC-114 -> OHM-Trade-Agent-v1/app/jobs/scan_opportunities.py
+AC-115 -> OHM-Trade-Agent-v1/app/jobs/run_cycle.py
 DEFERRED DISCOVERIES:
 - The AI-dependency correction (P6) and the depth-based monitoring classification remain designed
   but unwired; they are explicitly inactive and require their own authorisation.

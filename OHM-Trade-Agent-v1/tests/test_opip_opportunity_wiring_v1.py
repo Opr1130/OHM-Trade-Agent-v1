@@ -98,3 +98,38 @@ def test_evidence_capture_failure_never_propagates(tmp_path):
     assert wiring.record_finalist_evidence(
         _on(), evidence_path_override=tmp_path / "x.jsonl", symbol="DOTUSD",
     ) is False  # missing required fields -> refused, never raised
+
+
+def test_stamp_from_observation_maps_a_nested_report(tmp_path):
+    """AC-115: the publisher serialises the verdict the observation already holds."""
+    observation = SimpleNamespace(
+        report={"protection": {"admissions_suspended": True,
+                               "coverage_complete": False,
+                               "reason_codes": ["UNMANAGED_EXPOSURE"]}},
+        incidents_healthy=True,
+    )
+    payload = wiring.publish_stamp_from_observation(
+        _on(), observation, release_sha=SHA, policy_version="v1", observed_at=NOW,
+    )
+    assert payload is not None
+    assert payload["admissions_suspended"] is True
+    assert payload["coverage_complete"] is False
+    assert payload["reasons"] == ["UNMANAGED_EXPOSURE"]
+
+
+def test_stamp_from_observation_is_fail_closed_without_a_verdict():
+    """A missing verdict must never publish an admission-safe stamp."""
+    observation = SimpleNamespace(report={}, incidents_healthy=None)
+    payload = wiring.publish_stamp_from_observation(
+        _on(), observation, release_sha=SHA, policy_version="v1", observed_at=NOW,
+    )
+    assert payload is not None
+    assert payload["admissions_suspended"] is True
+
+
+def test_stamp_from_observation_is_inert_when_disabled():
+    observation = SimpleNamespace(report={"admissions_suspended": False},
+                                  incidents_healthy=True)
+    assert wiring.publish_stamp_from_observation(
+        _off(), observation, release_sha=SHA, policy_version="v1",
+    ) is None

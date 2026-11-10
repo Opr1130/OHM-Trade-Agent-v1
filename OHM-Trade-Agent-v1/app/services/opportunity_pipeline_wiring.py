@@ -139,6 +139,63 @@ def publish_stamp_if_enabled(
         return None
 
 
+def _lookup(mapping: Any, key: str, depth: int = 0) -> Any:
+    """Find ``key`` in a possibly nested report mapping. Never raises."""
+    if depth > 6 or not isinstance(mapping, dict):
+        return None
+    if key in mapping:
+        return mapping[key]
+    for value in mapping.values():
+        found = _lookup(value, key, depth + 1)
+        if found is not None:
+            return found
+    return None
+
+
+def publish_stamp_from_observation(
+    settings: Any,
+    observation: Any,
+    *,
+    release_sha: str,
+    policy_version: str,
+    observed_at: datetime | None = None,
+) -> dict[str, Any] | None:
+    """Publish F11's verdict from ONE authoritative completed observation.
+
+    ``observation`` is the existing ``ProtectionObservation`` produced by the
+    protection phase (one exposure resolution, one incident read). This function
+    does not observe anything itself: it only serialises the verdict that
+    observation already carries, so no second observation is ever taken.
+
+    Fail-closed: if the suspension verdict cannot be determined from the
+    observation, the published stamp reports suspended.
+    """
+    if not protectin_stamp_publish_enabled(settings):
+        return None
+    if observation is None:
+        return None
+    report = getattr(observation, "report", None)
+    suspended = _lookup(report, "admissions_suspended")
+    coverage = _lookup(report, "coverage_complete")
+    reasons = _lookup(report, "reason_codes") or _lookup(report, "reasons") or []
+    if not isinstance(reasons, (list, tuple)):
+        reasons = []
+    incidents_healthy = getattr(observation, "incidents_healthy", None)
+    if suspended is None:
+        # Cannot prove the verdict: never publish an admission-safe stamp.
+        suspended = True
+    return publish_stamp_if_enabled(
+        settings,
+        release_sha=release_sha,
+        policy_version=policy_version,
+        observed_at=observed_at or datetime.now(timezone.utc),
+        admissions_suspended=bool(suspended),
+        coverage_complete=None if coverage is None else bool(coverage),
+        incidents_healthy=incidents_healthy,
+        reasons=[str(reason) for reason in reasons],
+    )
+
+
 __all__ = [
     "DEFAULT_EVIDENCE_PATH",
     "annotate_candidates",
@@ -146,6 +203,7 @@ __all__ = [
     "evidence_enabled",
     "evidence_path",
     "protectin_stamp_publish_enabled",
+    "publish_stamp_from_observation",
     "publish_stamp_if_enabled",
     "record_finalist_evidence",
 ]
