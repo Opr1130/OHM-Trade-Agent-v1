@@ -739,15 +739,30 @@ def _check_delivery(evidence: ActionableEvidence) -> str | None:
 
 
 def _check_depth(evidence: ActionableEvidence, *, policy) -> str | None:
-    """Verified weaker-side band depth. Adds no refusal unless enabled."""
+    """Verify that a depth PASS also proves this policy's threshold and band."""
     if not policy.require_verified_depth:
         return None
     status = str(evidence.depth_status or "").strip().upper()
-    if status == "PASS":
-        return None
     if status == "FAIL":
         return REASON_DEPTH_INSUFFICIENT
-    return REASON_DEPTH_UNKNOWN
+    if status != "PASS":
+        return REASON_DEPTH_UNKNOWN
+
+    depth = _number(evidence.weaker_side_depth_usd)
+    measured_band = _number(evidence.depth_band_pct)
+    minimum = _number(policy.min_weaker_side_depth_usd)
+    allowed_band = _number(policy.depth_band_pct)
+    if (depth is None or depth < 0 or
+            measured_band is None or measured_band <= 0 or
+            minimum is None or minimum <= 0 or
+            allowed_band is None or allowed_band <= 0):
+        return REASON_DEPTH_UNKNOWN
+    # A measurement within a narrower band remains a valid lower-bound proof.
+    if measured_band > allowed_band:
+        return REASON_DEPTH_UNKNOWN
+    if depth < minimum:
+        return REASON_DEPTH_INSUFFICIENT
+    return None
 
 
 def _check_probability(evidence: ActionableEvidence, *, policy) -> str | None:
