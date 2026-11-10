@@ -383,7 +383,7 @@ def _passing(evidence=None, policy=None):
 
 @pytest.mark.acceptance
 def test_depth_pass_must_satisfy_the_active_policy():
-    """A prior PASS at a weaker threshold or wider band cannot authorize a new entry."""
+    """ATDD-OPIP-ACTIONABLE-LIQUIDITY-v1/AC-106: enforce active-policy depth and band."""
     assert _passing({"weaker_side_depth_usd": 599_999.99}).reason == \
         admission.REASON_DEPTH_INSUFFICIENT
     for fields in (
