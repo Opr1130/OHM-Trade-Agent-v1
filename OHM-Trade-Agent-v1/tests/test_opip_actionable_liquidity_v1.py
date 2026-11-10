@@ -368,6 +368,8 @@ def _passing(evidence=None, policy=None):
     """A plan satisfying every guard, used as the positive control."""
     fields = dict(
         depth_status="PASS",
+        weaker_side_depth_usd=650_000.0,
+        depth_band_pct=0.50,
         calibration_status="CALIBRATED",
         calibrated_probability=0.93,
         calibration_model_version="cal-shadow-v1",
@@ -377,6 +379,22 @@ def _passing(evidence=None, policy=None):
     )
     fields.update(evidence or {})
     return _admit(_base_evidence(**fields), policy)
+
+
+@pytest.mark.acceptance
+def test_depth_pass_must_satisfy_the_active_policy():
+    """A prior PASS at a weaker threshold or wider band cannot authorize a new entry."""
+    assert _passing({"weaker_side_depth_usd": 599_999.99}).reason == \
+        admission.REASON_DEPTH_INSUFFICIENT
+    for fields in (
+        {"weaker_side_depth_usd": None},
+        {"depth_band_pct": None},
+        {"depth_band_pct": 0.51},
+        {"weaker_side_depth_usd": float("nan")},
+    ):
+        assert _passing(fields).reason == admission.REASON_DEPTH_UNKNOWN
+    assert _passing({"weaker_side_depth_usd": 600_000.0, "depth_band_pct": 0.50}).admitted
+    assert _passing({"weaker_side_depth_usd": 650_000.0, "depth_band_pct": 0.40}).admitted
 
 
 @pytest.mark.acceptance
