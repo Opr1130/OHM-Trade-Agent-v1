@@ -84,7 +84,7 @@ def cycle_liveness(path: Path, *, cutoff: datetime, max_bytes: int = DEFAULT_MAX
     Log lines must carry an ISO timestamp to be assigned to the window.
     Without stamps, report the fact as unmeasured instead of assuming health.
     """
-    result: dict[str, Any] = {"present": False, "truncated": False, "completed": 0, "degraded": 0, "skipped_lock": 0, "timestamped_events": 0}
+    result: dict[str, Any] = {"present": False, "truncated": False, "completed": 0, "degraded": None, "skipped_lock": None, "timestamped_events": 0}
     try:
         with path.open("rb") as handle:
             size = handle.seek(0, os.SEEK_END)
@@ -99,20 +99,17 @@ def cycle_liveness(path: Path, *, cutoff: datetime, max_bytes: int = DEFAULT_MAX
                 line = raw.decode("utf-8", "replace").strip()
                 # The host's cron log can be un-stamped. A status without a
                 # timestamp cannot be attributed to the last N hours.
+                if "OPIP_UNIFIED_CYCLE_COMPLETED_AT=" not in line:
+                    continue
                 try:
-                    head = line.split(" ", 1)[0]
-                    stamp = datetime.fromisoformat(head.replace("Z", "+00:00"))
+                    value = line.split("OPIP_UNIFIED_CYCLE_COMPLETED_AT=", 1)[1].split()[0]
+                    stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
                     if stamp.tzinfo is None or stamp.utcoffset() is None or stamp < cutoff:
                         continue
                 except (ValueError, TypeError):
                     continue
                 result["timestamped_events"] += 1
-                if "OPIP_UNIFIED_CYCLE_STATUS=SUCCESS" in line:
-                    result["completed"] += 1
-                elif "OPIP_UNIFIED_CYCLE_STATUS=DEGRADED" in line:
-                    result["degraded"] += 1
-                elif "LOCK_CONTENTION_SKIPPED" in line:
-                    result["skipped_lock"] += 1
+                result["completed"] += 1
     except OSError as exc:
         result["error"] = type(exc).__name__
     result["measurement"] = "INCOMPLETE" if not result["present"] or result["truncated"] or not result["timestamped_events"] else "TIMESTAMPED_LOG_WINDOW"
@@ -134,7 +131,7 @@ def _runtime() -> dict[str, Any]:
         return {"scope": "UNAVAILABLE"}
 
 
-def snapshot(root: Path, *, now: datetime | None = None, hours: int = 24, max_bytes: int = DEFAULT_MAX_BYTES) -> dict[str, Any]:
+def snapshot(root: Path, *, now: datetime | None = None, hours: int = 24, max_bytes: int = DEFAULT_MAX_BYTES, cycle_log: Path | None = None) -> dict[str, Any]:
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("now must be timezone aware")
@@ -164,7 +161,7 @@ def snapshot(root: Path, *, now: datetime | None = None, hours: int = 24, max_by
     # Hosts without an explicitly timestamped cycle log cannot establish
     # cycle-health rates, regardless of whether the release probe passed.
     result["metrics"]["cycles"] = cycle_liveness(
-        root.parent / "log" / "ohm-unified-cycle.log", cutoff=cutoff, max_bytes=max_bytes
+        cycle_log or Path("/var/log/ohm-unified-cycle.log"), cutoff=cutoff, max_bytes=max_bytes
     )
     try:
         disk = os.statvfs(root)
@@ -212,9 +209,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path("/app/data"))
     parser.add_argument("--hours", type=int, default=24)
+    parser.add_argument("--cycle-log", type=Path, default=Path("/var/log/ohm-unified-cycle.log"))
     parser.add_argument("--max-ledger-mib", type=int, default=32)
     args = parser.parse_args()
-    print(json.dumps(snapshot(args.root, hours=args.hours, max_bytes=max(1, args.max_ledger_mib) * 1024 * 1024), sort_keys=True, indent=2))
+    print(json.dumps(snapshot(args.root, hours=args.hours, max_bytes=max(1, args.max_ledger_mib) * 1024 * 1024, cycle_log=args.cycle_log), sort_keys=True, indent=2))
 
 
 if __name__ == "__main__":
