@@ -1846,6 +1846,46 @@ def main(scan_override=None):
 
     opip.record_market_intelligence(candidates, intelligence.assessments)
 
+    # ATDD-OPIP-ACTIONABLE-LIQUIDITY-v1: prospective evidence for the
+    # deterministic finalists, captured BEFORE AI review. AI availability must
+    # never be able to erase internal candidate evidence, so this loop runs on
+    # the deterministic candidate set and is independent of the AI-annotation
+    # flag. Default OFF; it records nothing and changes no verdict when unset.
+    try:
+        from app.services import opportunity_pipeline_wiring as _pre_wiring
+
+        if _pre_wiring.evidence_enabled(settings):
+            _pre_scan_id = f"QUALIFIED_OPPORTUNITY:{decision_at.isoformat()}"
+            for _finalist in candidates[:8]:
+                _pre_exec = getattr(_finalist, "execution_validation", None)
+                _pre_wiring.record_finalist_evidence(
+                    settings,
+                    symbol=str(_finalist.symbol),
+                    venue=str(VENUE_ID),
+                    instrument=str(_finalist.symbol),
+                    observed_at_utc=decision_at.isoformat(),
+                    scan_id=str(_pre_scan_id),
+                    episode_id=str(
+                        f"{_pre_scan_id}:{_finalist.symbol}:"
+                        f"{_finalist.trade_direction}"
+                    ),
+                    policy_version=str(
+                        getattr(settings, "opip_actionable_policy_version", None)
+                    ),
+                    direction=str(_finalist.trade_direction or "LONG"),
+                    technical_score=getattr(_finalist, "technical_score", None),
+                    market_regime=getattr(market_regime, "regime", None),
+                    spread_bps=getattr(_pre_exec, "spread_bps", None),
+                    economics_available=None,
+                    admission_decision="PRE_AI_FINALIST",
+                )
+    except Exception as exc:  # evidence capture never breaks a scan
+        print(
+            "O'Pip pre-AI opportunity evidence unavailable:",
+            f"{type(exc).__name__}: {exc}",
+        )
+
+
     review = review_candidates(
         candidates,
         settings.openai_model,
@@ -2377,7 +2417,7 @@ def main(scan_override=None):
         execution_evidence["venue_identity_valid"] = (
             split_canonical_pair(plan.symbol) is not None
         )
-        if send_trade_plan(
+        delivered = send_trade_plan(
             candidate=alert,
             plan=plan,
             summary=review.get("summary", ""),
@@ -2387,12 +2427,79 @@ def main(scan_override=None):
             policy=ActionableNotificationPolicy.from_settings(settings),
             execution_evidence=execution_evidence,
             observed_at=decision_at,
-        ):
+        )
+        if delivered:
             sent += 1
             if not plan.valid_now:
                 pending_saved += 1
         if alert.get("notification_attempted"):
             delivery_attempts += 1
+        # ATDD-OPIP-ACTIONABLE-LIQUIDITY-v1: the AI annotation is guarded by its
+        # OWN flag, independent of evidence capture, and never gates anything.
+        try:
+            from app.services import opportunity_pipeline_wiring as _wiring
+
+            _wiring.annotate_candidates(
+                settings,
+                [alert],
+                ai_status=str(review.get("ai_status") or "UNAVAILABLE").upper(),
+            )
+        except Exception as exc:
+            print(
+                "O'Pip AI advisory annotation unavailable:",
+                f"{type(exc).__name__}: {exc}",
+            )
+        # ATDD-OPIP-ACTIONABLE-LIQUIDITY-v1: point-in-time shadow evidence for
+        # this finalist evaluation, and (when enabled) the AI advisory
+        # annotation. Both are default OFF and strictly non-authoritative: the
+        # annotation never filters or reorders candidates, and evidence capture
+        # can never change a verdict or send anything.
+        try:
+            from app.services import opportunity_pipeline_wiring as _wiring
+
+            if _wiring.evidence_enabled(settings):
+                _wiring.record_finalist_evidence(
+                    settings,
+                    symbol=str(plan.symbol),
+                    venue=str(execution_evidence.get("venue") or VENUE_ID),
+                    instrument=str(plan.symbol),
+                    observed_at_utc=decision_at.isoformat(),
+                    episode_id=str(alert.get("trade_id") or plan.symbol),
+                    policy_version=str(
+                        getattr(settings, "opip_actionable_policy_version", None)
+                    ),
+                    direction=str(alert.get("direction") or "LONG"),
+                    technical_score=alert.get("technical_score"),
+                    market_regime=alert.get("market_regime"),
+                    depth_status=execution_evidence.get("depth_status"),
+                    weaker_side_depth_usd=execution_evidence.get(
+                        "weaker_side_depth_usd"
+                    ),
+                    depth_band_pct=execution_evidence.get("depth_band_pct"),
+                    depth_evidence_complete=execution_evidence.get(
+                        "depth_evidence_complete"
+                    ),
+                    order_notional_usd=alert.get("economic_position_notional"),
+                    spread_bps=execution_evidence.get("spread_bps"),
+                    size_slippage_pct=execution_evidence.get("size_slippage_pct"),
+                    economics_available=alert.get("economic_qualified"),
+                    risk_gate_passed=alert.get("action_gate_allowed"),
+                    admission_decision=(
+                        "ADMITTED"
+                        if delivered
+                        else ("SUPPRESSED" if reason is not None else "NOT_EVALUATED")
+                    ),
+                    suppression_reason=reason,
+                    rejection_codes=(reason,) if reason else (),
+                    trade_id=alert.get("trade_id"),
+                    journey_id=alert.get("journey_id"),
+                    signal_id=alert.get("signal_id"),
+                )
+        except Exception as exc:  # evidence capture never breaks a scan
+            print(
+                "O'Pip opportunity evidence capture unavailable:",
+                f"{type(exc).__name__}: {exc}",
+            )
         if reason is not None:
             alert["notification_disposition"] = reason
             try:
