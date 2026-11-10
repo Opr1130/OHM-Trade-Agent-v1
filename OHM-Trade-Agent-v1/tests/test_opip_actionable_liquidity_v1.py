@@ -381,7 +381,6 @@ def _passing(evidence=None, policy=None):
     return _admit(_base_evidence(**fields), policy)
 
 
-@pytest.mark.acceptance
 def test_depth_pass_must_satisfy_the_active_policy():
     """ATDD-OPIP-ACTIONABLE-LIQUIDITY-v1/AC-106: enforce active-policy depth and band."""
     assert _passing({"weaker_side_depth_usd": 599_999.99}).reason == \
