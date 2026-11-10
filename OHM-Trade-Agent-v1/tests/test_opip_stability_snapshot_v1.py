@@ -81,9 +81,9 @@ def test_cycle_liveness_only_counts_timestamped_completions(tmp_path: Path):
     """ATDD-OPIP-STABILITY-EVIDENCE-v1/AC-204: cycle completions require observation timestamps."""
     log = tmp_path / "cycle.log"
     log.write_text(
-        "OPIP_UNIFIED_CYCLE_COMPLETED_AT=2026-11-10T12:00:00+00:00\\n"
-        "OPIP_UNIFIED_CYCLE_COMPLETED_AT=2026-11-08T12:00:00+00:00\\n"
-        "OHM Unified Cycle skipped: previous cycle still running.\\n",
+        "OPIP_UNIFIED_CYCLE_COMPLETED_AT=2026-11-10T12:00:00+00:00\n"
+        "OPIP_UNIFIED_CYCLE_COMPLETED_AT=2026-11-08T12:00:00+00:00\n"
+        "OHM Unified Cycle skipped: previous cycle still running.\n",
         encoding="utf-8",
     )
     out = module.cycle_liveness(log, cutoff=datetime(2026, 11, 9, tzinfo=timezone.utc))
