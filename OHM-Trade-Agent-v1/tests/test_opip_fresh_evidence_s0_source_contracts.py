@@ -30,6 +30,22 @@ def _exported_jsonl_paths() -> set[str]:
     return set(re.findall(r'copy_locked_jsonl "\$DATA_ROOT/([^"]+)"', script))
 
 
+def _exported_json_state_paths_with_locks() -> dict[str, str]:
+    """Planned copy-only JSON state routes, separate from JSONL evidence.
+
+    Each route must name the writer's actual registry lock explicitly. This
+    avoids inventing a .<file>.lock path from the JSON filename and avoids
+    introducing an independently-written JSONL twin.
+    """
+    script = EXPORTER.read_text(encoding="utf-8")
+    pattern = (
+        r'^\\s*copy_locked_json_state\\s+"\\$DATA_ROOT/([^"]+\\.json)"'
+        r'\\s+"state_snapshots/[^"]+\\.json"'
+        r'\\s+"\\$DATA_ROOT/(\\.[^"]+\\.lock)"'
+    )
+    return dict(re.findall(pattern, script, flags=re.MULTILINE))
+
+
 def _screening_row() -> dict:
     snapshot = MarketSnapshot(
         symbol="XRPUSD",
@@ -130,22 +146,30 @@ def test_s0_005_tradevisor_frozen_decisions_have_verified_transfer_coverage():
     Telegram delivery records alone cannot reconstruct rejected/unnotified
     Tradevisor decisions or the frozen decision_record.
     """
-    from app.services.tradevisor_inbox import INBOX_FILE
+    from app.services.tradevisor_inbox import INBOX_FILE, LOCK_FILE
 
-    assert INBOX_FILE.name in _exported_jsonl_paths(), (
-        "S0 GAP: tradevisor_v1_inbox.json is not in the verified learning export; "
-        "no alternate approved frozen-decision export has been demonstrated"
+    routes = _exported_json_state_paths_with_locks()
+    assert routes.get(INBOX_FILE.name) == LOCK_FILE.name, (
+        "S0 GAP: Tradevisor JSON frozen decisions lack a copy-only snapshot "
+        "route under their existing registry lock; JSONL conversion is forbidden"
+    )
+    assert "state_snapshots/manifest.json" in EXPORTER.read_text(encoding="utf-8"), (
+        "S0 GAP: a per-generation snapshot integrity/lineage manifest is missing"
     )
 
 
 @pytest.mark.acceptance
 def test_s0_006_manual_advisory_outcome_source_has_verified_transfer_coverage():
     """RED until recommendation/observed-outcome source is available remotely."""
-    from app.services.trade_outcome_registry import OUTCOME_FILE
+    from app.services.trade_outcome_registry import OUTCOME_FILE, registry_lock_file
 
-    assert OUTCOME_FILE.name in _exported_jsonl_paths(), (
-        "S0 GAP: trade_outcomes.json has no verified copy-only transfer route; "
-        "Telegram alone cannot establish TP/SL outcome or fill attribution"
+    routes = _exported_json_state_paths_with_locks()
+    assert routes.get(OUTCOME_FILE.name) == registry_lock_file().name, (
+        "S0 GAP: trade-outcome JSON registry lacks a copy-only snapshot route "
+        "under its existing registry lock; Telegram is not trade-outcome proof"
+    )
+    assert "state_snapshots/manifest.json" in EXPORTER.read_text(encoding="utf-8"), (
+        "S0 GAP: a per-generation snapshot integrity/lineage manifest is missing"
     )
 
 
