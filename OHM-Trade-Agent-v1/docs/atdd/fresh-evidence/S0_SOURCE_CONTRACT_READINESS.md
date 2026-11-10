@@ -72,3 +72,39 @@ Do not add these known-red tests to mandatory release CI or initiate production 
 5. Receive owner approval for the next slice; no funded trading, training, model promotion, legacy P1 reactivation, merge or deployment.
 
 **No modifications to production source, deploy scripts, environment files, services or CI workflows in Slice 0.**
+
+## Slice 0B follow-up — 2026-11-10 (read-only diagnostics and test-contract correction)
+
+**Gate remains BLOCKED.** This section updates the earlier static inspection; it does not authorize Slice 1, producer changes, merges, deployment, or learning activation.
+
+### Exact evidence and status
+
+- The owner-reported clean worktree run on the original S0 test branch executed exactly eight focused acceptance tests: **5 PASS, 3 expected RED** (S0-005/006/007). S0-002/003/004 have now been execution-confirmed **on the original branch**. These tests have **not** been rerun after the S0B wording correction; do not claim a new pass/fail result.
+- GitHub workflow [42920173042](https://github.com/Opr1130/OHM-Trade-Agent-v1/actions/runs/42920173042) executed the owner-gated read-only `/diagnose-learning` successfully on production release `1d5290e0d47545ab0b6ade0f8b77e1dc41fc676e`. Its diagnostic disposition was **DEGRADED**, not fully healthy.
+- At 23:04 UTC, the export manifest, source-release receipt and canonical replica inner manifest all identified `1d5290e0...`; the earlier `736c4af0...` mismatch had **cleared**. **Do not run `/deploy-learning` to fix it**. That separate downstream workflow can enable learning workers/timers and was never approved.
+- The exporter remains expensive: approximately **4.9 GiB** per canonical replica, with a measured **254-second** export process while its schedule is **160 seconds**. Gate polling and export completion are not guaranteed to align. The specific prior timeout's process-level cause cannot be established from untimestamped logs.
+- **Active production V2 remains UNPROVEN**, not inactive: source configuration includes `OPIP_PRODUCTION_SCORING_VERSION: "v2"`, but effective in-process settings and actual finalized attempt status have not been read. A scanner image marked V2-ready or paper admission source marked inactive is not proof of production scorer selection.
+- Latest bounded diagnostics are 24-hour aggregates, **not** per-scan/7-day source coverage: BROAD_SEARCH `7,800` observations, `270` advanced, `6,687` below-threshold, leaving **843 observations requiring accounting**. Do not label these records missing or corrupt until cohort/denominator and exclusion semantics are reconciled. Funnel `1,362 = 3 qualified + 1,347 rejected + 12 operational failures`; Chief `95 eligible, 83 invoked, 12 unavailable`; `83 = 5 alert + 78 watch + 0 reject`.
+- Tradevisor frozen-decision and trade-outcome registries remain outside the verified export; registry item counts and lineage per record remain unknown. Dead-letter paths and hot/archive coverage still require a read-only reconciliation.
+
+### S0-005 / S0-006 test-contract correction
+
+The original S0-005/006 tests incorrectly looked for **mutable JSON registry names** in the list of `copy_locked_jsonl` exports. That failed requirement would encourage a destructive JSON-to-JSONL twin or false source attribution.
+
+The S0B tests now require a **distinct, explicitly locked, copy-only JSON snapshot transfer route**, mapped to the original registry lock path:
+
+- `tradevisor_v1_inbox.json` under `.tradevisor_v1_inbox.lock`.
+- `trade_outcomes.json` under `.trade_outcomes.lock`.
+- One per-generation `state_snapshots/manifest.json` declaration, separate from JSONL source inventory.
+
+This is a **static tests-first contract only** and stays RED until a separately approved implementation exists. It does not verify runtime consistency or provide a green gate. Any implementation must additionally test: opening pre-existing locks without creating them; bounded wait and size; stat+digest before/after byte-copy; safe atomic publish tied to the outer `manifest.env`; consistent export-reader member lists; snapshot row counts and explicit failed/absent dispositions; immutable provenance; source file unchanged; no activation; no legacy P1 replay. An incompatible new registry lock or JSONL conversion is prohibited.
+
+### Remaining owner gate
+
+1. **Production scorer evidence:** read effective V2 settings from the active process and inspect a recent completed isolated attempt's `scoring.v2_status_counts`; distinguish V2 evaluation from selection and require authoritative per-row release/config/scorer attribution.
+2. **Coverage:** prove the latest ten completed scans and a multi-release seven-day window with explicit scan IDs, archive segments, dead letters, rejected/omitted observations, Chief candidates, downstream decisions and record-level reconciliation.
+3. **Copy-only registry coverage:** approve the snapshot source contract and targeted fail-closed tests before implementing it; no mainline code or production file changes in S0/S0B.
+4. **Export capacity:** bound the 4.9-GiB full-copy cost, scheduling/locking behavior and resource headroom independently from lineage correctness.
+5. **Separate UI issue:** the dashboard route is missing after an edge replacement; do not mix UI recovery or a core deployment into learning evidence work.
+
+**Disposition: HOLD.** No auto trading, F11 expansion, Committee, learning activation, merge, or deploy. No background worker or timer started by this tests-only branch.
