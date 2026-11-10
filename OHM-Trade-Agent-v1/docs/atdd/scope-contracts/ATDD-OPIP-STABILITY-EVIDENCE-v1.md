@@ -34,6 +34,11 @@ GIVEN: cycle log entries with valid timestamps and stale or unstamped messages
 WHEN: the cycle observation window is evaluated
 THEN: only fresh timestamped cycle completions are counted
 
+AC-205:
+GIVEN: an operator explicitly requests a bounded Docker resource observation
+WHEN: the optional read-only Docker CLI probes are executed
+THEN: only allowlisted CPU, memory and container state fields are returned
+
 EXPLICITLY OUT OF SCOPE:
 - Merging or deploying code; installing the logrotate policy; restarting a service.
 - Editing any live host runtime configuration or provider budgets.
@@ -52,6 +57,7 @@ AC-201 -> tests/test_opip_stability_snapshot_v1.py::test_counts_are_aggregates_n
 AC-202 -> tests/test_opip_stability_snapshot_v1.py::test_missing_ledgers_are_unknown_not_zero_coverage
 AC-203 -> tests/test_opip_stability_snapshot_v1.py::test_large_ledger_tail_is_bounded_and_declares_truncation
 AC-204 -> tests/test_opip_stability_snapshot_v1.py::test_cycle_liveness_only_counts_timestamped_completions
+AC-205 -> tests/test_opip_stability_snapshot_v1.py::test_docker_probe_is_opt_in_bounded_and_redacted
 
 IMPLEMENTATION MAP:
 AC-201 -> OHM-Trade-Agent-v1/tools/opip_stability_snapshot.py
@@ -62,6 +68,8 @@ AC-203 -> OHM-Trade-Agent-v1/tools/opip_stability_snapshot.py
 AC-203 -> OHM-Trade-Agent-v1/tests/test_opip_stability_snapshot_v1.py
 AC-204 -> OHM-Trade-Agent-v1/tools/opip_stability_snapshot.py
 AC-204 -> OHM-Trade-Agent-v1/tests/test_opip_stability_snapshot_v1.py
+AC-205 -> OHM-Trade-Agent-v1/tools/opip_stability_snapshot.py
+AC-205 -> OHM-Trade-Agent-v1/tests/test_opip_stability_snapshot_v1.py
 AC-201 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
 AC-201 -> OHM-Trade-Agent-v1/deploy/logrotate.d/opip
 AC-201 -> OHM-Trade-Agent-v1/docs/operations/stability-evidence-readonly-2026-11.md
