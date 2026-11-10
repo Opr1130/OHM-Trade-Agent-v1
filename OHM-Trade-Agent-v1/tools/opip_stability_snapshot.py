@@ -11,6 +11,7 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 import json
 import os
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -131,7 +132,45 @@ def _runtime() -> dict[str, Any]:
         return {"scope": "UNAVAILABLE"}
 
 
-def snapshot(root: Path, *, now: datetime | None = None, hours: int = 24, max_bytes: int = DEFAULT_MAX_BYTES, cycle_log: Path | None = None) -> dict[str, Any]:
+def docker_metrics() -> dict[str, Any]:
+    """One optional, non-mutating Docker snapshot with a bounded command timeout."""
+    commands = {
+        "stats": ["docker", "stats", "--no-stream", "--format", "{{json .}}"],
+        "containers": ["docker", "ps", "-a", "--format", "{{json .}}"],
+    }
+    result: dict[str, Any] = {"scope": "DOCKER_CLI_READ_ONLY", "status": "UNAVAILABLE"}
+    for label, argv in commands.items():
+        try:
+            process = subprocess.run(
+                argv, capture_output=True, text=True, timeout=8, check=False
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            result[label] = {"status": "UNAVAILABLE"}
+            continue
+        if process.returncode != 0:
+            # Docker errors may contain host paths; do not leak stderr.
+            result[label] = {"status": "UNAVAILABLE"}
+            continue
+        records = []
+        for line in process.stdout.splitlines()[:100]:
+            try:
+                raw = json.loads(line)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(raw, dict):
+                continue
+            if label == "stats":
+                allow = ("Name", "MemUsage", "MemPerc", "CPUPerc", "PIDs")
+            else:
+                allow = ("Names", "State", "Status")
+            records.append({key: str(raw[key])[:128] for key in allow if key in raw})
+        result[label] = {"status": "OK", "rows": records, "truncated": len(process.stdout.splitlines()) > 100}
+    if all(result.get(label, {}).get("status") == "OK" for label in commands):
+        result["status"] = "OK"
+    return result
+
+
+def snapshot(root: Path, *, now: datetime | None = None, hours: int = 24, max_bytes: int = DEFAULT_MAX_BYTES, cycle_log: Path | None = None, inspect_docker: bool = False) -> dict[str, Any]:
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("now must be timezone aware")
@@ -192,6 +231,7 @@ def snapshot(root: Path, *, now: datetime | None = None, hours: int = 24, max_by
         "by_family": _counts(delivery, "alert_family"),
         "by_suppression_reason": _counts([r for r in delivery if r.get("suppression_reason")], "suppression_reason"),
     }
+    result["docker"] = docker_metrics() if inspect_docker else {"status": "NOT_REQUESTED"}
     result["coverage"] = "INCOMPLETE" if any(
         not meta["present"] or meta["truncated"] or meta.get("error")
         for meta in result["ledgers"].values()
@@ -210,9 +250,10 @@ def main() -> None:
     parser.add_argument("--root", type=Path, default=Path("/app/data"))
     parser.add_argument("--hours", type=int, default=24)
     parser.add_argument("--cycle-log", type=Path, default=Path("/var/log/ohm-unified-cycle.log"))
+    parser.add_argument("--docker", action="store_true", help="Optional read-only Docker stats and container states")
     parser.add_argument("--max-ledger-mib", type=int, default=8)
     args = parser.parse_args()
-    print(json.dumps(snapshot(args.root, hours=args.hours, max_bytes=max(1, args.max_ledger_mib) * 1024 * 1024, cycle_log=args.cycle_log), sort_keys=True, indent=2))
+    print(json.dumps(snapshot(args.root, hours=args.hours, max_bytes=max(1, args.max_ledger_mib) * 1024 * 1024, cycle_log=args.cycle_log, inspect_docker=args.docker), sort_keys=True, indent=2))
 
 
 if __name__ == "__main__":
