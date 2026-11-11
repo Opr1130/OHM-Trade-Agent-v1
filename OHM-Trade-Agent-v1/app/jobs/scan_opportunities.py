@@ -2407,10 +2407,14 @@ def main(scan_override=None):
         alert_direction = str(
             getattr(plan, "direction", None) or alert.get("trade_direction") or "LONG"
         ).upper()
+        # Admission sizes the order actually recommended by the action gate,
+        # not the larger economic-validation envelope. The action gate has
+        # already applied portfolio risk, leverage and the liquidity cap;
+        # measured execution quality and the capacity veto remain unchanged.
         execution_evidence = execution_evidence_from_snapshot(
             opportunity.snapshot,
             direction=alert_direction,
-            order_notional_usd=alert.get("economic_position_notional"),
+            order_notional_usd=alert.get("recommended_position_notional"),
         )
         # Authoritative venue and instrument identity from the exchange that produced the book.
         execution_evidence["venue"] = VENUE_ID
