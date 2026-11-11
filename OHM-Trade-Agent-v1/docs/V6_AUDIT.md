@@ -8,11 +8,11 @@ This audit is the input to v6 slice 0A. It proposes dispositions; it does not de
 
 - The code base is 589 Python modules and about 239,000 lines under `app/`, plus 488 test files, 16 GitHub workflows and a React admin console (`control-center-v2`).
 - A static import analysis from every entrypoint named in compose files, deploy scripts and workflows finds **105 modules (39,553 lines, 16.5%) that nothing deployed reaches**. These are retirement candidates, not confirmed dead code (see limits in section 2).
-- Strongest candidates: ten single-file `app/opip/*` modules (about 5,800 lines), `app/backtesting` (6 modules), 19 job files with no scheduler reference, and Paper Trade v1.
+- Strongest candidates: ten single-file `app/opip/*` modules (about 5,800 lines), `app/backtesting` (6 modules), 19 job files with no scheduler reference, and the internal shadow paper simulator (the paper control switch and Freqtrade bridge stay).
 - **Versioning is almost empty.** One fixed strategy version string (`OPIP-STRATEGY-V1`), and the model and feature-schema versions are explicit nulls. The Scorecard cannot compare strategies or models until v6 builds this. A threshold fingerprint (`gate_policy_fingerprint()`) already exists and should be reused to stamp every signal.
 - **The Ops Center is an extension, not a new build.** A schema-driven config registry already covers scoring, scanner, safety, AI routing, retention and resource budgets, and `control-center-v2` already exists.
 - **Data on the live droplet is 7.4 GB.** 5.2 GB is `opip/canonical`. Retention settings already exist as environment values; deletion is switched off by default.
-- **Paper trading:** Freqtrade paper is live and healthy. Paper Trade v1 has recorded nothing since 21 Oct.
+- **Paper trading:** the Freqtrade containers are healthy but have 0 trades, because the master paper switch has never been turned on. It stays off until the new trade box exists.
 
 ## 2. Method and limits
 
@@ -70,7 +70,9 @@ Two need special care. `opip_analytics_maintenance` relates to analytics retenti
 ## 6. Paper trading
 
 - **Freqtrade paper is live.** Two containers read admitted signals from `data/freqtrade_bridge/signals.json` (read-only) using `OHMExternalSignalStrategy`. Each is capped at 384 MB and 0.20 CPU. Results come back through `freqtrade_result_ingest`. They have no Kraken order authority.
-- **Paper Trade v1** is a separate simulation subsystem with its own settings. On the droplet its `state.json` is 67 bytes, last written 2026-10-21, with no events file; `control.json` was last changed 2026-10-27; `monitor_paper_trades` has no scheduler reference. It looks unused. **Retire candidate once `control.json` is confirmed off** (theme R3).
+- **`control.json` is the master paper switch, not a v1 leftover.** `paper_trade_control` gates publishing to the Freqtrade bridge: with `enabled: false` the scanner logs `PAPER_OFF` and skips `publish_qualified_long`. On the droplet (2026-11-11) it reads `enabled: false`, `updated_by: SYSTEM_BOOTSTRAP`, never changed; `signals.json` is empty (last written 2026-10-20) and both Freqtrade dry-run databases hold 0 trades. So zero trades is by design, not an ingestion fault. Keep the control file, CLI, Telegram `/paper` command, monitor and signal bridge.
+- **Internal shadow simulator** (`paper_trade_engine`, `paper_trade_registry`) is the part that duplicates Freqtrade. It is labelled shadow/control in the status output. **Retire candidate** once Freqtrade results feed the Scorecard (theme R3). The earlier note that Paper Trade v1 "looks unused" referred to this simulator; it was not a reason to touch the switch.
+- **Owner decision (2026-11-11):** paper stays off on the current server to protect production. It turns on after migration, on the new trade box, as an explicit gate. Until then the Scorecard labels its evidence shadow-only. The two idle Freqtrade containers use about 557 MB combined (about 280 MB each, 0% CPU); stopping them until migration is optional and reversible.
 - **Paper v2** is pinned off in compose (`OPIP_PAPER_V2_MODE: "off"`). It is built but inactive.
 - **v6 task:** diagnose whether Freqtrade results are ingested into the app, and use them as the Scorecard's simulated-trade source. Keep one paper system as the source of truth.
 
@@ -105,7 +107,11 @@ Rough growth estimate: the paper folder dates from 21 Oct, so about 250 MB a day
 
 Retention settings that already exist (environment values): events go cold after 30 days (`opip_event_cold_after_days`); analytics retention is 7, 15, 30, 60 or 90 days (`opip_analytics_retention_days`, default 30); retention deletion is off (`opip_enable_retention_delete = false`); the TradingView inbox keeps 7 days; JSONL ledgers can be compacted by size (`jsonl_retention.py`). The v6 retention policy table puts these behind the Operations Center with a dry-run preview and a minimum floor per dataset.
 
-Open structural question: whether `canonical` is segmented or hash-chained. If it is, trim whole segments only.
+Measured on the same droplet: the root disk is 47 GB used of 77 GB, so about 40 GB sits outside `data`. Docker images are 8.2 GB (6.9 GB reclaimable) and build cache 6.9 GB (6.5 GB reclaimable); the remainder is not yet accounted for. Keep older images as the rollback path.
+
+**`canonical` is one SQLite file, not segments.** `opip_canonical_v1.sqlite3` is 5.5 GB with a WAL file and a single-writer lock and socket. There is nothing to trim by segment. Retention design: the writer rolls to a new file per day or week; closed files are shipped to the data box, hash-verified, then deleted after the hot window; the existing file is split by date once on the data box. Deleting rows then running VACUUM is ruled out because the writer locks and it needs another 5.5 GB free. This needs a small writer change and readers that can span files. Whether the writer keeps its own hash chain is still unchecked.
+
+**I/O wait.** `sar` shows 12% to 20% I/O wait over 14 samples (average 17.7%), with about 35% idle CPU and 2.3 GB memory available. The likely cause is the 5.5 GB database exceeding the 2.5 GB page cache; this is a hypothesis until a file roll shows the effect.
 
 ## 10. Docs and workflows
 
@@ -120,16 +126,16 @@ Method for every theme: disable behind a flag, observe for at least two weeks (s
 |---|---|---|
 | R1 | Move root design notes to `docs/archive/` | Owner review |
 | R2 | Ten single-file `app/opip/*` modules and `app/backtesting` | No test or doc depends on them; replay code kept |
-| R3 | Paper Trade v1 | `control.json` confirmed off |
-| R4 | The 19 unreferenced jobs | Timer and cron check on the droplet |
+| R3 | Internal shadow paper simulator (not the control switch, CLI or bridge) | Freqtrade results feed the Scorecard, after paper is live on the new trade box |
+| R4 | The 19 unreferenced jobs | Systemd and cron confirmed clear (2026-11-11); check in-container schedulers |
 | R5 | `risk`, `detectors`, `committee` decision | Scorecard evidence for the committee |
 | R6 | `app/services` second pass | Per-module owner notes |
 
 ## 12. Open questions for the owner
 
-1. Is Paper Trade v1 switched off? `cat data/paper_trading/control.json` on the droplet.
-2. Are any of the 19 unreferenced jobs run by a timer or cron outside the repo? `systemctl list-timers --all` and `crontab -l` on the droplet.
-3. Is `opip/canonical` segmented or hash-chained? `ls -la data/opip/canonical | head -20`.
+1. ~~Is Paper Trade v1 switched off?~~ Answered: the master switch is off and has never been on (see section 6).
+2. ~~Are any of the 19 unreferenced jobs run outside the repo?~~ Answered: `systemctl list-timers` shows only OS timers and `crontab -l` is empty, so jobs run inside Docker. The `opip_analytics_maintenance` and `drain_tradevisor_inbox` caution still stands for in-container schedulers.
+3. ~~Is `opip/canonical` segmented?~~ Answered: single SQLite file (section 9).
 4. How many strategies and models are actually live? The registry is empty, so this needs the owner's knowledge.
 5. Does the committee earn its cost? Decide after the Scorecard exists.
 6. What is the daily data growth? Re-run `du -sh data` a day later.
