@@ -985,7 +985,7 @@ def test_a_plan_that_expired_before_the_attempt_is_never_delivered_late(
 
 
 def test_native_scan_uses_post_action_notional_for_notification_capacity():
-    """Prevent the pre-cap economic-validation envelope from vetoing the final order."""
+    """ATDD-OPIP-NATIVE-ALERT-SIZING-v1/AC-001: final sizing, not the pre-cap economic envelope."""
     source = ast.parse((APP / "jobs" / "scan_opportunities.py").read_text(encoding="utf-8"))
     calls = [
         node for node in ast.walk(source)
@@ -1004,7 +1004,7 @@ def test_native_scan_uses_post_action_notional_for_notification_capacity():
 
 
 def test_post_action_notional_passes_only_within_verified_capacity():
-    """The smaller *approved* notional can pass; the original large order still fails.
+    """ATDD-OPIP-NATIVE-ALERT-SIZING-v1/AC-002: smaller approved notional may pass, but the old large order and uncovered depth fail.
 
     This changes only the size supplied by the producer, never the capacity formula,
     market-liquidity floor, original measured drag, or required depth coverage.
