@@ -4,6 +4,10 @@ The report is the measurement half of the R2 retirement decision: for each R2
 module it names the importers, the tests and the documents that still refer to
 it, so an owner can see what a later retirement would have to touch. It is a
 read-only reader and these tests prove both the information and the safety.
+
+The tool is developer tooling at tools/retirement_readiness.py, deliberately
+outside the ``app/`` runtime package: the audit's R2 list has to name the shadow
+seams, and the R3 isolation guards forbid ``app/`` modules from naming them.
 """
 
 from __future__ import annotations
@@ -16,7 +20,7 @@ import shutil
 
 import pytest
 
-from app.opip.data_platform.retirement_readiness import build_report, main
+from tools.retirement_readiness import build_report, main
 
 APP_ROOT = Path(__file__).resolve().parents[1]
 

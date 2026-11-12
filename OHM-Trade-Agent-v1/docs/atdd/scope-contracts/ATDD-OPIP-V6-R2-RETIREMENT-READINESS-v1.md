@@ -54,16 +54,19 @@ AC-002 -> tests/test_v6_r2_retirement_readiness_v1.py::test_report_never_creates
 
 
 IMPLEMENTATION MAP:
-AC-001 -> OHM-Trade-Agent-v1/app/opip/data_platform/retirement_readiness.py
+AC-001 -> OHM-Trade-Agent-v1/tools/retirement_readiness.py
 AC-001 -> OHM-Trade-Agent-v1/tests/test_v6_r2_retirement_readiness_v1.py
 AC-001 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-V6-R2-RETIREMENT-READINESS-v1.md
 AC-001 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
-AC-002 -> OHM-Trade-Agent-v1/app/opip/data_platform/retirement_readiness.py
+AC-001 -> OHM-Trade-Agent-v1/app/opip/data_platform/retirement_readiness.py
+AC-002 -> OHM-Trade-Agent-v1/tools/retirement_readiness.py
 AC-002 -> OHM-Trade-Agent-v1/tests/test_v6_r2_retirement_readiness_v1.py
 AC-002 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-V6-R2-RETIREMENT-READINESS-v1.md
 AC-002 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
+AC-002 -> OHM-Trade-Agent-v1/app/opip/data_platform/retirement_readiness.py
 
 DEFERRED DISCOVERIES:
+- The report's source necessarily names the R2 seams, and the R3 isolation guards (`test_opip_r3_f4_opportunity_lifecycle`, `test_opip_r3_f5_feasibility`, `test_opip_r3_f6_forecast_engine`, `test_opip_r3_f7_economic_portfolio_selector`) fail if any `app/` module names them. The tool is therefore developer tooling at `OHM-Trade-Agent-v1/tools/retirement_readiness.py`, and its earlier `OHM-Trade-Agent-v1/app/opip/data_platform/retirement_readiness.py` placement is deleted by this same increment. No isolation guard, assertion or application module is changed or relaxed, and no `app/` runtime module gained a new reference.
 - The audit's section 11 precondition reads "no test or doc depends on them", while this report already shows real test and doc references for every R2 module. The retirement decision must therefore reconcile the precondition with the measured references and record the disposition; that reconciliation is a separate owner-approved increment, not this tool.
 - Importers are detected only from Python imports (including relative imports) and exact dotted or source-path references in docs. Dynamic imports built from strings, string concatenation and generated documentation are not resolved, so a retirement increment should re-run the report after any test or doc edits.
 - The report scans the whole repository on each invocation and takes about a second on the current tree; a bounded, cached or per-module variant is not needed yet.

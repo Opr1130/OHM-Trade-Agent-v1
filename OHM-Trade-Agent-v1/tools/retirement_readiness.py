@@ -5,6 +5,13 @@ the audit's R2 retirement list (the ten single-file ``app/opip/*`` modules plus
 the ``app/backtesting`` package), which source files import it, which test files
 reference it and which documents mention it.
 
+This is developer tooling, so it lives in ``tools/`` and not in the ``app/``
+runtime package. The audit's R2 list necessarily names the shadow seams, and the
+R3 isolation guards forbid any ``app/`` module from naming them. Keeping the
+report outside ``app/`` preserves that invariant at full strength instead of
+weakening a guard. Nothing here imports, executes, registers or promotes an R2
+module; it only reads file text.
+
 It is a static reader. It walks the repository, parses Python files with
 :mod:`ast` to find real imports (including relative imports) and searches docs
 for the module's dotted name or source path. It only reads files: it never
@@ -14,7 +21,7 @@ exchange, network, Telegram or learning authority.
 
 Run it from the application root::
 
-    python -m app.opip.data_platform.retirement_readiness
+    python -m tools.retirement_readiness
 
 A "reference" is deliberately precise so the report is not swamped by prose
 that merely contains the word *forecast*:
@@ -41,8 +48,8 @@ import re
 import sys
 from typing import Iterable, Iterator
 
-#: Repo root inferred from this file (``app/opip/data_platform/<this file>``).
-DEFAULT_REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+#: Repo root inferred from this file (``tools/<this file>``).
+DEFAULT_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 #: Only these suffixes are read. Secrets, configuration and data are not opened.
 SOURCE_SUFFIXES: tuple[str, ...] = (".py",)
