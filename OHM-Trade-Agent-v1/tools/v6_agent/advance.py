@@ -55,6 +55,10 @@ def main() -> int:
         for p in prs
         if str(p["head"]["ref"]).startswith("v6/") and str(p["number"]) != merged
     ]
+    print(
+        f"queued={len(open_issues or [])} closed={len(closed)} "
+        f"open_v6_prs={[p['number'] for p in v6_prs]} merged={merged!r}"
+    )
     number = pick_next(open_issues or [], len(v6_prs), {int(i["number"]) for i in closed})
     if number is None:
         print("no slice ready")
