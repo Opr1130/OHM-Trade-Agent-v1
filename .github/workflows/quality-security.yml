@@ -4,10 +4,14 @@ name: quality-security
 # This workflow is intentionally separate from pytest.yml and must never
 # gate production/analytics deployment. Findings are reported; jobs use
 # continue-on-error so the layer stays non-blocking while logs stay visible.
+#
+# Runs on pushes to main only. deploy-learning-recovery requires a successful
+# exact-SHA run of this workflow on main, so the push trigger and the
+# non-blocking jobs must stay. It does not run on pull requests: the advisory
+# findings were permanently red there and hid real signal. PR-time secret
+# scanning lives in secret-scan-pr.yml.
 
 on:
-  pull_request:
-    branches: [main]
   push:
     branches: [main]
 
