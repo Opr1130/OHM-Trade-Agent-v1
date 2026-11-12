@@ -51,7 +51,7 @@ THEN: the template carries only a render placeholder with no credential, and the
 AC-004:
 GIVEN: a genuine TradingView delivery was refused HTTP 400 by `ssl_verify_client optional_no_ca` due to unsuitable certificate purpose, and no trusted client-cert CA is published
 WHEN: the vhost and its log format are read
-THEN: client certificates are not requested or treated as authentication; the independently verified IP, edge-stamp and body-token controls remain, no invented trust anchor is configured, and the webhook log records no request body, headers or query string
+THEN: client certificates are not requested or treated as authentication, the UI-only edge overlay mounts the corrected nginx template from the approved immutable release tree instead of the older core tree, the independently verified IP, edge-stamp and body-token controls remain, no invented trust anchor is configured, and the webhook log records no request body, headers or query string
 
 AC-005:
 GIVEN: an existing production stack with a read-only container filesystem and a single approved application secret file
@@ -83,6 +83,7 @@ EXPLICITLY OUT OF SCOPE:
 
 FROZEN BOUNDARIES:
 - The dashboard listener on 8443, its certificate paths and its existing locations are unchanged; exactly one additive wildcard include is permitted.
+- The UI-only overlay may additionally override only the Tradevisor template bind mount with the digest-verified candidate release tree; existing edge-only service isolation and credential handling are unchanged.
 - `dashboard-sidecar.conf` remains the single tracked nginx mount, read-only, and is never rewritten on the host (ARCH-5).
 - The application port stays `127.0.0.1:8000` and is never published publicly.
 - The three authentication checks (source allowlist, edge stamp, body token) and the 404-on-mismatch behaviour stay exactly as merged.
@@ -119,6 +120,7 @@ AC-003 -> OHM-Trade-Agent-v1/deploy/nginx/tradevisor-webhook.conf.template
 AC-003 -> OHM-Trade-Agent-v1/docker-compose.yml
 AC-003 -> OHM-Trade-Agent-v1/tests/test_tradevisor_production_edge_v1.py
 AC-004 -> OHM-Trade-Agent-v1/deploy/nginx/tradevisor-webhook.conf.template
+AC-004 -> OHM-Trade-Agent-v1/deploy/control-center/docker-compose.v2.yml
 AC-004 -> OHM-Trade-Agent-v1/TRADEVISOR_V2.md
 AC-004 -> OHM-Trade-Agent-v1/tests/test_tradevisor_production_edge_v1.py
 AC-005 -> OHM-Trade-Agent-v1/docker-compose.yml
