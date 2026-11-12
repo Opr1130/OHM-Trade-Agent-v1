@@ -16,6 +16,14 @@ Run it from the application root::
 
 A dataset is a top-level entry under the data root; files that sit directly in
 the root are reported as the ``(root)`` dataset.
+
+The hot window per dataset comes from the pure retention policy table in
+:mod:`app.opip.data_platform.retention_policy`; a dataset the table does not list
+uses the table's 14-day default and 7-day floor. The table is validated before
+it is read, so an unusable policy fails closed instead of being applied. The
+optional ``--hot-window-days`` flag is an ad-hoc, read-only reporting lens for
+one invocation: it is not the policy, it is never persisted, and it cannot
+delete anything.
 """
 
 from __future__ import annotations
@@ -28,8 +36,17 @@ from pathlib import Path
 import sys
 from typing import Iterable
 
-HOT_WINDOW_DAYS = 14
-ROOT_DATASET = "(root)"
+from app.opip.data_platform.retention_policy import (
+    DEFAULT_HOT_WINDOW_DAYS,
+    DEFAULT_MIN_FLOOR_DAYS,
+    DEFAULT_RETENTION_POLICY,
+    ROOT_DATASET,
+    RetentionPolicyEntry,
+    entry_for_dataset,
+    validate_retention_policy,
+)
+
+HOT_WINDOW_DAYS = DEFAULT_HOT_WINDOW_DAYS
 SECONDS_PER_DAY = 86400.0
 
 
@@ -51,12 +68,14 @@ class RetentionFile:
 
 @dataclass(frozen=True)
 class DatasetRetentionReport:
-    """Size of one dataset and the files the hot window would prune."""
+    """Size of one dataset, its policy window and the files a prune would select."""
 
     dataset: str
     size_bytes: int
     file_count: int
     prune_candidates: tuple[RetentionFile, ...]
+    hot_window_days: int = HOT_WINDOW_DAYS
+    min_floor_days: int = DEFAULT_MIN_FLOOR_DAYS
 
     @property
     def prune_bytes(self) -> int:
@@ -67,6 +86,8 @@ class DatasetRetentionReport:
             "dataset": self.dataset,
             "size_bytes": self.size_bytes,
             "file_count": self.file_count,
+            "hot_window_days": self.hot_window_days,
+            "min_floor_days": self.min_floor_days,
             "prune_candidate_count": len(self.prune_candidates),
             "prune_bytes": self.prune_bytes,
             "prune_candidates": [item.as_dict() for item in self.prune_candidates],
@@ -140,14 +161,47 @@ def _age_days(modified: float, *, now: datetime) -> float:
     return max(0.0, (now - modified_at).total_seconds() / SECONDS_PER_DAY)
 
 
+def _dataset_report(
+    dataset: str,
+    files: list[RetentionFile],
+    size_bytes: int,
+    entry: RetentionPolicyEntry,
+    override_hot_window_days: int | None,
+) -> DatasetRetentionReport:
+    """Apply one policy row (or the ad-hoc override) to one dataset."""
+
+    window = entry.hot_window_days if override_hot_window_days is None else override_hot_window_days
+    return DatasetRetentionReport(
+        dataset=dataset,
+        size_bytes=size_bytes,
+        file_count=len(files),
+        prune_candidates=tuple(
+            sorted(
+                (item for item in files if item.age_days > window),
+                key=lambda item: (-item.age_days, item.path),
+            )
+        ),
+        hot_window_days=window,
+        min_floor_days=entry.min_floor_days,
+    )
+
+
 def build_report(
     root: Path,
     *,
-    hot_window_days: int = HOT_WINDOW_DAYS,
+    hot_window_days: int | None = None,
+    policy: Iterable[RetentionPolicyEntry] = DEFAULT_RETENTION_POLICY,
     now: datetime | None = None,
 ) -> RetentionDryRunReport:
-    """Collect sizes and hot-window prune candidates. Read-only by construction."""
-    if hot_window_days <= 0:
+    """Collect sizes and hot-window prune candidates. Read-only by construction.
+
+    Each dataset's hot window comes from ``policy``. An explicit
+    ``hot_window_days`` is an ad-hoc reporting override for this invocation
+    only; it is never persisted and it does not rewrite the table.
+    """
+
+    entries = validate_retention_policy(policy)
+    if hot_window_days is not None and hot_window_days <= 0:
         raise ValueError("hot_window_days must be a positive number of days")
     data_root = Path(root)
     if not data_root.is_dir():
@@ -182,23 +236,21 @@ def build_report(
         files_by_dataset.setdefault(dataset, []).append(entry)
 
     datasets = tuple(
-        DatasetRetentionReport(
-            dataset=dataset,
-            size_bytes=sizes.get(dataset, 0),
-            file_count=len(files),
-            prune_candidates=tuple(
-                sorted(
-                    (item for item in files if item.age_days > hot_window_days),
-                    key=lambda item: (-item.age_days, item.path),
-                )
-            ),
+        _dataset_report(
+            dataset,
+            files,
+            sizes.get(dataset, 0),
+            entry_for_dataset(dataset, entries),
+            hot_window_days,
         )
         for dataset, files in sorted(files_by_dataset.items())
     )
 
     return RetentionDryRunReport(
         root=str(data_root),
-        hot_window_days=hot_window_days,
+        hot_window_days=(
+            DEFAULT_HOT_WINDOW_DAYS if hot_window_days is None else hot_window_days
+        ),
         generated_at=current.isoformat(),
         datasets=datasets,
     )
@@ -218,6 +270,8 @@ def render_text(report: RetentionDryRunReport) -> str:
         lines.append(
             f"dataset={item.dataset} files={item.file_count} "
             f"size_bytes={item.size_bytes} "
+            f"hot_window_days={item.hot_window_days} "
+            f"min_floor_days={item.min_floor_days} "
             f"prune_candidates={len(item.prune_candidates)} "
             f"prune_bytes={item.prune_bytes}"
         )
@@ -244,8 +298,11 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument(
         "--hot-window-days",
         type=int,
-        default=HOT_WINDOW_DAYS,
-        help=f"Hot data window in days (default {HOT_WINDOW_DAYS})",
+        default=None,
+        help=(
+            "Ad-hoc read-only override of the hot window for this invocation "
+            f"only (default: the policy table's per-dataset windows, {HOT_WINDOW_DAYS} days)"
+        ),
     )
     parser.add_argument("--json", action="store_true", help="Emit the report as JSON")
     args = parser.parse_args(list(argv) if argv is not None else None)
