@@ -1,16 +1,22 @@
 #!/usr/bin/env bash
-# Run the v6 builder (Aider + DeepSeek) once on the checked-out branch.
+# Run the v6 builder (Cline CLI + DeepSeek) once on the checked-out branch.
 # Usage: run_agent.sh <task-file>
-# Needs DEEPSEEK_API_KEY and V6_AGENT_MODEL in the environment. Edits files only.
+# Needs DEEPSEEK_API_KEY, V6_AGENT_PROVIDER and V6_AGENT_MODEL in the environment.
+# Cline runs headless (-y) with a hard timeout. Verification happens afterwards
+# in a separate step that has no AI credential.
 set -euo pipefail
 task_file="${1:?task file required}"
-reads=(--read AGENTS.md --read CLAUDE.md --read OHM-Trade-Agent-v1/tools/v6_agent/builder_prompt.md)
-if [ -f OHM-Trade-Agent-v1/docs/V6_SPEC.md ]; then
-  reads+=(--read OHM-Trade-Agent-v1/docs/V6_SPEC.md)
-fi
-aider \
-  --model "${V6_AGENT_MODEL:?model required}" \
-  --yes-always --no-auto-commits --no-suggest-shell-commands \
-  --no-check-update --analytics-disable --no-pretty --no-stream \
-  "${reads[@]}" \
-  --message-file "$task_file"
+prompt="$(cat OHM-Trade-Agent-v1/tools/v6_agent/builder_prompt.md)
+
+Read AGENTS.md and CLAUDE.md first.
+$( [ -f OHM-Trade-Agent-v1/docs/V6_SPEC.md ] && echo "Also read OHM-Trade-Agent-v1/docs/V6_SPEC.md." )
+
+TASK:
+$(cat "$task_file")"
+cline -y \
+  -P "${V6_AGENT_PROVIDER:?provider required}" \
+  -m "${V6_AGENT_MODEL:?model required}" \
+  -k "${DEEPSEEK_API_KEY:?key required}" \
+  -t 1500 \
+  -c "$PWD" \
+  "$prompt"

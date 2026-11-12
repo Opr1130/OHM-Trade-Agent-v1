@@ -3,8 +3,8 @@ ATDD-OPIP-V6-DEVENV-v1
 
 OWNER-APPROVED INTENT:
 Proposed for owner approval; merging this contract is that approval. Add the
-automated v6 build loop: an issue labeled `build` is implemented by a DeepSeek
-builder on a v6/ branch and opened as a PR; failed pytest runs get at most two
+automated v6 build loop: an issue labeled `build` is implemented by a Cline
+CLI builder (DeepSeek models) on a v6/ branch and opened as a PR; failed pytest runs get at most two
 automatic fix attempts; after the owner merges, the next queued slice starts.
 The owner only approves and merges. This increment changes no application code,
 deploy workflow, trading, learning, AI-review or notification behavior.
@@ -80,7 +80,7 @@ AC-806 -> .github/workflows/v6-agent.yml
 
 DEFERRED DISCOVERIES:
 - Without the GitHub App, PRs and labels created with the default token do not start other workflows, so the loop pauses until the owner labels or re-runs; the App is a one-time owner setup.
-- The Aider version range and the `deepseek/deepseek-v4-pro` model name are assumptions to confirm on the first run.
+- The Cline provider id `deepseek` and the model ids `deepseek-v4-flash` (attempt 1) and `deepseek-v4-pro` (retry) are assumptions to confirm on the first run; both are overridable by repo variables.
 - The first v6 slices and docs/V6_SPEC.md are separate PRs.
 
 UNAPPROVED SCOPE CHANGES:

@@ -64,6 +64,10 @@ def test_verification_steps_have_no_ai_credential() -> None:
         assert "api_key" not in str(step).lower()
     agent_steps = [s for s in steps if s["name"].startswith("Agent attempt")]
     assert len(agent_steps) == 2
+    assert "inputs.model" in str(agent_steps[0]["env"])
+    assert "inputs.retry_model" in str(agent_steps[1]["env"])
+    install = next(s for s in steps if s["name"] == "Install builder")
+    assert "npm install -g cline" in install["run"]
     run_script = (APP / "tools/v6_agent/verify.sh").read_text(encoding="utf-8")
     assert "DEEPSEEK" not in run_script.upper()
 

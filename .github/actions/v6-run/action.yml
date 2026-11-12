@@ -8,7 +8,13 @@ inputs:
     description: Credential for the builder steps only.
     required: true
   model:
-    description: Builder model name.
+    description: Builder model for attempt 1.
+    required: true
+  retry_model:
+    description: Builder model for the retry attempt.
+    required: true
+  provider:
+    description: Cline provider id.
     required: true
 outputs:
   changed:
@@ -22,12 +28,13 @@ runs:
   steps:
     - name: Install builder
       shell: bash
-      run: pipx install "aider-chat>=0.86,<1"
+      run: npm install -g cline
 
     - name: Agent attempt 1
       shell: bash
       env:
         DEEPSEEK_API_KEY: ${{ inputs.deepseek_api_key }}
+        V6_AGENT_PROVIDER: ${{ inputs.provider }}
         V6_AGENT_MODEL: ${{ inputs.model }}
         TASK_FILE: ${{ inputs.task_file }}
       run: bash OHM-Trade-Agent-v1/tools/v6_agent/run_agent.sh "$TASK_FILE"
@@ -72,7 +79,8 @@ runs:
       shell: bash
       env:
         DEEPSEEK_API_KEY: ${{ inputs.deepseek_api_key }}
-        V6_AGENT_MODEL: ${{ inputs.model }}
+        V6_AGENT_PROVIDER: ${{ inputs.provider }}
+        V6_AGENT_MODEL: ${{ inputs.retry_model }}
       run: bash OHM-Trade-Agent-v1/tools/v6_agent/run_agent.sh "$RUNNER_TEMP/retry.md"
 
     - name: Commit attempt 2
