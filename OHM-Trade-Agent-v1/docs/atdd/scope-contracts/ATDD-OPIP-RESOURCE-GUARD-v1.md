@@ -18,6 +18,7 @@ ARCHITECTURE REFERENCES:
 - deploy/cron.d/opip-irr-shadow: owner-authorized isolated shadow worker, no stagger due to its >60s worker limit.
 - deploy/cron.d/ohm-unified-cycle and deploy/remote/reconcile-scheduler.sh: unchanged protected cycle and installation allowlist.
 - tests/test_opip_resource_guard_v1.py: hermetic regression evidence.
+- tests/test_canonical_learning_replica_transfer_e2e_v1.py: root-only CI fixture opts into export for the existing real transfer contract.
 
 APPROVED ACCEPTANCE CRITERIA:
 AC-001:
@@ -50,6 +51,7 @@ FROZEN BOUNDARIES:
 
 ACCEPTANCE TEST TRACEABILITY:
 AC-001 -> tests/test_opip_resource_guard_v1.py::test_export_exits_silently_without_explicit_enable_file
+AC-001 -> tests/test_canonical_learning_replica_transfer_e2e_v1.py::test_export_reader_sync_installs_a_verified_generation
 AC-002 -> tests/test_opip_resource_guard_v1.py::test_guard_skips_under_low_memory_without_running_child
 AC-002 -> tests/test_opip_resource_guard_v1.py::test_guard_execs_command_when_memory_is_available
 AC-002 -> tests/test_opip_resource_guard_v1.py::test_guard_fails_closed_when_meminfo_is_unavailable
@@ -58,6 +60,7 @@ AC-003 -> tests/test_opip_resource_guard_v1.py::test_crons_keep_flock_and_stagge
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/deploy/remote/export-opip-learning-evidence.sh
 AC-001 -> OHM-Trade-Agent-v1/tests/test_opip_resource_guard_v1.py
+AC-001 -> OHM-Trade-Agent-v1/tests/test_canonical_learning_replica_transfer_e2e_v1.py
 AC-002 -> OHM-Trade-Agent-v1/deploy/remote/opip-run-guarded
 AC-002 -> OHM-Trade-Agent-v1/tests/test_opip_resource_guard_v1.py
 AC-003 -> OHM-Trade-Agent-v1/deploy/cron.d/opip-feature-bus-capture
