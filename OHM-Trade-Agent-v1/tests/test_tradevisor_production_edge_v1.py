@@ -113,14 +113,15 @@ def test_ac_003_rendering_substitutes_the_placeholder_completely():
     assert rendered.count("{") == rendered.count("}")
 
 
-def test_ac_004_the_client_certificate_is_requested_but_not_trusted():
-    """ATDD-TRADEVISOR-PRODUCTION-EDGE-v1/AC-004: static contract for this increment."""
+def test_ac_004_the_client_certificate_is_not_requested_or_trusted():
+    """ATDD-TRADEVISOR-PRODUCTION-EDGE-v1/AC-004: prevent EKU-related 400 at the edge."""
     text = _text(TEMPLATE)
-    assert "ssl_verify_client optional_no_ca;" in text
-    assert "no CA certificate or public key" in text
-    assert "never treated as authentication" in text
-    assert "ssl_verify_client on;" not in text
-    assert "ssl_client_ca_certificate" not in text
+    lines = _code_lines(text)
+    assert lines.count("ssl_verify_client off;") == 1
+    assert "ssl_verify_client optional_no_ca;" not in lines
+    assert "Client-certificate observation is unavailable" in text
+    assert "ssl_verify_client on;" not in lines
+    assert "ssl_client_ca_certificate" not in lines
 
 
 def test_ac_004_the_webhook_log_carries_no_body_and_no_headers():

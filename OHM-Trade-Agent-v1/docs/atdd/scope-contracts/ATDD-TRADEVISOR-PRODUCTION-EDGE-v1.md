@@ -15,10 +15,12 @@ enters Git; and an absent or unsafe value leaves the vhost dark while nginx stil
 starts for the dashboard. Authentication does not change: source-IP allowlist,
 edge stamp and body token, with the application additionally pinning the
 immediate peer to the edge address on a dedicated compose network. TradingView
-publishes no CA or public key, so client-certificate chain verification cannot be
-configured without inventing a trust anchor; the vhost only requests the
-certificate for observation and records the presented subject as delivery
-evidence. This increment activates no trading, learning, PAPER_V2 or Committee
+publishes no usable client-cert CA, so trusted client-certificate verification
+cannot be configured. A live delivery on 2026-11-12 proved that requesting its
+certificate via `optional_no_ca` causes an nginx HTTP 400 (unsuitable certificate
+purpose), before authentication can run. The owner-approved repair disables
+client-certificate requests on this vhost, retaining the three independent
+authentication gates. This increment activates no trading, learning, PAPER_V2 or Committee
 authority, changes no threshold and does not relax the trusted 4H requirement.
 
 ARCHITECTURE REFERENCES:
@@ -47,9 +49,9 @@ WHEN: the tracked template and the compose entrypoint are read
 THEN: the template carries only a render placeholder with no credential, and the container substitutes the value from the host `.env` into a tmpfs file, so no secret is committed or written to host disk
 
 AC-004:
-GIVEN: TradingView documents a client certificate but publishes no CA or public key to verify it against
+GIVEN: a genuine TradingView delivery was refused HTTP 400 by `ssl_verify_client optional_no_ca` due to unsuitable certificate purpose, and no trusted client-cert CA is published
 WHEN: the vhost and its log format are read
-THEN: the certificate is requested for observation only, never treated as authentication, no invented trust anchor is configured, and the webhook log records no request body, headers or query string
+THEN: client certificates are not requested or treated as authentication; the independently verified IP, edge-stamp and body-token controls remain, no invented trust anchor is configured, and the webhook log records no request body, headers or query string
 
 AC-005:
 GIVEN: an existing production stack with a read-only container filesystem and a single approved application secret file
@@ -94,7 +96,7 @@ AC-002 -> tests/test_tradevisor_production_edge_v1.py::test_ac_002_only_the_docu
 AC-002 -> tests/test_tradevisor_production_edge_v1.py::test_ac_002_the_route_is_post_only_bounded_and_throttled_to_429
 AC-003 -> tests/test_tradevisor_production_edge_v1.py::test_ac_003_the_edge_stamp_is_a_render_placeholder_and_not_a_secret
 AC-003 -> tests/test_tradevisor_production_edge_v1.py::test_ac_003_rendering_substitutes_the_placeholder_completely
-AC-004 -> tests/test_tradevisor_production_edge_v1.py::test_ac_004_the_client_certificate_is_requested_but_not_trusted
+AC-004 -> tests/test_tradevisor_production_edge_v1.py::test_ac_004_the_client_certificate_is_not_requested_or_trusted
 AC-004 -> tests/test_tradevisor_production_edge_v1.py::test_ac_004_the_webhook_log_carries_no_body_and_no_headers
 AC-005 -> tests/test_tradevisor_production_edge_v1.py::test_ac_005_compose_publishes_443_and_preserves_the_existing_surface
 AC-005 -> tests/test_tradevisor_production_edge_v1.py::test_ac_005_the_render_target_is_tmpfs_and_the_template_is_read_only
@@ -134,7 +136,7 @@ AC-008 -> OHM-Trade-Agent-v1/tests/test_tradevisor_production_edge_v1.py
 
 DEFERRED DISCOVERIES:
 - Runtime validation of the rendered vhost (`nginx -t`) and container startup is not executable off-host: no Docker or nginx binary is available to this increment, so it remains an operator gate before traffic is enabled.
-- Client-certificate chain verification stays unimplemented because TradingView publishes no CA or public key; subject observation is recorded as evidence only and is explicitly not authentication.
+- Client-certificate chain verification and subject observation stay disabled: `optional_no_ca` caused a confirmed HTTP 400 on 2026-11-12. Three-part application ingress authentication remains intact.
 - Cloud firewall access for 443 from the four TradingView addresses and the production secret values are outside repository control and are operator steps.
 - Genuine TradingView delivery (G-01) remains unproven until an owner-created alert is delivered; this increment proves configuration only.
 

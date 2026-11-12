@@ -296,11 +296,18 @@ Operating steps (owner, on the host, in this order):
    the include then matches nothing. A bad *release* is rolled back only through
    `/deploy <previous-approved-sha>`.
 
-Client certificate: TradingView publishes no CA, so chain verification is not
-configurable without an invented trust anchor. The vhost only *requests* the
-certificate (`optional_no_ca`) and logs `$ssl_client_verify`/`$ssl_client_s_dn`
-as delivery evidence. Source allowlist, edge stamp and body token remain the
-authentication, and the application fails closed on any of them.
+Client certificate: On 2026-11-12, a genuine TradingView source
+(`54.218.53.128`) reached the dedicated vhost, but nginx returned HTTP 400
+with `client_verify=FAILED:unsuitable certificate purpose`. Even without CA
+chain enforcement, `ssl_verify_client optional_no_ca` can reject a presented
+certificate based on its intended purpose. The production webhook vhost now
+uses `ssl_verify_client off;`: it neither requests nor verifies a client
+certificate. `$ssl_client_verify`/`$ssl_client_s_dn` are retained in the log
+format for compatibility but **do not provide certificate identity evidence**.
+The TradingView source-IP allowlist, internal edge verification stamp and
+application body token remain mandatory and unchanged. A deliberately invalid
+token should produce an application-level 404 (not a TLS-layer 400), with no
+inbox row; a real valid signal must still pass the full admission gates.
 
 ## Configuration
 
