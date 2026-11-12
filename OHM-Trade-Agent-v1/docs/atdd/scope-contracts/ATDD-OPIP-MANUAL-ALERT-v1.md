@@ -23,6 +23,8 @@ ARCHITECTURE REFERENCES:
 - app/services/actionable_admission.py: unchanged seven independent conditions.
 - app/services/pending_setup_registry.py: unchanged waiting-setup identity.
 - tests/test_opip_manual_only_alerts_v1.py: focused acceptance evidence.
+- tests/test_target_attainability.py: positive-only synthetic LONG execution-evidence
+  fixture repair for existing CI tests; no production quality gate is changed.
 
 APPROVED ACCEPTANCE CRITERIA:
 AC-001:
@@ -80,12 +82,17 @@ AC-001 -> OHM-Trade-Agent-v1/app/services/qualified_trade_tracking.py
 AC-001 -> OHM-Trade-Agent-v1/tests/test_opip_manual_only_alerts_v1.py
 AC-002 -> OHM-Trade-Agent-v1/app/services/chief_alert_notifier.py
 AC-002 -> OHM-Trade-Agent-v1/tests/test_opip_manual_only_alerts_v1.py
+AC-002 -> OHM-Trade-Agent-v1/tests/test_target_attainability.py
 AC-003 -> OHM-Trade-Agent-v1/app/services/qualified_alert_outbox.py
 AC-003 -> OHM-Trade-Agent-v1/tests/test_opip_manual_only_alerts_v1.py
 AC-003 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
 AC-003 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-MANUAL-ALERT-v1.md
 
 DEFERRED DISCOVERIES:
+- Existing target-attainability positive fixtures omitted mandatory execution
+  validation and caused four unrelated CI failures; they now specify synthetic
+  LONG evidence, consistent with the isolated fixture repair in draft PR #521.
+  Missing production evidence is still rejected; no scoring or veto bypass.
 - Owner must verify production still has reconciliation disabled and no
   funded order authority before deploying; manual-alert label is not a stop.
 - PR #521 final recommended notional correction is a separate release dependency
