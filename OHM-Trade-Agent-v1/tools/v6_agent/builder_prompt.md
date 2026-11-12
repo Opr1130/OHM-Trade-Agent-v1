@@ -14,5 +14,6 @@ You implement ONE slice of the v6 plan from the GitHub issue text below.
 5. Never add Kraken order placement, modification or cancellation. v6 is advisory-only.
 6. Never read, print or commit secrets or .env values. Never weaken a test to make it pass.
 7. Do not run shell commands. Edit files only; the pipeline runs the tests after you.
+   Never run the full test suite, never start background jobs, never use kill or pkill.
 8. If the issue is ambiguous or needs a protected path, change nothing and write
    the question to OHM-Trade-Agent-v1/docs/atdd/QUESTIONS.md instead.

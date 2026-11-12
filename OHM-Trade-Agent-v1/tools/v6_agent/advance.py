@@ -49,7 +49,12 @@ def main() -> int:
     open_issues = _gh("api", f"repos/{repo}/issues?state=open&labels={QUEUE_LABEL}&per_page=100")
     closed = _gh("api", f"repos/{repo}/issues?state=closed&per_page=100") or []
     prs = _gh("api", f"repos/{repo}/pulls?state=open&per_page=100") or []
-    v6_prs = [p for p in prs if str(p["head"]["ref"]).startswith("v6/")]
+    merged = os.environ.get("MERGED_PR", "")
+    v6_prs = [
+        p
+        for p in prs
+        if str(p["head"]["ref"]).startswith("v6/") and str(p["number"]) != merged
+    ]
     number = pick_next(open_issues or [], len(v6_prs), {int(i["number"]) for i in closed})
     if number is None:
         print("no slice ready")

@@ -19,4 +19,4 @@ cline -y \
   -k "${DEEPSEEK_API_KEY:?key required}" \
   -t 1500 \
   -c "$PWD" \
-  "$prompt"
+  "$prompt" || echo "builder exited with status $? (continuing: the verify step decides)"
