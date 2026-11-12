@@ -27,6 +27,16 @@ under the data root:
 Dead-letter streams are skipped because they describe failed writes rather
 than a recorded outcome.
 
+The report opens with one coverage header line so a reader sees how much
+evidence it is about to describe before reading any per-version row::
+
+    coverage total_records=9 unversioned_records=1
+
+``total_records`` is every parsed row the report read and ``unversioned_records``
+is how many of those carry no usable strategy version stamp, using the same
+:data:`~app.opip.analytics.scorecard.UNVERSIONED` rule as the per-version rows.
+The header changes nothing about scoring: it is printed output only.
+
 The report only opens files for reading. It never writes, creates, renames,
 truncates, compresses or deletes a file, starts no background work and opens no
 database. It has no trading, exchange, network, Telegram or learning authority:
@@ -48,9 +58,11 @@ from typing import Any, Iterable, Mapping
 
 from app.opip.analytics.scorecard import (
     HIT_FIELD,
+    UNVERSIONED,
     VERSION_FIELD,
     VersionScore,
     score_outcomes,
+    version_of,
 )
 from app.opip.storage.bounded_jsonl import iter_lines, parse_json_object_line
 
@@ -73,6 +85,7 @@ class SourceScorecard:
     records: int
     scored: int
     unscored: int
+    unversioned: int
     invalid: int
     error: str | None = None
 
@@ -82,6 +95,7 @@ class SourceScorecard:
             "records": self.records,
             "scored": self.scored,
             "unscored": self.unscored,
+            "unversioned": self.unversioned,
             "invalid": self.invalid,
             "error": self.error,
         }
@@ -108,6 +122,12 @@ class ScorecardReport:
         return sum(item.unscored for item in self.sources)
 
     @property
+    def total_unversioned(self) -> int:
+        """How many read records carry no usable strategy version stamp."""
+
+        return sum(item.unversioned for item in self.sources)
+
+    @property
     def total_invalid(self) -> int:
         return sum(item.invalid for item in self.sources)
 
@@ -122,6 +142,7 @@ class ScorecardReport:
             "records": self.total_records,
             "scored": self.total_scored,
             "unscored": self.total_unscored,
+            "unversioned": self.total_unversioned,
             "invalid": self.total_invalid,
             "strategy_version_count": len(self.versions),
             "strategy_versions": [score.as_dict() for score in self.versions],
@@ -182,6 +203,22 @@ def is_scored_outcome(record: Mapping[str, Any]) -> bool:
     return version is None or isinstance(version, str)
 
 
+def is_unversioned(record: Mapping[str, Any]) -> bool:
+    """Return whether a record carries no usable strategy version stamp.
+
+    The header and the per-version rows must agree on what "unversioned" means,
+    so this reuses the pure core's :func:`version_of` instead of restating the
+    rule. A stamp that is absent, ``None``, blank or whitespace is unversioned
+    evidence; a stamp that is not a string at all is a malformed stamp, which
+    the report already treats as unscored rather than grouping it anywhere.
+    """
+
+    try:
+        return version_of(record) == UNVERSIONED
+    except TypeError:
+        return False
+
+
 def _read_source(
     path: Path,
     data_root: Path,
@@ -190,6 +227,7 @@ def _read_source(
     records = 0
     scored = 0
     unscored = 0
+    unversioned = 0
     invalid = 0
     collected: list[dict[str, Any]] = []
     try:
@@ -200,6 +238,8 @@ def _read_source(
                 invalid += 1
                 continue
             records += 1
+            if is_unversioned(record):
+                unversioned += 1
             if not is_scored_outcome(record):
                 unscored += 1
                 continue
@@ -217,6 +257,7 @@ def _read_source(
                 records=records,
                 scored=scored,
                 unscored=unscored,
+                unversioned=unversioned,
                 invalid=invalid,
                 error=str(exc),
             ),
@@ -228,6 +269,7 @@ def _read_source(
             records=records,
             scored=scored,
             unscored=unscored,
+            unversioned=unversioned,
             invalid=invalid,
         ),
         collected,
@@ -259,6 +301,10 @@ def render_text(report: ScorecardReport) -> str:
     """Render the human-readable Scorecard. Printing is the only side effect."""
 
     lines = [
+        (
+            f"coverage total_records={report.total_records} "
+            f"unversioned_records={report.total_unversioned}"
+        ),
         "O'Pip Scorecard (read-only; nothing is written, changed or deleted)",
         f"root={report.root} sources={len(report.sources)}",
         (
