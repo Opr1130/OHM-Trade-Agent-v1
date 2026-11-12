@@ -117,7 +117,8 @@ jobs:
             gh pr create --base main --head "v6/issue-${ISSUE_NUMBER}" \
               --title "$ISSUE_TITLE" --body-file "$RUNNER_TEMP/pr.md" "${draft[@]}"
           fi
-          # REST only: the bot token cannot use GraphQL label mutations.
+          # REST only, with the workflow token (issues: write): the bot token cannot edit labels.
+          export GH_TOKEN="${{ github.token }}"
           gh api -X DELETE "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/labels/build" || true
           gh api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/labels" -f 'labels[]=built' >/dev/null
 
