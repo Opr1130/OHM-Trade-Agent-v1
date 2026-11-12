@@ -133,5 +133,5 @@ def test_release_controller_shell_syntax_and_non_deploying_ui_path():
     )
     assert command.returncode == 0, command.stderr
     assert DEPLOY.index('if [[ -n "$UI_MODE" ]]; then') < DEPLOY.index("paper_deploy_mode() {")
-    assert 'opip_f11_release_credential_gate "EVIDENCE_SHADOW"' in DEPLOY
+    assert 'opip_f11_release_credential_gate EVIDENCE_SHADOW' in DEPLOY
     assert 'OPIP_RELEASE_RUNTIME_VERIFIER_ATTEMPTED' not in WORKFLOW
