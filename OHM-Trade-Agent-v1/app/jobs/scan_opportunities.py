@@ -72,6 +72,7 @@ from app.services.entry_exit_advisor import build_entry_exit_plan
 from app.services.entry_watch_queue import enqueue_entry_watch, remove_entry_watch
 from app.services.freqtrade_signal_bridge import build_signal_id, to_freqtrade_pair
 from app.services.independent_research_review import enqueue_final_qualified
+from app.services.kraken_reconciliation import reconciliation_enabled, reconciliation_mode
 from app.services.market_intelligence_integration import enrich_finalist_market_intelligence
 from app.services.price_movement_learning import (
     get_latest_price_movement,
@@ -2416,6 +2417,11 @@ def main(scan_override=None):
         execution_evidence["venue"] = VENUE_ID
         execution_evidence["venue_identity_valid"] = (
             split_canonical_pair(plan.symbol) is not None
+        )
+        # Manual-only signal notification is separate from Kraken fill tracking;
+        # no funded order, fill intent or automatic protection authority exists.
+        alert["manual_only_advisory"] = (
+            not reconciliation_enabled() and reconciliation_mode() == "observe"
         )
         delivered = send_trade_plan(
             candidate=alert,

@@ -22,6 +22,8 @@ from app.services.pending_setup_registry import (
 from app.services.qualified_trade_tracking import (
     ReconciliationIdentityMismatch,
     ReconciliationTrackingDisabled,
+    MANUAL_ONLY_ALERT_BANNER,
+    manual_advisory_without_reconciliation,
     register_reconciliation_intent,
 )
 from app.services.registry_io import RegistryIOError, load_json, registry_lock, save_json_atomic
@@ -103,6 +105,7 @@ def queue_qualified_alert(
         row["updated_at"] = now
         row["reason"] = str(reason)
         row["message"] = str(message)
+        row["manual_only_advisory"] = candidate.get("manual_only_advisory") is True
         row["action"] = str(action)
         row["direction"] = str(direction).upper()
         row["identity"] = str(identity)
@@ -113,6 +116,7 @@ def queue_qualified_alert(
         row["tracking_candidate"] = {
             "economic_qualified": candidate.get("economic_qualified") is True,
             "recommended_capital": candidate.get("recommended_capital"),
+            "manual_only_advisory": candidate.get("manual_only_advisory") is True,
         }
         row["leverage"] = float(
             candidate.get("margin_leverage")
@@ -380,6 +384,26 @@ def _retry_one(
             trade_id=trade_id,
         )
         return "SUPERSEDED"
+
+    if row.get("manual_only_advisory") is True and (
+        not manual_advisory_without_reconciliation(candidate)
+        or not str(row.get("message") or "").startswith(MANUAL_ONLY_ALERT_BANNER)
+    ):
+        # Never replay an advisory card after tracking mode has changed or
+        # deliver a legacy card lacking the untracked/manual warning.
+        _release(trade_id, lease_token)
+        record_telegram_suppression(
+            identity=str(row.get("identity") or f"QUALIFIED_OPPORTUNITY:{trade_id}"),
+            alert_family="QUALIFIED_OPPORTUNITY",
+            event_type=action or "ACTION",
+            fingerprint=str(row.get("fingerprint") or ""),
+            reason="MANUAL_ADVISORY_RETRY_UNVERIFIED",
+            symbol=plan.symbol,
+            journey_id=row.get("journey_id"),
+            signal_id=row.get("signal_id"),
+            trade_id=trade_id,
+        )
+        return "MODE_PENDING"
 
     if candidate.get("economic_qualified") is True:
         try:

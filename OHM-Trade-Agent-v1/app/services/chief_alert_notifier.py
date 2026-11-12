@@ -41,6 +41,8 @@ from app.services.qualified_alert_outbox import (
 from app.services.qualified_trade_tracking import (
     ReconciliationIdentityMismatch,
     ReconciliationTrackingDisabled,
+    MANUAL_ONLY_ALERT_BANNER,
+    manual_advisory_without_reconciliation,
     register_reconciliation_intent,
 )
 from app.services.registry_io import RegistryIOError, load_json, registry_lock, save_json_atomic
@@ -141,7 +143,7 @@ def _alert_state_key(candidate: dict[str, Any], plan: EntryExitPlan) -> str:
             _round_price(plan.stop_price),
             _round_price(plan.target_1),
             _round_price(plan.target_2),
-        ]
+        ] + (["MANUAL_ONLY_V1"] if candidate.get("manual_only_advisory") is True else [])
     )
 
 
@@ -365,9 +367,14 @@ def format_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan, summary: s
 
     fill_tracking_note = ""
     if candidate.get("economic_qualified") is True:
-        fill_tracking_note = (
-            "Fill Tracking: read-only Kraken reconciliation; a monitoring-degraded alert is sent if position verification is unavailable\n"
-        )
+        if manual_advisory_without_reconciliation(candidate):
+            fill_tracking_note = (
+                "Fill Tracking: DISABLED — manual-only advisory; no exchange order, fill, or stop is tracked by O'Pip\n"
+            )
+        else:
+            fill_tracking_note = (
+                "Fill Tracking: read-only Kraken reconciliation; a monitoring-degraded alert is sent if position verification is unavailable\n"
+            )
 
     chase_label = "Do Not Chase Below" if direction == "SHORT" else "Do Not Chase Above"
     base_asset = str(candidate.get("underlying_asset") or plan.symbol)
@@ -561,6 +568,23 @@ def send_trade_plan(
             )
         return False
 
+    manual_advisory = manual_advisory_without_reconciliation(candidate)
+    if candidate.get("manual_only_advisory") is True and not manual_advisory:
+        # A mode switch between scan and notify cannot silently create an
+        # exchange intent for a card labelled MANUAL ONLY.
+        record_telegram_suppression(
+            identity=identity,
+            alert_family="QUALIFIED_OPPORTUNITY",
+            event_type=action,
+            fingerprint=initial_fingerprint,
+            reason="MANUAL_ADVISORY_MODE_UNVERIFIED",
+            symbol=plan.symbol,
+            journey_id=candidate.get("journey_id"),
+            signal_id=candidate.get("signal_id"),
+            trade_id=candidate.get("trade_id"),
+        )
+        return False
+
     movement = attach_actionable_plan(
         candidate.get("price_movement"),
         plan=plan,
@@ -608,6 +632,12 @@ def send_trade_plan(
         action=action,
     )
     message = format_primary_new_trade_alert(candidate=candidate, plan=plan)
+    if manual_advisory:
+        message = (
+            MANUAL_ONLY_ALERT_BANNER
+            + "\nNo automatic order, fill tracking, or protective stop. Owner executes and manages every trade manually.\n\n"
+            + message
+        )
     # OPIP-ALERT-ACTIONABLE-ONLY-001 card contract: the delivered card must carry the entry zone,
     # stop-loss, targets, invalidation, expiry, net reward-to-risk, the setup identity and the
     # manual-execution statement. If the rendered card is incomplete it is not sent at all.
