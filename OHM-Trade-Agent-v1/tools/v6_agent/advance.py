@@ -39,16 +39,22 @@ def pick_next(
     return None
 
 
-def _gh(*args: str) -> Any:
-    out = subprocess.run(["gh", *args], check=True, capture_output=True, text=True).stdout
+def _gh(*args: str, token: str | None = None) -> Any:
+    env = {**os.environ, "GH_TOKEN": token} if token else None
+    out = subprocess.run(
+        ["gh", *args], check=True, capture_output=True, text=True, env=env
+    ).stdout
     return json.loads(out) if out.strip() else None
 
 
 def main() -> int:
     repo = os.environ["GH_REPOSITORY"]
-    open_issues = _gh("api", f"repos/{repo}/issues?state=open&labels={QUEUE_LABEL}&per_page=100")
-    closed = _gh("api", f"repos/{repo}/issues?state=closed&per_page=100") or []
-    prs = _gh("api", f"repos/{repo}/pulls?state=open&per_page=100") or []
+    read = os.environ.get("READ_TOKEN") or None  # workflow token: the App token cannot list issues
+    open_issues = _gh(
+        "api", f"repos/{repo}/issues?state=open&labels={QUEUE_LABEL}&per_page=100", token=read
+    )
+    closed = _gh("api", f"repos/{repo}/issues?state=closed&per_page=100", token=read) or []
+    prs = _gh("api", f"repos/{repo}/pulls?state=open&per_page=100", token=read) or []
     merged = os.environ.get("MERGED_PR", "")
     v6_prs = [
         p
