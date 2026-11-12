@@ -1,0 +1,321 @@
+name: v6-agent
+
+# End-to-end v6 build loop. The owner (or the v6 bot) labels an issue `build`;
+# the builder opens a PR on a v6/ branch; failed pytest runs get at most two
+# automatic fix attempts; the owner merges; the next queued slice starts.
+# The builder never pushes to main, never touches protected paths, and has no
+# trading authority. It runs only on label, comment, CI-failure or merge events,
+# never on pull_request or push.
+
+on:
+  issues:
+    types: [labeled]
+  issue_comment:
+    types: [created]
+  workflow_run:
+    workflows: [pytest]
+    types: [completed]
+  pull_request_target:
+    types: [closed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: read
+
+concurrency:
+  group: v6-agent-${{ github.event.issue.number || github.event.pull_request.number || github.event.workflow_run.head_branch || github.run_id }}
+  cancel-in-progress: false
+
+env:
+  V6_AGENT_MODEL: ${{ vars.V6_AGENT_MODEL || 'deepseek/deepseek-v4-pro' }}
+  MAX_AUTOFIX_ATTEMPTS: '2'
+
+jobs:
+  build:
+    if: >-
+      github.event_name == 'issues' &&
+      github.event.label.name == 'build' &&
+      (github.actor == github.repository_owner ||
+       (vars.V6_BOT_LOGIN != '' && github.actor == vars.V6_BOT_LOGIN))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+      ISSUE_TITLE: ${{ github.event.issue.title }}
+      ISSUE_BODY: ${{ github.event.issue.body }}
+    steps:
+      - name: Mint bot token
+        id: app
+        if: vars.V6_APP_ID != ''
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.V6_APP_ID }}
+          private-key: ${{ secrets.V6_APP_PRIVATE_KEY }}
+
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ steps.app.outputs.token || github.token }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            OHM-Trade-Agent-v1/requirements.txt
+            OHM-Trade-Agent-v1/requirements-test.txt
+
+      - name: Install application test dependencies
+        run: |
+          pip install -r OHM-Trade-Agent-v1/requirements.txt
+          pip install -r OHM-Trade-Agent-v1/requirements-test.txt
+
+      - name: Create branch and task
+        run: |
+          set -euo pipefail
+          git config user.name "opip-v6-agent"
+          git config user.email "opip-v6-agent@users.noreply.github.com"
+          git checkout -b "v6/issue-${ISSUE_NUMBER}"
+          printf '# %s\n\n%s\n' "$ISSUE_TITLE" "$ISSUE_BODY" > "$RUNNER_TEMP/task.md"
+
+      - name: Run builder
+        id: run
+        uses: ./.github/actions/v6-run
+        with:
+          task_file: ${{ runner.temp }}/task.md
+          deepseek_api_key: ${{ secrets.DEEPSEEK_API_KEY }}
+          model: ${{ env.V6_AGENT_MODEL }}
+
+      - name: Open PR and report
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
+          CHANGED: ${{ steps.run.outputs.changed }}
+          VERIFIED: ${{ steps.run.outputs.verified }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ "$CHANGED" != "true" ]; then
+            gh issue comment "$ISSUE_NUMBER" --body "v6 builder made no change. Run: $RUN_URL"
+          else
+            git push origin "HEAD:refs/heads/v6/issue-${ISSUE_NUMBER}"
+            draft=()
+            [ "$VERIFIED" = "true" ] || draft=(--draft)
+            {
+              echo "Closes #${ISSUE_NUMBER}"
+              echo
+              echo "Built by the v6 agent. Verification: $([ "$VERIFIED" = "true" ] && echo passed || echo FAILED, opened as draft)."
+              echo "Run: $RUN_URL"
+            } > "$RUNNER_TEMP/pr.md"
+            gh pr create --base main --head "v6/issue-${ISSUE_NUMBER}" \
+              --title "$ISSUE_TITLE" --body-file "$RUNNER_TEMP/pr.md" "${draft[@]}"
+          fi
+          gh issue edit "$ISSUE_NUMBER" --remove-label build --add-label built
+
+      - name: Report failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh issue comment "$ISSUE_NUMBER" --body "v6 builder run failed before opening a PR. Run: $RUN_URL"
+
+  fix:
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/fix') &&
+      github.actor == github.repository_owner
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PR_NUMBER: ${{ github.event.issue.number }}
+      COMMENT_BODY: ${{ github.event.comment.body }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Resolve PR branch
+        id: pr
+        run: |
+          set -euo pipefail
+          ref="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefName,isCrossRepository --jq 'select(.isCrossRepository|not)|.headRefName')"
+          case "$ref" in v6/*) ;; *) echo "not a v6 branch"; exit 1;; esac
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Mint bot token
+        id: app
+        if: vars.V6_APP_ID != ''
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.V6_APP_ID }}
+          private-key: ${{ secrets.V6_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr.outputs.ref }}
+          fetch-depth: 0
+          token: ${{ steps.app.outputs.token || github.token }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            OHM-Trade-Agent-v1/requirements.txt
+            OHM-Trade-Agent-v1/requirements-test.txt
+
+      - name: Install application test dependencies
+        run: |
+          pip install -r OHM-Trade-Agent-v1/requirements.txt
+          pip install -r OHM-Trade-Agent-v1/requirements-test.txt
+
+      - name: Prepare task
+        run: |
+          set -euo pipefail
+          git config user.name "opip-v6-agent"
+          git config user.email "opip-v6-agent@users.noreply.github.com"
+          printf '%s\n' "${COMMENT_BODY#/fix}" > "$RUNNER_TEMP/task.md"
+
+      - name: Run builder
+        id: run
+        uses: ./.github/actions/v6-run
+        with:
+          task_file: ${{ runner.temp }}/task.md
+          deepseek_api_key: ${{ secrets.DEEPSEEK_API_KEY }}
+          model: ${{ env.V6_AGENT_MODEL }}
+
+      - name: Push and report
+        env:
+          PUSH_REF: ${{ steps.pr.outputs.ref }}
+          CHANGED: ${{ steps.run.outputs.changed }}
+          VERIFIED: ${{ steps.run.outputs.verified }}
+        run: |
+          set -euo pipefail
+          if [ "$CHANGED" = "true" ]; then
+            git push origin "HEAD:refs/heads/${PUSH_REF}"
+          fi
+          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --body "v6 fix: changed=$CHANGED, verification passed=$VERIFIED"
+
+  autofix:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      startsWith(github.event.workflow_run.head_branch, 'v6/') &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      HEAD_REF: ${{ github.event.workflow_run.head_branch }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Count previous automatic fixes
+        id: gate
+        run: |
+          set -euo pipefail
+          pr="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$HEAD_REF" --state open --json number --jq '.[0].number // empty')"
+          [ -n "$pr" ] || { echo "run=false" >> "$GITHUB_OUTPUT"; exit 0; }
+          n="$(gh pr view "$pr" --repo "$GITHUB_REPOSITORY" --json comments --jq '[.comments[].body|select(contains("v6-autofix"))]|length')"
+          if [ "$n" -ge "$MAX_AUTOFIX_ATTEMPTS" ]; then
+            gh pr comment "$pr" --repo "$GITHUB_REPOSITORY" --body "v6 autofix limit reached ($MAX_AUTOFIX_ATTEMPTS). Owner decision needed."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "pr=$pr" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Mint bot token
+        id: app
+        if: steps.gate.outputs.run == 'true' && vars.V6_APP_ID != ''
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.V6_APP_ID }}
+          private-key: ${{ secrets.V6_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.run == 'true'
+        with:
+          ref: ${{ env.HEAD_REF }}
+          fetch-depth: 0
+          token: ${{ steps.app.outputs.token || github.token }}
+
+      - uses: actions/setup-python@v5
+        if: steps.gate.outputs.run == 'true'
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            OHM-Trade-Agent-v1/requirements.txt
+            OHM-Trade-Agent-v1/requirements-test.txt
+
+      - name: Install application test dependencies
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          pip install -r OHM-Trade-Agent-v1/requirements.txt
+          pip install -r OHM-Trade-Agent-v1/requirements-test.txt
+
+      - name: Prepare task from failed log
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name "opip-v6-agent"
+          git config user.email "opip-v6-agent@users.noreply.github.com"
+          {
+            echo "CI failed on this branch. Fix the cause without weakening any test. Failing log tail:"
+            echo
+            gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --log-failed | tail -n 150
+          } > "$RUNNER_TEMP/task.md"
+
+      - name: Run builder
+        id: run
+        if: steps.gate.outputs.run == 'true'
+        uses: ./.github/actions/v6-run
+        with:
+          task_file: ${{ runner.temp }}/task.md
+          deepseek_api_key: ${{ secrets.DEEPSEEK_API_KEY }}
+          model: ${{ env.V6_AGENT_MODEL }}
+
+      - name: Push and report
+        if: steps.gate.outputs.run == 'true'
+        env:
+          CHANGED: ${{ steps.run.outputs.changed }}
+          VERIFIED: ${{ steps.run.outputs.verified }}
+          PR: ${{ steps.gate.outputs.pr }}
+        run: |
+          set -euo pipefail
+          if [ "$CHANGED" = "true" ]; then
+            git push origin "HEAD:refs/heads/${HEAD_REF}"
+          fi
+          gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" \
+            --body "v6-autofix: changed=$CHANGED, verification passed=$VERIFIED"
+
+  advance:
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      github.event.pull_request.merged == true &&
+      startsWith(github.event.pull_request.head.ref, 'v6/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Mint bot token
+        id: app
+        if: vars.V6_APP_ID != ''
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.V6_APP_ID }}
+          private-key: ${{ secrets.V6_APP_PRIVATE_KEY }}
+
+      - name: Checkout main (trusted code only)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Queue next slice
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+        run: python OHM-Trade-Agent-v1/tools/v6_agent/advance.py

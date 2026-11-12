@@ -1,0 +1,106 @@
+name: v6-run
+description: Run the v6 builder with one bounded retry, then verify without AI credentials.
+inputs:
+  task_file:
+    description: Path to the task text for the builder.
+    required: true
+  deepseek_api_key:
+    description: Credential for the builder steps only.
+    required: true
+  model:
+    description: Builder model name.
+    required: true
+outputs:
+  changed:
+    description: Whether the builder produced any change.
+    value: ${{ steps.commit1.outputs.changed }}
+  verified:
+    description: Whether the final verification passed.
+    value: ${{ steps.final.outputs.ok }}
+runs:
+  using: composite
+  steps:
+    - name: Install builder
+      shell: bash
+      run: pipx install "aider-chat>=0.86,<1"
+
+    - name: Agent attempt 1
+      shell: bash
+      env:
+        DEEPSEEK_API_KEY: ${{ inputs.deepseek_api_key }}
+        V6_AGENT_MODEL: ${{ inputs.model }}
+        TASK_FILE: ${{ inputs.task_file }}
+      run: bash OHM-Trade-Agent-v1/tools/v6_agent/run_agent.sh "$TASK_FILE"
+
+    - name: Commit attempt 1
+      id: commit1
+      shell: bash
+      run: |
+        git add -A
+        if git diff --cached --quiet; then
+          echo "changed=false" >> "$GITHUB_OUTPUT"
+        else
+          git commit -q -m "v6 builder: attempt 1"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Verify attempt 1
+      id: verify1
+      if: steps.commit1.outputs.changed == 'true'
+      shell: bash
+      run: |
+        if bash OHM-Trade-Agent-v1/tools/v6_agent/verify.sh "$RUNNER_TEMP/verify1.txt"; then
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "ok=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Build retry task
+      if: steps.verify1.outputs.ok == 'false'
+      shell: bash
+      env:
+        TASK_FILE: ${{ inputs.task_file }}
+      run: |
+        {
+          cat "$TASK_FILE"
+          printf '\n\nYour previous attempt failed these checks. Fix them without weakening any test:\n\n'
+          cat "$RUNNER_TEMP/verify1.txt"
+        } > "$RUNNER_TEMP/retry.md"
+
+    - name: Agent attempt 2
+      if: steps.verify1.outputs.ok == 'false'
+      shell: bash
+      env:
+        DEEPSEEK_API_KEY: ${{ inputs.deepseek_api_key }}
+        V6_AGENT_MODEL: ${{ inputs.model }}
+      run: bash OHM-Trade-Agent-v1/tools/v6_agent/run_agent.sh "$RUNNER_TEMP/retry.md"
+
+    - name: Commit attempt 2
+      id: commit2
+      if: steps.verify1.outputs.ok == 'false'
+      shell: bash
+      run: |
+        git add -A
+        git diff --cached --quiet || git commit -q -m "v6 builder: attempt 2"
+
+    - name: Verify attempt 2
+      id: verify2
+      if: steps.verify1.outputs.ok == 'false'
+      shell: bash
+      run: |
+        if bash OHM-Trade-Agent-v1/tools/v6_agent/verify.sh "$RUNNER_TEMP/verify2.txt"; then
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "ok=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Final result
+      id: final
+      shell: bash
+      env:
+        V1: ${{ steps.verify1.outputs.ok }}
+        V2: ${{ steps.verify2.outputs.ok }}
+      run: |
+        if [ "$V1" = "true" ] || [ "$V2" = "true" ]; then ok=true; else ok=false; fi
+        echo "ok=$ok" >> "$GITHUB_OUTPUT"
+        { echo '### v6 builder verification'; cat "$RUNNER_TEMP"/verify2.txt 2>/dev/null || cat "$RUNNER_TEMP"/verify1.txt 2>/dev/null || true; } >> "$GITHUB_STEP_SUMMARY"
