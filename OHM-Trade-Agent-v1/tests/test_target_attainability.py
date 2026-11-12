@@ -1,7 +1,10 @@
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from app.jobs import scan_opportunities
+from app.scanner.execution_validation import ExecutionValidation
 from app.scanner.market_scanner import (
     ScanResult,
     _percentage_change,
@@ -41,6 +44,13 @@ def snapshot(**overrides) -> MarketSnapshot:
         rolling_72h_upside_median_pct=12.0,
         rolling_72h_upside_p75_pct=16.0,
         rolling_72h_upside_p90_pct=20.0,
+        # Positive test fixtures need explicit, synthetic execution evidence.
+        # Live snapshots without it must still fail closed.
+        execution_validation=ExecutionValidation(
+            status="VALID", book_coverage_status="COMPLETE", warnings=[],
+            spread_bps=6.0, estimated_visible_round_trip_market_drag_pct=0.20,
+            buy_fully_covered=True, validation_notional_usd=750.0,
+        ),
     )
     values.update(overrides)
     return MarketSnapshot(**values)
@@ -197,7 +207,9 @@ def test_chief_payload_labels_hypothetical_economics_and_uses_one_call(monkeypat
     assert "target_2_net_profit" not in low_quality
 
 
+@pytest.mark.acceptance
 def test_clean_target_scores_well_and_passes():
+    """ATDD-OPIP-NATIVE-ALERT-SIZING-v1/AC-003: positive target-quality fixtures include explicit LONG execution."""
     result = evaluate_target_attainability(plan(), snapshot())
     assert result.qualified is True
     assert result.attainability_score >= 85

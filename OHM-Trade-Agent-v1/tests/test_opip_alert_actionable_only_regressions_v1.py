@@ -978,3 +978,73 @@ def test_a_plan_that_expired_before_the_attempt_is_never_delivered_late(
     assert result["suppression"]["reason"] == "ACTIONABLE_GATE:EXPIRY_PASSED"
     assert result["suppression"]["symbol"] == "SOLUSD"
 
+
+# --------------------------------------------------------------------------- #
+# Native scanner: the actionable size must be the post-action-gate notional.
+# --------------------------------------------------------------------------- #
+
+
+def test_native_scan_uses_post_action_notional_for_notification_capacity():
+    """ATDD-OPIP-NATIVE-ALERT-SIZING-v1/AC-001: final sizing, not the pre-cap economic envelope."""
+    source = ast.parse((APP / "jobs" / "scan_opportunities.py").read_text(encoding="utf-8"))
+    calls = [
+        node for node in ast.walk(source)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "execution_evidence_from_snapshot"
+    ]
+    assert len(calls) == 1
+    notional = next(kw.value for kw in calls[0].keywords if kw.arg == "order_notional_usd")
+    assert isinstance(notional, ast.Call)
+    assert isinstance(notional.func, ast.Attribute) and notional.func.attr == "get"
+    assert isinstance(notional.func.value, ast.Name) and notional.func.value.id == "alert"
+    assert len(notional.args) == 1
+    assert isinstance(notional.args[0], ast.Constant)
+    assert notional.args[0].value == "recommended_position_notional"
+
+
+def test_post_action_notional_passes_only_within_verified_capacity():
+    """ATDD-OPIP-NATIVE-ALERT-SIZING-v1/AC-002: smaller approved notional may pass, but the old large order and uncovered depth fail.
+
+    This changes only the size supplied by the producer, never the capacity formula,
+    market-liquidity floor, original measured drag, or required depth coverage.
+    """
+    snapshot = SimpleNamespace(
+        last_price=100.0,
+        combined_24h_liquidity_usd=2_400_000.0,
+        execution_validation=SimpleNamespace(
+            validation_notional_usd=750.0,
+            spread_bps=8.0,
+            estimated_visible_round_trip_market_drag_pct=0.25,
+            buy_fully_covered=True,
+        ),
+    )
+    candidate = {
+        "economic_position_notional": 750.0,
+        "recommended_position_notional": 250.0,
+        "liquidity_capacity_ceiling_usd": 300.0,
+    }
+    sized = admission.execution_evidence_from_snapshot(
+        snapshot, direction="LONG", order_notional_usd=candidate["recommended_position_notional"]
+    )
+    evidence = admission.evidence_from_trade_plan(candidate, _plan(), execution=sized)
+    assert evidence.order_size_usd == 250.0
+    assert evidence.position_capacity_usd == 300.0
+    assert evidence.size_slippage_pct == 0.25
+    assert admission._check_execution(
+        evidence, policy=admission.ActionableNotificationPolicy()
+    ) is None
+
+    envelope = admission.execution_evidence_from_snapshot(
+        snapshot, direction="LONG", order_notional_usd=candidate["economic_position_notional"]
+    )
+    oversized = admission.evidence_from_trade_plan(candidate, _plan(), execution=envelope)
+    assert admission._check_execution(
+        oversized, policy=admission.ActionableNotificationPolicy()
+    ) == admission.REASON_CAPACITY_INSUFFICIENT
+
+    sized["depth_covered"] = False
+    uncovered = admission.evidence_from_trade_plan(candidate, _plan(), execution=sized)
+    assert admission._check_execution(
+        uncovered, policy=admission.ActionableNotificationPolicy()
+    ) == admission.REASON_DEPTH_INSUFFICIENT
