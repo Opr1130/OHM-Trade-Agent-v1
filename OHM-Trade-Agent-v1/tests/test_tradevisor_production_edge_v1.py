@@ -122,6 +122,13 @@ def test_ac_004_the_client_certificate_is_not_requested_or_trusted():
     assert "Client-certificate observation is unavailable" in text
     assert "ssl_verify_client on;" not in lines
     assert "ssl_client_ca_certificate" not in lines
+    # UI-only release must mount the approved template, not the old core tree.
+    overlay = _text(ROOT / "deploy" / "control-center" / "docker-compose.v2.yml")
+    assert (
+        "${OPIP_UI_TREE:?exact release tree required}/deploy/nginx/"
+        "tradevisor-webhook.conf.template:"
+        "/etc/nginx/templates/tradevisor-webhook.conf.template:ro"
+    ) in overlay
 
 
 def test_ac_004_the_webhook_log_carries_no_body_and_no_headers():
