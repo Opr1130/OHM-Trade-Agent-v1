@@ -89,7 +89,7 @@ jobs:
         uses: ./.github/actions/v6-run
         with:
           task_file: ${{ runner.temp }}/task.md
-          deepseek_api_key: ${{ secrets.DEEPSEEK_API_KEY }}
+          deepseek_api_key: ${{ secrets.V6_DEEPSEEK_API_KEY }}
           model: ${{ env.V6_AGENT_MODEL }}
           retry_model: ${{ env.V6_RETRY_MODEL }}
           provider: ${{ env.V6_AGENT_PROVIDER }}
@@ -187,7 +187,7 @@ jobs:
         uses: ./.github/actions/v6-run
         with:
           task_file: ${{ runner.temp }}/task.md
-          deepseek_api_key: ${{ secrets.DEEPSEEK_API_KEY }}
+          deepseek_api_key: ${{ secrets.V6_DEEPSEEK_API_KEY }}
           model: ${{ env.V6_AGENT_MODEL }}
           retry_model: ${{ env.V6_RETRY_MODEL }}
           provider: ${{ env.V6_AGENT_PROVIDER }}
@@ -282,7 +282,7 @@ jobs:
         uses: ./.github/actions/v6-run
         with:
           task_file: ${{ runner.temp }}/task.md
-          deepseek_api_key: ${{ secrets.DEEPSEEK_API_KEY }}
+          deepseek_api_key: ${{ secrets.V6_DEEPSEEK_API_KEY }}
           model: ${{ env.V6_AGENT_MODEL }}
           retry_model: ${{ env.V6_RETRY_MODEL }}
           provider: ${{ env.V6_AGENT_PROVIDER }}
