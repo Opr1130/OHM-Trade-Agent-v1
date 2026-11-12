@@ -443,7 +443,7 @@ jobs:
                 paper_verdict="PROVEN"
               fi
               # OWNER_OFF is not a READY export. The new contract proves the
-              # disabled posture and paper independently, while legacy receipts
+              # disabled posture and paper independently. Legacy receipts
               # still need the original SUCCESS+READY exact-SHA export proof.
               if [[ "$LEARNING_POLICY" == "OWNER_OFF" \
                     && "$LEARNING_EXPORT_STATUS" == "SKIPPED" \

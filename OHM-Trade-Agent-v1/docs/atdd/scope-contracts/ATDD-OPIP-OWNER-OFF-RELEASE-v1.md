@@ -74,6 +74,8 @@ AC-001 -> OHM-Trade-Agent-v1/tests/test_opip_owner_off_release_v1.py
 AC-002 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
 AC-002 -> OHM-Trade-Agent-v1/tests/test_opip_owner_off_release_v1.py
 AC-003 -> OHM-Trade-Agent-v1/deploy/remote/ohm-deploy
+AC-002 -> OHM-Trade-Agent-v1/tests/test_opip_canonical_single_writer_feasibility_v1.py
+AC-002 -> OHM-Trade-Agent-v1/tests/test_tradevisor_core_env_isolation_v1.py
 AC-003 -> .github/workflows/deploy-production.yml
 AC-003 -> OHM-Trade-Agent-v1/tests/test_opip_owner_off_release_v1.py
 AC-003 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
