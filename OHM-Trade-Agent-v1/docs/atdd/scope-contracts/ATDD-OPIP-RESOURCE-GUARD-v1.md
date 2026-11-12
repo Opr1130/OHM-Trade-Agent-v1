@@ -51,7 +51,6 @@ FROZEN BOUNDARIES:
 
 ACCEPTANCE TEST TRACEABILITY:
 AC-001 -> tests/test_opip_resource_guard_v1.py::test_export_exits_silently_without_explicit_enable_file
-AC-001 -> tests/test_canonical_learning_replica_transfer_e2e_v1.py::test_export_reader_sync_installs_a_verified_generation
 AC-002 -> tests/test_opip_resource_guard_v1.py::test_guard_skips_under_low_memory_without_running_child
 AC-002 -> tests/test_opip_resource_guard_v1.py::test_guard_execs_command_when_memory_is_available
 AC-002 -> tests/test_opip_resource_guard_v1.py::test_guard_fails_closed_when_meminfo_is_unavailable
