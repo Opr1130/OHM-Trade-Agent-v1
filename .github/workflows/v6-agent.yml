@@ -117,7 +117,9 @@ jobs:
             gh pr create --base main --head "v6/issue-${ISSUE_NUMBER}" \
               --title "$ISSUE_TITLE" --body-file "$RUNNER_TEMP/pr.md" "${draft[@]}"
           fi
-          gh issue edit "$ISSUE_NUMBER" --remove-label build --add-label built
+          # REST only: the bot token cannot use GraphQL label mutations.
+          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/labels/build" || true
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/labels" -f 'labels[]=built' >/dev/null
 
       - name: Report failure
         if: failure()
@@ -125,7 +127,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          gh issue comment "$ISSUE_NUMBER" --body "v6 builder run failed before opening a PR. Run: $RUN_URL"
+          gh issue comment "$ISSUE_NUMBER" --body "v6 builder run failed. Check the run for details: $RUN_URL"
 
   fix:
     if: >-
