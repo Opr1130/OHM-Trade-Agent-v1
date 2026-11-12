@@ -328,4 +328,5 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
           GH_REPOSITORY: ${{ github.repository }}
+          MERGED_PR: ${{ github.event.pull_request.number }}
         run: python OHM-Trade-Agent-v1/tools/v6_agent/advance.py
