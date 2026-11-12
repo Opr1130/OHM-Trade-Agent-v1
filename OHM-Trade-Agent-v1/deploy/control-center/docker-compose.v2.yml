@@ -18,4 +18,7 @@ services:
       # snippet becomes reachable without deploying the whole trading stack.
       - ${OPIP_UI_TREE:?exact release tree required}/deploy/nginx/dashboard-sidecar.conf:/etc/nginx/nginx.conf:ro
       - ${OPIP_UI_TREE:?exact release tree required}/deploy/control-center/nginx:/etc/nginx/opip-control-center:ro
+      # Pin webhook TLS policy to this same approved, immutable UI release;
+      # otherwise the base Compose mount keeps the old (broken) core tree.
+      - ${OPIP_UI_TREE:?exact release tree required}/deploy/nginx/tradevisor-webhook.conf.template:/etc/nginx/templates/tradevisor-webhook.conf.template:ro
     # No new ports, credentials, networks, resource allowances, or trading services.
