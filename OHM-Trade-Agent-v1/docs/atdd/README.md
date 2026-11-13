@@ -102,7 +102,7 @@ New PRs should add their own contract and **not** touch `ACTIVE_INCREMENT`. The 
 
 ### The active increment pointer is movable
 
-`docs/atdd/ACTIVE_INCREMENT` holds a single increment identifier. It is **mutable orchestration state**, not a permanent record: it is **deliberately movable** and **no longer authoritative for PRs that carry their own contract**; it is only the migration fallback for PRs that change none (the fallback is intentionally supported and still fails closed when missing, ambiguous or unknown). **New work should carry its own contract and must not edit this file.** Enforcement belongs to `tests/atdd_scope.py` and the `atdd scope` CI job.
+`docs/atdd/ACTIVE_INCREMENT` holds a single increment identifier. It is **mutable orchestration state**, not a permanent record: it is **deliberately movable** and **no longer authoritative for PRs that carry their own contract**; it is only the migration fallback for PRs that change none (the fallback is intentionally supported and still fails closed when missing, ambiguous or unknown). **New work should carry its own contract and must not edit this file.** Exact current-increment enforcement belongs to `tests/atdd_scope.py` and the `atdd scope` CI job.
 
 Consequences for acceptance tests:
 
