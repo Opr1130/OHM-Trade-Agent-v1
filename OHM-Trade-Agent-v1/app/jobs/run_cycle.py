@@ -3,7 +3,10 @@ from __future__ import annotations
 import os
 import re
 from datetime import datetime, timezone
+import os
 from pathlib import Path
+import signal
+import time
 
 from app.core.config import get_settings
 from app.jobs.monitor_active_trades import main as monitor_active_main
@@ -103,6 +106,192 @@ def _publish_protection_admission_stamp_fail_open(settings=None) -> None:
             f"{type(exc).__name__}: {exc}",
         )
 
+
+
+
+#: Terminal-status markers for a cycle that was stopped by its bound or by an
+#: operator signal. They are deliberately distinct from ``SUCCESS``/``DEGRADED``
+#: and, critically, the run emits NO ``OPIP_UNIFIED_CYCLE_COMPLETED_AT`` when it
+#: ends this way.
+#:
+#: The release controller treats "the last COMPLETED_AT at or after readiness"
+#: as proof of a fresh completion and pairs it with the last
+#: ``STATUS=(SUCCESS|DEGRADED)`` it can find. Emitting COMPLETED_AT for a
+#: bound-killed cycle would therefore bind a *fresh* timestamp to a *stale*
+#: SUCCESS and manufacture a healthy-completion receipt out of a failed cycle.
+#: A terminated cycle is not a completion, so it claims neither marker.
+_CYCLE_STATUS_PREFIX = "OPIP_UNIFIED_CYCLE_STATUS="
+CYCLE_STATUS_TERMINATED = "TERMINATED"
+_TERMINATED_AT_PREFIX = "OPIP_UNIFIED_CYCLE_TERMINATED_AT="
+_TERMINATED_REASON_PREFIX = "OPIP_UNIFIED_CYCLE_TERMINATED_REASON="
+
+#: Signals that mean "stop this cycle now and shut down in an orderly way".
+_SHUTDOWN_SIGNALS = ("SIGTERM", "SIGINT", "SIGHUP")
+
+
+class _CycleTerminated(BaseException):
+    """The cycle was told to stop by its bound or by an operator signal.
+
+    Deliberately a ``BaseException``: the cycle body is dense with
+    ``except Exception`` blocks whose contract is "this phase failed, keep going
+    with the rest of the cycle". A shutdown request is not a phase failure, and it
+    must not be swallowed by any of them - if it were, a bound-killed cycle would
+    carry on starting new workloads instead of releasing its lock.
+    """
+
+    def __init__(self, signal_name: str) -> None:
+        self.signal_name = signal_name
+        super().__init__(f"cycle terminated by {signal_name}")
+
+
+def _handle_shutdown_signal(signum: int, _frame: object) -> None:
+    """Turn a termination signal into an orderly, evidence-producing stop.
+
+    Python's default SIGTERM disposition ends the process without unwinding, so
+    every ``finally`` in this module is skipped: the cycle lock is left to the
+    kernel, no terminal evidence is written, and the log cannot distinguish "was
+    killed" from "died". Raising instead makes the existing ``finally`` around the
+    cycle lock run and leaves a durable terminal receipt in the cycle log.
+
+    The handler is intentionally minimal - one flushed marker and a raise. It must
+    stay safe to run in the middle of a canonical write.
+    """
+    name = _signal_name(signum)
+    print(f"{_CYCLE_PHASE_PREFIX}SHUTDOWN_SIGNAL_{name}", flush=True)
+    raise _CycleTerminated(name)
+
+
+def _signal_name(signum: int) -> str:
+    for candidate in _SHUTDOWN_SIGNALS:
+        value = getattr(signal, candidate, None)
+        if value is not None and int(value) == int(signum):
+            return candidate
+    return f"SIG{int(signum)}"
+
+
+def _install_shutdown_handlers() -> dict[str, object]:
+    """Install orderly-stop handlers, returning the handlers they replaced.
+
+    Installation is best-effort by design: a non-main thread or a platform without
+    the signal leaves the default disposition in place, which is exactly today's
+    behaviour. The bound is still enforced by the scheduler's in-container
+    ``timeout``, so a missing handler degrades the *evidence*, never the bound.
+    """
+    previous: dict[str, object] = {}
+    for name in _SHUTDOWN_SIGNALS:
+        signum = getattr(signal, name, None)
+        if signum is None:
+            continue
+        try:
+            previous[name] = signal.signal(signum, _handle_shutdown_signal)
+        except (ValueError, OSError, RuntimeError):
+            continue
+    return previous
+
+
+def _restore_shutdown_handlers(previous: dict[str, object]) -> None:
+    for name, handler in previous.items():
+        signum = getattr(signal, name, None)
+        if signum is None:
+            continue
+        try:
+            signal.signal(signum, handler)  # type: ignore[arg-type]
+        except (ValueError, OSError, RuntimeError):
+            continue
+
+
+def _record_termination(reason: str) -> None:
+    """Write the durable receipt for a cycle that did not complete."""
+    terminated_at = datetime.now(timezone.utc).isoformat()
+    print(f"{_CYCLE_STATUS_PREFIX}{CYCLE_STATUS_TERMINATED}", flush=True)
+    print(f"{_TERMINATED_AT_PREFIX}{terminated_at}", flush=True)
+    print(f"{_TERMINATED_REASON_PREFIX}{reason}", flush=True)
+#: Wall-clock budget after which the cycle stops STARTING non-critical workloads.
+#:
+#: Protection phases are sequenced first and are never gated, so this cannot
+#: delay or suppress protection. It exists so an advisory / learning / dormant
+#: tail cannot occupy the whole authorized runtime bound and starve the *next*
+#: protection pass: before this gate, a slow non-critical phase was bounded only
+#: by the container's hard bound, which is sixty minutes of no fresh protection.
+#:
+#: The default is deliberately far below that bound (45 minutes vs a 59 minute
+#: in-container bound), so it can only pre-empt work that is already running long.
+#: ``0`` disables the gate, and an unparseable value falls back to the default
+#: rather than to "unlimited": an unbounded tail is the defect, so it is never the
+#: fail-open answer.
+_CYCLE_BUDGET_ENV = "OPIP_UNIFIED_CYCLE_BUDGET_SECONDS"
+DEFAULT_CYCLE_BUDGET_SECONDS = 2700
+
+#: Marks a phase that was not started because the cycle budget was exhausted.
+#: Emitted at the phase boundary so the skipped work is visible in the same
+#: durable log the release controller and the diagnostics read.
+_PHASE_BUDGET_SKIPPED_PREFIX = "OPIP_UNIFIED_CYCLE_PHASE_SKIPPED_BUDGET="
+
+#: The only phases the budget may skip. Everything absent from this set is
+#: protection-critical (real-position protection, Paper-v2 protection, pending
+#: lifecycle, discovery and the qualified-alert recovery path) and always runs.
+NONCRITICAL_PHASES = frozenset(
+    {
+        "EVENT_INTELLIGENCE",
+        "LEARNING",
+        "TARGET_SPINE",
+        "TRADEVISOR_ADVISORY",
+    }
+)
+
+
+def _cycle_budget_seconds() -> int:
+    """The configured non-critical workload budget for one cycle."""
+    raw = os.environ.get(_CYCLE_BUDGET_ENV)
+    if raw is None or not raw.strip():
+        return DEFAULT_CYCLE_BUDGET_SECONDS
+    try:
+        return max(0, int(raw.strip()))
+    except ValueError:
+        return DEFAULT_CYCLE_BUDGET_SECONDS
+
+
+class _CycleBudget:
+    """Deterministic per-cycle budget for non-critical workloads.
+
+    Time is read from a monotonic clock captured once, so the gate is a pure
+    function of elapsed wall time and cannot be extended by a phase that
+    rewrites state. A budget of ``0`` disables the gate entirely.
+    """
+
+    def __init__(self, seconds: int, *, clock=time.monotonic) -> None:
+        self.seconds = max(0, int(seconds))
+        self._clock = clock
+        self._started_at = clock()
+        self._skipped: list[str] = []
+
+    @property
+    def enabled(self) -> bool:
+        return self.seconds > 0
+
+    def elapsed_seconds(self) -> float:
+        return max(0.0, self._clock() - self._started_at)
+
+    def exhausted(self) -> bool:
+        return self.enabled and self.elapsed_seconds() >= self.seconds
+
+    def allows(self, phase: str) -> bool:
+        """Whether ``phase`` may start now.
+
+        Critical phases are always allowed: correctness of protection never
+        depends on how slow an earlier phase was.
+        """
+        if phase not in NONCRITICAL_PHASES:
+            return True
+        return not self.exhausted()
+
+    def record_skip(self, phase: str) -> None:
+        self._skipped.append(phase)
+        print(f"{_PHASE_BUDGET_SKIPPED_PREFIX}{phase}", flush=True)
+
+    @property
+    def skipped(self) -> tuple[str, ...]:
+        return tuple(self._skipped)
 
 
 
@@ -700,6 +889,7 @@ def _reserve_isolated_attempt(*, settings) -> bool:
 
 
 def _run_cycle_once() -> bool:
+    budget = _CycleBudget(_cycle_budget_seconds())
     _cycle_phase("KRAKEN_RECONCILIATION")
     try:
         reconciliation = reconcile_kraken_account()
@@ -840,45 +1030,72 @@ def _run_cycle_once() -> bool:
     )
     _cycle_phase("PAPER_MONITOR")
     _run_paper_monitor_fail_open()
+    # Everything from here on is advisory, learning or dormant: it can never
+    # place, protect or admit anything. These phases are therefore gated by the
+    # cycle budget so a long tail cannot occupy the authorized bound and starve
+    # the next protection pass. Each skip is recorded at its own phase boundary.
     _cycle_phase("EVENT_INTELLIGENCE")
-    _run_event_intelligence_fail_open(settings=settings)
+    if budget.allows("EVENT_INTELLIGENCE"):
+        _run_event_intelligence_fail_open(settings=settings)
+    else:
+        budget.record_skip("EVENT_INTELLIGENCE")
     _cycle_phase("EXTERNAL_ORDER_REVIEW")
     _run_external_order_review_fail_open()
     _cycle_phase("LEARNING")
-    _run_learning_fail_open()
+    if budget.allows("LEARNING"):
+        _run_learning_fail_open()
+    else:
+        budget.record_skip("LEARNING")
     # R4-B1 dormant target spine: last, and only after every protection and
     # non-authoritative workload above. It is inert when the gate is off.
     _cycle_phase("TARGET_SPINE")
-    _run_target_spine_fail_open()
+    if budget.allows("TARGET_SPINE"):
+        _run_target_spine_fail_open()
+    else:
+        budget.record_skip("TARGET_SPINE")
     # Tradevisor advisory ingress: strictly last, after protection and after the
     # dormant spine, and inert unless explicitly enabled. It has no admission,
     # order, or execution authority.
     _cycle_phase("TRADEVISOR_ADVISORY")
-    _run_tradevisor_fail_open()
+    if budget.allows("TRADEVISOR_ADVISORY"):
+        _run_tradevisor_fail_open()
+    else:
+        budget.record_skip("TRADEVISOR_ADVISORY")
     _cycle_phase("WORKLOAD_COMPLETE")
-    return True
+    # A cycle that skipped work is not a clean cycle. It is reported as DEGRADED
+    # so the durable receipt never claims more than the run actually did.
+    return not budget.skipped
 
 
 def main() -> None:
     """Run one canonical cycle, distinguishing lock contention from workload failure."""
-    cycle_lock = registry_lock(CYCLE_LOCK_FILE, timeout=0.0)
+    previous_handlers = _install_shutdown_handlers()
     try:
-        cycle_lock.__enter__()
-    except TimeoutError:
-        _cycle_phase("LOCK_CONTENTION_SKIPPED")
-        print("OHM Unified Cycle skipped: previous cycle still running.")
-        return
+        cycle_lock = registry_lock(CYCLE_LOCK_FILE, timeout=0.0)
+        try:
+            cycle_lock.__enter__()
+        except TimeoutError:
+            _cycle_phase("LOCK_CONTENTION_SKIPPED")
+            print("OHM Unified Cycle skipped: previous cycle still running.")
+            return
 
-    try:
-        _cycle_phase("RECOVER_INTERRUPTED_SEARCH")
-        if recover_interrupted_search():
-            print("O'Pip recovered interrupted broad-search lifecycle as FAILED.")
-        completed = _run_cycle_once()
-        completed_at = datetime.now(timezone.utc).isoformat()
-        print(f"OPIP_UNIFIED_CYCLE_STATUS={'SUCCESS' if completed else 'DEGRADED'}", flush=True)
-        print(f"OPIP_UNIFIED_CYCLE_COMPLETED_AT={completed_at}", flush=True)
+        try:
+            _cycle_phase("RECOVER_INTERRUPTED_SEARCH")
+            if recover_interrupted_search():
+                print("O'Pip recovered interrupted broad-search lifecycle as FAILED.")
+            completed = _run_cycle_once()
+            completed_at = datetime.now(timezone.utc).isoformat()
+            print(f"OPIP_UNIFIED_CYCLE_STATUS={'SUCCESS' if completed else 'DEGRADED'}", flush=True)
+            print(f"OPIP_UNIFIED_CYCLE_COMPLETED_AT={completed_at}", flush=True)
+        except _CycleTerminated as stopped:
+            # The scheduler's in-container bound (or an operator) asked this cycle
+            # to stop. Record it as a termination - never as a completion - and let
+            # the ``finally`` below release the cycle lock in order.
+            _record_termination(stopped.signal_name)
+        finally:
+            cycle_lock.__exit__(None, None, None)
     finally:
-        cycle_lock.__exit__(None, None, None)
+        _restore_shutdown_handlers(previous_handlers)
 
 
 if __name__ == "__main__":
