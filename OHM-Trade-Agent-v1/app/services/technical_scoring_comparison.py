@@ -113,6 +113,23 @@ def build_scoring_comparison(
     }
 
 
+def _rotate_without_overwrite(path: Path) -> None:
+    """Archive the active file to the first unused ``.N.jsonl`` name.
+
+    Existing archives are never replaced: ``os.link`` fails if the name is taken, so
+    the first rotation still produces ``.1.jsonl`` and later ones ``.2``, ``.3``, ...
+    """
+    for index in range(1, 100_000):
+        archive = path.with_suffix(f".{index}.jsonl")
+        try:
+            os.link(path, archive)
+        except FileExistsError:
+            continue
+        os.unlink(path)
+        return
+    raise OSError("no free comparison archive name")
+
+
 def record_comparison_fail_soft(row: dict, path: Path = COMPARISON_FILE) -> bool:
     """No errors are propagated to the scanner; discard on I/O failure."""
     try:
@@ -121,7 +138,14 @@ def record_comparison_fail_soft(row: dict, path: Path = COMPARISON_FILE) -> bool
             raise ValueError("comparison record exceeds maximum size")
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists() and path.stat().st_size + len(data) > MAX_BYTES:
-            os.replace(path, path.with_suffix(".1.jsonl"))
+            try:
+                _rotate_without_overwrite(path)
+            except OSError as exc:
+                # Keep evidence: append to the active file rather than lose or overwrite.
+                logger.warning(
+                    "V2 comparison rotation failed; evidence kept in active file: %s",
+                    type(exc).__name__,
+                )
         fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         try:
             os.write(fd, data)
