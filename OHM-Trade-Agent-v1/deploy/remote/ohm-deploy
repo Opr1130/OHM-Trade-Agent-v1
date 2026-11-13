@@ -208,22 +208,48 @@ wait_core_health() {
   [[ "$healthy" == "1" ]]
 }
 
+# The writer builds its one-time episode index and hydrates BEFORE it listens, so a
+# first start against a large canonical store can legitimately take longer than the
+# old 60 s window. The window is a fixed, bounded constant (no environment override):
+# it widens the allowance for a slow-but-working start-up, it does not make a failing
+# writer wait. Docker may report "unhealthy" while start-up is still running (the
+# probe fails until the socket listens) and recovers to "healthy", so "unhealthy"
+# alone is not fatal; a stopped, restarting, OOM-killed or restart-looping container
+# is, and fails at once.
+WRITER_HEALTH_TIMEOUT_SECONDS=180
+WRITER_HEALTH_POLL_SECONDS=2
+
 wait_writer_health() {
   # Writer health is validated separately from core. Core must never depend on
   # writer availability to start; this check only gates a successful deploy of
   # the PR 2 service itself.
-  local cid status
-  for _ in $(seq 1 30); do
+  local cid state state_status restarting oom restarts health baseline="" waited=0
+  while (( waited < WRITER_HEALTH_TIMEOUT_SECONDS )); do
     cid="$(docker compose ps -q opip-canonical-writer 2>/dev/null || true)"
     if [[ -n "$cid" ]]; then
-      status="$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null || true)"
-      if [[ "$status" == "healthy" ]]; then
+      state="$(docker inspect --format='{{.State.Status}}|{{.State.Restarting}}|{{.State.OOMKilled}}|{{.RestartCount}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null || true)"
+      IFS='|' read -r state_status restarting oom restarts health <<<"$state"
+      if [[ "$health" == "healthy" ]]; then
         return 0
       fi
+      if [[ -n "$state_status" ]]; then
+        if [[ "$state_status" == "exited" || "$state_status" == "dead" || "$restarting" == "true" || "$oom" == "true" ]]; then
+          echo "opip-canonical-writer failed during start-up: status=$state_status restarting=$restarting oom_killed=$oom restart_count=$restarts after ${waited}s" >&2
+          docker compose ps opip-canonical-writer >&2 || true
+          return 1
+        fi
+        [[ -n "$baseline" ]] || baseline="$restarts"
+        if [[ "$restarts" =~ ^[0-9]+$ && "$baseline" =~ ^[0-9]+$ ]] && (( restarts > baseline )); then
+          echo "opip-canonical-writer is restart-looping: restart_count $baseline -> $restarts after ${waited}s" >&2
+          docker compose ps opip-canonical-writer >&2 || true
+          return 1
+        fi
+      fi
     fi
-    sleep 2
+    sleep "$WRITER_HEALTH_POLL_SECONDS"
+    waited=$((waited + WRITER_HEALTH_POLL_SECONDS))
   done
-  echo "opip-canonical-writer health check failed" >&2
+  echo "opip-canonical-writer health check failed: not healthy within ${WRITER_HEALTH_TIMEOUT_SECONDS}s (last health=${health:-unknown})" >&2
   docker compose ps opip-canonical-writer >&2 || true
   return 1
 }

@@ -52,7 +52,7 @@ following are read from the committed deploy configuration, **not** measured on 
 | Writer container memory | `mem_limit: 128m`, `memswap_limit: 128m` (compose; `ohm-deploy` asserts 134217728) |
 | Writer container CPU | **`cpus: "0.15"`** |
 | Writer health check | `start_period 20s`, `interval 15s`, `timeout 5s`, `retries 3` |
-| Deploy wait | `wait_writer_health`: 30 × 2 s = **60 s** to report `healthy`, else the deploy fails |
+| Deploy wait | `wait_writer_health`: 30 × 2 s = **60 s** on `main`. The draft `ATDD-OPIP-WRITER-HEALTH-WINDOW-V1` PR makes it a fixed **180 s** (90 × 2 s), failing at once on an exited, restarting, OOM-killed or restart-looping writer; owner-recommended, unmerged |
 | Start-up order | `CanonicalWriterServer.__init__` builds `CanonicalWriter` (schema, **indexes, hydration**) *before* the socket listens, so the container cannot be healthy until hydration finishes |
 
 **What that implies (estimate, one stated assumption).** Measured on a full core the
@@ -119,7 +119,7 @@ SQLite's volatile `-shm` index is the one file excluded from that comparison.
 
 | ID | Condition | Closes when |
 | --- | --- | --- |
-| R-1 | Writer start-up may exceed the 60 s deploy wait at 0.15 CPU (§3) | Bundle §4/§5 shows count < threshold or an observed start-up well under 60 s; otherwise owner approves a resource/health change |
+| R-1 | The candidate writer's first start against the 6.08 GB / 1.02 M-event store is **inferred, not observed**: ~20–40 s (index build ~10 s CPU at 0.15 CPU on production-shaped synthetic rows, plus unmeasured cold I/O). The deployed writer's 8 s is the OLD code | The first-start timestamps and writer RSS are recorded on a separately owner-approved deployment; the 180 s window (draft PR) is the margin until then |
 | R-2 | Host RAM/swap/disk, observed memory, and orphans are unmeasured | Bundle §1–§3, §7 |
 | R-3 | dozens of other file writers not individually interruption-tested | Accepted as advisory, or a follow-up audit is requested |
 | R-4 | 2,700 s budget not owner-approved | Owner decision |
@@ -136,3 +136,25 @@ SQLite's volatile `-shm` index is the one file excluded from that comparison.
 | Cycle reports `DEGRADED` repeatedly | Set `OPIP_UNIFIED_CYCLE_BUDGET_SECONDS=0` to disable the gate | Cycle log phase-skip markers |
 
 The new indexes are additive: an older build ignores them and no data is migrated.
+
+## 8. Host evidence, 2026-11-13 22:43 UTC (bundle at `96ba823b`)
+
+Observed on the droplet (read-only): 4 GB RAM (3.1 GB available), swap 51 MB used,
+46 GB disk free, load 0.6; writer `mem 128 MiB / 0.15 CPU`, 0 restarts, no OOM,
+103.7 MiB (81%) resident on the **deployed pre-#516 code**; canonical store 6.08 GB,
+**1,023,601 events in one epoch**, **0** opportunity-lifecycle events, no `idx_events_*`
+indexes; deployed-writer start-up **8 s** (13:35:59 → ready 13:36:07); only
+`OPIP_COMMITTEE_MODE=off` set among the safety flags.
+
+What is *not* established, and must stay labelled that way:
+- The 20–40 s first start of the candidate writer is an **inference** from synthetic rows
+  (0.3 s CPU per 200 k × ~6 KB rows) plus an assumed cold-read cost. It has not been
+  observed on the new writer in production.
+- The cycle log shows 33 consecutive `SUCCESS` completions about one a minute and a
+  longest gap of ~133 s between completions. That is **completion cadence, not measured
+  per-cycle execution time**; paired start/finish timestamps were not in the bundle, so
+  actual cycle duration is `UNVERIFIED`.
+- The in-container orphan count printed 0 only because `ps` is absent in that container
+  (`UNVERIFIED`); the host `ps` showed no `run_cycle`. The cron-bound line printed nothing.
+- The 2,700 s budget is an owner-recommended advisory-phase ceiling (skips end in
+  `DEGRADED`, never `SUCCESS`) and is **not** formally accepted until the owner says so.
