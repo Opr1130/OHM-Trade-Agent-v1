@@ -31,6 +31,7 @@ case "$*" in
     cat > /dev/null
     exit "${STUB_RESTORE_RC:-0}"
     ;;
+  *pg_isready*) exit "${STUB_READY_RC:-0}" ;;
   *psql*) echo 12 ;;
 esac
 """
@@ -311,3 +312,21 @@ def test_failed_restore_cleans_up_and_records_no_success(tmp_path):
     assert "rm -f opip-restore-drill-" in _calls(stub)
     assert list((tmp_path / "work").iterdir()) == []
     assert not (Path(env["OPIP_BACKUP_STATE_ROOT"]) / "last-restore-drill.env").exists()
+
+
+@pytest.mark.acceptance
+def test_restore_drill_waits_for_the_real_server_and_fails_loudly_when_not_ready(tmp_path):
+    """ATDD-OPIP-POSTGRES-BACKUP-REPAIR-v1/AC-009: readiness is checked over TCP loopback and a timeout is reported, not silent."""
+    env, stub, root = _setup(
+        tmp_path, 10 * GIB, STUB_READY_RC="2",
+        OPIP_DRILL_READY_TRIES="2", OPIP_DRILL_READY_SLEEP="0",
+    )
+    _dump_with_checksum(root)
+    result = _run(DRILL, env)
+    assert result.returncode == 1
+    assert "did not become ready" in result.stderr
+    calls = _calls(stub)
+    assert "pg_isready --host 127.0.0.1" in calls
+    assert "pg_restore" not in calls, "no restore may start against an unready server"
+    assert "rm -f opip-restore-drill-" in calls
+    assert list((tmp_path / "work").iterdir()) == []

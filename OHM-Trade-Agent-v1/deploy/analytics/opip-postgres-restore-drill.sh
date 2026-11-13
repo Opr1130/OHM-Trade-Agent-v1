@@ -75,11 +75,22 @@ docker run -d --name "$cname" --network none --memory 384m --memory-swap 384m --
   -e POSTGRES_USER=drill -e POSTGRES_HOST_AUTH_METHOD=trust \
   -v "$work:/var/lib/postgresql/data" "$IMAGE" \
   postgres -c shared_buffers=64MB -c fsync=off -c max_wal_size=512MB > /dev/null
-for _ in $(seq 1 60); do
-  docker exec "$cname" pg_isready --username drill > /dev/null 2>&1 && break
-  sleep 1
+# The official image first runs a TEMPORARY server that listens on the unix socket only,
+# then restarts the real one. Checking over TCP loopback (--network none still has lo)
+# succeeds only once the real server is up, so the restore cannot race the restart.
+ready=0
+for _ in $(seq 1 "${OPIP_DRILL_READY_TRIES:-90}"); do
+  if docker exec "$cname" pg_isready --host 127.0.0.1 --username drill > /dev/null 2>&1; then
+    ready=1
+    break
+  fi
+  sleep "${OPIP_DRILL_READY_SLEEP:-1}"
 done
-docker exec "$cname" pg_isready --username drill > /dev/null
+if (( ready != 1 )); then
+  echo "CRITICAL: throwaway postgres did not become ready; drill aborted, nothing recorded" >&2
+  docker logs --tail 20 "$cname" >&2 || true
+  exit 1
+fi
 
 # Hard-floor watchdog: below 2 GiB free the throwaway container is killed, the restore
 # fails closed and cleanup removes everything the drill wrote.
