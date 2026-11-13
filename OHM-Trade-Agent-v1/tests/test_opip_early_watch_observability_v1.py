@@ -25,6 +25,8 @@ import pytest
 from app.services import early_watch_mode as mode
 from app.services import phase_resources as resources
 
+pytestmark = pytest.mark.acceptance
+
 APP_ROOT = Path(__file__).resolve().parents[1]
 MOVEMENT = APP_ROOT / "app" / "services" / "movement_discovery_v2.py"
 
@@ -35,6 +37,7 @@ MOVEMENT = APP_ROOT / "app" / "services" / "movement_discovery_v2.py"
 
 
 def test_ac_001_a_sample_reports_duration_cpu_rss_and_cgroup_memory():
+    """ATDD-OPIP-EARLY-WATCH-OBSERVABILITY-v1/AC-001: a sample reports duration cpu rss and cgroup memory."""
     sample = resources.PhaseResourceSample(
         phase="EARLY_WATCH",
         duration_ms=1234,
@@ -59,6 +62,7 @@ def test_ac_001_a_sample_reports_duration_cpu_rss_and_cgroup_memory():
 
 
 def test_ac_001_an_unmeasurable_value_is_reported_as_unknown():
+    """ATDD-OPIP-EARLY-WATCH-OBSERVABILITY-v1/AC-001: an unmeasurable value is reported as unknown."""
     sample = resources.PhaseResourceSample(
         phase="EARLY_WATCH",
         duration_ms=5,
@@ -81,11 +85,13 @@ def test_ac_001_an_unmeasurable_value_is_reported_as_unknown():
 
 
 def test_ac_002_resident_bytes_is_measured_or_absent_never_invented():
+    """ATDD-OPIP-EARLY-WATCH-OBSERVABILITY-v1/AC-002: resident bytes is measured or absent never invented."""
     value = resources.resident_bytes()
     assert value is None or value > 0
 
 
 def test_ac_002_cgroup_paths_match_the_documented_layout_or_are_absent():
+    """ATDD-OPIP-EARLY-WATCH-OBSERVABILITY-v1/AC-002: cgroup paths match the documented layout or are absent."""
     paths = resources.cgroup_memory_paths()
     if paths is None:
         pytest.skip("cgroup v2 is not available on this platform")
@@ -101,6 +107,7 @@ def test_ac_002_cgroup_paths_match_the_documented_layout_or_are_absent():
 
 
 def test_ac_003_measurement_is_off_unless_explicitly_enabled():
+    """ATDD-OPIP-EARLY-WATCH-OBSERVABILITY-v1/AC-003: measurement is off unless explicitly enabled."""
     assert resources.telemetry_enabled({}) is False
     assert resources.telemetry_enabled({"OPIP_PHASE_RESOURCE_TELEMETRY": ""}) is False
     assert resources.telemetry_enabled({"OPIP_PHASE_RESOURCE_TELEMETRY": "0"}) is False
@@ -108,6 +115,7 @@ def test_ac_003_measurement_is_off_unless_explicitly_enabled():
 
 
 def test_ac_003_a_disabled_phase_emits_nothing():
+    """ATDD-OPIP-EARLY-WATCH-OBSERVABILITY-v1/AC-003: a disabled phase emits nothing."""
     emitted: list[str] = []
     with resources.measure_phase("EARLY_WATCH", emit=emitted.append, env={}):
         pass
@@ -115,6 +123,7 @@ def test_ac_003_a_disabled_phase_emits_nothing():
 
 
 def test_ac_003_an_enabled_phase_emits_exactly_one_line():
+    """ATDD-OPIP-EARLY-WATCH-OBSERVABILITY-v1/AC-003: an enabled phase emits exactly one line."""
     emitted: list[str] = []
     with resources.measure_phase(
         "EARLY_WATCH",
@@ -127,6 +136,7 @@ def test_ac_003_an_enabled_phase_emits_exactly_one_line():
 
 
 def test_ac_003_a_failing_phase_still_emits_and_the_error_propagates():
+    """ATDD-OPIP-EARLY-WATCH-OBSERVABILITY-v1/AC-003: a failing phase still emits and the error propagates."""
     emitted: list[str] = []
     with pytest.raises(RuntimeError):
         with resources.measure_phase(
@@ -139,6 +149,7 @@ def test_ac_003_a_failing_phase_still_emits_and_the_error_propagates():
 
 
 def test_ac_003_a_broken_emitter_cannot_break_the_workload():
+    """ATDD-OPIP-EARLY-WATCH-OBSERVABILITY-v1/AC-003: a broken emitter cannot break the workload."""
     def explode(_line, **__):
         raise OSError("log sink gone")
 
@@ -156,11 +167,13 @@ def test_ac_003_a_broken_emitter_cannot_break_the_workload():
 
 
 def test_ac_004_the_default_mode_is_todays_behaviour():
+    """ATDD-OPIP-EARLY-WATCH-OBSERVABILITY-v1/AC-004: the default mode is todays behaviour."""
     assert mode.resolve_early_watch_mode({}) == mode.MODE_ACTIVE
     assert mode.automatic_notifications_enabled({}) is True
 
 
 def test_ac_004_evidence_only_is_honoured_and_is_the_only_alternative():
+    """ATDD-OPIP-EARLY-WATCH-OBSERVABILITY-v1/AC-004: evidence only is honoured and is the only alternative."""
     assert (
         mode.resolve_early_watch_mode({mode.MODE_ENV: "evidence_only"})
         == mode.MODE_EVIDENCE_ONLY
@@ -176,7 +189,7 @@ def test_ac_004_evidence_only_is_honoured_and_is_the_only_alternative():
 
 
 def test_ac_004_the_reason_codes_stay_separable():
-    """A mode suppression must not be confused with a policy/eligibility one."""
+    """ATDD-OPIP-EARLY-WATCH-OBSERVABILITY-v1/AC-004: A mode suppression must not be confused with a policy/eligibility one."""
     assert mode.MODE_ACTIVE in mode.ALLOWED_MODES
     assert mode.MODE_EVIDENCE_ONLY in mode.ALLOWED_MODES
     source = MOVEMENT.read_text(encoding="utf-8")
@@ -192,7 +205,7 @@ def test_ac_004_the_reason_codes_stay_separable():
 
 
 def test_ac_005_the_switch_is_only_consulted_at_the_early_mover_boundary():
-    """AC-005: critical safety, qualified entry and COMMAND_WATCH are separate."""
+    """ATDD-OPIP-EARLY-WATCH-OBSERVABILITY-v1/AC-005: critical safety, qualified entry and COMMAND_WATCH are separate."""
     source = MOVEMENT.read_text(encoding="utf-8")
     start = source.index("def send_early_mover_update(")
     end = len(source)
@@ -226,6 +239,7 @@ def test_ac_005_the_switch_is_only_consulted_at_the_early_mover_boundary():
 
 
 def test_ac_006_suppression_evidence_names_the_identity_and_mode():
+    """ATDD-OPIP-EARLY-WATCH-OBSERVABILITY-v1/AC-006: suppression evidence names the identity and mode."""
     line = mode.suppression_evidence_line(
         "EARLY_MOVER:SOLUSD", mode=mode.MODE_EVIDENCE_ONLY
     )
