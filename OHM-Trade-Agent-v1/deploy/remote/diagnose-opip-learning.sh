@@ -259,6 +259,10 @@ else
 fi
 
 HOST_CYCLE_LOCK="/var/run/ohm-unified-cycle.lock"
+# The probe's verdict is kept in a variable as well as echoed, so the later
+# overdue/orphan assessment can combine it with the cycle log without probing
+# the lock a second time. UNKNOWN until the probe runs.
+UNIFIED_CYCLE_HOST_LOCK_STATE="UNKNOWN"
 # Read-only liveness probe. Never delete the lock file. flock -n fails when
 # the canonical cron still holds the exclusive lock.
 # Never kill the owner or restart services from diagnostics.
@@ -319,6 +323,7 @@ _report_lock_owner() {
 if [[ -e "$HOST_CYCLE_LOCK" ]]; then
   exec {cycle_lock_fd}<>"$HOST_CYCLE_LOCK"
   if flock -n "$cycle_lock_fd"; then
+    UNIFIED_CYCLE_HOST_LOCK_STATE="IDLE"
     echo "unified_cycle_host_lock=IDLE"
     echo "lock_owner_pid=NONE"
     echo "lock_owner_ppid=NONE"
@@ -327,11 +332,13 @@ if [[ -e "$HOST_CYCLE_LOCK" ]]; then
     echo "lock_owner_comm=NONE"
     flock -u "$cycle_lock_fd"
   else
+    UNIFIED_CYCLE_HOST_LOCK_STATE="HELD"
     echo "unified_cycle_host_lock=HELD"
     _report_lock_owner "$HOST_CYCLE_LOCK"
   fi
   eval "exec ${cycle_lock_fd}>&-"
 else
+  UNIFIED_CYCLE_HOST_LOCK_STATE="ABSENT"
   echo "unified_cycle_host_lock=ABSENT"
   echo "lock_owner_pid=ABSENT"
   echo "lock_owner_ppid=ABSENT"
@@ -1650,11 +1657,30 @@ if [[ -f "$UNIFIED_CYCLE_CRON" ]]; then
   echo "unified_cycle_cron_schedule=${unified_cycle_cron_schedule:-UNKNOWN}"
   # The hard runtime bound is derived with the SAME expression the release
   # controller uses to size its own bounded cycle wait, so diagnostics can never
-  # report a different bound than the one the deploy enforced.
-  unified_cycle_bound="$(
-    grep -m1 -oE 'timeout --signal=TERM --kill-after=[0-9]+s [0-9]+' "$UNIFIED_CYCLE_CRON" 2>/dev/null \
-      | grep -oE '[0-9]+$' || true
+  # report a different bound than the one the deploy enforced. Like the
+  # controller, it reads only the EXECUTABLE job line: cron.d comments and
+  # `NAME=value` assignments are stripped first, so documentation that quotes the
+  # long timeout flags can neither supply nor override the reported bound.
+  unified_cycle_program="$(
+    awk '
+      /^[[:space:]]*#/ {next}
+      /^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=/ {next}
+      NF {print}
+    ' "$UNIFIED_CYCLE_CRON" 2>/dev/null || true
   )"
+  unified_cycle_bound_matches="$(
+    printf '%s\n' "$unified_cycle_program" \
+      | grep -oE 'timeout --signal=TERM --kill-after=[0-9]+s [0-9]+' || true
+  )"
+  if [[ "$(printf '%s\n' "$unified_cycle_bound_matches" | grep -c . || true)" == "1" ]]; then
+    unified_cycle_bound="$(
+      printf '%s\n' "$unified_cycle_bound_matches" | grep -oE '[0-9]+$' || true
+    )"
+  else
+    # Zero matches means no bound is installed; two means the authority is
+    # ambiguous. Diagnostics reports UNKNOWN for both instead of choosing one.
+    unified_cycle_bound=""
+  fi
   if [[ "$unified_cycle_bound" =~ ^[0-9]+$ && "$unified_cycle_bound" -ge 1 ]]; then
     echo "unified_cycle_hard_runtime_bound_seconds=$unified_cycle_bound"
   else
@@ -1721,6 +1747,70 @@ fi
 echo "OPIP_UNIFIED_CYCLE_LOG_TAIL"
 printf '%s\n' "${unified_cycle_tail:-}" | redact_export_secrets || true
 echo "OPIP_UNIFIED_CYCLE_LOG_TAIL_END"
+# ---------------------------------------------------------------------------
+# Overdue and orphan assessment (read-only).
+#
+# The two failure modes that stalled protection were invisible in the receipt:
+# a cycle that outlived its authorized bound, and a container process still
+# working after its host launcher was gone -- an orphan that kept
+# `/app/data/.unified_cycle.lock` and turned every following minute into
+# `LOCK_CONTENTION_SKIPPED` while the host lock looked free.
+#
+# Both are derived from state this block already collects: the non-destructive
+# host lock probe, its lock-free owner lookup, and the bounded, redacted log
+# tail. No new probe, subprocess, file or lock is introduced, and every field
+# reports UNKNOWN rather than a guess when its own input is unavailable.
+# ---------------------------------------------------------------------------
+cycle_lock_state="${UNIFIED_CYCLE_HOST_LOCK_STATE:-UNKNOWN}"
+echo "unified_cycle_lock_state=$cycle_lock_state"
+unified_cycle_bound_value="${unified_cycle_bound:-}"
+[[ "$unified_cycle_bound_value" =~ ^[0-9]+$ ]] || unified_cycle_bound_value=""
+# A held lock whose owner has already outlived the authorized bound is overdue:
+# the bound the container is supposed to enforce has not taken effect.
+unified_cycle_holder_elapsed="UNKNOWN"
+if [[ "$cycle_lock_state" == "HELD" ]]; then
+  unified_cycle_holder_elapsed="$(
+    _report_lock_owner "$HOST_CYCLE_LOCK" 2>/dev/null \
+      | awk -F= '$1 == "lock_owner_elapsed" {print $2; exit}' || true
+  )"
+  [[ "$unified_cycle_holder_elapsed" =~ ^[0-9]+$ ]] || unified_cycle_holder_elapsed="UNKNOWN"
+fi
+echo "unified_cycle_holder_elapsed_seconds=$unified_cycle_holder_elapsed"
+if [[ "$unified_cycle_holder_elapsed" =~ ^[0-9]+$ && -n "$unified_cycle_bound_value" ]]; then
+  if (( unified_cycle_holder_elapsed > unified_cycle_bound_value )); then
+    echo "unified_cycle_holder_overdue=YES"
+  else
+    echo "unified_cycle_holder_overdue=NO"
+  fi
+else
+  echo "unified_cycle_holder_overdue=UNKNOWN"
+fi
+# In-flight means the last thing the log recorded was a phase boundary that is
+# not a terminal phase: work was still running when the log was last written.
+unified_cycle_in_flight="$(
+  printf '%s\n' "${unified_cycle_tail:-}" | awk '
+    /OPIP_UNIFIED_CYCLE_PHASE=/ {phase = $0; state = "PHASE"}
+    /OPIP_UNIFIED_CYCLE_STATUS=/ {state = "TERMINAL"}
+    /OPIP_UNIFIED_CYCLE_COMPLETED_AT=/ {state = "TERMINAL"}
+    END {
+      if (state != "PHASE") {print "NO"; exit}
+      if (phase ~ /PHASE=(WORKLOAD_COMPLETE|LOCK_CONTENTION_SKIPPED)$/) {print "NO"; exit}
+      print "YES"
+    }
+  ' 2>/dev/null || true
+)"
+[[ -n "$unified_cycle_in_flight" ]] || unified_cycle_in_flight="UNKNOWN"
+echo "unified_cycle_in_flight=$unified_cycle_in_flight"
+# In-flight work with no host launcher holding the lock can only be a process
+# the launcher no longer supervises -- the exact condition that used to hold the
+# in-container cycle lock for ever.
+if [[ "$unified_cycle_in_flight" == "YES" && ( "$cycle_lock_state" == "IDLE" || "$cycle_lock_state" == "ABSENT" ) ]]; then
+  echo "unified_cycle_orphan_suspected=YES"
+elif [[ "$unified_cycle_in_flight" == "UNKNOWN" || "$cycle_lock_state" == "UNKNOWN" ]]; then
+  echo "unified_cycle_orphan_suspected=UNKNOWN"
+else
+  echo "unified_cycle_orphan_suspected=NO"
+fi
 echo "OPIP_UNIFIED_CYCLE_END"
 
 echo "diagnostics_status=$status"
