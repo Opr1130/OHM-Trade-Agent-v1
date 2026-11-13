@@ -377,27 +377,27 @@ def test_ac_004_the_episode_lookup_is_planned_as_an_index_seek(canonical_db):
         plan = " ".join(
             str(row[3])
             for row in writer._conn.execute(
-                "EXPLAIN QUERY PLAN SELECT event_id, history_epoch, local_sequence, "
-                "payload_json FROM events WHERE event_type = ? "
-                "AND json_extract(payload_json, '$.episode.episode_id') = ? "
-                "AND (history_epoch > ? OR (history_epoch = ? AND local_sequence > ?)) "
-                "ORDER BY history_epoch ASC, local_sequence ASC LIMIT ?",
-                (RECORDED, "OPEP:x", 0, 0, -1, 10),
+                "EXPLAIN QUERY PLAN " + writer_module._EPISODE_ROWS_SQL,
+                ("OPEP:x", 0, 0, -1, 10),
             )
         )
         assert "idx_events_episode_identity" in plan, plan
-        assert "SCAN" not in plan.replace("SCAN ... USING", ""), plan
+        assert "SCAN" not in plan, plan
     finally:
         writer.close()
 
 
-def test_ac_004_the_index_is_additive_and_vocabulary_free(canonical_db):
-    """ATDD-OPIP-RELEASE-GATES-V1/AC-004: IF NOT EXISTS, no table or column change, and the generic schema stays free of the F4 token it is pinned against."""
-    source = (APP_ROOT / "app" / "opip" / "canonical" / "schema.py").read_text(
+def test_ac_004_the_index_is_additive_partial_and_outside_the_generic_schema(
+    canonical_db,
+):
+    """ATDD-OPIP-RELEASE-GATES-V1/AC-004: IF NOT EXISTS, partial on the one event type, created by the writer, and the generic schema stays free of the F4 token it is pinned against."""
+    schema_source = (APP_ROOT / "app" / "opip" / "canonical" / "schema.py").read_text(
         encoding="utf-8"
     )
-    assert "CREATE INDEX IF NOT EXISTS idx_events_episode_identity" in source
-    assert "opportunity" not in source.lower()
+    assert "opportunity" not in schema_source.lower()
+    sql = writer_module._EPISODE_IDENTITY_INDEX_SQL
+    assert sql.startswith("CREATE INDEX IF NOT EXISTS idx_events_episode_identity")
+    assert f"WHERE event_type = '{RECORDED}'" in sql
     writer = CanonicalWriter(canonical_db)
     try:
         names = {

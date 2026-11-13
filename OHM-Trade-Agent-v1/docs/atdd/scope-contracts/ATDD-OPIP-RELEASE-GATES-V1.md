@@ -81,7 +81,7 @@ EXPLICITLY OUT OF SCOPE:
 FROZEN BOUNDARIES:
 - Protection-critical cycle phases are never gated.
 - No funded order path, no learning activation, F11 independent.
-- The only runtime changes are one additive index, one indexed re-derivation read, and one rollback guard.
+- The only runtime changes are one additive writer-created index, one indexed re-derivation read, and one rollback guard.
 
 ACCEPTANCE TEST TRACEABILITY:
 AC-001 -> tests/test_opip_release_gates_v1.py::test_ac_001_sigkill_mid_write_never_loses_an_acknowledged_event
@@ -91,7 +91,7 @@ AC-003 -> tests/test_opip_release_gates_v1.py::test_ac_003_an_interruption_mid_t
 AC-003 -> tests/test_opip_release_gates_v1.py::test_ac_003_the_cycle_never_constructs_a_writing_canonical_writer
 AC-004 -> tests/test_opip_release_gates_v1.py::test_ac_004_hydration_does_not_rescan_the_event_type_per_released_episode
 AC-004 -> tests/test_opip_release_gates_v1.py::test_ac_004_the_episode_lookup_is_planned_as_an_index_seek
-AC-004 -> tests/test_opip_release_gates_v1.py::test_ac_004_the_index_is_additive_and_vocabulary_free
+AC-004 -> tests/test_opip_release_gates_v1.py::test_ac_004_the_index_is_additive_partial_and_outside_the_generic_schema
 AC-005 -> tests/test_opip_release_gates_v1.py::test_ac_005_retention_is_first_in_first_out_and_a_refresh_does_not_reorder
 AC-005 -> tests/test_opip_release_gates_v1.py::test_ac_005_a_release_changes_latency_never_the_answer
 AC-006 -> tests/test_opip_release_gates_v1.py::test_ac_006_telemetry_is_off_by_default_and_unwired
@@ -108,7 +108,6 @@ AC-002 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-RELEASE-GATES-V
 AC-003 -> OHM-Trade-Agent-v1/app/opip/canonical/writer.py
 AC-003 -> OHM-Trade-Agent-v1/tests/test_opip_release_gates_v1.py
 AC-003 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-RELEASE-GATES-V1.md
-AC-004 -> OHM-Trade-Agent-v1/app/opip/canonical/schema.py
 AC-004 -> OHM-Trade-Agent-v1/app/opip/canonical/writer.py
 AC-004 -> OHM-Trade-Agent-v1/tests/test_opip_release_gates_v1.py
 AC-004 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-RELEASE-GATES-V1.md

@@ -352,6 +352,30 @@ def _new_event_id() -> str:
 #: and resident memory at startup grew with total history. Pages ride the existing
 #: ``idx_events_type_cursor`` range index, so each step costs one page and the
 #: canonical commit order is unchanged.
+# Additive episode-identity index, created by the writer (not the generic schema,
+# which is pinned free of this event family's vocabulary). It is PARTIAL on the one
+# event type so ``json_extract`` is never evaluated on any other row: an unrelated
+# malformed payload must not be able to fail writer start-up. The type is a trusted
+# module constant inlined as a literal, because SQLite only uses a partial index
+# whose predicate the query states literally. A malformed row of this very type
+# already fails hydration closed, so this adds no new way to refuse to start.
+_EPISODE_IDENTITY_INDEX_NAME = "idx_events_episode_identity"
+_EPISODE_IDENTITY_INDEX_SQL = (
+    f"CREATE INDEX IF NOT EXISTS {_EPISODE_IDENTITY_INDEX_NAME} "
+    "ON events(json_extract(payload_json, '$.episode.episode_id'), "
+    "history_epoch, local_sequence) "
+    "WHERE event_type = "
+    f"'{opportunity_persistence_contract.OPPORTUNITY_LIFECYCLE_TRANSITION_RECORDED}'"
+)
+_EPISODE_ROWS_SQL = (
+    "SELECT event_id, history_epoch, local_sequence, payload_json FROM events "
+    "WHERE event_type = "
+    f"'{opportunity_persistence_contract.OPPORTUNITY_LIFECYCLE_TRANSITION_RECORDED}' "
+    "AND json_extract(payload_json, '$.episode.episode_id') = ? "
+    "AND (history_epoch > ? OR (history_epoch = ? AND local_sequence > ?)) "
+    "ORDER BY history_epoch ASC, local_sequence ASC LIMIT ?"
+)
+
 HYDRATION_PAGE_ROWS = 1000
 
 #: Upper bound on retained current-state projection entries.
@@ -415,6 +439,7 @@ class CanonicalWriter:
         try:
             self._conn = connect(self.db_path, read_only=False)
             initialize_schema(self._conn, now_iso=_utc_now())
+            self._conn.execute(_EPISODE_IDENTITY_INDEX_SQL)
             self._request_lifecycle_projection: dict[str, str] = _BoundedProjection()
             self._request_lifecycle_projection_watermark: tuple[int, int] = (0, -1)
             # Role-result identity is answered from the durable row through
@@ -793,19 +818,8 @@ class CanonicalWriter:
         epoch_cursor, sequence_cursor = 0, -1
         while True:
             rows = self._conn.execute(
-                "SELECT event_id, history_epoch, local_sequence, payload_json "
-                "FROM events WHERE event_type = ? "
-                "AND json_extract(payload_json, '$.episode.episode_id') = ? "
-                "AND (history_epoch > ? OR (history_epoch = ? AND local_sequence > ?)) "
-                "ORDER BY history_epoch ASC, local_sequence ASC LIMIT ?",
-                (
-                    contract.OPPORTUNITY_LIFECYCLE_TRANSITION_RECORDED,
-                    episode_id,
-                    epoch_cursor,
-                    epoch_cursor,
-                    sequence_cursor,
-                    HYDRATION_PAGE_ROWS,
-                ),
+                _EPISODE_ROWS_SQL,
+                (episode_id, epoch_cursor, epoch_cursor, sequence_cursor, HYDRATION_PAGE_ROWS),
             ).fetchall()
             if not rows:
                 break

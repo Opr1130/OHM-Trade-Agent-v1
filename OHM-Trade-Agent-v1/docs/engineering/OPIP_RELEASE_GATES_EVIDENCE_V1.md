@@ -69,9 +69,13 @@ released episodes, so startup was quadratic in history. #516's tests never excee
 rows. **Deploying #516 as merged would have made the canonical writer fail to start
 within any sane health deadline once history passed ~2k episodes.**
 
-Fix: additive `idx_events_episode_identity` (generic, partial, no F4 vocabulary — the
-schema is pinned free of it) and an indexed per-episode read. Regression tests:
-`test_ac_004_*`.
+Fix: additive `idx_events_episode_identity`, created by the writer (the generic schema is
+pinned free of F4 vocabulary), **partial on the one event type** so `json_extract` is
+never evaluated on any other row, and an indexed per-episode read with the type inlined
+as a literal (SQLite only uses a partial index whose predicate the query states
+literally). A first draft of the index that was not type-partial failed CI on two
+existing tests that store non-JSON rows of other types; that is why it is typed.
+Regression tests: `test_ac_004_*`.
 
 ### 2b. Fixed code against the pre-#516 code
 
@@ -132,9 +136,9 @@ separate, approved change that wires it.
 
 ## 4. Runtime changes in the release-gates PR (the whole list)
 
-1. `schema.py`: one additive partial index.
-2. `writer.py`: per-episode re-derivation uses that index; `submit()` rolls back on a
-   non-`Exception` interruption.
+1. `writer.py`: one additive writer-created partial index; per-episode re-derivation
+   uses it; `submit()` rolls back on a non-`Exception` interruption. (`schema.py` is
+   unchanged.)
 3. No change to `run_cycle.py`, `deploy/`, cron, compose, trading, learning, Early Watch,
    Committee or F11.
 

@@ -192,17 +192,6 @@ CREATE INDEX IF NOT EXISTS idx_events_di_request_state
     ON events(json_extract(payload_json, '$.request_id'), history_epoch, local_sequence)
     WHERE event_type = 'decision_intelligence.transition.recorded';
 
--- Additive episode-identity index. A bounded projection that has released an
--- episode re-derives it from that episode's own rows; without this index that
--- re-derivation is a scan of the whole event type, and because hydration itself
--- re-derives released episodes the writer's startup became quadratic in history.
--- The key is the payload's own ``episode.episode_id``; the partial predicate keeps
--- rows that carry no such identity out of the index. ``IF NOT EXISTS`` and no table
--- or column change: no data is rewritten.
-CREATE INDEX IF NOT EXISTS idx_events_episode_identity
-    ON events(json_extract(payload_json, '$.episode.episode_id'), history_epoch, local_sequence)
-    WHERE json_extract(payload_json, '$.episode.episode_id') IS NOT NULL;
-
 -- Additive continuity-restore indexes. Instrument identity lives in the
 -- payload. ``IF NOT EXISTS`` and no table or column change: an existing
 -- database gains the indexes on the next writer schema initialisation.

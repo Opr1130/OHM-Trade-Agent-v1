@@ -39,7 +39,7 @@ INDEX_SQL = (
     "WHERE event_type = 'decision_intelligence.role_result.recorded'",
     "CREATE INDEX IF NOT EXISTS idx_events_episode_identity "
     "ON events(json_extract(payload_json, '$.episode.episode_id'), history_epoch, local_sequence) "
-    "WHERE json_extract(payload_json, '$.episode.episode_id') IS NOT NULL",
+    "WHERE event_type = 'opportunity_lifecycle.transition.recorded'",
     "CREATE INDEX IF NOT EXISTS idx_events_di_request_state "
     "ON events(json_extract(payload_json, '$.request_id'), history_epoch, local_sequence) "
     "WHERE event_type = 'decision_intelligence.transition.recorded'",
