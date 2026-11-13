@@ -54,7 +54,7 @@ THEN: it keeps the newest 3 verified dumps, the newest verified dump of each of 
 AC-009:
 GIVEN: a checksummed dump and enough measured space
 WHEN: the restore drill runs
-THEN: the restore happens in a throwaway container with no network and its own data directory, never against the live container or admin credentials; a failed restore removes the container and data and writes no success evidence; success writes measured byte counts to the evidence file
+THEN: the restore starts only after the real server answers over TCP loopback (a readiness timeout is reported and cleans up); it runs in a throwaway container with no network and its own data directory, never against the live container or admin credentials; a failed restore removes the container and data and writes no success evidence; success writes measured byte counts to the evidence file
 
 AC-010:
 GIVEN: a failed dump or failed verification
@@ -85,6 +85,7 @@ AC-008 -> tests/test_opip_postgres_backup_repair_v1.py::test_retention_keeps_thr
 AC-008 -> tests/test_opip_postgres_backup_repair_v1.py::test_retention_refuses_to_prune_more_than_ten_dumps
 AC-009 -> tests/test_opip_postgres_backup_repair_v1.py::test_restore_drill_is_isolated_and_records_measured_bytes
 AC-009 -> tests/test_opip_postgres_backup_repair_v1.py::test_failed_restore_cleans_up_and_records_no_success
+AC-009 -> tests/test_opip_postgres_backup_repair_v1.py::test_restore_drill_waits_for_the_real_server_and_fails_loudly_when_not_ready
 AC-010 -> tests/test_opip_postgres_backup_repair_v1.py::test_failed_backup_never_prunes_anything
 
 IMPLEMENTATION MAP:
