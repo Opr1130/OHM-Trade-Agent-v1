@@ -193,3 +193,58 @@ def test_equivalent_on_boundary_grid():
         c = GateInput("LONG", e, e, 98.0, e * 1.02, e * (1 + move / 100), rr, cap, 1.0, 0.0)
         p = dataclasses.replace(EXEC, max_account_risk_at_stop_pct=None)
         assert evaluate_gate(c, p).qualified == _prod(c, p).qualified, (rr, move, cap)
+
+
+# --- extreme-value, boundary and serialization stability ---
+
+@pytest.mark.parametrize("kw", [
+    dict(available_capital=1e308, leverage=1e308),
+    dict(available_capital=1e308),
+    dict(leverage=1e308),
+    dict(entry_low=1e308, entry_high=1e308, stop_price=1.7e308, target_1=1e-300, target_2=1e-301, direction="SHORT"),
+    dict(reward_to_risk_2=1e308),
+])
+def test_extreme_finite_inputs_never_raise_and_never_pass_silently(kw):
+    pol = dataclasses.replace(EXEC, estimated_round_trip_cost_pct=1e308)
+    for p in (ADV, EXEC, pol):
+        r = evaluate_gate(dataclasses.replace(good(), **kw), p)
+        assert isinstance(r.qualified, bool)
+        assert r.qualified is False or all(math.isfinite(v) for v in r.metrics.values())
+
+
+def test_overflow_is_explicit_reason():
+    r = evaluate_gate(good(available_capital=1e308, leverage=1e308), ADV)
+    assert not r.qualified and r.primary_reason == ReasonCode.NUMERIC_OVERFLOW
+
+
+def test_policy_extremes_and_unserialisable_policy_fail_closed():
+    assert not evaluate_gate(good(), dataclasses.replace(ADV, min_net_profit=1e308)).qualified
+    weird = dataclasses.replace(ADV, policy_id=object())  # type: ignore[arg-type]
+    assert not evaluate_gate(good(), weird).qualified
+
+
+def test_exact_decimal_net_profit_boundary_half_up():
+    # notional 10000 * move 0.75% = 75.00 gross, cost 0 => net exactly $75.00
+    c = good(entry_low=100, entry_high=100, stop_price=90, target_1=100.5, target_2=100.75, available_capital=10000.0)
+    at = dataclasses.replace(ADV, min_net_profit=75.0)
+    assert evaluate_gate(c, at).qualified == _prod(c, at).qualified is True
+    above = dataclasses.replace(ADV, min_net_profit=75.01)
+    assert evaluate_gate(c, above).qualified == _prod(c, above).qualified is False
+
+
+def test_direction_convention_matches_production_exactly():
+    c = good(direction="short", entry_low=100, entry_high=100, stop_price=105, target_1=95, target_2=90)
+    assert evaluate_gate(c, ADV).qualified == _prod(c, ADV).qualified
+    with pytest.raises(ValueError):
+        _prod(good(direction="BUY"), ADV)
+    assert evaluate_gate(good(direction="BUY"), ADV).primary_reason == ReasonCode.INPUT_INVALID
+
+
+def test_digest_golden_and_result_serialisation_are_stable():
+    assert ADV.digest() == ADV.digest()
+    assert ADV.digest() == "c17c156d2addbee6713295f9631b4d64f44817e5a14007d271f576711deb42fa"
+    r = evaluate_gate(good(), EXEC)
+    import json
+    a = json.dumps(dataclasses.asdict(r), sort_keys=True, default=str)
+    b = json.dumps(dataclasses.asdict(evaluate_gate(good(), EXEC)), sort_keys=True, default=str)
+    assert a == b

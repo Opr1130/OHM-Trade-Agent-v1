@@ -33,3 +33,14 @@ purity, "not imported outside the package", equivalence with the production gate
 ## Gating / non-goals
 No scanner, Chief, S1-dependent reconciliation, lineage or S4 persistence changes.
 Integration requires S1 evidence and a compatibility review, then a separate owner approval.
+
+## Hardening addendum (owner review, 2026-11-13)
+- `evaluate_gate` is wrapped: any arithmetic/type failure becomes `INTERNAL_ERROR`;
+  non-finite derived values become `NUMERIC_OVERFLOW`. Stress tests cover 1e308 capital,
+  leverage, costs, geometry and policy floors.
+- **Production finding:** `evaluate_economic_quality(plan, 1e308)` raises `OverflowError`
+  (verified). The interface is stricter by design; production callers are unchanged.
+- Direction convention verified: production accepts only LONG/SHORT (case-insensitive,
+  raises otherwise); the interface is identical except it rejects instead of raising.
+- Added: exact decimal net-profit boundary ($75.00 / $75.01) vs production, golden
+  policy digest, stable result serialization. 37 tests.

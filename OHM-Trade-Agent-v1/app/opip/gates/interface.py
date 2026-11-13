@@ -36,6 +36,8 @@ class ReasonCode(str, Enum):
     TARGET_MOVE_BELOW_MIN = "TARGET_MOVE_BELOW_MIN"
     NET_PROFIT_BELOW_MIN = "NET_PROFIT_BELOW_MIN"
     ACCOUNT_RISK_ABOVE_MAX = "ACCOUNT_RISK_ABOVE_MAX"
+    NUMERIC_OVERFLOW = "NUMERIC_OVERFLOW"
+    INTERNAL_ERROR = "INTERNAL_ERROR"
 
 
 def _is_number(value: Any) -> bool:
@@ -159,7 +161,16 @@ def _safe_digest(policy: GatePolicy) -> str:
 
 
 def evaluate_gate(candidate: GateInput, policy: GatePolicy) -> GateResult:
-    """Evaluate one candidate against one policy. Never raises on bad data."""
+    """Evaluate one candidate against one policy. Never raises: any unexpected
+    arithmetic/type failure is converted to a fail-closed rejection."""
+    try:
+        return _evaluate(candidate, policy)
+    except (ArithmeticError, ValueError, TypeError, AttributeError):
+        pid = policy.policy_id if isinstance(policy, GatePolicy) and isinstance(policy.policy_id, str) else ""
+        return GateResult(GATE_INTERFACE_VERSION, pid, "", False, (ReasonCode.INTERNAL_ERROR,))
+
+
+def _evaluate(candidate: GateInput, policy: GatePolicy) -> GateResult:
     if not isinstance(policy, GatePolicy):
         return GateResult(GATE_INTERFACE_VERSION, "", "", False, (ReasonCode.POLICY_INVALID,))
     bad = policy.validation_errors()
@@ -199,8 +210,13 @@ def evaluate_gate(candidate: GateInput, policy: GatePolicy) -> GateResult:
     capital = vals["available_capital"] * policy.max_capital_fraction
     notional = capital * vals["leverage"]
     cost = notional * (policy.estimated_round_trip_cost_pct + vals["estimated_margin_cost_pct"]) / 100
-    net_t2 = quantize_usd_cents(notional * t2_move / 100 - cost)
+    raw_net = notional * t2_move / 100 - cost
+    net_t2 = quantize_usd_cents(raw_net) if math.isfinite(raw_net * 100.0) else float("nan")
     account_risk = stop_pct * vals["leverage"] * policy.max_capital_fraction
+
+    derived = (stop_pct, t2_move, capital, notional, cost, net_t2, account_risk)
+    if not all(math.isfinite(d) for d in derived):
+        return _reject(policy, ReasonCode.NUMERIC_OVERFLOW, "derived value not finite")
 
     reasons: list[ReasonCode] = []
     detail: list[str] = []
