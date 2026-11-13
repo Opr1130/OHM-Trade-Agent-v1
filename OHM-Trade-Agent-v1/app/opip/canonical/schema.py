@@ -176,6 +176,22 @@ CREATE INDEX IF NOT EXISTS idx_events_paper_trade
 CREATE INDEX IF NOT EXISTS idx_events_type_cursor
     ON events(event_type, history_epoch, local_sequence);
 
+-- Additive identity-lookup index for the current-state projections.
+--
+-- The writer used to answer "what is this identity's state now?" from an
+-- unbounded in-process dictionary hydrated from the whole history. The authority
+-- for the answer is the durable row, so this index makes the per-identity read a
+-- range seek instead of a full scan. ``IF NOT EXISTS`` and no table or column
+-- change: an existing database gains it on the next writer schema initialisation
+-- and no data is rewritten.
+CREATE INDEX IF NOT EXISTS idx_events_role_result_identity
+    ON events(json_extract(payload_json, '$.result_id'))
+    WHERE event_type = 'decision_intelligence.role_result.recorded';
+
+CREATE INDEX IF NOT EXISTS idx_events_di_request_state
+    ON events(json_extract(payload_json, '$.request_id'), history_epoch, local_sequence)
+    WHERE event_type = 'decision_intelligence.transition.recorded';
+
 -- Additive continuity-restore indexes. Instrument identity lives in the
 -- payload. ``IF NOT EXISTS`` and no table or column change: an existing
 -- database gains the indexes on the next writer schema initialisation.

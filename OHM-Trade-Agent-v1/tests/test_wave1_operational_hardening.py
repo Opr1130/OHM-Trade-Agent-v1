@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from app.jobs import run_cycle
 from app.services import active_trade_monitor_runner
 from app.services.external_order_review import ExternalOrderReviewSummary
@@ -26,6 +28,18 @@ def _decision_search():
         quiet_hours=False,
         reason="capacity available",
     )
+
+
+@pytest.fixture(autouse=True)
+def _self_contained_settings(monkeypatch):
+    # run_cycle calls get_settings(); do not depend on another test having
+    # primed the lru_cache or on ambient env (CI order differs by selection).
+    from app.core.config import get_settings
+
+    monkeypatch.setenv("WEBHOOK_SECRET", "wave1-test-secret-0123456789")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 
 def test_reconciliation_failure_does_not_block_active_monitor(monkeypatch):
