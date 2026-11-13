@@ -309,14 +309,19 @@ def test_oom_evidence_tolerates_an_unreadable_container():
 def test_scope_contract_declares_the_active_increment():
     """ATDD-SCANNER-OOM-OBSERVABILITY-M01/AC-003: the scope is declared."""
     app_root = Path(__file__).resolve().parents[1]
+    # The global pointer is movable orchestration state (PR-scoped selection
+    # resolves a PR's own contract), so this test proves its identity from its own
+    # frozen contract and only requires the pointer to name a real contract.
+    contract_dir = app_root / "docs" / "atdd" / "scope-contracts"
     pointer = (app_root / "docs" / "atdd" / "ACTIVE_INCREMENT").read_text(
         encoding="utf-8"
     ).strip()
-    assert pointer == "ATDD-SCANNER-OOM-OBSERVABILITY-M01"
-    contract_path = app_root / "docs" / "atdd" / "scope-contracts" / f"{pointer}.md"
+    assert (contract_dir / f"{pointer}.md").is_file(), pointer
+    own = "ATDD-SCANNER-OOM-OBSERVABILITY-M01"
+    contract_path = contract_dir / f"{own}.md"
     assert contract_path.is_file()
     contract = contract_path.read_text(encoding="utf-8")
-    assert contract.startswith(f"INCREMENT:\n{pointer}")
+    assert contract.startswith(f"INCREMENT:\n{own}")
     for section in (
         "OWNER-APPROVED INTENT:",
         "ARCHITECTURE REFERENCES:",
