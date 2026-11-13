@@ -29,7 +29,7 @@ from app.opip.storage.bounded_jsonl import (
     encode_row,
     fsync_dir as _fsync_dir,
     parse_json_object_line as _parse_json_object_line,
-    read_lines as _read_lines,
+    read_tail_lines as _read_tail_lines,
     repair_truncated_tail,
     sha256_file as _sha256_file,
     write_atomic_lines as _write_atomic_lines,
@@ -316,9 +316,16 @@ class EventStore:
                 os.fsync(handle.fileno())
             if (
                 self.dead_letter_file.stat().st_size > DEAD_LETTER_MAX_BYTES
-                or len(_read_lines(self.dead_letter_file)) > DEAD_LETTER_KEEP_LINES
+                or len(_read_tail_lines(self.dead_letter_file, DEAD_LETTER_KEEP_LINES + 1))
+                > DEAD_LETTER_KEEP_LINES
             ):
-                lines = _read_lines(self.dead_letter_file)[-DEAD_LETTER_KEEP_LINES:]
+                # Retention reads only the tail it will keep. The previous shape
+                # materialised the whole dead-letter file twice - once to count and
+                # once to slice - so the read cost (and peak RSS) grew with a file
+                # this path exists to bound.
+                lines = _read_tail_lines(
+                    self.dead_letter_file, DEAD_LETTER_KEEP_LINES
+                )
                 _write_atomic_lines(self.dead_letter_file, lines)
 
     def _iter_archive_events(self) -> Iterable[OPipEvent]:

@@ -1033,12 +1033,23 @@ class CaptureProcessLock:
         fd = os.open(self._path, flags, 0o600)
         try:
             identity = os.fstat(fd)
-            if (
-                not stat.S_ISREG(identity.st_mode)
-                or identity.st_nlink != 1
+            # Regular-file identity is a property of the path, not of the
+            # platform: it must hold everywhere.
+            #
+            # The link/ownership/mode invariant is a POSIX invariant. Windows has
+            # no POSIX permission bits in ``st_mode`` (it synthesizes 0o666), so
+            # testing ``st_mode & 0o022`` there rejects EVERY lock file and makes
+            # the producer lock unusable - a portability defect, not a security
+            # control. It is therefore asserted only where its inputs exist; on
+            # Windows the equivalent protection is the reparse/symlink rejection
+            # above, and the production runtime is Linux, where the full check
+            # always applies.
+            posix_identity_problem = os.name == "posix" and (
+                identity.st_nlink != 1
                 or (hasattr(os, "geteuid") and identity.st_uid != os.geteuid())
-                or identity.st_mode & 0o022
-            ):
+                or bool(identity.st_mode & 0o022)
+            )
+            if not stat.S_ISREG(identity.st_mode) or posix_identity_problem:
                 raise PermissionError(
                     "capture lock must be a singly linked, owned, "
                     "non-group-writable regular file"
