@@ -65,7 +65,9 @@ pre-#516 writer's memory limit was reached at roughly **37k** rows
 size where the new code starts to fail on time.
 
 **Threshold used for the decision:** GO on this axis only if the host shows fewer than
-about **20,000 total events** (`next_local_sequence`, ~25% margin), *or* the observed
+about **20,000 total events** (bundle §5 `EVENT_TOTAL_UPPER_BOUND`, ~25% margin; **never**
+`next_local_sequence`, which a supported restore resets to 1 without deleting history, so
+it is only a current-epoch position), *or* the observed
 `StartedAt → "ready"` interval in bundle §4 is well under 60 s. The CPU-scaling
 assumption is exactly what bundle §4 replaces with an observation. If the count is
 higher, the fix is a production-config decision (raise the writer's CPU and/or the
@@ -99,12 +101,19 @@ health wait) — not made here, and not a code defect.
 `tools/opip_readiness_bundle.sh` — run `sudo bash opip_readiness_bundle.sh | tee /tmp/opip-readiness.txt`.
 It reports: host RAM/swap/CPU/disk; the writer's limits, restarts, OOM flag and
 health configuration; one `docker stats` sample; the **observed writer start-up
-interval**; database/WAL sizes and the O(1) `next_local_sequence`; one niced,
-20-second-boxed count of the opportunity event type; cycle bound, recent statuses,
-orphans (`ps` and the existing diagnostic's lock fields); the deployed health deadline;
-and the safety-relevant environment variables. It copies no database, scans nothing
-unbounded, and a test (`AC-007`) fails if a mutating command or a non-read-only
-database open is ever added.
+interval**; database/WAL sizes; `history_epoch` and `next_local_sequence` labelled as a current-epoch
+position; `EVENT_TOTAL_UPPER_BOUND`, the sum over every epoch of the per-epoch maximum
+`local_sequence` (O(epochs × log n) index seeks, never below the true total, or
+`UNVERIFIED` — which keeps this axis NO-GO); one niced, 20-second-boxed count of the
+opportunity event type; cycle bound, recent statuses, orphans (`ps`) and the cycle-lock
+holder read from `/proc/locks`; the deployed health deadline; and the safety-relevant
+environment variables. It copies no database, scans nothing unbounded, and **invokes no
+other repository script**: the learning diagnostic it originally called reaches
+`registry_io.load_json`, which can quarantine a malformed registry with `os.replace`, and
+filtering a callee's output cannot undo its side effect. Tests (probe `AC-007`, and
+`ATDD-OPIP-READINESS-BUNDLE-FIX-V1` AC-001/AC-002) run the bundle against a booby-trapped
+callee, a corrupt registry and a multi-epoch store and compare bytes, names and mtimes.
+SQLite's volatile `-shm` index is the one file excluded from that comparison.
 
 ## 7. Open risks (exact conditions)
 
