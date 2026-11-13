@@ -71,7 +71,7 @@ From `OHM-Trade-Agent-v1/`:
 python -m pytest -m acceptance
 ```
 
-`.github/workflows/pytest.yml` runs that suite and an `atdd-scope` job. The job reads `docs/atdd/ACTIVE_INCREMENT` and compares the pull-request diff with that increment only.
+`.github/workflows/pytest.yml` runs that suite and an `atdd-scope` job. The job runs `tests/atdd_scope.py --pr-scoped`: it selects the one scope contract the pull request adds or modifies and compares the diff with that increment only. `docs/atdd/ACTIVE_INCREMENT` is read only as the legacy fallback when the pull request changes no contract.
 
 ## Scope-drift stop
 
@@ -86,7 +86,7 @@ Do not implement it. Do not silently broaden an existing criterion. Record the p
 
 Adjacent bugs, refactors, observability, and future requirements go under `DEFERRED DISCOVERIES`. They are not acceptance criteria and do not enter the increment.
 
-`docs/atdd/ACTIVE_INCREMENT` names the one increment allowed to authorize files. An older contract's implementation map does not authorize a later increment. A missing, ambiguous, or unknown active increment fails closed.
+Per pull request, exactly one increment may authorize files: the contract that PR changes (see PR-scoped selection below), or, for a PR that changes no contract, the legacy `docs/atdd/ACTIVE_INCREMENT` fallback. An older contract's implementation map does not authorize a later increment. A missing, ambiguous, or unknown active increment fails closed.
 
 ### PR-scoped selection (collision-free)
 
@@ -102,7 +102,7 @@ New PRs should add their own contract and **not** touch `ACTIVE_INCREMENT`. The 
 
 ### The active increment pointer is movable
 
-`docs/atdd/ACTIVE_INCREMENT` holds a single increment identifier. It is **mutable orchestration state**, not a permanent record: it names the one increment currently authorized to change files and is **deliberately movable**. Exact current-increment enforcement belongs to `tests/atdd_scope.py` and the `atdd scope` CI job, which read the pointer from the pull-request head and compare the diff against that increment only.
+`docs/atdd/ACTIVE_INCREMENT` holds a single increment identifier. It is **mutable orchestration state**, not a permanent record: it is **no longer authoritative for PRs that carry their own contract** and is only the migration fallback for PRs that change none (the fallback is intentionally supported and still fails closed when missing, ambiguous or unknown). **New work should carry its own contract and must not edit this file.** Enforcement belongs to `tests/atdd_scope.py` and the `atdd scope` CI job.
 
 Consequences for acceptance tests:
 
