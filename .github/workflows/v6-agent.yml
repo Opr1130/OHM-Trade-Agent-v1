@@ -43,6 +43,13 @@ jobs:
        (vars.V6_BOT_LOGIN != '' && github.actor == vars.V6_BOT_LOGIN))
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # Job-level override: same as the workflow defaults plus actions: write, used only
+    # to dispatch the advisory Gemini review for a verified PR.
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: write
     env:
       ISSUE_NUMBER: ${{ github.event.issue.number }}
       ISSUE_TITLE: ${{ github.event.issue.title }}
@@ -114,8 +121,16 @@ jobs:
               echo "Built by the v6 agent. Verification: $([ "$VERIFIED" = "true" ] && echo passed || echo FAILED, opened as draft)."
               echo "Run: $RUN_URL"
             } > "$RUNNER_TEMP/pr.md"
-            gh pr create --base main --head "v6/issue-${ISSUE_NUMBER}" \
-              --title "$ISSUE_TITLE" --body-file "$RUNNER_TEMP/pr.md" "${draft[@]}"
+            pr_url="$(gh pr create --base main --head "v6/issue-${ISSUE_NUMBER}" \
+              --title "$ISSUE_TITLE" --body-file "$RUNNER_TEMP/pr.md" "${draft[@]}")"
+            echo "$pr_url"
+            # Advisory only: ask Gemini for an independent review of verified PRs. A
+            # dispatch failure must never fail the build or block the PR.
+            if [ "$VERIFIED" = "true" ]; then
+              GH_TOKEN="${{ github.token }}" gh workflow run gemini-review.yml \
+                --repo "$GITHUB_REPOSITORY" --ref main -f pr_number="${pr_url##*/}" \
+                || echo "::warning::Gemini review dispatch failed; PR is unaffected."
+            fi
           fi
           # REST only, with the workflow token (issues: write): the bot token cannot edit labels.
           export GH_TOKEN="${{ github.token }}"
