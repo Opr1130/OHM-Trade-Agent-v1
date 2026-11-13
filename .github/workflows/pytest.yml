@@ -165,7 +165,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Enforce the active ATDD increment against the changed-file set
+      - name: Enforce the PR's own ATDD increment against the changed-file set
         working-directory: OHM-Trade-Agent-v1
         run: |
           set -euo pipefail
@@ -182,8 +182,10 @@ jobs:
               ;;
           esac
           git rev-parse --verify "$base"
-          increment="$(tr -d '\r\n' < docs/atdd/ACTIVE_INCREMENT)"
-          python tests/atdd_scope.py --increment "$increment" --git-base "$base"
+          # PR-scoped: the increment is the one scope contract this change set
+          # adds or modifies. docs/atdd/ACTIVE_INCREMENT is only the legacy
+          # fallback when no contract changed; see docs/atdd/README.md.
+          python tests/atdd_scope.py --pr-scoped --git-base "$base"
 
   architecture-gate:
     name: release architecture gate
