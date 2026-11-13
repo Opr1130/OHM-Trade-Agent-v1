@@ -773,6 +773,8 @@ def _rollback_harness(tmp: Path, quiescence_rc: int) -> subprocess.CompletedProc
         f"LOG={shlex.quote(log.as_posix())}\n"
         ': >"$LOG"\n'
         "PREVIOUS_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        # This legacy rollback fixture models an already-proven Paper ON release.
+        "PAPER_DEPLOY_MODE=ON\n"
         f"APP_ROOT={shlex.quote(tmp.as_posix())}\n"
         f"SAFE_BASELINE_OVERRIDE={shlex.quote((tmp / 'override.yml').as_posix())}\n"
         f"LAST_GOOD_FILE={shlex.quote((tmp / 'last-good-sha').as_posix())}\n"

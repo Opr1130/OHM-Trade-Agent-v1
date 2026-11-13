@@ -14,6 +14,18 @@ from app.services.order_intent_registry import (
 )
 
 
+MANUAL_ONLY_ALERT_BANNER = "Tradevisor Alerts — MANUAL ONLY (FILL NOT TRACKED)"
+
+
+def manual_advisory_without_reconciliation(candidate: dict[str, Any]) -> bool:
+    """Manual advisory is never exchange-authorized and only exists while tracking is OFF."""
+    return (
+        candidate.get("manual_only_advisory") is True
+        and not reconciliation_enabled()
+        and reconciliation_mode() == "observe"
+    )
+
+
 class ReconciliationTrackingDisabled(RuntimeError):
     """Qualified trade tracking is intentionally unavailable by configuration."""
 
@@ -58,6 +70,14 @@ def register_reconciliation_intent(
         else str(reconciliation_mode_value).lower()
     )
     if not enabled or mode != "apply":
+        # Notification-only owner mode: no Kraken intent or fill lifecycle is
+        # ever created. Enabled/apply retains the original full tracking path.
+        if (
+            candidate.get("manual_only_advisory") is True
+            and not enabled
+            and mode == "observe"
+        ):
+            return
         raise ReconciliationTrackingDisabled(
             "Kraken reconciliation must be enabled in apply mode"
         )

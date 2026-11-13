@@ -23,6 +23,13 @@ The store is dark by default. ``OPIP_FUNNEL_TELEMETRY_ENABLED`` must be set
 explicitly, exactly like ``P1_SHADOW_OUTBOX_ENABLED``, so merging this build
 cannot begin writing to a production volume that nobody sized for it. The
 in-memory funnel and the printed scan summary do not depend on the flag.
+
+Every row written through an appender that has no builder-level stamp (the
+screening and milestone streams) is labelled with the v6 version block from
+``app.opip.decision.versioning`` before it is encoded. The stamp is additive and
+never overwrites a value the caller captured, and reads are untouched, so rows
+written before the stamp existed still load exactly as recorded. Nothing in this
+module gates, ranks, alerts or trades differently because of it.
 """
 
 from __future__ import annotations
@@ -36,6 +43,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from app.opip.decision.versioning import version_stamp
 from app.opip.storage.bounded_jsonl import (
     BoundedJsonlArchive,
     encode_row,
@@ -313,6 +321,22 @@ def _serialize(payload: Mapping[str, Any]) -> str:
     return json.dumps(payload, sort_keys=True, allow_nan=False)
 
 
+def stamp_qualification_record(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Return ``row`` with the v6 version stamp added as additive fields.
+
+    The stamp names the strategy, model and gate policy that produced the
+    record, so a future analysis can partition evidence by policy version. It is
+    strictly additive: a key the caller already set always wins, which keeps the
+    exact values a row captured (the funnel and scan-summary builders stamp
+    their own rows) and never rewrites a replayed historical row. Every call
+    returns a fresh dict, so the caller's mapping is not mutated.
+    """
+    stamped = dict(row)
+    for key, value in version_stamp().items():
+        stamped.setdefault(key, value)
+    return stamped
+
+
 def _append_dead_letter(path: Path, reason: str, payload: Any) -> None:
     """Record a row that could not be serialised, never raising."""
     try:
@@ -349,10 +373,14 @@ def _append_rows(
     max_bytes: int,
     keep_lines: int,
     dead_letter_path: Path,
+    version_stamped: bool = False,
 ) -> int:
     """Append rows under one lock, isolating per-row serialisation failures.
 
     Returns the number of rows actually written, not the number attempted.
+    ``version_stamped`` adds the version block to rows that do not already carry
+    their own stamp (see ``stamp_qualification_record``). It only labels the
+    record; it cannot change a gate, a threshold or a decision.
     """
     pending = list(rows)
     if not pending:
@@ -363,7 +391,10 @@ def _append_rows(
     encoded_rows: list[bytes] = []
     for row in pending:
         try:
-            encoded_rows.append(encode_row(dict(row)))
+            payload = (
+                stamp_qualification_record(row) if version_stamped else dict(row)
+            )
+            encoded_rows.append(encode_row(payload))
         except (TypeError, ValueError) as exc:
             failures.append((f"{type(exc).__name__}: {exc}", row))
 
@@ -481,7 +512,12 @@ def append_screening_evaluations(
     dead_letter_path: Path | None = None,
     enabled: bool | None = None,
 ) -> int:
-    """Persist screening rows. Fail-soft; returns the number written."""
+    """Persist screening rows. Fail-soft; returns the number written.
+
+    Screening rows are built by the scanners, not by a builder that stamps its
+    own rows, so the writer labels each record with the v6 version block before
+    it is encoded. The label is additive and cannot change admission.
+    """
     active = opip_funnel_telemetry_enabled() if enabled is None else bool(enabled)
     if not active:
         return 0
@@ -491,6 +527,7 @@ def append_screening_evaluations(
         max_bytes=SCREENING_EVALUATIONS_MAX_BYTES,
         keep_lines=SCREENING_EVALUATIONS_KEEP_LINES,
         dead_letter_path=dead_letter_path or DEAD_LETTER_FILE,
+        version_stamped=True,
     )
 
 
@@ -506,7 +543,9 @@ def append_early_timing_milestones(
     Measurement-only, additive, and bounded by the same archive-before-delete
     machinery as every other stream here. Deliberately a new stream rather
     than a new evidence plane: it shares the directory, the lock convention,
-    the dead-letter file and the retention model.
+    the dead-letter file and the retention model. Like the screening stream the
+    rows are built outside a stamping builder, so the writer labels them with
+    the v6 version block.
     """
     active = opip_funnel_telemetry_enabled() if enabled is None else bool(enabled)
     if not active:
@@ -517,6 +556,7 @@ def append_early_timing_milestones(
         max_bytes=EARLY_TIMING_MILESTONES_MAX_BYTES,
         keep_lines=EARLY_TIMING_MILESTONES_KEEP_LINES,
         dead_letter_path=dead_letter_path or DEAD_LETTER_FILE,
+        version_stamped=True,
     )
 
 

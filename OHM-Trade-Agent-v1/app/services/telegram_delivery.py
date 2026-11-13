@@ -539,6 +539,7 @@ def build_delivery_summary(*, scope: str = "all", path: Path = EVENT_FILE) -> di
     delivery_rows = [row for row in rows if row.get("record_type") == "TELEGRAM_DELIVERY_EVENT"]
     statuses: dict[str, int] = {}
     families: dict[str, int] = {}
+    suppression_reasons: dict[str, int] = {}
     delivered = 0
     failed = 0
     suppressed = 0
@@ -555,6 +556,8 @@ def build_delivery_summary(*, scope: str = "all", path: Path = EVENT_FILE) -> di
                 latencies.append(value)
         elif status == "SUPPRESSED":
             suppressed += 1
+            reason = str(row.get("suppression_reason") or "UNSPECIFIED").upper()
+            suppression_reasons[reason] = suppression_reasons.get(reason, 0) + 1
         elif status.endswith("FAILED"):
             failed += 1
     return {
@@ -573,5 +576,8 @@ def build_delivery_summary(*, scope: str = "all", path: Path = EVENT_FILE) -> di
         ),
         "by_status": dict(sorted(statuses.items())),
         "by_family": dict(sorted(families.items())),
+        # OPIP-ALERT-ACTIONABLE-ONLY-001: bounded aggregate of *why* cards were suppressed, so
+        # suppression remains attributable per reason and family without a second store.
+        "by_suppression_reason": dict(sorted(suppression_reasons.items())),
         "recent": list(reversed(delivery_rows[-40:])),
     }

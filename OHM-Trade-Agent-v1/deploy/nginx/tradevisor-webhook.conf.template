@@ -55,14 +55,13 @@ server {
     ssl_certificate     /etc/letsencrypt/live/161-35-106-207.sslip.io/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/161-35-106-207.sslip.io/privkey.pem;
 
-    # TradingView documents that its webhook server presents a client
-    # certificate, but publishes no CA certificate or public key to verify it
-    # against. Chain verification therefore cannot be configured without
-    # inventing a trust anchor, and a subject-only match would be satisfied by
-    # any self-signed certificate carrying the same subject. `optional_no_ca`
-    # REQUESTS the certificate so the subject can be observed as delivery
-    # evidence; it is never treated as authentication here.
-    ssl_verify_client optional_no_ca;
+    # Do not request a client certificate. A genuine TradingView delivery on
+    # 2026-11-12 was rejected with HTTP 400 and
+    # client_verify=FAILED:unsuitable certificate purpose under optional_no_ca.
+    # TradingView publishes no usable client-cert CA for trusted verification.
+    # Client-certificate observation is unavailable; authentication remains
+    # the TradingView source-IP allowlist, edge stamp and body ingest token.
+    ssl_verify_client off;
 
     access_log /dev/stdout tradevisor_edge;
 

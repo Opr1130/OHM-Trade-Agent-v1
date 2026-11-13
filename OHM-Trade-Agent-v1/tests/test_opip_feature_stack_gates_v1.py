@@ -140,18 +140,19 @@ def test_ac_027_the_scope_base_stays_github_derived_and_fail_closed() -> None:
     WHEN its diff base is resolved
     THEN a pull request always diffs against `origin/<github.base_ref>` from
     GitHub, a push diffs against `github.event.before`, a missing or all-zero base
-    fails closed, the increment stays the movable pointer, and no caller-supplied
-    input may replace either base
+    fails closed, the increment is selected PR-scoped from the change set's own
+    contract (legacy movable pointer only as fallback; see
+    ATDD-OPIP-ATDD-PR-SCOPED-SELECTION-v1), and no caller-supplied input may
+    replace either base
     """
     text = _workflow_text()
     assert 'git fetch origin "${{ github.base_ref }}"' in text
     assert 'base="origin/${{ github.base_ref }}"' in text
     assert 'base="${{ github.event.before }}"' in text
     assert "changed-file base is missing" in text
-    assert (
-        'python tests/atdd_scope.py --increment "$increment" --git-base "$base"' in text
-    )
-    assert "increment=\"$(tr -d '\\r\\n' < docs/atdd/ACTIVE_INCREMENT)\"" in text
+    assert 'python tests/atdd_scope.py --pr-scoped --git-base "$base"' in text
+    # No caller- or pointer-supplied increment is passed on the CI command line.
+    assert "--increment" not in text.split("atdd-scope:")[1].split("architecture-gate:")[0]
     assert "workflow_dispatch" not in text
     assert "inputs." not in text
 

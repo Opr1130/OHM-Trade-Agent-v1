@@ -18,6 +18,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from app.exchanges.kraken import KrakenAPIError, KrakenClient
+from app.exchanges.kraken_identity import VENUE_ID
 from app.scanner.execution_validation import ExecutionValidation, evaluate_execution
 from app.scanner.market_scanner import analyze_symbol
 from app.scanner.models import MarketSnapshot
@@ -27,6 +28,10 @@ from app.scanner.models import MarketSnapshot
 DEFAULT_VALIDATION_NOTIONAL_USD = 250.0
 PUBLIC_TIMEOUT_SECONDS = 5.0
 RECENT_TRADE_COUNT = 20
+
+#: The venue ``kraken_execution_evidence`` actually reads. This is recorded with the evidence so a
+#: consumer never has to guess (or hardcode) which venue a book came from.
+EXECUTION_VENUE = VENUE_ID
 
 
 def native_snapshot(market: str):

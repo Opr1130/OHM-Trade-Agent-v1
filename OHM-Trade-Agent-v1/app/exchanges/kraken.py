@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from app.services.kraken_transport import (
@@ -9,6 +10,8 @@ from app.services.kraken_transport import (
     get_shared_kraken_transport,
 )
 
+#: Kraken silently returns fewer levels than requested above this ceiling.
+DEPTH_MAX_COUNT = 500
 
 class KrakenAPIError(RuntimeError):
     """Raised when Kraken returns an API or network error."""
@@ -167,6 +170,45 @@ class KrakenClient:
             price=float(item["price"]),
             quantity=float(item["qty"]),
             publication_timestamp=item.get("publication_ts"),
+        )
+
+    def get_depth(self, pair: str, count: int = DEPTH_MAX_COUNT) -> PreTradeBook:
+        """Deep public order book for shortlisted finalists only.
+
+        ``PreTrade`` returns exactly ten aggregated levels regardless of the
+        parameters it is given, so a +/-0.5% band can never be measured from it.
+        Kraken's public ``Depth`` endpoint does support a deep book, but it
+        SILENTLY returns fewer levels than requested above its own ceiling, so
+        the count is clamped here and the caller must verify what actually came
+        back instead of assuming the request was honoured.
+        """
+        requested = max(1, min(int(count), DEPTH_MAX_COUNT))
+        result = self._get("Depth", {"pair": pair, "count": requested})
+        key = next((name for name in result if name != "last"), None)
+        if key is None:
+            raise KrakenAPIError(f"No Depth data returned for {pair}")
+        body = result.get(key) or {}
+        return PreTradeBook(
+            symbol=pair,
+            bids=[self._depth_level(row) for row in (body.get("bids") or [])[:requested]],
+            asks=[self._depth_level(row) for row in (body.get("asks") or [])[:requested]],
+        )
+
+    @staticmethod
+    def _depth_level(row: list[Any]) -> BookLevel:
+        """Depth rows are ``[price, volume, unix_seconds]`` triples."""
+        published = None
+        if len(row) > 2:
+            try:
+                published = datetime.fromtimestamp(
+                    int(float(row[2])), tz=timezone.utc
+                ).isoformat()
+            except (TypeError, ValueError, OSError):
+                published = None
+        return BookLevel(
+            price=float(row[0]),
+            quantity=float(row[1]),
+            publication_timestamp=published,
         )
 
     def get_post_trade(self, symbol: str, count: int = 100) -> list[PublicTrade]:
