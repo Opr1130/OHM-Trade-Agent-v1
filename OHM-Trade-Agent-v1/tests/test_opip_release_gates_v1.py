@@ -548,7 +548,7 @@ def test_ac_007_the_posix_lock_invariants_are_still_enforced(tmp_path):
 def test_ac_008_the_scale_probe_refuses_live_looking_paths_and_copies_for_measuring(
     tmp_path,
 ):
-    """ATDD-OPIP-RELEASE-GATES-V1/AC-008: the probe never opens a live store and measures a copy, leaving the original byte-identical."""
+    """ATDD-OPIP-RELEASE-GATES-V1/AC-008: the probe never opens a live store and measures a verified snapshot, leaving the original byte-identical."""
     sys.path.insert(0, str(APP_ROOT / "tools"))
     try:
         import opip_canonical_scale_probe as probe
@@ -563,7 +563,7 @@ def test_ac_008_the_scale_probe_refuses_live_looking_paths_and_copies_for_measur
     seed = CanonicalWriter(db)
     seed.close()
     before = db.read_bytes()
-    copied = probe._working_copy(db, copy=True)
-    assert copied != db and copied.read_bytes() == before
+    target = tmp_path / "snap" / "snapshot.sqlite3"
+    info = probe.snapshot_database(db, target)
+    assert target.is_file() and info["integrity"] == "ok"
     assert db.read_bytes() == before
-    assert json.loads(json.dumps({"ok": True}))["ok"] is True
