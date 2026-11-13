@@ -43,6 +43,10 @@ SAFE_BASELINE_OVERRIDE="$STATE_DIR/safe-baseline-rollback.override.yml"
 PAPER_GENESIS_MARKER="$STATE_DIR/paper-registry-initialized-v1"
 SCHEDULER_RECONCILE="$APP_ROOT/deploy/remote/reconcile-scheduler.sh"
 PAPER_COMPOSE="$APP_ROOT/docker-compose.paper.yml"
+PAPER_CONTROL_FILE="$DATA_ROOT/paper_trading/control.json"
+LEARNING_EXPORT_FLAG="/etc/opip/learning-export.enabled"
+PAPER_DEPLOY_MODE="UNPROVEN"
+LEARNING_EXPORT_MODE="UNPROVEN"
 #: Isolated acquisition worker. A separate Compose service with its own
 #: image, so it must ship with the release instead of drifting behind it.
 SCANNER_SERVICE="opip-scan-worker"
@@ -243,6 +247,35 @@ paper_services() {
     | grep -E '^ohm-freqtrade-paper(-usdt)?$' || true
 }
 
+# Read-only operator proof, before the rollback trap or any runtime mutation.
+paper_deploy_mode() {
+  [[ -f "$PAPER_CONTROL_FILE" && -r "$PAPER_CONTROL_FILE" && ! -L "$PAPER_CONTROL_FILE" ]] || return 1
+  "$PYTHON_BIN" - "$PAPER_CONTROL_FILE" <<'PY'
+import json
+import sys
+from pathlib import Path
+try:
+    payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    enabled = payload["enabled"] if isinstance(payload, dict) else None
+    if type(enabled) is not bool:
+        raise ValueError("paper enabled must be a boolean")
+except (OSError, ValueError, KeyError, TypeError) as exc:
+    print(f"paper control unproven: {type(exc).__name__}", file=sys.stderr)
+    sys.exit(1)
+print("ON" if enabled else "OFF")
+PY
+}
+
+verify_paper_disabled() {
+  local running
+  running="$(docker ps --format '{{.Names}}')" || return 1
+  if grep -Eq '^ohm-freqtrade-paper(-usdt)?$' <<< "$running"; then
+    echo "owner-disabled Freqtrade paper container unexpectedly running" >&2
+    return 1
+  fi
+  return 0
+}
+
 stop_paper_stack() {
   if [[ -s "$PAPER_COMPOSE" ]]; then
     docker compose -f "$PAPER_COMPOSE" stop >/dev/null 2>&1 || true
@@ -304,6 +337,10 @@ validate_target_resource_budget() {
   # rather than trusting only the YAML checked into this SHA.
   local name expected_mem expected_swap actual
   while IFS='|' read -r name expected_mem expected_swap; do
+    # Owner OFF means the workers are deliberately absent; never require their cgroups.
+    if [[ "$PAPER_DEPLOY_MODE" == "OFF" && ( "$name" == "ohm-freqtrade-paper" || "$name" == "ohm-freqtrade-paper-usdt" ) ]]; then
+      continue
+    fi
     actual="$(docker inspect --format='{{.HostConfig.Memory}}|{{.HostConfig.MemorySwap}}' "$name" 2>/dev/null || true)"
     if [[ "$actual" != "$expected_mem|$expected_swap" ]]; then
       echo "resource limit mismatch: container=$name expected=$expected_mem|$expected_swap actual=$actual" >&2
@@ -449,9 +486,76 @@ cleanup_snapshot() {
 # implicitly when the service is named - would have built it. Detection
 # therefore answered NOT_DECLARED for every release, the build target list
 # stayed empty, and the scanner image was never rebuilt.
+#
+# Discovery is therefore PROVEN and RECORDED, because the two facts a single
+# discarded exit status conflated are not the same fact:
+#
+#   * Activation is stated redundantly - the explicit flag AND the command's own
+#     environment - because profile activation is the one input to this render
+#     that comes from the host's effective environment rather than from the
+#     candidate release. `COMPOSE_DISABLE_ENV_FILE` stops the owner's `.env`
+#     from seeding Compose's own `COMPOSE_*` controls into this one render, so a
+#     host environment document can never silently decide which services the
+#     candidate model contains.
+#   * The probe's outcome is published instead of discarded. An approved release
+#     that DECLARES `opip-scan-worker` was refused on the production host, and
+#     the receipt carried only the verdict: with `2>/dev/null` a render that
+#     failed and a release that declares no scanner are the same single line.
+#     They are distinct markers now, and the render's bounded, redacted
+#     diagnostic is published with them.
+SCANNER_DECLARATION="NOT_PROBED"
+SCANNER_DECLARATION_EXIT="NA"
+SCANNER_DECLARATION_SERVICES="NONE"
+SCANNER_DECLARATION_DIAGNOSTIC="NONE"
+SCANNER_DIAGNOSTIC_BYTES=240
+
+# Bounded, secret-free rendering of Compose's own diagnostic. Compose names
+# variables rather than values, but a parse error can echo a raw environment
+# line, so `KEY=value` fields are redacted FIRST; the text is then reduced to an
+# allowlist, flattened to one line and truncated. Only this form is ever
+# published, so no value can reach a receipt or a log through this path.
+opip_scanner_diagnostic_text() {
+  sed -E 's/[A-Za-z0-9_.-]+=[^[:space:]]+/<redacted-assignment>/g' 2>/dev/null \
+    | tr '\n' ' ' \
+    | tr -cd 'A-Za-z0-9 .,:;/()<>_|+-' \
+    | tr -s ' ' \
+    | cut -c "1-$SCANNER_DIAGNOSTIC_BYTES" \
+    | sed -e 's/^ *//' -e 's/ *$//' || true
+}
+
 scanner_declared() {
-  docker compose --profile scanner -f docker-compose.yml config --services 2>/dev/null \
-    | grep -qx "$SCANNER_SERVICE"
+  local rendered="" rc=0 services=""
+  rendered="$(
+    COMPOSE_PROFILES="scanner${COMPOSE_PROFILES:+,$COMPOSE_PROFILES}" \
+      COMPOSE_DISABLE_ENV_FILE=1 \
+      docker compose --profile scanner -f docker-compose.yml config --services 2>&1
+  )" || rc=$?
+  SCANNER_DECLARATION_EXIT="$rc"
+  # A service name is the only rendered line that is a bare name; Compose
+  # warnings and errors are `level=...` records or prose, so this list is the
+  # resolved model itself and never a diagnostic.
+  services="$(printf '%s\n' "$rendered" \
+    | grep -oE '^[A-Za-z0-9][A-Za-z0-9_.-]*$' \
+    | tr '\n' ',' \
+    | cut -c "1-$SCANNER_DIAGNOSTIC_BYTES")" || true
+  SCANNER_DECLARATION_SERVICES="${services:-NONE}"
+  if [[ "$rc" -ne 0 ]]; then
+    # Fail closed exactly as before; only the evidence is new.
+    SCANNER_DECLARATION="PROBE_FAILED"
+    SCANNER_DECLARATION_DIAGNOSTIC="$(printf '%s\n' "$rendered" \
+      | opip_scanner_diagnostic_text)" || true
+    SCANNER_DECLARATION_DIAGNOSTIC="${SCANNER_DECLARATION_DIAGNOSTIC:-NONE}"
+    return 1
+  fi
+  if printf '%s\n' "$rendered" | grep -qx "$SCANNER_SERVICE"; then
+    SCANNER_DECLARATION="DECLARED"
+    return 0
+  fi
+  SCANNER_DECLARATION="SERVICE_NOT_IN_RESOLVED_MODEL"
+  SCANNER_DECLARATION_DIAGNOSTIC="$(printf '%s\n' "$rendered" \
+    | opip_scanner_diagnostic_text)" || true
+  SCANNER_DECLARATION_DIAGNOSTIC="${SCANNER_DECLARATION_DIAGNOSTIC:-NONE}"
+  return 1
 }
 
 # A release whose core selects with V2 production authority cannot function
@@ -946,15 +1050,37 @@ report_unified_cycle_wait_failure() {
 #: scheduler entry (``timeout --signal=TERM --kill-after=Ns <BOUND> ...'').
 #: Returns the bound on stdout, or non-zero when it cannot be determined.
 scheduler_hard_bound_seconds() {
-  local entry="/etc/cron.d/ohm-unified-cycle" value
+  local entry="/etc/cron.d/ohm-unified-cycle" program matches value
   # The path override is honored ONLY under an explicit test marker, so a
   # production deploy cannot be pointed at an arbitrary entry to extend the wait.
   if [[ "${OPIP_DEPLOY_TEST_SEAMS:-0}" == "1" && -n "${OPIP_RELEASE_SCHEDULER_ENTRY:-}" ]]; then
     entry="$OPIP_RELEASE_SCHEDULER_ENTRY"
   fi
   [[ -s "$entry" ]] || return 1
-  value="$(grep -m1 -oE 'timeout --signal=TERM --kill-after=[0-9]+s [0-9]+' "$entry" 2>/dev/null \
-    | grep -oE '[0-9]+$' || true)"
+  # ONLY EXECUTABLE LINES MAY SUPPLY THE BOUND. cron.d entries carry comments and
+  # `NAME=value` assignments, and the deployment itself writes an explanatory
+  # comment above the job. Matching the file verbatim therefore let a comment
+  # become the derived authority: quoting the long-form flags in documentation
+  # either replaced the real bound or produced two matches and failed the deploy.
+  # Comments and assignments are stripped first, so the derivation reads the
+  # scheduled command and nothing else.
+  program="$(awk '
+      /^[[:space:]]*#/ {next}
+      /^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=/ {next}
+      NF {print}
+    ' "$entry" 2>/dev/null || true)"
+  [[ -n "$program" ]] || return 1
+  # The bound has to come from the command that actually runs the cycle. A
+  # timeout belonging to some other scheduled program is not this cycle's bound.
+  if ! printf '%s\n' "$program" | grep -q 'python -m app\.jobs\.run_cycle'; then
+    return 1
+  fi
+  matches="$(printf '%s\n' "$program" \
+    | grep -oE 'timeout --signal=TERM --kill-after=[0-9]+s [0-9]+' || true)"
+  # Exactly one. Zero means there is no bound to enforce; two mean the authority
+  # is ambiguous. Both fail closed rather than silently picking one.
+  [[ "$(printf '%s\n' "$matches" | grep -c . || true)" == "1" ]] || return 1
+  value="$(printf '%s\n' "$matches" | grep -oE '[0-9]+$' || true)"
   [[ "$value" =~ ^[0-9]+$ && "$value" -ge 1 ]] || return 1
   printf '%s' "$value"
 }
@@ -1180,6 +1306,20 @@ RELEASE_EVIDENCE_BASELINE="$(capture_release_evidence_baseline)"
 }
 
 snapshot_scheduler_state
+
+# Fail before rollback trap and first mutation if paper ownership is unproven.
+if ! PAPER_DEPLOY_MODE="$(paper_deploy_mode)"; then
+  echo "OPIP_OWNER_RUNTIME_PREFLIGHT=BLOCKED_PAPER_CONTROL_UNPROVEN" >&2
+  cleanup_snapshot
+  exit 77
+fi
+if [[ -f "$LEARNING_EXPORT_FLAG" && ! -L "$LEARNING_EXPORT_FLAG" ]]; then
+  LEARNING_EXPORT_MODE="ENABLED"
+else
+  LEARNING_EXPORT_MODE="OWNER_OFF"
+fi
+echo "OPIP_PAPER_CONTROL_PREFLIGHT=$PAPER_DEPLOY_MODE"
+echo "OPIP_LEARNING_POLICY_PREFLIGHT=$LEARNING_EXPORT_MODE"
 
 #: Candidate evidence producers that can contend with the canonical writer's
 #: store lock. They are installed by the CANDIDATE revision's scheduler
@@ -1673,8 +1813,22 @@ rollback() {
   restore_scheduler_state
   release_evidence_producer_locks
 
-  if ! start_paper_stack || ! wait_paper_health; then
-    echo "rollback paper topology validation failed" >&2
+  if [[ "$PAPER_DEPLOY_MODE" == "OFF" ]]; then
+    if ! verify_paper_disabled; then
+      echo "rollback failed to preserve owner-disabled paper state" >&2
+      cleanup_snapshot
+      exit "$rc"
+    fi
+    echo "OPIP_ROLLBACK_PAPER=OWNER_OFF_VERIFIED"
+  elif [[ "$PAPER_DEPLOY_MODE" == "ON" ]]; then
+    if ! start_paper_stack || ! wait_paper_health; then
+      echo "rollback paper topology validation failed" >&2
+      cleanup_snapshot
+      exit "$rc"
+    fi
+    echo "OPIP_ROLLBACK_PAPER=DRY_RUN_HEALTHY"
+  else
+    echo "rollback paper state unproven; refusing to start workers" >&2
     cleanup_snapshot
     exit "$rc"
   fi
@@ -2307,17 +2461,36 @@ stop_paper_stack
 SCANNER_IMAGE_PREVIOUS="$(current_scanner_image)"
 scanner_build_targets=()
 if scanner_declared; then
+  echo "OPIP_SCANNER_DECLARATION=$SCANNER_DECLARATION"
+  echo "OPIP_SCANNER_DECLARATION_SERVICES=$SCANNER_DECLARATION_SERVICES"
   scanner_build_targets=("$SCANNER_SERVICE")
 elif release_requires_scanner; then
   # Fail closed: a V2 release that cannot prove its scanner was declared would
   # activate a core that selects from V2 evidence nothing can produce. Refuse
   # before any service is recreated; the rollback trap restores the previous
   # release.
+  #
+  # The refusal states the evidence it was derived from, so a release that DOES
+  # declare the service can never again be refused with only a verdict: the
+  # resolved model, the render's exit status and its bounded diagnostic are
+  # published BEFORE the refusal, and the reason on stderr distinguishes "the
+  # render did not complete" from "the model does not contain the service".
+  echo "OPIP_SCANNER_DECLARATION=$SCANNER_DECLARATION"
+  echo "OPIP_SCANNER_DECLARATION_EXIT=$SCANNER_DECLARATION_EXIT"
+  echo "OPIP_SCANNER_DECLARATION_SERVICES=$SCANNER_DECLARATION_SERVICES"
+  echo "OPIP_SCANNER_DECLARATION_DIAGNOSTIC=$SCANNER_DECLARATION_DIAGNOSTIC"
   echo "OPIP_SCANNER_IMAGE=UNDECLARED_FOR_V2_RELEASE"
   echo "OPIP_SCANNER_IMAGE_ACCEPTANCE=BLOCKED"
   echo "refusing release: the core selects with V2 production authority but this release declares no $SCANNER_SERVICE" >&2
+  if [[ "$SCANNER_DECLARATION" == "PROBE_FAILED" ]]; then
+    echo "the scanner declaration probe did not complete (exit $SCANNER_DECLARATION_EXIT): $SCANNER_DECLARATION_DIAGNOSTIC" >&2
+  else
+    echo "the scanner declaration probe resolved a model without $SCANNER_SERVICE (services=$SCANNER_DECLARATION_SERVICES): $SCANNER_DECLARATION_DIAGNOSTIC" >&2
+  fi
   false
 else
+  echo "OPIP_SCANNER_DECLARATION=$SCANNER_DECLARATION"
+  echo "OPIP_SCANNER_DECLARATION_SERVICES=$SCANNER_DECLARATION_SERVICES"
   echo "OPIP_SCANNER_IMAGE=NOT_DECLARED_BY_CANDIDATE_RELEASE"
 fi
 echo "OPIP_SCANNER_ATTEMPT_ACTIVE_AT_BUILD=$(scanner_attempt_active)"
@@ -2358,10 +2531,19 @@ fi
 # exact revision. Nothing else about the reconciliation changes.
 OPIP_RELEASE_SHA="$TARGET_SHA" bash "$SCHEDULER_RECONCILE"
 
-# Applying the SHA is not complete until the paper topology from that same SHA
-# has been recreated and both authoritative dry-run workers are healthy.
-start_paper_stack
-wait_paper_health
+# Paper ON retains the original full dry-run topology proof; OFF preserves
+# owner-disabled workers and verifies their absence before the commit point.
+if [[ "$PAPER_DEPLOY_MODE" == "ON" ]]; then
+  start_paper_stack
+  wait_paper_health
+  echo "OPIP_PAPER_STACK=DRY_RUN_HEALTHY"
+elif [[ "$PAPER_DEPLOY_MODE" == "OFF" ]]; then
+  verify_paper_disabled
+  echo "OPIP_PAPER_STACK=OWNER_OFF_VERIFIED"
+else
+  echo "owner paper state unproven; refusing deployment" >&2
+  false
+fi
 validate_target_resource_budget
 validate_candidate_container_identity
 validate_release_scheduler_contract
@@ -2562,48 +2744,43 @@ else
 fi
 echo "OPIP_P1_RETIREMENT_STATUS=$p1_status"
 
-# --- Learning evidence export (post-deploy gate) -----------------------------
-# Publish schema-4 evidence immediately so the remote worker stops requesting the
-# retired multi-hundred-MB artifact without waiting for the next cron tick.
-#
-# Deliberately NOT fatal: this is non-authoritative for the core release. A
-# success here also does not prove the target SHA is committed - the exporter
-# returns success when a cron run already holds the lock - so the proof below is
-# what actually gates learning readiness.
+# --- Owner policy: learning export absent is not a READY replica ------------
+# OFF never runs the multi-gigabyte exporter, does not poll verify-export,
+# and must not be reported as export SUCCESS or learning READY. Enabled export
+# retains the original exact-SHA fresh-replica check.
 learning_export="SKIPPED"
-if [[ -s "$LEARNING_EXPORTER" ]]; then
-  if bash "$LEARNING_EXPORTER"; then
-    learning_export="SUCCESS"
+learning_readiness="NOT_APPLICABLE"
+learning_policy="UNPROVEN"
+if [[ "$LEARNING_EXPORT_MODE" == "OWNER_OFF" && ! -e "$LEARNING_EXPORT_FLAG" && ! -L "$LEARNING_EXPORT_FLAG" && -s "$LEARNING_EXPORTER" ]]; then
+  learning_policy="OWNER_OFF"
+elif [[ "$LEARNING_EXPORT_MODE" == "ENABLED" && -f "$LEARNING_EXPORT_FLAG" && ! -L "$LEARNING_EXPORT_FLAG" ]]; then
+  learning_policy="ENABLED"
+  if [[ -s "$LEARNING_EXPORTER" ]]; then
+    if bash "$LEARNING_EXPORTER"; then
+      learning_export="SUCCESS"
+    else
+      learning_export="FAILED"
+      echo "O'Pip learning evidence export FAILED; core release already committed" >&2
+    fi
   else
     learning_export="FAILED"
-    echo "O'Pip learning evidence export FAILED; core release already committed" >&2
+    echo "learning exporter missing after P1 retirement" >&2
+  fi
+  learning_readiness="BLOCKED"
+  if [[ -x "$PYTHON_BIN" ]] && PYTHONPATH="$APP_ROOT" "$PYTHON_BIN" -m app.opip.learning.canonical_replica verify-export \
+    --root "$EXPORT_ROOT" \
+    --release-sha "$TARGET_SHA" \
+    --max-age-seconds "$EXPORT_PROOF_FRESHNESS_SECONDS" \
+    --wait-seconds "$EXPORT_PROOF_WAIT_SECONDS"; then
+    learning_readiness="READY"
   fi
 else
   learning_export="FAILED"
-  echo "learning exporter missing after P1 retirement" >&2
+  learning_readiness="BLOCKED"
+  echo "learning exporter or owner flag changed; learning mode unproven" >&2
 fi
+echo "OPIP_LEARNING_POLICY=$learning_policy"
 echo "OPIP_LEARNING_EXPORT_STATUS=$learning_export"
-
-# --- Fresh committed-export proof (authoritative learning readiness) --------
-# A lock skip is valid exporter behaviour and is NOT proof that the deployed SHA
-# is exported. Readiness is therefore proven from durable artifacts: the
-# committed manifest must name this exact SHA, be fresh, carry replica marker
-# version 1, reference a real content-addressed replica directory, and that
-# generation's inner manifest must verify against this same release.
-#
-# The wait is bounded (derived from the export cadence) and covers exactly one
-# legitimate case: the exporter skipped because the cron run held the lock, so
-# the next scheduled run may still commit the target. It never spins.
-learning_readiness="BLOCKED"
-if [[ ! -x "$PYTHON_BIN" ]]; then
-  echo "O'Pip Python interpreter missing; committed-export proof unavailable" >&2
-elif PYTHONPATH="$APP_ROOT" "$PYTHON_BIN" -m app.opip.learning.canonical_replica verify-export \
-  --root "$EXPORT_ROOT" \
-  --release-sha "$TARGET_SHA" \
-  --max-age-seconds "$EXPORT_PROOF_FRESHNESS_SECONDS" \
-  --wait-seconds "$EXPORT_PROOF_WAIT_SECONDS"; then
-  learning_readiness="READY"
-fi
 echo "OPIP_LEARNING_READINESS=$learning_readiness"
 
 # ---------------------------------------------------------------------------

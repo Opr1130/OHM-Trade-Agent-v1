@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
+from typing import Any
 import math
 
 from app.exchanges.kraken import BookLevel, PreTradeBook, PublicTrade
@@ -322,4 +324,249 @@ def evaluate_execution(
         recent_trade_status=trade_status, latest_trade_price=trade_price,
         latest_trade_age_seconds=trade_age,
         recent_trade_count=len(trades) if trades is not None else 0,
+    )
+
+# ---------------------------------------------------------------------------
+# Verified band depth (ATDD-OPIP-ACTIONABLE-LIQUIDITY-v1, slice P0)
+#
+# A single, pure measurement of how much notional is genuinely available inside a
+# price band around mid. It is deliberately SEPARATE from execution feasibility:
+# depth answers "is the market deep enough at all", the fill simulation answers
+# "does this order for this size fill acceptably". Collapsing the two hides which
+# fact failed.
+#
+# Tri-state is the whole point:
+#   PASS    observed depth is a SUBSET of the truth, so observed >= threshold
+#           proves the true depth is >= threshold - even when coverage is
+#           incomplete. This asymmetry is why partial evidence can pass.
+#   FAIL    only when coverage is PROVEN (the band boundary was reached, or the
+#           venue returned fewer levels than requested) and depth is still short.
+#   UNKNOWN everything else. Never zero, never a guess, never a silent pass.
+#
+# Arithmetic is exact decimal: summing binary floats can turn a genuine 600,000
+# into 599,999.9999999999 and refuse a plan that should pass.
+# ---------------------------------------------------------------------------
+
+DEPTH_PASS = "PASS"
+DEPTH_FAIL = "FAIL"
+DEPTH_UNKNOWN = "UNKNOWN"
+
+#: Actionable weaker-side depth floor, inclusive, verified USD notional.
+DEPTH_ACTIONABLE_USD = 600_000.0
+#: Internal enhanced-monitoring floor, inclusive. Never authorises a card.
+DEPTH_MONITORING_USD = 500_000.0
+#: Kraken silently caps Depth below this; requesting more returns fewer.
+DEPTH_MAX_LEVELS = 500
+
+REASON_BOOK_MISSING = "MARKET_DEPTH_EVIDENCE_MISSING"
+REASON_BOOK_EMPTY = "MARKET_DEPTH_EVIDENCE_EMPTY"
+REASON_BOOK_ONE_SIDED = "MARKET_DEPTH_EVIDENCE_ONE_SIDED"
+REASON_BOOK_INVALID = "MARKET_DEPTH_EVIDENCE_INVALID"
+REASON_BOOK_CROSSED = "MARKET_DEPTH_EVIDENCE_CROSSED"
+REASON_BOOK_STALE = "MARKET_DEPTH_EVIDENCE_STALE"
+REASON_BOOK_PARTIAL = "MARKET_DEPTH_EVIDENCE_PARTIAL"
+REASON_CLOCK_UNTRUSTED = "MARKET_DEPTH_CLOCK_UNTRUSTED"
+REASON_MID_UNUSABLE = "MARKET_DEPTH_MID_UNUSABLE"
+REASON_DEPTH_INSUFFICIENT = "MARKET_DEPTH_INSUFFICIENT"
+
+
+def _notional(level: BookLevel, quote_rate: float) -> Decimal:
+    return (Decimal(str(level.price)) * Decimal(str(level.quantity))
+            * Decimal(str(quote_rate)))
+
+
+def _side_depth(
+    levels: list[BookLevel],
+    *,
+    mid: float,
+    band_pct: float,
+    side: str,
+    quote_rate: float,
+    threshold_usd: float,
+    returned_levels: int,
+    levels_requested: int,
+) -> tuple[str, Decimal, bool, float | None, int]:
+    if side == "bid":
+        boundary = mid * (1.0 - band_pct / 100.0)
+        in_band = [lv for lv in levels if lv.price >= boundary]
+        beyond = any(lv.price < boundary for lv in levels)
+        marginal = min((lv.price for lv in in_band), default=None)
+    else:
+        boundary = mid * (1.0 + band_pct / 100.0)
+        in_band = [lv for lv in levels if lv.price <= boundary]
+        beyond = any(lv.price > boundary for lv in levels)
+        marginal = max((lv.price for lv in in_band), default=None)
+    notional = sum((_notional(lv, quote_rate) for lv in in_band), Decimal("0"))
+    # The venue returning fewer levels than requested means the book ended, so we
+    # have seen everything that could lie inside the band.
+    exhausted = returned_levels < levels_requested
+    covered = bool(beyond or exhausted)
+    if notional >= Decimal(str(threshold_usd)):
+        status = DEPTH_PASS
+    elif covered:
+        status = DEPTH_FAIL
+    else:
+        status = DEPTH_UNKNOWN
+    return status, notional, covered, marginal, returned_levels
+
+@dataclass(frozen=True)
+class DepthEvidence:
+    """Tri-state verified band depth. Read-only; grants no authority."""
+
+    status: str
+    reason: str | None = None
+    weaker_side_usd: Decimal | None = None
+    bid_usd: Decimal | None = None
+    ask_usd: Decimal | None = None
+    bid_status: str = DEPTH_UNKNOWN
+    ask_status: str = DEPTH_UNKNOWN
+    covered_bid: bool = False
+    covered_ask: bool = False
+    levels_requested: int = 0
+    levels_returned_bid: int = 0
+    levels_returned_ask: int = 0
+    marginal_bid_price: float | None = None
+    marginal_ask_price: float | None = None
+    band_pct: float = 0.0
+    threshold_usd: float = 0.0
+    mid: float | None = None
+    age_seconds: float | None = None
+
+    @property
+    def passed(self) -> bool:
+        return self.status == DEPTH_PASS
+
+    def monitoring_eligible(self, floor_usd: float = DEPTH_MONITORING_USD) -> bool:
+        """Internal monitoring only. This never authorises a notification."""
+        if self.weaker_side_usd is None:
+            return False
+        return self.weaker_side_usd >= Decimal(str(floor_usd))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "reason": self.reason,
+            "weaker_side_usd": None if self.weaker_side_usd is None else float(self.weaker_side_usd),
+            "bid_usd": None if self.bid_usd is None else float(self.bid_usd),
+            "ask_usd": None if self.ask_usd is None else float(self.ask_usd),
+            "bid_status": self.bid_status,
+            "ask_status": self.ask_status,
+            "covered_bid": self.covered_bid,
+            "covered_ask": self.covered_ask,
+            "levels_requested": self.levels_requested,
+            "levels_returned_bid": self.levels_returned_bid,
+            "levels_returned_ask": self.levels_returned_ask,
+            "marginal_bid_price": self.marginal_bid_price,
+            "marginal_ask_price": self.marginal_ask_price,
+            "band_pct": self.band_pct,
+            "threshold_usd": self.threshold_usd,
+            "mid": self.mid,
+            "age_seconds": self.age_seconds,
+        }
+
+
+def depth_evidence(
+    book: PreTradeBook | None,
+    *,
+    mid: float | None,
+    band_pct: float,
+    threshold_usd: float,
+    quote_rate: float = 1.0,
+    observed_at: datetime | None = None,
+    now: datetime | None = None,
+    max_age_seconds: float = 900.0,
+    levels_requested: int = 0,
+) -> DepthEvidence:
+    """Measure verified weaker-side depth inside ``band_pct`` of ``mid``.
+
+    Pure: no I/O, no clock of its own, no authority. Every unusable input is
+    UNKNOWN, never a zero and never a pass.
+    """
+    requested = max(0, int(levels_requested))
+    if book is None:
+        return DepthEvidence(status=DEPTH_UNKNOWN, reason=REASON_BOOK_MISSING,
+                             band_pct=band_pct, threshold_usd=threshold_usd,
+                             mid=mid, levels_requested=requested)
+
+    bids = [lv for lv in (book.bids or []) if lv.quantity and lv.quantity > 0]
+    raw_bids = list(book.bids or [])
+    raw_asks = list(book.asks or [])
+    asks = [lv for lv in raw_asks if lv.quantity and lv.quantity > 0]
+
+    if not raw_bids and not raw_asks:
+        return DepthEvidence(status=DEPTH_UNKNOWN, reason=REASON_BOOK_EMPTY,
+                             band_pct=band_pct, threshold_usd=threshold_usd,
+                             mid=mid, levels_requested=requested)
+    if not bids or not asks:
+        return DepthEvidence(status=DEPTH_UNKNOWN, reason=REASON_BOOK_ONE_SIDED,
+                             band_pct=band_pct, threshold_usd=threshold_usd,
+                             mid=mid, levels_requested=requested)
+
+    for level in bids + asks:
+        if not (math.isfinite(level.price) and math.isfinite(level.quantity)):
+            return DepthEvidence(status=DEPTH_UNKNOWN, reason=REASON_BOOK_INVALID,
+                                 band_pct=band_pct, threshold_usd=threshold_usd,
+                                 mid=mid, levels_requested=requested)
+        if level.price <= 0 or level.quantity < 0:
+            return DepthEvidence(status=DEPTH_UNKNOWN, reason=REASON_BOOK_INVALID,
+                                 band_pct=band_pct, threshold_usd=threshold_usd,
+                                 mid=mid, levels_requested=requested)
+
+    best_bid = max(lv.price for lv in bids)
+    best_ask = min(lv.price for lv in asks)
+    if best_bid >= best_ask:
+        return DepthEvidence(status=DEPTH_UNKNOWN, reason=REASON_BOOK_CROSSED,
+                             band_pct=band_pct, threshold_usd=threshold_usd,
+                             mid=mid, levels_requested=requested)
+
+    used_mid = mid if (mid is not None and math.isfinite(mid) and mid > 0) \
+        else (best_bid + best_ask) / 2.0
+    if not (math.isfinite(used_mid) and used_mid > 0):
+        return DepthEvidence(status=DEPTH_UNKNOWN, reason=REASON_MID_UNUSABLE,
+                             band_pct=band_pct, threshold_usd=threshold_usd,
+                             mid=mid, levels_requested=requested)
+
+    age = None
+    if observed_at is not None and now is not None:
+        age = (now - observed_at).total_seconds()
+        if age < 0:
+            return DepthEvidence(status=DEPTH_UNKNOWN, reason=REASON_CLOCK_UNTRUSTED,
+                                 band_pct=band_pct, threshold_usd=threshold_usd,
+                                 mid=used_mid, levels_requested=requested,
+                                 age_seconds=age)
+        if age > max_age_seconds:
+            return DepthEvidence(status=DEPTH_UNKNOWN, reason=REASON_BOOK_STALE,
+                                 band_pct=band_pct, threshold_usd=threshold_usd,
+                                 mid=used_mid, levels_requested=requested,
+                                 age_seconds=age)
+    returned_bid = len(raw_bids)
+    returned_ask = len(raw_asks)
+    bid_status, bid_usd, covered_bid, marginal_bid, n_bid = _side_depth(
+        bids, returned_levels=returned_bid, mid=used_mid, band_pct=band_pct,
+        side="bid", quote_rate=quote_rate, threshold_usd=threshold_usd,
+        levels_requested=requested,
+    )
+    ask_status, ask_usd, covered_ask, marginal_ask, n_ask = _side_depth(
+        asks, returned_levels=returned_ask, mid=used_mid, band_pct=band_pct,
+        side="ask", quote_rate=quote_rate, threshold_usd=threshold_usd,
+        levels_requested=requested,
+    )
+    weaker = min(bid_usd, ask_usd)
+    if bid_status == DEPTH_FAIL or ask_status == DEPTH_FAIL:
+        status, reason = DEPTH_FAIL, REASON_DEPTH_INSUFFICIENT
+    elif bid_status == DEPTH_PASS and ask_status == DEPTH_PASS:
+        status, reason = DEPTH_PASS, None
+    else:
+        status, reason = DEPTH_UNKNOWN, REASON_BOOK_PARTIAL
+
+    return DepthEvidence(
+        status=status, reason=reason, weaker_side_usd=weaker,
+        bid_usd=bid_usd, ask_usd=ask_usd,
+        bid_status=bid_status, ask_status=ask_status,
+        covered_bid=covered_bid, covered_ask=covered_ask,
+        levels_requested=requested,
+        levels_returned_bid=n_bid, levels_returned_ask=n_ask,
+        marginal_bid_price=marginal_bid, marginal_ask_price=marginal_ask,
+        band_pct=band_pct, threshold_usd=threshold_usd, mid=used_mid,
+        age_seconds=age,
     )

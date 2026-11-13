@@ -77,6 +77,24 @@ def _require_v2_evidence(settings: Any, snapshots: Sequence[MarketSnapshot]) -> 
     if statuses == {V2_STATUS_ERROR}:
         raise PromotionRejected(REASON_V2_EVIDENCE_ERROR)
 
+    # Activating a versioned advisory profile changes the V2 threshold/policy
+    # digest. The isolated acquisition worker must use exactly that profile,
+    # not its bundled default. Reject a stale or inaccessible policy here so
+    # the durable promotion receipt distinguishes a mismatch from no signals.
+    if bool(getattr(settings, "opip_advisory_profile_enabled", False)):
+        from app.core.strategy_policy import load_active_strategy_policy
+
+        try:
+            expected_digest = load_active_strategy_policy().digest
+        except (OSError, ValueError) as exc:
+            raise PromotionRejected("V2_ACTIVE_POLICY_UNAVAILABLE") from exc
+        if any(
+            _v2_status(snapshot) == "READY"
+            and getattr(snapshot, "v2_profile_digest", None) != expected_digest
+            for snapshot in snapshots
+        ):
+            raise PromotionRejected("V2_SCORING_POLICY_DIGEST_MISMATCH")
+
 
 class PromotionRejected(RuntimeError):
     """Acquisition evidence may not be consumed."""

@@ -33,7 +33,11 @@ jobs:
       APP_ENV: test
       OPIP_TEST_DATABASE_URL: postgresql://opip_test:test_password_min_20_chars_long@localhost:5432/opip_test
     steps:
+      # The focused selection needs the changed-file set of the exact commit, so
+      # the base commit must be present in the checkout.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -43,7 +47,58 @@ jobs:
             OHM-Trade-Agent-v1/requirements-test.txt
       - run: python -m pip install --upgrade pip
       - run: pip install -r requirements.txt -r requirements-test.txt
-      - run: python -m pytest -q
+      # Automatic release CI runs the focused selection (tests that reference
+      # the changed modules) plus the small mandatory safety suite. The complete
+      # suite and the real-Docker OOM/fault-injection proofs are manual-only and
+      # live in .github/workflows/pytest-full-manual.yml.
+      - name: Focused release selection (changed modules only)
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch --no-tags origin "${{ github.base_ref }}"
+            base="origin/${{ github.base_ref }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+          case "$base" in
+            ""|0000000000000000000000000000000000000000)
+              echo "changed-file base is missing" >&2
+              exit 2
+              ;;
+          esac
+          git rev-parse --verify "$base"
+          python -m tests.ci_release_selection \
+            --mode focused --git-base "$base" > focused-targets.txt
+          test -s focused-targets.txt
+          wc -l focused-targets.txt
+      - name: Run focused release selection
+        run: python -m pytest -q $(cat focused-targets.txt)
+      - name: Run mandatory safety suite
+        run: |
+          set -euo pipefail
+          python -m tests.ci_release_selection --mode safety > safety-targets.txt
+          test -s safety-targets.txt
+          python -m pytest -q -rs \
+            --junitxml=mandatory-safety-junit.xml \
+            $(cat safety-targets.txt)
+      - name: Verify mandatory safety receipt (fail closed)
+        run: |
+          set -euo pipefail
+          python -m tests.ci_mandatory_safety_receipt \
+            --report mandatory-safety-junit.xml \
+            --selection safety-targets.txt | tee mandatory-safety-receipt.txt
+          grep -Fx 'MANDATORY_SAFETY=PASS' mandatory-safety-receipt.txt
+          cat mandatory-safety-receipt.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain mandatory safety evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mandatory-safety-${{ github.sha }}
+          path: |
+            OHM-Trade-Agent-v1/mandatory-safety-receipt.txt
+            OHM-Trade-Agent-v1/mandatory-safety-junit.xml
+          if-no-files-found: error
+          retention-days: 30
       - run: python -m compileall -q app
       - name: Validate production Compose
         run: |
@@ -110,7 +165,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Enforce the active ATDD increment against the changed-file set
+      - name: Enforce the PR's own ATDD increment against the changed-file set
         working-directory: OHM-Trade-Agent-v1
         run: |
           set -euo pipefail
@@ -127,8 +182,10 @@ jobs:
               ;;
           esac
           git rev-parse --verify "$base"
-          increment="$(tr -d '\r\n' < docs/atdd/ACTIVE_INCREMENT)"
-          python tests/atdd_scope.py --increment "$increment" --git-base "$base"
+          # PR-scoped: the increment is the one scope contract this change set
+          # adds or modifies. docs/atdd/ACTIVE_INCREMENT is only the legacy
+          # fallback when no contract changed; see docs/atdd/README.md.
+          python tests/atdd_scope.py --pr-scoped --git-base "$base"
 
   architecture-gate:
     name: release architecture gate

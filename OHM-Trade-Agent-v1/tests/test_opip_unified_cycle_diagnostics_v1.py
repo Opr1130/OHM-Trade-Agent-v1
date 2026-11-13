@@ -187,11 +187,25 @@ def test_hard_runtime_bound_matches_the_release_controller():
     deploy = DEPLOY.read_text(encoding="utf-8")
     assert BOUND_PATTERN in deploy
     assert BOUND_PATTERN in block
-    # Both take the trailing integer, and both stop after the first match.
+    # Both take the trailing integer of the matched occurrence.
     assert r"grep -oE '[0-9]+$'" in deploy
     assert r"grep -oE '[0-9]+$'" in block
-    assert "grep -m1 -oE" in deploy
-    assert "grep -m1 -oE" in block
+    # ... and both read ONLY the executable job line, requiring exactly one
+    # occurrence. `grep -m1` stopped after one matching *line*, so a second match
+    # on that line was silently carried into the trailing-integer read, and a
+    # comment could supply or replace the bound. Comment/assignment stripping
+    # plus an explicit uniqueness check replaces it on both sides.
+    for source in (deploy, block):
+        assert "/^[[:space:]]*#/ {next}" in source
+        assert "/^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=/ {next}" in source
+        assert "grep -c ." in source
+    # The bound derivation itself must no longer rely on `-m1` line semantics.
+    # Other deploy helpers legitimately use `grep -m1 -oE` for unrelated
+    # single-valued identity reads, so the check is scoped to this function.
+    start = deploy.index("scheduler_hard_bound_seconds() {")
+    derivation = deploy[start : deploy.index("\n}\n", start)]
+    assert "grep -m1 -oE" not in derivation
+    assert "grep -m1 -oE" not in block
 
 
 # ---------------------------------------------------------------------------

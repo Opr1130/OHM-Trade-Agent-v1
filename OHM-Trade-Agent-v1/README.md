@@ -114,7 +114,7 @@ The production-safe default is `PRICE_MOVEMENT_MODE=shadow`. Movement-only
 alerts are disabled, outcome observations use public Kraken data with zero paid
 AI calls, and entry/stop/T1/T2 details appear only after direction confirmation
 and all existing OHM gates pass. See
-[`PRICE_MOVEMENT_RADAR.md`](PRICE_MOVEMENT_RADAR.md).
+[`docs/archive/PRICE_MOVEMENT_RADAR.md`](docs/archive/PRICE_MOVEMENT_RADAR.md).
 
 ## Run tests
 

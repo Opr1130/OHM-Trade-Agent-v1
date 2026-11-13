@@ -12,6 +12,11 @@ import math
 import re
 
 
+#: The venue this identity module speaks for. Producers pass this value (never a default inside
+#: a consumer) when they need to state which venue the book, snapshot and pair identity came from.
+VENUE_ID = "KRAKEN"
+
+
 # Explicit aliases are intentionally conservative. They cover Kraken's legacy
 # currency codes that appear in Balance, TradesHistory and OpenPositions while
 # leaving modern token symbols untouched.

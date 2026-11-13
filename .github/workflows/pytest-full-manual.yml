@@ -1,0 +1,80 @@
+name: pytest-full-manual
+
+# Manual-only evidence run for the complete pytest suite and the real-Docker
+# OOM/fault-injection proofs.
+#
+# Automatic release CI (pytest.yml) runs the focused selection plus the
+# mandatory safety suite. Nothing in this workflow is triggered by a pull
+# request, a main push or a schedule: a manual dispatch by a human is the only
+# way to spend the full-suite runtime.
+#
+# This workflow never deploys, reads no production secret, mutates no registry
+# and adds no trading authority.
+
+on:
+  workflow_dispatch:
+    inputs:
+      include_docker_fault_injection:
+        description: 'Also run the real-Docker OOM and fault-injection proofs'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  full-suite:
+    name: full pytest suite (manual)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: OHM-Trade-Agent-v1
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: opip_test
+          POSTGRES_PASSWORD: test_password_min_20_chars_long
+          POSTGRES_DB: opip_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    env:
+      APP_ENV: test
+      OPIP_TEST_DATABASE_URL: postgresql://opip_test:test_password_min_20_chars_long@localhost:5432/opip_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            OHM-Trade-Agent-v1/requirements.txt
+            OHM-Trade-Agent-v1/requirements-test.txt
+      - run: python -m pip install --upgrade pip
+      - run: pip install -r requirements.txt -r requirements-test.txt
+      - name: Full pytest suite (manual only)
+        run: |
+          set -euo pipefail
+          python -m pytest -q \
+            --ignore=tests/test_opip_scan_docker_fault_injection_v1.py \
+            --junitxml=full-suite-junit.xml
+      - name: Real-Docker OOM and fault-injection proofs (manual only)
+        if: inputs.include_docker_fault_injection
+        run: |
+          set -euo pipefail
+          python -m pytest -q -rs tests/test_opip_scan_docker_fault_injection_v1.py
+      - name: Retain full-suite evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-suite-${{ github.sha }}
+          path: OHM-Trade-Agent-v1/full-suite-junit.xml
+          if-no-files-found: ignore
+          retention-days: 14

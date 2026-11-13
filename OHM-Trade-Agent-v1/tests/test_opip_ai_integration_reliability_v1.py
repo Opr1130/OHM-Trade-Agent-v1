@@ -788,31 +788,31 @@ def test_ac_011_production_incident_chain_is_reproduced_and_attributed(
 
 
 def test_ac_012_scope_contract_declares_the_active_increment():
-    """ATDD-SCANNER-OOM-OBSERVABILITY-M01/AC-004 and ATDD-OPIP-AI-INTEGRATION-RELIABILITY-v1/AC-012: the pointer stays movable.
-
-    The global ``ACTIVE_INCREMENT`` file is deliberately movable orchestration
-    state: a completed increment must never pin it, or the next approved
-    increment could not activate (ATDD-SCOPE-MOVABLE-ACTIVE-POINTER-v1). This
-    module therefore proves its own identity from its own frozen contract and
-    only requires that whatever the pointer names resolves to a real contract.
-    """
-    from test_atdd_scope_control import global_pointer_pin_violations
-
-    path = Path(__file__)
-    # The repo's own detector for the obsolete completed-increment pin.
-    assert global_pointer_pin_violations(path.read_text(encoding="utf-8")) == []
-
-    app_root = path.resolve().parents[1]
-    contract_dir = app_root / "docs" / "atdd" / "scope-contracts"
-    active = (app_root / "docs" / "atdd" / "ACTIVE_INCREMENT").read_text(
+    """ATDD-OPIP-AI-INTEGRATION-RELIABILITY-v1/AC-012: the scope is declared."""
+    app_root = Path(__file__).resolve().parents[1]
+    pointer = (app_root / "docs" / "atdd" / "ACTIVE_INCREMENT").read_text(
         encoding="utf-8"
     ).strip()
-    assert (contract_dir / f"{active}.md").is_file(), active
-
-    own = contract_dir / "ATDD-OPIP-AI-INTEGRATION-RELIABILITY-v1.md"
-    assert own.is_file()
-    contract = own.read_text(encoding="utf-8")
-    assert contract.startswith("INCREMENT:\nATDD-OPIP-AI-INTEGRATION-RELIABILITY-v1")
+    # `docs/atdd/ACTIVE_INCREMENT` is deliberately movable orchestration state
+    # (ATDD-SCOPE-MOVABLE-ACTIVE-POINTER-v1): it must resolve to a declared
+    # scope contract. This increment proves its own identity from its own frozen
+    # contract instead of pinning the global pointer to itself, because only one
+    # increment can be active and such a pin would block every later approved
+    # increment.
+    contract_path = (
+        app_root / "docs" / "atdd" / "scope-contracts" / f"{pointer}.md"
+    )
+    assert contract_path.is_file(), pointer
+    contract = (
+        app_root
+        / "docs"
+        / "atdd"
+        / "scope-contracts"
+        / "ATDD-OPIP-AI-INTEGRATION-RELIABILITY-v1.md"
+    ).read_text(encoding="utf-8")
+    assert contract.startswith(
+        "INCREMENT:\nATDD-OPIP-AI-INTEGRATION-RELIABILITY-v1"
+    )
     for section in (
         "OWNER-APPROVED INTENT:",
         "ARCHITECTURE REFERENCES:",

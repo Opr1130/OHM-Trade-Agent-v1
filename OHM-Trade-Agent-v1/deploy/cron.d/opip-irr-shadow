@@ -45,6 +45,6 @@
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-* * * * * root flock -n /var/run/opip-irr-shadow.lock -c '/usr/local/bin/opip-irr-shadow-run >> /var/log/opip-irr-shadow.log 2>&1'
+* * * * * root /bin/bash /opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1/deploy/remote/opip-run-guarded 512 -- flock -n /var/run/opip-irr-shadow.lock -c '/usr/local/bin/opip-irr-shadow-run >> /var/log/opip-irr-shadow.log 2>&1'
 
 

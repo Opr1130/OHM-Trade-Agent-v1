@@ -1,6 +1,8 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from app.jobs import scan_movers, scan_opportunities
 
 
@@ -90,8 +92,13 @@ def test_settings_default_explicit_early_watch_channel_is_dark():
     assert fields["opip_early_watch_alerts_enabled"].default is False
 
 
-def test_explicit_early_watch_can_run_with_actionable_only_enabled():
-    settings = SimpleNamespace(
+def test_explicit_early_watch_requires_the_legacy_policy():
+    """OPIP-ALERT-ACTIONABLE-ONLY-001: one unambiguous Early Watch policy.
+
+    The explicit Early Watch opt-in can no longer run while the actionable-only policy governs
+    alerts, so there is no partial bypass of the actionable gate.
+    """
+    gated = SimpleNamespace(
         opip_actionable_only_alerts=True,
         opip_early_watch_alerts_enabled=True,
         price_movement_mode="shadow",
@@ -100,14 +107,17 @@ def test_explicit_early_watch_can_run_with_actionable_only_enabled():
         telegram_chat_id="chat",
     )
 
-    assert scan_movers._early_watch_telegram_enabled(settings) is True
-    # The legacy broad-watch transport stays suppressed.
-    assert scan_movers._watch_telegram_enabled(settings) is False
+    assert scan_movers._early_watch_telegram_enabled(gated) is False
+    # The legacy broad-watch transport stays suppressed too.
+    assert scan_movers._watch_telegram_enabled(gated) is False
+
+    legacy = SimpleNamespace(**{**vars(gated), "opip_actionable_only_alerts": False})
+    assert scan_movers._early_watch_telegram_enabled(legacy) is True
 
 
 def test_explicit_early_watch_requires_telegram_credentials():
     settings = SimpleNamespace(
-        opip_actionable_only_alerts=True,
+        opip_actionable_only_alerts=False,
         opip_early_watch_alerts_enabled=True,
         price_movement_mode="shadow",
         telegram_enabled=True,
@@ -143,9 +153,17 @@ def test_early_watch_card_never_authorizes_entry():
     assert "Action: WATCH ONLY — no entry is authorized" in message
     assert "REVIEW ENTRY" not in message
 
-def test_production_compose_explicitly_enables_early_watch():
+@pytest.mark.acceptance
+def test_production_compose_keeps_early_watch_dark():
+    """ATDD-OPIP-ALERT-ACTIONABLE-ONLY-001/AC-009: the release delivers no automatic watch cards.
+
+    The Compose contract is the production activation surface, so the informational Early Watch
+    channel must be pinned off there while observations keep being captured.
+    """
     compose = (Path(__file__).resolve().parents[1] / "docker-compose.yml").read_text(encoding="utf-8")
 
-    assert 'OPIP_EARLY_WATCH_ALERTS_ENABLED: "true"' in compose
-    assert 'OPIP_ACTIONABLE_ONLY_ALERTS' not in compose
+    assert 'OPIP_EARLY_WATCH_ALERTS_ENABLED: "false"' in compose
+    assert 'OPIP_EARLY_WATCH_ALERTS_ENABLED: "true"' not in compose
+    assert 'OPIP_CANONICAL_WRITER_MODE: "shadow"' in compose
+    assert "OPIP_ACTIONABLE_ONLY_ALERTS:" not in compose
 

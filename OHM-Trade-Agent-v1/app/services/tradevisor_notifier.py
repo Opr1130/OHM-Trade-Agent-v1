@@ -19,6 +19,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from app.services.actionable_admission import (
+    ActionableEvidence,
+    ActionableNotificationPolicy,
+    evaluate_actionable_admission,
+    evidence_from_trade_plan,
+)
+from app.services.actionable_card import missing_card_elements, render_actionable_block
 from app.services.notification_policy import (
     DEFAULT_COOLDOWN_SECONDS,
     confirm_emit,
@@ -238,7 +245,7 @@ def format_tradevisor_alert(decision: TradevisorDecision) -> str:
             f"Planned loss: {_usd(allocation.risk_dollars)}",
             f"Estimated net profit T1: {_usd(net_t1)}",
             f"Estimated net profit T2: {_usd(net_t2)}",
-            f"Reward/Risk: {float(plan.reward_to_risk_2):.2f}:1",
+            f"Gross Reward/Risk (T2, before costs): {float(plan.reward_to_risk_2):.2f}:1",
             f"Horizon: {decision.horizon or 'UNCLASSIFIED'} "
             f"(native ATR {_atr_label(decision)}; no holding duration is modelled)",
             "",
@@ -312,6 +319,49 @@ def native_alert_recently_emitted(
     return False
 
 
+def _tradevisor_admission_evidence(decision: TradevisorDecision) -> ActionableEvidence:
+    """Map this decision's own evidence onto the shared admission contract.
+
+    Only facts the evaluation already recorded are used, and the direction-specific ones are read
+    from the matching leg: a BUY buys into the asks (``buy_fully_covered``, long round-trip
+    drag), a SELL sells into the bids (``sell_fully_covered``, short round-trip drag). The venue
+    is the one the evaluation recorded with the book; nothing is defaulted here.
+    ``economic_qualified``/``action_gate_allowed`` are True because this function is only reached
+    for a decision that already passed the Tradevisor action/economic/allocation contract.
+    """
+    facts = decision.evidence if isinstance(decision.evidence, dict) else {}
+    raw_execution = facts.get("execution_evidence")
+    execution = raw_execution if isinstance(raw_execution, dict) else {}
+    raw_capital = facts.get("f7_capital")
+    capital = raw_capital if isinstance(raw_capital, dict) else {}
+    signal = str(decision.signal or "").strip().upper()
+    direction = "SHORT" if signal == "SELL" else "LONG"
+    if direction == "SHORT":
+        depth_covered = execution.get("sell_fully_covered")
+        measured_impact = execution.get("short_round_trip_market_drag_pct")
+    else:
+        depth_covered = execution.get("buy_fully_covered")
+        measured_impact = execution.get("round_trip_market_drag_pct")
+    candidate = {
+        "symbol": decision.market,
+        "venue": execution.get("venue"),
+        "venue_identity_valid": execution.get("venue_identity_valid"),
+        "direction": direction,
+        "economic_qualified": True,
+        "action_gate_allowed": True,
+        "evidence_observed_at": decision.evaluated_at,
+        "plan_expires_at": decision.expires_at,
+        "current_price": execution.get("current_price"),
+        "market_liquidity_usd": execution.get("visible_liquidity_usd"),
+        "position_capacity_usd": execution.get("position_capacity_usd"),
+        "spread_bps": execution.get("spread_bps"),
+        "size_slippage_pct": measured_impact,
+        "depth_covered": depth_covered,
+        "economic_position_notional": capital.get("recommended_capital"),
+    }
+    return evidence_from_trade_plan(candidate, decision.plan)
+
+
 def notify_tradevisor_decision(
     decision: TradevisorDecision,
     *,
@@ -351,8 +401,46 @@ def notify_tradevisor_decision(
             reason="the native path already alerted this market's actionable trade",
         )
 
-    message = format_tradevisor_alert(decision)
+    # OPIP-ALERT-ACTIONABLE-ONLY-001: the shared actionable admission gate. The Tradevisor plane
+    # already refuses anything that is not an actionable decision with a complete plan, capital
+    # and economic evidence, so those verdicts feed C6 unchanged; what the gate adds is the
+    # mandatory market/execution evidence, geometry, cost-adjusted economics and expiry.
+    evidence = _tradevisor_admission_evidence(decision)
+    admission = evaluate_actionable_admission(
+        evidence=evidence,
+        policy=ActionableNotificationPolicy.from_settings(settings),
+        now=now,
+    )
+    if admission.suppressed:
+        return TradevisorNotificationOutcome(
+            status=STATUS_SUPPRESSED_POLICY,
+            reason=admission.suppression_reason() or "ACTIONABLE_GATE",
+        )
+
     plan = decision.plan
+    message = format_tradevisor_alert(decision)
+    # OPIP-ALERT-ACTIONABLE-ONLY-001 card contract: one shared block so the Tradevisor card states
+    # the entry zone, stop, targets, invalidation, expiry, net R/R, setup identity and the
+    # manual-execution statement exactly like the native path.
+    message = (
+        f"{message}\n\n"
+        + render_actionable_block(
+            admission=admission,
+            plan=plan,
+            setup_id=str(decision.dedup_id),
+            direction="SHORT" if str(decision.signal).upper() == "SELL" else "LONG",
+            venue=evidence.venue,
+            instrument=decision.instrument,
+            observed_at=evidence.observed_at,
+        )
+    )
+    incomplete = missing_card_elements(message)
+    if incomplete:
+        return TradevisorNotificationOutcome(
+            status=STATUS_SUPPRESSED_POLICY,
+            reason="ACTIONABLE_CARD_INCOMPLETE:" + ",".join(incomplete),
+            message=message,
+        )
     identity = f"TRADEVISOR:LONG:{decision.market}"
     fingerprint = ":".join(
         (

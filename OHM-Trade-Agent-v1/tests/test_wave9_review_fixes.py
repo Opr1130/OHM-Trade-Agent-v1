@@ -728,6 +728,10 @@ def _queued_plan():
 def test_outbox_removes_already_confirmed_policy_emission(monkeypatch):
     row = {
         "trade_id": "Q-CONFIRMED",
+        # OPIP-ALERT-ACTIONABLE-ONLY-001: a queued actionable row carries the admitted verdict and
+        # its resolved expiry, so the retry can be revalidated before anything is sent.
+        "admission": {"admission": "ADMITTED", "policy_version": "opip-actionable-only-v1"},
+        "plan_expires_at": "2999-01-01T00:00:00+00:00",
         "plan": _queued_plan(),
         "direction": "LONG",
         "action": "ENTER_NOW",

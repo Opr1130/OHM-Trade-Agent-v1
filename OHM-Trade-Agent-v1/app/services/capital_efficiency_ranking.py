@@ -53,16 +53,43 @@ def _finite(value: Any, default: float = 0.0) -> float:
     return numeric if math.isfinite(numeric) else default
 
 
+def position_capacity_ceiling_usd(
+    *,
+    liquidity_24h_usd: Any,
+    bid_depth_050_usd: Any,
+    ask_depth_050_usd: Any,
+) -> float | None:
+    """Largest notional the venue can absorb, from the two capacity limits.
+
+    This is the single owner of the capacity formula: market 24h liquidity and visible
+    +/-0.50% book depth each bound a position, and the binding constraint is the smaller of the
+    two. It is deliberately *not* a market-quality score -- callers that need "is this market
+    deep enough at all" must test the 24h turnover separately.
+
+    Returns ``None`` when neither limit is measurable, so a caller fails closed instead of
+    treating an unknown book as infinite capacity.
+    """
+    liquidity_24h = max(0.0, _finite(liquidity_24h_usd, 0.0))
+    bid_depth = _finite(bid_depth_050_usd, -1.0)
+    ask_depth = _finite(ask_depth_050_usd, -1.0)
+    limits: list[float] = []
+    if liquidity_24h > 0:
+        limits.append(liquidity_24h * MAX_POSITION_TO_24H_LIQUIDITY_FRACTION)
+    if bid_depth >= 0 and ask_depth >= 0:
+        limits.append(
+            min(bid_depth, ask_depth) * MAX_POSITION_TO_HALF_PERCENT_DEPTH_FRACTION
+        )
+    if not limits:
+        return None
+    return min(limits)
+
+
 def _capacity_metrics(
     *,
     ranked: RankedOpportunity,
     required_notional: float,
 ) -> tuple[bool, str, float | None, float | None, float]:
     snapshot = ranked.opportunity.snapshot
-    liquidity_24h = max(
-        0.0,
-        _finite(getattr(snapshot, "combined_24h_liquidity_usd", 0.0)),
-    )
     execution = getattr(snapshot, "execution_validation", None)
     bid_depth = _finite(
         getattr(execution, "bid_depth_050_usd", None),
@@ -75,20 +102,14 @@ def _capacity_metrics(
     if bid_depth < 0 or ask_depth < 0:
         return False, "UNKNOWN", None, None, 0.0
 
-    limits: list[float] = []
-    if liquidity_24h > 0:
-        limits.append(
-            liquidity_24h * MAX_POSITION_TO_24H_LIQUIDITY_FRACTION
-        )
-    limits.append(
-        min(bid_depth, ask_depth)
-        * MAX_POSITION_TO_HALF_PERCENT_DEPTH_FRACTION
+    ceiling = position_capacity_ceiling_usd(
+        liquidity_24h_usd=getattr(snapshot, "combined_24h_liquidity_usd", 0.0),
+        bid_depth_050_usd=bid_depth,
+        ask_depth_050_usd=ask_depth,
     )
-
-    if not limits:
+    if ceiling is None:
         return False, "UNKNOWN", None, None, 0.0
 
-    ceiling = min(limits)
     if required_notional <= 0:
         return False, "INVALID_NOTIONAL", ceiling, None, 0.0
 

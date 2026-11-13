@@ -98,6 +98,57 @@ class Settings(BaseSettings):
     # deep-qualified EARLY_MOVER watch channel. It does not re-enable legacy
     # broad-watch / price-movement Telegram and never grants trade authority.
     opip_early_watch_alerts_enabled: bool = False
+    # OPIP-ALERT-ACTIONABLE-ONLY-001 actionable-notification policy. These are *notification*
+    # thresholds only: they add refusals in front of the existing deterministic qualification,
+    # geometry, economic and risk gates and never change qualification, sizing, execution
+    # geometry or funded authority. The minimum is a net (cost-adjusted) reward-to-risk
+    # requirement, deliberately not a fixed profit amount. It is a notification floor only: the
+    # authoritative reward-to-risk policy remains the existing deterministic economic gate.
+    opip_actionable_policy_version: str = "opip-actionable-only-v1"
+    opip_actionable_max_evidence_age_seconds: int = Field(default=900, ge=60, le=21600)
+    opip_actionable_plan_validity_minutes: int = Field(default=720, ge=0, le=10080)
+    opip_actionable_min_net_reward_to_risk: float = Field(default=1.0, ge=0.1, le=10.0)
+    #: Fees/venue friction only. The measured, direction-specific market impact is added once from
+    #: the execution evidence, so the card's net R/R states the same total the gate used.
+    opip_actionable_round_trip_fee_pct: float = Field(default=0.52, ge=0.0, le=5.0)
+    #: Market 24h turnover floor (market quality). Never compared with the position-capacity
+    #: ceiling, which bounds order size instead.
+    opip_actionable_min_market_liquidity_usd: float = Field(default=100_000.0, gt=0)
+    #: Share of the venue's visible capacity ceiling the contemplated order may consume.
+    opip_actionable_max_capacity_utilization_pct: float = Field(
+        default=100.0, gt=0, le=100.0
+    )
+    opip_actionable_max_spread_bps: float = Field(default=50.0, gt=0, le=1000.0)
+    opip_actionable_max_size_slippage_pct: float = Field(default=1.0, gt=0, le=10.0)
+    opip_actionable_require_fully_covered_depth: bool = True
+    opip_actionable_admit_executable_limit_entries: bool = True
+    opip_actionable_require_target_2: bool = False
+    # ATDD-OPIP-ACTIONABLE-LIQUIDITY-v1 notification-admission guards. All
+    # default OFF so the shipped notification policy is unchanged. Enabling any
+    # of them can only ADD refusals; none can widen notification authority.
+    opip_actionable_require_verified_depth: bool = False
+    opip_actionable_min_weaker_side_depth_usd: float = Field(
+        default=600_000.0, gt=0
+    )
+    opip_actionable_depth_band_pct: float = Field(default=0.50, gt=0, le=5.0)
+    opip_actionable_require_calibrated_probability: bool = False
+    opip_actionable_min_calibrated_probability: float = Field(
+        default=0.90, gt=0.0, le=1.0
+    )
+    opip_actionable_require_protection_admission: bool = False
+    opip_actionable_rolling_24h_max_new_entries: int = Field(default=0, ge=0, le=20)
+    # ATDD-OPIP-ACTIONABLE-LIQUIDITY-v1 producer wiring. All default OFF:
+    # with a flag unset the producer does nothing at all, so the deployed
+    # behaviour is unchanged until an owner enables it deliberately.
+    opip_opportunity_evidence_enabled: bool = False
+    opip_opportunity_evidence_path: str = "/app/data/opportunity_evidence.jsonl"
+    opip_ai_advisory_isolation_enabled: bool = False
+    opip_protection_stamp_publish_enabled: bool = False
+    opip_protection_stamp_path: str = "/app/data/protection_admission_stamp.json"
+    opip_protection_stamp_history_path: str = "/app/data/protection_admission_stamp_history.json"
+    opip_protection_stamp_max_freshness_seconds: float = Field(
+        default=300.0, gt=0.0, le=3600.0
+    )
     # PR 2 canonical writer capture. Default off. "shadow" records Early Watch
     # governor transitions into SQLite evidence only; it does not grant trading
     # authority, ranking influence, or production activation.

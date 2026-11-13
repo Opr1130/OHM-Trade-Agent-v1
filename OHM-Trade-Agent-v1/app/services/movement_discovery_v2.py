@@ -51,12 +51,23 @@ from app.scanner.universe import (
     _market_symbols,
 )
 from app.services.asset_display_identity import VERIFIED_MAPPING_STATUSES
+from app.services.early_watch_mode import (
+    automatic_notifications_enabled,
+    suppression_evidence_line,
+)
 from app.services.notification_policy import record_emitted, should_emit
 from app.services.telegram_delivery import (
     record_telegram_not_eligible,
     record_telegram_suppression,
     send_tracked_telegram,
 )
+
+#: Suppression reason recorded when ``OPIP_EARLY_WATCH_MODE=evidence_only``
+#: withholds an automatic Early Watch notification. Distinct from
+#: ``NOTIFICATION_POLICY`` (a dedup/cooldown decision) and from
+#: ``ALERT_NOT_ELIGIBLE`` (a qualification decision) so the three are separable
+#: in the delivered-evidence record.
+EVIDENCE_ONLY_SUPPRESSION_REASON = "EARLY_WATCH_EVIDENCE_ONLY"
 
 VERSION = "movement-discovery-v2.1"
 WATCH = "WATCH"
@@ -1427,8 +1438,33 @@ def format_early_mover_message(signal: EarlyMoverSignal) -> str:
     return format_operator_watch_message(signal, style="telegram")
 
 
-def send_early_mover_update(signal: EarlyMoverSignal, *, bot_token: str, chat_id: str, cooldown_seconds: int = 1800) -> bool:
+def send_early_mover_update(
+    signal: EarlyMoverSignal,
+    *,
+    bot_token: str,
+    chat_id: str,
+    cooldown_seconds: int = 1800,
+    informational_watch_opted_in: bool = False,
+) -> bool:
+    """Direct Early Watch send, closed by OPIP-ALERT-ACTIONABLE-ONLY-001.
+
+    The governed automatic path is ``app.jobs.scan_movers``, which resolves the single Early
+    Watch policy (evidence-only by default) and owns the governor, identity and dedupe. This
+    direct helper carried no admission gate of its own, so it is now fail-closed: a caller must
+    pass ``informational_watch_opted_in=True`` -- the legacy, non-actionable-only opt-in -- for a
+    card to be delivered, and every refusal keeps its reason in the delivery ledger.
+    """
     identity = f"EARLY_MOVER:{signal.symbol}"
+    if not informational_watch_opted_in:
+        record_telegram_suppression(
+            identity=identity,
+            alert_family="EARLY_MOVER",
+            event_type=signal.stage,
+            fingerprint=signal.fingerprint,
+            reason="ACTIONABLE_ONLY_POLICY:DIRECT_WATCH_SEND_DISABLED",
+            symbol=signal.symbol,
+        )
+        return False
     if not signal.alert_eligible:
         record_telegram_not_eligible(
             identity=identity,
@@ -1449,6 +1485,25 @@ def send_early_mover_update(signal: EarlyMoverSignal, *, bot_token: str, chat_id
             reason="NOTIFICATION_POLICY",
             symbol=signal.symbol,
         )
+        return False
+    # ``evidence_only`` is an explicit release configuration: detection, scoring
+    # and evidence persistence are unchanged (the caller already recorded the
+    # observation), and only this AUTOMATIC delivery is withheld. It is checked
+    # after the eligibility and policy gates so their reasons keep their meaning,
+    # and it records its own distinct reason plus a durable marker, so a withheld
+    # observation stays auditable instead of vanishing. Critical safety alerts,
+    # qualified entry notifications and subscribed COMMAND_WATCH are separate
+    # families and are untouched by this switch.
+    if not automatic_notifications_enabled():
+        record_telegram_suppression(
+            identity=identity,
+            alert_family="EARLY_MOVER",
+            event_type=signal.stage,
+            fingerprint=signal.fingerprint,
+            reason=EVIDENCE_ONLY_SUPPRESSION_REASON,
+            symbol=signal.symbol,
+        )
+        print(suppression_evidence_line(identity), flush=True)
         return False
     delivery = send_tracked_telegram(
         bot_token=bot_token,

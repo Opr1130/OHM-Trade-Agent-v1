@@ -345,6 +345,54 @@ def _new_event_id() -> str:
     return f"EVT:{uuid.uuid4().hex}"
 
 
+#: Rows folded per hydration / refresh page.
+#:
+#: Hydration used to run one ``fetchall()`` over the whole per-type history, so the
+#: entire backlog was materialised as Python rows before the first one was folded
+#: and resident memory at startup grew with total history. Pages ride the existing
+#: ``idx_events_type_cursor`` range index, so each step costs one page and the
+#: canonical commit order is unchanged.
+HYDRATION_PAGE_ROWS = 1000
+
+#: Upper bound on retained current-state projection entries.
+#:
+#: The projections answer "what is this identity's state now?". They were retained
+#: for every identity ever seen, so a closed episode or a finished request stayed
+#: resident for the life of the process. Retention is now a bound; an entry that
+#: has been released is re-derived from its own durable rows on the next read,
+#: because the durable row - not the dictionary - is the authority for both.
+PROJECTION_RETENTION_ENTRIES = 2048
+
+
+class _BoundedProjection(dict):
+    """Insertion-ordered projection that releases its oldest entry past a bound.
+
+    Releasing an entry loses nothing: every retention consumer re-derives the
+    answer from the identity's own durable rows when the entry is absent, and that
+    is the same authority the retained value was folded from. ``released`` makes
+    the behaviour observable so a test can prove the bound is real.
+    """
+
+    def __init__(self, limit: int | None = None) -> None:
+        super().__init__()
+        # Resolved at construction so the bound stays a single module-level
+        # constant that a test (or a future operator knob) can override.
+        bound = PROJECTION_RETENTION_ENTRIES if limit is None else limit
+        self.limit = max(1, int(bound))
+        self.released = 0
+
+    def __setitem__(self, key, value) -> None:
+        if key not in self:
+            super().__setitem__(key, value)
+            while len(self) > self.limit:
+                super().__delitem__(next(iter(self)))
+                self.released += 1
+            return
+        # Refreshing an existing identity must not move it in insertion order, so
+        # the release order stays deterministic.
+        super().__setitem__(key, value)
+
+
 class CanonicalWriter:
     """Single write authority for the operational SQLite WAL database."""
 
@@ -367,21 +415,22 @@ class CanonicalWriter:
         try:
             self._conn = connect(self.db_path, read_only=False)
             initialize_schema(self._conn, now_iso=_utc_now())
-            self._request_lifecycle_projection: dict[str, str] = {}
+            self._request_lifecycle_projection: dict[str, str] = _BoundedProjection()
             self._request_lifecycle_projection_watermark: tuple[int, int] = (0, -1)
-            self._role_result_idempotency_by_id: dict[str, str] = {}
+            # Role-result identity is answered from the durable row through
+            # ``idx_events_role_result_identity``, so there is no resident map to
+            # grow: the watermark only records how far the uniqueness check has run.
             self._role_result_projection_watermark: tuple[int, int] = (0, -1)
-            # F4 opportunity-lifecycle persistence projection. Mirrors the DI
-            # hydration pattern: the durable rows are the source of truth and the
-            # in-memory projection is rebuilt from them, failing closed on an
-            # impossible history.
+            # F4 opportunity-lifecycle persistence projection. The durable rows are
+            # the source of truth; the in-memory fold is a bounded cache over them
+            # and is rebuilt from them, failing closed on an impossible history.
             self._opportunity_transition_projection: dict[
                 str, opportunity_persistence_contract.OpportunityEpisode
-            ] = {}
-            self._opportunity_transition_count: dict[str, int] = {}
+            ] = _BoundedProjection()
+            self._opportunity_transition_count: dict[str, int] = _BoundedProjection()
             self._opportunity_transition_last: dict[
                 str, tuple[str, str, int, int]
-            ] = {}
+            ] = _BoundedProjection()
             self._opportunity_transition_watermark: tuple[int, int] = (0, -1)
             self._opportunity_transition_hydrated = False
             self._hydrate_request_lifecycle_projection()
@@ -422,13 +471,12 @@ class CanonicalWriter:
         instance._read_only = True
         instance._store_lock = None
         instance._conn = connect(instance.db_path, read_only=True)
-        instance._request_lifecycle_projection = {}
+        instance._request_lifecycle_projection = _BoundedProjection()
         instance._request_lifecycle_projection_watermark = (0, -1)
-        instance._role_result_idempotency_by_id = {}
         instance._role_result_projection_watermark = (0, -1)
-        instance._opportunity_transition_projection = {}
-        instance._opportunity_transition_count = {}
-        instance._opportunity_transition_last = {}
+        instance._opportunity_transition_projection = _BoundedProjection()
+        instance._opportunity_transition_count = _BoundedProjection()
+        instance._opportunity_transition_last = _BoundedProjection()
         instance._opportunity_transition_watermark = (0, -1)
         instance._opportunity_transition_hydrated = False
         return instance
@@ -452,38 +500,137 @@ class CanonicalWriter:
         with contextlib.suppress(Exception):
             self._store_lock.release()
 
+    def _iter_event_rows(
+        self,
+        event_type: str,
+        columns: str,
+        *,
+        after: tuple[int, int] = (0, -1),
+    ):
+        """Yield canonical rows of one event type in commit order, page by page.
+
+        ``columns`` is a module-private literal at every call site; the only bound
+        parameter is the exclusive ``(history_epoch, local_sequence)`` cursor, which
+        is also what makes the read an index range seek on
+        ``idx_events_type_cursor``. Paging keeps both the SQLite result set and the
+        Python row list bounded by ``HYDRATION_PAGE_ROWS`` however long the history
+        grows, and preserves the exact commit order the fold depends on.
+        """
+        epoch, sequence = after
+        while True:
+            rows = self._conn.execute(
+                f"SELECT {columns} FROM events WHERE event_type = ? "
+                "AND (history_epoch > ? "
+                "     OR (history_epoch = ? AND local_sequence > ?)) "
+                "ORDER BY history_epoch ASC, local_sequence ASC LIMIT ?",
+                (event_type, epoch, epoch, sequence, HYDRATION_PAGE_ROWS),
+            ).fetchall()
+            if not rows:
+                return
+            for row in rows:
+                epoch = int(row["history_epoch"])
+                sequence = int(row["local_sequence"])
+                yield row
+
+    def _iter_identity_rows(
+        self,
+        event_type: str,
+        columns: str,
+        *,
+        payload_path: str,
+        value: str,
+        before: tuple[int, int] | None = None,
+    ):
+        """Yield the durable rows of ONE identity, in commit order.
+
+        Served by the filtered identity indexes, so it is a range seek for a single
+        identity rather than a scan of the event type. It is deliberately not paged:
+        an identity's own history is a handful of rows, which is what makes it a
+        safe replacement for an unbounded resident map. ``payload_path`` and
+        ``columns`` are module-private literals at every call site.
+        """
+        sql = (
+            f"SELECT {columns} FROM events WHERE event_type = ? "
+            f"AND json_extract(payload_json, '{payload_path}') = ?"
+        )
+        params: list[object] = [event_type, value]
+        if before is not None:
+            epoch, sequence = before
+            sql += (
+                " AND (history_epoch < ? "
+                "      OR (history_epoch = ? AND local_sequence < ?))"
+            )
+            params.extend((epoch, epoch, sequence))
+        sql += " ORDER BY history_epoch ASC, local_sequence ASC"
+        for row in self._conn.execute(sql, tuple(params)):
+            yield row
+
     def _apply_persisted_request_transition(
         self,
         payload: Mapping[str, object],
+        *,
+        cursor: tuple[int, int] | None = None,
     ) -> None:
         if payload.get("supersedes_id") is not None:
             return
         request_id = str(payload["request_id"])
-        current = self._request_lifecycle_projection.get(
-            request_id, "ELIGIBLE"
-        )
+        current = self._request_current_state(request_id, before=cursor)
         if payload["from_state"] != current:
             raise ValueError("persisted transition history is invalid")
         self._request_lifecycle_projection[request_id] = str(
             payload["to_state"]
         )
 
+    def _request_current_state(
+        self,
+        request_id: str,
+        *,
+        before: tuple[int, int] | None = None,
+    ) -> str:
+        """The request's current lifecycle state, from the cache or its own rows.
+
+        The retained entry is the fast path. When retention has released it - the
+        bound is what keeps a finished request from staying resident for the life of
+        the process - the state is re-folded from that request's own durable rows,
+        which is the same authority the retained value came from. ``ELIGIBLE`` is
+        returned only when no transition has been committed at all, exactly the
+        starting state the fold assumes.
+        """
+        retained = self._request_lifecycle_projection.get(request_id)
+        if retained is not None:
+            return retained
+        state = "ELIGIBLE"
+        for row in self._iter_identity_rows(
+            DECISION_INTELLIGENCE_TRANSITION_RECORDED,
+            "history_epoch, local_sequence, payload_json",
+            payload_path="$.request_id",
+            value=request_id,
+            before=before,
+        ):
+            replayed = validate_di_payload(
+                DECISION_INTELLIGENCE_TRANSITION_RECORDED,
+                json.loads(str(row["payload_json"])),
+            )
+            if replayed.get("supersedes_id") is not None:
+                continue
+            if replayed["from_state"] != state:
+                raise ValueError("persisted transition history is invalid")
+            state = str(replayed["to_state"])
+        return state
+
     def _hydrate_request_lifecycle_projection(self) -> None:
-        rows = self._conn.execute(
-            """
-            SELECT history_epoch, local_sequence, payload_json
-            FROM events
-            WHERE event_type = ?
-            ORDER BY history_epoch ASC, local_sequence ASC
-            """,
-            (DECISION_INTELLIGENCE_TRANSITION_RECORDED,),
-        ).fetchall()
-        for row in rows:
+        for row in self._iter_event_rows(
+            DECISION_INTELLIGENCE_TRANSITION_RECORDED,
+            "history_epoch, local_sequence, payload_json",
+        ):
             payload = validate_di_payload(
                 DECISION_INTELLIGENCE_TRANSITION_RECORDED,
                 json.loads(str(row["payload_json"])),
             )
-            self._apply_persisted_request_transition(payload)
+            self._apply_persisted_request_transition(
+                payload,
+                cursor=(int(row["history_epoch"]), int(row["local_sequence"])),
+            )
             self._request_lifecycle_projection_watermark = (
                 int(row["history_epoch"]),
                 int(row["local_sequence"]),
@@ -493,33 +640,19 @@ class CanonicalWriter:
         history_epoch, local_sequence = (
             self._request_lifecycle_projection_watermark
         )
-        rows = self._conn.execute(
-            """
-            SELECT history_epoch, local_sequence, payload_json
-            FROM events
-            WHERE event_type = ?
-              AND (
-                    history_epoch > ?
-                    OR (
-                        history_epoch = ?
-                        AND local_sequence > ?
-                    )
-                  )
-            ORDER BY history_epoch ASC, local_sequence ASC
-            """,
-            (
-                DECISION_INTELLIGENCE_TRANSITION_RECORDED,
-                history_epoch,
-                history_epoch,
-                local_sequence,
-            ),
-        ).fetchall()
-        for row in rows:
+        for row in self._iter_event_rows(
+            DECISION_INTELLIGENCE_TRANSITION_RECORDED,
+            "history_epoch, local_sequence, payload_json",
+            after=(history_epoch, local_sequence),
+        ):
             payload = validate_di_payload(
                 DECISION_INTELLIGENCE_TRANSITION_RECORDED,
                 json.loads(str(row["payload_json"])),
             )
-            self._apply_persisted_request_transition(payload)
+            self._apply_persisted_request_transition(
+                payload,
+                cursor=(int(row["history_epoch"]), int(row["local_sequence"])),
+            )
             self._request_lifecycle_projection_watermark = (
                 int(row["history_epoch"]),
                 int(row["local_sequence"]),
@@ -531,25 +664,46 @@ class CanonicalWriter:
         idempotency_key: str,
         payload: Mapping[str, object],
     ) -> None:
+        """Validate one persisted role result's identity uniqueness.
+
+        Answered from the durable rows through
+        ``idx_events_role_result_identity``: the previous implementation kept a
+        ``result_id -> idempotency_key`` map for every role result ever recorded, so
+        resident memory grew without bound with total history. The check is the same
+        one, as an indexed anti-join - no other committed row may claim this
+        ``result_id`` under a different idempotency key - so corrupt history still
+        fails closed at hydration.
+        """
         result_id = payload.get("result_id")
         if not isinstance(result_id, str) or not result_id:
             raise ValueError("persisted role result has invalid result_id")
-        existing = self._role_result_idempotency_by_id.get(result_id)
-        if existing is not None and existing != idempotency_key:
+        conflicting = self._conn.execute(
+            "SELECT 1 FROM events WHERE event_type = ? "
+            "AND json_extract(payload_json, '$.result_id') = ? "
+            "AND idempotency_key <> ? LIMIT 1",
+            (DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED, result_id, idempotency_key),
+        ).fetchone()
+        if conflicting is not None:
             raise ValueError("persisted role result identity is not unique")
-        self._role_result_idempotency_by_id[result_id] = idempotency_key
+
+    def _role_result_idempotency_key(self, result_id: str) -> str | None:
+        """The committed idempotency key for one role-result identity, or ``None``.
+
+        Indexed and DB-backed, so ancestry lookups cost one range seek and retain
+        nothing between calls.
+        """
+        row = self._conn.execute(
+            "SELECT idempotency_key FROM events WHERE event_type = ? "
+            "AND json_extract(payload_json, '$.result_id') = ? LIMIT 1",
+            (DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED, str(result_id)),
+        ).fetchone()
+        return str(row["idempotency_key"]) if row is not None else None
 
     def _hydrate_role_result_identity_projection(self) -> None:
-        rows = self._conn.execute(
-            """
-            SELECT history_epoch, local_sequence, idempotency_key, payload_json
-            FROM events
-            WHERE event_type = ?
-            ORDER BY history_epoch ASC, local_sequence ASC
-            """,
-            (DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED,),
-        ).fetchall()
-        for row in rows:
+        for row in self._iter_event_rows(
+            DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED,
+            "history_epoch, local_sequence, idempotency_key, payload_json",
+        ):
             payload = validate_di_payload(
                 DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED,
                 json.loads(str(row["payload_json"])),
@@ -565,28 +719,11 @@ class CanonicalWriter:
 
     def _refresh_role_result_identity_projection(self) -> None:
         history_epoch, local_sequence = self._role_result_projection_watermark
-        rows = self._conn.execute(
-            """
-            SELECT history_epoch, local_sequence, idempotency_key, payload_json
-            FROM events
-            WHERE event_type = ?
-              AND (
-                    history_epoch > ?
-                    OR (
-                        history_epoch = ?
-                        AND local_sequence > ?
-                    )
-                  )
-            ORDER BY history_epoch ASC, local_sequence ASC
-            """,
-            (
-                DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED,
-                history_epoch,
-                history_epoch,
-                local_sequence,
-            ),
-        ).fetchall()
-        for row in rows:
+        for row in self._iter_event_rows(
+            DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED,
+            "history_epoch, local_sequence, idempotency_key, payload_json",
+            after=(history_epoch, local_sequence),
+        ):
             payload = validate_di_payload(
                 DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED,
                 json.loads(str(row["payload_json"])),
@@ -603,39 +740,92 @@ class CanonicalWriter:
     # -- F4 opportunity-lifecycle persistence projection --------------------
 
     def _apply_persisted_opportunity_transition(
-        self, payload: Mapping[str, object]
+        self,
+        payload: Mapping[str, object],
+        *,
+        cursor: tuple[int, int] | None = None,
     ) -> None:
-        """Fold one durable F4 record into the in-memory projection.
+        """Fold one durable F4 record onto the episode's recorded prior state.
 
-        The payload is re-validated and folded onto the episode's recorded prior
-        state, so an impossible transition raises and the caller fails closed
-        rather than accepting a corrupt history.
+        The payload is re-validated and folded onto the episode's prior state, so
+        an impossible transition raises and the caller fails closed rather than
+        accepting a corrupt history. The prior state comes from the bounded cache
+        or, when retention has released it, from that episode's own durable rows -
+        the durable rows are the authority either way.
         """
         contract = opportunity_persistence_contract
         episode_id = contract.opportunity_transition_episode_id(payload)
         episode = contract.apply_opportunity_transition_record(
-            self._opportunity_transition_projection.get(episode_id), payload
+            self._opportunity_episode_state(episode_id, before=cursor), payload
         )
         self._opportunity_transition_projection[episode.episode_id] = episode
         self._opportunity_transition_count[episode.episode_id] = (
             self._opportunity_transition_count.get(episode.episode_id, 0) + 1
         )
 
+    def _opportunity_episode_state(
+        self,
+        episode_id: str,
+        *,
+        before: tuple[int, int] | None = None,
+    ) -> "opportunity_persistence_contract.OpportunityEpisode | None":
+        """One episode's folded state, from the cache or from its own rows.
+
+        Retaining every episode ever recorded - including closed ones - is a
+        permanent resident cost that grows with total history. The cache is
+        bounded instead, and a released episode is re-folded from its own indexed
+        rows, so a closed episode still answers exactly as it did while retained.
+        ``None`` means the episode has no committed transition at all.
+        """
+        contract = opportunity_persistence_contract
+        retained = self._opportunity_transition_projection.get(episode_id)
+        if retained is not None:
+            return retained
+        episode = None
+        last: tuple[str, str, int, int] = ("", "", 0, -1)
+        count = 0
+        # The generic store carries no F4-specific index by contract (the schema
+        # must stay free of this increment's vocabulary), so this cold path re-reads
+        # the event type through the PAGED iterator and filters by episode identity.
+        # Memory stays bounded by one page; the cost is O(type) and is only paid
+        # when retention has released an episode a caller still asks about.
+        for row in self._iter_event_rows(
+            contract.OPPORTUNITY_LIFECYCLE_TRANSITION_RECORDED,
+            "event_id, history_epoch, local_sequence, payload_json",
+        ):
+            epoch = int(row["history_epoch"])
+            sequence = int(row["local_sequence"])
+            if before is not None and (epoch, sequence) >= before:
+                break
+            replayed = json.loads(str(row["payload_json"]))
+            if contract.opportunity_transition_episode_id(replayed) != episode_id:
+                continue
+            episode = contract.apply_opportunity_transition_record(episode, replayed)
+            last = (
+                contract.opportunity_transition_event_id(replayed),
+                str(row["event_id"]),
+                epoch,
+                sequence,
+            )
+            count += 1
+        if episode is not None:
+            # Re-cache what was re-derived so the next read is served from memory
+            # again; the values are identical to the ones retention released.
+            self._opportunity_transition_projection[episode.episode_id] = episode
+            self._opportunity_transition_last[episode_id] = last
+            self._opportunity_transition_count[episode_id] = count
+        return episode
+
     def _hydrate_opportunity_transition_projection(self) -> None:
-        rows = self._conn.execute(
-            """
-            SELECT event_id, history_epoch, local_sequence, payload_json
-            FROM events
-            WHERE event_type = ?
-            ORDER BY history_epoch ASC, local_sequence ASC
-            """,
-            (
-                opportunity_persistence_contract.OPPORTUNITY_LIFECYCLE_TRANSITION_RECORDED,
-            ),
-        ).fetchall()
-        for row in rows:
+        for row in self._iter_event_rows(
+            opportunity_persistence_contract.OPPORTUNITY_LIFECYCLE_TRANSITION_RECORDED,
+            "event_id, history_epoch, local_sequence, payload_json",
+        ):
             payload = json.loads(str(row["payload_json"]))
-            self._apply_persisted_opportunity_transition(payload)
+            self._apply_persisted_opportunity_transition(
+                payload,
+                cursor=(int(row["history_epoch"]), int(row["local_sequence"])),
+            )
             episode_id = (
                 opportunity_persistence_contract.opportunity_transition_episode_id(
                     payload
@@ -662,27 +852,16 @@ class CanonicalWriter:
     def _refresh_opportunity_transition_projection(self) -> None:
         self._ensure_opportunity_transition_projection()
         history_epoch, local_sequence = self._opportunity_transition_watermark
-        rows = self._conn.execute(
-            """
-            SELECT event_id, history_epoch, local_sequence, payload_json
-            FROM events
-            WHERE event_type = ?
-              AND (
-                    history_epoch > ?
-                    OR (history_epoch = ? AND local_sequence > ?)
-                  )
-            ORDER BY history_epoch ASC, local_sequence ASC
-            """,
-            (
-                opportunity_persistence_contract.OPPORTUNITY_LIFECYCLE_TRANSITION_RECORDED,
-                history_epoch,
-                history_epoch,
-                local_sequence,
-            ),
-        ).fetchall()
-        for row in rows:
+        for row in self._iter_event_rows(
+            opportunity_persistence_contract.OPPORTUNITY_LIFECYCLE_TRANSITION_RECORDED,
+            "event_id, history_epoch, local_sequence, payload_json",
+            after=(history_epoch, local_sequence),
+        ):
             payload = json.loads(str(row["payload_json"]))
-            self._apply_persisted_opportunity_transition(payload)
+            self._apply_persisted_opportunity_transition(
+                payload,
+                cursor=(int(row["history_epoch"]), int(row["local_sequence"])),
+            )
             episode_id = (
                 opportunity_persistence_contract.opportunity_transition_episode_id(
                     payload
@@ -741,7 +920,7 @@ class CanonicalWriter:
                     error_code="SQLITE_ERROR",
                     detail=str(exc),
                 )
-            episode = self._opportunity_transition_projection.get(episode_id)
+            episode = self._opportunity_episode_state(episode_id)
             if episode is None:
                 return contract.OpportunityEpisodeProjection(
                     status="NOT_FOUND", episode_id=episode_id
@@ -3469,11 +3648,10 @@ class CanonicalWriter:
         )
 
     def _load_role_result_by_id(self, result_id: str) -> dict:
-        idempotency_key = self._role_result_idempotency_by_id.get(result_id)
+        idempotency_key = self._role_result_idempotency_key(result_id)
         if idempotency_key is None:
-            self._refresh_role_result_identity_projection()
-            idempotency_key = self._role_result_idempotency_by_id.get(result_id)
-        if idempotency_key is None:
+            # No resident cache can be stale: the durable row is the authority, so
+            # a miss here means the record really is absent.
             raise ValueError(
                 "required decision_intelligence.role_result.recorded "
                 "record is missing for ancestry validation"
@@ -3759,9 +3937,7 @@ class CanonicalWriter:
             return
 
         self._refresh_request_lifecycle_projection()
-        current_state = self._request_lifecycle_projection.get(
-            request_id, "ELIGIBLE"
-        )
+        current_state = self._request_current_state(request_id)
         from_state = payload.get("from_state")
         if from_state != current_state:
             raise ValueError(
@@ -5717,7 +5893,7 @@ class CanonicalWriter:
             self._ensure_opportunity_transition_projection()
             projected_episode = (
                 opportunity_persistence_contract.apply_opportunity_transition_record(
-                    self._opportunity_transition_projection.get(
+                    self._opportunity_episode_state(
                         opportunity_persistence_contract.opportunity_transition_episode_id(
                             payload
                         )
@@ -5866,9 +6042,8 @@ class CanonicalWriter:
                     "to_state"
                 ]
         if intent.event_type == DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED:
-            self._role_result_idempotency_by_id[payload["result_id"]] = (
-                intent.idempotency_key
-            )
+            # Keep the uniqueness-check watermark current. There is no resident
+            # identity map to update: the committed row is the lookup.
             self._role_result_projection_watermark = (
                 history_epoch,
                 local_sequence,

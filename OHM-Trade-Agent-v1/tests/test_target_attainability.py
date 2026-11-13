@@ -2,6 +2,7 @@ import json
 from types import SimpleNamespace
 
 from app.jobs import scan_opportunities
+from app.scanner.execution_validation import ExecutionValidation
 from app.scanner.market_scanner import (
     ScanResult,
     _percentage_change,
@@ -41,6 +42,13 @@ def snapshot(**overrides) -> MarketSnapshot:
         rolling_72h_upside_median_pct=12.0,
         rolling_72h_upside_p75_pct=16.0,
         rolling_72h_upside_p90_pct=20.0,
+        # Positive fixtures require explicit synthetic LONG execution quality.
+        # Live snapshots with missing evidence still fail closed.
+        execution_validation=ExecutionValidation(
+            status="VALID", book_coverage_status="COMPLETE", warnings=[],
+            spread_bps=6.0, estimated_visible_round_trip_market_drag_pct=0.20,
+            buy_fully_covered=True, validation_notional_usd=750.0,
+        ),
     )
     values.update(overrides)
     return MarketSnapshot(**values)
