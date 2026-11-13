@@ -49,7 +49,7 @@ EXPLICITLY OUT OF SCOPE:
 - Review-based authorization of contract content (still a human review step).
 
 FROZEN BOUNDARIES:
-- Existing contracts, acceptance tests and release architecture gate are unchanged except one workflow-invocation assertion.
+- Existing contracts, acceptance tests and release architecture gate are unchanged except the two workflow-invocation assertions (ATDD-000 AC-004 and ATDD-RELEASE-PIPELINE-v1 AC-027), which pinned the old pointer-fed command; owner to confirm.
 - No bypass, disabled check or permissive fallback.
 
 ACCEPTANCE TEST TRACEABILITY:
@@ -76,6 +76,7 @@ AC-002 -> OHM-Trade-Agent-v1/tests/test_atdd_pr_scoped_selection_v1.py
 AC-003 -> .github/workflows/pytest.yml
 AC-003 -> OHM-Trade-Agent-v1/docs/atdd/README.md
 AC-003 -> OHM-Trade-Agent-v1/tests/test_atdd_scope_control.py
+AC-003 -> OHM-Trade-Agent-v1/tests/test_opip_feature_stack_gates_v1.py
 AC-003 -> OHM-Trade-Agent-v1/tests/test_atdd_pr_scoped_selection_v1.py
 AC-004 -> OHM-Trade-Agent-v1/tests/test_atdd_pr_scoped_selection_v1.py
 
