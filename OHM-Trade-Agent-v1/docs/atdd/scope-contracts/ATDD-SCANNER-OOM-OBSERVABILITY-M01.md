@@ -41,11 +41,6 @@ GIVEN: this increment is the active ATDD increment
 WHEN: the scope checker evaluates the contract and the changed-file set
 THEN: the contract declares every required section in order with GIVEN, WHEN and THEN criteria, every acceptance test is traced to its criterion, and only files mapped to an approved criterion may change.
 
-AC-004:
-GIVEN: a completed increment's acceptance test observes the global ATDD pointer
-WHEN: the pointer is deliberately moved to a later approved increment
-THEN: that test resolves the pointer to an existing scope contract and proves its own identity from its own frozen contract, instead of pinning the pointer to its own increment and blocking the next one.
-
 EXPLICITLY OUT OF SCOPE:
 - Any change to app/services/scan_supervisor.py, classify_exit, the OOM outcome vocabulary or the scanner's fail-closed behavior.
 - Any change to the dispatcher, the isolated worker, resource controls, or the Compose memory limits.
@@ -65,17 +60,16 @@ AC-001 -> tests/test_opip_scan_docker_fault_injection_v1.py::test_oom_killed_fla
 AC-002 -> tests/test_opip_scan_docker_fault_injection_v1.py::test_oom_evidence_reports_exit_limit_and_cgroup_counter
 AC-002 -> tests/test_opip_scan_docker_fault_injection_v1.py::test_oom_evidence_tolerates_an_unreadable_container
 AC-003 -> tests/test_opip_scan_docker_fault_injection_v1.py::test_scope_contract_declares_the_active_increment
-AC-004 -> tests/test_opip_ai_integration_reliability_v1.py::test_ac_012_scope_contract_declares_the_active_increment
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/tests/test_opip_scan_docker_fault_injection_v1.py
 AC-002 -> OHM-Trade-Agent-v1/tests/test_opip_scan_docker_fault_injection_v1.py
 AC-003 -> OHM-Trade-Agent-v1/tests/test_opip_scan_docker_fault_injection_v1.py
-AC-004 -> OHM-Trade-Agent-v1/tests/test_opip_ai_integration_reliability_v1.py
 AC-003 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-SCANNER-OOM-OBSERVABILITY-M01.md
 AC-003 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
 
 DEFERRED DISCOVERIES:
+- The completed-increment pointer pin in the AI-integration test was already removed on main (PR-scoped selection), so it is no longer part of this increment.
 Local execution of the Docker-dependent assertion was impossible in the
 development environment: this host has no Docker CLI or daemon and no WSL, so the
 focused test skips here exactly as its skip condition specifies. The correction is
