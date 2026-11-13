@@ -8,6 +8,7 @@ set -Eeuo pipefail
 ENV_FILE="${OPIP_BACKUP_ENV_FILE:-/etc/opip-data-platform.env}"
 BACKUP_ROOT="${OPIP_BACKUP_ROOT:-/var/backups/opip-postgres}"
 LOCK_FILE="${OPIP_BACKUP_LOCK_FILE:-/var/lock/opip-postgres-backup.lock}"
+STATE_ROOT="${OPIP_BACKUP_STATE_ROOT:-/var/lib/opip-data-platform}"
 CONTAINER="${OPIP_BACKUP_CONTAINER:-opip-postgres}"
 MIN_FREE_BYTES=$((2 * 1024 * 1024 * 1024))   # D1 absolute minimum: never write below it
 DEFAULT_DUMP_BYTES="${OPIP_BACKUP_DEFAULT_DUMP_BYTES:-$((512 * 1024 * 1024))}"  # used when no earlier dump exists
@@ -69,8 +70,52 @@ sha256sum "$target" > "$target.sha256"
 chmod 0600 "$target" "$target.sha256"
 sha256sum --check --status "$target.sha256"
 
-# Retention is intentionally not applied here: older dumps are preserved until a
-# separate, explicitly approved retention change.
+# Mark this dump as verified (checksum + readable table of contents). Only marked
+# dumps are ever eligible for retention; older unmarked dumps are never touched and
+# need a separate, reviewed pruning manifest.
+printf 'toc_verified_at_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$target.verified"
+chmod 0600 "$target.verified"
+
+# Retention (approved rule): keep the newest 3 verified dumps plus the newest verified
+# dump of each of the 4 most recent ISO weeks. Always keep the newest verified dump and
+# the dump named by the last restore drill (the last known recoverable backup), even
+# beyond the counts. Refuse to prune more than 10 dumps in one run.
+keep_daily=3
+keep_weekly=4
+max_delete=10
+retain() {
+  local -a verified=()
+  local -A keep=() weeks=()
+  local f d w i=0 drilled n=0
+  mapfile -t verified < <(find "$BACKUP_ROOT" -maxdepth 1 -type f -name 'opip-postgres-*.dump.verified' -printf '%f\n' | sed 's/\.verified$//' | sort -r)
+  for f in "${verified[@]}"; do
+    i=$((i + 1))
+    (( i <= keep_daily )) && keep[$f]=1
+    d="${f#opip-postgres-}"
+    w="$(date -u -d "${d:0:8}" +%G-%V 2>/dev/null)" || { keep[$f]=1; continue; }
+    if [[ -z "${weeks[$w]:-}" && ${#weeks[@]} -lt $keep_weekly ]]; then
+      weeks[$w]=1
+      keep[$f]=1
+    fi
+  done
+  drilled="$(awk -F= '$1 == "backup_file" {print $2; exit}' "$STATE_ROOT/last-restore-drill.env" 2>/dev/null || true)"
+  [[ "$drilled" =~ ^opip-postgres-[0-9TZ]+\.dump$ ]] && keep[$drilled]=1
+  local -a doomed=()
+  for f in "${verified[@]}"; do
+    [[ -n "${keep[$f]:-}" ]] || doomed+=("$f")
+  done
+  n=${#doomed[@]}
+  (( n == 0 )) && return 0
+  if (( n > max_delete )); then
+    echo "WARNING: retention would prune $n dumps (limit $max_delete); nothing pruned, review required" >&2
+    return 0
+  fi
+  for f in "${doomed[@]}"; do
+    rm -f -- "$BACKUP_ROOT/$f" "$BACKUP_ROOT/$f.sha256" "$BACKUP_ROOT/$f.verified"
+  done
+  echo "retention pruned $n verified dump(s); kept ${#keep[@]}"
+}
+retain || echo "WARNING: retention step failed; the new backup is intact" >&2
 
 echo "O'Pip PostgreSQL backup created: $target"
 echo "A restore drill and an off-host copy are still required before this backup is relied on."
