@@ -22,7 +22,7 @@ WHEN: the backup script runs
 THEN: it exits non-zero and leaves no partial or final dump file
 
 AC-003:
-GIVEN: free space below 2 GiB plus the expected dump size, or unreadable
+GIVEN: free space below 2 GiB plus the expected dump size (the larger of 512 MiB and twice the newest earlier dump), or unreadable
 WHEN: the backup script runs
 THEN: it exits 75 with a CRITICAL message before any container call, writes nothing and deletes nothing
 
@@ -36,9 +36,19 @@ GIVEN: either script
 WHEN: its executable lines are inspected
 THEN: none invokes `docker compose`
 
+AC-006:
+GIVEN: existing dumps and sidecars, including ones older than 30 days
+WHEN: the backup script runs
+THEN: none is deleted; the script contains no deletion of backups
+
+AC-007:
+GIVEN: a dump larger than the free space above the 2 GiB floor
+WHEN: the backup script runs
+THEN: the write is stopped by a file-size bound at that headroom, the script exits non-zero and no file remains, so the floor is never breached during writing
+
 EXPLICITLY OUT OF SCOPE:
 - No deployment, timer change, bootstrap change, restart, restore drill run or backup run on any host by this PR.
-- No change to the 30-day dump retention, off-host copy, receiver, S2 shipment, learning export, legacy sync or learning activation.
+- The 30-day deletion is removed from the backup script and no retention is applied by this PR (deferred to a separately approved change); no other retention change, off-host copy, receiver, S2 shipment, learning export, legacy sync or learning activation.
 - No deletion of existing backups, images or evidence, and no database or admin credential use by this PR.
 - No trading, Kraken, Telegram, scoring or alert changes.
 
@@ -52,7 +62,10 @@ AC-001 -> tests/test_opip_postgres_backup_repair_v1.py::test_backup_uses_docker_
 AC-002 -> tests/test_opip_postgres_backup_repair_v1.py::test_backup_failure_leaves_no_partial_or_final_file
 AC-003 -> tests/test_opip_postgres_backup_repair_v1.py::test_backup_refuses_below_free_space_floor_before_any_docker_call
 AC-004 -> tests/test_opip_postgres_backup_repair_v1.py::test_restore_drill_refuses_low_space_before_touching_the_database
+AC-003 -> tests/test_opip_postgres_backup_repair_v1.py::test_expected_size_uses_twice_the_previous_dump
 AC-005 -> tests/test_opip_postgres_backup_repair_v1.py::test_scripts_never_invoke_docker_compose
+AC-006 -> tests/test_opip_postgres_backup_repair_v1.py::test_backup_never_deletes_existing_dumps
+AC-007 -> tests/test_opip_postgres_backup_repair_v1.py::test_oversized_dump_is_killed_at_the_free_space_floor
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/deploy/analytics/opip-postgres-backup.sh
@@ -76,11 +89,19 @@ AC-005 -> OHM-Trade-Agent-v1/deploy/analytics/opip-postgres-restore-drill.sh
 AC-005 -> OHM-Trade-Agent-v1/tests/test_opip_postgres_backup_repair_v1.py
 AC-005 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-POSTGRES-BACKUP-REPAIR-v1.md
 AC-005 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
+AC-006 -> OHM-Trade-Agent-v1/deploy/analytics/opip-postgres-backup.sh
+AC-006 -> OHM-Trade-Agent-v1/tests/test_opip_postgres_backup_repair_v1.py
+AC-006 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-POSTGRES-BACKUP-REPAIR-v1.md
+AC-006 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
+AC-007 -> OHM-Trade-Agent-v1/deploy/analytics/opip-postgres-backup.sh
+AC-007 -> OHM-Trade-Agent-v1/tests/test_opip_postgres_backup_repair_v1.py
+AC-007 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-POSTGRES-BACKUP-REPAIR-v1.md
+AC-007 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
 
 DEFERRED DISCOVERIES:
 - A restore of the existing September dump has never been proven; a restore drill on the learning worker needs its own owner approval and a free-space check first.
 - Identical dump sizes (176,124,039 bytes, 9-21 Sep) suggest but do not prove an unchanged database; content identity is checked by hash in the Phase 1 inventory.
-- The 30-day dump retention can delete the only good dump if backups keep failing; a keep-last-good rule is a separate decision.
+- With deletion removed, dumps accumulate (about 176 MB each); a bounded, keep-last-good retention is a separate decision that needs owner approval.
 - An off-host copy of dumps remains required.
 
 UNAPPROVED SCOPE CHANGES:

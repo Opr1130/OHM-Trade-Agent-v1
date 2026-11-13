@@ -2,6 +2,7 @@
 
 import hashlib
 import os
+import time
 import subprocess
 from pathlib import Path
 
@@ -18,7 +19,7 @@ case "$*" in
   *pg_dump*)
     [[ -n "${STUB_DUMP_FAIL:-}" ]] && { echo "pg_dump: boom" >&2; exit 3; }
     [[ -n "${STUB_DUMP_EMPTY:-}" ]] && exit 0
-    printf 'PGDMP-stub-archive'
+    if [[ -n "${STUB_DUMP_BYTES:-}" ]]; then head -c "$STUB_DUMP_BYTES" /dev/zero; else printf 'PGDMP-stub-archive'; fi
     ;;
   *"pg_restore --list"*)
     cat > /dev/null
@@ -135,3 +136,46 @@ def test_scripts_never_invoke_docker_compose():
             if not line.lstrip().startswith("#")
         ]
         assert not any("docker compose" in line or "COMPOSE" in line for line in code), script.name
+
+
+@pytest.mark.acceptance
+def test_backup_never_deletes_existing_dumps(tmp_path):
+    """ATDD-OPIP-POSTGRES-BACKUP-REPAIR-v1/AC-006: even dumps older than 30 days are preserved by a backup run."""
+    env, _, root = _setup(tmp_path, 10 * GIB)
+    root.mkdir()
+    old = root / "opip-postgres-20250101T000000Z.dump"
+    old.write_bytes(b"old")
+    sidecar = Path(f"{old}.sha256")
+    sidecar.write_text("x  old\n", encoding="utf-8")
+    ancient = time.time() - 400 * 86400
+    os.utime(old, (ancient, ancient))
+    os.utime(sidecar, (ancient, ancient))
+    assert _run(BACKUP, env).returncode == 0
+    assert old.exists() and sidecar.exists()
+    code = [l for l in BACKUP.read_text(encoding="utf-8").splitlines() if not l.lstrip().startswith("#")]
+    assert not any("-delete" in l or "rm -f" in l and "tmp" not in l for l in code)
+
+
+@pytest.mark.acceptance
+def test_oversized_dump_is_killed_at_the_free_space_floor(tmp_path):
+    """ATDD-OPIP-POSTGRES-BACKUP-REPAIR-v1/AC-007: a dump larger than the headroom above 2 GiB cannot be written."""
+    mib = 1024 * 1024
+    env, _, root = _setup(
+        tmp_path, 2 * GIB + 2 * mib,
+        STUB_DUMP_BYTES=str(8 * mib), OPIP_BACKUP_DEFAULT_DUMP_BYTES=str(mib),
+    )
+    result = _run(BACKUP, env)
+    assert result.returncode != 0
+    assert list(root.iterdir()) == []
+
+
+@pytest.mark.acceptance
+def test_expected_size_uses_twice_the_previous_dump(tmp_path):
+    """ATDD-OPIP-POSTGRES-BACKUP-REPAIR-v1/AC-003: the preflight reserves a 2x growth margin over the last dump."""
+    mib = 1024 * 1024
+    env, stub, root = _setup(tmp_path, 2 * GIB + 150 * mib, OPIP_BACKUP_DEFAULT_DUMP_BYTES=str(mib))
+    root.mkdir()
+    (root / "opip-postgres-20260101T000000Z.dump").write_bytes(b"y" * (100 * mib))
+    result = _run(BACKUP, env)
+    assert result.returncode == 75, "100 MiB previous dump needs 200 MiB headroom, only 150 MiB free"
+    assert _calls(stub) == ""

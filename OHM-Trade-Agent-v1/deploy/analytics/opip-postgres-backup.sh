@@ -10,7 +10,7 @@ BACKUP_ROOT="${OPIP_BACKUP_ROOT:-/var/backups/opip-postgres}"
 LOCK_FILE="${OPIP_BACKUP_LOCK_FILE:-/var/lock/opip-postgres-backup.lock}"
 CONTAINER="${OPIP_BACKUP_CONTAINER:-opip-postgres}"
 MIN_FREE_BYTES=$((2 * 1024 * 1024 * 1024))   # D1 absolute minimum: never write below it
-DEFAULT_DUMP_BYTES=$((256 * 1024 * 1024))    # used when no earlier dump exists
+DEFAULT_DUMP_BYTES="${OPIP_BACKUP_DEFAULT_DUMP_BYTES:-$((512 * 1024 * 1024))}"  # used when no earlier dump exists
 
 [[ -r "$ENV_FILE" ]] || exit 78
 set -a
@@ -25,7 +25,8 @@ install -d -m 0700 "$BACKUP_ROOT"
 # Fail closed before writing: free space must cover the expected dump (the newest
 # earlier dump, else a default) on top of the 2 GiB floor. Nothing is deleted here.
 last_dump="$(find "$BACKUP_ROOT" -maxdepth 1 -type f -name 'opip-postgres-*.dump' -printf '%T@ %s\n' | sort -nr | awk 'NR == 1 {print $2}')"
-expected="${last_dump:-$DEFAULT_DUMP_BYTES}"
+expected="$DEFAULT_DUMP_BYTES"
+(( ${last_dump:-0} * 2 > expected )) && expected=$((last_dump * 2))   # 2x margin for growth
 free_bytes="$(df -PB1 "$BACKUP_ROOT" | awk 'NR == 2 {print $4}')"
 [[ "$free_bytes" =~ ^[0-9]+$ ]] || {
   echo "CRITICAL: free space on the backup volume could not be read; backup refused" >&2
@@ -42,11 +43,17 @@ tmp="$BACKUP_ROOT/.$name.tmp"
 target="$BACKUP_ROOT/$name"
 trap 'rm -f -- "$tmp"' EXIT INT TERM
 
+# The write itself is bounded: the dump may use only the headroom above the 2 GiB
+# floor (ulimit -f is in 1024-byte units), so a larger-than-expected dump is killed
+# by the kernel, fails closed and is removed by the trap, instead of breaching the floor.
 # `-e PGPASSWORD` with no value forwards the variable, so the secret never enters argv.
-PGPASSWORD="$OPIP_POSTGRES_ADMIN_PASSWORD" docker exec -i -e PGPASSWORD "$CONTAINER" \
-  pg_dump --format=custom --compress=9 \
-  --username "${OPIP_POSTGRES_ADMIN_USER:-opip_admin}" \
-  --dbname "${OPIP_POSTGRES_DB:-opip}" > "$tmp"
+(
+  ulimit -f $(( (free_bytes - MIN_FREE_BYTES) / 1024 ))
+  PGPASSWORD="$OPIP_POSTGRES_ADMIN_PASSWORD" docker exec -i -e PGPASSWORD "$CONTAINER" \
+    pg_dump --format=custom --compress=9 \
+    --username "${OPIP_POSTGRES_ADMIN_USER:-opip_admin}" \
+    --dbname "${OPIP_POSTGRES_DB:-opip}" > "$tmp"
+)
 # A recoverable dump, not merely a present one: it must be non-empty and its archive
 # table of contents must be readable by pg_restore (no database credentials needed).
 [[ -s "$tmp" ]] || {
@@ -62,8 +69,8 @@ sha256sum "$target" > "$target.sha256"
 chmod 0600 "$target" "$target.sha256"
 sha256sum --check --status "$target.sha256"
 
-find "$BACKUP_ROOT" -maxdepth 1 -type f -name 'opip-postgres-*.dump' -mtime +30 -delete
-find "$BACKUP_ROOT" -maxdepth 1 -type f -name 'opip-postgres-*.dump.sha256' -mtime +30 -delete
+# Retention is intentionally not applied here: older dumps are preserved until a
+# separate, explicitly approved retention change.
 
 echo "O'Pip PostgreSQL backup created: $target"
 echo "A restore drill and an off-host copy are still required before this backup is relied on."
