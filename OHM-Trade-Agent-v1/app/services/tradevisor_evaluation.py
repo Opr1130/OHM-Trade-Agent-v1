@@ -56,7 +56,9 @@ from app.services.target_attainability import (
     evaluate_target_attainability,
 )
 from app.services.tradevisor_ingress import TradevisorSignal
-from app.services.tradevisor_market import attach_execution_evidence
+from app.exchanges.kraken_identity import split_canonical_pair
+from app.services.capital_efficiency_ranking import position_capacity_ceiling_usd
+from app.services.tradevisor_market import EXECUTION_VENUE, attach_execution_evidence
 from app.services.tradevisor_native_context import build_native_context
 
 #: Source attribution. A measurement/policy identifier, never an authority.
@@ -723,6 +725,24 @@ def evaluate_signal(
             execution, "estimated_visible_round_trip_market_drag_pct", None
         ),
         "warnings": list(getattr(execution, "warnings", []) or []),
+        # OPIP-ALERT-ACTIONABLE-ONLY-001: record the facts the admission gate needs -- the venue
+        # that produced the book, its instrument identity, the direction-specific depth leg, the
+        # size-dependent short impact, the 24h market turnover and the analysed price. Additive
+        # evidence only; the decision above is unchanged.
+        "venue": EXECUTION_VENUE,
+        "venue_identity_valid": split_canonical_pair(snapshot.symbol) is not None,
+        "buy_fully_covered": bool(getattr(execution, "buy_fully_covered", False)),
+        "sell_fully_covered": bool(getattr(execution, "sell_fully_covered", False)),
+        "short_round_trip_market_drag_pct": getattr(
+            execution, "estimated_visible_short_round_trip_market_drag_pct", None
+        ),
+        "visible_liquidity_usd": getattr(snapshot, "combined_24h_liquidity_usd", None),
+        "position_capacity_usd": position_capacity_ceiling_usd(
+            liquidity_24h_usd=getattr(snapshot, "combined_24h_liquidity_usd", None),
+            bid_depth_050_usd=getattr(execution, "bid_depth_050_usd", None),
+            ask_depth_050_usd=getattr(execution, "ask_depth_050_usd", None),
+        ),
+        "current_price": price,
     }
     # Independent native context (BTC regime, chase risk, breadth, ranking).
     # Read-only: it informs the operator and never grants authority.

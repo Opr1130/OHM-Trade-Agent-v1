@@ -32,4 +32,4 @@
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-* * * * * root flock -n /var/run/opip-feasibility-capture.lock -c 'cd /opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1 && /usr/bin/docker compose exec -T ohm-trade-agent timeout --signal=TERM --kill-after=5s 50 python -m app.jobs.capture_feasibility_evidence_shadow >> /var/log/opip-feasibility-capture.log 2>&1'
+* * * * * root sleep 3; /bin/bash /opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1/deploy/remote/opip-run-guarded 512 -- flock -n /var/run/opip-feasibility-capture.lock -c 'cd /opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1 && /usr/bin/docker compose exec -T ohm-trade-agent timeout --signal=TERM --kill-after=5s 50 python -m app.jobs.capture_feasibility_evidence_shadow >> /var/log/opip-feasibility-capture.log 2>&1'

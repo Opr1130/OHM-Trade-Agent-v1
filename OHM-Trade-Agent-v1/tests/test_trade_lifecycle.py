@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -22,6 +23,36 @@ from app.services.confirm_entry import confirm_trade_id
 from app.services.entry_exit_advisor import EntryExitPlan, build_entry_exit_plan
 from app.services.order_intent_registry import OrderIntent
 from app.services.pending_setup_monitor import PendingSetupMonitorResult
+
+
+#: Execution facts the scan validates before an actionable card may be delivered. Fixtures that
+#: exercise a successful delivery must carry them: OPIP-ALERT-ACTIONABLE-ONLY-001 fails closed
+#: when the mandatory execution evidence is absent.
+def scanner_evidence() -> dict:
+    """Execution, identity and timing facts the scan supplies for an actionable card.
+
+    Venue identity, the analysed price, the 24h market turnover and the position-capacity ceiling
+    are separate facts; OPIP-ALERT-ACTIONABLE-ONLY-001 refuses a card that omits any of them, and
+    the capacity ceiling is compared with the order size rather than with the turnover floor.
+    """
+    return {
+        "venue": "KRAKEN",
+        "venue_identity_valid": True,
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+        "current_price": 100.0,
+        "market_liquidity_usd": 2_500_000.0,
+        "position_capacity_usd": 2_500.0,
+        "economic_position_notional": 500.0,
+        "execution_evidence": {
+            "venue": "KRAKEN",
+            "venue_identity_valid": True,
+            "market_liquidity_usd": 2_500_000.0,
+            "spread_bps": 6.0,
+            "size_slippage_pct": 0.2,
+            "depth_covered": True,
+            "current_price": 100.0,
+        },
+    }
 
 
 @pytest.fixture
@@ -185,6 +216,7 @@ def test_actionable_setup_is_persisted_without_confirmation_buttons(
     )
     assert chief_alert_notifier.send_trade_plan(
         {
+            **scanner_evidence(),
             "confidence": 90,
             "decision": "alert",
             "economic_qualified": True,
@@ -212,6 +244,7 @@ def test_movement_plan_becomes_actionable_only_after_final_intelligence_gate(
         "subtype": "VOLATILITY_EXPANSION",
     }
     candidate = {
+        **scanner_evidence(),
         "confidence": 90,
         "decision": "alert",
         "economic_qualified": True,
@@ -269,6 +302,7 @@ def test_production_alert_registers_buttonless_kraken_reconciliation_intent(
         lambda *args, **kwargs: sent.update(kwargs) or SimpleNamespace(delivered=True, message_id=103),
     )
     candidate = {
+        **scanner_evidence(),
         "confidence": 90,
         "decision": "alert",
         "economic_qualified": True,
@@ -315,6 +349,7 @@ def test_place_limit_reuses_pending_trade_id_for_reconciliation(
         lambda *args, **kwargs: SimpleNamespace(delivered=True, message_id=104),
     )
     candidate = {
+        **scanner_evidence(),
         "confidence": 90,
         "decision": "alert",
         "economic_qualified": True,

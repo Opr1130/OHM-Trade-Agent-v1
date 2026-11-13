@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import re
 from datetime import datetime, timezone
 import os
 from pathlib import Path
@@ -59,6 +61,52 @@ _CYCLE_PHASE_PREFIX = "OPIP_UNIFIED_CYCLE_PHASE="
 def _cycle_phase(name: str) -> None:
     """Record the phase the canonical cycle has entered, durably."""
     print(f"{_CYCLE_PHASE_PREFIX}{name}", flush=True)
+
+def _publish_protection_admission_stamp_fail_open(settings=None) -> None:
+    """Publish F11's admission verdict for other containers. Default OFF.
+
+    The observation is taken exactly once, here, from the same authoritative
+    seam the protection report owns: ``build_observation()`` performs one
+    exposure resolution and one durable-incident read. Nothing else in a cycle
+    observes, so no second observation is created, and F11 keeps sole
+    computation authority.
+
+    A stamp without real release provenance is never published: readers would
+    reject it anyway, and publishing an unattributable verdict is worse than
+    publishing none. Failure is reported and never aborts the cycle.
+    """
+    try:
+        if settings is None:
+            settings = get_settings()
+        from app.services import opportunity_pipeline_wiring as wiring
+
+        if not wiring.protectin_stamp_publish_enabled(settings):
+            return
+        release_sha = str(os.getenv("OPIP_RELEASE_SHA", "") or "").strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", release_sha):
+            print(
+                "O'Pip protection stamp not published: release provenance unavailable"
+            )
+            return
+        from app.jobs.report_protection_health import build_observation
+
+        observation = build_observation()
+        wiring.publish_stamp_from_observation(
+            settings,
+            observation,
+            release_sha=release_sha,
+            policy_version=str(
+                getattr(settings, "opip_actionable_policy_version", "unknown")
+            ),
+        )
+    except Exception as exc:  # never break the protection cycle
+        print(
+            "O'Pip protection stamp publication unavailable; "
+            "production protection unaffected:",
+            f"{type(exc).__name__}: {exc}",
+        )
+
+
 
 
 #: Terminal-status markers for a cycle that was stopped by its bound or by an
@@ -909,6 +957,15 @@ def _run_cycle_once() -> bool:
         monitor_active_main()
     finally:
         _run_paper_v2_protection_fail_open()
+
+    # ATDD-OPIP-ACTIONABLE-LIQUIDITY-v1: publish the F11 admission verdict for
+    # consumers in other containers. Default OFF. The observation is taken ONCE
+    # here - the same ProtectionObservation the protection phase already owns,
+    # with one exposure resolution and one incident read - so no second
+    # observation is ever created and F11 keeps sole computation authority.
+    # Publication cannot grant authority: consumers fail closed on a missing,
+    # stale, corrupt or unproven stamp.
+    _publish_protection_admission_stamp_fail_open()
 
     # Qualification (AI review, market validation, notification delivery) runs
     # in its own detached job. It must never execute under this cycle's lock: a

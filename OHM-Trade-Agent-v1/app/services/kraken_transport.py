@@ -130,6 +130,7 @@ class KrakenPublicTransport:
         "Ticker": 3.0,
         "OHLC": 20.0,
         "PreTrade": 2.0,
+        "Depth": 2.0,
         "PostTrade": 2.0,
     }
 

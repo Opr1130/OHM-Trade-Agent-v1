@@ -43,6 +43,10 @@ SAFE_BASELINE_OVERRIDE="$STATE_DIR/safe-baseline-rollback.override.yml"
 PAPER_GENESIS_MARKER="$STATE_DIR/paper-registry-initialized-v1"
 SCHEDULER_RECONCILE="$APP_ROOT/deploy/remote/reconcile-scheduler.sh"
 PAPER_COMPOSE="$APP_ROOT/docker-compose.paper.yml"
+PAPER_CONTROL_FILE="$DATA_ROOT/paper_trading/control.json"
+LEARNING_EXPORT_FLAG="/etc/opip/learning-export.enabled"
+PAPER_DEPLOY_MODE="UNPROVEN"
+LEARNING_EXPORT_MODE="UNPROVEN"
 #: Isolated acquisition worker. A separate Compose service with its own
 #: image, so it must ship with the release instead of drifting behind it.
 SCANNER_SERVICE="opip-scan-worker"
@@ -243,6 +247,35 @@ paper_services() {
     | grep -E '^ohm-freqtrade-paper(-usdt)?$' || true
 }
 
+# Read-only operator proof, before the rollback trap or any runtime mutation.
+paper_deploy_mode() {
+  [[ -f "$PAPER_CONTROL_FILE" && -r "$PAPER_CONTROL_FILE" && ! -L "$PAPER_CONTROL_FILE" ]] || return 1
+  "$PYTHON_BIN" - "$PAPER_CONTROL_FILE" <<'PY'
+import json
+import sys
+from pathlib import Path
+try:
+    payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    enabled = payload["enabled"] if isinstance(payload, dict) else None
+    if type(enabled) is not bool:
+        raise ValueError("paper enabled must be a boolean")
+except (OSError, ValueError, KeyError, TypeError) as exc:
+    print(f"paper control unproven: {type(exc).__name__}", file=sys.stderr)
+    sys.exit(1)
+print("ON" if enabled else "OFF")
+PY
+}
+
+verify_paper_disabled() {
+  local running
+  running="$(docker ps --format '{{.Names}}')" || return 1
+  if grep -Eq '^ohm-freqtrade-paper(-usdt)?$' <<< "$running"; then
+    echo "owner-disabled Freqtrade paper container unexpectedly running" >&2
+    return 1
+  fi
+  return 0
+}
+
 stop_paper_stack() {
   if [[ -s "$PAPER_COMPOSE" ]]; then
     docker compose -f "$PAPER_COMPOSE" stop >/dev/null 2>&1 || true
@@ -304,6 +337,10 @@ validate_target_resource_budget() {
   # rather than trusting only the YAML checked into this SHA.
   local name expected_mem expected_swap actual
   while IFS='|' read -r name expected_mem expected_swap; do
+    # Owner OFF means the workers are deliberately absent; never require their cgroups.
+    if [[ "$PAPER_DEPLOY_MODE" == "OFF" && ( "$name" == "ohm-freqtrade-paper" || "$name" == "ohm-freqtrade-paper-usdt" ) ]]; then
+      continue
+    fi
     actual="$(docker inspect --format='{{.HostConfig.Memory}}|{{.HostConfig.MemorySwap}}' "$name" 2>/dev/null || true)"
     if [[ "$actual" != "$expected_mem|$expected_swap" ]]; then
       echo "resource limit mismatch: container=$name expected=$expected_mem|$expected_swap actual=$actual" >&2
@@ -1270,6 +1307,20 @@ RELEASE_EVIDENCE_BASELINE="$(capture_release_evidence_baseline)"
 
 snapshot_scheduler_state
 
+# Fail before rollback trap and first mutation if paper ownership is unproven.
+if ! PAPER_DEPLOY_MODE="$(paper_deploy_mode)"; then
+  echo "OPIP_OWNER_RUNTIME_PREFLIGHT=BLOCKED_PAPER_CONTROL_UNPROVEN" >&2
+  cleanup_snapshot
+  exit 77
+fi
+if [[ -f "$LEARNING_EXPORT_FLAG" && ! -L "$LEARNING_EXPORT_FLAG" ]]; then
+  LEARNING_EXPORT_MODE="ENABLED"
+else
+  LEARNING_EXPORT_MODE="OWNER_OFF"
+fi
+echo "OPIP_PAPER_CONTROL_PREFLIGHT=$PAPER_DEPLOY_MODE"
+echo "OPIP_LEARNING_POLICY_PREFLIGHT=$LEARNING_EXPORT_MODE"
+
 #: Candidate evidence producers that can contend with the canonical writer's
 #: store lock. They are installed by the CANDIDATE revision's scheduler
 #: reconciliation, they are the only scheduled processes that open canonical
@@ -1762,8 +1813,22 @@ rollback() {
   restore_scheduler_state
   release_evidence_producer_locks
 
-  if ! start_paper_stack || ! wait_paper_health; then
-    echo "rollback paper topology validation failed" >&2
+  if [[ "$PAPER_DEPLOY_MODE" == "OFF" ]]; then
+    if ! verify_paper_disabled; then
+      echo "rollback failed to preserve owner-disabled paper state" >&2
+      cleanup_snapshot
+      exit "$rc"
+    fi
+    echo "OPIP_ROLLBACK_PAPER=OWNER_OFF_VERIFIED"
+  elif [[ "$PAPER_DEPLOY_MODE" == "ON" ]]; then
+    if ! start_paper_stack || ! wait_paper_health; then
+      echo "rollback paper topology validation failed" >&2
+      cleanup_snapshot
+      exit "$rc"
+    fi
+    echo "OPIP_ROLLBACK_PAPER=DRY_RUN_HEALTHY"
+  else
+    echo "rollback paper state unproven; refusing to start workers" >&2
     cleanup_snapshot
     exit "$rc"
   fi
@@ -2466,10 +2531,19 @@ fi
 # exact revision. Nothing else about the reconciliation changes.
 OPIP_RELEASE_SHA="$TARGET_SHA" bash "$SCHEDULER_RECONCILE"
 
-# Applying the SHA is not complete until the paper topology from that same SHA
-# has been recreated and both authoritative dry-run workers are healthy.
-start_paper_stack
-wait_paper_health
+# Paper ON retains the original full dry-run topology proof; OFF preserves
+# owner-disabled workers and verifies their absence before the commit point.
+if [[ "$PAPER_DEPLOY_MODE" == "ON" ]]; then
+  start_paper_stack
+  wait_paper_health
+  echo "OPIP_PAPER_STACK=DRY_RUN_HEALTHY"
+elif [[ "$PAPER_DEPLOY_MODE" == "OFF" ]]; then
+  verify_paper_disabled
+  echo "OPIP_PAPER_STACK=OWNER_OFF_VERIFIED"
+else
+  echo "owner paper state unproven; refusing deployment" >&2
+  false
+fi
 validate_target_resource_budget
 validate_candidate_container_identity
 validate_release_scheduler_contract
@@ -2670,48 +2744,43 @@ else
 fi
 echo "OPIP_P1_RETIREMENT_STATUS=$p1_status"
 
-# --- Learning evidence export (post-deploy gate) -----------------------------
-# Publish schema-4 evidence immediately so the remote worker stops requesting the
-# retired multi-hundred-MB artifact without waiting for the next cron tick.
-#
-# Deliberately NOT fatal: this is non-authoritative for the core release. A
-# success here also does not prove the target SHA is committed - the exporter
-# returns success when a cron run already holds the lock - so the proof below is
-# what actually gates learning readiness.
+# --- Owner policy: learning export absent is not a READY replica ------------
+# OFF never runs the multi-gigabyte exporter, does not poll verify-export,
+# and must not be reported as export SUCCESS or learning READY. Enabled export
+# retains the original exact-SHA fresh-replica check.
 learning_export="SKIPPED"
-if [[ -s "$LEARNING_EXPORTER" ]]; then
-  if bash "$LEARNING_EXPORTER"; then
-    learning_export="SUCCESS"
+learning_readiness="NOT_APPLICABLE"
+learning_policy="UNPROVEN"
+if [[ "$LEARNING_EXPORT_MODE" == "OWNER_OFF" && ! -e "$LEARNING_EXPORT_FLAG" && ! -L "$LEARNING_EXPORT_FLAG" && -s "$LEARNING_EXPORTER" ]]; then
+  learning_policy="OWNER_OFF"
+elif [[ "$LEARNING_EXPORT_MODE" == "ENABLED" && -f "$LEARNING_EXPORT_FLAG" && ! -L "$LEARNING_EXPORT_FLAG" ]]; then
+  learning_policy="ENABLED"
+  if [[ -s "$LEARNING_EXPORTER" ]]; then
+    if bash "$LEARNING_EXPORTER"; then
+      learning_export="SUCCESS"
+    else
+      learning_export="FAILED"
+      echo "O'Pip learning evidence export FAILED; core release already committed" >&2
+    fi
   else
     learning_export="FAILED"
-    echo "O'Pip learning evidence export FAILED; core release already committed" >&2
+    echo "learning exporter missing after P1 retirement" >&2
+  fi
+  learning_readiness="BLOCKED"
+  if [[ -x "$PYTHON_BIN" ]] && PYTHONPATH="$APP_ROOT" "$PYTHON_BIN" -m app.opip.learning.canonical_replica verify-export \
+    --root "$EXPORT_ROOT" \
+    --release-sha "$TARGET_SHA" \
+    --max-age-seconds "$EXPORT_PROOF_FRESHNESS_SECONDS" \
+    --wait-seconds "$EXPORT_PROOF_WAIT_SECONDS"; then
+    learning_readiness="READY"
   fi
 else
   learning_export="FAILED"
-  echo "learning exporter missing after P1 retirement" >&2
+  learning_readiness="BLOCKED"
+  echo "learning exporter or owner flag changed; learning mode unproven" >&2
 fi
+echo "OPIP_LEARNING_POLICY=$learning_policy"
 echo "OPIP_LEARNING_EXPORT_STATUS=$learning_export"
-
-# --- Fresh committed-export proof (authoritative learning readiness) --------
-# A lock skip is valid exporter behaviour and is NOT proof that the deployed SHA
-# is exported. Readiness is therefore proven from durable artifacts: the
-# committed manifest must name this exact SHA, be fresh, carry replica marker
-# version 1, reference a real content-addressed replica directory, and that
-# generation's inner manifest must verify against this same release.
-#
-# The wait is bounded (derived from the export cadence) and covers exactly one
-# legitimate case: the exporter skipped because the cron run held the lock, so
-# the next scheduled run may still commit the target. It never spins.
-learning_readiness="BLOCKED"
-if [[ ! -x "$PYTHON_BIN" ]]; then
-  echo "O'Pip Python interpreter missing; committed-export proof unavailable" >&2
-elif PYTHONPATH="$APP_ROOT" "$PYTHON_BIN" -m app.opip.learning.canonical_replica verify-export \
-  --root "$EXPORT_ROOT" \
-  --release-sha "$TARGET_SHA" \
-  --max-age-seconds "$EXPORT_PROOF_FRESHNESS_SECONDS" \
-  --wait-seconds "$EXPORT_PROOF_WAIT_SECONDS"; then
-  learning_readiness="READY"
-fi
 echo "OPIP_LEARNING_READINESS=$learning_readiness"
 
 # ---------------------------------------------------------------------------

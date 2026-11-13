@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from app.services.actionable_admission import ActionableAdmission
 from app.services.entry_exit_advisor import EntryExitPlan
 from app.services.notification_policy import (
     confirm_emit,
@@ -21,6 +22,8 @@ from app.services.pending_setup_registry import (
 from app.services.qualified_trade_tracking import (
     ReconciliationIdentityMismatch,
     ReconciliationTrackingDisabled,
+    MANUAL_ONLY_ALERT_BANNER,
+    manual_advisory_without_reconciliation,
     register_reconciliation_intent,
 )
 from app.services.registry_io import RegistryIOError, load_json, registry_lock, save_json_atomic
@@ -63,12 +66,31 @@ def queue_qualified_alert(
     identity: str,
     fingerprint: str,
     reason: str,
+    admission: ActionableAdmission | None = None,
 ) -> None:
     """Persist an actionable decision whose tracking/delivery is incomplete.
 
     This is transport/operational state only. It never changes the underlying
     trade qualification or terminalizes the pending setup.
+
+    OPIP-ALERT-ACTIONABLE-ONLY-001: the caller passes the admission verdict it already obtained
+    from the single gate. A refused verdict is never queued, and an admitted verdict carries its
+    resolved expiry so send-time revalidation needs no rescanned market evidence. When no verdict
+    is supplied the previous behaviour is kept exactly.
     """
+    if admission is not None and admission.suppressed:
+        record_telegram_suppression(
+            identity=identity,
+            alert_family="QUALIFIED_OPPORTUNITY",
+            event_type=str(action or "ACTION"),
+            fingerprint=str(fingerprint or ""),
+            reason=admission.suppression_reason() or "ACTIONABLE_GATE",
+            symbol=plan.symbol,
+            journey_id=candidate.get("journey_id"),
+            signal_id=candidate.get("signal_id"),
+            trade_id=trade_id,
+        )
+        return
     key = str(trade_id or "").strip()
     if not key:
         raise ValueError("qualified alert outbox requires trade_id")
@@ -83,6 +105,7 @@ def queue_qualified_alert(
         row["updated_at"] = now
         row["reason"] = str(reason)
         row["message"] = str(message)
+        row["manual_only_advisory"] = candidate.get("manual_only_advisory") is True
         row["action"] = str(action)
         row["direction"] = str(direction).upper()
         row["identity"] = str(identity)
@@ -93,6 +116,7 @@ def queue_qualified_alert(
         row["tracking_candidate"] = {
             "economic_qualified": candidate.get("economic_qualified") is True,
             "recommended_capital": candidate.get("recommended_capital"),
+            "manual_only_advisory": candidate.get("manual_only_advisory") is True,
         }
         row["leverage"] = float(
             candidate.get("margin_leverage")
@@ -100,6 +124,13 @@ def queue_qualified_alert(
         )
         row["journey_id"] = candidate.get("journey_id")
         row["signal_id"] = candidate.get("signal_id")
+        # OPIP-ALERT-ACTIONABLE-ONLY-001: the admission verdict and its resolved expiry travel
+        # with the retry record so send-time revalidation needs no rescanned market evidence.
+        if admission is not None:
+            row["admission"] = admission.evidence_payload()
+            row["plan_expires_at"] = (
+                admission.expires_at.isoformat() if admission.expires_at else None
+            )
         # Preserve an active lease if the same actionable decision is observed
         # while another worker is attempting recovery.
         rows[key] = row
@@ -354,6 +385,26 @@ def _retry_one(
         )
         return "SUPERSEDED"
 
+    if row.get("manual_only_advisory") is True and (
+        not manual_advisory_without_reconciliation(candidate)
+        or not str(row.get("message") or "").startswith(MANUAL_ONLY_ALERT_BANNER)
+    ):
+        # Never replay an advisory card after tracking mode has changed or
+        # deliver a legacy card lacking the untracked/manual warning.
+        _release(trade_id, lease_token)
+        record_telegram_suppression(
+            identity=str(row.get("identity") or f"QUALIFIED_OPPORTUNITY:{trade_id}"),
+            alert_family="QUALIFIED_OPPORTUNITY",
+            event_type=action or "ACTION",
+            fingerprint=str(row.get("fingerprint") or ""),
+            reason="MANUAL_ADVISORY_RETRY_UNVERIFIED",
+            symbol=plan.symbol,
+            journey_id=row.get("journey_id"),
+            signal_id=row.get("signal_id"),
+            trade_id=trade_id,
+        )
+        return "MODE_PENDING"
+
     if candidate.get("economic_qualified") is True:
         try:
             register_reconciliation_intent(
@@ -397,10 +448,11 @@ def _retry_one(
             )
             return "TRACKING_PENDING"
 
+    # A message already accepted for this exact identity/fingerprint is retired first: nothing will
+    # be sent, so this stays safe for rows queued before the admission policy existed.
     identity = str(row.get("identity") or f"QUALIFIED_OPPORTUNITY:{trade_id}")
     fingerprint = str(row.get("fingerprint") or "")
     event_type = action or "ACTION"
-
     accepted = accepted_delivery_message_id(
         identity=identity,
         event_type=event_type,
@@ -409,6 +461,44 @@ def _retry_one(
     if accepted is not None:
         _remove(trade_id, token=lease_token)
         return "ALREADY_DELIVERED"
+
+    # OPIP-ALERT-ACTIONABLE-ONLY-001 send-time revalidation. A retry can run long after the queue
+    # attempt, so delivery eligibility is enforced again here:
+    #   * a row without an admitted-verdict record cannot be proven admissible -> fail closed;
+    #   * an entry plan that has since expired must never be delivered late.
+    stored_admission = row.get("admission")
+    if not isinstance(stored_admission, dict) or str(
+        stored_admission.get("admission") or ""
+    ).upper() != "ADMITTED":
+        _remove(trade_id, token=lease_token)
+        record_telegram_suppression(
+            identity=identity,
+            alert_family="QUALIFIED_OPPORTUNITY",
+            event_type=str(row.get("action") or "ACTION"),
+            fingerprint=fingerprint,
+            reason="ACTIONABLE_GATE:MISSING_ADMISSION_EVIDENCE",
+            symbol=plan.symbol,
+            journey_id=row.get("journey_id"),
+            signal_id=row.get("signal_id"),
+            trade_id=trade_id,
+        )
+        return "SUPPRESSED"
+
+    plan_expires_at = _parse_utc(row.get("plan_expires_at"))
+    if plan_expires_at is not None and plan_expires_at <= datetime.now(timezone.utc):
+        _remove(trade_id, token=lease_token)
+        record_telegram_suppression(
+            identity=identity,
+            alert_family="QUALIFIED_OPPORTUNITY",
+            event_type=str(row.get("action") or "ACTION"),
+            fingerprint=fingerprint,
+            reason="ACTIONABLE_GATE:EXPIRY_PASSED",
+            symbol=plan.symbol,
+            journey_id=row.get("journey_id"),
+            signal_id=row.get("signal_id"),
+            trade_id=trade_id,
+        )
+        return "SUPPRESSED"
 
     policy_identity = str(row.get("policy_identity") or f"{direction}:{plan.symbol}")
     reservation = reserve_emit(

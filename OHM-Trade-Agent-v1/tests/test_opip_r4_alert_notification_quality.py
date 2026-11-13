@@ -6,6 +6,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+from datetime import datetime, timezone
+
 import pytest
 
 from app.api import routes
@@ -57,6 +59,25 @@ def _rows():
         {"rank": 3, "quality_score": 70.0, "symbol": "CCC"},
         {"rank": 4, "quality_score": None, "symbol": "DDD"},
     ]
+
+
+def _admitted_verdict(expires_in_hours: float = 4.0):
+    """The verdict a producer always passes when it queues an actionable retry.
+
+    OPIP-ALERT-ACTIONABLE-ONLY-001 fails a retry closed unless the row carries an admitted verdict
+    with a resolved expiry, so the fixture states one explicitly.
+    """
+    from app.services.actionable_admission import POLICY_VERSION, ActionableAdmission
+
+    return ActionableAdmission(
+        admitted=True,
+        policy_version=POLICY_VERSION,
+        net_reward_to_risk=2.0,
+        effective_cost_pct=0.72,
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=expires_in_hours),
+        expiry_source="explicit",
+        entry_trigger_kind="MARKET_ENTRY_CONFIRMED",
+    )
 
 
 def test_score_only_path_cannot_send_new_trade():
@@ -287,6 +308,14 @@ def _isolate_lifecycle(tmp_path, monkeypatch):
 
 
 def _candidate(symbol: str, score: float) -> dict:
+    """A candidate shaped as the scanner produces it.
+
+    OPIP-ALERT-ACTIONABLE-ONLY-001 requires execution evidence to exist before an actionable card
+    may be delivered, so the fixture carries the same facts the scan already validates
+    (liquidity ceiling, spread, measured round-trip drag, full depth coverage). The plan geometry
+    above is unchanged, so these tests keep proving the notification lifecycle they were written
+    for.
+    """
     return {
         "symbol": symbol,
         "confidence": 88,
@@ -299,6 +328,22 @@ def _candidate(symbol: str, score: float) -> dict:
         "underlying_asset": symbol,
         "primary_pair": symbol,
         "reference_price": 100.0,
+        "venue": "KRAKEN",
+        "venue_identity_valid": True,
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+        "current_price": 100.0,
+        "market_liquidity_usd": 2_500_000.0,
+        "position_capacity_usd": 2_500.0,
+        "economic_position_notional": 500.0,
+        "execution_evidence": {
+            "spread_bps": 6.0,
+            "size_slippage_pct": 0.2,
+            "depth_covered": True,
+            "venue": "KRAKEN",
+            "venue_identity_valid": True,
+            "current_price": 100.0,
+            "market_liquidity_usd": 2_500_000.0,
+        },
     }
 
 
@@ -620,6 +665,7 @@ def _seed_retry_row(trade_id: str, symbol: str) -> None:
         identity=f"QUALIFIED_OPPORTUNITY:{trade_id}",
         fingerprint=f"fp-{trade_id}",
         reason="DELIVERY_PENDING",
+        admission=_admitted_verdict(),
     )
 
 
@@ -697,6 +743,7 @@ def test_stuck_tracking_row_does_not_block_a_later_recovery(tmp_path, monkeypatc
         identity="QUALIFIED_OPPORTUNITY:Q-1",
         fingerprint="fp-Q-1",
         reason="TRACKING_PENDING:RuntimeError",
+        admission=_admitted_verdict(),
     )
     _seed_retry_row("Q-2", "BBB")
     _seed_retry_row("Q-3", "CCC")

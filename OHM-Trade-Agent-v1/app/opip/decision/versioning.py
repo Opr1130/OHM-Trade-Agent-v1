@@ -83,7 +83,15 @@ def app_code_fingerprint() -> str:
 
 
 def version_stamp() -> dict[str, Any]:
-    """Return the version block carried by every O'Pip qualification event."""
+    """Return the version block carried by every O'Pip qualification event.
+
+    The stamp is pure and deterministic: with unchanged production thresholds two
+    calls return equal dicts, so a recorded stamp always names the policy that
+    produced the evidence. ``model_version`` stays an explicit ``None`` until an
+    ML build declares one, which keeps "not yet versioned" distinguishable from
+    "field absent". Every call returns a fresh dict, so a consumer can annotate
+    its own copy without reaching shared state.
+    """
     return {
         "schema_version": FUNNEL_SCHEMA_VERSION,
         "strategy_version": STRATEGY_VERSION,

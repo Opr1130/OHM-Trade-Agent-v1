@@ -442,6 +442,8 @@ STATE_DIR=__STATE__
 LAST_GOOD_FILE=__STATE__/last-good-sha
 SAFE_BASELINE_OVERRIDE=__STATE__/safe-baseline-rollback.override.yml
 RELEASE_RUNTIME_VERIFIER_ATTEMPTED=""
+# Legacy rollback fixtures explicitly exercise the proven Paper ON branch.
+PAPER_DEPLOY_MODE=ON
 source __LIBRARY__
 __OVERRIDE__
 stop_paper_stack() { echo "stop_paper_stack" >>"$LOG"; }

@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# The legacy export cron may be reinstalled by scheduler reconciliation.
+# Learning is off by default; do not touch locks, files or the canonical DB.
+[[ -f /etc/opip/learning-export.enabled && ! -L /etc/opip/learning-export.enabled ]] || exit 0
+
 # Migration audit: the pre-retirement export contract used schema_version=3.
 # Active output below is schema 4 and intentionally excludes the P1 shadow outbox.
 

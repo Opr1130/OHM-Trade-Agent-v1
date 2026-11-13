@@ -105,7 +105,7 @@ pytestmark = pytest.mark.skipif(
 def _cleanup() -> None:
     for path in (EXPORT_ROOT, LEARNING_REPLICA, Path("/var/lib/opip-learning"), DEPLOY_STATE):
         shutil.rmtree(path, ignore_errors=True)
-    for path in (ENV_FILE, Path("/var/run/opip-learning-export.lock")):
+    for path in (ENV_FILE, Path("/var/run/opip-learning-export.lock"), Path("/etc/opip/learning-export.enabled")):
         path.unlink(missing_ok=True)
     shutil.rmtree("/opt/OHM-Trade-Agent-v1", ignore_errors=True)
 
@@ -135,6 +135,10 @@ def harness(tmp_path_factory):
     ):
         (DATA_ROOT / relative).mkdir(parents=True, exist_ok=True)
     DEPLOY_STATE.mkdir(parents=True, exist_ok=True)
+    # This root-only fixture explicitly enables the otherwise default-off export.
+    # No production gate is changed; cleanup removes this test-owned flag.
+    Path("/etc/opip").mkdir(parents=True, exist_ok=True)
+    Path("/etc/opip/learning-export.enabled").touch(mode=0o600)
     EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
     LEARNING_DATA.mkdir(parents=True, exist_ok=True)
     LEARNING_STATE.mkdir(parents=True, exist_ok=True)

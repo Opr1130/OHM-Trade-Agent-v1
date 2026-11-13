@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Sequence
 
 #: Protection-health states. ``HEALTHY`` is the only state that permits new
@@ -266,3 +267,240 @@ __all__ = [
     "STATE_UNSAFE",
     "evaluate_protection_health",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Protection admission stamp (ATDD-OPIP-ACTIONABLE-LIQUIDITY-v1, slice P2)
+#
+# F11 keeps sole computation authority. This module only publishes the verdict
+# it already computed and reads it back for consumers in other containers. The
+# stamp can never grant authority, relax an F11 decision or override an
+# incident.
+#
+# The freshness bound is DERIVED from successful authoritative observations -
+# not hardcoded, and not taken from cron configuration. Below STAMP_MIN_SAMPLES
+# the bound is unknown and every consumer fails closed: twenty samples give a
+# preliminary operating baseline, they do NOT establish a reliable p99.
+# ---------------------------------------------------------------------------
+
+STAMP_CONTRACT_VERSION = "opip-protection-admission-stamp-v1"
+STAMP_MIN_SAMPLES = 20
+STAMP_P99_MULTIPLIER = 2.0
+STAMP_ABSOLUTE_CEILING_SECONDS = 3600.0
+
+REASON_STAMP_UNKNOWN = "PROTECTION_ADMISSIONS_SUSPENDED_UNKNOWN"
+REASON_STAMP_SUSPENDED = "PROTECTION_ADMISSIONS_SUSPENDED"
+
+
+@dataclass(frozen=True)
+class ProtectionAdmissionStamp:
+    """Read-only view of an F11 admission verdict. Grants nothing."""
+
+    admissions_suspended: bool
+    fresh: bool
+    reason: str | None
+    observed_at: datetime | None = None
+    freshness_bound_s: float | None = None
+    sample_count: int = 0
+    sequence: int | None = None
+    coverage_complete: bool | None = None
+    incidents_healthy: bool | None = None
+    contract_version: str | None = None
+
+    @property
+    def usable(self) -> bool:
+        """True only when the stamp may be used to avoid a refusal."""
+        return self.fresh and not self.admissions_suspended
+
+
+def _unknown_stamp() -> ProtectionAdmissionStamp:
+    return ProtectionAdmissionStamp(
+        admissions_suspended=True, fresh=False, reason=REASON_STAMP_UNKNOWN
+    )
+
+
+def derive_freshness_bound(
+    observation_times: Sequence[datetime],
+    *,
+    min_samples: int = STAMP_MIN_SAMPLES,
+    p99_multiplier: float = STAMP_P99_MULTIPLIER,
+    ceiling_seconds: float = STAMP_ABSOLUTE_CEILING_SECONDS,
+) -> float | None:
+    """Derive the freshness bound from SUCCESSFUL observation timestamps.
+
+    Returns ``None`` while fewer than ``min_samples`` successful observations
+    exist, which every consumer must treat as fail-closed. The ceiling is a
+    safety clamp so a corrupt stamp cannot widen its own authority.
+    """
+    ordered = sorted(observation_times)
+    if len(ordered) < max(2, int(min_samples)):
+        return None
+    gaps = [
+        (ordered[i + 1] - ordered[i]).total_seconds()
+        for i in range(len(ordered) - 1)
+    ]
+    gaps = sorted(gap for gap in gaps if gap > 0)
+    if not gaps:
+        return None
+    index = min(len(gaps) - 1, max(0, int(round(0.99 * (len(gaps) - 1)))))
+    bound = max(gaps[index] * float(p99_multiplier), gaps[0])
+    return min(float(ceiling_seconds), bound)
+
+
+def read_admission_stamp(
+    payload: Any,
+    *,
+    now: datetime,
+    running_release_sha: str | None,
+    contract_version: str = STAMP_CONTRACT_VERSION,
+    previous_sequence: int | None = None,
+) -> ProtectionAdmissionStamp:
+    """Validate a stamp document. Every failure is fail-closed.
+
+    ``payload`` is the already-parsed stamp mapping, or ``None`` when the file
+    was missing or unreadable. No I/O happens here, so callers keep control of
+    filesystem access.
+    """
+    if not isinstance(payload, dict):
+        return _unknown_stamp()
+    if payload.get("contract_version") != contract_version:
+        return _unknown_stamp()
+    if running_release_sha and payload.get("release_sha") != running_release_sha:
+        return _unknown_stamp()
+
+    try:
+        observed = datetime.fromisoformat(
+            str(payload.get("observed_at_utc")).replace("Z", "+00:00")
+        )
+    except (TypeError, ValueError):
+        return _unknown_stamp()
+    if observed.tzinfo is None or observed.utcoffset() is None:
+        return _unknown_stamp()
+    observed = observed.astimezone(timezone.utc)
+
+    try:
+        bound = float(payload.get("freshness_bound_s"))
+        samples = int(payload.get("sample_count") or 0)
+    except (TypeError, ValueError):
+        return _unknown_stamp()
+    if not math.isfinite(bound) or bound <= 0:
+        return _unknown_stamp()
+    if bound > STAMP_ABSOLUTE_CEILING_SECONDS:
+        return _unknown_stamp()
+    if samples < STAMP_MIN_SAMPLES:
+        return _unknown_stamp()
+
+    age = (now - observed).total_seconds()
+    if age < 0 or age > bound:
+        return ProtectionAdmissionStamp(
+            admissions_suspended=True, fresh=False, reason=REASON_STAMP_UNKNOWN,
+            observed_at=observed, freshness_bound_s=bound, sample_count=samples,
+        )
+
+    sequence = payload.get("sequence")
+    if previous_sequence is not None and sequence is not None:
+        try:
+            regressed = int(sequence) <= int(previous_sequence)
+        except (TypeError, ValueError):
+            return _unknown_stamp()
+        if regressed:
+            return ProtectionAdmissionStamp(
+                admissions_suspended=True, fresh=False,
+                reason=REASON_STAMP_UNKNOWN, observed_at=observed,
+                freshness_bound_s=bound, sample_count=samples,
+            )
+
+    coverage = payload.get("coverage_complete")
+    healthy = payload.get("incidents_healthy")
+    reasons = payload.get("reasons") or []
+    # Explicit F11 status semantics. A healthy result legitimately carries the
+    # informational code PROTECTION_PROVEN, so a non-empty reason list is not by
+    # itself evidence of ill health - but the state must say HEALTHY and every
+    # other input must agree, or the payload is contradictory and refused.
+    state = str(payload.get("state") or "").strip().upper()
+    if state not in {STATE_HEALTHY, STATE_UNSAFE, STATE_UNAVAILABLE}:
+        return ProtectionAdmissionStamp(
+            admissions_suspended=True, fresh=False, reason=REASON_STAMP_UNKNOWN,
+            observed_at=observed, freshness_bound_s=bound, sample_count=samples,
+        )
+
+    if state == STATE_HEALTHY:
+        unexpected = [
+            str(reason) for reason in reasons if str(reason) != REASON_HEALTHY
+        ]
+        healthy_consistent = (
+            payload.get("admissions_suspended") is False
+            and coverage is True
+            and healthy is True
+            and not unexpected
+        )
+        if not healthy_consistent:
+            # HEALTHY contradicts its own evidence: refuse rather than trust it.
+            return ProtectionAdmissionStamp(
+                admissions_suspended=True, fresh=False,
+                reason=REASON_STAMP_UNKNOWN, observed_at=observed,
+                freshness_bound_s=bound, sample_count=samples,
+            )
+        suspended = False
+    else:
+        suspended = True
+
+    return ProtectionAdmissionStamp(
+        admissions_suspended=bool(suspended),
+        fresh=True,
+        reason=REASON_STAMP_SUSPENDED if suspended else None,
+        observed_at=observed,
+        freshness_bound_s=bound,
+        sample_count=samples,
+        sequence=None if sequence is None else int(sequence),
+        coverage_complete=None if coverage is None else bool(coverage),
+        incidents_healthy=None if healthy is None else bool(healthy),
+        contract_version=contract_version,
+    )
+
+
+def build_admission_stamp_payload(
+    *,
+    release_sha: str,
+    policy_version: str,
+    observed_at: datetime,
+    sequence: int,
+    admissions_suspended: bool,
+    coverage_complete: bool | None,
+    incidents_healthy: bool | None,
+    reasons: Sequence[str],
+    freshness_bound_s: float,
+    sample_count: int,
+    state: str | None = None,
+    contract_version: str = STAMP_CONTRACT_VERSION,
+) -> dict[str, Any]:
+    """Serialise the verdict the protection phase already computed.
+
+    A naive or non-UTC timestamp is refused here rather than being silently
+    coerced through the host's local timezone: a stamp whose age cannot be
+    reasoned about must never reach a consumer.
+    """
+    if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+        raise ValueError("observed_at must be timezone-aware UTC")
+    return {
+        "contract_version": contract_version,
+        "policy_version": policy_version,
+        "release_sha": release_sha,
+        "observed_at_utc": observed_at.astimezone(timezone.utc).isoformat(),
+        "sequence": int(sequence),
+        "state": state,
+        "admissions_suspended": bool(admissions_suspended),
+        "coverage_complete": coverage_complete,
+        "incidents_healthy": incidents_healthy,
+        "reasons": list(reasons),
+        "freshness_bound_s": float(freshness_bound_s),
+        "sample_count": int(sample_count),
+    }
+
+
+
+#: Bounded ring of successful observations used to derive the freshness
+#: bound. Kept here as a pure constant; the reading/writing lives in
+#: ``app.services.protection_admission_stamp_io`` so this module stays
+#: read-only.
+STAMP_HISTORY_LIMIT = 200
