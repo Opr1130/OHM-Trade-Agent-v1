@@ -92,44 +92,34 @@ IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/deploy/analytics/opip-postgres-backup.sh
 AC-001 -> OHM-Trade-Agent-v1/tests/test_opip_postgres_backup_repair_v1.py
 AC-001 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-POSTGRES-BACKUP-REPAIR-v1.md
-AC-001 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
 AC-002 -> OHM-Trade-Agent-v1/deploy/analytics/opip-postgres-backup.sh
 AC-002 -> OHM-Trade-Agent-v1/tests/test_opip_postgres_backup_repair_v1.py
 AC-002 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-POSTGRES-BACKUP-REPAIR-v1.md
-AC-002 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
 AC-003 -> OHM-Trade-Agent-v1/deploy/analytics/opip-postgres-backup.sh
 AC-003 -> OHM-Trade-Agent-v1/tests/test_opip_postgres_backup_repair_v1.py
 AC-003 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-POSTGRES-BACKUP-REPAIR-v1.md
-AC-003 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
 AC-004 -> OHM-Trade-Agent-v1/deploy/analytics/opip-postgres-restore-drill.sh
 AC-004 -> OHM-Trade-Agent-v1/tests/test_opip_postgres_backup_repair_v1.py
 AC-004 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-POSTGRES-BACKUP-REPAIR-v1.md
-AC-004 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
 AC-005 -> OHM-Trade-Agent-v1/deploy/analytics/opip-postgres-backup.sh
 AC-005 -> OHM-Trade-Agent-v1/deploy/analytics/opip-postgres-restore-drill.sh
 AC-005 -> OHM-Trade-Agent-v1/tests/test_opip_postgres_backup_repair_v1.py
 AC-005 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-POSTGRES-BACKUP-REPAIR-v1.md
-AC-005 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
 AC-006 -> OHM-Trade-Agent-v1/deploy/analytics/opip-postgres-backup.sh
 AC-006 -> OHM-Trade-Agent-v1/tests/test_opip_postgres_backup_repair_v1.py
 AC-006 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-POSTGRES-BACKUP-REPAIR-v1.md
-AC-006 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
 AC-007 -> OHM-Trade-Agent-v1/deploy/analytics/opip-postgres-backup.sh
 AC-007 -> OHM-Trade-Agent-v1/tests/test_opip_postgres_backup_repair_v1.py
 AC-007 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-POSTGRES-BACKUP-REPAIR-v1.md
-AC-007 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
 AC-008 -> OHM-Trade-Agent-v1/deploy/analytics/opip-postgres-backup.sh
 AC-008 -> OHM-Trade-Agent-v1/tests/test_opip_postgres_backup_repair_v1.py
 AC-008 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-POSTGRES-BACKUP-REPAIR-v1.md
-AC-008 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
 AC-009 -> OHM-Trade-Agent-v1/deploy/analytics/opip-postgres-restore-drill.sh
 AC-009 -> OHM-Trade-Agent-v1/tests/test_opip_postgres_backup_repair_v1.py
 AC-009 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-POSTGRES-BACKUP-REPAIR-v1.md
-AC-009 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
 AC-010 -> OHM-Trade-Agent-v1/deploy/analytics/opip-postgres-backup.sh
 AC-010 -> OHM-Trade-Agent-v1/tests/test_opip_postgres_backup_repair_v1.py
 AC-010 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-POSTGRES-BACKUP-REPAIR-v1.md
-AC-010 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
 
 DEFERRED DISCOVERIES:
 - A restore of the existing September dump has never been proven; the approved isolated drill proves one dump only and runs once by hand after Tier A cleanup.
