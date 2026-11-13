@@ -866,7 +866,23 @@ def test_ac_025_post_install_ownership_failure_restores(tmp_path):
     _require_toolchain()
     sandbox = Sandbox(tmp_path / "ownerless", REAL_CONTROLLER, install_previous=False)
     assert not sandbox.installed.exists()
-    shim = _make_shim(sandbox.root / "shim-chown-ok", "chown", "#!/usr/bin/env bash\nexit 0\n")
+    # chown "succeeds" but must leave the file NOT owned by root:root, so the
+    # post-install verifier cannot prove ownership. A non-root runner already
+    # satisfies this (files stay owned by the test user). As root, files are
+    # created root:root, so the shim must hand the target to another account or
+    # the precondition (and this test) would not hold.
+    real_chown = shutil.which("chown")  # resolved before the shim is on PATH
+    assert real_chown is not None
+    shim = _make_shim(
+        sandbox.root / "shim-chown-ok",
+        "chown",
+        "#!/usr/bin/env bash\n"
+        'if [ "$(id -u)" = "0" ]; then\n'
+        '  for target; do :; done\n'
+        f'  {real_chown} 65534:65534 -- "$target" || exit 1\n'
+        "fi\n"
+        "exit 0\n",
+    )
     env = sandbox.env_with(OPIP_BOOTSTRAP_PRODUCTION_MODE="1")
     env["PATH"] = str(shim) + os.pathsep + env["PATH"]
 
