@@ -1438,8 +1438,33 @@ def format_early_mover_message(signal: EarlyMoverSignal) -> str:
     return format_operator_watch_message(signal, style="telegram")
 
 
-def send_early_mover_update(signal: EarlyMoverSignal, *, bot_token: str, chat_id: str, cooldown_seconds: int = 1800) -> bool:
+def send_early_mover_update(
+    signal: EarlyMoverSignal,
+    *,
+    bot_token: str,
+    chat_id: str,
+    cooldown_seconds: int = 1800,
+    informational_watch_opted_in: bool = False,
+) -> bool:
+    """Direct Early Watch send, closed by OPIP-ALERT-ACTIONABLE-ONLY-001.
+
+    The governed automatic path is ``app.jobs.scan_movers``, which resolves the single Early
+    Watch policy (evidence-only by default) and owns the governor, identity and dedupe. This
+    direct helper carried no admission gate of its own, so it is now fail-closed: a caller must
+    pass ``informational_watch_opted_in=True`` -- the legacy, non-actionable-only opt-in -- for a
+    card to be delivered, and every refusal keeps its reason in the delivery ledger.
+    """
     identity = f"EARLY_MOVER:{signal.symbol}"
+    if not informational_watch_opted_in:
+        record_telegram_suppression(
+            identity=identity,
+            alert_family="EARLY_MOVER",
+            event_type=signal.stage,
+            fingerprint=signal.fingerprint,
+            reason="ACTIONABLE_ONLY_POLICY:DIRECT_WATCH_SEND_DISABLED",
+            symbol=signal.symbol,
+        )
+        return False
     if not signal.alert_eligible:
         record_telegram_not_eligible(
             identity=identity,

@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Optional evidence/queue jobs only. Never wrap the protected unified cycle.
+# Usage: opip-run-guarded [minimum-MiB (default 512)] -- command [args...]
+# Overrides are for hermetic tests; production cron supplies neither.
+minimum_mb=512
+if [[ $# -gt 0 && "$1" =~ ^[0-9]+$ ]]; then
+  minimum_mb="$1"
+  shift
+fi
+if [[ "${1:-}" == "--" ]]; then
+  shift
+fi
+if (( $# == 0 )) || [[ ! "$minimum_mb" =~ ^[1-9][0-9]{0,4}$ ]]; then
+  echo 'usage: opip-run-guarded [minimum-MiB] -- command [args...]' >&2
+  exit 64
+fi
+
+meminfo="${OPIP_GUARD_MEMINFO_PATH:-/proc/meminfo}"
+log_path="${OPIP_GUARD_LOG_PATH:-/var/log/opip-guard.log}"
+available_kb="$(awk '$1 == "MemAvailable:" && $2 ~ /^[0-9]+$/ { print $2; exit }' "$meminfo" 2>/dev/null || true)"
+reason=''
+available_mb='UNKNOWN'
+if [[ ! "$available_kb" =~ ^[0-9]{1,12}$ ]]; then
+  reason='MEMINFO_UNAVAILABLE'
+else
+  available_mb=$((10#$available_kb / 1024))
+  if (( available_mb < minimum_mb )); then
+    reason='LOW_MEMORY'
+  fi
+fi
+if [[ -n "$reason" ]]; then
+  printf '%s SKIPPED reason=%s available_mb=%s required_mb=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$reason" "$available_mb" "$minimum_mb" \
+    >> "$log_path" 2>/dev/null || true
+  exit 0
+fi
+exec "$@"

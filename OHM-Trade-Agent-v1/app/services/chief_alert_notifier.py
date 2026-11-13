@@ -2,7 +2,15 @@ from pathlib import Path
 from typing import Any
 import math
 
+from datetime import datetime, timezone
+
 from app.services.asset_display_identity import display_asset_text, display_market_label
+from app.services.actionable_admission import (
+    ActionableNotificationPolicy,
+    evaluate_actionable_admission,
+    evidence_from_trade_plan,
+)
+from app.services.actionable_card import missing_card_elements, render_actionable_block
 from app.services.entry_exit_advisor import EntryExitPlan
 from app.services.kraken_reconciliation import (
     reconciliation_enabled,
@@ -33,6 +41,8 @@ from app.services.qualified_alert_outbox import (
 from app.services.qualified_trade_tracking import (
     ReconciliationIdentityMismatch,
     ReconciliationTrackingDisabled,
+    MANUAL_ONLY_ALERT_BANNER,
+    manual_advisory_without_reconciliation,
     register_reconciliation_intent,
 )
 from app.services.registry_io import RegistryIOError, load_json, registry_lock, save_json_atomic
@@ -133,7 +143,7 @@ def _alert_state_key(candidate: dict[str, Any], plan: EntryExitPlan) -> str:
             _round_price(plan.stop_price),
             _round_price(plan.target_1),
             _round_price(plan.target_2),
-        ]
+        ] + (["MANUAL_ONLY_V1"] if candidate.get("manual_only_advisory") is True else [])
     )
 
 
@@ -357,9 +367,14 @@ def format_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan, summary: s
 
     fill_tracking_note = ""
     if candidate.get("economic_qualified") is True:
-        fill_tracking_note = (
-            "Fill Tracking: read-only Kraken reconciliation; a monitoring-degraded alert is sent if position verification is unavailable\n"
-        )
+        if manual_advisory_without_reconciliation(candidate):
+            fill_tracking_note = (
+                "Fill Tracking: DISABLED — manual-only advisory; no exchange order, fill, or stop is tracked by O'Pip\n"
+            )
+        else:
+            fill_tracking_note = (
+                "Fill Tracking: read-only Kraken reconciliation; a monitoring-degraded alert is sent if position verification is unavailable\n"
+            )
 
     chase_label = "Do Not Chase Below" if direction == "SHORT" else "Do Not Chase Above"
     base_asset = str(candidate.get("underlying_asset") or plan.symbol)
@@ -467,6 +482,9 @@ def send_trade_plan(
     chat_id: str,
     *,
     notify: bool = True,
+    policy: ActionableNotificationPolicy | None = None,
+    execution_evidence: dict[str, Any] | None = None,
+    observed_at: datetime | None = None,
 ) -> bool:
     action = _action_type(plan)
     direction = str(candidate.get("direction") or plan.direction or "LONG").upper()
@@ -507,6 +525,59 @@ def send_trade_plan(
             event_type=action,
             fingerprint=initial_fingerprint,
             reason="PORTFOLIO_OR_ALLOCATION_GUARDRAIL",
+            symbol=plan.symbol,
+            journey_id=candidate.get("journey_id"),
+            signal_id=candidate.get("signal_id"),
+            trade_id=candidate.get("trade_id"),
+        )
+        return False
+
+    # OPIP-ALERT-ACTIONABLE-ONLY-001: the single actionable-notification admission gate. It runs
+    # after the existing action/economic/risk verdicts and before any pending-setup registration,
+    # reservation or send, so a card with missing or stale evidence can never be delivered and
+    # can never leave delivery side effects behind. The refusal is a *notification* outcome: the
+    # trade itself is untouched.
+    evidence = evidence_from_trade_plan(
+        candidate,
+        plan,
+        execution=execution_evidence or candidate.get("execution_evidence"),
+        observed_at=observed_at,
+    )
+    # The admission clock is the real UTC time of this delivery attempt, never the evidence
+    # timestamp: C1 freshness and C4 expiry exist precisely to refuse a *delayed* card, so
+    # handing the gate the evidence time would compare it with itself and always pass. The
+    # evidence keeps the independently captured producer timestamp above.
+    admission = evaluate_actionable_admission(
+        evidence=evidence,
+        policy=policy,
+        now=datetime.now(timezone.utc),
+    )
+    if admission.suppressed:
+        reason = admission.suppression_reason() or "ACTIONABLE_GATE"
+        if notify:
+            record_telegram_suppression(
+                identity=identity,
+                alert_family="QUALIFIED_OPPORTUNITY",
+                event_type=action,
+                fingerprint=initial_fingerprint,
+                reason=reason,
+                symbol=plan.symbol,
+                journey_id=candidate.get("journey_id"),
+                signal_id=candidate.get("signal_id"),
+                trade_id=candidate.get("trade_id"),
+            )
+        return False
+
+    manual_advisory = manual_advisory_without_reconciliation(candidate)
+    if candidate.get("manual_only_advisory") is True and not manual_advisory:
+        # A mode switch between scan and notify cannot silently create an
+        # exchange intent for a card labelled MANUAL ONLY.
+        record_telegram_suppression(
+            identity=identity,
+            alert_family="QUALIFIED_OPPORTUNITY",
+            event_type=action,
+            fingerprint=initial_fingerprint,
+            reason="MANUAL_ADVISORY_MODE_UNVERIFIED",
             symbol=plan.symbol,
             journey_id=candidate.get("journey_id"),
             signal_id=candidate.get("signal_id"),
@@ -561,6 +632,27 @@ def send_trade_plan(
         action=action,
     )
     message = format_primary_new_trade_alert(candidate=candidate, plan=plan)
+    if manual_advisory:
+        message = (
+            MANUAL_ONLY_ALERT_BANNER
+            + "\nNo automatic order, fill tracking, or protective stop. Owner executes and manages every trade manually.\n\n"
+            + message
+        )
+    # OPIP-ALERT-ACTIONABLE-ONLY-001 card contract: the delivered card must carry the entry zone,
+    # stop-loss, targets, invalidation, expiry, net reward-to-risk, the setup identity and the
+    # manual-execution statement. If the rendered card is incomplete it is not sent at all.
+    message = (
+        f"{message}\n\n"
+        + render_actionable_block(
+            admission=admission,
+            plan=plan,
+            setup_id=f"QUALIFIED_OPPORTUNITY:{trade_id or plan.symbol}",
+            direction=direction,
+            venue=evidence.venue,
+            instrument=evidence.instrument,
+            observed_at=evidence.observed_at,
+        )
+    )
     candidate["alert_detail"] = format_trade_plan(
         candidate=candidate,
         plan=plan,
@@ -569,6 +661,23 @@ def send_trade_plan(
     key = _alert_state_key(candidate, plan)
     identity = f"QUALIFIED_OPPORTUNITY:{trade_id or plan.symbol}"
     already_queued = queued_alert_fingerprint(trade_id) == key
+
+    incomplete = missing_card_elements(message)
+    if incomplete:
+        # Fail closed: an actionable card that does not state every mandatory plan element is not
+        # a valid notification, so it is refused rather than delivered partially.
+        record_telegram_suppression(
+            identity=identity,
+            alert_family="QUALIFIED_OPPORTUNITY",
+            event_type=action,
+            fingerprint=key,
+            reason="ACTIONABLE_CARD_INCOMPLETE:" + ",".join(incomplete),
+            symbol=plan.symbol,
+            journey_id=candidate.get("journey_id"),
+            signal_id=candidate.get("signal_id"),
+            trade_id=trade_id,
+        )
+        return False
 
     def _queue_tracking_notification(queue_reason: str) -> None:
         if not notify or already_queued or not should_send_trade_plan(candidate, plan):
@@ -583,6 +692,7 @@ def send_trade_plan(
             identity=identity,
             fingerprint=key,
             reason=queue_reason,
+            admission=admission,
         )
         candidate["notification_attempted"] = True
 
@@ -758,6 +868,7 @@ def send_trade_plan(
                     identity=identity,
                     fingerprint=key,
                     reason=delivery_reason,
+                    admission=admission,
                 )
             except Exception as queue_exc:
                 print(
