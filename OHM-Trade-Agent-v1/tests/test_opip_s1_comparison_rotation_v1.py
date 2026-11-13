@@ -176,3 +176,37 @@ def test_lock_timeout_is_bounded_and_counted(tmp_path, monkeypatch):
 def test_hot_file_mode_stays_private(hot):
     cmp.record_comparison_fail_soft(_row(1), hot)
     assert (hot.stat().st_mode & 0o777) == 0o600
+
+
+@pytest.mark.acceptance
+def test_link_failure_never_renames_over_an_intruder_and_keeps_every_record(hot, monkeypatch):
+    """ATDD-OPIP-S1-COMPARISON-EVIDENCE-v1/AC-001: when hard links are unavailable nothing is renamed or replaced and no record is lost."""
+    monkeypatch.setattr(cmp, "MAX_BYTES", 2000)
+
+    def no_links(src, dst, *a, **k):
+        raise OSError("hard links unavailable")
+
+    monkeypatch.setattr(os, "link", no_links)
+    renames = []
+    real_rename = os.rename
+    monkeypatch.setattr(os, "rename", lambda *a, **k: renames.append(a) or real_rename(*a, **k))
+    before = cmp.comparison_write_stats()
+    for i in range(20):
+        assert cmp.record_comparison_fail_soft(_row(i), hot)
+    after = cmp.comparison_write_stats()
+    assert renames == []
+    assert _all_ids(hot.parent) == [f"scan-{i}" for i in range(20)]
+    assert after["rotation_unavailable"] > before["rotation_unavailable"]
+    assert after["dropped"] == before["dropped"]
+
+
+@pytest.mark.acceptance
+def test_archive_stats_report_count_and_bytes(hot, monkeypatch):
+    """ATDD-OPIP-S1-COMPARISON-EVIDENCE-v1/AC-003: archive growth is observable without reading any record."""
+    monkeypatch.setattr(cmp, "MAX_BYTES", 1500)
+    for i in range(12):
+        cmp.record_comparison_fail_soft(_row(i), hot)
+    stats = cmp.comparison_archive_stats(hot)
+    assert stats["archive_count"] >= 1
+    assert stats["archive_bytes"] > 0 and stats["hot_bytes"] > 0
+    assert stats["max_bytes"] == 1500

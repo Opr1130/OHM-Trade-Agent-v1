@@ -60,18 +60,19 @@ ACCEPTANCE TEST TRACEABILITY:
 AC-001 -> tests/test_opip_s1_comparison_rotation_v1.py::test_rotation_keeps_every_archive_and_never_overwrites
 AC-001 -> tests/test_opip_s1_comparison_rotation_v1.py::test_legacy_dot_one_file_is_never_touched
 AC-001 -> tests/test_opip_s1_comparison_rotation_v1.py::test_name_collision_gets_a_new_suffix_and_never_replaces
+AC-001 -> tests/test_opip_s1_comparison_rotation_v1.py::test_link_failure_never_renames_over_an_intruder_and_keeps_every_record
 AC-002 -> tests/test_opip_s1_comparison_rotation_v1.py::test_concurrent_writers_lose_no_record_across_rotations
 AC-002 -> tests/test_opip_s1_comparison_rotation_v1.py::test_crash_between_link_and_unlink_recovers_without_loss
 AC-002 -> tests/test_opip_s1_comparison_rotation_v1.py::test_torn_tail_is_preserved_on_its_own_line
 AC-003 -> tests/test_opip_s1_comparison_rotation_v1.py::test_short_writes_and_eintr_still_write_the_whole_record
 AC-003 -> tests/test_opip_s1_comparison_rotation_v1.py::test_write_failure_is_counted_and_never_raises
 AC-003 -> tests/test_opip_s1_comparison_rotation_v1.py::test_lock_timeout_is_bounded_and_counted
+AC-003 -> tests/test_opip_s1_comparison_rotation_v1.py::test_archive_stats_report_count_and_bytes
 AC-004 -> tests/test_opip_s1_router_cap_telemetry_v1.py::test_router_usage_record_carries_the_output_cap
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/services/technical_scoring_comparison.py
 AC-001 -> OHM-Trade-Agent-v1/tests/test_opip_s1_comparison_rotation_v1.py
-AC-001 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
 AC-001 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-S1-COMPARISON-EVIDENCE-v1.md
 AC-002 -> OHM-Trade-Agent-v1/app/services/technical_scoring_comparison.py
 AC-002 -> OHM-Trade-Agent-v1/tests/test_opip_s1_comparison_rotation_v1.py
