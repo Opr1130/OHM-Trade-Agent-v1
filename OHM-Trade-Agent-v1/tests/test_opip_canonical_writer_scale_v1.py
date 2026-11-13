@@ -40,6 +40,8 @@ from tests.test_opip_r3_f4_opportunity_persistence import (
     payload_for,
 )
 
+pytestmark = pytest.mark.acceptance
+
 APP_ROOT = Path(__file__).resolve().parents[1]
 STORAGE = APP_ROOT / "app" / "opip" / "events" / "storage.py"
 
@@ -77,7 +79,7 @@ def _episode_id(claim) -> str:
 
 
 def test_ac_001_hydration_reads_one_page_at_a_time():
-    """AC-001: every hydration query must be a bounded range seek.
+    """ATDD-OPIP-CANONICAL-WRITER-SCALE-v1/AC-001: every hydration query must be a bounded range seek.
 
     The previous implementation ran one ``fetchall()`` per event type, so the
     whole backlog became a Python list before the first row was folded and
@@ -95,7 +97,7 @@ def test_ac_001_hydration_reads_one_page_at_a_time():
 
 
 def test_ac_001_no_projection_fold_materialises_its_type_history():
-    """AC-001: the fold must consume the pager, not a result set."""
+    """ATDD-OPIP-CANONICAL-WRITER-SCALE-v1/AC-001: the fold must consume the pager, not a result set."""
     for name in (
         "_hydrate_request_lifecycle_projection",
         "_refresh_request_lifecycle_projection",
@@ -117,7 +119,7 @@ def test_ac_001_no_projection_fold_materialises_its_type_history():
 def test_ac_002_paging_preserves_commit_order_and_terminates(
     canonical_db, monkeypatch
 ):
-    """AC-002: several pages must fold to exactly the single-page result."""
+    """ATDD-OPIP-CANONICAL-WRITER-SCALE-v1/AC-002: several pages must fold to exactly the single-page result."""
     writer = open_writer(canonical_db)
     episode_ids = []
     try:
@@ -167,6 +169,7 @@ def test_ac_002_paging_preserves_commit_order_and_terminates(
 
 
 def test_ac_003_retention_releases_its_oldest_entry_past_the_bound():
+    """ATDD-OPIP-CANONICAL-WRITER-SCALE-v1/AC-003: retention releases its oldest entry past the bound."""
     projection = _BoundedProjection(3)
     for index in range(10):
         projection[f"id-{index}"] = index
@@ -182,7 +185,7 @@ def test_ac_003_retention_releases_its_oldest_entry_past_the_bound():
 def test_ac_004_a_released_episode_still_answers_exactly_as_the_retained_one(
     canonical_db,
 ):
-    """AC-004: releasing an identity must not change what it reports.
+    """ATDD-OPIP-CANONICAL-WRITER-SCALE-v1/AC-004: releasing an identity must not change what it reports.
 
     The durable rows are the authority in both cases, so a terminal episode that
     retention has released must answer with the same state, event count and
@@ -218,7 +221,7 @@ def test_ac_004_a_released_episode_still_answers_exactly_as_the_retained_one(
 def test_ac_004_a_released_request_state_is_re_derived_not_defaulted(
     canonical_db,
 ):
-    """AC-004: a released request must not silently reset to ELIGIBLE."""
+    """ATDD-OPIP-CANONICAL-WRITER-SCALE-v1/AC-004: a released request must not silently reset to ELIGIBLE."""
     writer = open_writer(canonical_db)
     try:
         writer._request_lifecycle_projection["REQ:scale"] = "CONSUMED"
@@ -238,7 +241,7 @@ def test_ac_004_a_released_request_state_is_re_derived_not_defaulted(
 
 
 def test_ac_005_role_result_identity_has_no_resident_map():
-    """AC-005: the per-result map grew with all history; the row is the lookup."""
+    """ATDD-OPIP-CANONICAL-WRITER-SCALE-v1/AC-005: the per-result map grew with all history; the row is the lookup."""
     assert not hasattr(CanonicalWriter, "_role_result_idempotency_by_id")
     constructor = inspect.getsource(CanonicalWriter.__init__)
     assert "_role_result_idempotency_by_id" not in constructor
@@ -250,6 +253,7 @@ def test_ac_005_role_result_identity_has_no_resident_map():
 
 
 def test_ac_005_the_identity_indexes_are_declared():
+    """ATDD-OPIP-CANONICAL-WRITER-SCALE-v1/AC-005: the identity indexes are declared."""
     ddl = canonical_schema.DDL
     for name in (
         "idx_events_type_cursor",
@@ -260,7 +264,7 @@ def test_ac_005_the_identity_indexes_are_declared():
 
 
 def test_ac_005_the_identity_query_is_planned_as_an_index_seek(canonical_db):
-    """AC-005: SQLite must plan the per-identity read as an index range seek."""
+    """ATDD-OPIP-CANONICAL-WRITER-SCALE-v1/AC-005: SQLite must plan the per-identity read as an index range seek."""
     writer = open_writer(canonical_db)
     try:
         plan = writer._conn.execute(
@@ -281,7 +285,7 @@ def test_ac_005_the_identity_query_is_planned_as_an_index_seek(canonical_db):
 
 
 def test_ac_006_dead_letter_retention_reads_only_the_tail(tmp_path):
-    """AC-006: retention must not read the file it is bounding.
+    """ATDD-OPIP-CANONICAL-WRITER-SCALE-v1/AC-006: retention must not read the file it is bounding.
 
     The previous shape called the whole-file reader twice - once to count, once
     to slice - so peak memory was the dead-letter file size.
@@ -305,7 +309,7 @@ def test_ac_006_dead_letter_retention_reads_only_the_tail(tmp_path):
 def test_ac_007_retained_entries_stay_bounded_while_history_grows(
     canonical_db, monkeypatch
 ):
-    """AC-007: resident entries must stop at the bound, however long history is."""
+    """ATDD-OPIP-CANONICAL-WRITER-SCALE-v1/AC-007: resident entries must stop at the bound, however long history is."""
     monkeypatch.setattr(writer_module, "PROJECTION_RETENTION_ENTRIES", 4)
     writer = open_writer(canonical_db)
     try:
@@ -330,6 +334,7 @@ def test_ac_007_retained_entries_stay_bounded_while_history_grows(
 def test_ac_007_a_released_identity_is_re_derived_from_the_durable_rows(
     canonical_db, monkeypatch
 ):
+    """ATDD-OPIP-CANONICAL-WRITER-SCALE-v1/AC-007: a released identity is re derived from the durable rows."""
     monkeypatch.setattr(writer_module, "PROJECTION_RETENTION_ENTRIES", 2)
     writer = open_writer(canonical_db)
     try:
