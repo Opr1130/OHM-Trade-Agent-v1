@@ -39,10 +39,6 @@ _MISSING_BASE = "0" * 40
 APP_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = APP_ROOT.parent
 ACTIVE_INCREMENT_PATH = APP_ROOT / "docs" / "atdd" / "ACTIVE_INCREMENT"
-SCOPE_CONTRACT_DIR = APP_ROOT / "docs" / "atdd" / "scope-contracts"
-# Repository-root namespaces, matching ``git diff`` output and implementation maps.
-CONTRACT_REPO_PREFIX = "OHM-Trade-Agent-v1/docs/atdd/scope-contracts/"
-POINTER_REPO_PATH = "OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT"
 
 
 @dataclass(frozen=True)
@@ -137,66 +133,6 @@ def load_scope_contracts(directory: Path) -> tuple[ScopeContract, ...]:
     if len(increments) != len(set(increments)):
         raise ValueError("active increment is ambiguous")
     return contracts
-
-
-def load_scope_contract_files(directory: Path) -> dict[str, ScopeContract]:
-    """Map each contract file stem to its parsed contract."""
-    files = {
-        path.stem: parse_scope_contract(path.read_text(encoding="utf-8"))
-        for path in sorted(directory.glob("*.md"))
-        if path.is_file()
-    }
-    if not files:
-        raise ValueError(f"no scope contracts in {directory}")
-    return files
-
-
-def resolve_pr_increment(
-    contract_files: dict[str, ScopeContract],
-    changed_files: tuple[str, ...],
-    read_pointer,
-) -> str:
-    """Select the one increment this change set is authorized under.
-
-    PR-scoped selection: the increment is the single scope contract this
-    change set adds or modifies, so concurrent PRs never share mutable state.
-    A change set that touches no contract falls back to the legacy
-    ``ACTIVE_INCREMENT`` pointer. Everything else fails closed (ValueError):
-
-    * more than one changed contract (ambiguous);
-    * a changed contract whose file stem differs from its INCREMENT;
-    * a pointer edited in this change set to a different increment.
-
-    An unchanged (possibly stale) pointer is ignored whenever the change set
-    carries its own contract. A contract still has to authorize its own file
-    through its implementation map, so it cannot be applied silently.
-    """
-    normalized = tuple(normalize_repo_path(path) for path in changed_files)
-    stems = sorted({
-        path[len(CONTRACT_REPO_PREFIX):-len(".md")]
-        for path in normalized
-        if path.startswith(CONTRACT_REPO_PREFIX)
-        and path.endswith(".md")
-        and "/" not in path[len(CONTRACT_REPO_PREFIX):]
-        and path[len(CONTRACT_REPO_PREFIX):-len(".md")] in contract_files
-    })
-    if len(stems) > 1:
-        raise ValueError("changed scope contracts are ambiguous: " + ", ".join(stems))
-    if not stems:
-        return read_pointer()
-    stem = stems[0]
-    if contract_files[stem].increment != stem:
-        raise ValueError(f"contract file name does not match its INCREMENT: {stem}")
-    if POINTER_REPO_PATH in normalized:
-        try:
-            pointer = read_pointer()
-        except ValueError:
-            pointer = None
-        if pointer is not None and pointer != stem:
-            raise ValueError(
-                f"edited active increment pointer conflicts with changed contract: {stem}"
-            )
-    return stem
 
 
 def read_increment_pointer(path: Path = ACTIVE_INCREMENT_PATH) -> str:
@@ -443,7 +379,6 @@ def main(argv: list[str] | None = None) -> int:
 def _main(args: list[str]) -> int:
     explicit: str | None = None
     git_base: str | None = None
-    pr_scoped = False
     positional: list[str] = []
     index = 0
     while index < len(args):
@@ -456,23 +391,14 @@ def _main(args: list[str]) -> int:
             git_base = _take_option(args, index)
             index += 2
             continue
-        if arg == "--pr-scoped":
-            pr_scoped = True
-            index += 1
-            continue
         if arg.startswith("--"):
             raise ValueError(f"unknown argument: {arg}")
         positional.append(arg)
         index += 1
-    if pr_scoped and explicit is not None:
-        raise ValueError("--pr-scoped cannot be combined with --increment")
-    if pr_scoped and git_base is None and not positional:
-        raise ValueError("--pr-scoped requires a changed-file set")
-    contracts = load_scope_contracts(SCOPE_CONTRACT_DIR)
-    if not pr_scoped:
-        pointer = read_increment_pointer()
-        if explicit is not None and explicit != pointer:
-            raise ValueError("active increment pointer does not match --increment")
+    pointer = read_increment_pointer()
+    if explicit is not None and explicit != pointer:
+        raise ValueError("active increment pointer does not match --increment")
+    contracts = load_scope_contracts(APP_ROOT / "docs" / "atdd" / "scope-contracts")
     acceptance = load_acceptance_index(APP_ROOT / "tests")
     changed: tuple[str, ...] | None
     if git_base is None and not positional:
@@ -482,20 +408,11 @@ def _main(args: list[str]) -> int:
         if git_base is not None:
             paths.extend(git_changed_paths(REPO_ROOT, git_base))
         changed = tuple(paths)
-    if pr_scoped:
-        assert changed is not None
-        active = resolve_pr_increment(
-            load_scope_contract_files(SCOPE_CONTRACT_DIR),
-            changed,
-            read_increment_pointer,
-        )
-    else:
-        active = explicit or pointer
     result = check_contracts(
         contracts,
         acceptance,
         changed,
-        active_increment=active,
+        active_increment=explicit or pointer,
     )
     print(result.status)
     for reason in result.reasons:

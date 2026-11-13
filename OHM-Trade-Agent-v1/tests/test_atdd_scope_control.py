@@ -372,7 +372,7 @@ def test_ac_004_omitted_changed_file_set_fails_closed(capsys: pytest.CaptureFixt
     )
     assert "atdd-scope:" in workflow
     assert "docs/atdd/ACTIVE_INCREMENT" in workflow
-    assert "python tests/atdd_scope.py --pr-scoped" in workflow
+    assert "python tests/atdd_scope.py --increment" in workflow
     assert "--git-base" in workflow
 
 
