@@ -104,6 +104,11 @@ the "write-lock duration" is these seconds of a writer that is not yet serving. 
 RSS during the build is 19 MB. Nothing is rewritten; rollback needs no migration (an
 older build ignores the extra indexes).
 
+Note: the 100k–1M measurements were taken with the first-draft predicate
+(`episode_id IS NOT NULL`); on this dataset every row is of the indexed type, so the
+typed predicate indexes exactly the same rows. A 6,000-row re-run with the final code
+opens in 1.45 s (re-derivation p50 0.41 ms).
+
 ### 2d. FIFO versus LRU — the intended policy
 
 The merged code is **FIFO by first insertion**, deliberately: a refresh does not move an
