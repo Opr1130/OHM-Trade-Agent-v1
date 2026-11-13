@@ -39,7 +39,8 @@ AC-004:
 GIVEN: the simulator package and its CLI
 WHEN: they are imported and run
 THEN: they import no exchange, order, notification or network module, write
-only the requested report, reject unknown parameters, and leave the production policy file unchanged
+only the requested report (atomically, never over an input or policy file),
+reject unknown, nonfinite or out-of-range parameters, and leave the production policy file unchanged
 
 EXPLICITLY OUT OF SCOPE:
 - Any wiring into the scanner, notifications, Telegram, reconciliation, F11 or trading.
@@ -57,16 +58,22 @@ AC-001 -> tests/test_opip_v6_strategy_simulator_v1.py::test_each_threshold_rejec
 AC-001 -> tests/test_opip_v6_strategy_simulator_v1.py::test_early_watch_band_and_net_economics_are_explicit
 AC-002 -> tests/test_opip_v6_strategy_simulator_v1.py::test_missing_or_invalid_data_fails_closed
 AC-002 -> tests/test_opip_v6_strategy_simulator_v1.py::test_missing_score_for_the_selected_scorer_is_data_missing
+AC-002 -> tests/test_opip_v6_strategy_simulator_v1.py::test_invalid_slippage_fails_closed_even_without_a_limit
+AC-002 -> tests/test_opip_v6_strategy_simulator_v1.py::test_missing_slippage_is_rejected_when_a_limit_is_set_and_flagged_otherwise
 AC-003 -> tests/test_opip_v6_strategy_simulator_v1.py::test_comparison_reports_funnel_changes_labels_and_digests
 AC-003 -> tests/test_opip_v6_strategy_simulator_v1.py::test_synthetic_data_is_deterministic_and_the_baseline_matches_the_reference_policy
 AC-004 -> tests/test_opip_v6_strategy_simulator_v1.py::test_simulator_has_no_order_network_or_notification_dependencies
 AC-004 -> tests/test_opip_v6_strategy_simulator_v1.py::test_cli_writes_only_the_report_and_never_changes_production_policy
 
+AC-004 -> tests/test_opip_v6_strategy_simulator_v1.py::test_invalid_policy_parameters_are_rejected_at_the_boundary
+AC-004 -> tests/test_opip_v6_strategy_simulator_v1.py::test_regimes_must_be_a_list_of_names_not_a_string
+AC-004 -> tests/test_opip_v6_strategy_simulator_v1.py::test_report_never_overwrites_an_input_file
+AC-004 -> tests/test_opip_v6_strategy_simulator_v1.py::test_report_output_must_be_json_in_an_existing_directory_and_leaves_no_temp
+
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/opip/simulator/__init__.py
 AC-001 -> OHM-Trade-Agent-v1/app/opip/simulator/engine.py
 AC-001 -> OHM-Trade-Agent-v1/tests/test_opip_v6_strategy_simulator_v1.py
-AC-001 -> OHM-Trade-Agent-v1/docs/atdd/ACTIVE_INCREMENT
 AC-001 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-V6-SIMULATOR-v1.md
 AC-002 -> OHM-Trade-Agent-v1/app/opip/simulator/engine.py
 AC-002 -> OHM-Trade-Agent-v1/tests/test_opip_v6_strategy_simulator_v1.py

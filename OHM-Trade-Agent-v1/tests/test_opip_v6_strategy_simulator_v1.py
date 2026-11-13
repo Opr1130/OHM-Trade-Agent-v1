@@ -139,3 +139,74 @@ def test_cli_writes_only_the_report_and_never_changes_production_policy(tmp_path
     data.write_text(json.dumps(cand()) + "\n")
     assert cli.main(["--candidates", str(data), "--out", str(tmp_path / "s.json")]) == 0
     assert json.loads((tmp_path / "s.json").read_text())["evidence_class"] == "SUPPLIED_UNVERIFIED"
+
+
+@pytest.mark.acceptance
+@pytest.mark.parametrize("slip", [float("nan"), -1.0, "x", True, float("inf")])
+def test_invalid_slippage_fails_closed_even_without_a_limit(slip):
+    """ATDD-OPIP-V6-SIMULATOR-v1/AC-002: present-but-invalid slippage is rejected and never lowers modelled cost."""
+    d = engine.evaluate_candidate(cand(est_slippage_pct=slip), SimPolicy())
+    assert d["status"] == engine.REJECTED
+    assert any(r.startswith(engine.DATA_MISSING) for r in d["reasons"])
+
+
+@pytest.mark.acceptance
+def test_missing_slippage_is_rejected_when_a_limit_is_set_and_flagged_otherwise():
+    """ATDD-OPIP-V6-SIMULATOR-v1/AC-002: missing slippage never passes a slippage limit; without a limit it is flagged as assumed zero."""
+    c = cand()
+    del c["est_slippage_pct"]
+    limited = engine.evaluate_candidate(c, SimPolicy(max_slippage_pct=0.1))
+    assert limited["status"] == engine.REJECTED and engine.SLIPPAGE_ABOVE_MAX in limited["reasons"]
+    unlimited = engine.evaluate_candidate(c, SimPolicy())
+    assert unlimited["metrics"]["slippage_assumed_zero"] is True
+
+
+@pytest.mark.acceptance
+@pytest.mark.parametrize("overrides", [
+    {"round_trip_cost_pct": -5}, {"notional_usd": float("nan")}, {"notional_usd": 0},
+    {"score_threshold": -1}, {"score_threshold": 1e9}, {"min_confidence": 2},
+    {"max_spread_pct": -1}, {"min_net_profit_usd": float("inf")},
+    {"blocked_btc_regimes": "UP"}, {"blocked_btc_regimes": [1]}, {"blocked_btc_regimes": [""]},
+    {"min_liquidity_usd": 100, "early_watch_liquidity_usd": 500},
+    {"scoring_version": "v3"}, {"min_reward_to_risk": True},
+])
+def test_invalid_policy_parameters_are_rejected_at_the_boundary(overrides):
+    """ATDD-OPIP-V6-SIMULATOR-v1/AC-004: nonphysical or guard-disabling parameters raise INVALID_SIM_PARAMETER."""
+    with pytest.raises(ValueError):
+        engine.with_overrides(SimPolicy(), overrides)
+
+
+@pytest.mark.acceptance
+def test_regimes_must_be_a_list_of_names_not_a_string():
+    """ATDD-OPIP-V6-SIMULATOR-v1/AC-004: a list of regimes is accepted and kept whole."""
+    p = engine.with_overrides(SimPolicy(), {"blocked_btc_regimes": ["UP", "DOWN"]})
+    assert p.blocked_btc_regimes == ("UP", "DOWN")
+
+
+@pytest.mark.acceptance
+@pytest.mark.parametrize("which", ["candidates", "variant"])
+def test_report_never_overwrites_an_input_file(tmp_path, which):
+    """ATDD-OPIP-V6-SIMULATOR-v1/AC-004: --out equal to an input (directly or via symlink) is refused and the input is unchanged."""
+    cands = tmp_path / "c.json"
+    cands.write_text(json.dumps(cand()) + "\n")
+    variant = tmp_path / "v.json"
+    variant.write_text("{}")
+    target = {"candidates": cands, "variant": variant}[which]
+    before = target.read_bytes()
+    link = tmp_path / "alias.json"
+    link.symlink_to(target)
+    for out in (target, link):
+        with pytest.raises(SystemExit):
+            cli.main(["--candidates", str(cands), "--variant", str(variant), "--out", str(out)])
+    assert target.read_bytes() == before
+
+
+@pytest.mark.acceptance
+def test_report_output_must_be_json_in_an_existing_directory_and_leaves_no_temp(tmp_path):
+    """ATDD-OPIP-V6-SIMULATOR-v1/AC-004: odd output paths are refused; a good run writes atomically and leaves no temp file."""
+    for bad in (tmp_path / "r.txt", tmp_path / "missing" / "r.json"):
+        with pytest.raises(SystemExit):
+            cli.main(["--synthetic", "5", "--out", str(bad)])
+    good = tmp_path / "r.json"
+    assert cli.main(["--synthetic", "5", "--out", str(good)]) == 0
+    assert good.exists() and [p.name for p in tmp_path.iterdir()] == ["r.json"]

@@ -52,9 +52,44 @@ class SimPolicy:
     notional_usd: float = 1000.0
     blocked_btc_regimes: tuple[str, ...] = ()
 
+    def __post_init__(self) -> None:
+        _validate_policy(self)
+
     def digest(self) -> str:
         blob = json.dumps(asdict(self), sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+
+def _finite(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
+
+
+def _validate_policy(p: "SimPolicy") -> None:
+    """Reject nonphysical or guard-disabling parameters with a stable reason."""
+    def bad(name: str) -> None:
+        raise ValueError(f"INVALID_SIM_PARAMETER:{name}")
+
+    if p.scoring_version not in ("v1", "v2"):
+        bad("scoring_version")
+    ranges = {
+        "score_threshold": (0.0, 100.0), "min_confidence": (0.0, 1.0),
+        "min_liquidity_usd": (0.0, 1e12), "max_spread_pct": (0.0, 100.0),
+        "max_slippage_pct": (0.0, 100.0), "round_trip_cost_pct": (0.0, 100.0),
+        "min_net_profit_usd": (0.0, 1e12), "min_target_2_move_pct": (0.0, 1e4),
+        "min_reward_to_risk": (0.0, 1e4),
+    }
+    for name, (lo, hi) in ranges.items():
+        value = getattr(p, name)
+        if not _finite(value) or not lo <= value <= hi:
+            bad(name)
+    if not _finite(p.notional_usd) or not 0.0 < p.notional_usd <= 1e12:
+        bad("notional_usd")
+    ew = p.early_watch_liquidity_usd
+    if ew is not None and (not _finite(ew) or not 0.0 <= ew <= p.min_liquidity_usd):
+        bad("early_watch_liquidity_usd")
+    regimes = p.blocked_btc_regimes
+    if not isinstance(regimes, tuple) or not all(isinstance(r, str) and r.strip() for r in regimes):
+        bad("blocked_btc_regimes")
 
 
 def baseline_from_strategy_policy(policy: StrategyPolicy) -> SimPolicy:
@@ -77,10 +112,11 @@ def with_overrides(base: SimPolicy, overrides: Mapping[str, Any]) -> SimPolicy:
         raise ValueError(f"UNKNOWN_SIM_PARAMETER:{sorted(unknown)}")
     values = dict(overrides)
     if "blocked_btc_regimes" in values:
-        values["blocked_btc_regimes"] = tuple(values["blocked_btc_regimes"])
-    if values.get("scoring_version", base.scoring_version) not in ("v1", "v2"):
-        raise ValueError("INVALID_SCORING_VERSION")
-    return replace(base, **values)
+        regimes = values["blocked_btc_regimes"]
+        if not isinstance(regimes, (list, tuple)):
+            raise ValueError("INVALID_SIM_PARAMETER:blocked_btc_regimes")
+        values["blocked_btc_regimes"] = tuple(regimes)
+    return replace(base, **values)  # __post_init__ validates every field
 
 
 def _num(candidate: Mapping[str, Any], key: str) -> float | None:
@@ -105,7 +141,11 @@ def evaluate_candidate(candidate: Mapping[str, Any], policy: SimPolicy) -> dict[
     if entry <= 0 or risk <= 0 or reward <= 0:
         return _decision(candidate, REJECTED, [GEOMETRY_INVALID], {})
 
-    slippage = _num(candidate, "est_slippage_pct") or 0.0
+    raw_slip = candidate.get("est_slippage_pct")
+    slippage_missing = raw_slip is None
+    if not slippage_missing and (not _finite(raw_slip) or raw_slip < 0):
+        return _decision(candidate, REJECTED, [f"{DATA_MISSING}:est_slippage_pct_invalid"], {})
+    slippage = 0.0 if slippage_missing else float(raw_slip)
     gross_pct = reward / entry * 100.0
     net_pct = gross_pct - policy.round_trip_cost_pct - 2.0 * slippage
     metrics = {
@@ -113,6 +153,9 @@ def evaluate_candidate(candidate: Mapping[str, Any], policy: SimPolicy) -> dict[
         "net_move_pct": round(net_pct, 6),
         "net_profit_usd": round(policy.notional_usd * net_pct / 100.0, 6),
         "reward_to_risk": round(reward / risk, 6),
+        # Costs: round_trip_cost_pct covers fees and spread for the full round
+        # trip; slippage is per side (entry and exit), hence 2x.
+        "slippage_assumed_zero": slippage_missing,
     }
 
     score = _num(candidate, "v2_score" if policy.scoring_version == "v2" else "v1_score")
@@ -125,7 +168,7 @@ def evaluate_candidate(candidate: Mapping[str, Any], policy: SimPolicy) -> dict[
         reasons.append(CONFIDENCE_BELOW_MIN)
     if policy.max_spread_pct < 100 and (_num(candidate, "spread_pct") is None or _num(candidate, "spread_pct") > policy.max_spread_pct):
         reasons.append(SPREAD_ABOVE_MAX)
-    if policy.max_slippage_pct < 100 and slippage > policy.max_slippage_pct:
+    if policy.max_slippage_pct < 100 and (slippage_missing or slippage > policy.max_slippage_pct):
         reasons.append(SLIPPAGE_ABOVE_MAX)
     if gross_pct < policy.min_target_2_move_pct:
         reasons.append(TARGET_MOVE_BELOW_MIN)
