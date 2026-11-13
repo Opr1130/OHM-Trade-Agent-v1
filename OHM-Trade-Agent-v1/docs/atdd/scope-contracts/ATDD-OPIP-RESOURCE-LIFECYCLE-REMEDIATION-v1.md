@@ -149,6 +149,7 @@ AC-002 -> OHM-Trade-Agent-v1/tests/test_opip_resource_lifecycle_remediation_v1.p
 AC-002 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-RESOURCE-LIFECYCLE-REMEDIATION-v1.md
 AC-003 -> OHM-Trade-Agent-v1/app/jobs/run_cycle.py
 AC-003 -> OHM-Trade-Agent-v1/tests/test_opip_resource_lifecycle_remediation_v1.py
+AC-003 -> OHM-Trade-Agent-v1/tests/test_wave1_operational_hardening.py
 AC-003 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-RESOURCE-LIFECYCLE-REMEDIATION-v1.md
 AC-004 -> OHM-Trade-Agent-v1/app/jobs/run_cycle.py
 AC-004 -> OHM-Trade-Agent-v1/tests/test_opip_resource_lifecycle_remediation_v1.py
