@@ -38,6 +38,8 @@ from app.jobs import run_cycle as rc
 from app.services import kraken_transport as kt
 from app.services.kraken_transport import KrakenPublicTransport
 
+pytestmark = pytest.mark.acceptance
+
 APP_ROOT = Path(__file__).resolve().parents[1]
 CRON_ENTRY = APP_ROOT / "deploy" / "cron.d" / "ohm-unified-cycle"
 DEPLOY = APP_ROOT / "deploy" / "remote" / "ohm-deploy"
@@ -59,7 +61,7 @@ def _cron_text() -> str:
 
 
 def test_ac_001_the_container_side_process_is_bounded_not_only_the_launcher():
-    """AC-001: the bound is enforced INSIDE the container, on the real process.
+    """ATDD-OPIP-RESOURCE-LIFECYCLE-REMEDIATION-v1/AC-001: the bound is enforced INSIDE the container, on the real process.
 
     A host-side ``timeout`` around ``docker compose exec`` signals the Compose
     CLIENT. The exec'd Python process is a child of the container's exec runtime,
@@ -77,7 +79,7 @@ def test_ac_001_the_container_side_process_is_bounded_not_only_the_launcher():
 
 
 def test_ac_001_the_container_bound_is_strictly_inside_the_release_bound():
-    """AC-001: the inner bound must resolve before the outer one is reaped."""
+    """ATDD-OPIP-RESOURCE-LIFECYCLE-REMEDIATION-v1/AC-001: the inner bound must resolve before the outer one is reaped."""
     text = _cron_text()
     outer = DERIVATION.findall(text)
     assert len(outer) == 1
@@ -90,7 +92,7 @@ def test_ac_001_the_container_bound_is_strictly_inside_the_release_bound():
 
 
 def test_ac_001_a_missing_timeout_binary_fails_closed_instead_of_running_unbounded():
-    """AC-001: absent bound tooling must not degrade into an unbounded cycle.
+    """ATDD-OPIP-RESOURCE-LIFECYCLE-REMEDIATION-v1/AC-001: absent bound tooling must not degrade into an unbounded cycle.
 
     An unbound cycle IS the defect this entry exists to prevent, so falling
     through to a plain ``exec`` trades a visible outage for a silent one: the
@@ -111,7 +113,7 @@ def test_ac_001_a_missing_timeout_binary_fails_closed_instead_of_running_unbound
 
 
 def test_ac_001_the_fail_closed_marker_cannot_be_read_as_a_completion():
-    """AC-001: the release controller accepts only SUCCESS|DEGRADED.
+    """ATDD-OPIP-RESOURCE-LIFECYCLE-REMEDIATION-v1/AC-001: the release controller accepts only SUCCESS|DEGRADED.
 
     The fail-closed status is deliberately outside that set and carries no
     COMPLETED_AT, so a cycle that never ran can never be observed as a fresh
@@ -124,7 +126,7 @@ def test_ac_001_the_fail_closed_marker_cannot_be_read_as_a_completion():
 
 
 def test_ac_002_release_derivation_still_resolves_exactly_one_bound():
-    """AC-002: the release controller must keep deriving the HOST bound.
+    """ATDD-OPIP-RESOURCE-LIFECYCLE-REMEDIATION-v1/AC-002: the release controller must keep deriving the HOST bound.
 
     ``scheduler_hard_bound_seconds`` pipes ``grep -m1 -oE`` into
     ``grep -oE '[0-9]+$'``. ``grep -m1`` stops after one matching *line*, not one
@@ -144,7 +146,7 @@ def test_ac_002_release_derivation_still_resolves_exactly_one_bound():
 
 
 def test_ac_002_the_real_derivation_function_returns_the_release_bound(tmp_path):
-    """AC-002: execute the controller's own extractor against the real entry."""
+    """ATDD-OPIP-RESOURCE-LIFECYCLE-REMEDIATION-v1/AC-002: execute the controller's own extractor against the real entry."""
     import shutil
     import subprocess
 
@@ -170,7 +172,7 @@ def test_ac_002_the_real_derivation_function_returns_the_release_bound(tmp_path)
 
 
 def test_ac_002_the_entry_is_still_one_canonical_scheduler():
-    """AC-002: containment must not introduce a second scheduler."""
+    """ATDD-OPIP-RESOURCE-LIFECYCLE-REMEDIATION-v1/AC-002: containment must not introduce a second scheduler."""
     jobs = [
         line
         for line in _cron_text().splitlines()
@@ -196,7 +198,7 @@ def _isolate_cycle(monkeypatch, tmp_path):
 def test_ac_003_a_shutdown_signal_terminates_with_durable_evidence(
     monkeypatch, tmp_path, capsys
 ):
-    """AC-003: a bounded cycle records that it was stopped, and releases its lock."""
+    """ATDD-OPIP-RESOURCE-LIFECYCLE-REMEDIATION-v1/AC-003: a bounded cycle records that it was stopped, and releases its lock."""
     _isolate_cycle(monkeypatch, tmp_path)
 
     def body() -> bool:
@@ -219,7 +221,7 @@ def test_ac_003_a_shutdown_signal_terminates_with_durable_evidence(
 def test_ac_003_a_terminated_cycle_never_claims_a_completion(
     monkeypatch, tmp_path, capsys
 ):
-    """AC-003: TERMINATED must not fabricate SUCCESS/DEGRADED or COMPLETED_AT.
+    """ATDD-OPIP-RESOURCE-LIFECYCLE-REMEDIATION-v1/AC-003: TERMINATED must not fabricate SUCCESS/DEGRADED or COMPLETED_AT.
 
     The release controller pairs the newest ``COMPLETED_AT`` with the newest
     ``STATUS=(SUCCESS|DEGRADED)`` it can find. A terminated cycle that published
@@ -240,7 +242,7 @@ def test_ac_003_a_terminated_cycle_never_claims_a_completion(
 def test_ac_003_a_completed_cycle_still_emits_the_completion_pair(
     monkeypatch, tmp_path, capsys
 ):
-    """AC-003: the unchanged path keeps its exact release-facing contract."""
+    """ATDD-OPIP-RESOURCE-LIFECYCLE-REMEDIATION-v1/AC-003: the unchanged path keeps its exact release-facing contract."""
     _isolate_cycle(monkeypatch, tmp_path)
     monkeypatch.setattr(rc, "_run_cycle_once", lambda: True)
     rc.main()
@@ -253,7 +255,7 @@ def test_ac_003_a_completed_cycle_still_emits_the_completion_pair(
 def test_ac_004_a_shutdown_cannot_be_swallowed_by_a_phase_fail_open_boundary(
     monkeypatch, tmp_path, capsys
 ):
-    """AC-004: every workload phase is wrapped in ``except Exception``.
+    """ATDD-OPIP-RESOURCE-LIFECYCLE-REMEDIATION-v1/AC-004: every workload phase is wrapped in ``except Exception``.
 
     A shutdown request is not a phase failure. If it were an ``Exception``
     subclass, the first fail-open boundary would capture it and the cycle would
@@ -280,7 +282,7 @@ def test_ac_004_a_shutdown_cannot_be_swallowed_by_a_phase_fail_open_boundary(
 
 
 def test_ac_004_handlers_are_restored_after_the_cycle(monkeypatch, tmp_path):
-    """AC-004: installing the handlers must not leak into the caller's process."""
+    """ATDD-OPIP-RESOURCE-LIFECYCLE-REMEDIATION-v1/AC-004: installing the handlers must not leak into the caller's process."""
     _isolate_cycle(monkeypatch, tmp_path)
     monkeypatch.setattr(rc, "_run_cycle_once", lambda: True)
     sigterm = getattr(signal, "SIGTERM", None)
@@ -294,7 +296,7 @@ def test_ac_004_handlers_are_restored_after_the_cycle(monkeypatch, tmp_path):
 def test_ac_004_lock_contention_is_still_a_skip_not_a_completion(
     monkeypatch, tmp_path, capsys
 ):
-    """AC-004: the unchanged contention path must not look like a completion."""
+    """ATDD-OPIP-RESOURCE-LIFECYCLE-REMEDIATION-v1/AC-004: the unchanged contention path must not look like a completion."""
     _isolate_cycle(monkeypatch, tmp_path)
 
     class _BusyLock:
@@ -356,7 +358,7 @@ def _transport(**kwargs) -> KrakenPublicTransport:
 
 
 def test_ac_006_the_entry_cap_bounds_the_cache_regardless_of_history():
-    """AC-006: a TTL alone never bounded retention; the entry cap does.
+    """ATDD-OPIP-RESOURCE-LIFECYCLE-REMEDIATION-v1/AC-006: a TTL alone never bounded retention; the entry cap does.
 
     ``_store`` used to insert unconditionally and only a read of the *same* key
     after expiry removed anything, so a process retained one entry per distinct
@@ -375,7 +377,7 @@ def test_ac_006_the_entry_cap_bounds_the_cache_regardless_of_history():
 
 
 def test_ac_006_eviction_is_least_recently_used_and_a_hit_refreshes_recency():
-    """AC-006: the cap must not destroy the repeated-read locality it exists for."""
+    """ATDD-OPIP-RESOURCE-LIFECYCLE-REMEDIATION-v1/AC-006: the cap must not destroy the repeated-read locality it exists for."""
     transport = _transport(max_cache_entries=2)
     transport._client = _Client()
     for pair in ("AAA", "BBB"):
@@ -393,7 +395,7 @@ def test_ac_006_eviction_is_least_recently_used_and_a_hit_refreshes_recency():
 
 
 def test_ac_006_expired_entries_are_swept_before_live_ones(monkeypatch):
-    """AC-006: an expired entry can never be served, so it is evicted first."""
+    """ATDD-OPIP-RESOURCE-LIFECYCLE-REMEDIATION-v1/AC-006: an expired entry can never be served, so it is evicted first."""
     clock = {"now": 1_000.0}
     monkeypatch.setattr(kt.time, "monotonic", lambda: clock["now"])
     transport = _transport(max_cache_entries=2)
@@ -410,7 +412,7 @@ def test_ac_006_expired_entries_are_swept_before_live_ones(monkeypatch):
 
 
 def test_ac_007_the_byte_cap_bounds_a_small_number_of_large_payloads():
-    """AC-007: an entry cap alone does not bound memory - payloads vary in size."""
+    """ATDD-OPIP-RESOURCE-LIFECYCLE-REMEDIATION-v1/AC-007: an entry cap alone does not bound memory - payloads vary in size."""
     transport = _transport(max_cache_entries=1000, max_cache_bytes=4096)
     transport._client = _Client(payload={"k": {"pad": "x" * 1000}})
     for index in range(20):
@@ -425,7 +427,7 @@ def test_ac_007_the_byte_cap_bounds_a_small_number_of_large_payloads():
 
 
 def test_ac_007_replacing_a_key_does_not_double_count_its_footprint():
-    """AC-007: refresh-in-place must keep the accounting exact."""
+    """ATDD-OPIP-RESOURCE-LIFECYCLE-REMEDIATION-v1/AC-007: refresh-in-place must keep the accounting exact."""
     transport = _transport(max_cache_entries=1000, max_cache_bytes=1_000_000)
     transport._store("k", {"payload": "a" * 100}, ttl=600.0)
     first = transport.telemetry_snapshot()["cache_bytes"]
@@ -435,7 +437,7 @@ def test_ac_007_replacing_a_key_does_not_double_count_its_footprint():
 
 
 def test_ac_008_cache_semantics_are_unchanged():
-    """AC-008: bounded retention must not change cache correctness."""
+    """ATDD-OPIP-RESOURCE-LIFECYCLE-REMEDIATION-v1/AC-008: bounded retention must not change cache correctness."""
     transport = _transport()
     transport._client = _Client()
     first = transport.request("Ticker", {"pair": "XBTUSD"}, timeout_seconds=1)
@@ -448,7 +450,7 @@ def test_ac_008_cache_semantics_are_unchanged():
 
 
 def test_ac_008_ttl_and_clear_still_behave(monkeypatch):
-    """AC-008: TTL expiry and explicit clearing keep their existing meaning."""
+    """ATDD-OPIP-RESOURCE-LIFECYCLE-REMEDIATION-v1/AC-008: TTL expiry and explicit clearing keep their existing meaning."""
     clock = {"now": 500.0}
     monkeypatch.setattr(kt.time, "monotonic", lambda: clock["now"])
     transport = _transport()
@@ -465,7 +467,7 @@ def test_ac_008_ttl_and_clear_still_behave(monkeypatch):
 
 
 def test_ac_008_defaults_are_bounded_and_overridable(monkeypatch):
-    """AC-008: the shipped defaults must be finite and the caps configurable."""
+    """ATDD-OPIP-RESOURCE-LIFECYCLE-REMEDIATION-v1/AC-008: the shipped defaults must be finite and the caps configurable."""
     default = _transport()
     assert default.max_cache_entries == kt.DEFAULT_CACHE_MAX_ENTRIES
     assert default.max_cache_bytes == kt.DEFAULT_CACHE_MAX_BYTES
@@ -484,7 +486,7 @@ def test_ac_008_defaults_are_bounded_and_overridable(monkeypatch):
 
 
 def test_ac_009_containment_grants_no_trading_learning_or_paper_authority():
-    """AC-009: this increment touches resource lifetime only."""
+    """ATDD-OPIP-RESOURCE-LIFECYCLE-REMEDIATION-v1/AC-009: this increment touches resource lifetime only."""
     cron = _cron_text()
     for forbidden in (
         "OPIP_PAPER_V2_MODE=on",
@@ -509,7 +511,7 @@ DIAGNOSE = APP_ROOT / "deploy" / "remote" / "diagnose-opip-learning.sh"
 
 
 def test_ac_010_neither_reader_matches_the_entry_verbatim():
-    """AC-010: a comment must never be able to supply or override the bound.
+    """ATDD-OPIP-RESOURCE-LIFECYCLE-REMEDIATION-v1/AC-010: a comment must never be able to supply or override the bound.
 
     Both readers used to run the derivation expression over the whole file, so
     a comment quoting the long-form flags became the authority: it either
@@ -526,7 +528,7 @@ def test_ac_010_neither_reader_matches_the_entry_verbatim():
 
 
 def test_ac_010_the_controller_derives_the_real_bound_past_a_decoy_comment(tmp_path):
-    """AC-010: execute the real derivation against an entry with decoy prose.
+    """ATDD-OPIP-RESOURCE-LIFECYCLE-REMEDIATION-v1/AC-010: execute the real derivation against an entry with decoy prose.
 
     The fixture reproduces the shape a contributor is most likely to write: a
     documentation comment that quotes the long-form flags with a different
@@ -588,7 +590,7 @@ def _budget(seconds, clock):
 
 
 def test_ac_011_the_budget_gates_only_noncritical_phases():
-    """AC-011: protection phases are never gated, whatever the elapsed time."""
+    """ATDD-OPIP-RESOURCE-LIFECYCLE-REMEDIATION-v1/AC-011: protection phases are never gated, whatever the elapsed time."""
     now = {"t": 0.0}
     budget = _budget(60, lambda: now["t"])
     now["t"] = 600.0
@@ -610,7 +612,7 @@ def test_ac_011_the_budget_gates_only_noncritical_phases():
 
 
 def test_ac_011_a_zero_budget_disables_the_gate_and_bad_values_never_open_it(monkeypatch):
-    """AC-011: the gate's own fallback must never be 'unlimited'."""
+    """ATDD-OPIP-RESOURCE-LIFECYCLE-REMEDIATION-v1/AC-011: the gate's own fallback must never be 'unlimited'."""
     now = {"t": 0.0}
     budget = _budget(0, lambda: now["t"])
     now["t"] = 1_000_000.0
@@ -627,14 +629,14 @@ def test_ac_011_a_zero_budget_disables_the_gate_and_bad_values_never_open_it(mon
 
 
 def test_ac_011_the_default_budget_expires_well_inside_the_container_bound():
-    """AC-011: the gate must be able to act before the hard bound does."""
+    """ATDD-OPIP-RESOURCE-LIFECYCLE-REMEDIATION-v1/AC-011: the gate must be able to act before the hard bound does."""
     text = _cron_text()
     inner = int(IN_CONTAINER_BOUND.findall(text)[0][1])
     assert 0 < rc.DEFAULT_CYCLE_BUDGET_SECONDS < inner
 
 
 def test_ac_011_every_noncritical_phase_is_actually_gated_in_the_cycle_body():
-    """AC-011: the gate must be wired, not merely defined."""
+    """ATDD-OPIP-RESOURCE-LIFECYCLE-REMEDIATION-v1/AC-011: the gate must be wired, not merely defined."""
     import inspect
 
     body = inspect.getsource(rc._run_cycle_once)
@@ -651,7 +653,7 @@ def test_ac_011_every_noncritical_phase_is_actually_gated_in_the_cycle_body():
 
 
 def test_ac_012_the_assessment_reports_overdue_and_orphan_from_existing_state():
-    """AC-012: the two failure modes must be visible in the diagnostics receipt."""
+    """ATDD-OPIP-RESOURCE-LIFECYCLE-REMEDIATION-v1/AC-012: the two failure modes must be visible in the diagnostics receipt."""
     source = DIAGNOSE.read_text(encoding="utf-8")
     for field in (
         "unified_cycle_lock_state=",
@@ -682,7 +684,7 @@ def test_ac_012_the_assessment_reports_overdue_and_orphan_from_existing_state():
 
 
 def test_ac_012_the_probe_verdict_is_available_to_the_assessment():
-    """AC-012: the earlier read-only probe must hand its verdict forward."""
+    """ATDD-OPIP-RESOURCE-LIFECYCLE-REMEDIATION-v1/AC-012: the earlier read-only probe must hand its verdict forward."""
     source = DIAGNOSE.read_text(encoding="utf-8")
     assert 'UNIFIED_CYCLE_HOST_LOCK_STATE="IDLE"' in source
     assert 'UNIFIED_CYCLE_HOST_LOCK_STATE="HELD"' in source
