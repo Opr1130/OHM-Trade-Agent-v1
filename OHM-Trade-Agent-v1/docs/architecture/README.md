@@ -6,7 +6,7 @@
 
 1. **Contract catalog**: `docs/architecture/contract_catalog.json` enumerates seven high-risk invariants, affected source paths and *references* to relevant tests/workflows. References are **not** proof that tests cover or validate an invariant.
 2. **Lightweight observer**: `tools/architecture_gap_capture.py` uses stdlib-only file matching plus a narrow Python AST check for direct F11 imports from `app.opip.data_platform`. A touched seam is an **UNVERIFIED review candidate**, never a confirmed bug or security clearance. Dynamic imports, behavioral bypasses, transactions and missing contracts cannot be fully detected by this script.
-3. **Automatic non-blocking capture**: `.github/workflows/architecture-observe.yml` triggers on relevant PR file changes. It runs no LLM calls, dependencies, database, network API queries or full test suite. It writes summary + JSON/Markdown artifacts. Weekly baseline checks evidence reference availability. It never creates or edits GitHub issues or merges PRs.
+3. **Automatic non-blocking capture**: `.github/workflows/architecture-observe.yml` triggers on relevant PR file changes. It runs no LLM calls, dependencies, database, network API queries or full test suite. It writes summary + JSON/Markdown artifacts. Weekly baseline checks evidence reference availability and scans the F11 import boundary across all existing files. It never creates or edits GitHub issues or merges PRs.
 4. **Confirmed findings register**: [GitHub issue #589](https://github.com/Opr1130/OHM-Trade-Agent-v1/issues/589) is the durable source of truth for triaged defects, architecture misses and missing executable contracts. Engineering conversation stays in [#569](https://github.com/Opr1130/OHM-Trade-Agent-v1/issues/569).
 
 ## Disposition
@@ -37,3 +37,12 @@ Use `--baseline` with no changed paths to inventory references. Review output; d
 - Start with baseline SAST, secrets, SCA, IaC and license findings; leave PR gating, autofix, merge writes, cloud/runtime deployment access and blocking actions disabled.
 - Triage only verified findings into #589, deduplicating existing Bandit, Semgrep, Gitleaks and Codex reports. Measure novel actionable findings, false positives and costs before adopting or replacing tools.
 - Never paste provider secrets or credentials into GitHub issue comments or artifacts.
+
+### Pilot readiness checklist (all owner-gated; nothing here is performed by automation)
+
+- [ ] Owner decides whether to run the pilot at all. Until then Aikido is **not connected** and no workflow assumes it is.
+- [ ] Owner reviews the permissions Aikido requests at install time and confirms they are read-only for source code; if anything beyond read access is requested, stop and record it in #589.
+- [ ] Repository scope limited to `Opr1130/OHM-Trade-Agent-v1`; no cloud, runtime, deployment or container-registry connection.
+- [ ] Autofix, PR comments that block, status checks, and merge actions stay disabled. Do not add any Aikido check to branch protection.
+- [ ] Existing Gitleaks, Bandit and Semgrep keep running unchanged.
+- [ ] Exit criteria, decided before the first scan: count of findings that are novel, verified against source and actionable; count of false positives; duplicate rate against existing tools; cost. Adopt, replace or drop only on a separate owner decision.
