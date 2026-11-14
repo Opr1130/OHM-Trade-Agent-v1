@@ -587,6 +587,27 @@ def _check_trigger(
     return reason
 
 
+def contemplated_order_notional_usd(candidate: dict[str, Any] | None) -> float | None:
+    """The order size the card actually recommends, for the capacity test.
+
+    The action gate may cut the allocation to the visible-book capacity ceiling and records the
+    resulting notional as ``recommended_position_notional``. That is the order the operator is
+    shown, so it is the order the capacity test must judge. ``economic_position_notional`` is the
+    pre-cap size from the economic gate and is used only when no usable recommended size exists,
+    which preserves the previous behaviour for candidates the action gate did not size. An
+    unusable value never becomes a size: the caller then refuses on ``ORDER_SIZE_UNUSABLE``.
+    """
+    if not isinstance(candidate, dict):
+        return None
+    for key in ("recommended_position_notional", "economic_position_notional"):
+        value = candidate.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if math.isfinite(float(value)) and float(value) > 0:
+            return float(value)
+    return None
+
+
 def _check_execution(
     evidence: ActionableEvidence, *, policy: ActionableNotificationPolicy
 ) -> str | None:
@@ -1092,6 +1113,7 @@ __all__ = [
     "POLICY_VERSION",
     "SUPPRESSED",
     "SUPPORTED_VENUES",
+    "contemplated_order_notional_usd",
     "cost_adjusted_reward_to_risk",
     "effective_round_trip_cost_pct",
     "evaluate_actionable_admission",
