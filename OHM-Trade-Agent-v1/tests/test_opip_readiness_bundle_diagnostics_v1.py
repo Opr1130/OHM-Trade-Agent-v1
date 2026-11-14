@@ -26,7 +26,7 @@ STUB = """#!/bin/sh
 case "$1" in
   ps) [ "${STUB_NO_CORE:-0}" = 1 ] && exit 0; echo core123 ;;
   exec) [ "${STUB_EXEC_FAIL:-0}" = 1 ] && exit 1; shift; shift; exec "$@" ;;
-  inspect) [ -n "$STUB_ENV_FILE" ] && cat "$STUB_ENV_FILE" ;;
+  inspect) [ "${STUB_INSPECT_FAIL:-0}" = 1 ] && exit 1; [ -n "$STUB_ENV_FILE" ] && cat "$STUB_ENV_FILE" ;;
   *) exit 1 ;;
 esac
 """
@@ -123,3 +123,13 @@ def test_ac_003_unset_is_distinguished_from_disabled_and_secrets_are_redacted(tm
     assert "OPIP_LEARNING_ENABLED=false" in out
     assert "abc123" not in out and "TOKEN=REDACTED" in out
     assert "UNAVAILABLE: core container not found" in _section(_run(tmp_path, extra={"STUB_NO_CORE": "1"}), "9")
+
+
+@requires_linux
+def test_ac_004_a_failed_inspect_is_unavailable_never_unset_or_off(tmp_path):
+    """ATDD-OPIP-BUNDLE-INSPECT-FAILURE-V1/AC-001: a failed docker inspect reports UNAVAILABLE; success may report UNSET."""
+    failed = _section(_run(tmp_path, env_lines="OPIP_COMMITTEE_MODE=off\n", extra={"STUB_INSPECT_FAIL": "1"}), "9")
+    assert "UNAVAILABLE: docker inspect failed" in failed
+    assert "<UNSET>" not in failed and "OPIP_COMMITTEE_MODE" not in failed
+    ok = _section(_run(tmp_path, env_lines="OPIP_COMMITTEE_MODE=off\n"), "9")
+    assert "OPIP_COMMITTEE_MODE=off" in ok and "OPIP_RELEASE_PROFILE=<UNSET>" in ok and "UNAVAILABLE: docker inspect" not in ok

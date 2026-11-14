@@ -148,16 +148,21 @@ section "9 runtime configuration of the core container (set vs unset; unset is N
 # is off. A value of off/false/0 is the only evidence of a disabled feature here.
 CORE="$(docker ps -q --filter name=ohm-trade-agent 2>/dev/null | head -n 1)"
 if [ -n "$CORE" ]; then
-  ENVDUMP="$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$CORE" 2>/dev/null)"
-  for NAME in OPIP_RELEASE_PROFILE OPIP_COMMITTEE_MODE OPIP_PAPER_V2_MODE OPIP_EARLY_WATCH_ALERTS_ENABLED \
-              OPIP_EARLY_WATCH_MODE OPIP_CANONICAL_WRITER_MODE OPIP_FEATURE_BUS_MODE OPIP_TARGET_SPINE_MODE \
-              OPIP_PRODUCTION_SCORING_VERSION OPIP_UNIFIED_CYCLE_BUDGET_SECONDS OPIP_PHASE_RESOURCE_TELEMETRY; do
-    LINE="$(printf '%s\n' "$ENVDUMP" | grep -E "^${NAME}=" | head -n 1)"
-    if [ -n "$LINE" ]; then echo "$LINE"; else echo "${NAME}=<UNSET> (code default applies; not evidence of OFF)"; fi
-  done
-  echo "-- any other learning/auto/trading-flag variables present --"
-  printf '%s\n' "$ENVDUMP" | grep -E '^(KRAKEN_.*(TRADING|LIVE|ORDER).*|OPIP_.*(LEARNING|AUTO).*)=' \
-    | sed 's/\(KEY\|SECRET\|TOKEN\)=.*/\1=REDACTED/' || true
+  # A failed inspection is an unavailable observation, never an absent variable: only a
+  # successful inspection may report <UNSET>, otherwise every flag would look unset.
+  if ENVDUMP="$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$CORE" 2>/dev/null)"; then
+    for NAME in OPIP_RELEASE_PROFILE OPIP_COMMITTEE_MODE OPIP_PAPER_V2_MODE OPIP_EARLY_WATCH_ALERTS_ENABLED \
+                OPIP_EARLY_WATCH_MODE OPIP_CANONICAL_WRITER_MODE OPIP_FEATURE_BUS_MODE OPIP_TARGET_SPINE_MODE \
+                OPIP_PRODUCTION_SCORING_VERSION OPIP_UNIFIED_CYCLE_BUDGET_SECONDS OPIP_PHASE_RESOURCE_TELEMETRY; do
+      LINE="$(printf '%s\n' "$ENVDUMP" | grep -E "^${NAME}=" | head -n 1)"
+      if [ -n "$LINE" ]; then echo "$LINE"; else echo "${NAME}=<UNSET> (code default applies; not evidence of OFF)"; fi
+    done
+    echo "-- any other learning/auto/trading-flag variables present --"
+    printf '%s\n' "$ENVDUMP" | grep -E '^(KRAKEN_.*(TRADING|LIVE|ORDER).*|OPIP_.*(LEARNING|AUTO).*)=' \
+      | sed 's/\(KEY\|SECRET\|TOKEN\)=.*/\1=REDACTED/' || true
+  else
+    echo "UNAVAILABLE: docker inspect failed; every flag state is UNKNOWN (not UNSET, not OFF)"
+  fi
 else
   echo "UNAVAILABLE: core container not found"
 fi
