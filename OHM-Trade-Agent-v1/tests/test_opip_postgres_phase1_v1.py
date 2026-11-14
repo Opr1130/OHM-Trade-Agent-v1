@@ -267,8 +267,27 @@ def test_ac_004_a_nothing_outside_the_data_platform_imports_the_business_store()
 # =============================================================================================
 # Real-PostgreSQL tests (disposable server only)
 # =============================================================================================
-ADMIN_DSN = os.environ.get("OPIP_TEST_POSTGRES_DSN")
-needs_pg = pytest.mark.skipif(not ADMIN_DSN, reason="set OPIP_TEST_POSTGRES_DSN to a disposable PostgreSQL server")
+def _admin_dsn() -> str | None:
+    """A disposable server: OPIP_TEST_POSTGRES_DSN, else CI's OPIP_TEST_DATABASE_URL (PostgreSQL 17).
+
+    The tests create and drop their own databases, so neither variable may point at a server that
+    holds anything that matters.
+    """
+    explicit = os.environ.get("OPIP_TEST_POSTGRES_DSN")
+    if explicit:
+        return explicit
+    url = os.environ.get("OPIP_TEST_DATABASE_URL")
+    if not url:
+        return None
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+    return make_conninfo(**conninfo_to_dict(url))
+
+
+ADMIN_DSN = _admin_dsn()
+needs_pg = pytest.mark.skipif(
+    not ADMIN_DSN, reason="set OPIP_TEST_POSTGRES_DSN (or OPIP_TEST_DATABASE_URL) to a disposable PostgreSQL server"
+)
 
 
 def _dsn_for(dbname: str) -> str:
@@ -552,3 +571,132 @@ def test_ac_009_a_preflight_reports_readiness_and_detects_checksum_drift(pg):
     with psycopg.connect(pg.dsn) as connection:
         drifted = {item["check"]: item for item in bs.preflight(connection)}
     assert drifted["migrations"]["status"] == "FAIL" and "7" in drifted["migrations"]["detail"]
+
+
+
+BYPASS_ATTEMPTS = [
+    "ALTER TABLE ops.business_event DISABLE TRIGGER USER",
+    "ALTER TABLE signal.ai_call DISABLE TRIGGER USER",
+    "DROP TRIGGER business_write_guard ON ops.business_event",
+    "TRUNCATE ops.business_event",
+    "DELETE FROM ops.business_event",
+    "DELETE FROM signal.ai_call",
+    "UPDATE ops.cutover_authority SET authority = 'FILES', epoch = 1",
+    "INSERT INTO ops.cutover_transition DEFAULT VALUES",
+    "SET session_replication_role = replica",
+    "CREATE FUNCTION ops.evil() RETURNS int LANGUAGE sql AS 'select 1'",
+    "CREATE TABLE ops.shadow (x int)",
+    "SELECT ops.set_cutover_authority('FILES', 99, 'attacker', 'bypass')",
+    "ALTER FUNCTION ops.append_business_event(text,text,text,text,timestamptz,jsonb,text,bigint,bigint) SET search_path = public",
+    "ALTER FUNCTION ops.append_business_event(text,text,text,text,timestamptz,jsonb,text,bigint,bigint) OWNER TO opip_app_writer",
+]
+
+
+def _as_role(pg, role):
+    import psycopg
+
+    connection = psycopg.connect(pg.dsn, autocommit=True)
+    connection.execute(f"SET ROLE {role}")
+    return connection
+
+
+@needs_pg
+def test_ac_006_d_definer_functions_pin_their_search_path_and_are_not_publicly_executable(pg):
+    """ATDD-OPIP-POSTGRES-PHASE1-V1/AC-006: SECURITY DEFINER functions cannot be redirected or called by the wrong role."""
+    rows = pg.sql(
+        "SELECT p.proname, pg_get_userbyid(p.proowner), p.proconfig::text[], p.oid::regprocedure::text"
+        " FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace"
+        " WHERE n.nspname = 'ops' AND p.prosecdef ORDER BY 1",
+        fetch=True,
+    )
+    names = {row[0] for row in rows}
+    assert {"append_business_event", "set_cutover_authority", "business_write_guard", "projection_write_guard"} <= names
+    app_roles = {"opip_app_writer", "opip_shipper", "opip_learning", "opip_dashboard", "opip_cutover_admin"}
+    for name, owner, config, signature in rows:
+        assert owner not in app_roles, f"{name} must not be owned by an application role"
+        assert config is not None and any(item == "search_path=ops, pg_temp" for item in config), (
+            f"{name} must pin search_path with pg_temp last"
+        )
+        assert pg.sql(f"SELECT has_function_privilege('public', '{signature}', 'EXECUTE')", fetch=True) == [(False,)] or (
+            name.endswith("_guard")  # trigger functions cannot be called from SQL at all
+        ), f"{name} must not be executable by PUBLIC"
+    for role in ("opip_app_writer", "opip_shipper", "opip_learning", "opip_dashboard"):
+        assert pg.sql(
+            f"SELECT has_function_privilege('{role}', 'ops.set_cutover_authority(text,bigint,text,text)', 'EXECUTE')",
+            fetch=True,
+        ) == [(False,)], role
+    assert pg.sql(
+        "SELECT has_function_privilege('opip_cutover_admin', 'ops.append_business_event(text,text,text,text,timestamptz,jsonb,text,bigint,bigint)', 'EXECUTE')",
+        fetch=True,
+    ) == [(False,)], "the cutover role changes authority; it does not append business records"
+
+
+@needs_pg
+def test_ac_006_e_direct_sql_cannot_bypass_the_ledger_projection_or_authority(pg):
+    """ATDD-OPIP-POSTGRES-PHASE1-V1/AC-006: a battery of direct SQL attempts by restricted roles all fail and change nothing."""
+    import psycopg
+
+    epoch = pg.flip("POSTGRES", 1)
+    digest = bs.canonical_json({})[1]
+    with _as_role(pg, "opip_app_writer") as writer:
+        writer.execute(
+            "SELECT status FROM ops.append_business_event('base','ai','1','AI_CALL',now(),'{}'::jsonb,%s,%s)", (digest, epoch)
+        )
+    snapshot = lambda: pg.sql(  # noqa: E731
+        "SELECT (SELECT authority || ':' || epoch FROM ops.cutover_authority),"
+        " (SELECT count(*) FROM ops.business_event), (SELECT count(*) FROM ops.cutover_transition),"
+        " (SELECT count(*) FROM signal.ai_call), (SELECT count(*) FROM ops.aggregate_head)",
+        fetch=True,
+    )
+    before = snapshot()
+    attempts = BYPASS_ATTEMPTS
+    for role in ("opip_app_writer", "opip_shipper", "opip_learning", "opip_dashboard"):
+        for statement in attempts:
+            with _as_role(pg, role) as connection:
+                try:
+                    connection.execute(statement)
+                except psycopg.Error as refused:
+                    assert refused.sqlstate in {"42501", "55000", "0LP01", "22023"}, (role, statement, refused.sqlstate)
+                else:
+                    pytest.fail(f"{role} was allowed: {statement}")
+    assert snapshot() == before, "no attempt changed authority, ledger, projections or heads"
+    # SET ROLE is judged against the connecting login, so a test run as a superuser cannot show it
+    # failing; what matters is that no restricted role is a member of a stronger one or is privileged.
+    restricted = ("opip_app_writer", "opip_shipper", "opip_learning", "opip_dashboard", "opip_cutover_admin")
+    for role in restricted:
+        flags = pg.sql(
+            f"SELECT rolsuper, rolcreaterole, rolcreatedb, rolbypassrls, rolreplication, rolcanlogin"
+            f" FROM pg_roles WHERE rolname = '{role}'",
+            fetch=True,
+        )
+        assert flags == [(False,) * 6], f"{role} must be an unprivileged NOLOGIN role"
+        for other in restricted:
+            if other != role:
+                assert pg.sql(f"SELECT pg_has_role('{role}', '{other}', 'MEMBER')", fetch=True) == [(False,)], (role, other)
+    # A temp table cannot shadow the ledger inside the definer function: pg_temp is last on its search_path.
+    with _as_role(pg, "opip_app_writer") as writer:
+        for name in ("business_event", "aggregate_head", "cutover_authority"):
+            writer.execute(f"CREATE TEMP TABLE {name} (LIKE ops.{name} INCLUDING DEFAULTS)")
+        writer.execute("SET search_path = pg_temp, ops, public")
+        assert writer.execute(
+            "SELECT status FROM ops.append_business_event('shadow','ai','2','AI_CALL',now(),'{}'::jsonb,%s,%s)", (digest, epoch)
+        ).fetchone()[0] == "INSERTED"
+        assert writer.execute("SELECT count(*) FROM pg_temp.business_event").fetchone()[0] == 0
+    assert pg.sql("SELECT count(*) FROM ops.business_event WHERE idempotency_key = 'shadow'", fetch=True) == [(1,)]
+
+
+def test_ac_004_b_business_store_has_no_dependency_on_f11_or_trading_modules():
+    """ATDD-OPIP-POSTGRES-PHASE1-V1/AC-004: the store imports nothing that could couple it to F11 or order authority."""
+    import ast
+
+    tree = ast.parse((APP_ROOT / "app/opip/data_platform/business_store.py").read_text(encoding="utf-8"))
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.add(("." * node.level) + (node.module or ""))
+    local = {name for name in imported if name.startswith("app.") or name.startswith(".")}
+    forbidden = ("kraken", "order", "protection", "f11", "exposure", "reconcil", "release_runtime", "trade_action")
+    assert not [name for name in local if any(word in name.lower() for word in forbidden)], local
+    assert all(name.startswith(("app.opip.data_platform", ".")) for name in local), local

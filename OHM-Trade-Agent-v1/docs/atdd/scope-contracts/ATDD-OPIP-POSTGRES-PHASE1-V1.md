@@ -55,7 +55,7 @@ an authority rollback, epoch change or restricted role
 WHEN:
 writers attempt to append or change authority
 THEN:
-stale or rolled-back writers are refused, transitions are audited and compare-and-set, epochs never decrease, the application role can append but cannot change authority or history, the ledger and its aggregate head are writable only through ops.append_business_event, and typed projection rows are refused at the database unless PostgreSQL is the authority and the ledger event belongs to the current epoch
+stale or rolled-back writers are refused, transitions are audited and compare-and-set, epochs never decrease, the application role can append but cannot change authority or history, the ledger and its aggregate head are writable only through ops.append_business_event, and typed projection rows are refused at the database unless PostgreSQL is the authority and the ledger event belongs to the current epoch; every SECURITY DEFINER function pins search_path with pg_temp last, is not owned by an application role and is not publicly executable; a battery of direct SQL attempts by each restricted role (disable triggers, truncate, delete, update authority, change replication role, create objects or functions, alter or re-own the definer function, shadow the ledger with temp tables) fails or has no effect; and no restricted role is privileged or a member of another
 
 AC-007:
 GIVEN:
@@ -102,6 +102,7 @@ AC-003 -> tests/test_opip_postgres_phase1_v1.py::test_ac_003_c_postgres_authorit
 AC-003 -> tests/test_opip_postgres_phase1_v1.py::test_ac_003_d_driver_failures_map_to_unavailable_and_state_errors_are_typed
 AC-003 -> tests/test_opip_postgres_phase1_v1.py::test_ac_003_e_payloads_are_canonical_and_reject_non_finite_values
 AC-004 -> tests/test_opip_postgres_phase1_v1.py::test_ac_004_a_nothing_outside_the_data_platform_imports_the_business_store
+AC-004 -> tests/test_opip_postgres_phase1_v1.py::test_ac_004_b_business_store_has_no_dependency_on_f11_or_trading_modules
 AC-005 -> tests/test_opip_postgres_phase1_v1.py::test_ac_005_a_migrations_apply_once_and_authority_starts_as_files
 AC-005 -> tests/test_opip_postgres_phase1_v1.py::test_ac_005_b_database_refuses_business_writes_while_files_is_authoritative
 AC-005 -> tests/test_opip_postgres_phase1_v1.py::test_ac_005_c_idempotent_ordered_atomic_append
@@ -110,6 +111,8 @@ AC-005 -> tests/test_opip_postgres_phase1_v1.py::test_ac_005_e_concurrent_writer
 AC-006 -> tests/test_opip_postgres_phase1_v1.py::test_ac_006_a_authority_rollback_stops_stale_writers_and_is_audited
 AC-006 -> tests/test_opip_postgres_phase1_v1.py::test_ac_006_b_application_writer_role_is_least_privilege
 AC-006 -> tests/test_opip_postgres_phase1_v1.py::test_ac_006_c_typed_projection_inserts_obey_authority_and_epoch
+AC-006 -> tests/test_opip_postgres_phase1_v1.py::test_ac_006_d_definer_functions_pin_their_search_path_and_are_not_publicly_executable
+AC-006 -> tests/test_opip_postgres_phase1_v1.py::test_ac_006_e_direct_sql_cannot_bypass_the_ledger_projection_or_authority
 AC-007 -> tests/test_opip_postgres_phase1_v1.py::test_ac_007_a_outcomes_never_turn_missing_evidence_into_a_verdict
 AC-008 -> tests/test_opip_postgres_phase1_v1.py::test_ac_008_a_database_outage_fails_closed_quickly_and_writes_nothing
 AC-009 -> tests/test_opip_postgres_phase1_v1.py::test_ac_009_a_preflight_reports_readiness_and_detects_checksum_drift
