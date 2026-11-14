@@ -481,6 +481,7 @@ def _append_router_usage(
     error_message: str | None = None,
     provider_status: str | int | None = None,
     incomplete_reason: str | None = None,
+    max_output_tokens: int | None = None,
 ) -> None:
     record = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -489,6 +490,11 @@ def _append_router_usage(
         "route_tier": route_tier,
         "route_reason": route_reason,
         "reasoning_effort": target.reasoning_effort,
+        # Additive: the output cap in force for this call, so a truncation can
+        # be compared with its budget without reading the environment.
+        "max_output_tokens": (
+            int(max_output_tokens) if max_output_tokens is not None else None
+        ),
         "candidate_count": int(candidate_count),
         "latency_ms": int(latency_ms),
         "status": status,
@@ -676,6 +682,7 @@ def invoke_chief_review(
                 provider_status=failure["provider_status"],
                 incomplete_reason=failure["incomplete_reason"],
                 usage=failure["usage"],
+                max_output_tokens=max_output_tokens,
             )
             continue
 
@@ -701,6 +708,7 @@ def invoke_chief_review(
             latency_ms=latency_ms,
             status="succeeded",
             usage=usage,
+            max_output_tokens=max_output_tokens,
         )
         return RouterResponse(
             output_text=output_text,
