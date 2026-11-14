@@ -65,6 +65,13 @@ docker exec -i "$CONTAINER" pg_restore --list < "$tmp" > /dev/null || {
   echo "dump table of contents is unreadable; backup discarded" >&2
   exit 1
 }
+# The table of contents sits at the front of the archive, so it stays readable when the
+# data blocks behind it are truncated or damaged. Stream the whole archive through
+# pg_restore (SQL to /dev/null, no database or credentials) so every block is decoded.
+docker exec -i "$CONTAINER" pg_restore -f - < "$tmp" > /dev/null || {
+  echo "dump data blocks are unreadable; backup discarded" >&2
+  exit 1
+}
 mv -f -- "$tmp" "$target"
 sha256sum "$target" > "$target.sha256"
 chmod 0600 "$target" "$target.sha256"
