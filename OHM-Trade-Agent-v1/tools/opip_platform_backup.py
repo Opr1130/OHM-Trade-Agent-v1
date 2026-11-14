@@ -27,6 +27,24 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+LINE_LEDGER_SUFFIXES = {".jsonl", ".ndjson"}
+
+
+def line_ledger_tail_complete(path: Path) -> bool:
+    """Whether a line-oriented ledger copy ends on a complete row.
+
+    Append-only ledgers are copied while writers may still be appending, so a
+    copy can end mid-row. The manifest hash is taken over the copy and cannot
+    reveal that, so the tail state is recorded beside it.
+    """
+    size = path.stat().st_size
+    if size == 0:
+        return True
+    with path.open("rb") as handle:
+        handle.seek(size - 1)
+        return handle.read(1) == b"\n"
+
+
 def should_skip(relative: Path) -> bool:
     name = relative.name
     if name == ".env":
@@ -86,14 +104,15 @@ def copy_data_tree(source: Path, stage_data: Path) -> list[dict]:
             shutil.copy2(path, target)
             kind = "file"
 
-        records.append(
-            {
-                "relative_path": relative.as_posix(),
-                "size": target.stat().st_size,
-                "sha256": sha256_file(target),
-                "kind": kind,
-            }
-        )
+        record = {
+            "relative_path": relative.as_posix(),
+            "size": target.stat().st_size,
+            "sha256": sha256_file(target),
+            "kind": kind,
+        }
+        if path.suffix.lower() in LINE_LEDGER_SUFFIXES:
+            record["line_ledger_tail_complete"] = line_ledger_tail_complete(target)
+        records.append(record)
     return records
 
 
