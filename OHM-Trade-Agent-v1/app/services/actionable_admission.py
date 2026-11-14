@@ -303,6 +303,11 @@ class ActionableEvidence:
     market_liquidity_usd: float | None = None
     position_capacity_usd: float | None = None
     order_size_usd: float | None = None
+    #: Evidence-only (never tested by the gate): the size the action gate finally recommended
+    #: after any capacity cap, and whether it capped the allocation. They let the audit record
+    #: show whether ``order_size_usd`` is the same order the card actually recommends.
+    recommended_position_notional_usd: float | None = None
+    capacity_capped: bool | None = None
     spread_bps: float | None = None
     size_slippage_pct: float | None = None
     depth_covered: bool | None = None
@@ -364,6 +369,9 @@ class ActionableAdmission:
     entry_zone_high: float | None = None
     current_price: float | None = None
     entry_trigger_kind: str | None = None
+    #: Offline audit record of the capacity test (order, ceiling, ratio). Evidence only; kept out
+    #: of ``evidence_payload`` so that stored contract is unchanged.
+    capacity: dict[str, Any] | None = None
 
     @property
     def admitted_plan(self) -> bool:
@@ -585,6 +593,53 @@ def _check_trigger(
         return REASON_TOO_EXTENDED
     _, reason = _entry_trigger_kind(evidence, policy)
     return reason
+
+
+def capacity_evidence(
+    evidence: ActionableEvidence, *, policy: ActionableNotificationPolicy
+) -> dict[str, Any]:
+    """Flat, JSON-safe record of the capacity test, for the suppression audit trail.
+
+    Evidence only: it restates the numbers :func:`_check_execution` compared and never feeds a
+    verdict. ``order_basis_matches_recommended`` is ``False`` when the order the gate sized
+    against differs from the size the action gate finally recommended -- the signature of a
+    stale-size input rather than a thin book.
+    """
+
+    def _r(value: float | None) -> float | None:
+        return None if value is None else round(value, 6)
+
+    capacity = _number(evidence.position_capacity_usd)
+    order = _number(evidence.order_size_usd)
+    recommended = _number(evidence.recommended_position_notional_usd)
+    utilization = max(0.0, policy.max_capacity_utilization_pct)
+    allowed = None if capacity is None else capacity * utilization / 100.0
+    ratio = (
+        order / allowed
+        if order is not None and order > 0 and allowed is not None and allowed > 0
+        else None
+    )
+    return {
+        "order_size_usd": _r(order),
+        "recommended_position_notional_usd": _r(recommended),
+        "capacity_capped_by_action_gate": evidence.capacity_capped,
+        "order_basis_matches_recommended": (
+            None
+            if order is None or recommended is None
+            else abs(order - recommended) <= 0.01
+        ),
+        "market_liquidity_usd": _r(_number(evidence.market_liquidity_usd)),
+        "min_market_liquidity_usd": _r(_number(policy.min_market_liquidity_usd)),
+        "weaker_side_depth_usd": _r(_number(evidence.weaker_side_depth_usd)),
+        "depth_band_pct": _r(_number(evidence.depth_band_pct)),
+        "position_capacity_usd": _r(capacity),
+        "max_capacity_utilization_pct": _r(utilization),
+        "allowed_notional_usd": _r(allowed),
+        "order_to_allowed_ratio": _r(ratio),
+        "order_exceeds_allowed": (
+            None if order is None or allowed is None else order > allowed
+        ),
+    }
 
 
 def _check_execution(
@@ -882,6 +937,7 @@ def evaluate_actionable_admission(
         "entry_zone_high": _number(evidence.entry_high),
         "current_price": _number(evidence.current_price),
         "entry_trigger_kind": trigger_kind,
+        "capacity": capacity_evidence(evidence, policy=applied),
     }
     if failures:
         condition, reason = failures[0]
@@ -1038,6 +1094,10 @@ def evidence_from_trade_plan(
                 "position_notional_usd",
             )
         ),
+        recommended_position_notional_usd=_number(
+            _first("recommended_position_notional")
+        ),
+        capacity_capped=_flag("liquidity_capacity_capped"),
         spread_bps=_number(_exec_first("spread_bps")),
         size_slippage_pct=_number(_exec_first("size_slippage_pct")),
         depth_covered=None if depth_covered is None else bool(depth_covered),
@@ -1092,6 +1152,7 @@ __all__ = [
     "POLICY_VERSION",
     "SUPPRESSED",
     "SUPPORTED_VENUES",
+    "capacity_evidence",
     "cost_adjusted_reward_to_risk",
     "effective_round_trip_cost_pct",
     "evaluate_actionable_admission",
