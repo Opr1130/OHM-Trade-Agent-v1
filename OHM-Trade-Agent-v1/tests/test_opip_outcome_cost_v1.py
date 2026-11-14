@@ -59,6 +59,22 @@ def test_ac_001_a_expiry_needs_full_horizon_coverage_and_net_costs_apply():
     assert (short_path.outcome, short_path.reason) == (oa.INSUFFICIENT_EVIDENCE, oa.R_SHORT_PATH)
 
 
+def test_ac_001_c_expiry_requires_observed_coverage_through_the_horizon():
+    """ATDD-OPIP-OUTCOME-COST-V1/AC-001"""
+    quiet = [(i * 600, 101) for i in range(1, 6)]  # last observation at 3000 of 3600
+    stale_tail = measure(sig(), pts(*quiet))
+    assert (stale_tail.outcome, stale_tail.reason, stale_tail.hit) == (
+        oa.INSUFFICIENT_EVIDENCE, oa.R_SHORT_PATH, None)
+    assert oa.to_scorecard_record(sig(), stale_tail) is None
+    covered = measure(sig(), pts(*quiet, (3700, 101)))
+    assert (covered.outcome, covered.hit) == (oa.EXPIRED_NO_HIT, False)
+    assert covered.exit_price is None and covered.net_return_pct is None, "no stale price as an exit"
+    too_late = measure(sig(), pts(*quiet, (4500, 101)))
+    assert too_late.reason == oa.R_SHORT_PATH
+    at_edge = measure(sig(), pts(*quiet, (3600, 101)))
+    assert at_edge.outcome == oa.EXPIRED_NO_HIT and at_edge.exit_price == 101.0
+
+
 def test_ac_001_b_hit_exactly_on_boundary_and_horizon_edge():
     """ATDD-OPIP-OUTCOME-COST-V1/AC-001"""
     assert measure(sig(), pts((10, 110))).outcome == oa.TARGET_HIT
@@ -92,6 +108,19 @@ def test_ac_002_missing_ordering_is_insufficient_evidence_never_a_hit():
     assert measure(sig(), pts((10, 111)), horizon_seconds=None).reason == oa.R_BAD_HORIZON
     assert measure(sig(), [{"ts": "2026-11-14T00:00:00", "price": 111}]).reason == oa.R_BAD_OBSERVATION
     assert measure(sig(), [{"ts": T0 + 5, "price": -1}]).reason == oa.R_BAD_OBSERVATION
+
+
+def test_ac_002_b_equal_timestamps_touching_both_levels_are_ambiguous_in_either_order():
+    """ATDD-OPIP-OUTCOME-COST-V1/AC-002"""
+    up_first = pts((300, 110), (300, 95))
+    down_first = pts((300, 95), (300, 110))
+    for path in (up_first, down_first):
+        got = measure(sig(), path)
+        assert (got.outcome, got.reason, got.hit) == (oa.INSUFFICIENT_EVIDENCE, oa.R_AMBIGUOUS, None)
+    same_side = measure(sig(), pts((300, 110), (300, 112)))
+    assert same_side.outcome == oa.TARGET_HIT
+    distinct = measure(sig(), pts((300, 95), (301, 110)))
+    assert distinct.outcome == oa.STOP_HIT
 
 
 def test_ac_002_a_scorecard_never_receives_an_insufficient_record():

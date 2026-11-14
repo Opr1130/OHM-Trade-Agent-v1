@@ -201,6 +201,25 @@ def _observation_range(raw: Mapping[str, Any]) -> tuple[float, float, float] | N
     return None
 
 
+def _merge_equal_timestamps(
+    ordered: list[tuple[float, float, float]],
+) -> list[tuple[float, float, float]]:
+    """Fold observations sharing a timestamp into one range.
+
+    Nothing says which of two same-instant observations came first, so they are
+    treated like one candle: if their combined range touches both levels the
+    order is unknown and the caller reports it, whatever the input order was.
+    """
+    merged: list[tuple[float, float, float]] = []
+    for when, low, high in ordered:
+        if merged and merged[-1][0] == when:
+            _, prev_low, prev_high = merged[-1]
+            merged[-1] = (when, min(prev_low, low), max(prev_high, high))
+        else:
+            merged.append((when, low, high))
+    return merged
+
+
 def measure_outcome(
     signal: Mapping[str, Any],
     observations: Iterable[Mapping[str, Any]],
@@ -257,6 +276,7 @@ def measure_outcome(
 
     end = start + horizon
     window: list[tuple[float, float, float]] = []
+    first_after_end: float | None = None
     for raw in observations:
         if not isinstance(raw, Mapping):
             return _insufficient(R_BAD_OBSERVATION, **levels)
@@ -265,9 +285,14 @@ def measure_outcome(
             return _insufficient(R_BAD_OBSERVATION, **levels)
         if parsed[0] > start and parsed[0] <= end:
             window.append(parsed)
+        elif parsed[0] > end and (first_after_end is None or parsed[0] < first_after_end):
+            # Not used to decide a hit; it only proves the tail of the horizon
+            # was observed, so a quiet path can be called an expiry.
+            first_after_end = parsed[0]
     if not window:
         return _insufficient(R_NO_PATH, **levels)
     window.sort(key=lambda item: item[0])
+    window = _merge_equal_timestamps(window)
 
     def hit_stop(low: float, high: float) -> bool:
         return low <= stop if direction == LONG else high >= stop
@@ -303,26 +328,17 @@ def measure_outcome(
             return _insufficient(R_GAP, used=index, **levels)
         previous = when
 
-    if end - previous > gap_limit:
+    # Expiry means the whole horizon was observed. The last observation must be
+    # at the horizon, or a later observation must follow it within the gap
+    # tolerance; a stale tail is not evidence that nothing happened.
+    if previous < end and (
+        first_after_end is None or first_after_end - previous > gap_limit
+    ):
         return _insufficient(R_SHORT_PATH, used=len(window), **levels)
 
-    last_price = window[-1][1] if window[-1][1] == window[-1][2] else None
-    if last_price is None:
-        # A candle has no single closing price here; do not invent one.
-        return OutcomeMeasurement(
-            outcome=EXPIRED_NO_HIT,
-            reason=None,
-            direction=direction,
-            entry=entry,
-            stop=stop,
-            target=target,
-            decided_at_epoch=end,
-            exit_price=None,
-            gross_return_pct=None,
-            net_return_pct=None,
-            observations_used=len(window),
-        )
-    gross = _directional_return_pct(direction, entry, last_price)
+    at_horizon = window[-1][0] == end and window[-1][1] == window[-1][2]
+    exit_price = window[-1][1] if at_horizon else None
+    gross = _directional_return_pct(direction, entry, exit_price) if exit_price else None
     return OutcomeMeasurement(
         outcome=EXPIRED_NO_HIT,
         reason=None,
@@ -331,9 +347,9 @@ def measure_outcome(
         stop=stop,
         target=target,
         decided_at_epoch=end,
-        exit_price=last_price,
+        exit_price=exit_price,
         gross_return_pct=gross,
-        net_return_pct=gross - cost_pct,
+        net_return_pct=None if gross is None else gross - cost_pct,
         observations_used=len(window),
     )
 
