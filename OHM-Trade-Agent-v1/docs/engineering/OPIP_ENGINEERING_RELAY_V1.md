@@ -1,6 +1,6 @@
 # O'Pip engineering relay v1 (issue #569) - ADR and runbook
 
-Status: draft PR, not merged. Communication only. No production integration.
+Status: merged (#570); remediated by `ATDD-OPIP-RELAY-REMEDIATION-V1`. Communication only. No production integration.
 
 ## Decision (transport)
 GitHub issue/PR conversation comments carrying a machine-parsable envelope
@@ -49,3 +49,23 @@ with the same latency. No credentials are stored; it uses the ambient `gh` login
 
 ## Out of scope
 New services, secrets, host installs, writes to #291, any execution of comment content.
+
+## Remediation of five confirmed defects (ATDD-OPIP-RELAY-REMEDIATION-V1)
+1. **Duplicate ACK after a crash.** A crash between posting the ACK and recording it locally
+   re-sent the ACK on restart. The pass now also reads the published `<id>-ack` messages
+   from the thread and treats an existing ACK as the answer (remote evidence).
+2. **Single-page read.** Only the first 100 comments were read, so a request later in a long
+   thread was never seen. All pages are read (bounded at 30); a longer thread fails closed
+   (exit 3, no state changed) rather than acting on a partial view.
+3. **Recipient not enforced.** A message for another recipient was answered. Only messages
+   whose `recipient` is one of `--recipients` (default: `--me`) are handled; others are
+   reported `NOT_FOR_US` and left unrecorded for their real recipient.
+4. **Stale head accepted when no head was supplied.** A request naming `head_sha` with no
+   `--head` was processed. A named head must equal the supplied current head; otherwise the
+   request is `STALE`. Pass `--head` when requests name one.
+5. **`-ack` id overflow.** A 93-96 character `message_id` made the derived `<id>-ack` exceed
+   the 96-character limit and crashed the pass. Inbound ids are capped at 92 characters
+   and a reply that still cannot be built is recorded `REJECTED`, never raised.
+
+None of these widens authority; each makes the relay refuse or dedupe more. The relay is
+still not owner authorization and still runs only when something invokes it.

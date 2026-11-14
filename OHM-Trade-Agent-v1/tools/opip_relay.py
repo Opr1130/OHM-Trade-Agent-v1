@@ -39,6 +39,9 @@ MAX_REPLIES_PER_RUN = 3
 REQUIRED = ("message_id", "sender", "recipient", "kind", "authority", "requested_action")
 _FIELD = re.compile(r"^`([a-z_]+):\s*(.*?)`\s*$")
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{5,95}$")
+#: Inbound ids are capped so the derived ``<id>-ack`` (4 more characters) always fits ``_ID``.
+_ID_IN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{5,91}$")
+MAX_PAGES = 30
 _SHA = re.compile(r"^[0-9a-f]{40}$")
 _SECRET = re.compile(
     r"(ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|"
@@ -103,7 +106,7 @@ def parse_comment(comment: dict, *, allowed_actor_ids: frozenset[int]) -> Envelo
         raise Reject("UNKNOWN_KIND")
     if fields["authority"] != AUTHORITY:
         raise Reject("AUTHORITY_NOT_COMMUNICATION_ONLY")
-    if not _ID.match(fields["message_id"]):
+    if not _ID_IN.match(fields["message_id"]):
         raise Reject("BAD_MESSAGE_ID")
     for key in ("head_sha", "base_sha"):
         if key in fields and not _SHA.match(fields[key]):
@@ -171,10 +174,21 @@ class Outcome:
 def process(comments: list[dict], *, allowed_actor_ids: frozenset[int], state: State,
             post: Callable[[str], None], me: str, current_head: str | None,
             runtime_summary: str, max_replies: int = MAX_REPLIES_PER_RUN,
-            now: datetime | None = None) -> list[Outcome]:
-    """One bounded pass. Replies only to fresh, valid, inert REVIEW_REQUESTs."""
+            now: datetime | None = None,
+            recipients: frozenset[str] | None = None) -> list[Outcome]:
+    """One bounded pass. Replies only to fresh, valid, inert REVIEW_REQUESTs addressed to us."""
     results: list[Outcome] = []
     replies = 0
+    mine = recipients or frozenset({me})
+    # Remote evidence of what was already answered: a crash between post() and
+    # state.record() must not produce a second ACK on restart.
+    published: set[str] = set()
+    for comment in comments:
+        try:
+            env = parse_comment(comment, allowed_actor_ids=allowed_actor_ids)
+        except Reject:
+            continue
+        published.add(env.message_id)
     for comment in sorted(comments, key=lambda c: (c.get("created_at", ""), c.get("id", 0))):
         try:
             env = parse_comment(comment, allowed_actor_ids=allowed_actor_ids)
@@ -184,6 +198,9 @@ def process(comments: list[dict], *, allowed_actor_ids: frozenset[int], state: S
         f, mid = env.fields, env.message_id
         if f["sender"] == me:
             continue  # never process our own messages
+        if f["recipient"] not in mine:
+            results.append(Outcome(mid, "NOT_FOR_US", "recipient is not this relay"))
+            continue  # not recorded: the intended recipient must still be able to handle it
         if mid in state.seen:
             results.append(Outcome(mid, "DUPLICATE", state.seen[mid]))
             continue
@@ -192,9 +209,11 @@ def process(comments: list[dict], *, allowed_actor_ids: frozenset[int], state: S
             results.append(Outcome(mid, "NO_REPLY", f["kind"]))
             continue
         head = f.get("head_sha")
-        if head and current_head and head != current_head:
+        if head and head != current_head:
+            # Fail closed: a named head that cannot be verified (no current head given)
+            # is as unusable as one that differs.
             state.record(mid, "STALE")
-            results.append(Outcome(mid, "STALE", "head_sha differs from current head"))
+            results.append(Outcome(mid, "STALE", "head_sha differs from, or cannot be verified against, current head"))
             continue
         if f["requested_action"] not in AUTO_ACTIONS:
             state.record(mid, "NEEDS_ENGINEER")
@@ -203,9 +222,18 @@ def process(comments: list[dict], *, allowed_actor_ids: frozenset[int], state: S
         if replies >= max_replies:
             results.append(Outcome(mid, "NO_REPLY", "reply budget exhausted; retry next pass"))
             continue
-        body = build_envelope(
-            message_id=f"{mid}-ack", sender=me, recipient=f["sender"], kind="ACK", reply_to=mid,
-            requested_action="none", title="ACK", summary=runtime_summary, now=now)
+        if f"{mid}-ack" in published:
+            state.record(mid, "REPLIED")  # answered before a crash lost the local record
+            results.append(Outcome(mid, "DUPLICATE", "ACK already published"))
+            continue
+        try:
+            body = build_envelope(
+                message_id=f"{mid}-ack", sender=me, recipient=f["sender"], kind="ACK", reply_to=mid,
+                requested_action="none", title="ACK", summary=runtime_summary, now=now)
+        except ValueError:
+            state.record(mid, "REJECTED")
+            results.append(Outcome(mid, "REJECTED", "reply envelope could not be built"))
+            continue
         try:
             post(body)
         except Exception as exc:  # missing permission / offline: report, never loop
@@ -225,8 +253,24 @@ def _gh(args: list[str], stdin: str | None = None) -> str:
     return done.stdout
 
 
+def fetch_comments(repo: str, issue: int, gh: Callable[..., str] | None = None,
+                   max_pages: int = MAX_PAGES) -> list[dict]:
+    """Every comment, oldest first, across pages. Raises RuntimeError if the thread is
+    longer than ``max_pages`` pages (fail closed: never act on a partial thread)."""
+    gh = gh or _gh
+    comments: list[dict] = []
+    for page in range(1, max_pages + 1):
+        chunk = json.loads(gh([f"repos/{repo}/issues/{issue}/comments?per_page=100&page={page}"]))
+        if not isinstance(chunk, list):
+            raise ValueError("unexpected response")
+        comments.extend(chunk)
+        if len(chunk) < 100:
+            return comments
+    raise RuntimeError("thread exceeds the page bound")
+
+
 def main(argv: list[str] | None = None) -> int:
-    """``--issue N --owner-id ID --state FILE --me NAME [--repo R] [--head SHA]``: one pass."""
+    """``--issue N --owner-id ID --state FILE --me NAME [--repo R] [--head SHA] [--recipients A,B]``: one pass."""
     args = dict(zip((argv or sys.argv[1:])[::2], (argv or sys.argv[1:])[1::2]))
     try:
         issue, owner_id = int(args["--issue"]), int(args["--owner-id"])
@@ -240,7 +284,7 @@ def main(argv: list[str] | None = None) -> int:
         print("BLOCKED: bad repo")
         return 2
     try:
-        comments = json.loads(_gh([f"repos/{repo}/issues/{issue}/comments?per_page=100"]))
+        comments = fetch_comments(repo, issue)
     except (RuntimeError, ValueError, subprocess.TimeoutExpired):
         print("BLOCKED: GitHub unreachable or permission missing; no state changed")
         return 3
@@ -252,7 +296,8 @@ def main(argv: list[str] | None = None) -> int:
                "Passive polling does not continue when no session or scheduler runs this tool.")
     t0 = time.monotonic()
     out = process(comments, allowed_actor_ids=frozenset({owner_id}), state=state, post=post, me=me,
-                  current_head=args.get("--head"), runtime_summary=summary)
+                  current_head=args.get("--head"), runtime_summary=summary,
+                  recipients=frozenset(r for r in args.get("--recipients", me).split(",") if r))
     for o in out:
         print(f"{o.status} {o.message_id} {o.detail}".strip())
     print(f"pass_latency_ms={int((time.monotonic() - t0) * 1000)}")
