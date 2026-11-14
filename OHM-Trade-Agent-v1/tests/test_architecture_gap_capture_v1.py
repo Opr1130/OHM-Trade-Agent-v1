@@ -7,6 +7,8 @@ import pytest
 
 from tools.architecture_gap_capture import capture, load_catalog, markdown_report, normalized_path
 
+pytestmark = pytest.mark.acceptance
+
 
 def catalog():
     return {
@@ -35,7 +37,7 @@ def setup_repo(tmp_path, source):
 
 
 def test_reports_affected_contract_without_calling_it_a_confirmed_bug(tmp_path):
-    changed, proof = setup_repo(tmp_path, "from app.services.protection import protect\n")
+    """ATDD-V6-ARCH-OBSERVE-v1/AC-001: Changed protected source becomes an unverified contract candidate without being treated as a confirmed defect."""\n    changed, proof = setup_repo(tmp_path, "from app.services.protection import protect\n")
     result = capture(tmp_path, catalog(), [changed])
     assert len(result["findings"]) == 1
     assert result["findings"][0]["type"] == "CONTRACT_REVIEW_CANDIDATE"
@@ -45,7 +47,7 @@ def test_reports_affected_contract_without_calling_it_a_confirmed_bug(tmp_path):
 
 
 def test_catches_direct_forbidden_import_as_candidate_not_proven_failure(tmp_path):
-    changed, _ = setup_repo(
+    """ATDD-V6-ARCH-OBSERVE-v1/AC-002: Direct forbidden F11 to business-store imports produce AST evidence rather than a silent pass."""\n    changed, _ = setup_repo(
         tmp_path,
         "from app.opip.data_platform.business_store import BusinessStore\n"
         "import app.opip.data_platform.db\n",
@@ -59,7 +61,7 @@ def test_catches_direct_forbidden_import_as_candidate_not_proven_failure(tmp_pat
 
 
 def test_baseline_is_inventory_only_and_existing_proof_not_claimed_validated(tmp_path):
-    _, _ = setup_repo(tmp_path, "import math\n")
+    """ATDD-V6-ARCH-OBSERVE-v1/AC-003: Baseline reports existing evidence references without treating their presence as passing proof."""\n    _, _ = setup_repo(tmp_path, "import math\n")
     result = capture(tmp_path, catalog(), [], baseline=True)
     assert result["findings"] == []
     assert result["contract_coverage"][0]["proof_status"] == "EXISTING_REFERENCES_NOT_REVALIDATED"
@@ -67,7 +69,7 @@ def test_baseline_is_inventory_only_and_existing_proof_not_claimed_validated(tmp
 
 
 def test_absent_proof_is_reported_not_auto_created(tmp_path):
-    changed, proof = setup_repo(tmp_path, "import math\n")
+    """ATDD-V6-ARCH-OBSERVE-v1/AC-003: Missing proof references are surfaced, never silently created or called validated."""\n    changed, proof = setup_repo(tmp_path, "import math\n")
     (tmp_path / proof).unlink()
     result = capture(tmp_path, catalog(), [changed])
     assert result["contract_coverage"][0]["proof_status"] == "NO_EVIDENCE_REFERENCES_FOUND"
@@ -75,7 +77,7 @@ def test_absent_proof_is_reported_not_auto_created(tmp_path):
 
 
 def test_changed_proof_and_duplicate_paths_are_deterministic(tmp_path):
-    changed, proof = setup_repo(tmp_path, "import math\n")
+    """ATDD-V6-ARCH-OBSERVE-v1/AC-003: Repeated paths and changed evidence references yield deterministic review evidence."""\n    changed, proof = setup_repo(tmp_path, "import math\n")
     result = capture(tmp_path, catalog(), [changed, changed, proof])
     assert result["changed_paths"] == sorted([changed, proof])
     assert result["contract_coverage"][0]["proof_status"] == "EVIDENCE_CHANGED_REQUIRES_REVIEW"
@@ -84,14 +86,27 @@ def test_changed_proof_and_duplicate_paths_are_deterministic(tmp_path):
 
 @pytest.mark.parametrize("bad", ["../outside", "/etc/passwd", "foo/../bar", "", "x\x00y"])
 def test_rejects_unsafe_changed_paths(bad):
-    with pytest.raises(ValueError):
+    """ATDD-V6-ARCH-OBSERVE-v1/AC-004: Path traversal and unsafe paths are rejected before source inspection."""\n    with pytest.raises(ValueError):
         normalized_path(bad)
 
 
 def test_catalog_rejects_duplicate_ids(tmp_path):
-    invalid = catalog()
+    """ATDD-V6-ARCH-OBSERVE-v1/AC-004: Catalog rejects duplicate contract identifiers."""\n    invalid = catalog()
     invalid["contracts"].append(dict(invalid["contracts"][0]))
     path = tmp_path / "catalog.json"
     path.write_text(json.dumps(invalid), encoding="utf-8")
     with pytest.raises(ValueError, match="duplicate"):
         load_catalog(path)
+
+def test_advisory_workflow_does_not_change_required_gate_or_write_issues():
+    """ATDD-V6-ARCH-OBSERVE-v1/AC-005: Advisory observation collects artifacts without replacing security or safety checks."""
+    root = __import__("pathlib").Path(__file__).resolve().parents[2]
+    observer = (root / ".github/workflows/architecture-observe.yml").read_text(encoding="utf-8")
+    current = (root / ".github/workflows/pytest.yml").read_text(encoding="utf-8")
+    assert "continue-on-error: true" in observer
+    assert "contents: read" in observer
+    assert "upload-artifact@v4" in observer
+    assert "architecture_gap_capture.py" in observer
+    assert "issue_comment:" not in observer and "pull-requests: write" not in observer
+    assert "release architecture gate" in current
+    assert "Run mandatory safety suite" in current
