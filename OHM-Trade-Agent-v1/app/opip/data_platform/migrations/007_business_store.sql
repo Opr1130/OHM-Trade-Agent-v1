@@ -169,7 +169,9 @@ BEGIN
     IF FOUND THEN
         IF existing.payload_sha256 <> p_payload_sha256
            OR existing.aggregate_type <> p_aggregate_type
-           OR existing.aggregate_id <> p_aggregate_id THEN
+           OR existing.aggregate_id <> p_aggregate_id
+           OR existing.event_type <> p_event_type
+           OR existing.occurred_at <> p_occurred_at THEN
             RAISE EXCEPTION 'idempotency conflict for key %', p_idempotency_key USING ERRCODE = 'P0004';
         END IF;
         RETURN QUERY SELECT 'DUPLICATE'::text, existing.aggregate_seq;
@@ -185,7 +187,11 @@ BEGIN
     -- Re-check under the aggregate lock: a concurrent writer may have inserted this key.
     SELECT * INTO existing FROM ops.business_event WHERE idempotency_key = p_idempotency_key;
     IF FOUND THEN
-        IF existing.payload_sha256 <> p_payload_sha256 THEN
+        IF existing.payload_sha256 <> p_payload_sha256
+           OR existing.aggregate_type <> p_aggregate_type
+           OR existing.aggregate_id <> p_aggregate_id
+           OR existing.event_type <> p_event_type
+           OR existing.occurred_at <> p_occurred_at THEN
             RAISE EXCEPTION 'idempotency conflict for key %', p_idempotency_key USING ERRCODE = 'P0004';
         END IF;
         RETURN QUERY SELECT 'DUPLICATE'::text, existing.aggregate_seq;
@@ -286,25 +292,60 @@ CREATE TABLE IF NOT EXISTS learning.signal_outcome (
 
 CREATE INDEX IF NOT EXISTS signal_outcome_signal_idx ON learning.signal_outcome (signal_id);
 
--- A typed row may only be written while PostgreSQL is the authority and its ledger event was
--- recorded under the current epoch. Without this, a role holding INSERT on a typed table could
--- still write after a rollback to FILES, because the foreign key checks neither authority nor epoch.
+-- A typed row may only be written while PostgreSQL is the authority, for a ledger event recorded
+-- under the current epoch, of the matching aggregate and event type, and in the SAME transaction
+-- that appended that event (the ledger row's xmin is this transaction). Without these checks a role
+-- holding INSERT on a typed table could write after a rollback to FILES, attach a typed row to an
+-- unrelated or older ledger event, or commit a projection separately from its ledger append.
 CREATE OR REPLACE FUNCTION ops.projection_write_guard() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = ops, pg_temp AS $$
 DECLARE
     held ops.cutover_authority%ROWTYPE;
-    event_epoch bigint;
+    ledger_epoch bigint;
+    ledger_aggregate_type text;
+    ledger_aggregate_id text;
+    ledger_event_type text;
+    ledger_same_txn boolean;
+    want_aggregate_type text;
+    want_event_type text;
+    want_aggregate_id text;
 BEGIN
     SELECT * INTO held FROM ops.cutover_authority WHERE singleton FOR SHARE;
     IF held.authority IS DISTINCT FROM 'POSTGRES' THEN
         RAISE EXCEPTION 'projection write refused: authority is %, not POSTGRES', held.authority
             USING ERRCODE = 'P0002';
     END IF;
-    SELECT e.authority_epoch INTO event_epoch FROM ops.business_event e
+    SELECT e.authority_epoch, e.aggregate_type, e.aggregate_id, e.event_type,
+           (e.xmin = pg_current_xact_id()::xid)
+      INTO ledger_epoch, ledger_aggregate_type, ledger_aggregate_id, ledger_event_type, ledger_same_txn
+      FROM ops.business_event e
      WHERE e.idempotency_key = NEW.idempotency_key;
-    IF event_epoch IS DISTINCT FROM held.epoch THEN
+    IF ledger_epoch IS DISTINCT FROM held.epoch THEN
         RAISE EXCEPTION 'projection write refused: ledger event epoch % is not current epoch %',
-            event_epoch, held.epoch USING ERRCODE = 'P0003';
+            ledger_epoch, held.epoch USING ERRCODE = 'P0003';
+    END IF;
+
+    IF TG_TABLE_NAME = 'delivery_event' THEN
+        want_aggregate_type := 'alert'; want_event_type := 'TELEGRAM_DELIVERY_EVENT';
+        want_aggregate_id := NEW.alert_id;
+    ELSIF TG_TABLE_NAME = 'ai_call' THEN
+        want_aggregate_type := 'ai_call'; want_event_type := 'AI_CALL_RECORDED';
+    ELSIF TG_TABLE_NAME = 'signal_outcome' THEN
+        want_aggregate_type := 'signal_outcome'; want_event_type := 'SIGNAL_OUTCOME_RECORDED';
+        want_aggregate_id := NEW.signal_id;
+    ELSE
+        RAISE EXCEPTION 'projection write refused: no ledger identity defined for %', TG_TABLE_NAME
+            USING ERRCODE = '23514';
+    END IF;
+    IF ledger_aggregate_type <> want_aggregate_type OR ledger_event_type <> want_event_type
+       OR (want_aggregate_id IS NOT NULL AND ledger_aggregate_id <> want_aggregate_id) THEN
+        RAISE EXCEPTION 'projection write refused: ledger event %/% (%) does not match %',
+            ledger_aggregate_type, ledger_aggregate_id, ledger_event_type, TG_TABLE_NAME
+            USING ERRCODE = '23514';
+    END IF;
+    IF ledger_same_txn IS NOT TRUE THEN
+        RAISE EXCEPTION 'projection write refused: the ledger event was not appended in this transaction'
+            USING ERRCODE = '23514';
     END IF;
     RETURN NEW;
 END $$;

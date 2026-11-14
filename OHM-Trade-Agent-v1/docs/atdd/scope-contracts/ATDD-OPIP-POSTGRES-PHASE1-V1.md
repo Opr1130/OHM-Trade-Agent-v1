@@ -101,6 +101,8 @@ AC-003 -> tests/test_opip_postgres_phase1_v1.py::test_ac_003_b_files_authority_n
 AC-003 -> tests/test_opip_postgres_phase1_v1.py::test_ac_003_c_postgres_authority_fails_closed_unless_proven
 AC-003 -> tests/test_opip_postgres_phase1_v1.py::test_ac_003_d_driver_failures_map_to_unavailable_and_state_errors_are_typed
 AC-003 -> tests/test_opip_postgres_phase1_v1.py::test_ac_003_e_payloads_are_canonical_and_reject_non_finite_values
+AC-003 -> tests/test_opip_postgres_phase1_v1.py::test_ac_003_f_invalid_explicit_authority_refuses_admissions_instead_of_falling_back_to_files
+AC-003 -> tests/test_opip_postgres_phase1_v1.py::test_ac_003_g_unset_or_explicit_files_is_the_legitimate_pre_cutover_state
 AC-004 -> tests/test_opip_postgres_phase1_v1.py::test_ac_004_a_nothing_outside_the_data_platform_imports_the_business_store
 AC-004 -> tests/test_opip_postgres_phase1_v1.py::test_ac_004_b_business_store_has_no_dependency_on_f11_or_trading_modules
 AC-005 -> tests/test_opip_postgres_phase1_v1.py::test_ac_005_a_migrations_apply_once_and_authority_starts_as_files
@@ -108,11 +110,13 @@ AC-005 -> tests/test_opip_postgres_phase1_v1.py::test_ac_005_b_database_refuses_
 AC-005 -> tests/test_opip_postgres_phase1_v1.py::test_ac_005_c_idempotent_ordered_atomic_append
 AC-005 -> tests/test_opip_postgres_phase1_v1.py::test_ac_005_d_a_rejected_projection_rolls_back_the_ledger_event
 AC-005 -> tests/test_opip_postgres_phase1_v1.py::test_ac_005_e_concurrent_writers_keep_the_sequence_gap_free_and_dedupe_replays
+AC-005 -> tests/test_opip_postgres_phase1_v1.py::test_ac_005_f_replay_compares_the_whole_business_fact_not_only_the_payload_hash
 AC-006 -> tests/test_opip_postgres_phase1_v1.py::test_ac_006_a_authority_rollback_stops_stale_writers_and_is_audited
 AC-006 -> tests/test_opip_postgres_phase1_v1.py::test_ac_006_b_application_writer_role_is_least_privilege
 AC-006 -> tests/test_opip_postgres_phase1_v1.py::test_ac_006_c_typed_projection_inserts_obey_authority_and_epoch
 AC-006 -> tests/test_opip_postgres_phase1_v1.py::test_ac_006_d_definer_functions_pin_their_search_path_and_are_not_publicly_executable
 AC-006 -> tests/test_opip_postgres_phase1_v1.py::test_ac_006_e_direct_sql_cannot_bypass_the_ledger_projection_or_authority
+AC-006 -> tests/test_opip_postgres_phase1_v1.py::test_ac_006_f_typed_rows_must_match_their_ledger_event_and_share_its_transaction
 AC-007 -> tests/test_opip_postgres_phase1_v1.py::test_ac_007_a_outcomes_never_turn_missing_evidence_into_a_verdict
 AC-008 -> tests/test_opip_postgres_phase1_v1.py::test_ac_008_a_database_outage_fails_closed_quickly_and_writes_nothing
 AC-009 -> tests/test_opip_postgres_phase1_v1.py::test_ac_009_a_preflight_reports_readiness_and_detects_checksum_drift

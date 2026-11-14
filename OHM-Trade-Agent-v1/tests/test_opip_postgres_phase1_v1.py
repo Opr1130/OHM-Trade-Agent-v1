@@ -121,7 +121,25 @@ def test_ac_003_a_disabled_by_default_and_unknown_values_never_enable_postgres()
     assert bs.BusinessStoreConfig.from_env({}).authority == bs.FILES
     assert bs.BusinessStoreConfig.from_env({"OPIP_BUSINESS_STORE_AUTHORITY": " postgres "}).authority == bs.POSTGRES
     typo = bs.BusinessStoreConfig.from_env({"OPIP_BUSINESS_STORE_AUTHORITY": "postgress"})
-    assert typo.authority == bs.FILES and "treated as FILES" in typo.config_error
+    assert typo.authority == bs.FILES and "new admissions refused" in typo.config_error
+
+
+@pytest.mark.parametrize("raw", ["postgress", "POSTGRESS", "pg", "true", "1", " ", "FILES,POSTGRES"])
+def test_ac_003_f_invalid_explicit_authority_refuses_admissions_instead_of_falling_back_to_files(raw):
+    """ATDD-OPIP-POSTGRES-PHASE1-V1/AC-003: a typo for POSTGRES must not keep the file admission path open."""
+    config = bs.BusinessStoreConfig.from_env({"OPIP_BUSINESS_STORE_AUTHORITY": raw})
+    store = _FakeStore()
+    decision = bs.new_admissions_allowed(config, store)
+    assert (decision.allowed, decision.reason) == (False, "INVALID_AUTHORITY_CONFIG")
+    assert store.calls == 0
+
+
+@pytest.mark.parametrize("env", [{}, {"OPIP_BUSINESS_STORE_AUTHORITY": ""}, {"OPIP_BUSINESS_STORE_AUTHORITY": "files"}])
+def test_ac_003_g_unset_or_explicit_files_is_the_legitimate_pre_cutover_state(env):
+    """ATDD-OPIP-POSTGRES-PHASE1-V1/AC-003: unset, empty and explicit FILES keep admitting without a database."""
+    config = bs.BusinessStoreConfig.from_env(env)
+    assert config.config_error is None
+    assert bs.new_admissions_allowed(config, None) == bs.AdmissionDecision(True, "FILES_AUTHORITATIVE")
 
 
 class _Boom(Exception):
@@ -700,3 +718,86 @@ def test_ac_004_b_business_store_has_no_dependency_on_f11_or_trading_modules():
     forbidden = ("kraken", "order", "protection", "f11", "exposure", "reconcil", "release_runtime", "trade_action")
     assert not [name for name in local if any(word in name.lower() for word in forbidden)], local
     assert all(name.startswith(("app.opip.data_platform", ".")) for name in local), local
+
+
+@needs_pg
+def test_ac_005_f_replay_compares_the_whole_business_fact_not_only_the_payload_hash(pg):
+    """ATDD-OPIP-POSTGRES-PHASE1-V1/AC-005: same key and payload with another event type or time is a conflict."""
+    import psycopg
+
+    epoch = pg.flip("POSTGRES", 1)
+    digest = bs.canonical_json({})[1]
+    when = NOW
+    call = (
+        "SELECT status FROM ops.append_business_event('k1','agg','1',%s,%s,'{}'::jsonb,%s,%s)"
+    )
+    with psycopg.connect(pg.dsn, autocommit=True) as connection:
+        assert connection.execute(call, ("EV", when, digest, epoch)).fetchone()[0] == "INSERTED"
+        assert connection.execute(call, ("EV", when, digest, epoch)).fetchone()[0] == "DUPLICATE"
+        for event_type, moment in (("OTHER", when), ("EV", when + timedelta(seconds=1))):
+            with pytest.raises(psycopg.Error) as conflict:
+                connection.execute(call, (event_type, moment, digest, epoch))
+            assert conflict.value.sqlstate == "P0004"
+        with pytest.raises(psycopg.Error) as other_aggregate:
+            connection.execute(
+                "SELECT status FROM ops.append_business_event('k1','agg','2','EV',%s,'{}'::jsonb,%s,%s)",
+                (when, digest, epoch),
+            )
+        assert other_aggregate.value.sqlstate == "P0004"
+    assert pg.sql("SELECT count(*) FROM ops.business_event", fetch=True) == [(1,)]
+
+
+@needs_pg
+def test_ac_006_f_typed_rows_must_match_their_ledger_event_and_share_its_transaction(pg):
+    """ATDD-OPIP-POSTGRES-PHASE1-V1/AC-006: a restricted role cannot commit a projection separately or for another event."""
+    import psycopg
+
+    epoch = pg.flip("POSTGRES", 1)
+    digest = bs.canonical_json({})[1]
+    append = (
+        "SELECT status FROM ops.append_business_event(%s,%s,%s,%s,now(),'{}'::jsonb,%s,%s)"
+    )
+    insert_ai = (
+        "INSERT INTO signal.ai_call (idempotency_key, observed_at, provider, model, status, total_tokens)"
+        " VALUES (%s, now(), 'p', 'm', 'SUCCESS', 1)"
+    )
+    insert_delivery = (
+        "INSERT INTO signal.delivery_event (idempotency_key, alert_id, alert_family, event_type, status,"
+        " delivered, attempted_at) VALUES (%s, %s, 'F', 'E', 'SENT', true, now())"
+    )
+
+    def writer():
+        connection = psycopg.connect(pg.dsn, autocommit=True)
+        connection.execute("SET ROLE opip_app_writer")
+        return connection
+
+    with writer() as connection:  # valid ledger events committed on their own
+        assert connection.execute(append, ("ok-ai", "ai_call", "c1", "AI_CALL_RECORDED", digest, epoch)).fetchone()
+        assert connection.execute(append, ("wrong-type", "ai_call", "c2", "SOMETHING_ELSE", digest, epoch)).fetchone()
+        assert connection.execute(append, ("alert-1", "alert", "A1", "TELEGRAM_DELIVERY_EVENT", digest, epoch)).fetchone()
+
+    # 1. A standalone projection in a later transaction, even for a matching ledger event, is refused.
+    with writer() as connection:
+        with pytest.raises(psycopg.Error) as separate:
+            connection.execute(insert_ai, ("ok-ai",))
+        assert separate.value.sqlstate == "23514" and "this transaction" in str(separate.value)
+
+    # 2. Same transaction but wrong ledger identity is refused.
+    with writer() as connection:
+        with pytest.raises(psycopg.Error) as wrong:
+            with connection.transaction():
+                connection.execute(insert_ai, ("wrong-type",))
+        assert wrong.value.sqlstate == "23514" and "does not match" in str(wrong.value)
+    with writer() as connection:
+        with pytest.raises(psycopg.Error) as other_alert:
+            with connection.transaction():
+                connection.execute(insert_delivery, ("alert-1", "A-DIFFERENT"))
+        assert other_alert.value.sqlstate == "23514"
+
+    # 3. Append and projection in one transaction is accepted through the same restricted role.
+    with writer() as connection:
+        with connection.transaction():
+            connection.execute(append, ("new-ai", "ai_call", "c3", "AI_CALL_RECORDED", digest, epoch)).fetchone()
+            connection.execute(insert_ai, ("new-ai",))
+    assert pg.sql("SELECT idempotency_key FROM signal.ai_call", fetch=True) == [("new-ai",)]
+    assert pg.sql("SELECT count(*) FROM signal.delivery_event", fetch=True) == [(0,)]

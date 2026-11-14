@@ -81,8 +81,9 @@ class BusinessStoreConfig:
         if raw == POSTGRES:
             authority = POSTGRES
         elif raw != FILES:
-            # An unrecognised value never enables PostgreSQL; it is surfaced instead.
-            error = f"unrecognised OPIP_BUSINESS_STORE_AUTHORITY {raw!r}; treated as FILES"
+            # An unrecognised value never enables PostgreSQL and never silently selects FILES:
+            # ``new_admissions_allowed`` refuses new admissions while this error is present.
+            error = f"unrecognised OPIP_BUSINESS_STORE_AUTHORITY {raw!r}; new admissions refused"
 
         def _int(name: str, default: int) -> int:
             try:
@@ -365,10 +366,14 @@ def new_admissions_allowed(
     """May the pipeline admit a NEW opportunity? Fails closed once PostgreSQL is the authority.
 
     While the configured authority is ``FILES`` this makes no database call and cannot fail.
-    Once it is ``POSTGRES`` an admission requires proof, on every call, that the database is
+    An explicit invalid authority value is refused. Once it is ``POSTGRES`` an admission requires proof, on every call, that the database is
     reachable, reports ``POSTGRES`` and the configured epoch. This gate is for NEW admissions
     only: protective exits, F11 and emergency alerts must never call it.
     """
+    if config.config_error:
+        # An explicit but invalid authority (for example a typo for POSTGRES) must not fall back to
+        # the file path: a misconfigured node would otherwise keep admitting while others have cut over.
+        return AdmissionDecision(False, "INVALID_AUTHORITY_CONFIG")
     if config.authority != POSTGRES:
         return AdmissionDecision(True, "FILES_AUTHORITATIVE")
     if store is None or config.expected_epoch <= 0:
