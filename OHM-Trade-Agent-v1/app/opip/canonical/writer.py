@@ -352,6 +352,30 @@ def _new_event_id() -> str:
 #: and resident memory at startup grew with total history. Pages ride the existing
 #: ``idx_events_type_cursor`` range index, so each step costs one page and the
 #: canonical commit order is unchanged.
+# Additive episode-identity index, created by the writer (not the generic schema,
+# which is pinned free of this event family's vocabulary). It is PARTIAL on the one
+# event type so ``json_extract`` is never evaluated on any other row: an unrelated
+# malformed payload must not be able to fail writer start-up. The type is a trusted
+# module constant inlined as a literal, because SQLite only uses a partial index
+# whose predicate the query states literally. A malformed row of this very type
+# already fails hydration closed, so this adds no new way to refuse to start.
+_EPISODE_IDENTITY_INDEX_NAME = "idx_events_episode_identity"
+_EPISODE_IDENTITY_INDEX_SQL = (
+    f"CREATE INDEX IF NOT EXISTS {_EPISODE_IDENTITY_INDEX_NAME} "
+    "ON events(json_extract(payload_json, '$.episode.episode_id'), "
+    "history_epoch, local_sequence) "
+    "WHERE event_type = "
+    f"'{opportunity_persistence_contract.OPPORTUNITY_LIFECYCLE_TRANSITION_RECORDED}'"
+)
+_EPISODE_ROWS_SQL = (
+    "SELECT event_id, history_epoch, local_sequence, payload_json FROM events "
+    "WHERE event_type = "
+    f"'{opportunity_persistence_contract.OPPORTUNITY_LIFECYCLE_TRANSITION_RECORDED}' "
+    "AND json_extract(payload_json, '$.episode.episode_id') = ? "
+    "AND (history_epoch > ? OR (history_epoch = ? AND local_sequence > ?)) "
+    "ORDER BY history_epoch ASC, local_sequence ASC LIMIT ?"
+)
+
 HYDRATION_PAGE_ROWS = 1000
 
 #: Upper bound on retained current-state projection entries.
@@ -415,6 +439,7 @@ class CanonicalWriter:
         try:
             self._conn = connect(self.db_path, read_only=False)
             initialize_schema(self._conn, now_iso=_utc_now())
+            self._conn.execute(_EPISODE_IDENTITY_INDEX_SQL)
             self._request_lifecycle_projection: dict[str, str] = _BoundedProjection()
             self._request_lifecycle_projection_watermark: tuple[int, int] = (0, -1)
             # Role-result identity is answered from the durable row through
@@ -784,30 +809,43 @@ class CanonicalWriter:
         episode = None
         last: tuple[str, str, int, int] = ("", "", 0, -1)
         count = 0
-        # The generic store carries no F4-specific index by contract (the schema
-        # must stay free of this increment's vocabulary), so this cold path re-reads
-        # the event type through the PAGED iterator and filters by episode identity.
-        # Memory stays bounded by one page; the cost is O(type) and is only paid
-        # when retention has released an episode a caller still asks about.
-        for row in self._iter_event_rows(
-            contract.OPPORTUNITY_LIFECYCLE_TRANSITION_RECORDED,
-            "event_id, history_epoch, local_sequence, payload_json",
-        ):
-            epoch = int(row["history_epoch"])
-            sequence = int(row["local_sequence"])
-            if before is not None and (epoch, sequence) >= before:
+        # The episode's own rows are read through ``idx_events_episode_identity``
+        # (a range seek on the payload's ``episode.episode_id``), paged by the same
+        # exclusive cursor as every other hydration read. The cost is proportional
+        # to that episode's history, never to the event type's: hydration itself
+        # re-derives released episodes, so a type-wide scan here made writer
+        # startup quadratic in history.
+        epoch_cursor, sequence_cursor = 0, -1
+        while True:
+            rows = self._conn.execute(
+                _EPISODE_ROWS_SQL,
+                (episode_id, epoch_cursor, epoch_cursor, sequence_cursor, HYDRATION_PAGE_ROWS),
+            ).fetchall()
+            if not rows:
                 break
-            replayed = json.loads(str(row["payload_json"]))
-            if contract.opportunity_transition_episode_id(replayed) != episode_id:
-                continue
-            episode = contract.apply_opportunity_transition_record(episode, replayed)
-            last = (
-                contract.opportunity_transition_event_id(replayed),
-                str(row["event_id"]),
-                epoch,
-                sequence,
-            )
-            count += 1
+            reached_cursor = False
+            for row in rows:
+                epoch = int(row["history_epoch"])
+                sequence = int(row["local_sequence"])
+                epoch_cursor, sequence_cursor = epoch, sequence
+                if before is not None and (epoch, sequence) >= before:
+                    reached_cursor = True
+                    break
+                replayed = json.loads(str(row["payload_json"]))
+                if contract.opportunity_transition_episode_id(replayed) != episode_id:
+                    continue
+                episode = contract.apply_opportunity_transition_record(
+                    episode, replayed
+                )
+                last = (
+                    contract.opportunity_transition_event_id(replayed),
+                    str(row["event_id"]),
+                    epoch,
+                    sequence,
+                )
+                count += 1
+            if reached_cursor:
+                break
         if episode is not None:
             # Re-cache what was re-derived so the next read is served from memory
             # again; the values are identical to the ones retention released.
@@ -1014,6 +1052,17 @@ class CanonicalWriter:
             except sqlite3.Error as exc:
                 self._conn.rollback()
                 return WriterAck(status="RETRYABLE", error_code="SQLITE_ERROR", detail=str(exc))
+            except BaseException:
+                # A non-Exception interruption (an orderly-shutdown request, a
+                # KeyboardInterrupt) can land between ``BEGIN IMMEDIATE`` and
+                # ``COMMIT``. Left open, the half-written transaction is visible to
+                # this connection's own idempotency lookup - which would then
+                # acknowledge a never-committed event as already recorded - and a
+                # later ``commit()`` would make it durable. Roll back first, then
+                # let the interruption propagate unchanged.
+                with contextlib.suppress(Exception):
+                    self._conn.rollback()
+                raise
 
     def _insert_event_row_in_transaction(
         self,
