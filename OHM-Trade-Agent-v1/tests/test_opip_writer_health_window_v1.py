@@ -39,12 +39,23 @@ def _run(tmp_path: Path, states: list[str], container: bool = True) -> tuple[int
     bin_dir.mkdir()
     (tmp_path / "states").write_text("\n".join(states) + "\n", encoding="utf-8")
     (tmp_path / "count").write_text("0", encoding="utf-8")
+    # Faithful to Docker: `compose ps -q` WITHOUT --all lists only running containers.
     (bin_dir / "docker").write_text(
         f"""#!/usr/bin/env bash
-if [ "$1" = compose ] && [ "$2" = ps ] && [ "$3" = -q ]; then
-  {'echo cid123' if container else 'true'}; exit 0
+if [ "$1" = compose ] && [ "$2" = ps ]; then
+  all=0; quiet=0
+  for a in "$@"; do [ "$a" = --all ] && all=1; [ "$a" = -q ] && quiet=1; done
+  if [ "$quiet" = 1 ]; then
+    {'true' if not container else ''}
+    {'exit 0' if not container else ''}
+    n=$(cat {tmp_path}/count); total=$(wc -l < {tmp_path}/states)
+    line=$((n + 1)); [ "$line" -gt "$total" ] && line="$total"
+    cur=$(sed -n "${{line}}p" {tmp_path}/states | cut -d'|' -f1)
+    if [ "$all" = 1 ] || [ "$cur" = running ] || [ "$cur" = restarting ]; then echo cid123; fi
+    exit 0
+  fi
+  echo "compose ps output"; exit 0
 fi
-if [ "$1" = compose ]; then echo "compose ps output"; exit 0; fi
 if [ "$1" = inspect ]; then
   n=$(cat {tmp_path}/count); total=$(wc -l < {tmp_path}/states)
   line=$((n + 1)); [ "$line" -gt "$total" ] && line="$total"
@@ -153,3 +164,51 @@ def test_ac_003_both_call_sites_still_fail_the_deploy_and_the_state_template_is_
     assert 'echo "production writer health check failed" >&2' in text
     for field in (".State.Status", ".State.Restarting", ".State.OOMKilled", ".RestartCount", ".State.Health.Status"):
         assert field in _function_source()
+
+
+def test_fix_001_the_writer_is_listed_with_all_so_a_stopped_container_is_visible():
+    """ATDD-OPIP-WRITER-HEALTH-FIX-V1/AC-001: plain `compose ps -q` omits stopped containers; the wait must use --all."""
+    source = _function_source()
+    assert "docker compose ps --all -q opip-canonical-writer" in source
+    assert "docker compose ps -q opip-canonical-writer" not in source
+
+
+@requires_bash
+@pytest.mark.parametrize("stopped", ["exited|false|false|0|unhealthy", "dead|false|false|0|none"])
+def test_fix_001_a_stopped_writer_is_reported_at_once_not_after_180_seconds(tmp_path, stopped):
+    """ATDD-OPIP-WRITER-HEALTH-FIX-V1/AC-001: with Docker's real listing semantics a crashed writer is found on the first poll."""
+    rc, err, sleeps = _run(tmp_path, [stopped])
+    assert rc == 1 and sleeps == []
+    assert "failed during start-up" in err
+
+
+@requires_bash
+@pytest.mark.parametrize(
+    "state,needle",
+    [
+        ("restarting|true|false|2|healthy", "restarting=true"),
+        ("running|false|true|0|healthy", "oom_killed=true"),
+        ("exited|false|false|0|healthy", "status=exited"),
+    ],
+)
+def test_fix_002_a_fatal_state_wins_over_a_stale_healthy_reading(tmp_path, state, needle):
+    """ATDD-OPIP-WRITER-HEALTH-FIX-V1/AC-002: 'healthy' is accepted only after the fatal states are ruled out."""
+    rc, err, sleeps = _run(tmp_path, [state])
+    assert rc == 1 and sleeps == []
+    assert needle in err
+
+
+@requires_bash
+def test_fix_002_a_restart_that_looks_healthy_is_still_a_loop(tmp_path):
+    """ATDD-OPIP-WRITER-HEALTH-FIX-V1/AC-002: a rising RestartCount fails even when the latest reading says healthy."""
+    rc, err, sleeps = _run(tmp_path, ["running|false|false|0|starting", "running|false|false|1|healthy"])
+    assert rc == 1 and len(sleeps) == 1
+    assert "restart-looping" in err
+
+
+@requires_bash
+def test_fix_003_the_180_second_bound_and_rollback_contract_are_preserved(tmp_path):
+    """ATDD-OPIP-WRITER-HEALTH-FIX-V1/AC-003: never-healthy still ends at exactly 180 s with a non-zero return that the unchanged callers turn into rollback."""
+    rc, err, sleeps = _run(tmp_path, [UNHEALTHY])
+    assert rc == 1 and sum(sleeps) == 180 and len(sleeps) == 90
+    assert DEPLOY.read_text(encoding="utf-8").count("if ! wait_writer_health; then") == 2
