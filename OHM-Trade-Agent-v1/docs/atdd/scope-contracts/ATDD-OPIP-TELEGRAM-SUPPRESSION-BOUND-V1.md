@@ -49,6 +49,22 @@ the delivery summary is built
 THEN:
 suppressed, by_status, by_family and by_suppression_reason include every collapsed repeat under the verdict it repeated (not the verdict of the row that carries it), nothing is counted twice when pending repeats are later flushed to a row, and collapsed_suppression_repeats reports how many were folded
 
+AC-006:
+GIVEN:
+a malformed, non-object or non-finite Telegram delivery state file
+WHEN:
+the delivery summary is built for any scope
+THEN:
+the summary never moves, quarantines, locks or rewrites the file or creates any file, and reports that the state was not readable
+
+AC-007:
+GIVEN:
+collapsed suppression runs that began before, on or after the requested UTC day
+WHEN:
+a day-scoped summary is built
+THEN:
+only runs that began that day are credited to it, runs that began on an earlier day are reported separately as unattributed to a day and never credited, and the all-time summary counts every run exactly once
+
 EXPLICITLY OUT OF SCOPE:
 - Any change to admission verdicts, delivery, retry scheduling, the outbox, or message content.
 - Truncation or rewriting of the existing ledger; deployment, restarts, runtime configuration, PostgreSQL, F11, Learning, Committee and order authority.
@@ -65,9 +81,13 @@ AC-002 -> tests/test_telegram_suppression_repeat_bound_v1.py::test_ac_002_send_a
 AC-002 -> tests/test_telegram_suppression_repeat_bound_v1.py::test_ac_002_a_a_send_between_suppressions_resets_the_run
 AC-003 -> tests/test_telegram_suppression_repeat_bound_v1.py::test_ac_003_window_expiry_and_clock_skew_write_the_row
 AC-005 -> tests/test_telegram_suppression_repeat_bound_v1.py::test_ac_005_summary_counts_collapsed_repeats_under_the_verdict_they_repeated
+AC-006 -> tests/test_telegram_suppression_repeat_bound_v1.py::test_ac_006_summary_never_moves_or_rewrites_a_malformed_state_file
+AC-007 -> tests/test_telegram_suppression_repeat_bound_v1.py::test_ac_007_a_day_scoped_summary_never_credits_a_run_that_began_yesterday
 
 IMPLEMENTATION MAP:
 AC-005 -> OHM-Trade-Agent-v1/app/services/telegram_delivery.py
+AC-006 -> OHM-Trade-Agent-v1/app/services/telegram_delivery.py
+AC-007 -> OHM-Trade-Agent-v1/app/services/telegram_delivery.py
 AC-001 -> OHM-Trade-Agent-v1/app/services/telegram_delivery.py
 AC-002 -> OHM-Trade-Agent-v1/app/services/telegram_delivery.py
 AC-003 -> OHM-Trade-Agent-v1/app/services/telegram_delivery.py

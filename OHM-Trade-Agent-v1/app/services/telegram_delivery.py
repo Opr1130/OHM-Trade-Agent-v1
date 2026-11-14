@@ -11,7 +11,13 @@ import time
 from typing import Any
 
 from app.services.asset_display_identity import resolve_asset_identity
-from app.services.registry_io import RegistryIOError, load_json, registry_lock, save_json_atomic
+from app.services.registry_io import (
+    RegistryIOError,
+    load_json,
+    read_json_without_quarantine,
+    registry_lock,
+    save_json_atomic,
+)
 from app.services.telegram_notifier import edit_telegram_message, send_telegram_message_with_id
 
 
@@ -201,6 +207,9 @@ def _record(
                     row["suppressed_since_last_row"] = skipped_repeats
                     row["suppressed_since_last_row_status"] = previous.get("last_status")
                     row["suppressed_since_last_row_reason"] = previous.get("last_suppression_reason")
+                    # When the collapsed run began, so a day-scoped summary can tell whether
+                    # the run is wholly inside the day.
+                    row["suppressed_since_last_row_from"] = previous.get("last_event_row_at")
                 _append_event_locked(row, event_file=event_file)
 
             updated = dict(previous)
@@ -574,29 +583,57 @@ def _collapsed_repeats(
     path: Path,
     scope: str,
     today: str,
-) -> list[tuple[str, str, str | None, int]]:
-    """Suppressions the ledger collapsed, as ``(family, status, reason, count)``.
+) -> tuple[list[tuple[str, str, str | None, int]], int, bool]:
+    """Suppressions the ledger collapsed.
+
+    Returns ``(counted, unattributed, state_readable)`` where ``counted`` holds
+    ``(family, status, reason, count)`` entries.
 
     Written rows carry ``suppressed_since_last_row`` with the verdict those
     repeats had. Repeats not yet flushed into a row live in the state file and
     are added here, so a row and the state never count the same repeat twice.
+    The state file is read without quarantine: a summary must never move or
+    rewrite durable state, even when that state is malformed.
+
+    A collapsed run has one start time but no per-repeat times. For
+    ``scope == "today"`` a run is counted only when it began today; a run that
+    began on an earlier UTC day (or has no start time) cannot be split by day, so
+    it is returned in ``unattributed`` instead of being credited to today. A run
+    that began after the requested day is simply outside it.
     """
-    found: list[tuple[str, str, str | None, int]] = []
+
+    def placement(started: Any) -> str:
+        """``count`` (begins today or scope is all), ``earlier`` or ``later`` than the day."""
+        if scope != "today":
+            return "count"
+        day = str(started or "")[:10]
+        if day == today:
+            return "count"
+        # An unknown start cannot be placed in the day, so it is reported as unattributed.
+        return "later" if day and day > today else "earlier"
+
+    counted: list[tuple[str, str, str | None, int]] = []
+    unattributed = 0
     for row in rows:
         count = row.get("suppressed_since_last_row")
-        if isinstance(count, int) and not isinstance(count, bool) and count > 0:
-            found.append(
-                (
-                    str(row.get("alert_family") or "UNKNOWN").upper(),
-                    str(row.get("suppressed_since_last_row_status") or "SUPPRESSED").upper(),
-                    row.get("suppressed_since_last_row_reason"),
-                    count,
-                )
+        if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+            continue
+        where = placement(row.get("suppressed_since_last_row_from"))
+        if where != "count":
+            unattributed += count if where == "earlier" else 0
+            continue
+        counted.append(
+            (
+                str(row.get("alert_family") or "UNKNOWN").upper(),
+                str(row.get("suppressed_since_last_row_status") or "SUPPRESSED").upper(),
+                row.get("suppressed_since_last_row_reason"),
+                count,
             )
+        )
     try:
-        state = load_json(path.parent / STATE_FILE.name)
+        state = read_json_without_quarantine(path.parent / STATE_FILE.name)
     except (OSError, ValueError, TypeError, RegistryIOError):
-        return found
+        return counted, unattributed, False
     alerts = state.get("alerts") if isinstance(state, dict) else None
     for entry in (alerts or {}).values() if isinstance(alerts, dict) else ():
         if not isinstance(entry, dict):
@@ -604,9 +641,11 @@ def _collapsed_repeats(
         pending = entry.get("suppressed_repeat_count")
         if not isinstance(pending, int) or isinstance(pending, bool) or pending <= 0:
             continue
-        if scope == "today" and str(entry.get("updated_at") or "")[:10] != today:
+        where = placement(entry.get("last_event_row_at"))
+        if where != "count":
+            unattributed += pending if where == "earlier" else 0
             continue
-        found.append(
+        counted.append(
             (
                 str(entry.get("alert_family") or "UNKNOWN").upper(),
                 str(entry.get("last_status") or "SUPPRESSED").upper(),
@@ -614,15 +653,18 @@ def _collapsed_repeats(
                 pending,
             )
         )
-    return found
+    return counted, unattributed, True
 
 
-def build_delivery_summary(*, scope: str = "all", path: Path = EVENT_FILE) -> dict[str, Any]:
+def build_delivery_summary(
+    *, scope: str = "all", path: Path = EVENT_FILE, now: datetime | None = None
+) -> dict[str, Any]:
     if scope not in {"all", "today"}:
         raise ValueError("scope must be all or today")
+    clock = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     rows = read_delivery_events(path=path)
     if scope == "today":
-        today = datetime.now(timezone.utc).date()
+        today = clock.date()
         rows = [
             row
             for row in rows
@@ -654,12 +696,10 @@ def build_delivery_summary(*, scope: str = "all", path: Path = EVENT_FILE) -> di
         elif status.endswith("FAILED"):
             failed += 1
     collapsed = 0
-    for family, status, reason, count in _collapsed_repeats(
-        delivery_rows,
-        path=path,
-        scope=scope,
-        today=datetime.now(timezone.utc).date().isoformat(),
-    ):
+    folded, unattributed, state_readable = _collapsed_repeats(
+        delivery_rows, path=path, scope=scope, today=clock.date().isoformat()
+    )
+    for family, status, reason, count in folded:
         collapsed += count
         suppressed += count
         statuses[status] = statuses.get(status, 0) + count
@@ -671,6 +711,10 @@ def build_delivery_summary(*, scope: str = "all", path: Path = EVENT_FILE) -> di
         # Suppressions folded into other rows or still pending in state; already
         # included in suppressed, by_status, by_family and by_suppression_reason.
         "collapsed_suppression_repeats": collapsed,
+        # Collapsed runs that began before today's UTC day and cannot be split by day; reported
+        # here and not credited to today. Always 0 for scope "all".
+        "collapsed_repeats_unattributed_to_day": unattributed,
+        "collapsed_repeats_state_readable": state_readable,
         "lineage_links": lineage_links,
         "delivered": delivered,
         "failed": failed,

@@ -151,3 +151,53 @@ def test_ac_005_summary_counts_collapsed_repeats_under_the_verdict_they_repeated
     flushed = delivery.build_delivery_summary(path=_paths(tmp_path)[1])
     assert flushed["suppressed"] == 17, "flushing must not count a repeat twice"
     assert flushed["by_suppression_reason"] == {REASON: 12, other: 5}
+
+
+def _tree(path):
+    return {p.name: p.read_bytes() for p in path.iterdir()}
+
+
+@pytest.mark.parametrize("damage", [b'{"alerts": {', b"[1, 2]", b'{"alerts": {"a": {"suppressed_repeat_count": NaN}}}'])
+def test_ac_006_summary_never_moves_or_rewrites_a_malformed_state_file(tmp_path, damage):
+    """ATDD-OPIP-TELEGRAM-SUPPRESSION-BOUND-V1/AC-006: a read-only summary leaves malformed state untouched."""
+    for i in range(3):
+        _record(tmp_path, at=T0 + timedelta(minutes=5 * i))
+    state, events = _paths(tmp_path)
+    state.write_bytes(damage)
+    before = _tree(tmp_path)
+    for scope in ("all", "today"):
+        summary = delivery.build_delivery_summary(scope=scope, path=events, now=T0)
+        assert summary["collapsed_repeats_state_readable"] is False
+        assert summary["events"] >= 0
+    assert _tree(tmp_path) == before, "no rename, quarantine copy, lock file or rewrite"
+    assert not list(tmp_path.glob("*corrupt*"))
+    missing = tmp_path / "empty"
+    missing.mkdir()
+    assert delivery.build_delivery_summary(path=missing / "events.jsonl")["collapsed_repeats_state_readable"] is True
+    assert list(missing.iterdir()) == []
+
+
+def test_ac_007_a_day_scoped_summary_never_credits_a_run_that_began_yesterday(tmp_path):
+    """ATDD-OPIP-TELEGRAM-SUPPRESSION-BOUND-V1/AC-007: collapsed runs are attributed by when they began."""
+    day = datetime(2026, 11, 12, tzinfo=timezone.utc)
+    other = "ACTIONABLE_GATE:SPREAD_TOO_WIDE"
+    _record(tmp_path, at=day.replace(hour=23, minute=30))  # run begins on day D
+    for minute in (35, 40, 45):
+        _record(tmp_path, at=day.replace(hour=23, minute=minute))  # three repeats on day D
+    tomorrow = day + timedelta(days=1)
+    _record(tmp_path, reason=other, at=tomorrow.replace(minute=5))  # day D+1 row carries the 3
+    _record(tmp_path, reason=other, at=tomorrow.replace(minute=10))  # a repeat that begins today: pending
+    noon = tomorrow.replace(hour=12)
+    today = delivery.build_delivery_summary(scope="today", path=_paths(tmp_path)[1], now=noon)
+    assert today["events"] == 1
+    assert today["collapsed_repeats_unattributed_to_day"] == 3, "yesterday's run is reported, not credited"
+    assert today["collapsed_suppression_repeats"] == 1 and today["suppressed"] == 2
+    assert today["by_suppression_reason"] == {other: 2}
+    everything = delivery.build_delivery_summary(scope="all", path=_paths(tmp_path)[1], now=noon)
+    assert everything["collapsed_repeats_unattributed_to_day"] == 0
+    assert everything["events"] == 2 and everything["suppressed"] == 6  # 2 rows + 3 carried + 1 pending
+    assert everything["by_suppression_reason"][REASON] == 1 + 3
+    assert everything["by_suppression_reason"][other] == 2
+    yesterday = delivery.build_delivery_summary(scope="today", path=_paths(tmp_path)[1], now=day.replace(hour=23, minute=59))
+    assert yesterday["events"] == 1 and yesterday["by_suppression_reason"] == {REASON: 1}
+    assert yesterday["collapsed_repeats_unattributed_to_day"] == 0
