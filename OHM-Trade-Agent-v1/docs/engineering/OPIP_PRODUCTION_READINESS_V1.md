@@ -52,7 +52,7 @@ following are read from the committed deploy configuration, **not** measured on 
 | Writer container memory | `mem_limit: 128m`, `memswap_limit: 128m` (compose; `ohm-deploy` asserts 134217728) |
 | Writer container CPU | **`cpus: "0.15"`** |
 | Writer health check | `start_period 20s`, `interval 15s`, `timeout 5s`, `retries 3` |
-| Deploy wait | `wait_writer_health`: 30 × 2 s = **60 s** on `main`. The draft `ATDD-OPIP-WRITER-HEALTH-WINDOW-V1` PR makes it a fixed **180 s** (90 × 2 s), failing at once on an exited, restarting, OOM-killed or restart-looping writer; owner-recommended, unmerged |
+| Deploy wait | `wait_writer_health`: 30 × 2 s = **60 s** on `main`. Merged #575 makes it a fixed **180 s** (90 × 2 s), failing at once on an exited, restarting, OOM-killed or restart-looping writer. `ATDD-OPIP-WRITER-HEALTH-FIX-V1` then corrected two defects in it: the listing now uses `compose ps --all -q` (plain `-q` hides a stopped container) and fatal states are evaluated **before** a `healthy` reading is accepted |
 | Start-up order | `CanonicalWriterServer.__init__` builds `CanonicalWriter` (schema, **indexes, hydration**) *before* the socket listens, so the container cannot be healthy until hydration finishes |
 
 **What that implies (estimate, one stated assumption).** Measured on a full core the
