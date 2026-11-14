@@ -1,6 +1,6 @@
 # O'Pip engineering relay v1 (issue #569) - ADR and runbook
 
-Status: draft PR, not merged. Communication only. No production integration.
+Status: merged (#570); remediated by `ATDD-OPIP-RELAY-REMEDIATION-V1`. Communication only. No production integration.
 
 ## Decision (transport)
 GitHub issue/PR conversation comments carrying a machine-parsable envelope
@@ -49,3 +49,33 @@ with the same latency. No credentials are stored; it uses the ambient `gh` login
 
 ## Out of scope
 New services, secrets, host installs, writes to #291, any execution of comment content.
+
+## Remediation of five confirmed defects (ATDD-OPIP-RELAY-REMEDIATION-V1)
+1. **Duplicate ACK after a crash.** A crash between posting the ACK and recording it locally
+   re-sent the ACK on restart. The pass now also reads the published `<id>-ack` messages
+   from the thread and treats an existing ACK as the answer (remote evidence).
+2. **Single-page read.** Only the first 100 comments were read, so a request later in a long
+   thread was never seen. All pages are read (bounded at 30); a longer thread fails closed
+   (exit 3, no state changed) rather than acting on a partial view.
+3. **Recipient not enforced.** A message for another recipient was answered. Only messages
+   whose `recipient` is one of `--recipients` (default: `--me`) are handled; others are
+   reported `NOT_FOR_US` and left unrecorded for their real recipient.
+4. **Stale head accepted when no head was supplied.** A request naming `head_sha` with no
+   `--head` was processed. A named head must equal the supplied current head; otherwise the
+   request is `STALE`. Pass `--head` when requests name one.
+5. **`-ack` id overflow.** A 93-96 character `message_id` made the derived `<id>-ack` exceed
+   the 96-character limit and crashed the pass. Inbound ids are capped at 92 characters
+   and a reply that still cannot be built is recorded `REJECTED`, never raised.
+
+None of these widens authority; each makes the relay refuse or dedupe more. The relay is
+still not owner authorization and still runs only when something invokes it.
+
+### Follow-up: two Codex P2 findings on #577 (ATDD-OPIP-RELAY-ACK-FOLLOWUP-V1)
+- **Full-length ACK ids.** The 92-character cap applies only to reply-triggering requests
+  (so `<id>-ack` fits). A generated ACK id (93-96 characters) now parses when read back, so
+  the published-reply scan finds it and a restart cannot duplicate it.
+- **Verified ACK metadata.** Only an `ACK` from this relay, addressed to the requester and
+  with `reply_to` equal to the request, counts as having answered it. A comment that merely
+  carries the `<id>-ack` message id (any other kind, sender, recipient or `reply_to`) no
+  longer suppresses the real acknowledgement.
+The relay is still not activated and still runs only when something invokes it.
