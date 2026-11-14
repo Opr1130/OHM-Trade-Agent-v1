@@ -62,6 +62,52 @@ def test_catches_direct_forbidden_import_as_candidate_not_proven_failure(tmp_pat
     assert all(f["line"] in {1, 2} for f in violations)
 
 
+@pytest.mark.parametrize("source,expected", [
+    ("from app.opip import data_platform\n", "app.opip.data_platform"),
+    ("from app.opip import data_platform as dp\n", "app.opip.data_platform"),
+    ("from app.opip.data_platform import business_store\n", "app.opip.data_platform"),
+    ("from app.opip import (\n    other,\n    data_platform,\n)\n", "app.opip.data_platform"),
+])
+def test_from_import_of_forbidden_submodule_is_not_missed(tmp_path, source, expected):
+    """ATDD-V6-ARCH-OBSERVE-v1/AC-002: `from package import forbidden_submodule` is a candidate, one finding per statement."""
+    changed, _ = setup_repo(tmp_path, source)
+    hits = [f for f in capture(tmp_path, catalog(), [changed])["findings"]
+            if f["type"] == "STATIC_IMPORT_BOUNDARY_CANDIDATE"]
+    assert [h["import"] for h in hits] == [expected]
+
+
+def test_unrelated_from_import_is_not_a_candidate(tmp_path):
+    """ATDD-V6-ARCH-OBSERVE-v1/AC-002: Sibling packages and prefix look-alikes are not flagged."""
+    changed, _ = setup_repo(
+        tmp_path,
+        "from app.opip import analytics\nfrom app.opip.data_platform_extras import x\nfrom . import data_platform\n",
+    )
+    hits = [f for f in capture(tmp_path, catalog(), [changed])["findings"]
+            if f["type"] == "STATIC_IMPORT_BOUNDARY_CANDIDATE"]
+    assert hits == []
+
+
+def test_baseline_scans_existing_files_for_forbidden_imports(tmp_path):
+    """ATDD-V6-ARCH-OBSERVE-v1/AC-003: The weekly baseline inspects the import boundary of unchanged files instead of reporting a false all-clear."""
+    _, _ = setup_repo(tmp_path, "from app.opip import data_platform\n")
+    result = capture(tmp_path, catalog(), [], baseline=True)
+    hits = [f for f in result["findings"] if f["type"] == "STATIC_IMPORT_BOUNDARY_CANDIDATE"]
+    assert [(h["import"], h["status"]) for h in hits] == [("app.opip.data_platform", "UNVERIFIED")]
+    assert result["confirmed_defects"] == 0
+    assert "No candidates identified" not in markdown_report(result)
+
+
+def test_symlinked_source_is_not_followed(tmp_path):
+    """ATDD-V6-ARCH-OBSERVE-v1/AC-004: A symlinked changed path is not read by the observer."""
+    changed, _ = setup_repo(tmp_path, "import math\n")
+    outside = tmp_path / "outside.py"
+    outside.write_text("import app.opip.data_platform\n", encoding="utf-8")
+    link = tmp_path / "OHM-Trade-Agent-v1/app/services/f11_link.py"
+    link.symlink_to(outside)
+    result = capture(tmp_path, catalog(), [link.relative_to(tmp_path).as_posix()])
+    assert [f for f in result["findings"] if f["type"] == "STATIC_IMPORT_BOUNDARY_CANDIDATE"] == []
+
+
 def test_baseline_is_inventory_only_and_existing_proof_not_claimed_validated(tmp_path):
     """ATDD-V6-ARCH-OBSERVE-v1/AC-003: Baseline reports existing evidence references without treating their presence as passing proof."""
     _, _ = setup_repo(tmp_path, "import math\n")

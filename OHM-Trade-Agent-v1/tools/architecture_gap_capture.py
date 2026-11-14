@@ -57,6 +57,8 @@ def _matches(path: str, patterns: list[str]) -> bool:
 
 
 def _import_violations(path: Path, *, forbidden: list[str]) -> list[dict[str, Any]]:
+    if path.is_symlink():
+        return []
     try:
         source = path.read_text(encoding="utf-8")
         parsed = ast.parse(source, filename=str(path))
@@ -70,10 +72,14 @@ def _import_violations(path: Path, *, forbidden: list[str]) -> list[dict[str, An
         if isinstance(node, ast.Import):
             modules = [alias.name for alias in node.names]
         elif isinstance(node, ast.ImportFrom) and node.level == 0:
-            modules = [node.module or ""]
+            base = node.module or ""
+            # `from app.opip import data_platform` imports the submodule named by the alias.
+            modules = [base] + [f"{base}.{a.name}" for a in node.names if a.name != "*"]
         for name in modules:
             if any(name == prefix or name.startswith(prefix + ".") for prefix in forbidden):
+                # One finding per import statement: the first (least specific) matching name.
                 findings.append({"line": node.lineno, "import": name})
+                break
     return findings
 
 
@@ -119,7 +125,14 @@ def capture(
         boundary = contract.get("import_boundary") or {}
         patterns = boundary.get("paths") or []
         forbidden = boundary.get("forbidden_modules") or []
-        for rel in affected:
+        scan = affected
+        if baseline and patterns:
+            scan = sorted(
+                item.relative_to(repo_root).as_posix()
+                for item in repo_root.rglob("*.py")
+                if ".git" not in item.parts and item.is_file()
+            )
+        for rel in scan:
             if not rel.endswith(".py") or not _matches(rel, patterns):
                 continue
             for hit in _import_violations(repo_root / rel, forbidden=forbidden):
@@ -155,7 +168,7 @@ def markdown_report(result: dict[str, Any]) -> str:
         "Candidate records are **not** verified bugs or merge/deployment decisions.",
         "Issue #589 is the canonical triaged gap register.",
         "",
-        "| Contract | Evidence references | Changed proof |",
+        "| Contract | Evidence proof status | Evidence files changed |",
         "|---|---|---|",
     ]
     for item in result["contract_coverage"]:
@@ -173,7 +186,11 @@ def markdown_report(result: dict[str, Any]) -> str:
             f"{finding.get('review_question') or finding.get('note')}"
         )
     if not result["findings"]:
-        lines.append("- No changed high-risk seams identified by this lightweight catalog.")
+        lines.append(
+            "- No candidates identified by this lightweight catalog."
+            if result["baseline"] else
+            "- No changed high-risk seams identified by this lightweight catalog."
+        )
     lines.extend(["", "No CI gate changes or automated issue creation occurred.", ""])
     return "\n".join(lines)
 

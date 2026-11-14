@@ -67,6 +67,10 @@ FROZEN BOUNDARIES:
 ACCEPTANCE TEST TRACEABILITY:
 AC-001 -> tests/test_architecture_gap_capture_v1.py::test_reports_affected_contract_without_calling_it_a_confirmed_bug
 AC-002 -> tests/test_architecture_gap_capture_v1.py::test_catches_direct_forbidden_import_as_candidate_not_proven_failure
+AC-002 -> tests/test_architecture_gap_capture_v1.py::test_from_import_of_forbidden_submodule_is_not_missed
+AC-002 -> tests/test_architecture_gap_capture_v1.py::test_unrelated_from_import_is_not_a_candidate
+AC-003 -> tests/test_architecture_gap_capture_v1.py::test_baseline_scans_existing_files_for_forbidden_imports
+AC-004 -> tests/test_architecture_gap_capture_v1.py::test_symlinked_source_is_not_followed
 AC-003 -> tests/test_architecture_gap_capture_v1.py::test_baseline_is_inventory_only_and_existing_proof_not_claimed_validated
 AC-003 -> tests/test_architecture_gap_capture_v1.py::test_absent_proof_is_reported_not_auto_created
 AC-003 -> tests/test_architecture_gap_capture_v1.py::test_changed_proof_and_duplicate_paths_are_deterministic
