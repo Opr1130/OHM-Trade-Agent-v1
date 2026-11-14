@@ -23,6 +23,10 @@ MAX_SUMMARY_EVENTS = 20_000
 #: alert) is re-written to the event ledger at most once per window; the repeats in between are
 #: counted on the next row instead. Send attempts and failures are never collapsed.
 SUPPRESSION_REPEAT_WINDOW_SECONDS = 3_600
+#: Only these alert families are bounded. Other families (for example SYSTEM_HEALTH incidents)
+#: have their own occurrence accounting and an explicit contract that every occurrence stays an
+#: auditable ledger row, so they keep writing one row per call.
+BOUNDED_SUPPRESSION_FAMILIES = frozenset({"QUALIFIED_OPPORTUNITY"})
 
 
 @dataclass(frozen=True)
@@ -157,6 +161,7 @@ def _record(
             last_row_at = _parse_iso(previous.get("last_event_row_at"))
             repeat_of_unchanged_verdict = bool(
                 not is_attempt
+                and family in BOUNDED_SUPPRESSION_FAMILIES
                 and previous.get("last_status") == normalized_status
                 and previous.get("last_suppression_reason") == reason_text
                 and last_row_at is not None

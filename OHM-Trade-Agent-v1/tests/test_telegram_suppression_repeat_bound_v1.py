@@ -19,11 +19,12 @@ def _paths(tmp_path):
     return tmp_path / "state.json", tmp_path / "events.jsonl"
 
 
-def _record(tmp_path, *, status="SUPPRESSED", reason=REASON, fingerprint="fp", at=T0, failure=None):
+def _record(tmp_path, *, status="SUPPRESSED", reason=REASON, fingerprint="fp", at=T0, failure=None,
+            family="QUALIFIED_OPPORTUNITY"):
     state, events = _paths(tmp_path)
     return delivery._record(  # noqa: SLF001 - clock-controlled access to the ledger writer
-        identity="QUALIFIED_OPPORTUNITY:T1",
-        alert_family="QUALIFIED_OPPORTUNITY",
+        identity=f"{family}:T1",
+        alert_family=family,
         event_type="NEW_TRADE",
         fingerprint=fingerprint,
         status=status,
@@ -113,3 +114,12 @@ def test_ac_003_window_expiry_and_clock_skew_write_the_row(tmp_path, monkeypatch
     _record(tmp_path, at=T0 + timedelta(hours=9, seconds=1))
     _record(tmp_path, at=T0 + timedelta(hours=9, seconds=2))
     assert len(_rows(tmp_path)) == 5  # a zero window disables the bound entirely
+
+
+def test_ac_004_other_alert_families_keep_one_row_per_occurrence(tmp_path):
+    """ATDD-OPIP-TELEGRAM-SUPPRESSION-BOUND-V1/AC-004: incident alerts keep their auditable per-occurrence rows."""
+    for i in range(5):
+        _record(tmp_path, family="SYSTEM_HEALTH", reason="INCIDENT_ALREADY_NOTIFIED", at=T0 + timedelta(seconds=i))
+    rows = _rows(tmp_path)
+    assert len(rows) == 5 and all("suppressed_since_last_row" not in row for row in rows)
+    assert delivery.BOUNDED_SUPPRESSION_FAMILIES == frozenset({"QUALIFIED_OPPORTUNITY"})
