@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from decimal import ROUND_DOWN, Decimal
 import math
 from typing import Any
 
@@ -75,6 +76,11 @@ def _reject(
     candidate["portfolio_risk_allowed"] = False
     candidate["portfolio_risk_reason"] = reason
     return ActionGateDecision(False, reason, None, rejection_class, reason_code)
+
+
+def _floor_cents(value: float) -> float:
+    """Round toward zero to whole cents, so a capped size can never exceed its ceiling."""
+    return float(Decimal(repr(float(value))).quantize(Decimal("0.01"), rounding=ROUND_DOWN))
 
 
 def apply_action_gate(
@@ -171,7 +177,7 @@ def apply_action_gate(
             intelligence.allocation.recommended_capital
         )
         if original_capital > max_capital_by_capacity:
-            capped_capital = max(0.0, max_capital_by_capacity)
+            capped_capital = _floor_cents(max(0.0, max_capital_by_capacity))
             ratio = (
                 capped_capital / original_capital
                 if original_capital > 0
@@ -179,7 +185,7 @@ def apply_action_gate(
             )
             capped_allocation = replace(
                 intelligence.allocation,
-                recommended_capital=round(capped_capital, 2),
+                recommended_capital=capped_capital,
                 risk_dollars=round(
                     intelligence.allocation.risk_dollars * ratio,
                     2,
@@ -255,7 +261,9 @@ def apply_action_gate(
         if math.isfinite(leverage) and leverage > 0
         else 0.0
     )
-    candidate["recommended_position_notional"] = round(final_notional, 2)
+    # Cent rounding toward zero: a notional rounded half-up could exceed the very ceiling it
+    # was just capped to and be refused downstream for a fraction of a cent.
+    candidate["recommended_position_notional"] = _floor_cents(final_notional)
     # Executable-notional and post-cap profit checks are independent rules; each
     # is evaluated in its own right so one rejection never hides another.
     if (

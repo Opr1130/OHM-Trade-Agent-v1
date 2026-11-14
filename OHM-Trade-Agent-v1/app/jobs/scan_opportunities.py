@@ -66,6 +66,7 @@ from app.services.economic_quality_gate import (
 )
 from app.services.actionable_admission import (
     ActionableNotificationPolicy,
+    contemplated_order_notional_usd,
     execution_evidence_from_snapshot,
 )
 from app.services.entry_exit_advisor import build_entry_exit_plan
@@ -2411,7 +2412,7 @@ def main(scan_override=None):
         execution_evidence = execution_evidence_from_snapshot(
             opportunity.snapshot,
             direction=alert_direction,
-            order_notional_usd=alert.get("economic_position_notional"),
+            order_notional_usd=contemplated_order_notional_usd(alert),
         )
         # Authoritative venue and instrument identity from the exchange that produced the book.
         execution_evidence["venue"] = VENUE_ID
@@ -2485,7 +2486,7 @@ def main(scan_override=None):
                     depth_evidence_complete=execution_evidence.get(
                         "depth_evidence_complete"
                     ),
-                    order_notional_usd=alert.get("economic_position_notional"),
+                    order_notional_usd=contemplated_order_notional_usd(alert),
                     spread_bps=execution_evidence.get("spread_bps"),
                     size_slippage_pct=execution_evidence.get("size_slippage_pct"),
                     economics_available=alert.get("economic_qualified"),

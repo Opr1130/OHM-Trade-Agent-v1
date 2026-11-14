@@ -587,6 +587,32 @@ def _check_trigger(
     return reason
 
 
+def contemplated_order_notional_usd(candidate: dict[str, Any] | None) -> float | None:
+    """The order size the card actually recommends, for the capacity test.
+
+    The action gate may cut the allocation to the visible-book capacity ceiling and records the
+    resulting notional as ``recommended_position_notional``. That is the order the operator is
+    shown, so it is the order the capacity test must judge. When that field is PRESENT it is the
+    only basis: a value that is not a positive finite number is an inconsistent payload and yields
+    ``None`` (the caller refuses on ``ORDER_SIZE_UNUSABLE``) -- it never falls back to the larger
+    pre-cap size. ``economic_position_notional`` is used only when the action gate recorded no
+    recommended size at all (field absent or ``None``), which preserves the previous behaviour for
+    candidates it did not size.
+    """
+    if not isinstance(candidate, dict):
+        return None
+
+    def _positive(value: Any) -> float | None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value) if math.isfinite(float(value)) and float(value) > 0 else None
+
+    recommended = candidate.get("recommended_position_notional")
+    if recommended is not None:
+        return _positive(recommended)
+    return _positive(candidate.get("economic_position_notional"))
+
+
 def _check_execution(
     evidence: ActionableEvidence, *, policy: ActionableNotificationPolicy
 ) -> str | None:
@@ -969,6 +995,16 @@ def evidence_from_trade_plan(
                 return value
         return None
 
+    def _order_size_basis() -> Any:
+        # One basis for the capacity test. A producer that states ``order_size_usd`` (the scan always
+        # does, from contemplated_order_notional_usd) has decided the order size: ``None`` there means
+        # "unusable" and must refuse, not fall through to the larger pre-cap economic size. Only
+        # callers that supply no such key use the shared candidate rule.
+        if "order_size_usd" in execution_map:
+            return execution_map["order_size_usd"]
+        explicit = _first("order_size_usd", "position_notional_usd")
+        return explicit if explicit is not None else contemplated_order_notional_usd(mapping)
+
     def _exec_first(*names: str) -> Any:
         for name in names:
             value = execution_map.get(name)
@@ -1031,13 +1067,7 @@ def evidence_from_trade_plan(
         position_capacity_usd=_number(
             _exec_first("position_capacity_usd", "liquidity_capacity_ceiling_usd")
         ),
-        order_size_usd=_number(
-            _exec_first(
-                "order_size_usd",
-                "economic_position_notional",
-                "position_notional_usd",
-            )
-        ),
+        order_size_usd=_number(_order_size_basis()),
         spread_bps=_number(_exec_first("spread_bps")),
         size_slippage_pct=_number(_exec_first("size_slippage_pct")),
         depth_covered=None if depth_covered is None else bool(depth_covered),
@@ -1092,6 +1122,7 @@ __all__ = [
     "POLICY_VERSION",
     "SUPPRESSED",
     "SUPPORTED_VENUES",
+    "contemplated_order_notional_usd",
     "cost_adjusted_reward_to_risk",
     "effective_round_trip_cost_pct",
     "evaluate_actionable_admission",
