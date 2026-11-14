@@ -47,6 +47,7 @@ from app.services.canonical_episode_capture import (
     canonical_episode_id,
 )
 from app.services.chief_alert_notifier import _alert_state_key, send_trade_plan
+from app.opip.data_platform.admission_gate import business_store_refusal_reason
 from app.services.notification_policy import (
     authorize_new_trade_notification,
     select_new_trade_window,
@@ -2350,6 +2351,10 @@ def main(scan_override=None):
         protection_sweep is not None and protection_sweep.new_admissions_allowed
     )
 
+    # ARCH-007: NEW admissions also require the business-store authority (inert while FILES).
+    # Evaluated after the protection sweep, once per scan; protective paths never consult it.
+    business_store_reason = business_store_refusal_reason()
+
     notification_window = []
     for ranked in ranked_opportunities:
         alert = ranked.opportunity.alert
@@ -2400,6 +2405,7 @@ def main(scan_override=None):
             quality_reason=quality_blocked.get(id(ranked)),
             delivery_attempts=delivery_attempts,
             max_per_window=delivery_cap,
+            business_store_reason=business_store_reason,
         )
         # OPIP-ALERT-ACTIONABLE-ONLY-001: hand the actionable admission gate the execution facts
         # this scan already validated, plus the scan's own evidence timestamp and the venue that
