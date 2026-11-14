@@ -1,5 +1,34 @@
 # O'Pip — resource-remediation release-readiness report
 
+## Current status (2026-11-13) — merged, NOT deployed
+
+| PR | Merged SHA (squash on `main`) | Gate status |
+| --- | --- | --- |
+| [#515](https://github.com/Opr1130/OHM-Trade-Agent-v1/pull/515) | `8425018d3ca137a36cfe993a23fc28c503df102a` | Interruption safety **proven** (real SIGKILL/SIGTERM); production liveness still unverified |
+| [#516](https://github.com/Opr1130/OHM-Trade-Agent-v1/pull/516) | `0139cd338f5d1e6c472021e4f3d895a7d7545e81` | **Defective as merged** (quadratic writer startup); fixed in the release-gates PR — see below |
+| [#517](https://github.com/Opr1130/OHM-Trade-Agent-v1/pull/517) | `2789d421bcb487a58b925db9a83ed09092a55559` | Default behaviour **verified unchanged**; phase telemetry is unwired |
+
+`main` was at `2789d421` when the gates were run. **Merging is not deployment
+approval and nothing has been deployed, activated or enabled.** The release-gate
+evidence, the measurements and the defect fix are in
+[`OPIP_RELEASE_GATES_EVIDENCE_V1.md`](OPIP_RELEASE_GATES_EVIDENCE_V1.md).
+
+Outstanding production validations (cannot be performed from the engineering
+workstation; the production store and host were not reachable):
+
+1. Production canonical row counts per event type, then the probe
+   (`tools/opip_canonical_scale_probe.py`) against a **copy** of the production store.
+2. §5 read-only host diagnosis (container-side bound installed, no orphan, cycle
+   duration distribution against the 2700 s budget).
+3. Owner decision on the 2700 s cycle budget skipping advisory phases (reported
+   `DEGRADED`, never `SUCCESS`).
+4. Phase telemetry is **not wired into any runtime path**: setting
+   `OPIP_PHASE_RESOURCE_TELEMETRY` today measures nothing. Wiring it is a separate
+   runtime change that needs its own approval.
+
+The sections below are the original report, written before merge; where they say
+"nothing was merged" they are historical.
+
 Consolidated report for the resource-remediation mission. **Nothing was merged,
 deployed or activated.** This is the final release authorization gate.
 
