@@ -159,7 +159,7 @@ CREATE OR REPLACE FUNCTION ops.append_business_event(
     p_authority_epoch bigint,
     p_expected_prev_seq bigint DEFAULT NULL
 ) RETURNS TABLE (status text, aggregate_seq bigint)
-LANGUAGE plpgsql AS $$
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = ops, pg_temp AS $$
 DECLARE
     existing ops.business_event%ROWTYPE;
     head_seq bigint;
@@ -286,13 +286,51 @@ CREATE TABLE IF NOT EXISTS learning.signal_outcome (
 
 CREATE INDEX IF NOT EXISTS signal_outcome_signal_idx ON learning.signal_outcome (signal_id);
 
+-- A typed row may only be written while PostgreSQL is the authority and its ledger event was
+-- recorded under the current epoch. Without this, a role holding INSERT on a typed table could
+-- still write after a rollback to FILES, because the foreign key checks neither authority nor epoch.
+CREATE OR REPLACE FUNCTION ops.projection_write_guard() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = ops, pg_temp AS $$
+DECLARE
+    held ops.cutover_authority%ROWTYPE;
+    event_epoch bigint;
+BEGIN
+    SELECT * INTO held FROM ops.cutover_authority WHERE singleton FOR SHARE;
+    IF held.authority IS DISTINCT FROM 'POSTGRES' THEN
+        RAISE EXCEPTION 'projection write refused: authority is %, not POSTGRES', held.authority
+            USING ERRCODE = 'P0002';
+    END IF;
+    SELECT e.authority_epoch INTO event_epoch FROM ops.business_event e
+     WHERE e.idempotency_key = NEW.idempotency_key;
+    IF event_epoch IS DISTINCT FROM held.epoch THEN
+        RAISE EXCEPTION 'projection write refused: ledger event epoch % is not current epoch %',
+            event_epoch, held.epoch USING ERRCODE = 'P0003';
+    END IF;
+    RETURN NEW;
+END $$;
+
+DROP TRIGGER IF EXISTS projection_write_guard ON signal.delivery_event;
+CREATE TRIGGER projection_write_guard BEFORE INSERT ON signal.delivery_event
+    FOR EACH ROW EXECUTE FUNCTION ops.projection_write_guard();
+DROP TRIGGER IF EXISTS projection_write_guard ON signal.ai_call;
+CREATE TRIGGER projection_write_guard BEFORE INSERT ON signal.ai_call
+    FOR EACH ROW EXECUTE FUNCTION ops.projection_write_guard();
+DROP TRIGGER IF EXISTS projection_write_guard ON learning.signal_outcome;
+CREATE TRIGGER projection_write_guard BEFORE INSERT ON learning.signal_outcome
+    FOR EACH ROW EXECUTE FUNCTION ops.projection_write_guard();
+
 -- ---------------------------------------------------------------------------------------------
 -- Grants: the application writer appends and reads; it never changes authority or history.
 -- ---------------------------------------------------------------------------------------------
 GRANT USAGE ON SCHEMA ops, signal, learning TO opip_app_writer;
 GRANT SELECT ON ops.cutover_authority TO opip_app_writer;
-GRANT SELECT, INSERT, UPDATE ON ops.aggregate_head TO opip_app_writer;
-GRANT SELECT, INSERT ON ops.business_event TO opip_app_writer;
+-- The ledger and its per-aggregate head are written only through ops.append_business_event
+-- (SECURITY DEFINER), so no role can insert an out-of-order sequence or bypass the head.
+GRANT SELECT ON ops.aggregate_head TO opip_app_writer;
+GRANT SELECT ON ops.business_event TO opip_app_writer;
+REVOKE EXECUTE ON FUNCTION ops.append_business_event(
+    text, text, text, text, timestamptz, jsonb, text, bigint, bigint
+) FROM PUBLIC;
 GRANT SELECT, INSERT ON signal.delivery_event, signal.ai_call, learning.signal_outcome TO opip_app_writer;
 GRANT EXECUTE ON FUNCTION ops.append_business_event(
     text, text, text, text, timestamptz, jsonb, text, bigint, bigint

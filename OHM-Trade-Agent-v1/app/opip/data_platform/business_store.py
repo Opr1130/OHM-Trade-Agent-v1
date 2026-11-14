@@ -145,8 +145,12 @@ def _classify(exc: BaseException) -> BusinessStoreError:
     if state == _SQLSTATE_SEQUENCE_CONFLICT:
         return SequenceConflict(str(exc))
     class_name = type(exc).__name__
-    # psycopg.errors.IntegrityError / DataError / ProgrammingError describe the row, not the link.
-    if class_name in {"IntegrityError", "DataError", "CheckViolation", "NotNullViolation"}:
+    # SQLSTATE class 22 (data exception) and 23 (integrity constraint violation) describe the row,
+    # not the link, and so does any driver subclass of IntegrityError/DataError (for example
+    # UniqueViolation, NumericValueOutOfRange, InvalidTextRepresentation). Retrying cannot help.
+    if isinstance(state, str) and state[:2] in {"22", "23"}:
+        return StoreRejected(str(exc))
+    if any(base.__name__ in {"IntegrityError", "DataError"} for base in type(exc).__mro__):
         return StoreRejected(str(exc))
     return StoreUnavailable(f"{class_name}: {exc}")
 

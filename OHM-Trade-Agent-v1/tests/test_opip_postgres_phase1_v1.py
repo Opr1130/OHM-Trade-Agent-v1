@@ -205,6 +205,25 @@ def test_ac_003_d_driver_failures_map_to_unavailable_and_state_errors_are_typed(
     assert isinstance(bs._classify(_State("P0005")), bs.SequenceConflict)
     assert isinstance(bs._classify(_Boom("x")), bs.StoreUnavailable)
 
+    class DataError(Exception):  # stands in for psycopg.DataError (matched by name up the MRO)
+        pass
+
+    class IntegrityError(Exception):
+        pass
+
+    class _NumericValueOutOfRange(DataError):  # a driver subclass, not named in any list
+        pass
+
+    class _UniqueViolation(IntegrityError):
+        pass
+
+    for rejected in ("22003", "22P02", "23505", "23514", "23502"):
+        assert isinstance(bs._classify(_State(rejected)), bs.StoreRejected), rejected
+    assert isinstance(bs._classify(_NumericValueOutOfRange("x")), bs.StoreRejected)
+    assert isinstance(bs._classify(_UniqueViolation("x")), bs.StoreRejected)
+    for unavailable in ("08006", "57P01", "53300", "42501", "XX000"):
+        assert isinstance(bs._classify(_State(unavailable)), bs.StoreUnavailable), unavailable
+
 
 def test_ac_003_e_payloads_are_canonical_and_reject_non_finite_values():
     """ATDD-OPIP-POSTGRES-PHASE1-V1/AC-003: deterministic hashing; NaN and non-JSON values are refused."""
@@ -437,6 +456,49 @@ def test_ac_006_b_application_writer_role_is_least_privilege(pg):
         ):
             with pytest.raises(psycopg.errors.InsufficientPrivilege):
                 connection.execute(denied)
+        for bypass in (  # the function is the only way into the ledger and its head
+            "INSERT INTO ops.business_event (idempotency_key, aggregate_type, aggregate_id, aggregate_seq,"
+            " event_type, occurred_at, payload, payload_sha256, authority_epoch)"
+            f" VALUES ('direct','agg','1',9,'E',now(),'{{}}'::jsonb,repeat('0',64),{epoch})",
+            "UPDATE ops.aggregate_head SET last_seq = 99",
+            "INSERT INTO ops.aggregate_head (aggregate_type, aggregate_id, last_seq) VALUES ('x','y',0)",
+        ):
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                connection.execute(bypass)
+
+
+@needs_pg
+def test_ac_006_c_typed_projection_inserts_obey_authority_and_epoch(pg):
+    """ATDD-OPIP-POSTGRES-PHASE1-V1/AC-006: a restricted role cannot write a typed row after rollback."""
+    import psycopg
+
+    epoch = pg.flip("POSTGRES", 1)
+    digest = bs.canonical_json({})[1]
+    with psycopg.connect(pg.dsn, autocommit=True) as connection:
+        connection.execute("SET ROLE opip_app_writer")
+        assert connection.execute(
+            "SELECT status FROM ops.append_business_event('ev1','ai','1','AI_CALL',now(),'{}'::jsonb,%s,%s)",
+            (digest, epoch),
+        ).fetchone()[0] == "INSERTED"
+        connection.execute("RESET ROLE")
+    rolled_back = pg.flip("FILES", epoch, "rollback drill")
+    insert_ai_call = (
+        "INSERT INTO signal.ai_call (idempotency_key, observed_at, provider, model, status, total_tokens)"
+        " VALUES ('ev1', now(), 'p', 'm', 'SUCCESS', 1)"
+    )
+    with psycopg.connect(pg.dsn, autocommit=True) as connection:
+        connection.execute("SET ROLE opip_app_writer")
+        with pytest.raises(psycopg.Error) as refused:
+            connection.execute(insert_ai_call)
+        assert refused.value.sqlstate == "P0002"
+    reenabled = pg.flip("POSTGRES", rolled_back, "re-enable drill")
+    assert reenabled != epoch
+    with psycopg.connect(pg.dsn, autocommit=True) as connection:
+        connection.execute("SET ROLE opip_app_writer")
+        with pytest.raises(psycopg.Error) as stale:
+            connection.execute(insert_ai_call)  # ledger event belongs to the old epoch
+        assert stale.value.sqlstate == "P0003"
+    assert pg.sql("SELECT count(*) FROM signal.ai_call", fetch=True) == [(0,)]
 
 
 @needs_pg

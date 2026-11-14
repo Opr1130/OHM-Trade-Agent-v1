@@ -55,7 +55,7 @@ an authority rollback, epoch change or restricted role
 WHEN:
 writers attempt to append or change authority
 THEN:
-stale or rolled-back writers are refused, transitions are audited and compare-and-set, epochs never decrease, and the application role can append but cannot change authority or history
+stale or rolled-back writers are refused, transitions are audited and compare-and-set, epochs never decrease, the application role can append but cannot change authority or history, the ledger and its aggregate head are writable only through ops.append_business_event, and typed projection rows are refused at the database unless PostgreSQL is the authority and the ledger event belongs to the current epoch
 
 AC-007:
 GIVEN:
@@ -109,6 +109,7 @@ AC-005 -> tests/test_opip_postgres_phase1_v1.py::test_ac_005_d_a_rejected_projec
 AC-005 -> tests/test_opip_postgres_phase1_v1.py::test_ac_005_e_concurrent_writers_keep_the_sequence_gap_free_and_dedupe_replays
 AC-006 -> tests/test_opip_postgres_phase1_v1.py::test_ac_006_a_authority_rollback_stops_stale_writers_and_is_audited
 AC-006 -> tests/test_opip_postgres_phase1_v1.py::test_ac_006_b_application_writer_role_is_least_privilege
+AC-006 -> tests/test_opip_postgres_phase1_v1.py::test_ac_006_c_typed_projection_inserts_obey_authority_and_epoch
 AC-007 -> tests/test_opip_postgres_phase1_v1.py::test_ac_007_a_outcomes_never_turn_missing_evidence_into_a_verdict
 AC-008 -> tests/test_opip_postgres_phase1_v1.py::test_ac_008_a_database_outage_fails_closed_quickly_and_writes_nothing
 AC-009 -> tests/test_opip_postgres_phase1_v1.py::test_ac_009_a_preflight_reports_readiness_and_detects_checksum_drift
