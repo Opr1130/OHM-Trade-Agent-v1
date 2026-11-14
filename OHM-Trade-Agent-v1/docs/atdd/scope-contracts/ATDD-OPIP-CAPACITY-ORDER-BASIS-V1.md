@@ -12,11 +12,11 @@ ARCHITECTURE REFERENCES:
 APPROVED ACCEPTANCE CRITERIA:
 AC-001:
 GIVEN:
-a candidate whose allocation the action gate capped to the capacity ceiling, and separately candidates with a missing, non-finite, non-positive, boolean or non-numeric recommended notional
+a candidate whose allocation the action gate capped to the capacity ceiling, and separately candidates with an absent, non-finite, non-positive, boolean or non-numeric recommended notional
 WHEN:
 the order size for the capacity test is chosen
 THEN:
-the capped candidate is judged at its recommended notional and is not refused for capacity, an order still above the ceiling is refused, and an unusable recommended notional falls back to the economic notional or, when none exists, to ORDER_SIZE_UNUSABLE
+the capped candidate is judged at its recommended notional and is not refused for capacity, an order still above the ceiling is refused, and a PRESENT but unusable recommended notional is refused with ORDER_SIZE_UNUSABLE and never falls back to the larger pre-cap economic notional; the economic notional is used only when no recommended notional was recorded
 
 AC-002:
 GIVEN:
@@ -42,6 +42,14 @@ orders are judged on the recommended basis and on the old pre-cap basis
 THEN:
 an uncapped order is judged identically, an order is admitted exactly when it fits the ceiling times the utilization limit, no previously admitted candidate becomes refused, only capped candidates change decision (refused to admitted), and every other gate (market liquidity, spread, slippage, depth coverage, missing or non-finite ceiling or order size, a book thinner than the order) still refuses
 
+AC-005:
+GIVEN:
+a candidate with a healthy pre-cap economic notional and ample capacity whose recommended notional is present but unusable (zero, negative, non-finite, boolean or a string)
+WHEN:
+the scan's order basis is handed to the real send_trade_plan producer
+THEN:
+the card is suppressed with ACTIONABLE_GATE:ORDER_SIZE_UNUSABLE and nothing is sent, because neither the scan basis nor the evidence builder falls back to the pre-cap economic notional; the same candidate with a valid recommended notional is delivered
+
 EXPLICITLY OUT OF SCOPE:
 - Any change to the capacity ceiling formula, MAX_CAPACITY_UTILIZATION, minimum market liquidity, spread, slippage or depth limits.
 - Deployment, restarts, runtime configuration, PostgreSQL, F11, Learning, Committee and order authority.
@@ -59,6 +67,7 @@ AC-003 -> tests/test_opip_capacity_order_basis_v1.py::test_ac_003_scan_call_site
 AC-004 -> tests/test_opip_capacity_order_basis_v1.py::test_ac_004_a_uncapped_orders_are_judged_exactly_as_before
 AC-004 -> tests/test_opip_capacity_order_basis_v1.py::test_ac_004_b_no_false_admission_across_the_capacity_grid
 AC-004 -> tests/test_opip_capacity_order_basis_v1.py::test_ac_004_c_thin_books_and_missing_evidence_still_refuse_a_capped_order
+AC-005 -> tests/test_opip_capacity_order_basis_v1.py::test_ac_005_inconsistent_recommended_size_cannot_reach_telegram
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/services/actionable_admission.py
@@ -67,6 +76,9 @@ AC-003 -> OHM-Trade-Agent-v1/app/jobs/scan_opportunities.py
 AC-001 -> OHM-Trade-Agent-v1/tests/test_opip_capacity_order_basis_v1.py
 AC-001 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-CAPACITY-ORDER-BASIS-V1.md
 AC-004 -> OHM-Trade-Agent-v1/app/services/actionable_admission.py
+AC-005 -> OHM-Trade-Agent-v1/app/services/actionable_admission.py
+AC-005 -> OHM-Trade-Agent-v1/tests/test_opip_capacity_order_basis_v1.py
+AC-005 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-CAPACITY-ORDER-BASIS-V1.md
 
 DEFERRED DISCOVERIES:
 NONE

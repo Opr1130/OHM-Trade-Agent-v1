@@ -111,15 +111,20 @@ def test_ac_001_b_limits_are_not_relaxed(monkeypatch):
     [
         ({"recommended_position_notional": 250.0, "economic_position_notional": 400.0}, 250.0),
         ({"economic_position_notional": 400.0}, 400.0),
-        ({"recommended_position_notional": 0, "economic_position_notional": 400.0}, 400.0),
-        ({"recommended_position_notional": float("nan"), "economic_position_notional": 400.0}, 400.0),
-        ({"recommended_position_notional": True, "economic_position_notional": 400.0}, 400.0),
-        ({"recommended_position_notional": "250", "economic_position_notional": 400.0}, 400.0),
+        ({"recommended_position_notional": None, "economic_position_notional": 400.0}, 400.0),
+        ({"recommended_position_notional": 0, "economic_position_notional": 400.0}, None),
+        ({"recommended_position_notional": -5.0, "economic_position_notional": 400.0}, None),
+        ({"recommended_position_notional": float("nan"), "economic_position_notional": 400.0}, None),
+        ({"recommended_position_notional": float("inf"), "economic_position_notional": 400.0}, None),
+        ({"recommended_position_notional": True, "economic_position_notional": 400.0}, None),
+        ({"recommended_position_notional": "250", "economic_position_notional": 400.0}, None),
+        ({"recommended_position_notional": 250.0, "economic_position_notional": 0}, 250.0),
+        ({"economic_position_notional": 0}, None),
         ({}, None),
     ],
 )
 def test_ac_001_c_basis_selection_fails_closed(candidate, expected):
-    """ATDD-OPIP-CAPACITY-ORDER-BASIS-V1/AC-001: an unusable recommended size falls back, never invents one."""
+    """ATDD-OPIP-CAPACITY-ORDER-BASIS-V1/AC-001: a present recommended size is the only basis; unusable means refuse, never a larger fallback."""
     assert admission.contemplated_order_notional_usd(candidate) == expected
 
 
@@ -230,3 +235,32 @@ def test_ac_004_c_thin_books_and_missing_evidence_still_refuse_a_capped_order(mo
         assert _decide(candidate, order=bad_order) == admission.REASON_ORDER_SIZE_UNUSABLE, bad_order
     thin = _decide(candidate, order=order, position_capacity_usd=order - 0.01)
     assert thin == admission.REASON_CAPACITY_INSUFFICIENT, "a thinner book than the order refuses it"
+
+
+@pytest.mark.parametrize("bad", [0, -5.0, float("nan"), float("inf"), True, "250"])
+def test_ac_005_inconsistent_recommended_size_cannot_reach_telegram(monkeypatch, bad):
+    """ATDD-OPIP-CAPACITY-ORDER-BASIS-V1/AC-005: scan basis -> send_trade_plan sends nothing for an inconsistent payload.
+
+    The candidate has a healthy pre-cap economic size and ample capacity, but its recommended
+    size is present and unusable. The real producer must suppress it with ORDER_SIZE_UNUSABLE and
+    never call the transport; the same candidate with a valid recommended size is delivered.
+    """
+    from tests.test_opip_alert_actionable_only_regressions_v1 import _run_send_trade_plan
+
+    def run(recommended):
+        candidate = {"recommended_position_notional": recommended, "economic_position_notional": 750.0}
+        evidence = {
+            "venue": "KRAKEN", "venue_identity_valid": True, "market_liquidity_usd": 2_400_000.0,
+            "position_capacity_usd": 5_000.0, "spread_bps": 8.0, "size_slippage_pct": 0.25,
+            "depth_covered": True, "current_price": 100.0,
+            # the exact expression scan_opportunities passes to execution_evidence_from_snapshot
+            "order_size_usd": admission.contemplated_order_notional_usd(candidate),
+        }
+        return _run_send_trade_plan(monkeypatch, candidate={**candidate, "execution_evidence": evidence})
+
+    refused = run(bad)
+    assert refused["delivered"] is False
+    assert "message" not in refused
+    assert refused["suppression"]["reason"] == "ACTIONABLE_GATE:ORDER_SIZE_UNUSABLE"
+    admitted = run(250.0)
+    assert admitted["delivered"] is True and "message" in admitted
