@@ -92,9 +92,21 @@ grep -E 'OPIP_UNIFIED_CYCLE_(STATUS|COMPLETED_AT|TERMINATED_AT|TERMINATED_REASON
 echo "status counts (last 1000 lines):"
 tail -n 1000 /var/log/ohm-unified-cycle.log 2>/dev/null | grep -o 'OPIP_UNIFIED_CYCLE_STATUS=[A-Z_]*' | sort | uniq -c
 
-section "7 orphaned or stuck cycle processes (read-only ps)"
+section "7 orphaned or stuck cycle processes (read-only)"
 ps -eo pid,etimes,args 2>/dev/null | grep -E "[r]un_cycle|[o]hm-unified-cycle" | head -n 20
-docker exec "$(docker ps -q --filter name=ohm-trade-agent | head -n 1)" sh -c 'ps -eo pid,etimes,args | grep -c "[r]un_cycle"' 2>&1 | sed 's/^/in-container run_cycle count: /'
+# The container image has no ps, so count from /proc. The pattern is split with quotes so
+# this shell's own command line never matches itself. A failed exec prints UNAVAILABLE,
+# never a count: "0" must mean "looked and found none".
+CORE="$(docker ps -q --filter name=ohm-trade-agent 2>/dev/null | head -n 1)"
+if [ -n "$CORE" ]; then
+  COUNT="$(docker exec "$CORE" sh -c 'n=0; for d in /proc/[0-9]*; do c=$(tr "\0" " " < "$d/cmdline" 2>/dev/null); case "$c" in *run_"cycle"*) n=$((n+1));; esac; done; echo "$n"' 2>/dev/null)"
+  case "$COUNT" in
+    ''|*[!0-9]*) echo "in-container run_cycle count: UNAVAILABLE (exec failed)" ;;
+    *) echo "in-container run_cycle count: $COUNT (from /proc)" ;;
+  esac
+else
+  echo "in-container run_cycle count: UNAVAILABLE (core container not found)"
+fi
 LOCK="${OPIP_CYCLE_LOCK:-/var/run/ohm-unified-cycle.lock}"
 if [ -e "$LOCK" ]; then
   # Read-only: /proc/locks lists kernel locks by inode; the lock file is never opened,
@@ -110,11 +122,44 @@ else
   echo "unified_cycle_host_lock=ABSENT"
 fi
 
-section "8 deploy health deadline in the deployed script"
-grep -n -A8 '^wait_writer_health' "$APP_ROOT/deploy/remote/ohm-deploy" 2>/dev/null | grep -E 'seq 1|sleep' 
+section "8 deploy health deadline: the INSTALLED controller (what a deploy runs) and the release copy"
+# /usr/local/sbin/ohm-deploy is what actually executes; the release-tree copy is only what
+# the NEXT bootstrap would install. A deadline is NEW when WRITER_HEALTH_* is defined and
+# LEGACY when only a fixed `seq 1 N` poll loop is found.
+for f in "${OPIP_INSTALLED_CONTROLLER:-/usr/local/sbin/ohm-deploy}" "$APP_ROOT/deploy/remote/ohm-deploy"; do
+  if [ -r "$f" ]; then
+    T="$(grep -E '^WRITER_HEALTH_TIMEOUT_SECONDS=' "$f" | head -n 1)"
+    P="$(grep -E '^WRITER_HEALTH_POLL_SECONDS=' "$f" | head -n 1)"
+    if [ -n "$T" ]; then
+      echo "$f: ${T} ${P} verdict=NEW"
+    elif grep -qE '^wait_writer_health' "$f"; then
+      echo "$f: $(grep -A10 '^wait_writer_health' "$f" | grep -E 'seq 1' | head -n 1 | sed 's/^ *//') verdict=LEGACY (fixed poll loop, no WRITER_HEALTH_*)"
+    else
+      echo "$f: wait_writer_health not found verdict=UNVERIFIED"
+    fi
+  else
+    echo "$f: UNAVAILABLE (not readable)"
+  fi
+done
 
-section "9 safety flags in the live environment (read-only)"
-docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$(docker ps -q --filter name=ohm-trade-agent | head -n 1)" 2>/dev/null \
-  | grep -E '^(OPIP_EARLY_WATCH_MODE|OPIP_PHASE_RESOURCE_TELEMETRY|OPIP_UNIFIED_CYCLE_BUDGET_SECONDS|KRAKEN_.*(TRADING|LIVE|ORDER).*|OPIP_.*(LEARNING|COMMITTEE|AUTO).*)=' | sed 's/\(KEY\|SECRET\|TOKEN\)=.*/\1=REDACTED/'
-echo "(absence of a line = variable unset = default)"
+section "9 runtime configuration of the core container (set vs unset; unset is NOT disabled)"
+# Each name is listed explicitly. NAME=<UNSET> means the variable is absent from the
+# container environment, so the code default applies; it is not evidence that a feature
+# is off. A value of off/false/0 is the only evidence of a disabled feature here.
+CORE="$(docker ps -q --filter name=ohm-trade-agent 2>/dev/null | head -n 1)"
+if [ -n "$CORE" ]; then
+  ENVDUMP="$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$CORE" 2>/dev/null)"
+  for NAME in OPIP_RELEASE_PROFILE OPIP_COMMITTEE_MODE OPIP_PAPER_V2_MODE OPIP_EARLY_WATCH_ALERTS_ENABLED \
+              OPIP_EARLY_WATCH_MODE OPIP_CANONICAL_WRITER_MODE OPIP_FEATURE_BUS_MODE OPIP_TARGET_SPINE_MODE \
+              OPIP_PRODUCTION_SCORING_VERSION OPIP_UNIFIED_CYCLE_BUDGET_SECONDS OPIP_PHASE_RESOURCE_TELEMETRY; do
+    LINE="$(printf '%s\n' "$ENVDUMP" | grep -E "^${NAME}=" | head -n 1)"
+    if [ -n "$LINE" ]; then echo "$LINE"; else echo "${NAME}=<UNSET> (code default applies; not evidence of OFF)"; fi
+  done
+  echo "-- any other learning/auto/trading-flag variables present --"
+  printf '%s\n' "$ENVDUMP" | grep -E '^(KRAKEN_.*(TRADING|LIVE|ORDER).*|OPIP_.*(LEARNING|AUTO).*)=' \
+    | sed 's/\(KEY\|SECRET\|TOKEN\)=.*/\1=REDACTED/' || true
+else
+  echo "UNAVAILABLE: core container not found"
+fi
+
 echo; echo "BUNDLE_COMPLETE (no state was changed)"

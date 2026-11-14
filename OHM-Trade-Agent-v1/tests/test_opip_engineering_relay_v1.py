@@ -45,7 +45,8 @@ def run(comments, tmp_path, wire=None, head=None, **kw):
     state = relay.State(tmp_path / "state.json")
     wire = wire or Wire()
     out = relay.process(comments, allowed_actor_ids=frozenset({OWNER}), state=state, post=wire,
-                        me="claude-engineering", current_head=head, runtime_summary="s", **kw)
+                        me="claude-engineering", current_head=head, runtime_summary="s",
+                        recipients=frozenset({"claude-cline-engineering"}), **kw)
     return out, wire, state
 
 
