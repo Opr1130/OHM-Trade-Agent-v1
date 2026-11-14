@@ -16,7 +16,7 @@ REASON = "ACTIONABLE_GATE:POSITION_CAPACITY_INSUFFICIENT"
 
 
 def _paths(tmp_path):
-    return tmp_path / "state.json", tmp_path / "events.jsonl"
+    return tmp_path / "telegram_delivery_state.json", tmp_path / "events.jsonl"
 
 
 def _record(tmp_path, *, status="SUPPRESSED", reason=REASON, fingerprint="fp", at=T0, failure=None,
@@ -123,3 +123,31 @@ def test_ac_004_other_alert_families_keep_one_row_per_occurrence(tmp_path):
     rows = _rows(tmp_path)
     assert len(rows) == 5 and all("suppressed_since_last_row" not in row for row in rows)
     assert delivery.BOUNDED_SUPPRESSION_FAMILIES == frozenset({"QUALIFIED_OPPORTUNITY"})
+
+
+def test_ac_005_summary_counts_collapsed_repeats_under_the_verdict_they_repeated(tmp_path):
+    """ATDD-OPIP-TELEGRAM-SUPPRESSION-BOUND-V1/AC-005: the summary does not undercount collapsed suppressions."""
+    other = "ACTIONABLE_GATE:SPREAD_TOO_WIDE"
+    for i in range(12):  # one row, eleven collapsed repeats of REASON
+        _record(tmp_path, at=T0 + timedelta(minutes=5 * i))
+    _record(tmp_path, reason=other, at=T0 + timedelta(minutes=60))  # verdict changes: a row carries the 11
+    rows = _rows(tmp_path)
+    assert len(rows) == 2
+    assert rows[1]["suppressed_since_last_row"] == 11
+    assert rows[1]["suppressed_since_last_row_reason"] == REASON, "carried repeats keep their own verdict"
+    assert rows[1]["suppression_reason"] == other
+    summary = delivery.build_delivery_summary(path=_paths(tmp_path)[1])
+    assert summary["events"] == 2
+    assert summary["suppressed"] == 13 and summary["collapsed_suppression_repeats"] == 11
+    assert summary["by_suppression_reason"] == {REASON: 12, other: 1}
+    assert summary["by_status"] == {"SUPPRESSED": 13}
+    for i in range(1, 4):  # three more repeats of the new verdict stay pending in state
+        _record(tmp_path, reason=other, at=T0 + timedelta(minutes=60 + 5 * i))
+    pending = delivery.build_delivery_summary(path=_paths(tmp_path)[1])
+    assert len(_rows(tmp_path)) == 2
+    assert pending["suppressed"] == 16 and pending["collapsed_suppression_repeats"] == 14
+    assert pending["by_suppression_reason"] == {REASON: 12, other: 4}
+    _record(tmp_path, reason=other, at=T0 + timedelta(minutes=125))  # window elapsed: flushed to a row
+    flushed = delivery.build_delivery_summary(path=_paths(tmp_path)[1])
+    assert flushed["suppressed"] == 17, "flushing must not count a repeat twice"
+    assert flushed["by_suppression_reason"] == {REASON: 12, other: 5}

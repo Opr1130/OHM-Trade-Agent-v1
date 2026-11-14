@@ -41,12 +41,20 @@ they are recorded
 THEN:
 every occurrence is written as before
 
+AC-005:
+GIVEN:
+suppressions collapsed into later rows, or still pending in the state file
+WHEN:
+the delivery summary is built
+THEN:
+suppressed, by_status, by_family and by_suppression_reason include every collapsed repeat under the verdict it repeated (not the verdict of the row that carries it), nothing is counted twice when pending repeats are later flushed to a row, and collapsed_suppression_repeats reports how many were folded
+
 EXPLICITLY OUT OF SCOPE:
 - Any change to admission verdicts, delivery, retry scheduling, the outbox, or message content.
 - Truncation or rewriting of the existing ledger; deployment, restarts, runtime configuration, PostgreSQL, F11, Learning, Committee and order authority.
 
 FROZEN BOUNDARIES:
-- Rows written are byte-compatible except for the additive suppressed_since_last_row field; state gains additive keys only.
+- Rows written are byte-compatible except for the additive suppressed_since_last_row, suppressed_since_last_row_status and suppressed_since_last_row_reason fields; state gains additive keys only.
 - No trading, order or Kraken authority is added or widened.
 
 ACCEPTANCE TEST TRACEABILITY:
@@ -56,8 +64,10 @@ AC-001 -> tests/test_telegram_suppression_repeat_bound_v1.py::test_ac_001_b_ever
 AC-002 -> tests/test_telegram_suppression_repeat_bound_v1.py::test_ac_002_send_attempts_are_never_collapsed
 AC-002 -> tests/test_telegram_suppression_repeat_bound_v1.py::test_ac_002_a_a_send_between_suppressions_resets_the_run
 AC-003 -> tests/test_telegram_suppression_repeat_bound_v1.py::test_ac_003_window_expiry_and_clock_skew_write_the_row
+AC-005 -> tests/test_telegram_suppression_repeat_bound_v1.py::test_ac_005_summary_counts_collapsed_repeats_under_the_verdict_they_repeated
 
 IMPLEMENTATION MAP:
+AC-005 -> OHM-Trade-Agent-v1/app/services/telegram_delivery.py
 AC-001 -> OHM-Trade-Agent-v1/app/services/telegram_delivery.py
 AC-002 -> OHM-Trade-Agent-v1/app/services/telegram_delivery.py
 AC-003 -> OHM-Trade-Agent-v1/app/services/telegram_delivery.py

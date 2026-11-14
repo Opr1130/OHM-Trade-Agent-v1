@@ -196,8 +196,11 @@ def _record(
             }
             if not repeat_of_unchanged_verdict:
                 if skipped_repeats > 0:
-                    # Keep the ledger complete: the rows skipped since the last write are counted.
+                    # Keep the ledger complete: the rows skipped since the last write are counted,
+                    # with the verdict they repeated (it may differ from this row's verdict).
                     row["suppressed_since_last_row"] = skipped_repeats
+                    row["suppressed_since_last_row_status"] = previous.get("last_status")
+                    row["suppressed_since_last_row_reason"] = previous.get("last_suppression_reason")
                 _append_event_locked(row, event_file=event_file)
 
             updated = dict(previous)
@@ -565,6 +568,55 @@ def read_delivery_events(*, path: Path = EVENT_FILE, limit: int = MAX_SUMMARY_EV
     return list(rows)
 
 
+def _collapsed_repeats(
+    rows: list[dict[str, Any]],
+    *,
+    path: Path,
+    scope: str,
+    today: str,
+) -> list[tuple[str, str, str | None, int]]:
+    """Suppressions the ledger collapsed, as ``(family, status, reason, count)``.
+
+    Written rows carry ``suppressed_since_last_row`` with the verdict those
+    repeats had. Repeats not yet flushed into a row live in the state file and
+    are added here, so a row and the state never count the same repeat twice.
+    """
+    found: list[tuple[str, str, str | None, int]] = []
+    for row in rows:
+        count = row.get("suppressed_since_last_row")
+        if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+            found.append(
+                (
+                    str(row.get("alert_family") or "UNKNOWN").upper(),
+                    str(row.get("suppressed_since_last_row_status") or "SUPPRESSED").upper(),
+                    row.get("suppressed_since_last_row_reason"),
+                    count,
+                )
+            )
+    try:
+        state = load_json(path.parent / STATE_FILE.name)
+    except (OSError, ValueError, TypeError, RegistryIOError):
+        return found
+    alerts = state.get("alerts") if isinstance(state, dict) else None
+    for entry in (alerts or {}).values() if isinstance(alerts, dict) else ():
+        if not isinstance(entry, dict):
+            continue
+        pending = entry.get("suppressed_repeat_count")
+        if not isinstance(pending, int) or isinstance(pending, bool) or pending <= 0:
+            continue
+        if scope == "today" and str(entry.get("updated_at") or "")[:10] != today:
+            continue
+        found.append(
+            (
+                str(entry.get("alert_family") or "UNKNOWN").upper(),
+                str(entry.get("last_status") or "SUPPRESSED").upper(),
+                entry.get("last_suppression_reason"),
+                pending,
+            )
+        )
+    return found
+
+
 def build_delivery_summary(*, scope: str = "all", path: Path = EVENT_FILE) -> dict[str, Any]:
     if scope not in {"all", "today"}:
         raise ValueError("scope must be all or today")
@@ -601,8 +653,24 @@ def build_delivery_summary(*, scope: str = "all", path: Path = EVENT_FILE) -> di
             suppression_reasons[reason] = suppression_reasons.get(reason, 0) + 1
         elif status.endswith("FAILED"):
             failed += 1
+    collapsed = 0
+    for family, status, reason, count in _collapsed_repeats(
+        delivery_rows,
+        path=path,
+        scope=scope,
+        today=datetime.now(timezone.utc).date().isoformat(),
+    ):
+        collapsed += count
+        suppressed += count
+        statuses[status] = statuses.get(status, 0) + count
+        families[family] = families.get(family, 0) + count
+        reason_key = str(reason or "UNSPECIFIED").upper()
+        suppression_reasons[reason_key] = suppression_reasons.get(reason_key, 0) + count
     return {
         "events": len(delivery_rows),
+        # Suppressions folded into other rows or still pending in state; already
+        # included in suppressed, by_status, by_family and by_suppression_reason.
+        "collapsed_suppression_repeats": collapsed,
         "lineage_links": lineage_links,
         "delivered": delivered,
         "failed": failed,
