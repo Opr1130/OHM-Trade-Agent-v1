@@ -138,7 +138,7 @@ def evaluate_candidate(candidate: Mapping[str, Any], policy: SimPolicy) -> dict[
     sign = 1.0 if direction == "LONG" else -1.0
     reward = sign * (t2 - entry)
     risk = sign * (entry - stop)
-    if entry <= 0 or risk <= 0 or reward <= 0:
+    if entry <= 0 or stop <= 0 or t2 <= 0 or risk <= 0 or reward <= 0:
         return _decision(candidate, REJECTED, [GEOMETRY_INVALID], {})
 
     raw_slip = candidate.get("est_slippage_pct")
@@ -176,8 +176,12 @@ def evaluate_candidate(candidate: Mapping[str, Any], policy: SimPolicy) -> dict[
         reasons.append(REWARD_TO_RISK_BELOW_MIN)
     if metrics["net_profit_usd"] < policy.min_net_profit_usd:
         reasons.append(NET_PROFIT_BELOW_MIN)
-    if str(candidate.get("btc_regime") or "") in policy.blocked_btc_regimes:
-        reasons.append(BACKDROP_BLOCKED)
+    if policy.blocked_btc_regimes:
+        regime = candidate.get("btc_regime")
+        if not isinstance(regime, str) or not regime.strip():
+            reasons.append(f"{DATA_MISSING}:btc_regime")  # backdrop cannot be evaluated: fail closed
+        elif regime in policy.blocked_btc_regimes:
+            reasons.append(BACKDROP_BLOCKED)
 
     liquidity = _num(candidate, "liquidity_usd")
     liquidity_low = policy.min_liquidity_usd > 0 and (liquidity is None or liquidity < policy.min_liquidity_usd)

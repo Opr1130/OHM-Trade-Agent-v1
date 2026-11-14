@@ -210,3 +210,23 @@ def test_report_output_must_be_json_in_an_existing_directory_and_leaves_no_temp(
     good = tmp_path / "r.json"
     assert cli.main(["--synthetic", "5", "--out", str(good)]) == 0
     assert good.exists() and [p.name for p in tmp_path.iterdir()] == ["r.json"]
+
+
+@pytest.mark.acceptance
+@pytest.mark.parametrize("direction,stop,target", [("SHORT", 102, -100), ("LONG", -5, 110), ("LONG", 98, -1), ("SHORT", 0, 90)])
+def test_nonpositive_stop_or_target_prices_are_rejected_as_invalid_geometry(direction, stop, target):
+    """ATDD-OPIP-V6-SIMULATOR-HARDENING-v1/AC-001: impossible nonpositive prices never become qualified evidence."""
+    d = engine.evaluate_candidate(cand(direction=direction, entry=100, stop=stop, target_2=target), SimPolicy())
+    assert d["status"] == engine.REJECTED and d["reasons"] == [engine.GEOMETRY_INVALID]
+
+
+@pytest.mark.acceptance
+@pytest.mark.parametrize("regime", [None, "", "  ", 5])
+def test_missing_backdrop_fails_closed_only_when_the_filter_is_enabled(regime):
+    """ATDD-OPIP-V6-SIMULATOR-HARDENING-v1/AC-002: a candidate whose BTC regime cannot be read is rejected when regimes are blocked, and unaffected when no filter is set."""
+    c = cand(direction="LONG", entry=100, stop=98, target_2=106)
+    c["btc_regime"] = regime
+    blocked = engine.evaluate_candidate(c, SimPolicy(blocked_btc_regimes=("DOWN",)))
+    assert blocked["status"] == engine.REJECTED
+    assert f"{engine.DATA_MISSING}:btc_regime" in blocked["reasons"]
+    assert engine.evaluate_candidate(c, SimPolicy())["status"] == engine.QUALIFIED

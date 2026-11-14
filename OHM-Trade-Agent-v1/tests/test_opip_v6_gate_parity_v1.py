@@ -18,7 +18,7 @@ def test_production_baseline_equals_live_constants():
     c = gate_policy_constants()
     b = parity.production_baseline()
     assert b.score_threshold == c["min_technical_score"]
-    assert b.min_confidence == pytest.approx(c["ai_min_confidence"] / 100.0)
+    assert b.min_confidence == 0.0  # confidence is measurement evidence, not an admission floor
     assert b.max_spread_pct == pytest.approx(c["max_long_spread_bps"] / 100.0)
     assert b.min_net_profit_usd == c["advisory_economic_min_net_profit"]
     assert b.min_target_2_move_pct == c["advisory_economic_min_target_2_move_pct"]
@@ -69,3 +69,14 @@ def test_unmapped_gate_change_moves_the_full_fingerprint_but_not_the_simulator_d
     rep = parity.parity_report()
     assert rep["provenance"] == "CODE_CONSTANTS_V1_REFERENCE"
     assert "baseline_digest" not in rep and rep["simulator_digest"] and rep["full_policy_fingerprint"].startswith("PGC:")
+
+
+@pytest.mark.acceptance
+def test_low_confidence_candidate_is_not_rejected_by_the_production_reference_baseline():
+    """ATDD-OPIP-V6-SIMULATOR-HARDENING-v1/AC-003: confidence is measurement evidence in production, so the parity baseline adds no confidence rejection."""
+    from app.opip.simulator.engine import QUALIFIED, evaluate_candidate
+    c = {"symbol": "A", "direction": "LONG", "entry": 100, "stop": 98, "target_2": 110,
+         "v1_score": 95, "confidence": 0.5, "est_slippage_pct": 0.0, "spread_pct": 0.1, "liquidity_usd": 1e6}
+    assert evaluate_candidate(c, parity.production_baseline())["status"] == QUALIFIED
+    row = {f["sim_field"]: f for f in parity.parity_report()["fields"]}["min_confidence"]
+    assert row["status"] == "MEASUREMENT_ONLY_NOT_ADMISSION"
