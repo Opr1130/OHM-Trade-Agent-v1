@@ -996,7 +996,9 @@ def test_real_migration_and_sync_round_trip(pg_connection):
         cursor.execute(
             "SELECT max(version) FROM ops.schema_version"
         )
-        assert cursor.fetchone()[0] == 6
+        from app.opip.data_platform.migrations import discover_migrations
+
+        assert cursor.fetchone()[0] == max(m.version for m in discover_migrations())
         cursor.execute("SELECT count(*) FROM ops.required_stream")
         assert cursor.fetchone()[0] == len(STREAM_SPECS)
 
@@ -1289,8 +1291,14 @@ def test_migration_006_upgrade_matches_fresh_install():
                 cursor.execute("SELECT max(version) FROM ops.schema_version")
                 assert cursor.fetchone()[0] == 5
 
-            # Land 006 as a genuine follow-up against the real migrations dir.
-            applied_second = apply_migrations(connection)
+            # Land 006 as a genuine follow-up. The root stops at 006 so this proof stays about
+            # 006 and does not change each time a later migration is added.
+            upto_006 = Path(tmp) / "upto_006"
+            upto_006.mkdir()
+            for path in sorted(MIGRATION_ROOT.glob("*.sql")):
+                if int(path.name[:3]) <= 6:
+                    shutil.copy(path, upto_006 / path.name)
+            applied_second = apply_migrations(connection, root=upto_006)
             assert applied_second == [6]
             with connection.cursor() as cursor:
                 cursor.execute("SELECT max(version) FROM ops.schema_version")
@@ -1321,8 +1329,11 @@ def test_migration_006_fresh_install_matches_upgrade_path():
     (a fresh database) must reach the identical function behavior."""
     with connect(DSN, application_name="opip-freshness-fresh-install-test") as connection:
         _reset_database(connection)
+        from app.opip.data_platform.migrations import discover_migrations
+
         applied = apply_migrations(connection)
-        assert applied == [1, 2, 3, 4, 5, 6]
+        assert applied == [m.version for m in discover_migrations()]
+        assert applied[:6] == [1, 2, 3, 4, 5, 6]
         sync_required_streams(connection)
         _refresh_freshness(connection)
 
