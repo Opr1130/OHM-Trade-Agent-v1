@@ -69,3 +69,13 @@ New services, secrets, host installs, writes to #291, any execution of comment c
 
 None of these widens authority; each makes the relay refuse or dedupe more. The relay is
 still not owner authorization and still runs only when something invokes it.
+
+### Follow-up: two Codex P2 findings on #577 (ATDD-OPIP-RELAY-ACK-FOLLOWUP-V1)
+- **Full-length ACK ids.** The 92-character cap applies only to reply-triggering requests
+  (so `<id>-ack` fits). A generated ACK id (93-96 characters) now parses when read back, so
+  the published-reply scan finds it and a restart cannot duplicate it.
+- **Verified ACK metadata.** Only an `ACK` from this relay, addressed to the requester and
+  with `reply_to` equal to the request, counts as having answered it. A comment that merely
+  carries the `<id>-ack` message id (any other kind, sender, recipient or `reply_to`) no
+  longer suppresses the real acknowledgement.
+The relay is still not activated and still runs only when something invokes it.

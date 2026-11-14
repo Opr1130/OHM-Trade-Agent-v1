@@ -106,7 +106,10 @@ def parse_comment(comment: dict, *, allowed_actor_ids: frozenset[int]) -> Envelo
         raise Reject("UNKNOWN_KIND")
     if fields["authority"] != AUTHORITY:
         raise Reject("AUTHORITY_NOT_COMMUNICATION_ONLY")
-    if not _ID_IN.match(fields["message_id"]):
+    # Only a reply-triggering request must be short enough for "<id>-ack" to fit; the
+    # generated ACK itself (up to the full limit) must still parse when read back.
+    id_rule = _ID_IN if fields["kind"] in REPLY_TRIGGERS else _ID
+    if not id_rule.match(fields["message_id"]):
         raise Reject("BAD_MESSAGE_ID")
     for key in ("head_sha", "base_sha"):
         if key in fields and not _SHA.match(fields[key]):
@@ -181,14 +184,16 @@ def process(comments: list[dict], *, allowed_actor_ids: frozenset[int], state: S
     replies = 0
     mine = recipients or frozenset({me})
     # Remote evidence of what was already answered: a crash between post() and
-    # state.record() must not produce a second ACK on restart.
-    published: set[str] = set()
+    # state.record() must not produce a second ACK on restart. Only a genuine ACK from
+    # this relay, addressed back to the requester and naming this request, counts.
+    published: dict[str, dict] = {}
     for comment in comments:
         try:
             env = parse_comment(comment, allowed_actor_ids=allowed_actor_ids)
         except Reject:
             continue
-        published.add(env.message_id)
+        if env.fields["kind"] == "ACK":
+            published[env.message_id] = env.fields
     for comment in sorted(comments, key=lambda c: (c.get("created_at", ""), c.get("id", 0))):
         try:
             env = parse_comment(comment, allowed_actor_ids=allowed_actor_ids)
@@ -222,7 +227,9 @@ def process(comments: list[dict], *, allowed_actor_ids: frozenset[int], state: S
         if replies >= max_replies:
             results.append(Outcome(mid, "NO_REPLY", "reply budget exhausted; retry next pass"))
             continue
-        if f"{mid}-ack" in published:
+        ack = published.get(f"{mid}-ack")
+        if (ack is not None and ack["sender"] == me and ack.get("reply_to") == mid
+                and ack["recipient"] == f["sender"]):
             state.record(mid, "REPLIED")  # answered before a crash lost the local record
             results.append(Outcome(mid, "DUPLICATE", "ACK already published"))
             continue
