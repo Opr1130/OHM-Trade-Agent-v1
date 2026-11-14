@@ -118,8 +118,15 @@ def authorize_new_trade_notification(
     quality_reason: str | None,
     delivery_attempts: int,
     max_per_window: int,
+    business_store_reason: str | None = None,
 ) -> tuple[bool, str | None]:
-    """Decide Telegram eligibility without changing rank order or lifecycle."""
+    """Decide Telegram eligibility without changing rank order or lifecycle.
+
+    ``business_store_reason`` is the database-authority refusal for NEW admissions (ARCH-007). It is
+    consulted only when no quality refusal exists, and ``None`` leaves behaviour unchanged.
+    """
+    if quality_reason is None and business_store_reason:
+        return False, business_store_reason
     notify = quality_reason is None and new_trade_delivery_slot_open(
         delivery_attempts,
         max_per_window,
