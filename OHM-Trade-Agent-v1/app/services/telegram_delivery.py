@@ -19,6 +19,10 @@ EVENT_FILE = Path("/app/data/telegram_delivery_events.jsonl")
 STATE_FILE = Path("/app/data/telegram_delivery_state.json")
 LOCK_FILE = STATE_FILE.parent / ".telegram_delivery.lock"
 MAX_SUMMARY_EVENTS = 20_000
+#: An unchanged, non-attempt verdict (SUPPRESSED / NOT_ELIGIBLE with the same reason for the same
+#: alert) is re-written to the event ledger at most once per window; the repeats in between are
+#: counted on the next row instead. Send attempts and failures are never collapsed.
+SUPPRESSION_REPEAT_WINDOW_SECONDS = 3_600
 
 
 @dataclass(frozen=True)
@@ -81,6 +85,14 @@ def _append_event_locked(row: dict[str, Any], *, event_file: Path) -> None:
             pass
 
 
+def _parse_iso(value: Any) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
 def _record(
     *,
     identity: str,
@@ -141,6 +153,17 @@ def _record(
             attempt = previous_attempts + 1 if is_attempt else previous_attempts
             retry_count = max(0, attempt - 1) if is_attempt else max(0, previous_attempts - 1)
 
+            reason_text = str(suppression_reason or "") or None
+            last_row_at = _parse_iso(previous.get("last_event_row_at"))
+            repeat_of_unchanged_verdict = bool(
+                not is_attempt
+                and previous.get("last_status") == normalized_status
+                and previous.get("last_suppression_reason") == reason_text
+                and last_row_at is not None
+                and 0 <= (attempted - last_row_at).total_seconds() < SUPPRESSION_REPEAT_WINDOW_SECONDS
+            )
+            skipped_repeats = int(previous.get("suppressed_repeat_count") or 0)
+
             row = {
                 "schema_version": 1,
                 "record_type": "TELEGRAM_DELIVERY_EVENT",
@@ -166,7 +189,11 @@ def _record(
                 "suppression_reason": str(suppression_reason or "") or None,
                 "failure_reason": str(failure_reason or "") or None,
             }
-            _append_event_locked(row, event_file=event_file)
+            if not repeat_of_unchanged_verdict:
+                if skipped_repeats > 0:
+                    # Keep the ledger complete: the rows skipped since the last write are counted.
+                    row["suppressed_since_last_row"] = skipped_repeats
+                _append_event_locked(row, event_file=event_file)
 
             updated = dict(previous)
             updated.update(
@@ -178,6 +205,15 @@ def _record(
                     "attempts": attempt,
                     "retry_count": retry_count,
                     "last_status": normalized_status,
+                    "last_suppression_reason": reason_text,
+                    "suppressed_repeat_count": (
+                        skipped_repeats + 1 if repeat_of_unchanged_verdict else 0
+                    ),
+                    "last_event_row_at": (
+                        previous.get("last_event_row_at")
+                        if repeat_of_unchanged_verdict
+                        else attempted.isoformat()
+                    ),
                     "updated_at": attempted.isoformat(),
                     "journey_id": str(journey_id or "") or None,
                     "signal_id": str(signal_id or "") or None,
