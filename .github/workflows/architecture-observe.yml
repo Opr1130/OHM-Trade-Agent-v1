@@ -1,0 +1,70 @@
+name: architecture-observe
+
+# V6 construction phase: observable architecture seams, NOT a release gate.
+# Stdlib-only, no AI tokens, no secret read, no deployed services, no issue writes.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'OHM-Trade-Agent-v1/app/**'
+      - 'OHM-Trade-Agent-v1/deploy/**'
+      - 'OHM-Trade-Agent-v1/docs/architecture/**'
+      - 'OHM-Trade-Agent-v1/tools/architecture_gap_capture.py'
+      - 'OHM-Trade-Agent-v1/tests/**'
+      - '.github/workflows/**'
+      - '.gitleaks.toml'
+  workflow_dispatch: {}
+  schedule:
+    - cron: '17 8 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    name: architecture observations (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Collect changed paths (exact PR head)
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            git diff --name-only --diff-filter=ACMR "$BASE_SHA" "$HEAD_SHA" > "$RUNNER_TEMP/v6-arch-paths.txt"
+          else
+            : > "$RUNNER_TEMP/v6-arch-paths.txt"
+          fi
+      - name: Capture evidence (never a mandatory CI result)
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            args=(--baseline)
+          fi
+          python OHM-Trade-Agent-v1/tools/architecture_gap_capture.py \
+            --changed-paths-file "$RUNNER_TEMP/v6-arch-paths.txt" \
+            --out-json "$RUNNER_TEMP/v6-arch-candidates.json" \
+            --out-markdown "$RUNNER_TEMP/v6-arch-report.md" \
+            "${args[@]}"
+          cat "$RUNNER_TEMP/v6-arch-report.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain candidate evidence for review
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v6-architecture-observations-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/v6-arch-candidates.json
+            ${{ runner.temp }}/v6-arch-report.md
+          retention-days: 30
+          if-no-files-found: warn

@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "mode": "advisory-only",
+  "contracts": [
+    {
+      "id": "V6-F11-001",
+      "title": "F11 protection remains independent of new stores",
+      "risk": "P0",
+      "implementation_paths": [
+        "OHM-Trade-Agent-v1/app/**/*f11*.py",
+        "OHM-Trade-Agent-v1/app/**/*protection*.py",
+        "OHM-Trade-Agent-v1/app/opip/data_platform/business_store.py"
+      ],
+      "evidence_refs": [
+        "OHM-Trade-Agent-v1/tests/test_opip_f11_precutover_protection.py"
+      ],
+      "review_question": "Could a new database, AI or advisory dependency delay or block existing protective operations?",
+      "import_boundary": {
+        "paths": [
+          "OHM-Trade-Agent-v1/app/**/*f11*.py",
+          "OHM-Trade-Agent-v1/app/**/*protection*.py"
+        ],
+        "forbidden_modules": [
+          "app.opip.data_platform"
+        ]
+      }
+    },
+    {
+      "id": "V6-PG-002",
+      "title": "PostgreSQL authority and invalid-config fail closed",
+      "risk": "P1",
+      "implementation_paths": [
+        "OHM-Trade-Agent-v1/app/opip/data_platform/**",
+        "OHM-Trade-Agent-v1/app/jobs/scan_opportunities.py",
+        "OHM-Trade-Agent-v1/deploy/analytics/**"
+      ],
+      "evidence_refs": [
+        "OHM-Trade-Agent-v1/tests/test_opip_data_platform_v1.py",
+        "OHM-Trade-Agent-v1/tests/*business_store*test*.py",
+        "OHM-Trade-Agent-v1/tests/test_*business_store*.py"
+      ],
+      "review_question": "Do explicit invalid authority, stale epoch and database outages reject new business admissions without affecting protection?"
+    },
+    {
+      "id": "V6-PG-003",
+      "title": "Atomic, idempotent ledger and typed business projections",
+      "risk": "P1",
+      "implementation_paths": [
+        "OHM-Trade-Agent-v1/app/opip/data_platform/**",
+        "OHM-Trade-Agent-v1/app/services/telegram_delivery.py"
+      ],
+      "evidence_refs": [
+        "OHM-Trade-Agent-v1/tests/test_opip_data_platform_v1.py",
+        "OHM-Trade-Agent-v1/tests/test_*business_store*.py"
+      ],
+      "review_question": "Are transaction atomicity, immutable event identity, SQL grants and concurrent aggregate ordering verified under the restricted app role?"
+    },
+    {
+      "id": "V6-TRADE-004",
+      "title": "Advisory cannot bypass execution, capacity or funded authority",
+      "risk": "P0",
+      "implementation_paths": [
+        "OHM-Trade-Agent-v1/app/services/actionable_admission.py",
+        "OHM-Trade-Agent-v1/app/services/trade_action_gate.py",
+        "OHM-Trade-Agent-v1/app/jobs/scan_opportunities.py",
+        "OHM-Trade-Agent-v1/app/services/*execution*.py",
+        "OHM-Trade-Agent-v1/deploy/**"
+      ],
+      "evidence_refs": [
+        "OHM-Trade-Agent-v1/tests/test_tradevisor_core_env_isolation_v1.py",
+        "OHM-Trade-Agent-v1/tests/test_opip_paper_v2_activation_bc3.py"
+      ],
+      "review_question": "Could malformed evidence, new entry code or mode drift bypass funded-execution and actionable-only safety boundaries?"
+    },
+    {
+      "id": "V6-SOT-005",
+      "title": "Exactly one authoritative new-record storage path",
+      "risk": "P1",
+      "implementation_paths": [
+        "OHM-Trade-Agent-v1/app/opip/data_platform/**",
+        "OHM-Trade-Agent-v1/app/services/registry_io.py",
+        "OHM-Trade-Agent-v1/app/services/*writer*.py",
+        "OHM-Trade-Agent-v1/deploy/analytics/**"
+      ],
+      "evidence_refs": [
+        "OHM-Trade-Agent-v1/tests/test_opip_data_platform_v1.py"
+      ],
+      "review_question": "After an separately approved cutover, are competing file/SQLite writes fenced, without retroactive historic migration?"
+    },
+    {
+      "id": "V6-ALERT-006",
+      "title": "Delivery telemetry is read-only in observer paths and accurately attributed",
+      "risk": "P2",
+      "implementation_paths": [
+        "OHM-Trade-Agent-v1/app/services/telegram_delivery.py",
+        "OHM-Trade-Agent-v1/app/services/telegram_notifier.py",
+        "OHM-Trade-Agent-v1/app/services/dashboard_read_model.py"
+      ],
+      "evidence_refs": [
+        "OHM-Trade-Agent-v1/tests/test_telegram_suppression_repeat_bound_v1.py",
+        "OHM-Trade-Agent-v1/tests/test_telegram_delivery*.py"
+      ],
+      "review_question": "Can read-only summary mutate state, lose folded counts, misattribute UTC days, or suppress attempts?"
+    },
+    {
+      "id": "V6-SEC-007",
+      "title": "Existing PR secrets and release security controls remain intact",
+      "risk": "P0",
+      "implementation_paths": [
+        ".github/workflows/secret-scan-pr.yml",
+        ".github/workflows/pytest.yml",
+        ".github/workflows/semgrep.yml",
+        ".github/workflows/quality-security.yml",
+        ".gitleaks.toml"
+      ],
+      "evidence_refs": [
+        ".github/workflows/secret-scan-pr.yml",
+        ".github/workflows/pytest.yml"
+      ],
+      "review_question": "Were Gitleaks, security gates, authorization checks or scan scopes weakened? A confirmed exposed credential requires immediate rotation."
+    }
+  ]
+}
