@@ -44,14 +44,17 @@ NOT_MODELLED_GATES = (
 def production_baseline(constants: dict[str, Any] | None = None) -> SimPolicy:
     """Code-constants v1 reference baseline (NOT proof of live behaviour, NOT the v2 target).
 
-    Confidence is converted from production's 0-100 scale to the simulator's
-    0-1 scale. Spread bps convert to percent.
+    Confidence is NOT an admission rule in production and is left disabled.
+    Spread bps convert to percent.
     """
     c = constants if constants is not None else gate_policy_constants()
     return SimPolicy(
         scoring_version="v1",
         score_threshold=float(c["min_technical_score"]),
-        min_confidence=float(c["ai_min_confidence"]) / 100.0,
+        # Confidence is measurement evidence in production (valid 0-100 required,
+        # no admission floor: recommendation_gate.candidate_alert_authorized), so
+        # the simulator filter stays disabled here.
+        min_confidence=0.0,
         max_spread_pct=float(c["max_long_spread_bps"]) / 100.0,
         min_net_profit_usd=float(c["advisory_economic_min_net_profit"]),
         min_target_2_move_pct=float(c["advisory_economic_min_target_2_move_pct"]),
@@ -64,7 +67,7 @@ def parity_report(constants: dict[str, Any] | None = None) -> dict[str, Any]:
     base = production_baseline(c)
     rows = [
         ("score_threshold", "min_technical_score", base.score_threshold, "EXACT"),
-        ("min_confidence", "ai_min_confidence", base.min_confidence, "SCALE_CONVERTED"),
+        ("min_confidence", "ai_min_confidence", base.min_confidence, "MEASUREMENT_ONLY_NOT_ADMISSION"),
         ("max_spread_pct", "max_long_spread_bps", base.max_spread_pct, "LONG_ONLY_APPROX"),
         ("min_net_profit_usd", "advisory_economic_min_net_profit", base.min_net_profit_usd, "EXACT"),
         ("min_target_2_move_pct", "advisory_economic_min_target_2_move_pct", base.min_target_2_move_pct, "EXACT"),
