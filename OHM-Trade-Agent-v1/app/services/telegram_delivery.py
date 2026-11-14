@@ -11,7 +11,13 @@ import time
 from typing import Any
 
 from app.services.asset_display_identity import resolve_asset_identity
-from app.services.registry_io import RegistryIOError, load_json, registry_lock, save_json_atomic
+from app.services.registry_io import (
+    RegistryIOError,
+    load_json,
+    read_json_without_quarantine,
+    registry_lock,
+    save_json_atomic,
+)
 from app.services.telegram_notifier import edit_telegram_message, send_telegram_message_with_id
 
 
@@ -19,6 +25,14 @@ EVENT_FILE = Path("/app/data/telegram_delivery_events.jsonl")
 STATE_FILE = Path("/app/data/telegram_delivery_state.json")
 LOCK_FILE = STATE_FILE.parent / ".telegram_delivery.lock"
 MAX_SUMMARY_EVENTS = 20_000
+#: An unchanged, non-attempt verdict (SUPPRESSED / NOT_ELIGIBLE with the same reason for the same
+#: alert) is re-written to the event ledger at most once per window; the repeats in between are
+#: counted on the next row instead. Send attempts and failures are never collapsed.
+SUPPRESSION_REPEAT_WINDOW_SECONDS = 3_600
+#: Only these alert families are bounded. Other families (for example SYSTEM_HEALTH incidents)
+#: have their own occurrence accounting and an explicit contract that every occurrence stays an
+#: auditable ledger row, so they keep writing one row per call.
+BOUNDED_SUPPRESSION_FAMILIES = frozenset({"QUALIFIED_OPPORTUNITY"})
 
 
 @dataclass(frozen=True)
@@ -81,6 +95,14 @@ def _append_event_locked(row: dict[str, Any], *, event_file: Path) -> None:
             pass
 
 
+def _parse_iso(value: Any) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
 def _record(
     *,
     identity: str,
@@ -141,6 +163,18 @@ def _record(
             attempt = previous_attempts + 1 if is_attempt else previous_attempts
             retry_count = max(0, attempt - 1) if is_attempt else max(0, previous_attempts - 1)
 
+            reason_text = str(suppression_reason or "") or None
+            last_row_at = _parse_iso(previous.get("last_event_row_at"))
+            repeat_of_unchanged_verdict = bool(
+                not is_attempt
+                and family in BOUNDED_SUPPRESSION_FAMILIES
+                and previous.get("last_status") == normalized_status
+                and previous.get("last_suppression_reason") == reason_text
+                and last_row_at is not None
+                and 0 <= (attempted - last_row_at).total_seconds() < SUPPRESSION_REPEAT_WINDOW_SECONDS
+            )
+            skipped_repeats = int(previous.get("suppressed_repeat_count") or 0)
+
             row = {
                 "schema_version": 1,
                 "record_type": "TELEGRAM_DELIVERY_EVENT",
@@ -166,7 +200,17 @@ def _record(
                 "suppression_reason": str(suppression_reason or "") or None,
                 "failure_reason": str(failure_reason or "") or None,
             }
-            _append_event_locked(row, event_file=event_file)
+            if not repeat_of_unchanged_verdict:
+                if skipped_repeats > 0:
+                    # Keep the ledger complete: the rows skipped since the last write are counted,
+                    # with the verdict they repeated (it may differ from this row's verdict).
+                    row["suppressed_since_last_row"] = skipped_repeats
+                    row["suppressed_since_last_row_status"] = previous.get("last_status")
+                    row["suppressed_since_last_row_reason"] = previous.get("last_suppression_reason")
+                    # When the collapsed run began, so a day-scoped summary can tell whether
+                    # the run is wholly inside the day.
+                    row["suppressed_since_last_row_from"] = previous.get("last_event_row_at")
+                _append_event_locked(row, event_file=event_file)
 
             updated = dict(previous)
             updated.update(
@@ -178,6 +222,15 @@ def _record(
                     "attempts": attempt,
                     "retry_count": retry_count,
                     "last_status": normalized_status,
+                    "last_suppression_reason": reason_text,
+                    "suppressed_repeat_count": (
+                        skipped_repeats + 1 if repeat_of_unchanged_verdict else 0
+                    ),
+                    "last_event_row_at": (
+                        previous.get("last_event_row_at")
+                        if repeat_of_unchanged_verdict
+                        else attempted.isoformat()
+                    ),
                     "updated_at": attempted.isoformat(),
                     "journey_id": str(journey_id or "") or None,
                     "signal_id": str(signal_id or "") or None,
@@ -524,12 +577,94 @@ def read_delivery_events(*, path: Path = EVENT_FILE, limit: int = MAX_SUMMARY_EV
     return list(rows)
 
 
-def build_delivery_summary(*, scope: str = "all", path: Path = EVENT_FILE) -> dict[str, Any]:
+def _collapsed_repeats(
+    rows: list[dict[str, Any]],
+    *,
+    path: Path,
+    scope: str,
+    today: str,
+) -> tuple[list[tuple[str, str, str | None, int]], int, bool]:
+    """Suppressions the ledger collapsed.
+
+    Returns ``(counted, unattributed, state_readable)`` where ``counted`` holds
+    ``(family, status, reason, count)`` entries.
+
+    Written rows carry ``suppressed_since_last_row`` with the verdict those
+    repeats had. Repeats not yet flushed into a row live in the state file and
+    are added here, so a row and the state never count the same repeat twice.
+    The state file is read without quarantine: a summary must never move or
+    rewrite durable state, even when that state is malformed.
+
+    A collapsed run has one start time but no per-repeat times. For
+    ``scope == "today"`` a run is counted only when it began today; a run that
+    began on an earlier UTC day (or has no start time) cannot be split by day, so
+    it is returned in ``unattributed`` instead of being credited to today. A run
+    that began after the requested day is simply outside it.
+    """
+
+    def placement(started: Any) -> str:
+        """``count`` (begins today or scope is all), ``earlier`` or ``later`` than the day."""
+        if scope != "today":
+            return "count"
+        day = str(started or "")[:10]
+        if day == today:
+            return "count"
+        # An unknown start cannot be placed in the day, so it is reported as unattributed.
+        return "later" if day and day > today else "earlier"
+
+    counted: list[tuple[str, str, str | None, int]] = []
+    unattributed = 0
+    for row in rows:
+        count = row.get("suppressed_since_last_row")
+        if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+            continue
+        where = placement(row.get("suppressed_since_last_row_from"))
+        if where != "count":
+            unattributed += count if where == "earlier" else 0
+            continue
+        counted.append(
+            (
+                str(row.get("alert_family") or "UNKNOWN").upper(),
+                str(row.get("suppressed_since_last_row_status") or "SUPPRESSED").upper(),
+                row.get("suppressed_since_last_row_reason"),
+                count,
+            )
+        )
+    try:
+        state = read_json_without_quarantine(path.parent / STATE_FILE.name)
+    except (OSError, ValueError, TypeError, RegistryIOError):
+        return counted, unattributed, False
+    alerts = state.get("alerts") if isinstance(state, dict) else None
+    for entry in (alerts or {}).values() if isinstance(alerts, dict) else ():
+        if not isinstance(entry, dict):
+            continue
+        pending = entry.get("suppressed_repeat_count")
+        if not isinstance(pending, int) or isinstance(pending, bool) or pending <= 0:
+            continue
+        where = placement(entry.get("last_event_row_at"))
+        if where != "count":
+            unattributed += pending if where == "earlier" else 0
+            continue
+        counted.append(
+            (
+                str(entry.get("alert_family") or "UNKNOWN").upper(),
+                str(entry.get("last_status") or "SUPPRESSED").upper(),
+                entry.get("last_suppression_reason"),
+                pending,
+            )
+        )
+    return counted, unattributed, True
+
+
+def build_delivery_summary(
+    *, scope: str = "all", path: Path = EVENT_FILE, now: datetime | None = None
+) -> dict[str, Any]:
     if scope not in {"all", "today"}:
         raise ValueError("scope must be all or today")
+    clock = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     rows = read_delivery_events(path=path)
     if scope == "today":
-        today = datetime.now(timezone.utc).date()
+        today = clock.date()
         rows = [
             row
             for row in rows
@@ -560,8 +695,26 @@ def build_delivery_summary(*, scope: str = "all", path: Path = EVENT_FILE) -> di
             suppression_reasons[reason] = suppression_reasons.get(reason, 0) + 1
         elif status.endswith("FAILED"):
             failed += 1
+    collapsed = 0
+    folded, unattributed, state_readable = _collapsed_repeats(
+        delivery_rows, path=path, scope=scope, today=clock.date().isoformat()
+    )
+    for family, status, reason, count in folded:
+        collapsed += count
+        suppressed += count
+        statuses[status] = statuses.get(status, 0) + count
+        families[family] = families.get(family, 0) + count
+        reason_key = str(reason or "UNSPECIFIED").upper()
+        suppression_reasons[reason_key] = suppression_reasons.get(reason_key, 0) + count
     return {
         "events": len(delivery_rows),
+        # Suppressions folded into other rows or still pending in state; already
+        # included in suppressed, by_status, by_family and by_suppression_reason.
+        "collapsed_suppression_repeats": collapsed,
+        # Collapsed runs that began before today's UTC day and cannot be split by day; reported
+        # here and not credited to today. Always 0 for scope "all".
+        "collapsed_repeats_unattributed_to_day": unattributed,
+        "collapsed_repeats_state_readable": state_readable,
         "lineage_links": lineage_links,
         "delivered": delivered,
         "failed": failed,
