@@ -140,6 +140,7 @@ AC-003 -> OHM-Trade-Agent-v1/app/opip/data_platform/migrations/007_business_stor
 AC-003 -> OHM-Trade-Agent-v1/app/opip/data_platform/business_store.py
 AC-003 -> OHM-Trade-Agent-v1/app/opip/data_platform/storage_inventory.py
 AC-003 -> OHM-Trade-Agent-v1/docs/engineering/OPIP_POSTGRES_PHASE1_STORAGE_INVENTORY.md
+AC-003 -> OHM-Trade-Agent-v1/docs/engineering/OPIP_POSTGRES_FAIL_CLOSED_CONTRACT.md
 AC-003 -> OHM-Trade-Agent-v1/tests/test_opip_postgres_phase1_v1.py
 AC-003 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-POSTGRES-PHASE1-V1.md
 AC-004 -> OHM-Trade-Agent-v1/app/opip/data_platform/migrations/007_business_store.sql
@@ -152,12 +153,14 @@ AC-005 -> OHM-Trade-Agent-v1/app/opip/data_platform/migrations/007_business_stor
 AC-005 -> OHM-Trade-Agent-v1/app/opip/data_platform/business_store.py
 AC-005 -> OHM-Trade-Agent-v1/app/opip/data_platform/storage_inventory.py
 AC-005 -> OHM-Trade-Agent-v1/docs/engineering/OPIP_POSTGRES_PHASE1_STORAGE_INVENTORY.md
+AC-005 -> OHM-Trade-Agent-v1/docs/engineering/OPIP_POSTGRES_FAIL_CLOSED_CONTRACT.md
 AC-005 -> OHM-Trade-Agent-v1/tests/test_opip_postgres_phase1_v1.py
 AC-005 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-POSTGRES-PHASE1-V1.md
 AC-006 -> OHM-Trade-Agent-v1/app/opip/data_platform/migrations/007_business_store.sql
 AC-006 -> OHM-Trade-Agent-v1/app/opip/data_platform/business_store.py
 AC-006 -> OHM-Trade-Agent-v1/app/opip/data_platform/storage_inventory.py
 AC-006 -> OHM-Trade-Agent-v1/docs/engineering/OPIP_POSTGRES_PHASE1_STORAGE_INVENTORY.md
+AC-006 -> OHM-Trade-Agent-v1/docs/engineering/OPIP_POSTGRES_FAIL_CLOSED_CONTRACT.md
 AC-006 -> OHM-Trade-Agent-v1/tests/test_opip_postgres_phase1_v1.py
 AC-006 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-POSTGRES-PHASE1-V1.md
 AC-007 -> OHM-Trade-Agent-v1/app/opip/data_platform/migrations/007_business_store.sql
