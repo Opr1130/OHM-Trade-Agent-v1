@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import time
@@ -81,6 +82,19 @@ def _append_event_locked(row: dict[str, Any], *, event_file: Path) -> None:
             pass
 
 
+def _flat_evidence(evidence: dict[str, Any] | None) -> dict[str, Any]:
+    """Bounded, flat audit evidence: scalar values only, so a row can never balloon."""
+    if not isinstance(evidence, dict):
+        return {}
+    flat: dict[str, Any] = {}
+    for key, value in list(evidence.items())[:32]:
+        if isinstance(value, (bool, int, str)) or value is None:
+            flat[str(key)[:64]] = value if not isinstance(value, str) else value[:120]
+        elif isinstance(value, float) and math.isfinite(value):
+            flat[str(key)[:64]] = value
+    return flat
+
+
 def _record(
     *,
     identity: str,
@@ -101,6 +115,7 @@ def _record(
     latency_ms: int,
     state_file: Path,
     event_file: Path,
+    evidence: dict[str, Any] | None = None,
 ) -> TelegramDeliveryResult:
     generated = _utc(generated_at)
     attempted = _utc(attempted_at)
@@ -166,6 +181,9 @@ def _record(
                 "suppression_reason": str(suppression_reason or "") or None,
                 "failure_reason": str(failure_reason or "") or None,
             }
+            flat_evidence = _flat_evidence(evidence)
+            if flat_evidence:
+                row["evidence"] = flat_evidence
             _append_event_locked(row, event_file=event_file)
 
             updated = dict(previous)
@@ -341,9 +359,11 @@ def record_telegram_suppression(
     generated_at: datetime | None = None,
     state_file: Path = STATE_FILE,
     event_file: Path = EVENT_FILE,
+    evidence: dict[str, Any] | None = None,
 ) -> TelegramDeliveryResult:
     now = _utc()
     return _record(
+        evidence=evidence,
         identity=identity,
         alert_family=alert_family,
         event_type=event_type,

@@ -565,6 +565,13 @@ def send_trade_plan(
                 journey_id=candidate.get("journey_id"),
                 signal_id=candidate.get("signal_id"),
                 trade_id=candidate.get("trade_id"),
+                # Audit evidence only: the numbers the gate compared, so a capacity refusal
+                # can be told apart from a stale-size input without re-running the scan.
+                evidence={
+                    "policy_version": admission.policy_version,
+                    "condition": admission.condition,
+                    **(admission.capacity or {}),
+                },
             )
         return False
 
