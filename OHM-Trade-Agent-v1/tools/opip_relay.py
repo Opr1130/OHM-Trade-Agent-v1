@@ -186,14 +186,16 @@ def process(comments: list[dict], *, allowed_actor_ids: frozenset[int], state: S
     # Remote evidence of what was already answered: a crash between post() and
     # state.record() must not produce a second ACK on restart. Only a genuine ACK from
     # this relay, addressed back to the requester and naming this request, counts.
-    published: dict[str, dict] = {}
+    # Every ACK candidate is kept per id: a same-id decoy must not shadow, by sorting
+    # later in the list, a genuine ACK that is also present.
+    published: dict[str, list[dict]] = {}
     for comment in comments:
         try:
             env = parse_comment(comment, allowed_actor_ids=allowed_actor_ids)
         except Reject:
             continue
         if env.fields["kind"] == "ACK":
-            published[env.message_id] = env.fields
+            published.setdefault(env.message_id, []).append(env.fields)
     for comment in sorted(comments, key=lambda c: (c.get("created_at", ""), c.get("id", 0))):
         try:
             env = parse_comment(comment, allowed_actor_ids=allowed_actor_ids)
@@ -227,9 +229,8 @@ def process(comments: list[dict], *, allowed_actor_ids: frozenset[int], state: S
         if replies >= max_replies:
             results.append(Outcome(mid, "NO_REPLY", "reply budget exhausted; retry next pass"))
             continue
-        ack = published.get(f"{mid}-ack")
-        if (ack is not None and ack["sender"] == me and ack.get("reply_to") == mid
-                and ack["recipient"] == f["sender"]):
+        if any(ack["sender"] == me and ack.get("reply_to") == mid and ack["recipient"] == f["sender"]
+               for ack in published.get(f"{mid}-ack", ())):
             state.record(mid, "REPLIED")  # answered before a crash lost the local record
             results.append(Outcome(mid, "DUPLICATE", "ACK already published"))
             continue
