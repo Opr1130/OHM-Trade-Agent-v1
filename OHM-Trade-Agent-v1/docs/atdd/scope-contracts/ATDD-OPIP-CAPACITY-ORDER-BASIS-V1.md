@@ -34,6 +34,14 @@ the source is inspected
 THEN:
 both read the contemplated order notional helper and neither reads the pre-cap economic notional directly
 
+AC-004:
+GIVEN:
+a sweep of requested capital, capacity ceiling and leverage run through the real action gate and the real capacity check
+WHEN:
+orders are judged on the recommended basis and on the old pre-cap basis
+THEN:
+an uncapped order is judged identically, an order is admitted exactly when it fits the ceiling times the utilization limit, no previously admitted candidate becomes refused, only capped candidates change decision (refused to admitted), and every other gate (market liquidity, spread, slippage, depth coverage, missing or non-finite ceiling or order size, a book thinner than the order) still refuses
+
 EXPLICITLY OUT OF SCOPE:
 - Any change to the capacity ceiling formula, MAX_CAPACITY_UTILIZATION, minimum market liquidity, spread, slippage or depth limits.
 - Deployment, restarts, runtime configuration, PostgreSQL, F11, Learning, Committee and order authority.
@@ -48,6 +56,9 @@ AC-001 -> tests/test_opip_capacity_order_basis_v1.py::test_ac_001_b_limits_are_n
 AC-001 -> tests/test_opip_capacity_order_basis_v1.py::test_ac_001_c_basis_selection_fails_closed
 AC-002 -> tests/test_opip_capacity_order_basis_v1.py::test_ac_002_capped_notional_never_exceeds_the_ceiling
 AC-003 -> tests/test_opip_capacity_order_basis_v1.py::test_ac_003_scan_call_sites_use_the_contemplated_order_basis
+AC-004 -> tests/test_opip_capacity_order_basis_v1.py::test_ac_004_a_uncapped_orders_are_judged_exactly_as_before
+AC-004 -> tests/test_opip_capacity_order_basis_v1.py::test_ac_004_b_no_false_admission_across_the_capacity_grid
+AC-004 -> tests/test_opip_capacity_order_basis_v1.py::test_ac_004_c_thin_books_and_missing_evidence_still_refuse_a_capped_order
 
 IMPLEMENTATION MAP:
 AC-001 -> OHM-Trade-Agent-v1/app/services/actionable_admission.py
@@ -55,6 +66,7 @@ AC-002 -> OHM-Trade-Agent-v1/app/services/trade_action_gate.py
 AC-003 -> OHM-Trade-Agent-v1/app/jobs/scan_opportunities.py
 AC-001 -> OHM-Trade-Agent-v1/tests/test_opip_capacity_order_basis_v1.py
 AC-001 -> OHM-Trade-Agent-v1/docs/atdd/scope-contracts/ATDD-OPIP-CAPACITY-ORDER-BASIS-V1.md
+AC-004 -> OHM-Trade-Agent-v1/app/services/actionable_admission.py
 
 DEFERRED DISCOVERIES:
 NONE

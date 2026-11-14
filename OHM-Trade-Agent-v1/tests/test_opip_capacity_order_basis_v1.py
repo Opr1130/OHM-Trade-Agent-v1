@@ -139,3 +139,94 @@ def test_ac_003_scan_call_sites_use_the_contemplated_order_basis():
     source = (APP_ROOT / "app" / "jobs" / "scan_opportunities.py").read_text(encoding="utf-8")
     assert 'order_notional_usd=alert.get("economic_position_notional")' not in source
     assert source.count("order_notional_usd=contemplated_order_notional_usd(alert)") == 2
+
+
+def _decide(candidate: dict, *, order: float | None, **over) -> str | None:
+    """Admission execution check for an explicit order size, other evidence healthy unless overridden."""
+    fields = dict(
+        market_liquidity_usd=2_400_000.0,
+        position_capacity_usd=candidate.get("liquidity_capacity_ceiling_usd"),
+        order_size_usd=order,
+        spread_bps=8.0,
+        size_slippage_pct=0.25,
+        depth_covered=True,
+    )
+    fields.update(over)
+    return admission._check_execution(  # noqa: SLF001
+        admission.ActionableEvidence(**fields), policy=admission.ActionableNotificationPolicy()
+    )
+
+
+def _swept_candidates(monkeypatch):
+    for capital in (50.0, 100.0, 250.0, 400.0, 1_000.0, 2_500.0):
+        for ceiling in (40.0, 99.99, 100.0, 250.0, 250.004, 400.0, 1_000.0, 5_000.0):
+            for leverage in (1.0, 2.0, 3.0):
+                try:
+                    yield capital, ceiling, leverage, _gate(
+                        monkeypatch, capital=capital, ceiling=ceiling, leverage=leverage
+                    )
+                except AssertionError:
+                    continue  # the action gate refused this combination; no card, nothing to admit
+
+
+def test_ac_004_a_uncapped_orders_are_judged_exactly_as_before(monkeypatch):
+    """ATDD-OPIP-CAPACITY-ORDER-BASIS-V1/AC-004: when nothing was capped the new basis changes no decision."""
+    seen = 0
+    for _capital, _ceiling, _leverage, candidate in _swept_candidates(monkeypatch):
+        if candidate["liquidity_capacity_capped"]:
+            continue
+        seen += 1
+        old_order = candidate["economic_position_notional"]
+        assert admission.contemplated_order_notional_usd(candidate) == pytest.approx(old_order, abs=0.01)
+        assert _decide(candidate, order=admission.contemplated_order_notional_usd(candidate)) == _decide(
+            candidate, order=old_order
+        )
+    assert seen >= 20, "the sweep must exercise uncapped candidates"
+
+
+def test_ac_004_b_no_false_admission_across_the_capacity_grid(monkeypatch):
+    """ATDD-OPIP-CAPACITY-ORDER-BASIS-V1/AC-004: admit exactly when the order fits the ceiling; never admit more than before's ceiling allows."""
+    utilization = admission.ActionableNotificationPolicy().max_capacity_utilization_pct
+    newly_admitted = capped = 0
+    for capital, ceiling, leverage, candidate in _swept_candidates(monkeypatch):
+        new_order = admission.contemplated_order_notional_usd(candidate)
+        old_order = candidate["economic_position_notional"]
+        new_reason, old_reason = _decide(candidate, order=new_order), _decide(candidate, order=old_order)
+        allowed = ceiling * utilization / 100.0
+        # An independent oracle: the order fits, or it is refused for capacity.
+        assert (new_reason is None) == (new_order <= allowed), (capital, ceiling, leverage)
+        if new_reason is None:
+            assert new_order <= allowed + 1e-9, "never admits an order above the ceiling"
+        if old_reason is None:
+            assert new_reason is None, "no previously admitted candidate may become refused"
+        if candidate["liquidity_capacity_capped"]:
+            capped += 1
+            if old_reason == admission.REASON_CAPACITY_INSUFFICIENT and new_reason is None:
+                newly_admitted += 1
+                assert new_order < old_order and new_order <= allowed
+    assert capped >= 10 and newly_admitted >= 1, "the fix must change some decisions, and only those"
+
+
+def test_ac_004_c_thin_books_and_missing_evidence_still_refuse_a_capped_order(monkeypatch):
+    """ATDD-OPIP-CAPACITY-ORDER-BASIS-V1/AC-004: capacity is one gate of several and the others are untouched."""
+    candidate = _gate(monkeypatch, capital=400.0, ceiling=250.0)
+    order = admission.contemplated_order_notional_usd(candidate)
+    assert _decide(candidate, order=order) is None
+    assert _decide(candidate, order=order, market_liquidity_usd=1.0) == admission.REASON_LIQUIDITY_INSUFFICIENT
+    assert _decide(candidate, order=order, market_liquidity_usd=None) == admission.REASON_EXECUTION_EVIDENCE_MISSING
+    assert _decide(candidate, order=order, spread_bps=10_000.0) == admission.REASON_SPREAD_TOO_WIDE
+    assert _decide(candidate, order=order, spread_bps=None) == admission.REASON_EXECUTION_EVIDENCE_MISSING
+    assert _decide(candidate, order=order, size_slippage_pct=50.0) == admission.REASON_SIZE_SLIPPAGE_EXCESSIVE
+    assert _decide(candidate, order=order, depth_covered=False) == admission.REASON_DEPTH_INSUFFICIENT
+    assert _decide(candidate, order=order, depth_covered=None) == admission.REASON_DEPTH_INSUFFICIENT
+    for ceiling in (None, float("nan"), float("inf"), "not-a-number"):
+        assert _decide(candidate, order=order, position_capacity_usd=ceiling) == admission.REASON_EXECUTION_EVIDENCE_MISSING, ceiling
+    # Pre-existing, unchanged: the shared number parser reads a bool as 1.0 and a numeric string as its
+    # value. The producer only ever supplies floats; a bool still refuses a real order.
+    assert _decide(candidate, order=order, position_capacity_usd=True) is not None
+    for ceiling in (0.0, -10.0):
+        assert _decide(candidate, order=order, position_capacity_usd=ceiling) == admission.REASON_CAPACITY_INSUFFICIENT
+    for bad_order in (None, 0.0, -1.0, float("nan"), float("inf")):  # a bool never reaches here: the basis helper drops it
+        assert _decide(candidate, order=bad_order) == admission.REASON_ORDER_SIZE_UNUSABLE, bad_order
+    thin = _decide(candidate, order=order, position_capacity_usd=order - 0.01)
+    assert thin == admission.REASON_CAPACITY_INSUFFICIENT, "a thinner book than the order refuses it"
